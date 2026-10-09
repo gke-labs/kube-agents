@@ -182,13 +182,15 @@ the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
 not this pod's, so the loader prints the report back as JSON and the job
 writes the files on this side, under `<agent home>/upgrade-readiness/`:
 `ledger.json`, and one dated `.md` and `.json` per report under
-`reports/<version>/`, with `latest.md` pointing at the newest. Each run starts
+`reports/<version>/`, with `latest.md` pointing at the newest, the ten newest
+kept per version and a retired version's directory removed with it. Each run starts
 from an empty rollout record, so a saved report's progress table is a
 first-run baseline, not a week-over-week comparison. Its stdout, one line per
 report with the pending clusters, the blocked ones, and the file's path on the
 gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
 sandbox and cannot open that path, which is why the line carries the verdicts.
-`--dry-run` prints what a tick would do and changes nothing.
+`--dry-run` prints what a tick would do and changes nothing, the failure
+marker included.
 
 Daily at 10:10 UTC, after the morning audits and before the US day; the
 version table is a handful of `gcloud` list calls and the readiness report
@@ -196,9 +198,12 @@ runs only on the day a version appears or its week comes round, once per
 project that holds a pending cluster with its own timeout, so one project the
 sandbox cannot finish leaves only its own clusters ungraded and the others'
 versions still reported. The whole tick keeps to forty-five minutes of the
-hour Hermes gives a `no_agent` script: each project's run gets what the budget
-has left, a project it cannot reach is left unread and named in the line, and
-the order turns daily so that is not the same project every day. Three guards
+hour Hermes gives a `no_agent` script: the version table and the readiness
+runs go project by project, each run gets what the budget has left, a project
+the budget cannot reach is left unread and named in the line (a version none
+of whose projects ran is not recorded and is retried tomorrow), and the next
+sweep starts at that project, so a budget that never reaches the end of the
+list does not leave the same project unread twice. Three guards
 keep the ledger honest: a version is
 retired only on a tick whose version table read every project, a report that
 graded none of a version's pending clusters is written but not recorded (the

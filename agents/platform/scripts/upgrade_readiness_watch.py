@@ -94,6 +94,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -122,6 +123,9 @@ REPORT_MARKDOWN_SUFFIX = ".md"
 REPORT_JSON_SUFFIX = ".json"
 REPORT_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 LATEST_LINK_NAME = "latest.md"
+# Dated reports kept per version; older pairs go when a new one is written, and
+# a retired version takes its directory with it.
+REPORTS_KEPT_PER_VERSION = 10
 JSON_INDENT = 2
 
 # The refresh interval: a report per new version, then one a week while pending.
@@ -177,12 +181,16 @@ WROTE_LINE_PREFIX = "Wrote "
 VERSION_TABLE_TIMEOUT_SECONDS = 600
 READINESS_TIMEOUT_SECONDS = 1500
 # Hermes kills a no_agent script at an hour (stall_watch.py records it); the
-# whole tick stays under this, so the readiness runs get what the version
-# table left, each capped at READINESS_TIMEOUT_SECONDS, and a project the
-# budget cannot reach is left unread and named rather than started.
+# whole tick stays under this. The version table and the readiness runs go
+# project by project, each capped at its own timeout and at what the budget
+# has left; a project the budget cannot reach is left unread and named rather
+# than started, and the next sweep starts at it.
 TICK_BUDGET_SECONDS = 2700
 MIN_PROJECT_RUN_SECONDS = 120
-BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} ran; retried tomorrow"
+BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} ran"
+TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
+TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
+PROJECT_NOT_RUN_DETAIL = "readiness run for {project} not started: {error}"
 STDERR_EXCERPT_CHARS = 300
 
 # The report's vocabulary this job reads (fleet_upgrade_report.py, upgrade_readiness.py).
@@ -209,6 +217,11 @@ FIRST_SEEN_KEY = "first_seen"
 LAST_REPORT_KEY = "last_report_at"
 PENDING_KEY = "pending"
 LAST_TICK_KEY = "last_tick"
+# Where the next sweep starts: the first project the budget left unread, so a
+# budget that never reaches the end of the list does not leave the same project
+# unread every time. None, or a project no longer in scope, means the sorted order.
+TABLE_RESUME_KEY = "table_resume_from"
+READINESS_RESUME_KEY = "readiness_resume_from"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
@@ -238,6 +251,10 @@ DRY_RUN_WOULD_RETIRE = "dry run: would retire {version} (no cluster is pending i
 UNGRADED_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
     "report on the gateway pod at {path}; retrying tomorrow"
+)
+NOT_RUN_LINE = (
+    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): not run; the tick budget was spent "
+    "before {projects} ran; retried tomorrow, starting there"
 )
 UNKNOWN_COUNT = ", {count} unknown"
 UNREAD_COUNT = ", {count} not read"
@@ -539,6 +556,9 @@ def load_ledger(path: Path) -> dict:
     # hand the None back on the next due or retired version.
     if data[ANNOUNCED_KEY].get(ANNOUNCED_UNGRADED_KEY) is None:
         data[ANNOUNCED_KEY][ANNOUNCED_UNGRADED_KEY] = {}
+    for key in (TABLE_RESUME_KEY, READINESS_RESUME_KEY):
+        if not isinstance(data.get(key), str):
+            data[key] = None
     return data
 
 
@@ -641,39 +661,99 @@ def project_of(member_key_text: str) -> str:
     return member_key_text.split(MEMBER_KEY_SEPARATOR, 1)[0]
 
 
+def ordered_projects(names: set[str] | list[str], resume_from: str | None) -> list[str]:
+    """The sorted project list, turned to start at ``resume_from`` when that
+    project is still in scope: the project the last sweep's budget left unread
+    runs first, so it is not the one left unread again."""
+    order = sorted(names)
+    if resume_from in order:
+        start = order.index(resume_from)
+        order = order[start:] + order[:start]
+    return order
+
+
+def empty_envelope() -> dict:
+    return {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {MEMBERS_KEY: [], ERRORS_KEY: []}}
+
+
+def merge_envelope(merged: dict, envelope: dict) -> None:
+    merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
+    merged[ENVELOPE_REPORT_KEY][MEMBERS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(MEMBERS_KEY) or []
+    merged[ENVELOPE_REPORT_KEY][ERRORS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
+    if envelope.get(ENVELOPE_EXIT_KEY) != EXIT_OK and merged[ENVELOPE_EXIT_KEY] == EXIT_OK:
+        merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
+
+
+def versions_by_project(names: list[str], deadline: float, resume_from: str | None) -> tuple[dict, str | None]:
+    """The version table, one sandbox run per project under its own timeout and
+    what is left of the tick's budget before ``deadline``, merged into one
+    envelope. A project whose run failed, or that the budget did not reach, is a
+    read error with no location, the shape a failed ``clusters list`` has, so
+    the table counts as partial: nothing is retired, and the ledger's pending
+    clusters of that project are carried forward. The second value is the first
+    project not reached, where the next tick's table starts."""
+    merged = empty_envelope()
+    unrun: list[str] = []
+    failed: dict[str, Exception] = {}
+    for project in ordered_projects(names, resume_from):
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_PROJECT_RUN_SECONDS:
+            unrun.append(project)
+            continue
+        try:
+            envelope = run_report([project], readiness=False, timeout=min(VERSION_TABLE_TIMEOUT_SECONDS, remaining))
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            failed[project] = exc
+            error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
+            merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=error)}
+            )
+            continue
+        merge_envelope(merged, envelope)
+    if failed and len(failed) == len(names):
+        # No project read at all is the sandbox or the credential, not a
+        # project: one failure line for the tick, announced once, rather than a
+        # partial table nobody can act on.
+        raise next(iter(failed.values()))
+    for project in unrun:
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_UNRUN_DETAIL.format(project=project)}
+        )
+    return merged, (unrun[0] if unrun else None)
+
+
 def readiness_by_project(
-    pending: dict[str, list[str]], due: dict[str, str], deadline: float, rotation: int = 0
-) -> tuple[dict, dict[str, str]]:
+    pending: dict[str, list[str]], due: dict[str, str], deadline: float, resume_from: str | None = None
+) -> tuple[dict, dict[str, str], list[str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
     budget before ``deadline`` (a ``time.monotonic`` instant), merged into one
-    envelope; a project whose run failed, or that the budget could not reach,
-    leaves its clusters ungraded and is named in the second value, so the
-    other projects' versions still get their report. ``rotation`` (the day
-    number) turns the sorted order so a budget that never reaches the last
-    project does not leave the same project unread every day."""
-    needed = sorted({project_of(key) for version in due for key in pending[version]})
-    if needed:
-        start = rotation % len(needed)
-        needed = needed[start:] + needed[:start]
-    merged = {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {MEMBERS_KEY: [], ERRORS_KEY: []}}
+    envelope. A project whose run failed leaves its clusters ungraded and is
+    named in the second value; a project the budget did not reach is named in
+    the third, so the caller can tell a failed read from a read that never
+    started. Both are read errors in the envelope, so the report names them."""
+    needed = {project_of(key) for version in due for key in pending[version]}
+    merged = empty_envelope()
     failures: dict[str, str] = {}
-    for project in needed:
+    unrun: list[str] = []
+    for project in ordered_projects(needed, resume_from):
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
-            failures[project] = BUDGET_EXHAUSTED_DETAIL.format(project=project)
+            unrun.append(project)
             continue
         try:
             envelope = run_report([project], readiness=True, timeout=min(READINESS_TIMEOUT_SECONDS, remaining))
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             failures[project] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             continue
-        merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
-        merged[ENVELOPE_REPORT_KEY][MEMBERS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(MEMBERS_KEY) or []
-        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
+        merge_envelope(merged, envelope)
     for project, error in failures.items():
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_RUN_FAILED_DETAIL.format(project=project, error=error)})
-    return merged, failures
+    for project in unrun:
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+            {MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))}
+        )
+    return merged, failures, unrun
 
 
 def cluster_names(clusters: list[str]) -> str:
@@ -728,6 +808,26 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
     return "\n".join(lines)
 
 
+def version_slice(report: dict, clusters: list[str]) -> dict:
+    """The merged report cut down to one version: its pending clusters' members
+    and the read errors of their projects. The tables stay whole in the
+    Markdown, since the skill prints them per project."""
+    wanted = set(clusters)
+    projects = {project_of(key) for key in clusters}
+    return {
+        MEMBERS_KEY: [m for m in report.get(MEMBERS_KEY) or [] if member_key(m) in wanted],
+        ERRORS_KEY: [e for e in report.get(ERRORS_KEY) or [] if e.get(MEMBER_ID_KEYS[0]) in projects],
+    }
+
+
+def prune_reports(directory: Path) -> None:
+    """Keep the newest REPORTS_KEPT_PER_VERSION dated pairs; the stamps sort by time."""
+    stamps = sorted({path.name.rsplit(".", 1)[0] for path in directory.iterdir() if path.name != LATEST_LINK_NAME and not path.is_symlink()})
+    for stamp in stamps[:-REPORTS_KEPT_PER_VERSION]:
+        for suffix in (REPORT_MARKDOWN_SUFFIX, REPORT_JSON_SUFFIX):
+            (directory / (stamp + suffix)).unlink(missing_ok=True)
+
+
 def write_report(home: Path, version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> Path:
     directory = home / REPORTS_DIR_NAME / version
     directory.mkdir(parents=True, exist_ok=True)
@@ -735,13 +835,33 @@ def write_report(home: Path, version: str, reason: str, clusters: list[str], env
     markdown = directory / (stamp + REPORT_MARKDOWN_SUFFIX)
     markdown.write_text(render_markdown(version, reason, clusters, envelope, now, days), encoding="utf-8")
     (directory / (stamp + REPORT_JSON_SUFFIX)).write_text(
-        json.dumps(envelope[ENVELOPE_REPORT_KEY], indent=JSON_INDENT) + "\n", encoding="utf-8"
+        json.dumps(version_slice(envelope[ENVELOPE_REPORT_KEY], clusters), indent=JSON_INDENT) + "\n", encoding="utf-8"
     )
     latest = directory / LATEST_LINK_NAME
     if latest.is_symlink() or latest.exists():
         latest.unlink()
     latest.symlink_to(markdown.name)
+    prune_reports(directory)
     return markdown
+
+
+def remove_reports(home: Path, version: str) -> None:
+    """A retired version's directory goes with it; nothing reads it afterwards."""
+    shutil.rmtree(home / REPORTS_DIR_NAME / version, ignore_errors=True)
+
+
+def clear_failure_marker(home: Path) -> bool:
+    """Remove the last failure's marker if there is one; True when one was
+    removed, so the caller announces the recovery. A marker that cannot be
+    removed stays, and the recovery is announced once it can be."""
+    marker = home / FAILURE_MARKER_FILE_NAME
+    try:
+        if not marker.exists():
+            return False
+        marker.unlink()
+    except OSError:
+        return False
+    return True
 
 
 # --- the tick --------------------------------------------------------------
@@ -755,7 +875,9 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
     names = projects()
-    versions = run_report(names, readiness=False)
+    deadline = started + TICK_BUDGET_SECONDS
+    versions, table_unrun = versions_by_project(names, deadline, ledger.get(TABLE_RESUME_KEY))
+    ledger[TABLE_RESUME_KEY] = table_unrun
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
@@ -770,6 +892,8 @@ def tick(dry_run: bool = False) -> list[str]:
         return lines
     due, retired = decide(ledger, pending, now, days, retire=complete)
     lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
+    for version in retired:
+        remove_reports(home, version)
     partial_signature = json.dumps(sorted(json.dumps(e, sort_keys=True) for e in read_errors)) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
     if partial_signature and partial_signature != already:
@@ -778,16 +902,33 @@ def tick(dry_run: bool = False) -> list[str]:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = partial_signature
     if due:
-        readiness, failures = readiness_by_project(pending, due, started + TICK_BUDGET_SECONDS, rotation=now.toordinal())
+        readiness, failures, unrun = readiness_by_project(pending, due, deadline, ledger.get(READINESS_RESUME_KEY))
+        ledger[READINESS_RESUME_KEY] = unrun[0] if unrun else None
         for version, reason in due.items():
             clusters = pending[version]
+            blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            version_projects = {project_of(k) for k in clusters}
+            failed_projects = sorted(version_projects & set(failures))
+            unrun_projects = sorted(version_projects & set(unrun))
+            if not blocked and not ready and not unknown and unrun_projects and not failed_projects and len(unrun_projects) == len(version_projects):
+                # Nothing was attempted for this version: not a report, not an
+                # ungraded attempt, and not recorded, so it is due again tomorrow,
+                # when the sweep starts at the project the budget left.
+                lines.append(
+                    NOT_RUN_LINE.format(
+                        prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
+                        names=cluster_names(clusters), projects=", ".join(unrun_projects),
+                    )
+                )
+                continue
             try:
                 path = write_report(home, version, reason, clusters, readiness, now, days)
             except OSError as exc:
                 raise WriteFailed(str(exc)) from exc
-            blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
-            failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
-            failure_text = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects)
+            failure_text = "; ".join(
+                [PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects]
+                + [PROJECT_NOT_RUN_DETAIL.format(project=p, error=BUDGET_EXHAUSTED_DETAIL.format(project=p)) for p in unrun_projects]
+            )
             if not blocked and not ready and not unknown:
                 detail = failure_text or READS_FAILED_DETAIL
                 ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
@@ -835,14 +976,15 @@ def tick(dry_run: bool = False) -> list[str]:
     for version in retired:
         announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
     ledger[LAST_TICK_KEY] = iso(now)
+    # The marker goes before the ledger is saved: a marker that cannot be
+    # removed must not cost the lines a saved ledger has already recorded.
+    recovered = clear_failure_marker(home)
     try:
         save_ledger(ledger_path, ledger)
     except OSError as exc:
         raise WriteFailed(str(exc)) from exc
-    marker = home / FAILURE_MARKER_FILE_NAME
-    if marker.exists():
+    if recovered:
         lines.insert(0, RECOVERED_LINE.format(prefix=LINE_PREFIX))
-        marker.unlink()
     return lines
 
 
@@ -873,7 +1015,9 @@ def main(argv: list[str] | None = None) -> int:
         return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
         detail = f"{type(exc).__name__}: {exc}"
-        if announce_failure_once(detail):
+        # A dry run changes nothing, the marker included, and is never silenced
+        # by it: the operator running one is looking at the failure.
+        if args.dry_run or announce_failure_once(detail):
             print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
         return 0
     for line in lines:
