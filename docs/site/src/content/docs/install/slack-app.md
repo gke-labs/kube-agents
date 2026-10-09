@@ -10,13 +10,7 @@ kube-agents talks to Slack through one Slack app that you create in your workspa
 
 The two need different app settings, so follow the section for your mode. The tokens and the allowlist work the same way in both.
 
-`spec.mode` is an unsupported development setting, and the installer and the Helm chart leave it at `today` ([`spec.mode`](/kube-agents/operator/platformagent-crd/) in the CRD reference). To run the `next` path, install as usual, then set it on the `PlatformAgent` resource:
-
-```bash
-kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p '{"spec":{"mode":"next"}}'
-```
-
-A later install or upgrade leaves the patched value alone.
+To install with the `next` path, pass `--mode=next` to the installer (`./install.sh --mode=next`, with the Slack flags below). `next` is an unsupported development stack; `today` is the default. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer.
 
 ## Before you start
 
