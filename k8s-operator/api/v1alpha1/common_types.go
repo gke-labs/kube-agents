@@ -603,7 +603,16 @@ type TuningSpec struct {
 	// every worker it spawns — platform and cluster alike — draws on the same model
 	// quota. Setting it to 1 serialises all delegated work.
 	//
-	// Unset means 2, the operator's default — not Hermes' own behaviour, which does not
+	// One slot is guaranteed to each class of card. At 2 or more, background work (event
+	// triage and cron report relays) may hold every slot but one, so a question asked in
+	// chat starts at once even while triage runs, and user cards may hold every slot but
+	// one, so a door's fan-out cannot silence alerts. The slots between go to whoever is
+	// first, user cards sorting first; at 2 each class gets one. At 1 nothing is held: a
+	// user card still goes ahead of waiting triage but waits for the running card. When
+	// every slot is busy the gateway logs "kanban dispatcher saturated", and a user card
+	// left waiting is told in its thread that it is queued.
+	//
+	// Unset means 6, the operator's default — not Hermes' own behaviour, which does not
 	// cap concurrency at all. The default exists because a worker is a full agent process
 	// holding a few hundred MiB for the length of the task: unbounded dispatch lets a
 	// burst of queued cards spawn workers until the cgroup OOM killer takes them, and
@@ -623,12 +632,27 @@ type TuningSpec struct {
 	// counters that would settle it — so raising resources is not a guaranteed fix;
 	// measure it.
 	//
+	// The arithmetic behind 6: a worker measured about 430 MiB, so six are about 2.6 GiB
+	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
+	// coordinator waiting on its own children gives its slot back but stays resident, so
+	// processes can sit above six. The credential proxy at its default 2Gi memory limit
+	// admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
+	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
+	// worker logs show them.
+	//
 	// Set it higher once a deployment has measured its own worker footprint and model
-	// quota — a fleet with headroom is throttled by 2. Set it to 1 to serialise all
-	// delegated work. When quota rather than memory binds, note the related failure mode:
-	// workers that exhaust their retry budget exit without calling a terminal kanban
-	// tool, and the dispatcher reports that as a "protocol violation" rather than as the
-	// quota exhaustion it actually is.
+	// quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
+	// already admits more than its slot cap of 8, so up to about eight workers' worth of
+	// commands fit at the defaults, fewer while the listings above run. Past that the
+	// slot cap binds, and no CR field moves it, so raising the memory limit in
+	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
+	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
+	// more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
+	// reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
+	// memory binds, note the related failure mode: workers that exhaust their retry
+	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
+	// as a "protocol violation" rather than as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`

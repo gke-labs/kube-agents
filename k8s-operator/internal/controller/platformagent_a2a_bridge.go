@@ -121,6 +121,15 @@ const (
 	a2aBridgeNATSURLEnvVar      = "NATS_URL"
 	a2aBridgeNATSUserEnvVar     = "NATS_USER"
 	a2aBridgeNATSPasswordEnvVar = "NATS_PASSWORD"
+
+	// a2aBusyNoticeAtEnvVar is the gateway's busy-notice threshold: how many
+	// fixed-route tasks have to be ahead of a new turn before the gateway
+	// says the system is busy (Config.BusyNoticeAt in a2a/gateway). Read from
+	// the CONTROLLER's environment and rendered onto the gateway under the
+	// same name, the override shape A2A_STRICT_EVENTS_WRITER has, since no CR
+	// field carries it. Unset, or not a count of at least one, the render
+	// uses the bridge's worker count (a2aBusyNoticeAt says why).
+	a2aBusyNoticeAtEnvVar = "A2A_BUSY_NOTICE_AT"
 )
 
 // a2aBridgeDeclared reports whether the CR declares its own bridge sidecar:
@@ -222,6 +231,24 @@ func a2aRenderedBridgeConcurrency() string {
 		return v
 	}
 	return strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
+}
+
+// a2aBusyNoticeAt is the gateway's A2A_BUSY_NOTICE_AT: the operator's own
+// A2A_BUSY_NOTICE_AT when it is a count of at least one, else the bridge's
+// worker count for this CR (a2aBridgeConcurrency, the number the TASKS budget
+// reads: the rendered bridge's, 10 by default, or a declared sidecar's). The
+// fixed addressee's executor runs that many tasks at once, so a turn with
+// that many ahead of it is the first one that waits, and that is when the
+// notice says so. A value that is not a count falls back rather than passing
+// through: the gateway refuses one at boot, and a typo in an informational
+// knob must not crash-loop the gateway.
+func a2aBusyNoticeAt(agent *agentv1alpha1.PlatformAgent) string {
+	if v := os.Getenv(a2aBusyNoticeAtEnvVar); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return strconv.Itoa(n)
+		}
+	}
+	return strconv.Itoa(a2aBridgeConcurrency(agent))
 }
 
 // a2aBridgeSidecars is every sidecar the bridge readers consider: the CR's

@@ -91,7 +91,8 @@ HELPER = f'''
 def {FLAG_HELPER}() -> bool:
     import os as _os
 
-    return _os.environ.get({FLAG_ENV!r}, "").strip().lower() in {FLAG_ON_VALUES!r}
+    value = _os.environ.get({FLAG_ENV!r})
+    return value is None or value.strip().lower() in {FLAG_ON_VALUES!r}
 '''
 
 AGENT_DESCRIPTION_ANCHOR = '''\

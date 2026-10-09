@@ -159,36 +159,87 @@ Two routes exist, and the terms recur below: a conversation is **fixed-routed** 
 its tasks address the standing executor configured at deploy time (the platform front
 door), and **session-routed** when they address the conversation's own spawned worker.
 The two differ on steers: a session worker absorbs them at its next turn boundary,
-while the standing front door refuses them with an honest status reply - the refusal
-posture the payload spec's steering rule records.
+while the standing front door queues them and answers each as a further turn after the
+current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher's width bias inverts per executor, and the inversion is the
-contract, not a tuning detail. Beyond the exact phrase set there is a wide
-interrogative rule (status-shaped words in an interrogative frame), and it applies only
-where the executor refuses steers - the fixed-route front door - because there a stolen
-false positive costs nothing. Where the executor absorbs steers, a session worker, only
-the exact phrases match: a stolen steer there is a dropped correction, and a
-status-shaped steer is a question the worker can answer itself. Anything no interceptor
-claims during a `working` task is a steer, per the 8/24 decision above.
+The status matcher is the exact phrase set on every route. A wider
+interrogative rule applied while the fixed-route front door refused steers, where a
+stolen false positive cost nothing; the front door now queues steers and answers them,
+so a stolen one is a lost correction there too, and a status-shaped steer is a question
+the agent can answer itself. Anything no interceptor claims during a `working` task is
+a steer, per the 8/24 decision above.
 
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
 edits), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
-below), and failure notices (a submission or steer that never reached the bus). All
+below), the notice the reap scan posts once when that grace passes with no turn to
+carry the release line, and failure notices (a submission or steer that never reached the bus). All
 are deterministic templates over facts the
 gateway itself owns - its own publishes, its own registry, stream replay - which is
 what keeps them inside the no-model rule. They also say only what the gateway knows:
 the steer acknowledgement reports that the steer is on the stream, and what it says
-next is conditioned on the route the same way the width bias above is, because the
-gateway knows the route and the two executors do different things: on a
+next is conditioned on the route, because the gateway knows the route and the two
+executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
-if the task is still running; on a fixed-routed one, that the standing executor does
-not take mid-task input and the reply will say so. Neither claims the steer was
-absorbed, which the gateway cannot know. The payload spec's refusal posture - both
-the fixed-route refusal and the race-window one - is what closes the loop on the
-stream.
+if the task is still running; on a fixed-routed one, "got it, I'll take that next".
+A task with nothing on its stream
+yet gets neither, on either route: both assume an executor holds the task, and none
+has shown it does (a session pod may still be starting, or nothing took the task), so
+the line promises no reply and, when the task has a submission time to measure from,
+says when the conversation frees up. The executor's notice on the stream corrects it when the follow-up was not taken
+(the task's follow-up limit reached, which the platform executor counts per task, the
+task already ending, or an executor that cannot continue a session: the platform executor
+runs follow-ups on its `api` executor only, and its `cli` executor refuses each one
+`no-resume` as it arrives), and the gateway posts that refusal at once. At the task's
+terminal the gateway says, with a count, which follow-ups the executor never answered or never
+ran. The never-answered line posts only once the gateway has heard a steer notice from that
+addressee since it started: an executor that predates the notices answers none, and every
+follow-up would read as missed. Those counts are the relay's cache. A gateway restart in
+between forgets the follow-ups it sent and the notices before it, so that terminal never
+posts the never-answered line, and its not-run line counts only the notices that arrived
+after the restart. Each earlier turn's answer posts as it completes; the result is the
+last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
+child is checked against the target's list first (rule `delegation.child-steer`);
+refused, it is not published, its author is not recorded, and the room is told the
+target is not reachable from here.
+
+**The busy notice.** The gateway tells a person when their turn is going to wait, on the
+turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the
+fixed addressee's other outstanding work: the session-state records whose active task was
+published to it, the turn's own task left out. The count is a read of the bucket (one KV
+watch over the session records), not an in-memory counter, so it is the same after a
+gateway restart as before it, and it falls as terminals arrive, because a terminal deletes
+the active task from its record. A terminal published while the gateway was down still
+lowers it: the relay's durable delivers the terminal once the gateway is back. Past the
+first-event grace a task is read from the stream and left out if nothing is on it, by the
+same test the never-started release below uses, or if its newest event is a terminal (a
+record whose clear was lost, which the heal would release on that conversation's next
+turn), so neither holds the number up. A detached task is counted while it is still its
+record's active task; a new turn in that conversation replaces it. At or above
+`A2A_BUSY_NOTICE_AT` the gateway edits the turn's "⏳ submitted…" placeholder, the message
+the relay's rolling-line edits target, to a queued state: "⏳ **queued** — 3 requests are
+ahead of yours; I'll start on it as soon as there's room" ("1 request is" for one). It posts
+nothing of its own. The relay's first edit past submitted (working, or the terminal)
+replaces the queued text as it would the placeholder, so the notice is never left under a
+"completed" header, where a separate post read as the output of some earlier command; the
+executor's own submitted event (the bridge publishes one on accept, before it has a worker)
+does not replace it. The line never moves backwards: the edit is made only while the task's
+line is still in its submitted state, and is skipped otherwise. It is made under the
+conversation's session lock, the same lock every relay batch renders under, which on the
+inbox path keeps the relay out from the placeholder post to the edit, so there the line is
+always still submitted; the check is for any path that loses that ordering. A turn whose placeholder post failed has no line to edit and gets the
+notice as a post. Nothing is refused, held back, or dropped; the notice is information, and
+a count that fails sends none. The operator renders the threshold as the bridge's worker
+count, 10 by default, so the turn told it waits is the first one that finds every worker
+taken; the operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend
+(Google Chat, Slack and Discord all edit the line in place) and the console. The inject and
+A2A doors get none, because their callers read the status line as data: the A2A door takes
+the line's first edit as the task going to `working`, so a queued edit would report a task
+no worker has as running, and the inject door hands every edit to the eval harness. The
+fallback post would be worse again, since both read every unedited post of a task as its
+output.
 
 ## The Delegate flow (added 8/31)
 
@@ -326,10 +377,11 @@ gateway while that child still runs is refused with a notice naming the running 
 (`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
 not. Every refusal names the target only, held until the delegating turn's own answer has posted
 so the room reads "delegated to platform" first and the refusal after it; the audit line carries
-the rule, the backend, and the hashed subject that failed it. A known gap: a person off every list
-above can still steer the running child directly, on `platform`'s own terms - that steer is
-outside this rule, which exists to keep an off-list steer from shaping a later delegation through
-the wake, not to gate `platform` itself.
+the rule, the backend, and the hashed subject that failed it. A steer into the running child is
+checked the same way before it is recorded or published (`delegation.child-steer`, or
+`delegation.door-unlisted` for a door the target does not list): the child runs on `platform`'s
+executor, which acts on a steer as a further turn (on its `api` executor), so an author the target's list refuses is
+refused here, with the same target-only notice and an audit line, and nothing reaches the child.
 
 **The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
 parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
@@ -359,7 +411,10 @@ two do not nest. When the session delegates, its turn completes with a reply tha
 thread as it does for any task, and the child's terminal wakes the session for one more turn
 with the child's result as its input, so the session can synthesize or follow up. A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
-today (the platform executor refuses steers on the fixed route today, and says so). A session pod
+today: the platform executor queues each one and answers it after the current turn (on its
+`api` executor; the `cli` executor refuses it `no-resume`), and
+the gateway checks the steer's author against the target's list first, as it checked the
+delegation's. A session pod
 is therefore busy for seconds per turn, not for the life of the work it delegated, which is also
 what keeps the per-conversation pod cost small. The delegating turn's answer is decided at the
 call, so an eviction that lands before its harness has exited (a fast child's wake retires the
@@ -382,7 +437,12 @@ message, carried down a longer chain, never an intermediate wake's gateway-autho
 result, capped at `lib.DelegateTextCap` and fenced under the label
 `Result from platform (not from the user):`, so the model reads the child's output as data, never
 as a new instruction from the user; a backtick run in either fenced body that could close its fence
-early is broken before fencing. The request is stored on the turn's history entry capped at 1 KiB
+early is broken before fencing. A child that ran follow-up turns wakes with every turn's answer in
+order, the first being the delegated request's, then the result, each follow-up's answer under
+`(follow-up N answer)`; one that answered turns and then failed or was rejected wakes with those
+answers, then its reason under `(then it failed)` (or `was rejected`). Over the cap the earlier
+answers are cut first, so the newest answer or the reason arrives whole unless it alone is over
+the cap. The request is stored on the turn's history entry capped at 1 KiB
 (each of up to fifty entries carries one, and 16 KiB each would put a full record near the KV's
 message ceiling). It is user content at rest under the same posture as the active task's ask copy,
 cleared with the requester copy at `A2A_ASK_TTL`. An entry with none, written before the field,
@@ -527,7 +587,16 @@ and assertion 9 exists because a task whose only event is its supervisor's termi
 empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
-named here rather than papered over. Otherwise the terminal event this chain
+named here rather than papered over. A human who waits rather than writes is told too: the reap scan
+posts one line once the grace has passed with nothing on the stream, naming the task and
+saying the next message starts a new task. It marks the active-task record before it
+posts, so the line goes out at most once per task, across gateway restarts, and it
+releases nothing; the release stays with the next turn, which reads the stream again
+first. The line is for a placeholder somebody may still be watching, so it has a ceiling:
+a task older than three graces (30 minutes by default) gets none, and neither does a
+record the same reap pass deletes past `A2A_SESSION_TTL`. Without the ceiling the first
+pass after a rollout, or after an outage longer than the grace, would post into every
+conversation that wedged in the last week. Otherwise the terminal event this chain
 guarantees is what deletes the active-task record (and the `ask` copy riding it). A
 detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
