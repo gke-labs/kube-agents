@@ -2244,6 +2244,27 @@ class KubeAgentsHarness(AgentHarness):
             # task's terminal has already released the conversation. Each
             # turn gets its own message id, or the door's dedupe would answer
             # the second turn with the first turn's task.
+            #
+            # Under the bridge's api executor, though, the turn ran in the
+            # Hermes session named after the conversation's contextId, which
+            # the read route reports. That session's store holds the
+            # ``kanban_create`` results the door cannot carry, so the cards
+            # are found there and waited on off the board, with no status
+            # turn (#2619). A door too old to report the contextId, or an
+            # install whose turns do not run in that session (the cli
+            # executor), falls through to the wait below.
+            context_id = exchange.probe.context_id if exchange.probe else ""
+            if context_id:
+                try:
+                    if self._await_delegated_cards(
+                        result,
+                        board.api_session_id(context_id),
+                        delegation_timeout=delegation_timeout,
+                        poll_interval=poll_interval,
+                    ):
+                        return result
+                except _DelegationTransportExhausted as exc:
+                    return _infra_failure(str(exc))
             turns = 0
 
             def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
@@ -2296,6 +2317,107 @@ class KubeAgentsHarness(AgentHarness):
             except _DelegationTransportExhausted as exc:
                 return _infra_failure(str(exc))
         return result
+
+    def _await_delegated_cards(
+        self,
+        result: AgentResult,
+        session_id: str,
+        *,
+        delegation_timeout: float,
+        poll_interval: float,
+    ) -> bool:
+        """Wait off the board for the cards ``session_id`` filed; ``False`` if it filed none.
+
+        The inject transport's wait under the bridge's api executor. The
+        delegating turn's ``kanban_create`` results are in the session's own
+        store rather than in the trajectory, and a status turn cannot carry a
+        card's result back through the door either, so both the ids and the
+        results come from the pod (:func:`board.read_session_cards`, one
+        ``kubectl exec`` per poll and no model turn). Each awaited card the
+        board shows is handed to :meth:`_settle` shaped as the ``kanban_show``
+        result an agent would have read back, so the delivered results, the
+        graded ``final_message`` and everything after are what the other
+        waits produce. Like those waits it follows the cards the front agent
+        filed, not their workers' children (:mod:`worker_trajectory` reads
+        those). A card the session files later joins the wait.
+
+        Returns ``False``, having touched nothing, when the first read fails
+        or the store has no card for the session -- an install whose turns
+        do not run there, or a turn that did not delegate -- and the caller
+        waits the way it always has. A board read that fails mid-wait is
+        retried up to :data:`_MAX_TRANSPORT_FAILURES` times running, after
+        which the run is infrastructure, as a status turn's transport
+        failures are.
+
+        Raises:
+            _DelegationTransportExhausted: The board could not be read
+                :data:`_MAX_TRANSPORT_FAILURES` times running.
+        """
+        read = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+        if read is None or not read.session_found or not read.card_ids:
+            if read is None:
+                why = "could not be read"
+                # The fallback grades the acknowledgement; say why on the record.
+                result.metadata["delegated_cards_source"] = f"unreadable ({session_id})"
+            elif not read.session_found:
+                why = "is not in the store"
+            else:
+                why = "filed no card"
+            _log.info("session %s %s; waiting on the trajectory's cards instead", session_id, why)
+            return False
+        result.metadata["delegated_cards_source"] = f"{read.source} ({session_id})"
+        awaited = self._capped(read.card_ids, result)
+        capped = len(read.card_ids) > _MAX_AWAITED_TASKS
+        deadline = time.monotonic() + delegation_timeout
+        failures = 0
+        timed_out = False
+
+        def _status(task_id: str) -> str:
+            return str(read.cards.get(task_id, {}).get("status") or "unknown")
+
+        outstanding = [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+        while outstanding:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
+            time.sleep(max(0.0, min(poll_interval, remaining)))
+            fresh = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+            if fresh is None:
+                failures += 1
+                _log.warning("board read failed (%d/%d)", failures, _MAX_TRANSPORT_FAILURES)
+                if failures >= _MAX_TRANSPORT_FAILURES:
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"the kanban board could not be read {failures} times running; "
+                        "still waiting on: " + ", ".join(outstanding)
+                    )
+                continue
+            failures = 0
+            read = fresh
+            merged = list(dict.fromkeys(awaited + read.card_ids))
+            awaited = self._capped(merged, None if capped else result)
+            capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            outstanding = [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+
+        observed: list[dict[str, Any]] = list(result.trajectory)
+        observed.extend(e for t in awaited if (e := read.as_shown(t)) is not None)
+        result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
+        if outstanding and timed_out:
+            report = (
+                "delegated tasks did not finish within "
+                f"{delegation_timeout:.0f}s: "
+                + ", ".join(f"{t} ({_status(t)})" for t in outstanding)
+            )
+            # The other wait's rule: with nothing delivered the record holds
+            # the acknowledgement alone, and the marker routes it to its own
+            # class in the scorer.
+            if not delivered_results(observed, awaited):
+                report = f"{DELEGATION_CEILING_MARKER}: {report}"
+            result.errors.append(report)
+        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
+        return True
 
     def _await_delegated_work(
         self,

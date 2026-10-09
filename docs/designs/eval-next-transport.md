@@ -455,11 +455,12 @@ the request asks for one or for a change to be submitted or fixed; the unattende
 `fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
 comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
-transport reaches. Three differences from the api lane remain, and all three are the transport's
-rather than the agent's. The delegation wait finds no card ids on this path (Completion signals), so a
-case whose answer is a delegated worker's report is graded on the Planning Agent's own reply,
-which may be the card receipt. And a router-scope `tool_called` reads the Planning Agent's calls
-through the door's trace, which carries no worker's calls. And the GitHub-write safeguard dates a
+transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
+session store rather than from the trajectory (Completion signals), so a case whose answer is a
+delegated worker's report is graded on that report, as on the api lane. Two differences from the
+api lane remain, and both are the transport's rather than the agent's. A router-scope
+`tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
+calls. And the GitHub-write safeguard dates a
 write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
 time; a worker that opens its pull request after the task's terminal can land that write in the
 next unit's window, which charges the next unit for it
@@ -579,23 +580,32 @@ ended and the card was filed, not that the work is done.
 
 Stage 1 handles that in three parts. The transport awaits the terminal of a named task id,
 "await the terminal of task X" rather than "await the task I submitted", for everything the
-executor does itself, which is most cases and removes the store reads and the collecting turn. For a terminal whose result
-names card ids, the case runner waits for the cards one hop further in, with the time cost above
+executor does itself, which is most cases and removes the store reads and the collecting turn. For a turn that
+filed cards, the case runner waits for the cards one hop further in, with the time cost above
 moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
 the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
 turns that report nothing, and
 on this path the trajectory holds no tool results (the door's trace carries calls without their
-results), so no card id can be read from it. Stage 1
-writes the wait again for the inject path: card ids and statuses read from the `result` text, the
-status question sent as a new turn on the same conversation key with its own backend message
-id, `<run>/<case>/<rep>/status-<n>`, so the dedupe does not answer it with the opening task,
-the delivered card results appended to the graded answer as
-today's wait appends them, so `ledger_issue_contains` and `report_contains` see what the worker
-returned, and the worker logs read by those ids for `worker_commands`. It
+results), so no card id can be read from it. The reply text does not carry one either: the
+Planning Agent's acknowledgement names no task id (`agents/chat/SOUL.md`). Stage 1 writes the wait
+again for the inject path and reads the cards from the pod
+([#2619](https://github.com/gke-labs/kube-agents/issues/2619)). The door's read route reports the
+conversation's A2A `contextId`, and under the bridge's `api` executor the turn ran in the Hermes
+session `a2a-<contextId>` (`apiSessionID` in `a2a/hermes-bridge/api.go`). The case runner reads
+that session's `kanban_create` tool results from the platform agent's `state.db`, or, when the
+store kept none, the `kanban_notify_subs` rows addressed to the session, through the same
+`kubectl exec` the board read uses. It polls `kanban.db` until every card is terminal or the
+delegation timeout passes, then reads `tasks.result` and the newest `task_runs.summary` off the
+board. No status turn is sent, because none could carry a result back through the door. Each card
+reaches the settle step shaped as a `kanban_show` result, so the delivered card results are
+appended to the graded answer as today's wait appends them, `ledger_issue_contains` and
+`report_contains` see what the worker returned, and the worker logs are read by those ids for
+`worker_commands`. A door that reports no `contextId`, or a session the store does not hold (the
+`cli` executor), falls back to the status-turn wait, which sends the status question as a new turn
+on the same conversation key with its own backend message id, `<run>/<case>/<rep>/status-<n>`. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
-transport. Reading card ids out of `result` text is interim: a structured artifact for them is
-a bridge change outside this document, and the text read is the first thing child tasks delete.
+transport, and it is the first thing child tasks delete.
 When child tasks exist, the parent's events name the child's task id, the same await code awaits
 it, and the wait goes.
 
