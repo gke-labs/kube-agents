@@ -485,7 +485,7 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
 
     busy = audits_in_flight(runs, now)
     if busy:
-        # One of the four has a run going, whatever started it, including the run a mark found
+        # One of the chain's audits has a run going, whatever started it, including the run a mark found
         # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)
