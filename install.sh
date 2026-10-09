@@ -5176,10 +5176,6 @@ run_menu_system() {
         ;;
       6)
         print_step "Saving & Re-applying Configuration State"
-        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
-        # from install.env, and under next an email in the Slack allowlist
-        # matches nobody.
-        refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "${SLACK_ALLOWED_USERS:-}" || return 1
         resolve_effective_image_tag image_tag "$repo_dir" "$image_tag" || return 1
         validate_immutable_ref "$image_tag" || return 1
         verify_local_source_ref "$repo_dir" "$image_tag"
@@ -5187,6 +5183,11 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
+        # from install.env, and if Slack moves to the A2A gateway under next,
+        # the settings it cannot use are refused (and again after the
+        # generator, for a bot token it recovers from the live Secret).
+        refuse_next_slack_gateway_settings_from_env || return 1
 
         # Into install.env, one key at a time, leaving the operator's comments
         # and ordering alone. This panel is the one place allowed to write
@@ -5243,6 +5244,7 @@ run_menu_system() {
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        refuse_next_slack_gateway_settings_from_env || return 1
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -5893,10 +5895,13 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
-  # The Slack allowlist is settled here, flag, install.env or answer, and an
-  # email in it matches nobody once the A2A gateway holds Slack under next.
-  # Refused now, before the generator, install.env or any apply.
-  refuse_next_slack_allowlist_emails "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$slack_allowed_users" "install.env or --slack-allowed-users" || exit 1
+  # The Slack settings are settled here, whether from a flag, install.env or
+  # an answer. If Slack moves to the A2A gateway under next, the settings it
+  # cannot use (an email in the allowlist, a home channel that is not a
+  # channel id, a list of bot tokens) are refused now, before the generator,
+  # install.env or any apply. A token the generator recovers from the live
+  # Secret is checked after it.
+  refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
@@ -6733,6 +6738,10 @@ main() {
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
   require_slack_tokens_after_recovery
+  # Again on the exported keys, for a bot token the generator recovered from
+  # the live Secret (refuse_next_slack_gateway_settings). Still before
+  # install.env and the apply.
+  refuse_next_slack_gateway_settings_from_env flags || exit 1
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a

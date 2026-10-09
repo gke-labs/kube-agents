@@ -4669,24 +4669,34 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertNotIn("ERROR", proc.stdout)
 
 
-class NextSlackAllowlistRefusalTest(unittest.TestCase):
-    """refuse_next_slack_allowlist_emails (#2812): under spec.mode next the A2A
-    gateway matches SLACK_ALLOWED_USERS against Slack member IDs exactly, so an
-    email entry (the 0.7/0.8 prompt asked for "User IDs / Emails") matches
-    nobody and locks that user out. The front doors call this before they
-    change anything; a today install, or next without Slack, is unaffected."""
+class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
+    """refuse_next_slack_gateway_settings (#2812). Under spec.mode next with
+    Slack on and Google Chat off, the A2A gateway takes Slack
+    (a2aSlackArmed in k8s-operator), and three settings that the today path
+    accepts break it:
+
+    - an email in SLACK_ALLOWED_USERS matches nobody, because the list is
+      matched against member IDs exactly;
+    - a SLACK_HOME_CHANNEL that is not a channel id leaves the notify route
+      unarmed;
+    - a comma-separated SLACK_BOT_TOKEN list makes the Slack backend fail
+      at connect.
+
+    With Chat on too, Chat holds the gateway and Slack stays on the today
+    path, so nothing is refused."""
 
     _DOC = "https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+    _TOKEN = "xoxb-1-secretpart"
 
-    def _run(self, mode, enabled, allowlist, where=None, cwd=None):
-        args = " ".join(shlex.quote(a) for a in (mode, enabled, allowlist) + ((where,) if where else ()))
+    def _run(self, mode="next", slack="true", chat="false", allowlist="", home="", token="", flags=False, cwd=None):
+        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, allowlist, home, token) + (("flags",) if flags else ()))
         script = (
             'print_info() { echo "INFO: $*"; }\n'
             'print_success() { :; }\n'
             'print_warning() { echo "WARN: $*"; }\n'
             'print_error() { echo "ERROR: $*"; }\n'
             f'source "{_INSTALLER_COMMON}"\n'
-            f'rc=0; refuse_next_slack_allowlist_emails {args} || rc=$?; echo "rc=$rc"\n'
+            f'rc=0; refuse_next_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
             'case "$-" in *f*) echo "noglob-left-on" ;; esac\n'
         )
         return subprocess.run(
@@ -4694,8 +4704,14 @@ class NextSlackAllowlistRefusalTest(unittest.TestCase):
             env=get_isolated_test_env(), cwd=str(cwd or _REPO_ROOT),
         )
 
-    def test_next_with_slack_refuses_an_email_and_names_it(self):
-        proc = self._run("next", "true", "U0123ABCD,alice@example.com")
+    def _passes(self, **kw):
+        proc = self._run(**kw)
+        self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
+
+    # ── the allowlist ──
+
+    def test_an_email_is_refused_and_named(self):
+        proc = self._run(allowlist="U0123ABCD,alice@example.com")
         out = proc.stdout + proc.stderr
         self.assertIn("rc=1", proc.stdout, out)
         self.assertIn(
@@ -4711,44 +4727,106 @@ class NextSlackAllowlistRefusalTest(unittest.TestCase):
             f"Slack app setup for next: {self._DOC}",
             out,
         )
-        self.assertNotIn("U0123ABCD,", out)
 
     def test_every_email_entry_is_named_after_the_allowlists_own_splitting(self):
-        # Commas and whitespace both separate, empty items drop, as
+        # Commas and whitespace both separate, and empty items drop, the way
         # hcl_csv_list renders the list into the tfvars.
-        proc = self._run("next", "True", " U1 ,alice@example.com  bob@example.com,,\tW2 ")
+        proc = self._run(slack="True", allowlist=" U1 ,alice@example.com  bob@example.com,,\tW2 ")
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("look like emails: alice@example.com, bob@example.com. ", proc.stdout)
 
-    def test_the_remedy_names_the_callers_source(self):
-        proc = self._run("next", "true", "alice@example.com", where="install.env or --slack-allowed-users")
+    def test_install_sh_names_the_flags_too(self):
+        proc = self._run(allowlist="alice@example.com", home="D0DM", token="a,b", flags=True)
         self.assertIn("rc=1", proc.stdout, proc.stderr)
-        self.assertIn("Replace the emails with those IDs in install.env or --slack-allowed-users and run again.", proc.stdout)
+        self.assertIn("in install.env or --slack-allowed-users and run again", proc.stdout)
+        self.assertIn("in install.env or --slack-home-channel and run again", proc.stdout)
+        self.assertIn("in install.env or --slack-bot-token and run again", proc.stdout)
 
     def test_member_ids_pass(self):
         for allowlist in ("U0123ABCD", "U0123ABCD, W0456EFGH", "U1 W2", ""):
             with self.subTest(allowlist=allowlist):
-                proc = self._run("next", "true", allowlist)
-                self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
-
-    def test_today_keeps_an_email(self):
-        for mode in ("today", ""):
-            with self.subTest(mode=mode):
-                proc = self._run(mode, "true", "alice@example.com")
-                self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
-
-    def test_next_without_slack_keeps_an_email(self):
-        for enabled in ("false", "", "no"):
-            with self.subTest(enabled=enabled):
-                proc = self._run("next", enabled, "alice@example.com")
-                self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
+                self._passes(allowlist=allowlist)
 
     def test_an_entry_is_never_expanded_against_the_working_directory(self):
         with tempfile.TemporaryDirectory() as cwd:
             (pathlib.Path(cwd) / "x@example.com").write_text("")
-            proc = self._run("next", "true", "*@example.com", cwd=cwd)
+            proc = self._run(allowlist="*@example.com", cwd=cwd)
         self.assertIn("look like emails: *@example.com. ", proc.stdout, proc.stderr)
         self.assertNotIn("noglob-left-on", proc.stdout)
+
+    # ── the home channel ──
+
+    def test_a_home_channel_that_is_not_a_channel_id_is_refused_and_named(self):
+        for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C", "C0HOME/1.2"):
+            with self.subTest(home=home):
+                proc = self._run(home=home)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(
+                    f"ERROR: SLACK_HOME_CHANNEL is '{home}', which is not a Slack channel id (C... or G...). "
+                    "Under spec.mode next the A2A gateway does not arm its notify route with it, so the "
+                    "agent's proactive posts and every board card's report back stop.",
+                    out,
+                )
+                self.assertIn(
+                    "INFO: Use the channel's id: in Slack, open the channel's details; the id is at the "
+                    "bottom of the About tab. Set it in install.env and run again.",
+                    out,
+                )
+
+    def test_a_channel_id_or_no_home_channel_passes(self):
+        for home in ("C0123ABCD", "G0123ABCD", " C0123ABCD ", "C01", ""):
+            with self.subTest(home=home):
+                self._passes(home=home)
+
+    # ── the bot token ──
+
+    def test_a_list_of_bot_tokens_is_refused_by_count_never_by_value(self):
+        for token, count in (("xoxb-1-secretpart,xoxb-2-secretpart", 2), ("xoxb-1-secretpart, xoxb-2-secretpart,xoxb-3-secretpart", 3)):
+            with self.subTest(count=count):
+                proc = self._run(token=token)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(
+                    f"ERROR: SLACK_BOT_TOKEN holds {count} tokens, a list for several workspaces. Under "
+                    "spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, "
+                    "and with a list it fails to connect and restarts without end.",
+                    out,
+                )
+                self.assertIn(
+                    "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env "
+                    "and run again, or keep this install on PLATFORM_AGENT_MODE=today.",
+                    out,
+                )
+                self.assertNotIn("secretpart", out)
+
+    def test_one_bot_token_or_none_passes(self):
+        for token in (self._TOKEN, f" {self._TOKEN} ", f"{self._TOKEN},", ""):
+            with self.subTest(token=token.replace("secretpart", "*")):
+                self._passes(token=token)
+
+    # ── the three together, and when none applies ──
+
+    def test_every_failing_setting_is_reported_in_one_run(self):
+        proc = self._run(allowlist="alice@example.com", home="D0DM", token="a,b")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        for said in ("look like emails: alice@example.com.", "SLACK_HOME_CHANNEL is 'D0DM'", "SLACK_BOT_TOKEN holds 2 tokens"):
+            self.assertIn(said, proc.stdout)
+
+    def test_nothing_is_refused_unless_slack_moves_to_the_gateway(self):
+        bad = dict(allowlist="alice@example.com", home="D0DM", token="xoxb-a,xoxb-b")
+        for gate in (
+            dict(mode="today"),
+            dict(mode=""),
+            dict(slack="false"),
+            dict(slack=""),
+            dict(slack="no"),
+            # Chat holds the gateway; Slack stays on the today path.
+            dict(chat="true"),
+            dict(chat="True"),
+        ):
+            with self.subTest(**gate):
+                self._passes(**{**bad, **gate})
 
 
 if __name__ == "__main__":

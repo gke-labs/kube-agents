@@ -3643,17 +3643,17 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertIn('kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts', common)
 
 
-class FullArmRefusesNextSlackAllowlistEmailsTest(unittest.TestCase):
-    """#2812 on upgrade.sh: the full arm applies PLATFORM_AGENT_MODE from
-    install.env, so a next install with Slack whose SLACK_ALLOWED_USERS holds
-    an email is refused there, beside refuse_full_apply_dropping_next and
-    before the arm's first write. The arm is run from the source with every
-    other guard and both writes stubbed, so "nothing applied" is observed."""
+class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
+    """#2812 on upgrade.sh. The full arm applies PLATFORM_AGENT_MODE from
+    install.env. With next, Slack on and Chat off, Slack moves to the A2A
+    gateway, so the arm refuses an email in SLACK_ALLOWED_USERS, a
+    SLACK_HOME_CHANNEL that is not a channel id, or a list of bot tokens.
+    The refusal sits beside refuse_full_apply_dropping_next and before the
+    arm's first write. The test runs the arm from the source with every
+    other guard and both writes stubbed, so it can observe that nothing was
+    applied."""
 
-    _CALL = (
-        'refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
-        '"${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${SLACK_ALLOWED_USERS:-}" || exit 1'
-    )
+    _CALL = "refuse_next_slack_gateway_settings_from_env || exit 1"
 
     def _arm(self):
         source = _UPGRADE_SH.read_text()
@@ -3686,17 +3686,24 @@ class FullArmRefusesNextSlackAllowlistEmailsTest(unittest.TestCase):
             env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
         )
 
-    def test_next_with_slack_and_an_email_is_refused_and_nothing_is_applied(self):
-        proc = self._run({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
-                          "SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"})
-        out = proc.stdout + proc.stderr
-        self.assertEqual(proc.returncode, 1, out)
-        self.assertNotIn("APPLIED", out)
-        self.assertIn("SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.", out)
-        self.assertIn("matches this allowlist against Slack member IDs exactly", out)
-        self.assertIn("Copy member ID", out)
-        self.assertIn("in install.env and run again", out)
-        self.assertIn("/kube-agents/install/slack-app/#allowed-users", out)
+    def test_next_with_slack_on_the_gateway_refuses_each_setting_and_applies_nothing(self):
+        base = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true"}
+        for extra, says in (
+            ({"SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"},
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ({"SLACK_HOME_CHANNEL": "D0123ABCD"},
+             "SLACK_HOME_CHANNEL is 'D0123ABCD', which is not a Slack channel id (C... or G...)."),
+            ({"SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"}, "SLACK_BOT_TOKEN holds 2 tokens"),
+        ):
+            with self.subTest(keys=list(extra)):
+                proc = self._run({**base, **extra})
+                out = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 1, out)
+                self.assertNotIn("APPLIED", out)
+                self.assertIn(says, out)
+                self.assertIn("in install.env and run again", out)
+                self.assertNotIn("--slack-", out)
+                self.assertNotIn("secretpart", out)
 
     def test_the_cases_the_refusal_leaves_alone_apply(self):
         for keys in (
@@ -3705,13 +3712,21 @@ class FullArmRefusesNextSlackAllowlistEmailsTest(unittest.TestCase):
             {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
+             "SLACK_HOME_CHANNEL": "C0123ABCD", "SLACK_BOT_TOKEN": "xoxb-1-secretpart"},
+            # Chat holds the gateway; Slack stays on the today path.
+            {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "true", "SLACK_ENABLED": "true",
+             "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
+             "SLACK_BOT_TOKEN": "xoxb-a,xoxb-b"},
         ):
-            with self.subTest(keys=keys):
+            with self.subTest(keys=sorted(keys.items())):
                 proc = self._run(keys)
                 out = proc.stdout + proc.stderr
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIn("APPLIED crds\nAPPLIED terraform", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
         arm = self._arm()
@@ -3719,6 +3734,8 @@ class FullArmRefusesNextSlackAllowlistEmailsTest(unittest.TestCase):
         call = arm.index(self._CALL)
         self.assertLess(arm.index('refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1'), call)
         self.assertLess(call, arm.index("declare -F announce_platform_agent_mode_for_apply"))
+        # Guarded: an older target's installer_common.sh lacks it.
+        self.assertIn("if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then\n        " + self._CALL, arm)
         self.assertLess(call, arm.index('UPGRADE_APPLY_STARTED="true"'))
 
 

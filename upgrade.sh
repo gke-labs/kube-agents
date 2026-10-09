@@ -2001,13 +2001,14 @@ main() {
       # refused, not dropped, as retag_values does on the other two arms. Ahead
       # of the notice below, which an older target's helpers cannot print.
       refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1
-      # Under next the A2A gateway matches SLACK_ALLOWED_USERS against Slack
-      # member IDs exactly, so an email there (the 0.7 and 0.8 prompt asked
-      # for "User IDs / Emails") would lock that person out once this apply
-      # renders next. Guarded: a target tree whose installer_common.sh
+      # If this apply moves Slack to the A2A gateway (next, Slack on, Chat
+      # off), the Slack settings the gateway cannot use are refused: an email
+      # in the allowlist, a home channel that is not a channel id, a list of
+      # bot tokens. The generator above has already recovered a token the
+      # live Secret holds. Guarded: a target tree whose installer_common.sh
       # predates the check does not define it.
-      if declare -F refuse_next_slack_allowlist_emails >/dev/null; then
-        refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${SLACK_ALLOWED_USERS:-}" || exit 1
+      if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
+        refuse_next_slack_gateway_settings_from_env || exit 1
       fi
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install

@@ -5802,21 +5802,26 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
-class NextSlackAllowlistRefusalWiringTest(unittest.TestCase):
-    """#2812 on install.sh: a run whose mode is next (--mode=next, or
-    PLATFORM_AGENT_MODE=next in install.env) with Slack on refuses an email in
-    the Slack allowlist once the chat interview has settled the list, before
-    the generator, install.env or any apply. The check itself is
-    refuse_next_slack_allowlist_emails (tests/test_installer_common.py)."""
+class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
+    """#2812 on install.sh. A run whose mode is next (--mode=next, or
+    PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
+    hands Slack to the A2A gateway. It refuses an email in the allowlist, a
+    home channel that is not a channel id, or a list of bot tokens.
+
+    The step-6 call refuses as soon as the chat interview has settled those
+    values, before the generator, install.env or any apply. A second call
+    after the generator catches a bot token recovered from the live Secret,
+    still before install.env and the apply. The menu's apply checks before
+    it saves and again after its generator. The check itself is
+    refuse_next_slack_gateway_settings (tests/test_installer_common.py)."""
 
     _CALL = (
-        'refuse_next_slack_allowlist_emails "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
-        '"$slack_enabled" "$slack_allowed_users" "install.env or --slack-allowed-users" || exit 1'
+        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        '"$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" '
+        'flags || exit 1'
     )
-    _MENU_CALL = (
-        'refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
-        '"$slack_enabled" "${SLACK_ALLOWED_USERS:-}" || return 1'
-    )
+    _ENV_CALL_MAIN = "  refuse_next_slack_gateway_settings_from_env flags || exit 1\n"
+    _ENV_CALL_MENU = "        refuse_next_slack_gateway_settings_from_env || return 1\n"
     _CHAT_STEP = '  print_step "6. Chat & Messaging Integrations Setup"\n'
 
     _env = staticmethod(PlatformAgentModeTest._env)
@@ -5855,50 +5860,70 @@ class NextSlackAllowlistRefusalWiringTest(unittest.TestCase):
         self.assertEqual(after, content, "the refusal rewrote install.env")
         return proc
 
-    def test_next_with_slack_and_an_email_is_refused_before_anything_is_written(self):
-        for flags, content in (
-            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,alice@example.com", ""),
-            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\"U0123ABCD, alice@example.com\"\n"),
+    def test_next_with_slack_on_the_gateway_refuses_each_setting_before_anything_is_written(self):
+        token = "xoxb-1-secretpart"
+        for flags, content, says in (
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,alice@example.com", "",
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\"U0123ABCD, alice@example.com\"\n",
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ("--mode=next --enable-slack --slack-home-channel=D0123ABCD", "",
+             "SLACK_HOME_CHANNEL is 'D0123ABCD', which is not a Slack channel id (C... or G...)."),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_HOME_CHANNEL=U0123ABCD\n",
+             "SLACK_HOME_CHANNEL is 'U0123ABCD', which is not a Slack channel id (C... or G...)."),
+            (f"--mode=next --enable-slack --slack-bot-token={token},{token}", "",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
+            ("", f"PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN={token},{token}\n",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
         ):
-            with self.subTest(flags=flags, content=content):
+            with self.subTest(flags=flags.replace("secretpart", "*"), content=content.replace("secretpart", "*")):
                 proc = self._step(flags, content)
                 out = proc.stdout + proc.stderr
                 self.assertNotIn("went on", proc.stdout, out)
                 self.assertEqual(proc.returncode, 1, out)
-                self.assertIn("SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.", out)
-                self.assertIn("matches this allowlist against Slack member IDs exactly", out)
-                self.assertIn("Copy member ID", out)
-                self.assertIn("in install.env or --slack-allowed-users and run again", out)
-                self.assertIn("/kube-agents/install/slack-app/#allowed-users", out)
+                self.assertIn(says, out)
+                self.assertIn("in install.env or --slack-", out)
+                self.assertNotIn("secretpart", out)
 
     def test_the_cases_the_refusal_leaves_alone_go_on(self):
         for flags, content in (
-            # next with member IDs.
-            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,W0456EFGH", ""),
-            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U0123ABCD\n"),
-            # today with an email: the today path is not changed here.
-            ("--enable-slack --slack-allowed-users=alice@example.com", ""),
-            ("", "PLATFORM_AGENT_MODE=today\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\n"),
-            # next without Slack: the list is inert.
+            # next with member IDs, a channel id and one token.
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,W0456EFGH --slack-home-channel=C0123ABCD", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U0123ABCD\nSLACK_HOME_CHANNEL=G0123ABCD\n"),
+            # today: this change leaves the today path as it was.
+            ("--enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
+            ("", "PLATFORM_AGENT_MODE=today\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
+            # next without Slack: the Slack keys are inert.
             ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\nSLACK_ALLOWED_USERS=alice@example.com\n"),
+            # next with Chat and Slack: Chat holds the gateway, so Slack stays
+            # on the today path.
+            ("--mode=next --enable-google-chat --enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nGOOGLE_CHAT_ENABLED=true\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
         ):
             with self.subTest(flags=flags, content=content):
                 proc = self._step(flags, content)
                 out = proc.stdout + proc.stderr
                 self.assertIn("went on", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
-    def test_main_refuses_after_the_interview_and_before_any_write(self):
+    def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
         text = _INSTALL_SH.read_text()
         main_start = text.index("\nmain() {")
         self.assertEqual(text.count(self._CALL), 1)
+        self.assertEqual(text.count(self._ENV_CALL_MAIN), 1)
         call = text.index(self._CALL, main_start)
-        # After the Slack prompts settle the list, so an interactive answer is
-        # checked too.
+        # After the Slack prompts settle the values, so an interactive answer
+        # is checked too.
         self.assertLess(text.index("      _prompt_slack_settings\n      ;;\n    4)", main_start), call)
+        self.assertLess(call, text.index('print_step "7. AI Model Provider Credentials"', main_start))
+        # The second call follows the generator's Secret recovery.
+        recovery = text.index("\n  require_slack_tokens_after_recovery\n", main_start)
+        env_call = text.index(self._ENV_CALL_MAIN, main_start)
+        self.assertLess(text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start), env_call)
+        self.assertLess(recovery, env_call)
         for later in (
-            'print_step "7. AI Model Provider Credentials"',
-            'write_tfvars_from_state "$tfvars_file" "$image_tag"',
             'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"',
             "\n  record_flags_into_install_env\n",
             "\n    record_flags_into_install_env\n",
@@ -5906,15 +5931,21 @@ class NextSlackAllowlistRefusalWiringTest(unittest.TestCase):
         ):
             with self.subTest(later=later):
                 self.assertLess(call, text.index(later, main_start))
+                self.assertLess(env_call, text.index(later, main_start))
 
-    def test_the_menu_apply_refuses_before_it_saves(self):
+    def test_the_menu_apply_refuses_before_it_saves_and_after_its_generator(self):
         text = _INSTALL_SH.read_text()
         arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
-        self.assertEqual(text.count(self._MENU_CALL), 1)
-        call = text.index(self._MENU_CALL)
-        self.assertLess(arm, call)
-        self.assertLess(call, text.index("save_env_var PROJECT_ID", arm))
-        self.assertLess(call, text.index("run_lifecycle_apply", arm))
+        self.assertEqual(text.count(self._ENV_CALL_MENU), 2)
+        first = text.index(self._ENV_CALL_MENU, arm)
+        second = text.index(self._ENV_CALL_MENU, first + 1)
+        # After the export of the two toggles the menu edits, so the check
+        # reads them.
+        self.assertLess(text.index('export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"', arm), first)
+        self.assertLess(first, text.index("save_env_var PROJECT_ID", arm))
+        generator = text.index('write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"', arm)
+        self.assertLess(generator, second)
+        self.assertLess(second, text.index('run_lifecycle_apply "$repo_dir"', arm))
 
 
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
