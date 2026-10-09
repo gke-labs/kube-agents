@@ -232,7 +232,46 @@ def main() -> None:
         reply = log.read_text().splitlines() if log.exists() else []
         check(reply[:3] == ["notify", "--platform", "google_chat"] and reply[-1] == "the wake turn's reply",
               f"wake: the turn's reply went out through a2a notify ({reply})")
+    check_fold(Path(tmp))
     print("kanban_chat_notify: verified")
+
+
+
+def check_fold(tmp: Path) -> None:
+    """The fan-out fold against a real board: a child's answer is held while
+    its parent works (the real cursor rewind), and dropped once the parent has
+    answered. kanban_children_settled's table is created here, as its own
+    patch would."""
+    from hermes_cli import kanban_db, kanban_db_connect, kanban_db_notify
+    from gateway.kanban_chat_notify import WORKER_CHILDREN_TABLE, fold_fanout
+
+    conn = kanban_db_connect.connect(tmp / "fold.db")
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {WORKER_CHILDREN_TABLE} (child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL, created_at INTEGER NOT NULL)")
+    parent = kanban_db.create_task(conn, title="count pods", assignee="platform")
+    child = kanban_db.create_task(conn, title="count pods (cluster)", assignee="platform")
+    conn.execute(f"INSERT INTO {WORKER_CHILDREN_TABLE} VALUES (?, ?, 0)", (child, parent))
+    where = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T"}
+    for task in (parent, child):
+        kanban_db_notify.add_notify_sub(conn, task_id=task, **where)
+    kinds = notifier.TERMINAL_KINDS
+    kanban_db.complete_task(conn, child, result="13 pods")
+
+    def claim():
+        old, cur, events = kanban_db_notify.claim_unseen_events_for_sub(conn, task_id=child, kinds=kinds, **where)
+        return {"sub": dict(where, task_id=child), "old_cursor": old, "cursor": cur, "events": events} if events else None
+
+    first = claim()
+    check(first is not None and any(e.kind == "completed" for e in first["events"]), "fold: the child's completion is claimed")
+    check(fold_fanout(conn, first) is None, "fold: the child's answer is held while its parent works")
+    again = claim()
+    check(again is not None and any(e.kind == "completed" for e in again["events"]),
+          "fold: the hold rewound the real cursor, so the answer is claimed again")
+    kanban_db.complete_task(conn, parent, result="13 pods in kubeagents-system")
+    folded = fold_fanout(conn, again)
+    check(folded is None or not any(e.kind == "completed" for e in folded["events"]),
+          "fold: once the parent has answered, the child's answer is not posted")
+    check(claim() is None, "fold: the dropped answer leaves the cursor past it")
+    conn.close()
 
 
 if __name__ == "__main__":

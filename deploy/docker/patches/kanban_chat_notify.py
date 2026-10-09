@@ -307,6 +307,129 @@ def fresh_events(claim: Optional[dict], now: Optional[float] = None) -> Optional
     return claim
 
 
+#: How long a fanned-out child's answer waits for its parent to settle before
+#: it is posted anyway: the parent's answer is the one the thread wants, but a
+#: parent that never settles must not swallow what its child found.
+FOLD_HOLD_SECONDS = 30 * 60
+#: Parent statuses that mean it is still working toward its answer: the
+#: child's answer waits. A blocked parent (failed, gave up, or waiting on the
+#: user) releases it at once.
+FOLD_WAITING_STATUSES = frozenset({"triage", "todo", "scheduled", "ready", "running", "review"})
+#: kanban_children_settled's record of the card each worker's card was
+#: created by.
+WORKER_CHILDREN_TABLE = "kanban_worker_children"
+
+
+def _fold_parent(conn: Any, child_id: str, sub: dict) -> Optional[tuple]:
+    """``(status, completed_at)`` of the card that created ``child_id``, when
+    that card is subscribed to the same thread; else None.
+
+    A child its parent gates (a ``task_links`` edge from the parent, the
+    continuation kanban_children_settled exempts) is never folded: it runs
+    after its parent completes, so its answer is the answer.
+    """
+    try:
+        row = conn.execute(
+            f"SELECT c.creator_id FROM {WORKER_CHILDREN_TABLE} c WHERE c.child_id = ?"
+            " AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)",
+            (child_id,),
+        ).fetchone()
+        if not row:
+            return None
+        parent = row[0]
+        same_thread = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (parent, sub.get("platform") or "", sub.get("chat_id") or "", sub.get("thread_id") or ""),
+        ).fetchone()
+        if not same_thread:
+            return None
+        task = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (parent,)).fetchone()
+        return (task[0], task[1]) if task else None
+    except sqlite3.Error as exc:
+        # No children table on an install without kanban_children_settled,
+        # or a schema change: deliver as upstream would.
+        logger.debug("kanban notifier: fan-out fold skipped for %s: %s", child_id, exc)
+        return None
+
+
+def _rewind(conn: Any, sub: dict, claimed: int, to: int) -> bool:
+    """Move the subscription's cursor back from ``claimed`` to ``to`` (CAS)."""
+    from hermes_cli import kanban_db_notify
+    return kanban_db_notify.rewind_notify_cursor(
+        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+        thread_id=sub.get("thread_id") or "", claimed_cursor=claimed, old_cursor=to,
+    )
+
+
+def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
+    """``claim`` with a fanned-out child's answer folded into its parent's.
+
+    A worker that fans a question out to child cards completes its own card
+    with the synthesis, and kanban_children_settled holds that completion until
+    the children settle. Each child inherited the thread's subscription
+    (kanban_auto_subscribe), so without this the thread gets every child's
+    answer and then the parent's: the same answer, two or more times. Routed
+    delivery only (the A2A gateway's platforms); the Hermes path and its own
+    Slack fold are untouched.
+
+    For a child's ``completed`` event whose parent is subscribed to the same
+    thread:
+
+    - parent done (or archived) after the child completed: the event is
+      dropped, cursor advanced, so neither its post nor its wake runs;
+    - parent still working, for under FOLD_HOLD_SECONDS: the event is held.
+      Events before it deliver, and the cursor is rewound to just before it,
+      so the next tick claims it again;
+    - otherwise (the parent blocked, failed or gave up, finished before the
+      child, or the hold ran out): it delivers as upstream would, so nothing
+      a child found is lost when its parent's answer does not come.
+
+    Every other event kind (blocked, gave_up, crashed, progress) delivers.
+    """
+    if not claim:
+        return claim
+    sub = claim.get("sub") or {}
+    if (sub.get("platform") or "").lower() not in {p for p in (routed_platform(), conversation_platform()) if p}:
+        return claim
+    events = list(claim.get("events") or [])
+    now = time.time() if now is None else now
+    kept: list = []
+    for index, ev in enumerate(events):
+        if getattr(ev, "kind", "") != "completed":
+            kept.append(ev)
+            continue
+        parent = _fold_parent(conn, sub.get("task_id") or "", sub)
+        if parent is None:
+            kept.append(ev)
+            continue
+        status, completed_at = parent
+        created = getattr(ev, "created_at", 0) or 0
+        if status in ("done", "archived") and (completed_at or 0) >= created:
+            logger.info("kanban notifier: %s's answer folded into its parent's (parent done); not posted",
+                        sub.get("task_id"))
+            continue
+        if status in FOLD_WAITING_STATUSES and now - created < FOLD_HOLD_SECONDS:
+            hold_from = int(getattr(ev, "id"))
+            try:
+                rewound = _rewind(conn, sub, int(claim["cursor"]), hold_from - 1)
+            except Exception as exc:  # a failed hold must not lose the event
+                logger.warning("kanban notifier: could not hold %s's answer for its parent: %s", sub.get("task_id"), exc)
+                kept.extend(events[index:])
+                break
+            if not rewound:
+                kept.extend(events[index:])
+                break
+            logger.info("kanban notifier: holding %s's answer until its parent settles (parent %s)",
+                        sub.get("task_id"), status)
+            if not kept:
+                return None
+            return dict(claim, events=kept, cursor=hold_from - 1)
+        kept.append(ev)
+    if len(kept) == len(events):
+        return claim
+    return dict(claim, events=kept) if kept else None
+
+
 class ChatNotifyAdapter(BasePlatformAdapter):
     """Send-only adapter for a platform the A2A gateway holds; posts via ``a2a notify``."""
 

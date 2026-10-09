@@ -500,5 +500,122 @@ class ApplierTest(unittest.TestCase):
                 apply_kanban_chat_notify.apply(Path(root))
 
 
+
+@dataclass
+class _Ev:
+    id: int
+    kind: str
+    created_at: int
+
+
+class FoldFanoutTest(unittest.TestCase):
+    """A fanned-out child's answer folds into its parent's on the routed path."""
+
+    THREAD = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T"}
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, completed_at INTEGER);"
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
+            "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT, last_event_id INTEGER);"
+        )
+        self.conn.execute("INSERT INTO kanban_worker_children VALUES ('t_child', 't_parent', 1)")
+        for task in ("t_child", "t_parent"):
+            self.conn.execute("INSERT INTO kanban_notify_subs VALUES (?, ?, ?, ?, 0)",
+                              (task, self.THREAD["platform"], self.THREAD["chat_id"], self.THREAD["thread_id"]))
+        self.rewinds = []
+        self.rewind_ok = True
+        patcher = mock.patch.object(kanban_chat_notify, "_rewind", side_effect=self._rewind)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, ROUTED)
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _rewind(self, conn, sub, claimed, to):
+        self.rewinds.append((claimed, to))
+        return self.rewind_ok
+
+    def parent(self, status, completed_at=None):
+        self.conn.execute("INSERT OR REPLACE INTO tasks VALUES ('t_parent', ?, ?)", (status, completed_at))
+
+    def claim(self, *events, task="t_child"):
+        return {"sub": dict(self.THREAD, task_id=task), "old_cursor": 0, "cursor": events[-1].id, "events": list(events)}
+
+    def fold(self, claim, now=2000):
+        return kanban_chat_notify.fold_fanout(self.conn, claim, now=now)
+
+    def test_a_childs_answer_is_dropped_once_its_parent_has_answered(self):
+        self.parent("done", completed_at=1500)
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1400))))
+        self.assertEqual(self.rewinds, [], "a dropped answer must leave the cursor advanced, or it posts later")
+
+    def test_a_childs_answer_is_held_while_its_parent_works(self):
+        self.parent("running")
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.rewinds, [(7, 6)], "the hold rewinds to just before the answer")
+
+    def test_events_before_a_held_answer_still_deliver(self):
+        self.parent("running")
+        got = self.fold(self.claim(_Ev(5, "blocked", 1800), _Ev(7, "completed", 1900)))
+        self.assertEqual([e.id for e in got["events"]], [5])
+        self.assertEqual(got["cursor"], 6)
+        self.assertEqual(self.rewinds, [(7, 6)])
+
+    def test_a_parent_that_fails_releases_its_childs_answer(self):
+        # Blocked is where a failed, gave_up, crashed or timed-out card lands.
+        self.parent("blocked")
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+        self.assertEqual(self.rewinds, [])
+
+    def test_a_hold_that_runs_out_posts_the_answer(self):
+        self.parent("running")
+        created = 2000 - kanban_chat_notify.FOLD_HOLD_SECONDS - 1
+        claim = self.claim(_Ev(7, "completed", created))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_parent_that_finished_first_does_not_swallow_its_childs_answer(self):
+        self.parent("done", completed_at=1000)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_continuation_child_is_never_folded(self):
+        self.conn.execute("INSERT INTO task_links VALUES ('t_parent', 't_child')")
+        self.parent("done", completed_at=1500)
+        claim = self.claim(_Ev(7, "completed", 1400))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_parent_on_another_thread_does_not_fold(self):
+        self.conn.execute("UPDATE kanban_notify_subs SET thread_id = 'spaces/H/threads/OTHER' WHERE task_id = 't_parent'")
+        self.parent("done", completed_at=1500)
+        claim = self.claim(_Ev(7, "completed", 1400))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_only_completed_events_fold(self):
+        self.parent("done", completed_at=1500)
+        claim = self.claim(_Ev(6, "gave_up", 1400))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_failed_hold_delivers_rather_than_loses(self):
+        self.parent("running")
+        self.rewind_ok = False
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertEqual([e.id for e in self.fold(claim)["events"]], [7])
+
+    def test_the_hermes_path_is_untouched(self):
+        self.parent("done", completed_at=1500)
+        claim = self.claim(_Ev(7, "completed", 1400))
+        with mock.patch.dict(os.environ, UNROUTED):
+            self.assertIs(self.fold(claim), claim)
+
+    def test_no_children_table_delivers_as_upstream(self):
+        self.conn.execute("DROP TABLE kanban_worker_children")
+        claim = self.claim(_Ev(7, "completed", 1400))
+        self.assertIs(self.fold(claim), claim)
+
+
 if __name__ == "__main__":
     unittest.main()
