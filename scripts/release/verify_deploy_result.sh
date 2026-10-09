@@ -2,7 +2,7 @@
 # Verifies that an automated deployment to a long-lived environment (autopush,
 # autopush-next, staging) applied successfully and was not deferred or dropped
 # due to lease contention.
-# Used by .github/workflows/autopush-deploy.yml and .github/workflows/staging-deploy.yml.
+# Used by .github/workflows/autopush-deploy.yml, autopush-next-deploy.yml and staging-deploy.yml.
 #
 # ALLOW_SKIPPED=true also accepts `skipped`, which reconcile-environment.yml
 # reports only for a caller that passed skip_unconfigured: the environment is

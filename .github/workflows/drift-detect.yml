@@ -7,7 +7,8 @@ name: "Drift: Long-Lived Environments"
 # Read-only. It runs `terraform plan`, never an apply, so it is safe on an
 # environment somebody is live-testing against and needs no lease. Closing the
 # drift it reports is `Shared: Reconcile Environment` with `mode: apply`, or
-# the atomic deploy workflows (`autopush-deploy.yml` and `staging-deploy.yml`).
+# the atomic deploy workflows (`autopush-deploy.yml`, `autopush-next-deploy.yml`
+# and `staging-deploy.yml`).
 #
 # `autopush-next` is planned with skip_unconfigured until it is provisioned:
 # a missing environment, or one with no GCP_PROJECT_ID, posts a notice and
