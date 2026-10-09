@@ -1,9 +1,11 @@
 // Package hermesbridge is the stand-in executor for tasks addressed to the
 // platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
 // as a turn on the pod's Hermes API server (one session per contextId) or,
-// on the cli executor, by one `hermes -p {profile} chat -Q -q <prompt>` per
+// on the cli executor, by one `hermes -p {profile} chat -Q --query=<prompt>` per
 // task, and publishes the payload spec's lifecycle events with the answer as
-// the result artifact. It is
+// the result artifact. On the API executor a follow-up message that arrives
+// mid-task is queued and run as the next turn in the same session; the cli
+// executor cannot continue a session and refuses it no-resume. It is
 // scaffolding for the Hermes-first world - when the stage-3 dispatcher and
 // the W4 worker adapter land, the bridge retires. Design:
 // a2a/docs/hermes-bridge.md.
@@ -26,6 +28,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
@@ -40,6 +43,13 @@ const (
 	// taskQueueCapacity bounds the accepted-but-not-started queue; hitting
 	// it on a playground bridge is a fault, not load.
 	taskQueueCapacity = 1024
+	// steerQueueCapacity bounds the follow-ups one task queues in total,
+	// those whose turn has started or that left the queue refused included,
+	// not just those waiting: a task runs at most this many follow-ups, so
+	// at most this many turns past the opening one. The number is the
+	// worker adapter's steer bound (16). The next one is refused queue-full
+	// with a notice, never dropped silently.
+	steerQueueCapacity = 16
 	// stderrTailBytes and stdoutTailBytes are how much of each stream a
 	// failed task's status message carries. stdout matters on failure too:
 	// `hermes chat -Q` prints a failed turn's final_response (its own
@@ -82,6 +92,13 @@ const (
 	// spawns: the bound keeps a slow bus from parking a worker slot, it never
 	// drops the task.
 	lookAheadTimeout = 10 * time.Second
+	// steerNoticeTimeout bounds the steer notices of one call (a follow-up's
+	// one notice, or the refusals of a closing queue). They publish outside
+	// run.mu, so a stalled bus holds no lock a kill needs; what waits is
+	// whatever orders itself behind them (noticeMu) and, because the
+	// consumer runs one handler at a time, a cancel delivered behind the
+	// stalled one. The bound keeps that wait finite.
+	steerNoticeTimeout = 10 * time.Second
 
 	shutdownReason            = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
 	canceledBeforeStartReason = "reason: canceled-before-start"
@@ -129,14 +146,16 @@ type Config struct {
 	// carry their own per-task key either way).
 	ActivitySecret string
 	// Command is the CLI executor's invocation prefix; the task prompt is
-	// appended as the final argument. Default: ["hermes", "-p", <profile>,
-	// "chat", "-Q", "-q"].
+	// appended as the final argument, or replaces a trailing -q as one
+	// "--query=<prompt>" token (promptArgv). Default: ["hermes", "-p",
+	// <profile>, "chat", "-Q", "-q"].
 	Command []string
 	// Concurrency caps simultaneous tasks, hermes subprocesses or API
 	// requests (default 2, the platform profile's concurrency in the
 	// profiles spec).
 	Concurrency int
-	// TaskDeadline is the per-invocation wall-clock ceiling (default 7200s,
+	// TaskDeadline is the task's wall-clock ceiling, counted from its first
+	// turn and spanning every follow-up turn after it (default 7200s,
 	// matching the platform profile's activeDeadlineSeconds).
 	TaskDeadline time.Duration
 	// KillGrace is SIGTERM-to-SIGKILL grace on cancel/deadline (default 10s).
@@ -255,9 +274,16 @@ type taskRun struct {
 	origin *lib.Envelope
 	exec   *lib.TaskExecution
 
+	// noticeMu orders this run's status publishes that cannot ride under
+	// mu: every steer notice, the working status, and finalize, which holds
+	// it from its first look at the run to the terminal. A notice decided
+	// under mu is published under noticeMu with mu released, so a stalled
+	// bus never holds mu - a cancel's kill still runs - while finalize,
+	// queued behind noticeMu, still writes its terminal after every notice.
+	// Lock order: noticeMu, then mu; never the reverse.
+	noticeMu sync.Mutex
 	// mu guards state, proc, and killTimers - and is held across the
-	// finalize publish, so a steer refusal can never land after the final
-	// event: whoever holds the lock sees the true state before publishing.
+	// finalize's terminal publish: whoever holds it sees the true state.
 	mu         sync.Mutex
 	state      runState
 	proc       *exec.Cmd
@@ -265,6 +291,34 @@ type taskRun struct {
 	// cancelReq ends the API executor's request (api.go); nil outside one.
 	// Under mu like proc, which it is the counterpart of.
 	cancelReq context.CancelFunc
+
+	// steers are the follow-ups waiting for the current turn to end, oldest
+	// first. steersQueued counts every follow-up this run has queued, the
+	// ones since taken off steers included, and is what steerQueueCapacity
+	// bounds: the task's total, not what waits at one moment. seenSteers is
+	// every follow-up envelope this run has answered, so a redelivery is
+	// answered once.
+	// turnsClosed is set when the worker has chosen the current answer as
+	// the deliverable (nothing queued to run) or finalize began: a
+	// follow-up after the first is refused task-ending, never queued behind
+	// a terminal. One after finalize began waits on noticeMu, finds the run
+	// done and is dropped with a warning; the gateway's relay reports it as
+	// missed. All three under mu.
+	steers       []*lib.Envelope
+	steersQueued int
+	seenSteers   map[string]bool
+	turnsClosed  bool
+	// workingSent is set once the working status is on the stream
+	// (publishWorking), under mu: a notice reads it for the task's current
+	// state, so none can say submitted after working.
+	workingSent bool
+	// answerHeld is set, under mu, while the API executor's worker holds a
+	// turn's finished answer that is not yet on the stream: from the
+	// response until the next turn's request is sent, or the answer goes
+	// out as the result. shutdownTasks leaves such a run to its worker,
+	// which publishes the answer before any terminal (the capability check
+	// and the turn artifact between two turns take time).
+	answerHeld bool
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -490,7 +544,8 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 // shutdownTasks kills running subprocesses and finalizes every task still
 // open. A worker unblocked by the kill may finalize with the real outcome
-// first - finalize is idempotent and whoever wins writes exactly once.
+// first - finalize is idempotent and whoever wins writes exactly once. A
+// run whose worker holds a finished answer (answerHeld) is left to it.
 func (b *Bridge) shutdownTasks() {
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -500,6 +555,12 @@ func (b *Bridge) shutdownTasks() {
 	b.mu.Unlock()
 	for _, r := range runs {
 		r.mu.Lock()
+		if r.state == stateRunning && r.answerHeld {
+			// A finished answer is in the worker's hands; it sees closing
+			// and ends the task with that answer, and Run waits for it.
+			r.mu.Unlock()
+			continue
+		}
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
 		}
@@ -531,7 +592,7 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 	run := b.tasks[env.TaskID]
 	b.mu.Unlock()
 	if run != nil {
-		b.refuseSteer(ctx, run, env)
+		b.queueSteer(ctx, run, env)
 		return
 	}
 	// Unknown task: the dispatcher rule. Empty events subject means new;
@@ -677,29 +738,262 @@ func (b *Bridge) lastEventIsFinal(ctx context.Context, taskID string) bool {
 	return false
 }
 
-// refuseSteer answers a mid-run follow-up honestly: hermes chat -q is
-// one-shot, there is no stdin to inject into. The refusal is a non-final
-// status carrying the task's CURRENT state - a follow-up must not change
-// folded state by itself (assertion 12), so a queued task answers
-// submitted, a spawned one working. Published under run.mu, so it can
-// never land after the final event finalize writes under the same lock.
-func (b *Bridge) refuseSteer(ctx context.Context, run *taskRun, steer *lib.Envelope) {
+// queueSteer answers a follow-up to a task this bridge holds. Queued, it
+// runs as a further turn in the task's Hermes session after the current
+// one; refused, the requester is told why. Only the API executor queues:
+// the cli executor cannot continue a session, so every follow-up to one of
+// its tasks is refused no-resume here, at once. Either way one non-final
+// notice carrying the task's CURRENT state - a follow-up must not change
+// folded state by itself (assertion 12). The decision is made under mu; the notice
+// goes out under noticeMu with mu released (publishSteerNotices), so it
+// still lands ahead of the final event finalize writes behind noticeMu. A
+// follow-up that reaches noticeMu after finalize gets no notice: the run is
+// done, and the gateway's relay counts it as missed.
+func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelope) {
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
 	run.mu.Lock()
-	defer run.mu.Unlock()
 	if run.state == stateDone {
-		b.cfg.Logger.Warn("message for a task with a terminal event; ignoring", "task", steer.TaskID)
+		run.mu.Unlock()
+		b.cfg.Logger.Warn("follow-up for a task with a terminal event; ignoring", "task", steer.TaskID)
 		return
 	}
-	state := lib.StateWorking
-	if run.state == statePending || (b.cfg.Executor == ExecutorAPI && run.act.Load() == nil) {
-		// Queued, or on the API executor still waiting for its session's
-		// turn: working has not been published.
-		state = lib.StateSubmitted
+	if steer.EnvelopeID == run.origin.EnvelopeID || run.seenSteers[steer.EnvelopeID] {
+		run.mu.Unlock()
+		return // the submission or a follow-up redelivered: already answered
 	}
-	msg := "steering received but not absorbed: the bridge sends a task's instruction to Hermes once and cannot " +
-		"accept mid-run input. The task continues on its original instruction; cancel if that is wrong."
-	if err := b.publishStatusMessage(ctx, run, state, false, msg); err != nil {
-		b.cfg.Logger.Error("steer refusal publish failed", "task", steer.TaskID, "err", err)
+	if run.seenSteers == nil {
+		run.seenSteers = make(map[string]bool)
+	}
+	run.seenSteers[steer.EnvelopeID] = true
+	n := lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID}
+	_, hasText := promptFromMessage(steer.Payload)
+	switch {
+	case b.cfg.Executor != ExecutorAPI:
+		n.Reason = lib.SteerReasonNoResume
+	case !hasText:
+		n.Reason = lib.SteerReasonNoText
+	case run.turnsClosed:
+		n.Reason = lib.SteerReasonTaskEnding
+	case run.steersQueued >= steerQueueCapacity:
+		n.Reason = lib.SteerReasonQueueFull
+	default:
+		run.steers = append(run.steers, steer)
+		run.steersQueued++
+		n = lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
+	}
+	run.mu.Unlock()
+	b.publishSteerNotices(ctx, run, []lib.SteerNotice{n})
+}
+
+// refuseQueued closes the run's turns and refuses every follow-up still
+// queued, for reason, oldest first. The caller holds run.noticeMu and NOT
+// run.mu: the queue is taken under mu and the refusals publish without it.
+// After it returns nothing more can be queued on the run (turnsClosed); a
+// later follow-up is refused task-ending by queueSteer, unless the run is
+// done by the time it gets noticeMu, when it is dropped.
+func (b *Bridge) refuseQueued(ctx context.Context, run *taskRun, reason string) {
+	run.mu.Lock()
+	run.turnsClosed = true
+	queued := run.steers
+	run.steers = nil
+	run.mu.Unlock()
+	ns := make([]lib.SteerNotice, 0, len(queued))
+	for _, s := range queued {
+		ns = append(ns, lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: s.EnvelopeID, Reason: reason})
+	}
+	b.publishSteerNotices(ctx, run, ns)
+}
+
+// nextSteer is the follow-up to run next: the oldest queued one, left at the
+// head of the queue until its turn starts (takeSteerLocked), so a finalize
+// that comes first still finds it there and refuses it task-ended. With none
+// to run - the queue is empty, or the task was canceled, hit its deadline or
+// the bridge is stopping - it closes the queue and returns nil: the current
+// answer is the deliverable, and whatever is still queued is refused
+// task-ended by the caller's finalize. Closing and that finalize are two
+// critical sections; a follow-up between them sees turnsClosed and is
+// refused task-ending, still before the final event.
+func (b *Bridge) nextSteer(run *taskRun) *lib.Envelope {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning || run.canceled.Load() || run.deadlineHit.Load() || b.closing.Load() || len(run.steers) == 0 {
+		run.turnsClosed = true
+		return nil
+	}
+	return run.steers[0]
+}
+
+// takeSteerLocked removes steer from the head of the queue, where nextSteer
+// left it, and reports whether it was there: false means finalize has taken
+// the queue (and refused it). Caller holds run.mu. A follow-up leaves the
+// queue only here - when its turn starts, or when it is refused at the head -
+// so it is never out of the queue without its turn or its notice, and
+// nothing ever has to go back to the head.
+func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
+	if len(run.steers) == 0 || run.steers[0] != steer {
+		return false
+	}
+	run.steers = run.steers[1:]
+	return true
+}
+
+// runnableSteer finds the follow-up to run next: the capability it carries
+// (the task's, minted at submission) must still pass the check, because it
+// is a turn now, not a note: a revoked or expired capability stops it. A refused one
+// is told so, taken off the queue and skipped. Runs on the worker, never on
+// the durable's callback, for capabilityPermits's reason. nil means there is
+// none to run and the caller's answer is the deliverable; anything still
+// queued is refused task-ended by the caller's finalize.
+func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope, string) {
+	for {
+		steer := b.nextSteer(run)
+		if steer == nil {
+			return nil, ""
+		}
+		reason := b.capabilityRefusal(ctx, steer)
+		if reason == "" {
+			if b.nextSteer(run) != steer {
+				// Canceled, past the deadline or stopping during the
+				// check: the answer in hand is the deliverable, and the
+				// follow-up, still queued, is refused task-ended.
+				return nil, ""
+			}
+			prompt, _ := promptFromMessage(steer.Payload) // text was checked when it was queued
+			return steer, prompt
+		}
+		if ctx.Err() != nil {
+			// Stopping, not refused (capabilityPermits says why the two
+			// differ): left queued, for finalize to refuse task-ended.
+			return nil, ""
+		}
+		run.noticeMu.Lock()
+		run.mu.Lock()
+		took := run.state == stateRunning && takeSteerLocked(run, steer)
+		run.mu.Unlock()
+		if took {
+			b.publishSteerNotices(ctx, run, []lib.SteerNotice{
+				{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonCapability}})
+		}
+		run.noticeMu.Unlock()
+		if !took {
+			return nil, "" // finalized meanwhile; it refused this one with the rest
+		}
+	}
+}
+
+// closeTurns closes the queue and refuses what it holds, for reason. A no-op
+// once the task is final: its finalize refused the queue already.
+func (b *Bridge) closeTurns(run *taskRun, reason string) {
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
+	run.mu.Lock()
+	done := run.state == stateDone
+	run.mu.Unlock()
+	if !done {
+		b.refuseQueued(context.Background(), run, reason)
+	}
+}
+
+// publishTurnAnswer ships a finished turn's answer as a turn artifact,
+// because a follow-up is about to run after it. Under noticeMu with the run
+// still running, so it lands before the final event finalize writes behind
+// noticeMu. false means the task is final: it already was, or the publish
+// failed and this finalized it failed. Either way the follow-up is still at
+// the head of the queue, and that finalize refused it task-ended.
+func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
+	run.noticeMu.Lock()
+	run.mu.Lock()
+	running := run.state == stateRunning
+	run.mu.Unlock()
+	if !running {
+		run.noticeMu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	err := b.publishTextArtifact(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), lib.ArtifactTurn, text)
+	cancel()
+	run.noticeMu.Unlock()
+	if err != nil {
+		b.cfg.Logger.Error("turn answer publish failed", "task", run.origin.TaskID, "turn", turn, "err", err)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: bus-publish-failed at turn %d - %s", turn, tail(err.Error(), publishErrTailBytes)), nil)
+		return false
+	}
+	return true
+}
+
+// turnNote names the turn in a failed terminal's reason after the first.
+func turnNote(turn int) string {
+	if turn <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("; turn: %d", turn)
+}
+
+// noticeStateLocked is the task's current state for a non-final notice:
+// working once the working status is on the stream, submitted before it -
+// while queued, or on the API executor while waiting for its session's
+// turn. It reads workingSent, not anything set later (the activity state),
+// so a notice just after working never folds the task back. Caller holds
+// run.mu.
+func (b *Bridge) noticeStateLocked(run *taskRun) lib.TaskState {
+	if run.state == statePending || !run.workingSent {
+		return lib.StateSubmitted
+	}
+	return lib.StateWorking
+}
+
+// steerNoticeText is the notice's text part, for a reader that does not
+// know the data part (an older gateway posts it as "ℹ️ …"). Each says only
+// what is true for its reason: a task that has ended does not "continue".
+func steerNoticeText(n lib.SteerNotice) string {
+	if n.Steer == lib.SteerQueued {
+		return "follow-up queued: it runs as the next turn in this conversation when the current turn finishes"
+	}
+	prefix := "follow-up not taken (" + n.Reason + "): "
+	switch n.Reason {
+	case lib.SteerReasonQueueFull:
+		return prefix + fmt.Sprintf("this task has already taken its %d follow-ups (run or waiting); it continues without this one. "+
+			"Send it again after the answer.", steerQueueCapacity)
+	case lib.SteerReasonNoText:
+		return prefix + "the message has no text to ask; the task continues without it."
+	case lib.SteerReasonTaskEnding:
+		return prefix + "the task's answer was already chosen, so no further turn will run. Send it again after the answer."
+	case lib.SteerReasonTaskEnded:
+		return prefix + "the task ended before this follow-up's turn, so it never ran. Send it again as a new message."
+	case lib.SteerReasonCapability:
+		return prefix + "the task's capability check did not pass when its turn came (refused, or the verifier could not be reached), so it did not run."
+	case lib.SteerReasonNoResume:
+		return prefix + "this agent's executor can't continue a session, so a follow-up cannot run while the task does; " +
+			"the task continues on its original message. Send it again after the answer."
+	}
+	return prefix + "it did not run."
+}
+
+// publishSteerNotices publishes each notice on a non-final status carrying
+// the task's current state, read under mu just before each publish, on one
+// context bounded by steerNoticeTimeout and detached from ctx's
+// cancellation (a notice owed at shutdown still goes out, like finalize's).
+// The caller holds run.noticeMu and NOT run.mu.
+func (b *Bridge) publishSteerNotices(ctx context.Context, run *taskRun, ns []lib.SteerNotice) {
+	if len(ns) == 0 {
+		return
+	}
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), steerNoticeTimeout)
+	defer cancel()
+	for _, n := range ns {
+		part, err := lib.SteerNoticePart(n)
+		if err == nil {
+			run.mu.Lock()
+			state := b.noticeStateLocked(run)
+			run.mu.Unlock()
+			err = b.publishStatusParts(pctx, run, state, false,
+				[]lib.Part{{Kind: "text", Text: steerNoticeText(n)}, part})
+		}
+		if err != nil {
+			b.cfg.Logger.Error("steer notice publish failed", "task", run.origin.TaskID,
+				"steer", n.Steer, "reason", n.Reason, "envelope", n.EnvelopeID, "err", err)
+		}
 	}
 }
 
@@ -958,13 +1252,15 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			"reason: no-text-parts - the submission message carries nothing the hermes CLI can be asked", nil)
 		return
 	}
-	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+	if err := b.publishWorking(ctx, run); errors.Is(err, errRunEnded) {
+		return // canceled or shut down first; its finalize wrote the terminal
+	} else if err != nil {
 		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
 		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return
 	}
 
-	argv := append(append([]string(nil), b.cfg.Command...), prompt)
+	argv := promptArgv(b.cfg.Command, prompt)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout strings.Builder
@@ -1049,6 +1345,29 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	default:
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
+}
+
+// promptArgv is the cli executor's command: the configured command with the
+// prompt as its final argument. A command ending in Hermes's -q gets the
+// prompt as one "--query=<prompt>" token instead, so a prompt that starts
+// with "-" stays the query: after a bare -q, argparse reads a dash-led token
+// with no space in it ("--force") as an option and the child exits 2, and
+// Hermes's own pre-parse scans match whole tokens ("--help", "--tui", "-p").
+// Any other command gets the prompt appended as it is. Either way the prompt
+// is argvText's, without NUL bytes.
+func promptArgv(command []string, prompt string) []string {
+	n := len(command)
+	if n == 0 || command[n-1] != "-q" {
+		return append(append([]string(nil), command...), argvText(prompt))
+	}
+	return append(append([]string(nil), command[:n-1]...), "--query="+argvText(prompt))
+}
+
+// argvText is the prompt as an argv string can carry it: without NUL bytes,
+// which exec refuses in any argument (EINVAL), so a message holding one
+// would fail the task as spawn-failed.
+func argvText(prompt string) string {
+	return strings.ReplaceAll(prompt, "\x00", "")
 }
 
 // failureReason is the terminal message for a subprocess that exited
@@ -1143,11 +1462,24 @@ func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int,
 // caller's - the terminal event must go out even when the caller's context
 // is already canceled, which is exactly what shutdown looks like.
 func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultOutput *string) {
+	// noticeMu first and for the whole of it: no steer notice can be in
+	// flight past this, and a second finalizer waits here, then leaves on
+	// stateDone, as it always waited on mu.
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
 	run.mu.Lock()
 	if run.state == stateDone {
 		run.mu.Unlock()
 		return
 	}
+	run.mu.Unlock()
+	// What is still queued will never get its turn: each is refused
+	// task-ended ahead of the terminal, published with mu released so a
+	// stalled bus cannot hold a cancel's kill. turnsClosed keeps the queue
+	// empty from here; nothing but finalize sets stateDone, and finalize is
+	// serialized on noticeMu, so the state is still not done below.
+	b.refuseQueued(context.Background(), run, lib.SteerReasonTaskEnded)
+	run.mu.Lock()
 	// The trace first, while the state still admits it: any call still
 	// open, and the budget marker if calls were cut, go out ahead of the
 	// result inside this critical section, so the activity artifact is
@@ -1188,9 +1520,45 @@ func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.Ta
 	return b.publishStatusMessage(ctx, run, state, true, msg)
 }
 
+// errRunEnded is publishWorking finding the run already finalized: there is
+// nothing to report and nothing to finalize, the caller just returns.
+var errRunEnded = errors.New("run finalized before its working status")
+
+// publishWorking publishes the run's working status under noticeMu, so a
+// steer notice that read the run as still submitted lands before it, never
+// after: a late "submitted" would fold the task backwards. It publishes only
+// if the run is still running when noticeMu is held, and answers errRunEnded
+// otherwise. finalize drops mu while it refuses the queue, so a worker can
+// take a pending run in that gap and get here; finalize sets stateDone only
+// under noticeMu, so the check under it is final both ways - a finalize that
+// began first has written its terminal, and one that begins later waits for
+// this working.
+func (b *Bridge) publishWorking(ctx context.Context, run *taskRun) error {
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
+	run.mu.Lock()
+	running := run.state == stateRunning
+	run.mu.Unlock()
+	if !running {
+		return errRunEnded
+	}
+	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		return err
+	}
+	run.mu.Lock()
+	run.workingSent = true
+	run.mu.Unlock()
+	return nil
+}
+
 // publishStatusMessage is PublishStatus with a status.message attached -
 // the lib's TaskExecution doesn't carry one, and reasons ride there.
 func (b *Bridge) publishStatusMessage(ctx context.Context, run *taskRun, state lib.TaskState, final bool, text string) error {
+	return b.publishStatusParts(ctx, run, state, final, []lib.Part{{Kind: "text", Text: text}})
+}
+
+// publishStatusParts is publishStatusMessage with the message's parts given.
+func (b *Bridge) publishStatusParts(ctx context.Context, run *taskRun, state lib.TaskState, final bool, parts []lib.Part) error {
 	origin := run.origin
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID:    origin.TaskID,
@@ -1200,7 +1568,7 @@ func (b *Bridge) publishStatusMessage(ctx context.Context, run *taskRun, state l
 			Message: &lib.Message{
 				Role:      "agent",
 				MessageID: "msg-" + nuid.Next(),
-				Parts:     []lib.Part{{Kind: "text", Text: text}},
+				Parts:     parts,
 				TaskID:    origin.TaskID,
 				ContextID: origin.ContextID,
 			},
@@ -1217,18 +1585,22 @@ func (b *Bridge) publishStatusMessage(ctx context.Context, run *taskRun, state l
 	return b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, origin.TaskID), env)
 }
 
-// publishResult ships stdout as the result artifact, chunked per A2A rules
-// so one huge answer never trips the max-message-size gate.
+// publishResult ships stdout as the result artifact.
 func (b *Bridge) publishResult(ctx context.Context, run *taskRun, output string) error {
-	chunks := chunkString(output, b.cfg.ResultChunkSize)
-	artifactID := "artifact-" + run.origin.TaskID + "-result"
+	return b.publishTextArtifact(ctx, run, "artifact-"+run.origin.TaskID+"-result", lib.ArtifactResult, output)
+}
+
+// publishTextArtifact ships text as one artifact, chunked per A2A rules so
+// one huge answer never trips the max-message-size gate.
+func (b *Bridge) publishTextArtifact(ctx context.Context, run *taskRun, artifactID, name, text string) error {
+	chunks := chunkString(text, b.cfg.ResultChunkSize)
 	for i, chunk := range chunks {
 		payload, err := json.Marshal(lib.ArtifactUpdate{
 			TaskID:    run.origin.TaskID,
 			ContextID: run.origin.ContextID,
 			Artifact: lib.Artifact{
 				ArtifactID: artifactID,
-				Name:       lib.ArtifactResult,
+				Name:       name,
 				Parts:      []lib.Part{{Kind: "text", Text: chunk}},
 			},
 			Append:    i > 0,
@@ -1287,8 +1659,9 @@ func chunkString(s string, size int) []string {
 	return append(out, s)
 }
 
-// promptFromMessage joins the submission message's text parts. ok is false
-// when there is nothing textual to ask.
+// promptFromMessage joins the message's text parts, a submission's or a
+// follow-up's. ok is false when there is nothing textual to ask: no text
+// part holds anything but blankRune's runes.
 func promptFromMessage(payload json.RawMessage) (string, bool) {
 	var m lib.Message
 	if err := json.Unmarshal(payload, &m); err != nil {
@@ -1296,7 +1669,7 @@ func promptFromMessage(payload json.RawMessage) (string, bool) {
 	}
 	var texts []string
 	for _, p := range m.Parts {
-		if p.Kind == "text" && strings.TrimSpace(p.Text) != "" {
+		if p.Kind == "text" && strings.TrimFunc(p.Text, blankRune) != "" {
 			texts = append(texts, p.Text)
 		}
 	}
@@ -1304,6 +1677,16 @@ func promptFromMessage(payload json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return strings.Join(texts, "\n\n"), true
+}
+
+// blankRune reports a rune that asks nothing: Unicode white space, as Go's
+// TrimSpace reads it; U+001C-U+001F, which Python's str.strip() also strips,
+// so Hermes's API server refuses a turn of them alone ("No user message
+// found", a 400 that would fail the task); and NUL, which the cli executor
+// drops from its argv (argvText) and which leaves nothing to ask on either
+// executor.
+func blankRune(r rune) bool {
+	return unicode.IsSpace(r) || r == 0 || (r >= 0x1c && r <= 0x1f)
 }
 
 func isTaskNotFound(err error) bool {

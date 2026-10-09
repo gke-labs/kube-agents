@@ -56,7 +56,9 @@ cluster, `inventory_api`) are the exception: the script passes no `-replace`, so
 from a `main` checkout, under a lease on the project. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
-here, and commit the result. Detecting the drift is a separate job, and
+here, and commit the result. A resource type that needs a project role the reconciler does not hold
+brings the role in the same pull request and the grant before the merge (`docs/ci-pool-projects.md`
+§3). Detecting the drift is a separate job, and
 it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one project
 when asked, and the CI health bot's hourly scan runs it against every pool project and
 reports a repeated drift the way it reports a lost build node

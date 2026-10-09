@@ -15,7 +15,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// The conversation route: before each turn of the API executor, the bridge
+// The conversation route: before a task's first turn on the API executor, the bridge
 // records which gateway conversation its Hermes session answers, in the
 // pod's session-kv store (agents/platform/scripts/session_kv_server.py, PUT
 // /v1/sessions/{id}/route). A kanban card the turn files subscribes to the
