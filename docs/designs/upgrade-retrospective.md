@@ -28,8 +28,9 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
 2. **Review only what changed.** The review examines a cluster when the cluster is new to the agent,
    or when GKE upgraded it since the last review. For a cluster with no change, the report has one
    line that says so. Exception: a cluster that still has a finding from an earlier review is
-   checked again for that finding each time. A fix made between two upgrades then clears the
-   finding before the next upgrade.
+   checked again for that finding each time. This includes a finding that matches none of the
+   twenty failures. A fix made between two upgrades then clears the finding before the next
+   upgrade.
 3. **Write the `upgrade-retro-report`** with three sections, **Errors**, **Warnings** and **Info**.
    A section can be empty. An entry under Errors or Warnings is one incident: one workload object
    on one cluster, with four parts:
@@ -66,7 +67,9 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
    backend. Part (D) records the baseline for the next review and marks each shape as a risk for
    the readiness check to name before the next upgrade. The line for an unchanged cluster gives the
    date of its last upgrade and its next target version. The line for a cluster the review could
-   not read gives the reason. "None" appears only when the count is zero.
+   not read gives the reason. The report lists a cluster in the middle of an upgrade as upgrading
+   now. The review reads it after the upgrade ends. Until then, the tracked issue keeps that
+   cluster's earlier findings. "None" appears only when the count is zero.
 
 4. **Store the report where the agent can read it,** on the storage its tools use, with the latest
    report at a fixed path. Post one line per reviewed cluster in chat, with the counts and the most
@@ -149,20 +152,30 @@ the SOP calls `start`, then runs the collector, then `finish` with the collector
 refuses a manifest older than the run); without a repository it runs the collector alone, manifest
 included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
-the first Sunday tick.
+the first Sunday tick; the after-upgrade sweep, which on most such installs arrives first, finds no
+full run in the ledger and prints only that (§3.2).
 
 A third trigger reviews a cluster soon after its upgrade rather than at the weekend. It is a
 second roster entry, `upgrade-retrospective-after-upgrade`, whose prompt is the SOP's
 after-upgrade route: the collector run with `--after-upgrade`, which selects the clusters with an
-`UPGRADE_MASTER` or `UPGRADE_NODES` operation that reached `DONE` at least fifteen minutes before
-the run (the same floor the watch applies, so a second cluster's fresher operation waits for the
-next wake rather than being reviewed before its pods settle) and is not in the ledger's reviewed
-operations, as a scoped run (§3.2) that posts its lines and files no ledger issue. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
+`UPGRADE_MASTER` or `UPGRADE_NODES` operation inside the cluster's selection window (§3.2 defines
+it once: from the cluster's last full review, or fourteen days back when it has none, to the run)
+that reached `DONE` at least fifteen minutes before the run (the same floor the watch applies, so a
+second cluster's fresher operation waits for the next wake rather than being reviewed before its
+pods settle) and is not in the ledger's reviewed operations, as a scoped run (§3.2) that posts its
+lines and files no ledger issue. Both bounds matter: the floor keeps a run off pods that have not
+settled, and the window's start, which Sunday's full run advances, keeps Monday's sweep from
+re-selecting the operations Sunday reviewed once they leave the reviewed list. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
 `no_agent` script, `upgrade_retrospective_watch.py`, which runs every fifteen minutes on the gateway
 pod, reads the roster projects' operations through the sandbox hop the readiness watch uses
 (`sandbox_exec` as its default principal, read only) and, when an operation reached `DONE` at least
 fifteen minutes earlier that it has not seen, marks the after-upgrade job due with the same
-`trigger_job` call the first-run stage uses, which carries a job id and nothing else; the job finds
+`trigger_job` call the first-run stage uses, which carries a job id and nothing else, behind the
+same guard the stage puts in front of it: `trigger_job` also sets a job's `enabled` back to true,
+so the watch reads the Platform Agent's roster first, as the stage's `audit_holds` does, and when
+the entry is absent, paused or disabled it marks nothing and logs the hold with its reason. An
+operator's pause therefore stands until the operator lifts it, and the operations that complete
+meanwhile wait for the next full run, or for the sweep once the job is enabled again. The job finds
 its own scope from GKE and the collector's ledger, so nothing has to cross from the watch to the
 agent. The job runs as the agent, in the agent's shell, the only principal that may write the
 store (§3.6); the hop writes nothing, so a `hermes` caller never touches `/opt/data`, and a model
@@ -189,9 +202,20 @@ A question that names a cluster the last run did not review forces that cluster 
 ### 3.2 Scope: new or upgraded since the last run
 
 The ledger holds, per cluster, the control-plane version, every node pool's version, the time of
-the last run, the symptom set seen at the last full run (owner, category, reason and onset, no
-tenant text), and the operations reviewed (id, type, target and end time, kept while inside the
-selection window). A scoped run writes, for the clusters it reviewed, its report, the reviewed
+the last full review (`last_run`), the symptom set seen at the last full run (owner, category,
+reason and onset, no tenant text), and the operations reviewed (id, type, target, end time and the
+route that reviewed each, kept while the end time is inside the cluster's selection window). The
+selection window is defined once, here, for every route: per cluster, from its last full review to
+the run, or the first-run window of fourteen days back when the ledger has no `last_run` for it;
+`--since` widens a scoped run's window by hand and never moves `last_run`. Only an operation that
+reached `DONE` inside the window is considered on any route; the after-upgrade route adds its
+fifteen-minute settle floor at the near end; and the reviewed list is pruned at the earlier of
+`last_run` and the fourteen-day floor, so an operation leaves the list only once it can no longer
+be selected: Sunday's full run moves `last_run`, and Monday's sweep sees only what ended after it.
+The after-upgrade route also needs a baseline to diff against: when the ledger records no full run
+it prints one line, "no baseline yet; the first full run establishes it", and writes nothing, so an
+install that predates the job gets its first report from the first-run stage or the first Sunday
+tick (§3.1), never from a scoped sweep over a fortnight of operations. A scoped run writes, for the clusters it reviewed, its report, the reviewed
 operations and the guards (so the readiness check learns a failure the same day, requirement 3);
 versions, last-run time and the symptom set stay the full run's, so the next Sunday still selects
 the cluster on the operation's end time, refreshes its baseline, and reports an incident the
@@ -227,7 +251,8 @@ and grades by onset only, which it says. A cluster is _new_ when absent, _upgrad
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
 it that reached `DONE`, with or without an `error` (a failed or cancelled operation finishes as
 `DONE` with `error` set; `ABORTING` is still in progress), with an end time after the last run, and _re-checked_ when it is unchanged but holds a live guard:
-only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared. A
+only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared (a guard
+whose only source was events cannot be re-observed and is held; §3.5). A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
 says so, but only on a _full_ run. The ledger records the fleet's project set, written by the last
 full run. The collector cannot tell the roster from a hand-picked project list, so the SOP says
@@ -254,8 +279,9 @@ report under a `-scoped` name, does not move the latest link, and never calls th
 ledger's last-run time. A cluster with an operation still `PENDING`, `RUNNING` or `ABORTING` is not reviewed: a drain in progress shows a
 budget with no allowance, a Pending replacement and a `NotReady` node, which are the signatures of
 entries 1, 2 and 17 on a cluster that is simply not finished; it is listed under Info as upgrading
-now and reviewed on the next run, and the on-demand route says the same when asked mid-upgrade. The
-first run has no ledger and reviews the last fourteen days of operations. The collector runs where the fleet-audit collectors run, in the agent's terminal.
+now and reviewed on the next run (the after-upgrade route's, once the operation ends), §3.3 says
+what the manifest and the SOP write for it, and the on-demand route says the same when asked
+mid-upgrade. The collector runs where the fleet-audit collectors run, in the agent's terminal.
 Projects are `--project` when given, else the active `gcloud` project plus every project
 `gcloud projects list` returns: the order `collect.py`, `patch_readiness.py` and `fleet_drift.py`
 share, so this collector reads the same fleet as the three beside it. The SOP passes `--project` for
@@ -280,14 +306,21 @@ already uses, the collector manifest
 design's own. On a full run the collector writes it beside the report (`--manifest-file`): one
 `clusters[]` entry per cluster it enumerated, with `outcome: collected` and a `commands[]` record
 per check that ran, or `outcome: unreachable` or `gate-failed` with the error for a cluster whose
-project listing failed or whose reads failed; a cluster upgrading now is `collected` with every
-check in `checks_not_applicable` (reason: upgrading now, reviewed after the operation ends) and its
-held guards re-emitted as candidates, so a Sunday with one cluster mid-window is not a partial run
-and its ledger can still close; `candidates[]` for every
+project listing failed or whose reads failed; a cluster upgrading now is not `collected` either:
+the run read nothing on it, so it is `gate-failed` with the operation in flight as its `error`, the
+SOP's `draft` lists it in `scope.skipped` with that reason, and `finish` holds the stream's previous
+findings on it rather than resolving them. That costs a partial run: `finish` announces no finding
+as fixed that Sunday and keeps the ledger issue open with a comment naming the gap, until a full
+run reads the cluster (the after-upgrade route reviews it within the half hour, but a scoped run
+files nothing). The alternative was rejected on the manifest's own contract: `checks_not_applicable`
+is for a check that cannot apply to a cluster (Autopilot, no such resource kind), not for one
+deferred, and a candidate re-emitted from `guards.json` with no read behind it would make the
+manifest vouch for an observation nobody made. Then `candidates[]` for every
 incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
 excerpt and the mitigation text, including a candidate for every `failure` guard the run still
-observes, which is how the harness holds a finding on the ledger (its `still_flagged_ids` are the
-candidates the collector still emits); a `risk` guard is Info, filed nowhere, and is no candidate,
+observes or cannot re-observe, the unclassified Warning's guard among them (§3.5), which is how the
+harness holds a finding on the ledger (its `still_flagged_ids` are the candidates the collector
+still emits); a `risk` guard is Info, filed nowhere, and is no candidate,
 so a clean Sunday discloses nothing and runs silent; `checks_unevaluated[]` and `limitations` on a
 cluster whose read failed; and, in the carried keys the manifest reserves for
 collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
@@ -302,22 +335,22 @@ report; they are not what `finish` reads.
 Each symptom carries the catalogue entry it matches, a confidence, and the evidence string. The
 signatures:
 
-| Symptom read from the cluster                                                             | Entry |
-| ----------------------------------------------------------------------------------------- | ----- |
-| `failed calling webhook` in a `FailedCreate` event or a pod's message                     | 7     |
-| `didn't match … node selector` / node affinity on a pod                                   | 12    |
-| `OOMKilled` on a cgroup v2 pool with a runtime image older than the catalogue's floor     | 14    |
-| `OOMKilled` where the container runs several processes                                    | 15    |
-| `ImagePullBackOff` / `ErrImagePull` on rebuilt nodes while the same image runs elsewhere  | 20    |
-| `PersistentVolume's node affinity`, `FailedAttachVolume`, `FailedMount`                   | 19    |
-| `nvidia.com/gpu` in a scheduling message; `nvidia`, `CUDA`, `Error 803` in a container    | 18    |
-| nodes `NotReady` / `NetworkUnavailable` after a node-pool operation                       | 17    |
-| `Insufficient cpu` / `memory` on a Pending pod after a node-pool operation                | 2     |
-| a budget with no allowance left on a drained node; a node operation past an hour per node | 1     |
-| `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API     | 6     |
-| every replica of a workload unavailable inside one `UPGRADE_NODES` span, all on its pool  | 3     |
-| a pool two minors from its control plane, or one pool on two kubelet versions, standing   | 5     |
-| more than a day after the last window close or exclusion end                              |       |
+| Symptom read from the cluster                                                                          | Entry |
+| ------------------------------------------------------------------------------------------------------ | ----- |
+| `failed calling webhook` in a `FailedCreate` event or a pod's message                                  | 7     |
+| `didn't match … node selector` / node affinity on a pod                                                | 12    |
+| `OOMKilled` on a cgroup v2 pool with a runtime image older than the catalogue's floor                  | 14    |
+| `OOMKilled` where the container runs several processes                                                 | 15    |
+| `ImagePullBackOff` / `ErrImagePull` on rebuilt nodes while the same image runs elsewhere               | 20    |
+| `PersistentVolume's node affinity`, `FailedAttachVolume`, `FailedMount`                                | 19    |
+| `nvidia.com/gpu` in a scheduling message; `nvidia`, `CUDA`, `Error 803` in a container                 | 18    |
+| nodes `NotReady` / `NetworkUnavailable` after a node-pool operation                                    | 17    |
+| `Insufficient cpu` / `memory` on a Pending pod after a node-pool operation                             | 2     |
+| a budget with no allowance left on a drained node; a node operation past an hour per node              | 1     |
+| `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API                  | 6     |
+| every replica of a multi-replica workload unavailable inside one `UPGRADE_NODES` span, all on its pool | 3     |
+| a pool two minors from its control plane, or one pool on two kubelet versions, standing                | 5     |
+| more than a day after the last window close or exclusion end                                           |       |
 
 Rows overlap, and a symptom carries exactly one entry, so the rows are tried in a fixed order and
 the first that holds wins; the order is the most specific discriminator first, so a finding id (the
@@ -326,15 +359,36 @@ the same evidence: 7 (a webhook named), 6 (a removed API named), 19 (a Persisten
 affinity, an attach or mount failure), 18 (a scheduling message that names `nvidia.com/gpu`, or a
 driver error text in a container whose image or command names a GPU driver component), 14 (the
 pool's cgroup mode and the runtime floor are facts of the pool and the image) before 15 (several
-processes), then 20, 17, 2 (`Insufficient cpu` or `memory` in the clause for the pool the pod
-targets, after a node-pool operation), 1, and 12 last. Row 12 is the generic one: the scheduler
+processes), then 20, 17, 3 (an `Available=False` transition inside one `UPGRADE_NODES` span, every
+pod on the drained pool or in its zone, on a workload with more than one replica), 2 (`Insufficient
+cpu` or `memory` in the clause for the pool the pod targets, after a node-pool operation), 1, 5 (a
+version skew standing more than a day past the last window close or exclusion end; it is
+cluster-scoped and collides with nothing), and 12 last. The order is tried per symptom, and a
+symptom's source already narrows the rows it can reach: a workload's `Available` condition reaches
+row 3 alone, a budget reaches row 1 alone, a Pending pod's scheduling message reaches 18, 2 and 12.
+An object's incident then carries every symptom on it, each with its one entry, and the finding id
+is per object and check, not per entry, so the Deployment whose replacement is Pending (entry 2)
+and whose `Available` condition fell inside the span (entry 3) is one finding with two entries, not
+two findings, and a budget hold (entry 1) is a finding on the budget. Row 3 keeps the catalogue's
+floor, a workload with more than one replica: a single replica displaced by a drain is entry 2 (its
+Pending replacement) or entry 1 (the budget that held its drain), never 3, so
+`seeded-upgrade/pinned-batch-runner` files entry 1 on its budget (§4) and, while its replacement is
+still Pending, a second incident on the Deployment graded by the replacement's scheduling message
+(row 2, or row 12 when every clause is a selector miss). Row 12 is the generic one: the scheduler
 writes a `didn't match Pod's node affinity/selector` clause for every node group a pinned pod does
 not target, beside the clause that says why its own pool refused it, so row 12 holds only when every
 clause is a selector or affinity miss. That alone does not say the pool lost the label: an
 autoscaled pool at zero nodes, a label a pool never carried or a deleted pool write the same
 message, and the collector holds no before-state of node labels. Row 12 is therefore `medium`
-unless the selector names a label the catalogue lists as dropped in the target minor, which the
-collector carries as a table, and then it is `high`. An
+unless the selector names a label a kubelet stopped setting at or before the pool's minor, and then
+it is `high`. The list is the collector's `DROPPED_NODE_LABELS` table, label to the minor that
+dropped it, each entry with its source the way `removed_apis.json` beside `api_deprecation_scan.py`
+cites one; it is not in the catalogue, whose entry 12 names no dropped label and records that no
+GKE label removal is verified, so the table holds one entry today, `node-role.kubernetes.io/master`,
+which kubeadm stopped applying in 1.24 (kubernetes/kubeadm#2200 and the 1.24 changelog), and the
+deprecated `beta.kubernetes.io/` and `failure-domain.beta.kubernetes.io/` labels, still set, stay a
+before-signal shape and never a drop. A label the table does not name leaves row 12 at `medium`; an
+entry joins the table with its source, never from memory. An
 `OOMKilled` container on a migrated pool with an old runtime that also runs several processes is
 entry 14, with entry 15 named in the evidence as a second cause.
 
@@ -356,9 +410,10 @@ catalogue's part of it. The entries not in the table (4, 8, 9, 10, 11, 13, 16) h
 single read identifies with confidence; they are the ones the readiness checks have to catch before
 the upgrade, and the report says so under (C) when a cluster's symptoms are unclassified. Entries 3
 and 5 joined the table from the catalogue's gap review: entry 3 is a Deployment's `Available=False`
-transition, or a StatefulSet with no ready replica, inside one `UPGRADE_NODES` span with every pod
-on that pool (high; medium when the pods were in the zone it drained), keyed by the operation like a
-budget hold; entry 5 is read from the cluster describe and the maintenance policy, medium, and only
+transition, or a StatefulSet with no ready replica, on a workload with more than one replica,
+inside one `UPGRADE_NODES` span with every pod on that pool (high; medium when the pods were in the
+zone it drained), keyed by the operation like a budget hold; entry 5 is read from the cluster
+describe and the maintenance policy, medium, and only
 once the skew has stood more than a day after the latest window close or exclusion end (while a
 window is open or an exclusion active it is an Info line).
 
@@ -367,9 +422,18 @@ window is open or an exclusion active it is an Info line).
 (D) is what separates a retrospective from a post-mortem nobody reads. Two mechanisms, both
 automatic and both reversible:
 
-- **Guards.** `guards.json` beside the ledger holds one entry per classified failure and one per
-  risk shape found on a clean cluster, each marked `failure` or `risk`: cluster, entry, object
-  (`namespace/kind/name`), evidence, first and last seen. The collector merges it on
+- **Guards.** `guards.json` beside the ledger holds one entry per filed incident, classified or
+  not, and one per risk shape found on a clean cluster, each marked `failure` or `risk`: cluster,
+  entry (`unclassified` for a symptom no row holds for), object (`namespace/kind/name`), evidence,
+  source (pod or node state, or events alone), first and last seen. An unclassified Warning carries
+  a `failure` guard like a classified one, because the guard is what makes the next run re-check
+  the cluster for it (§3.2) and re-emit its candidate while it stands (§3.3); without one the
+  finding is filed once and announced fixed by the first run that does not re-read the cluster. The
+  re-check reads what the symptom came from: a symptom read from pod or node state is looked for
+  again with those reads and cleared when absent; one whose only source was events, such as §4's
+  probe failures, cannot be re-observed after the API server's hour, so its guard is held, reported
+  as still live and not re-checkable, and cleared by the cluster's next full review when the
+  symptom is absent. The collector merges the file on
   every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
   shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
   it ships, reads the file through its own sandbox hop and adds a line per live guard to its next
@@ -402,13 +466,21 @@ another. Under the root: `reports/<timestamp>.md`, `upgrade-retro-report.md` bes
 at the latest full run, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
 pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
 there. Three triggers write the same files, so one run holds an exclusive lock on `.lock` under the
-root for its duration; a second run, scheduled, after-upgrade or on demand, waits for it up to ten
-minutes (an after-upgrade wake can land in the same minute as the Sunday run), and only a run still
-locked out after that prints one line and exits without writing (a dry run reads without the lock).
-The SOP runs the collector the way the obtainability SOP runs its collector, as a background
-terminal command with a 1500-second budget, so the wait and the run fit inside it and the default
-180-second foreground timeout never cuts the run. An after-upgrade run that waited and then finds its operations already in the reviewed
-list prints nothing. Reports are named by their finish time in UTC, full
+root for its duration, and the SOP runs the collector in the foreground with the terminal tool's
+`timeout: 600`, the foreground maximum the fleet-audit SOPs name, never in the background. The
+budget is this design's own figure, not a sibling's precedent: the obtainability SOP runs its
+collector the same way at the same ceiling, and that collector, which reads a comparable set per
+cluster, takes 60–80 seconds on a twelve-cluster fleet. A background run was rejected for the
+sibling's reason and one of its own: it outlives the turn, so the SOP would have to poll for its
+end before `finish`, and a wake that starts a second run beside it is two writers past the lock.
+The lock wait is sized to fit under the budget with the run: a second run, scheduled,
+after-upgrade or on demand, waits up to two minutes, long enough for a scoped run of a few clusters
+to finish, which is the collision that matters, the Sunday run or a question landing while an
+after-upgrade run holds the lock. The reverse costs nothing: an after-upgrade wake locked out by the
+Sunday run exits after the wait with one line and writes nothing, the Sunday run reviews the same
+operation, and the route's next wake or sweep finds it in the reviewed list and prints nothing; an
+on-demand run locked out answers from the latest saved report and says a run is in progress. A
+dry run reads without the lock. Reports are named by their finish time in UTC, full
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
@@ -418,7 +490,9 @@ advance; a ledger that cannot be parsed is set aside under a dated name and the 
 as its line. While a dated crash record sits beside no ledger, every run refuses to start from empty
 and repeats that line, so the record is read rather than overwritten; `--reset-ledger`, run by an
 operator on purpose, archives the record and lets the next run start as a first run. A run starts
-from an empty ledger on its own only when neither a ledger nor a crash record exists. The readiness watch runs on the gateway pod and reaches the file the same way it reaches
+from an empty ledger on its own only when neither a ledger nor a crash record exists, and only on a
+route that may: the after-upgrade route with no full run recorded prints its no-baseline line
+instead (§3.2). The readiness watch runs on the gateway pod and reaches the file the same way it reaches
 `gcloud`, through its sandbox hop. The chat line still carries the counts and the top finding, so
 a reader who never opens the file gets the verdict.
 
@@ -461,6 +535,9 @@ Mitigation set up: guard ...
 
 ### Unclassified on <cluster>: <namespace>/Deployment/<name>
 What failed: Unhealthy probe events, 31 in the window, matching none of the twenty.
+Mitigation set up: guard <cluster> / unclassified / <namespace>/Deployment/<name> (first seen
+  <date>), event-only: held until the cluster's next full review; entry in the stream's ledger
+  issue where a repository is linked.
 
 ## Info
 
@@ -535,10 +612,15 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 
 ## 7. Testing
 
-- **Unit.** Each classifier signature against one captured fixture; selection (new, upgraded by
-  version, upgraded by operation, unchanged, forced); the ledger and guards round trips; an
-  unreachable cluster recorded without failing the run; the report rendering, including an empty
-  section and the severity of each fixture incident.
+- **Unit.** Each classifier signature against one captured fixture, row 3's against a workload of
+  one replica (entry 2 or 1, never 3) and of two; selection (new, upgraded by version, upgraded by
+  operation, unchanged, forced; `--after-upgrade` against the window's two bounds, the reviewed
+  list pruned at the window, and the no-baseline line when no full run is recorded); the ledger
+  and guards round trips, an unclassified symptom's guard among them, held when event-only and
+  cleared by a review; an unreachable cluster and an upgrading cluster recorded without failing
+  the run and without a candidate; the watch marking nothing for a paused, disabled or absent
+  job; the report rendering, including an empty section and the severity of each fixture
+  incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
@@ -561,6 +643,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 - Fourteen days for the first run, and a fixed Sunday evening for the fleet-wide run (the
   after-upgrade watch covers the slot after each window) rather than a slot after each
   install's maintenance window, are starting values.
+- The 600-second foreground budget and the two-minute lock wait (§3.6) are sized on a fleet of the
+  size the sibling collectors are measured on. A fleet whose full run does not fit under the budget
+  with the wait is an open question, to be settled by measurement, not by a background run.
 - Audit-log reads (eviction 429s, admission rejections) would sharpen (B); `gcloud logging read` is
   on the allowlist, cost and scope to decide.
 - Whether a live guard should turn the readiness verdict for that cluster to `blocked`, or only
