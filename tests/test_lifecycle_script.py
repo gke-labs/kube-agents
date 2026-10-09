@@ -1183,18 +1183,36 @@ exit 0
 
     def test_wedged_finalizer_truncates_long_instance_label_for_pvc(self):
         # Ensure that instanceLabel (>63 chars) is properly truncated to 63 chars
-        # and trailing dashes/dots/underscores are trimmed.
-        long_agent = "a" * 60 + "-xyz"
-        proc, _ = self._run_delete(wedged=True, agent_name=long_agent)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        # namespace (17) + '-' (1) + 64 chars = 82 chars. Truncated to 63 chars:
-        # 'kubeagents-system-' (18) + 45 'a's = 63 chars.
-        expected_label = "kubeagents-system-" + ("a" * 45)
-        self.assertEqual(len(expected_label), 63)
-        self.assertIn(
-            f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=data-{long_agent}-a2a-nats-0 --ignore-not-found --wait=false",
-            self.kubectl_args,
-        )
+        # and trailing dashes/dots/underscores are trimmed as instanceLabel does.
+        cases = [
+            (
+                "alphanumeric_cut_only",
+                "a" * 60 + "-xyz",
+                "kubeagents-system-" + ("a" * 45),
+                63,
+            ),
+            (
+                "trailing_dash_trimmed",
+                "a" * 44 + "-" + "b" * 20,
+                "kubeagents-system-" + ("a" * 44),
+                62,
+            ),
+            (
+                "multiple_trailing_punctuation_trimmed",
+                "a" * 42 + "-.-" + "b" * 20,
+                "kubeagents-system-" + ("a" * 42),
+                60,
+            ),
+        ]
+        for name, long_agent, expected_label, expected_len in cases:
+            with self.subTest(name=name):
+                proc, _ = self._run_delete(wedged=True, agent_name=long_agent)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(len(expected_label), expected_len)
+                self.assertIn(
+                    f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=data-{long_agent}-a2a-nats-0 --ignore-not-found --wait=false",
+                    self.kubectl_args,
+                )
 
     def test_it_uses_the_dns_endpoint_when_one_accepts_external_traffic(self):
         proc, args = self._run_delete()
