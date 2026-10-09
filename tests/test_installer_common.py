@@ -4790,7 +4790,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 self.assertIn(
                     f"ERROR: SLACK_BOT_TOKEN holds {count} tokens, a list for several workspaces. Under "
                     "spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, "
-                    "and with a list it fails to connect and restarts without end.",
+                    "and Slack refuses a list, so that backend retries without end and nothing answers on Slack.",
                     out,
                 )
                 self.assertIn(
@@ -4811,6 +4811,26 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
         proc = self._run(allowlist="alice@example.com", home="D0DM", token="a,b")
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         for said in ("look like emails: alice@example.com.", "SLACK_HOME_CHANNEL is 'D0DM'", "SLACK_BOT_TOKEN holds 2 tokens"):
+            self.assertIn(said, proc.stdout)
+
+    def test_warn_mode_names_every_setting_and_refuses_nothing(self):
+        # upgrade.sh --plan and install.sh --dry-run apply nothing, so they
+        # warn the way the scope check does.
+        args = " ".join(shlex.quote(a) for a in ("next", "true", "false", "alice@example.com", "D0DM", "a,b", "", "warn"))
+        script = (
+            'print_info() { echo "INFO: $*"; }\nprint_success() { :; }\n'
+            'print_warning() { echo "WARN: $*"; }\nprint_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; refuse_next_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("ERROR:", proc.stdout)
+        for said in (
+            "WARN: An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.",
+            "WARN: An applying run would be refused: SLACK_HOME_CHANNEL is 'D0DM'",
+            "WARN: An applying run would be refused: SLACK_BOT_TOKEN holds 2 tokens",
+        ):
             self.assertIn(said, proc.stdout)
 
     def test_nothing_is_refused_unless_slack_moves_to_the_gateway(self):

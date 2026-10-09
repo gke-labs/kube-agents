@@ -1905,6 +1905,11 @@ main() {
     if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
       announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
     fi
+    # The Slack settings the full arm refuses when next hands Slack to the
+    # A2A gateway, warned here, as the scope check is.
+    if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
+      refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \

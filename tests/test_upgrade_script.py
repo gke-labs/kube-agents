@@ -3728,6 +3728,54 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                 self.assertNotIn("SLACK_HOME_CHANNEL is", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
+    _PLAN_START = 'if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning (read-only)"\n'
+
+    def _plan(self, keys):
+        """upgrade.sh --plan's block, from the source, with the plan itself
+        stubbed: it applies nothing, so it warns and refuses nothing."""
+        source = _UPGRADE_SH.read_text()
+        start = source.index(self._PLAN_START)
+        end = source.index('    exit "$plan_status"\n  fi\n', start) + len('    exit "$plan_status"\n  fi\n')
+        stubs = (
+            "print_step() { :; }\nrefuse_apply_over_undeclared_scope() { :; }\n"
+            "check_scope_container_access() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
+            'write_report() { echo "REPORT $1"; }\nrun_lifecycle() { echo "PLANNED"; return 0; }\n'
+        )
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            f"{stubs}{exports}"
+            f'repo_dir="{_REPO_ROOT}"; target_namespace=kube-agents; PARAM_PLAN=true PARAM_IMAGE_TAG=0.9.0\n'
+            f"_plan() {{\n  {source[start:end]}}}\n"
+            "_plan\n"
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+
+    def test_a_plan_warns_of_each_setting_the_full_run_would_refuse(self):
+        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+                           "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
+                           "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"})
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("PLANNED", proc.stdout)
+        self.assertIn("REPORT PLAN_IN_SYNC", proc.stdout)
+        for said in (
+            "An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.",
+            "An applying run would be refused: SLACK_HOME_CHANNEL is 'D0DM'",
+            "An applying run would be refused: SLACK_BOT_TOKEN holds 2 tokens",
+        ):
+            self.assertIn(said, out)
+        self.assertNotIn("secretpart", out)
+        self.assertLess(out.index("An applying run would be refused"), out.index("PLANNED"))
+
+    def test_a_plan_is_quiet_where_slack_stays_on_the_today_path(self):
+        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
+                           "SLACK_ALLOWED_USERS": "alice@example.com"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("would be refused", proc.stdout + proc.stderr)
+
     def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
         arm = self._arm()
         self.assertEqual(arm.count(self._CALL), 1)
