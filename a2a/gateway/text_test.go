@@ -32,6 +32,9 @@ func TestIsStatusQuery(t *testing.T) {
 		"also check the memory limits",
 		"stop",
 		"what is the memory limit on the nats pod and can you also check its restarts", // long compound: steer
+		// Status-ish and interrogative, so only the wideMatchLenCap guard
+		// keeps it a steer: past the cap it is a composed instruction.
+		"what is the agent doing about the memory limit on the nats pod and its restarts",
 		"delete the deployment",
 	}
 	for _, s := range exact {
