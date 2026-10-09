@@ -3,7 +3,8 @@
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
 failed on before running) and the event watcher's injected-event counter, and
-reads process_start_time_seconds from both. Each series name, the status label
+reads process_start_time_seconds from both, and counts the watcher's per-cluster
+up gauge into the two cluster gauges. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -42,7 +43,17 @@ def _watcher_family(field):
     return match.group(1)
 
 
+def _watcher_gauge_family(field):
+    """The Name the watcher registers for the GaugeVec stored in field."""
+    match = re.search(rf'{field}:\s*prometheus\.NewGaugeVec\(prometheus\.GaugeOpts\{{\s*Name:\s*"([^"]+)"', _WATCHER_METRICS_GO.read_text())
+    assert match, f"{field} has no Name in {_WATCHER_METRICS_GO}"
+    return match.group(1)
+
+
 class UsageCountersSeriesNamesTest(unittest.TestCase):
+    def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
+        self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
+
     def test_the_brokers_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("TOOL_INVOCATIONS_METRIC"), _go_const(_SCRAPE_GO, "toolInvocationsSeries"))
 

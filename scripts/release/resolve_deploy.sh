@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Resolves the candidate commit SHA and deployment parameters for long-lived environments (autopush, staging).
-# Used by .github/workflows/autopush-deploy.yml and .github/workflows/staging-deploy.yml.
+# Used by .github/workflows/autopush-deploy.yml, autopush-next-deploy.yml (as autopush) and staging-deploy.yml.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

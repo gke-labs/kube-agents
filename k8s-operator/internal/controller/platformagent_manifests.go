@@ -4640,14 +4640,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_SERVICE_NAME":           {},
 
 		// The findings queue's pacing limits (`findings_queue.pacing_limits`,
-		// read by the `no_agent` script `findings_nudge.py`): how many findings
-		// are added to chat, and from which UTC hour;
-		// FINDINGS_FIRST_REPORT_CRITICALS is parsed but reserved for the
-		// first inventory report's selection, and nothing reads it yet. Each
-		// is parsed as a whole number, and a value that does not parse, is
-		// negative, or is not an hour falls back to its default, so an
-		// arbitrary value bounds a count of chat messages and reaches nothing
-		// else. Kept apart from the block above so gofmt does not realign it.
+		// read by the `no_agent` scripts `findings_nudge.py` and
+		// `bootstrap_handoff.py`, which passes them to the first inventory
+		// report's selection): how many findings are added to chat, and from
+		// which UTC hour. Each is parsed as a whole number, and a value that
+		// does not parse, is negative, or is not an hour falls back to its
+		// default, so an arbitrary value bounds a count of chat messages and
+		// reaches nothing else. Kept apart from the block above so gofmt does not realign it.
 		"FINDINGS_DAILY_CRITICALS":        {},
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},

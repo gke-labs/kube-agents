@@ -14,20 +14,25 @@ on:
         options:
           - "rc"
           - "nightly"
-          # autopush and staging are here as the escape hatch for when an
-          # in-place reconcile cannot converge — #1117's Option B. They are
-          # long-lived and this workflow DESTROYS what it finds, so they are
-          # dispatch-only and guarded by confirm_destroy below.
-          # `Shared: Reconcile Environment` is the routine way to move these
-          # two, and the nightly runs it.
+          # autopush, autopush-next and staging are here as the escape hatch
+          # for when an in-place reconcile cannot converge — #1117's Option B.
+          # They are long-lived and this workflow DESTROYS what it finds, so
+          # they are dispatch-only and guarded by confirm_destroy below.
+          # `Shared: Reconcile Environment` is the routine way to move them.
+          #
+          # autopush-next is refused `mode: next` here like the other two: it
+          # holds next only once the chart and installer render spec.mode
+          # (#2740, product item 1), and then through its PLATFORM_AGENT_MODE
+          # variable on the reconcile path, not through this input.
           - "autopush"
+          - "autopush-next"
           - "staging"
       rc_tag:
         description: "Release Candidate Tag or Commit SHA (Mandatory for standalone launch)"
         required: true
         type: string
       confirm_destroy:
-        description: "For autopush/staging only: type the environment name to confirm the teardown"
+        description: "For autopush/autopush-next/staging only: type the environment name to confirm the teardown"
         required: false
         default: ""
         type: string
@@ -99,8 +104,8 @@ jobs:
       # First, before the checkout, because everything after it costs minutes
       # and this is a typo check.
       #
-      # `rc` and `nightly` exist to be destroyed and are not gated. The other
-      # two are what agents live-test against and what the demo installs run
+      # `rc` and `nightly` exist to be destroyed and are not gated. The
+      # others are what agents live-test against and what the demo installs run
       # on; a teardown there takes the cluster, every AgentPlugin and Secret on
       # it, and any evidence somebody was midway through gathering. Nothing
       # about picking an environment from a dropdown communicates that, so the
@@ -110,8 +115,8 @@ jobs:
         # workflow that context reports the ORIGINATING event, so a future
         # workflow_call from a scheduled parent that targeted a long-lived
         # environment would skip both guards and destroy it unannounced. No
-        # caller passes these two today; the gate is what keeps that true.
-        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'staging'
+        # caller passes these today; the gate is what keeps that true.
+        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'autopush-next' || inputs.github_environment == 'staging'
         env:
           TARGET: ${{ inputs.github_environment }}
           CONFIRM: ${{ inputs.confirm_destroy }}
@@ -133,11 +138,12 @@ jobs:
       # pass; '' is today, as it is to the scripts. The steps only `next`
       # needs read this step's `next` output rather than the input.
       #
-      # `next` is refused on autopush and staging, matched case-insensitively
-      # like the two guards above. On a long-lived cluster the patched
-      # spec.mode outlives the run: the chart renders none and the installer
-      # does not read the key, so no upgrade, reconcile or drift report sees
-      # it, and Google Chat stays on the A2A gateway until a `today` rebuild.
+      # `next` is refused on autopush, autopush-next and staging, matched
+      # case-insensitively like the two guards above. On a long-lived cluster
+      # the patched spec.mode outlives the run: the chart renders none and the
+      # installer does not read the key, so no upgrade, reconcile or drift
+      # report sees it, and Google Chat stays on the A2A gateway until a
+      # `today` rebuild.
       # provision_environment.sh refuses it as well.
       - name: Check the PlatformAgent mode
         id: mode
@@ -157,7 +163,7 @@ jobs:
               ;;
           esac
           case "$(printf '%s' "${TARGET}" | tr '[:upper:]' '[:lower:]')" in
-            autopush | staging)
+            autopush | autopush-next | staging)
               echo "::error title=spec.mode next is for the ephemeral environments::Refusing mode next on '${TARGET}', a long-lived environment: nothing that later moves it knows about the patched mode, so it would stay next, with Google Chat on the A2A gateway, until a today rebuild. Use rc or nightly for next."
               exit 1
               ;;
@@ -252,7 +258,7 @@ jobs:
       # Only the long-lived environments. `rc` and `nightly` are rebuilt every
       # pipeline run and nobody live-tests against them.
       - name: Refuse while somebody is live-testing
-        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'staging'
+        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'autopush-next' || inputs.github_environment == 'staging'
         env:
           # Configured in GitHub Environment Variables (vars.KUBE_AGENTS_KUBECTL_TIMEOUT).
           # Overrides the default 8s kubectl timeout in live_test_lease.py to accommodate
@@ -263,8 +269,8 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           NAMESPACE: ${{ vars.NAMESPACE }}
-          # No PLATFORM_AGENT_MODE here. This step runs only on autopush and
-          # staging, where the mode check refuses `next`, so the only values
+          # No PLATFORM_AGENT_MODE here. This step runs only on the long-lived
+          # environments, where the mode check refuses `next`, so the only values
           # that could reach it render no key anyway. The reconcile path
           # (reconcile-environment.yml) is the one that carries the key into a
           # long-lived environment's install.env, from vars.PLATFORM_AGENT_MODE.
@@ -432,7 +438,7 @@ jobs:
           # every run and carry no allowlist by design, so they stay exempt —
           # the same long-lived/ephemeral split `render_install_env.sh` draws
           # with --strict.
-          LONG_LIVED_ENVIRONMENT: ${{ (inputs.github_environment == 'autopush' || inputs.github_environment == 'staging') && 'true' || '' }}
+          LONG_LIVED_ENVIRONMENT: ${{ (inputs.github_environment == 'autopush' || inputs.github_environment == 'autopush-next' || inputs.github_environment == 'staging') && 'true' || '' }}
           SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
           SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

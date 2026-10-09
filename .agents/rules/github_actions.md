@@ -1,7 +1,9 @@
 ---
-# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+# Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
 paths:
   - ".github/workflows/**"
+trigger: model_decision
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs and guarding credentialed workflows against forks."
 ---
 
 # GitHub Actions rules

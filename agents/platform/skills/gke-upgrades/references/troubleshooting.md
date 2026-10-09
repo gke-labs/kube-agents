@@ -3,17 +3,20 @@
 ## Diagnostic flowchart
 
 ## Table of Contents
-- [Diagnostic flowchart](#diagnostic-flowchart) (Line 3-17)
-- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common) (Line 18-40)
-- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods) (Line 41-61)
-- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain) (Line 62-71)
-- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation) (Line 72-88)
-- [5. PVC attachment issues](#5-pvc-attachment-issues) (Line 89-98)
-- [6. Long termination grace periods](#6-long-termination-grace-periods) (Line 99-108)
-- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level) (Line 109-117)
-- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration) (Line 118-148)
-- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues) (Line 149-187)
-- [Validation after applying a fix](#validation-after-applying-a-fix) (Line 188-200)
+- [Diagnostic flowchart](#diagnostic-flowchart) (Line 3-21)
+- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common) (Line 23-44)
+- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods) (Line 46-65)
+- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain) (Line 67-75)
+- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation) (Line 77-97)
+- [5. PVC attachment issues](#5-pvc-attachment-issues) (Line 99-107)
+- [6. Long termination grace periods](#6-long-termination-grace-periods) (Line 119-126)
+- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level) (Line 119-126)
+- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration) (Line 128-154)
+- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues) (Line 156-195)
+- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status) (Line 197-228)
+- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak) (Line 230-248)
+- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy) (Line 250-266)
+- [Validation after applying a fix](#validation-after-applying-a-fix) (Line 268-279)
 
 When an upgrade is stuck or failing, work through these checks in order. Each section has the diagnosis command, what to look for, and the fix.
 
@@ -26,19 +29,26 @@ kubectl get pdb -A -o wide
 kubectl describe pdb PDB_NAME -n NAMESPACE
 ```
 
-**Fix — temporarily relax the PDB:**
+**Fix — temporarily relax the PDB, and restore it in the same procedure:**
 ```bash
-# Option A: Allow all disruptions temporarily
-kubectl patch pdb PDB_NAME -n NAMESPACE \
-  -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
-
-# Option B: Back up and edit
+# 1. Record the original values before touching anything
 kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
-# Edit minAvailable/maxUnavailable, then:
-kubectl apply -f pdb-backup.yaml
-```
 
-Restore original PDB after upgrade completes.
+# 2. Allow all disruptions temporarily
+kubectl patch pdb PDB_NAME -n NAMESPACE \
+  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+
+# 3. Once the upgrade completes, RESTORE (mandatory): patch back the value
+#    pdb-backup.yaml records and clear the other field. If it set minAvailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \
+  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
+#    If it set maxUnavailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \
+  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+
+# 4. Verify the restore: the spec matches pdb-backup.yaml again
+kubectl get pdb PDB_NAME -n NAMESPACE -o yaml | grep -E 'minAvailable|maxUnavailable'
+```
 
 ## 2. Resource constraints (no room for pods)
 
@@ -83,9 +93,14 @@ kubectl describe validatingwebhookconfigurations WEBHOOK_NAME
 
 **Fix — temporarily disable problematic webhook:**
 ```bash
-# Add failure policy annotation or delete temporarily
+# Back up the webhook configuration first
+kubectl get validatingwebhookconfigurations WEBHOOK_NAME -o yaml > webhook-backup.yaml
+
+# Then delete temporarily
 kubectl delete validatingwebhookconfigurations WEBHOOK_NAME
+
 # Re-create after upgrade
+kubectl apply -f webhook-backup.yaml
 ```
 
 ## 5. PVC attachment issues
@@ -161,7 +176,8 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
    spec:
      containers:
      - name: vectoradd
-       image: nvidia/samples:vectoradd-cuda11.6.0
+       # Pin a tag whose CUDA version matches your node's driver
+       image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda11.7.1-ubuntu20.04
        resources:
          limits:
            nvidia.com/gpu: 1
@@ -179,11 +195,82 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
 2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
 3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version:
    ```bash
-   gcloud container node-pools upgrade NODE_POOL_NAME \
-     --cluster CLUSTER_NAME \
+   gcloud container clusters upgrade CLUSTER_NAME \
+     --node-pool NODE_POOL_NAME \
      --zone ZONE \
      --cluster-version PREVIOUS_VERSION
    ```
+
+## 10. Upgrade paused or partially completed (check auto-upgrade status)
+
+Before assuming a bug, check whether GKE has intentionally **paused** the upgrade.
+
+**Diagnose:**
+```bash
+# Cluster-level upgrade status and paused reason
+gcloud container clusters get-upgrade-info CLUSTER_NAME --location LOCATION
+
+# Per node pool (Standard clusters)
+gcloud container node-pools get-upgrade-info POOL_NAME --cluster CLUSTER_NAME --location LOCATION
+```
+
+**Auto-upgrade status values:**
+- `ACTIVE` — upgrades proceeding normally.
+- `MINOR_UPGRADE_PAUSED` — minor-version upgrades are paused.
+- `UPGRADE_PAUSED` — all automatic upgrades are paused.
+
+**Common paused reasons:**
+- `MAINTENANCE_WINDOW` — a maintenance window is preventing upgrades.
+- `MAINTENANCE_EXCLUSION_*` — a maintenance exclusion is blocking upgrades (suffix = scope, e.g. `MAINTENANCE_EXCLUSION_NO_UPGRADES`).
+- `CLUSTER_DISRUPTION_BUDGET` / `CLUSTER_DISRUPTION_BUDGET_MINOR_UPGRADE` — a post-operation cooldown protecting cluster stability.
+- `SYSTEM_CONFIG` — temporarily paused by GKE for technical or business reasons. **Do not force a manual upgrade unless it is required.**
+
+**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade:
+```bash
+gcloud container clusters upgrade CLUSTER_NAME \
+  --node-pool=NODE_POOL_NAME \
+  --location=LOCATION \
+  --cluster-version VERSION
+```
+A partially-upgraded node pool runs mixed versions until you resume it or roll it back.
+
+## 11. Upgrade too slow or too disruptive (tune blue-green soak)
+
+Blue-green upgrades add batch/soak controls that surge upgrades don't have. Use them when an upgrade churns nodes too aggressively, or when the soak wait is longer than needed.
+
+**Parameters:**
+- `BATCH_NODE_COUNT` / `BATCH_PERCENT` — how many blue nodes drain per batch (default `BATCH_NODE_COUNT=1`; set either to `0` to skip the batched drain phase).
+- `BATCH_SOAK_DURATION` — wait after each batch drain (default `0s`).
+- `NODE_POOL_SOAK_DURATION` — wait after all batches drain, before the blue pool is deleted (default `3600s`).
+
+**Update an existing node pool (Standard clusters only):**
+```bash
+gcloud container node-pools update NODE_POOL_NAME \
+  --cluster CLUSTER_NAME --location LOCATION \
+  --enable-blue-green-upgrade \
+  --standard-rollout-policy=batch-node-count=2,batch-soak-duration=10s \
+  --node-pool-soak-duration=600s
+```
+
+**Maintenance-window interaction:** surge upgrades **pause** when they run past the maintenance window and resume in the next one; blue-green upgrades **continue to completion** even past the window, and the extra pool keeps workloads available — prefer blue-green when a window is too short to finish.
+
+## 12. New nodes fail to become Ready / control plane unhealthy
+
+An upgrade can stall because replacement nodes never reach `Ready`, or because the control plane itself is unhealthy.
+
+**Diagnose:**
+```bash
+kubectl get nodes -o wide          # look for NotReady / SchedulingDisabled
+kubectl describe node NODE_NAME    # Conditions + Events
+```
+
+**Common node-level causes of an incomplete upgrade:** new nodes failing to register, IP address exhaustion in the pod/node ranges, or insufficient resource quota. For a node stuck `NotReady`, follow the dedicated node-NotReady flow (kubelet / container-runtime / networking).
+
+**Control plane:** during a control-plane upgrade GKE re-creates the API server; a firewall or webhook that blocks the new control plane can fail the upgrade, and a control plane that stays unhealthy causes the operation to fail (often transient — GKE retries). Confirm control-plane/node **version skew** stays within two minor versions:
+```bash
+gcloud container clusters describe CLUSTER_NAME --location LOCATION \
+  --format="value(currentMasterVersion,currentNodeVersion)"
+```
 
 ## Validation after applying a fix
 
