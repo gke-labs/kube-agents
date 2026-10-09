@@ -338,9 +338,9 @@ webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation wit
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
-this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
-signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
-as a failure meanwhile: on this transport's record the scorer sets every `worker_commands` and
+this path it has data when the case runner's delegation wait finds the cards in the session store
+(Completion signals), and none when the wait falls back. Neither is graded
+as a failure here: on this transport's record the scorer sets every `worker_commands` and
 `worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
 carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
 executor's budget dropped, a count or part it could not read, an input truncated with its nested
@@ -463,11 +463,14 @@ api lane remain, and both are the transport's rather than the agent's. A router-
 `tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
 calls. And the GitHub-write safeguard dates a
 write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
-time; a worker that opens its pull request after the task's terminal can land that write in the
-next unit's window, which charges the next unit for it
-([#2619](https://github.com/gke-labs/kube-agents/issues/2619),
-[#2611](https://github.com/gke-labs/kube-agents/issues/2611)). Read a block on a requesting
-case's later repetitions as transport until those are fixed. Parity in
+time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
+the card's worker opens lands in its own case's window. What the wait does not follow is a
+worker's own fan-out, the child cards a worker files, nor a card still running when the case
+reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
+the next unit's window and charge the next unit for it. Attributing each write to its case is
+[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
+on a requesting case's later repetitions as transport when the earlier case fanned out or ended
+at the ceiling. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
@@ -602,9 +605,11 @@ board. No status turn is sent, because none could carry a result back through th
 reaches the settle step shaped as a `kanban_show` result, so the delivered card results are
 appended to the graded answer as today's wait appends them, `ledger_issue_contains` and
 `report_contains` see what the worker returned, and the worker logs are read by those ids for
-`worker_commands`. A door that reports no `contextId`, or a session the store does not hold (the
-`cli` executor), falls back to the status-turn wait, which sends the status question as a new turn
-on the same conversation key with its own backend message id, `<run>/<case>/<rep>/status-<n>`. It
+`worker_commands`. A door that reports no `contextId`, a session the store does not hold (the
+`cli` executor), or a store that cannot be read three times running falls back to the status-turn
+wait. That wait takes its card ids from the trajectory, which holds none on this path, so it
+settles at once on the reply and sends no status turn; the last of the three cases also puts a
+line on the record's errors. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
 transport, and it is the first thing child tasks delete.
 When child tasks exist, the parent's events name the child's task id, the same await code awaits
