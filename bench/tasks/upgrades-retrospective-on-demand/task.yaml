@@ -111,14 +111,15 @@ verification_spec:
         - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md'
 
   # The reply names the report it answered from: the latest link, or a dated
-  # report (a `-scoped` one when the question named clusters).
+  # report (a `-scoped` one when the question named clusters). Lowercase stamp
+  # letters: the verifier lowercases the reply before it matches.
   - name: the-reply-names-the-report-file
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_patterns:
-        - 'upgrade-retrospective/(?:reports/\d{8}T\d{6}Z(?:-scoped)?\.md|upgrade-retro-report\.md)'
+        - 'upgrade-retrospective/(?:reports/\d{8}t\d{6}z(?:-scoped)?\.md|upgrade-retro-report\.md)'
 
   # One declared line per seeded slot. The accept is the whole line with every
   # value in its set; each forbid is the same anchor, any text, then one field

@@ -997,8 +997,15 @@
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
 
+# The retrospective's verdict on the fleet's planted upgrade failure: seeded-b's
+# drain-blocking budget (role readiness-drain-blocked) reported under catalogue
+# entry 1, graded on one declared line, `<cluster>/<namespace>/<kind>/<name>: entry
+# <n>`, plus the route check. deployer: noop; holds the `upgrade-retrospective`
+# stream for the same reason as the case below.
+./tasks/upgrades-retrospective-drained-budget/task.yaml
+
 # The upgrade retrospective's on-demand route (governance/upgrade_retrospective_sop.md,
-# its last section): a generic question about the last upgrades, answered from the
+# section 7): a generic question about the last upgrades, answered from the
 # retrospective's saved report or a run made for it, graded on the route (the worker's
 # terminal reached the store or the collector), the report file named, and one declared
 # line per seeded cluster. deployer: noop; a fleet-wide question with a stale report is
