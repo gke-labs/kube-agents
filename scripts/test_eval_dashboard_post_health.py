@@ -1024,6 +1024,26 @@ class PoolNote(RunHarness):
             "*Smoke gate: pool full* — all 30 projects are leased. Consider onboarding a project.",
         )
 
+    def test_a_refusal_breach_posts_with_nothing_queued_and_says_so(self):
+        # The periodic's third trigger: runs asked Boskos for a project and
+        # got none. Every run that would have waited died at the acquire, so
+        # Deck shows no backlog -- and the gate must not read that as nothing
+        # to say. The message names the refusals and the hand holds.
+        note = pool_note(waiting_longest_s=0, waiting_now=False, over_threshold=0,
+                         window_hours=None, p50_s=None, p95_s=None,
+                         lease_failures=2, lease_failures_hours=3, held_by_hand=2)
+        self.assertTrue(post_health.pool_advisable(note))
+        self.assertTrue(post_health.pool_advisable(note, drained=True))
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool full* — all 30 projects are leased, 2 held by hand;"
+            " 2 runs refused a project in the last 3h. Consider onboarding a project.",
+        )
+        self.assertEqual(
+            post_health.pool_digest_line(note),
+            "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
+        )
+
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
         # The other order. Once the reader has the build cluster, "cannot say
         # whose fault it is" is less than they already have, so an hour of

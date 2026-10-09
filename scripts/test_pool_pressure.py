@@ -26,6 +26,11 @@ QUIET_DIR = os.path.join(TESTDATA, "quiet")
 # with --as-of set to the following midnight so the window covers exactly it.
 BREACH_AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
 QUIET_AS_OF = datetime(2026, 8, 28, tzinfo=timezone.utc)
+# saturated is the afternoon of 2026-10-08, when the pool had nothing free and
+# runs failed at the Boskos acquire; read at a moment that puts the failures
+# inside the recent window (#2747).
+SATURATED_DIR = os.path.join(TESTDATA, "saturated")
+SATURATED_AS_OF = datetime(2026, 10, 8, 18, 30, tzinfo=timezone.utc)
 
 
 def run(**kwargs):
@@ -145,6 +150,28 @@ class Banners(unittest.TestCase):
         self.assertIsNotNone(requested)
         self.assertIsNone(acquired)
 
+    FAILED = "\n".join((
+        "=== [2026-10-08T17:34:26Z] Leasing GCP Project from Boskos ===",
+        "failed to acquire a resource: resources not found",
+    ))
+
+    def test_a_failed_acquire_is_recognised_by_boskosctls_last_line(self):
+        """Nothing follows the failure line, so without this the run has no
+        lease segment and scores as a fast one (#2747)."""
+        self.assertTrue(pp.lease_failed(self.FAILED))
+        self.assertEqual(
+            (pp.parse_rfc3339("2026-10-08T17:34:26Z"), None), pp.lease_window(self.FAILED)
+        )
+
+    def test_a_log_that_stops_at_the_lease_is_not_a_failed_acquire(self):
+        """A run killed inside the acquire has the same no-successor shape, so
+        silence stays unmeasured rather than becoming a failure."""
+        self.assertFalse(pp.lease_failed("\n".join(self.LOG.split("\n")[:2])))
+
+    def test_the_failure_line_counts_only_between_the_lease_banner_and_the_next(self):
+        self.assertFalse(pp.lease_failed(self.LOG + "\nfailed to acquire a resource: elsewhere"))
+        self.assertFalse(pp.lease_failed("failed to acquire a resource: earlier\n" + self.LOG))
+
     def test_rewording_that_keeps_the_keyword_still_matches(self):
         log = "\n".join((
             "=== [2026-08-26T17:09:39Z] Acquiring a project lease from boskos ===",
@@ -242,6 +269,19 @@ class WaitFromProwjob(unittest.TestCase):
         self.assertEqual({"queue", "pod", "setup", "lease"}, set(wait.segments))
         self.assertEqual(1800.0, wait.total_seconds)
 
+    def test_a_failed_acquire_is_flagged_and_measures_no_lease(self):
+        source = pp._collect_waits_from_dir(
+            SATURATED_DIR, SATURATED_AS_OF - timedelta(days=1), SATURATED_AS_OF
+        )
+        by_build = {w.build_id: w for w in source.value.waits}
+        failed = by_build[2108249555685347328]
+        self.assertTrue(failed.lease_failed)
+        self.assertIsNone(failed.lease_seconds)
+        self.assertEqual(pp.parse_rfc3339("2026-10-08T17:34:26Z"), failed.lease_requested)
+        slow = by_build[2108236254767222784]
+        self.assertFalse(slow.lease_failed)
+        self.assertAlmostEqual(559.0, slow.lease_seconds)
+
     def test_every_captured_fixture_parses(self):
         root = os.path.join(BREACH_DIR, "prowjobs")
         for name in os.listdir(root):
@@ -275,6 +315,16 @@ class LiveQueueFromDeck(unittest.TestCase):
         minutes = [w.minutes for w in queue.waiting]
         self.assertEqual(sorted(minutes, reverse=True), minutes)
         self.assertEqual(4, len(minutes))
+
+    def test_every_running_job_is_collected_for_the_leak_cross_reference(self):
+        """Every job in the pool leases, so a periodic's lease compared against
+        the smoke runs alone reads as leaked (#2747). The smoke set stays for
+        the cap confirmation."""
+        queue = self._queue(SATURATED_DIR, SATURATED_AS_OF)
+        self.assertEqual({"2108236254767222784"}, queue.running_build_ids)
+        self.assertEqual(
+            {"2108236254767222784", "2108256000000000000"}, queue.all_running_build_ids
+        )
 
     def test_another_tenants_job_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -310,6 +360,13 @@ class PoolStateFields(unittest.TestCase):
                             {pp.BOSKOS_NO_OWNER: 4, "pull-kube-agents-smoke-test-111": 1})
         self.assertEqual(["pull-kube-agents-smoke-test-111"], pool.lease_holders())
 
+    def test_an_owner_without_a_build_id_is_held_by_hand(self):
+        pool = pp.PoolState(
+            {"busy": 1, "rebuilding": 2},
+            {"": 0, "pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
+        )
+        self.assertEqual({"hangdng-rebuild": 2}, pool.held_by_hand())
+
     def test_a_third_state_is_counted_as_neither_leased_nor_available(self):
         """`cleaning` and `dirty` are projects nothing can lease right now. Read
         as free they make a pool that is out of projects look like it has some.
@@ -327,16 +384,29 @@ class LeakedLeases(unittest.TestCase):
         return pp.PoolState({"busy": len(holders)},
                             {f"pull-kube-agents-smoke-test-{b}": 1 for b in holders})
 
+    ONE = "2108236254767222784"
+    TWO = "2108256000000000000"
+
     def test_a_lease_held_by_a_running_job_is_not_a_leak(self):
-        queue = pp.LiveQueue([], {"111", "222"})
-        self.assertEqual([], pp.leaked_leases(self._pool(["111", "222"]), queue))
+        queue = pp.LiveQueue([], {self.ONE, self.TWO})
+        self.assertEqual([], pp.leaked_leases(self._pool([self.ONE, self.TWO]), queue))
 
     def test_a_lease_no_running_job_accounts_for_is_reported(self):
-        queue = pp.LiveQueue([], {"111"})
+        queue = pp.LiveQueue([], {self.ONE})
         self.assertEqual(
-            ["pull-kube-agents-smoke-test-222"],
-            pp.leaked_leases(self._pool(["111", "222"]), queue),
+            [f"pull-kube-agents-smoke-test-{self.TWO}"],
+            pp.leaked_leases(self._pool([self.ONE, self.TWO]), queue),
         )
+
+    def test_a_lease_held_by_a_running_periodic_is_not_a_leak(self):
+        pool = pp.PoolState({"busy": 1}, {f"ci-kube-agents-eval-next-{self.TWO}": 1})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), {self.TWO})))
+
+    def test_a_hand_hold_is_not_a_leak(self):
+        """An owner with no build ID was taken by a person, who Deck has never
+        heard of; it is reported as held, never as leaked."""
+        pool = pp.PoolState({"rebuilding": 2}, {"hangdng-rebuild": 2})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
 
     def test_the_unowned_placeholder_is_not_a_leak(self):
         """Boskos files free resources under the empty-string owner.
@@ -344,13 +414,15 @@ class LeakedLeases(unittest.TestCase):
         It is a count of nobody. Treated as a holder it would make every idle
         pool report a mystery lease.
         """
-        pool = pp.PoolState({"busy": 1, "free": 4}, {"": 4, "pull-kube-agents-smoke-test-111": 1})
-        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], {"111"})))
+        pool = pp.PoolState(
+            {"busy": 1, "free": 4}, {"": 4, f"pull-kube-agents-smoke-test-{self.ONE}": 1}
+        )
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], {self.ONE})))
 
     def test_nothing_is_reported_when_either_source_is_missing(self):
         """With no list of running jobs, every holder looks orphaned."""
-        self.assertEqual([], pp.leaked_leases(self._pool(["111"]), None))
-        self.assertEqual([], pp.leaked_leases(None, pp.LiveQueue([], {"111"})))
+        self.assertEqual([], pp.leaked_leases(self._pool([self.ONE]), None))
+        self.assertEqual([], pp.leaked_leases(None, pp.LiveQueue([], {self.ONE})))
 
 
 class LatestMaxConcurrency(unittest.TestCase):
@@ -386,6 +458,36 @@ class Cause(unittest.TestCase):
         label, text = pp.cause(self._pool(15, 0), pp.LiveQueue([], set()), 15)
         self.assertEqual(pp.CAUSE_CAPACITY, label)
         self.assertIn("Onboard the next project", " ".join(text))
+
+    def test_lease_failures_are_capacity_and_name_what_holds_the_pool(self):
+        """A refusal is Boskos saying nothing was free for the whole acquire,
+        so the label is CAPACITY; the text says what the projects are doing,
+        because the remedy differs when two of them are a repair or a leak."""
+        pool = pp.PoolState(
+            {"busy": 3, "rebuilding": 2},
+            {"pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
+        )
+        label, text = pp.cause(
+            pool, pp.LiveQueue([], set()), 35, lease_failures=2,
+            leaked=["pull-kube-agents-smoke-test-2108220000000000000"],
+        )
+        self.assertEqual(pp.CAUSE_CAPACITY, label)
+        joined = "\n".join(text)
+        self.assertIn("2 run(s)", joined)
+        self.assertIn("3 leased, 0 free, 5 total", joined)
+        self.assertIn("out of rotation: rebuilding 2", joined)
+        self.assertIn("held by hand: hangdng-rebuild (2)", joined)
+        self.assertIn("1 lease(s) leaked", joined)
+
+    def test_lease_failures_with_projects_free_now_are_still_capacity(self):
+        label, text = pp.cause(self._pool(30, 5), pp.LiveQueue([], set()), 35, lease_failures=1)
+        self.assertEqual(pp.CAUSE_CAPACITY, label)
+        self.assertIn("30 leased, 5 free, 35 total", "\n".join(text))
+
+    def test_lease_failures_with_an_unreadable_pool_stay_unknown(self):
+        label, text = pp.cause(None, None, None, lease_failures=1)
+        self.assertEqual(pp.CAUSE_UNKNOWN, label)
+        self.assertIn("1 run(s)", "\n".join(text))
 
     def test_free_projects_below_the_cap_is_the_cap(self):
         label, text = pp.cause(
@@ -471,6 +573,17 @@ class DailyRows(unittest.TestCase):
         self.assertFalse(row.breached(15, 45))
         self.assertEqual(600.0, row.worst)
 
+    def test_a_failed_acquire_is_counted_but_not_measured(self):
+        """Its wait is a lower bound on a run that never got a project, and it
+        would pull the day's percentiles down (#2747)."""
+        created = pp.parse_rfc3339("2026-10-08T12:00:00Z")
+        failed = pp.Wait(9, "1", created, created + timedelta(minutes=1), 35,
+                         lease_requested=created + timedelta(minutes=2), lease_failed=True)
+        row = pp.DayRow("2026-10-08", self._waits("2026-10-08", [20, 21, 22, 23, 24]) + [failed])
+        self.assertEqual((5, 1), (row.count, row.lease_failures))
+        self.assertEqual(22.0, row.p50)
+        self.assertEqual(24.0, row.worst)
+
     def test_the_highest_cap_seen_that_day_is_reported(self):
         created = pp.parse_rfc3339("2026-08-27T12:00:00Z")
         waits = [pp.Wait(1, "1", created, created, 6), pp.Wait(2, "2", created, created, 10)]
@@ -497,6 +610,20 @@ class RecentRow(unittest.TestCase):
         self.assertTrue(row["judged"])
         self.assertEqual(row["p50_minutes"], 20.0)
         self.assertEqual(row["window_start"], "2026-08-27T09:00:00Z")
+
+    def test_failed_acquires_are_counted_by_when_they_asked_and_left_out_of_the_percentiles(self):
+        """A run can queue an hour before it asks, so the ask dates the failure."""
+        def failed(n, created_back, asked_back):
+            return pp.Wait(n, "1", self.END - timedelta(minutes=created_back),
+                           self.END - timedelta(minutes=created_back - 1), 35,
+                           lease_requested=self.END - timedelta(minutes=asked_back),
+                           lease_failed=True)
+        inside = failed(8, created_back=200, asked_back=100)
+        outside = failed(9, created_back=400, asked_back=300)
+        row = pp.recent_row(self._waits([30, 60, 90, 120, 150]) + [inside, outside], self.END)
+        self.assertEqual(row["runs"], 5)
+        self.assertEqual(row["lease_failures"], 1)
+        self.assertEqual(row["p50_minutes"], 20.0)
 
     def test_a_stretch_under_the_sample_floor_withholds_its_percentiles(self):
         # Two samples put any number at p95, the same reason a day's row is
@@ -690,6 +817,22 @@ class SweepDeadline(unittest.TestCase):
         self.assertTrue(summary["trend"]["truncated"])
         self.assertEqual("2026-08-27", summary["trend"]["window_start"][:10])
         self.assertIn("ran out of time", pp.render(summary))
+
+
+class IndexCopy(unittest.TestCase):
+    def test_only_build_files_are_copied_from_the_index(self):
+        """`latest-build.txt` sits under the same prefix, and Prow rewrites it
+        at every smoke start. A bulk copy that includes it can 404 mid-copy and
+        turn the hour UNMEASURED, so the pattern is pinned as a literal."""
+        with unittest.mock.patch.object(pp, "run_cmd", return_value=(0, "", "")) as cmd, \
+                tempfile.TemporaryDirectory() as tmp:
+            pp._index_entries_from_gcs(tmp)
+        argv = cmd.call_args.args[0]
+        self.assertEqual(["gcloud", "storage", "cp"], argv[:3])
+        self.assertEqual(
+            "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
+            argv[3],
+        )
 
 
 class LogHead(unittest.TestCase):
@@ -938,6 +1081,30 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("queue 175.2", out)
         self.assertIn("CAPACITY", out)
 
+    def test_a_failed_acquire_in_the_last_three_hours_breaches_on_its_own(self):
+        """The requirement from #2747: runs refused a project on an afternoon
+        whose percentiles never moved, and the check said OK. Real artifacts
+        of two of them, with the pool as Boskos reported it: full, two
+        projects held by hand for a repair, one lease nobody is running."""
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("LEASE FAILED: 2 run(s)", out)
+        self.assertIn("PR 2703    build 2108249555685347328", out)
+        self.assertIn("CAPACITY", out)
+        self.assertIn("out of rotation: rebuilding 2", out)
+        self.assertIn("held by hand: hangdng-rebuild (2)", out)
+        leaks = out.split("held by runs Deck does not know about")[1].split("\n\n")[0]
+        self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", leaks)
+        self.assertNotIn("ci-kube-agents-eval-next", leaks, "a running periodic is not a leak")
+        self.assertNotIn("hangdng-rebuild", leaks, "a hand hold is not a leak")
+
+    def test_a_failed_acquire_older_than_three_hours_is_history_not_a_breach(self):
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF + timedelta(hours=3),
+                        window_days=1)
+        self.assertEqual(pp.EXIT_OK, code)
+        self.assertIn("WITHIN THRESHOLD", out)
+        self.assertNotIn("LEASE FAILED", out)
+
     def test_a_quiet_day_is_green_and_reports_no_leaks(self):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_OK, code)
@@ -1055,11 +1222,41 @@ class JsonOutput(unittest.TestCase):
         payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         self.assertEqual(
             set(payload["recent"]),
-            {"hours", "window_start", "runs", "judged", "p50_minutes", "p95_minutes", "worst_minutes"},
+            {"hours", "window_start", "runs", "lease_failures", "judged",
+             "p50_minutes", "p95_minutes", "worst_minutes"},
         )
         self.assertEqual(payload["recent"]["hours"], pp.RECENT_WINDOW_HOURS)
         self.assertFalse(payload["recent"]["judged"], "nothing ran in the fixture's last three hours")
         self.assertIn("last 3h", payload["report"])
+
+    def test_lease_failures_hand_holds_and_states_reach_the_payload(self):
+        # The health bot reads these three top-level fields and the recent
+        # count; the day rows carry the failures so the trend keeps them.
+        payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(
+            [("2108249555685347328", "2703", "2026-10-08T17:34:26Z", True),
+             ("2108248670569762816", "2712", "2026-10-08T17:30:56Z", True)],
+            [(f["build_id"], f["pull"], f["lease_requested"], f["recent"])
+             for f in payload["lease_failures"]],
+        )
+        self.assertEqual({"hangdng-rebuild": 2}, payload["held_by_hand"])
+        self.assertEqual({"busy": 3, "rebuilding": 2}, payload["states"])
+        self.assertEqual(2, payload["recent"]["lease_failures"])
+        self.assertEqual(2, payload["trend"]["lease_failures"])
+        self.assertEqual((1, 2), (payload["trend"]["days"][0]["runs"],
+                                  payload["trend"]["days"][0]["lease_failures"]))
+        self.assertEqual(["pull-kube-agents-smoke-test-2108220000000000000"],
+                         payload["leaked_leases"])
+        self.assertEqual(pp.CAUSE_CAPACITY, payload["cause"])
+
+    def test_an_unread_pool_leaves_the_holds_and_states_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            payload = self._payload(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertIsNone(payload["held_by_hand"])
+        self.assertIsNone(payload["states"])
+        self.assertEqual(pp.CAUSE_UNKNOWN, payload["cause"])
 
     def test_a_quiet_payload_says_so_without_a_cause_of_capacity(self):
         payload = self._payload(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
@@ -1177,13 +1374,34 @@ class JunitOutput(unittest.TestCase):
         prop = case.find(f"properties/property[@name='{pp.JUNIT_METRIC_PROPERTY}']")
         return None if prop is None else prop.get("value")
 
-    def test_the_file_is_a_testsuite_of_the_five_rows_in_order(self):
+    def test_the_file_is_a_testsuite_of_the_eight_rows_in_order(self):
         _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         self.assertEqual("testsuite", root.tag)
         self.assertEqual(pp.JUNIT_SUITE_NAME, root.get("name"))
         self.assertEqual(list(pp.JUNIT_ROW_NAMES),
                          [case.get("name") for case in root.findall("testcase")])
-        self.assertEqual("5", root.get("tests"))
+        self.assertEqual("8", root.get("tests"))
+
+    def test_the_lease_failure_hold_and_rotation_rows_carry_their_counts(self):
+        code, root = self._junit(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_HELD_BY_HAND]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_OUT_OF_ROTATION]))
+        self.assertIn("2 run(s)", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
+
+    def test_the_two_pool_rows_are_skipped_when_boskos_was_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            _, root = self._junit(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
+                         "the failures come from the trend, which was read")
+        for name in (pp.JUNIT_ROW_HELD_BY_HAND, pp.JUNIT_ROW_OUT_OF_ROTATION):
+            self.assertIsNotNone(rows[name].find("skipped"), name)
+            self.assertIsNone(self._value(rows[name]), name)
 
     def test_a_breach_fails_the_verdict_row_and_carries_the_numbers(self):
         code, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
@@ -1261,7 +1479,7 @@ class JunitOutput(unittest.TestCase):
         self.assertIn("boskos.json", pool_skip.get("message"))
         self.assertIsNone(self._value(rows[pp.JUNIT_ROW_QUEUE]))
         self.assertIsNone(self._value(rows[pp.JUNIT_ROW_FREE]))
-        self.assertEqual("2", root.get("skipped"))
+        self.assertEqual("4", root.get("skipped"), "the queue row and the three pool rows")
         self.assertEqual("BREACH (UNKNOWN)",
                          rows[pp.JUNIT_ROW_VERDICT].find("failure").get("message"))
 
@@ -1493,9 +1711,13 @@ class PublishedInterface(unittest.TestCase):
         self.assertEqual("setup p95 minutes", pp.JUNIT_ROW_P95)
         self.assertEqual("longest live queue minutes", pp.JUNIT_ROW_QUEUE)
         self.assertEqual("free pool projects", pp.JUNIT_ROW_FREE)
+        self.assertEqual("recent lease failures", pp.JUNIT_ROW_LEASE_FAILURES)
+        self.assertEqual("projects held by hand", pp.JUNIT_ROW_HELD_BY_HAND)
+        self.assertEqual("projects out of rotation", pp.JUNIT_ROW_OUT_OF_ROTATION)
         self.assertEqual(
             ("pool pressure within threshold", "setup p50 minutes", "setup p95 minutes",
-             "longest live queue minutes", "free pool projects"),
+             "longest live queue minutes", "free pool projects", "recent lease failures",
+             "projects held by hand", "projects out of rotation"),
             pp.JUNIT_ROW_NAMES,
         )
 

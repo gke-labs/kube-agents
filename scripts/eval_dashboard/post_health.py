@@ -384,6 +384,10 @@ def pool_advisable(pool: dict, drained: bool = False) -> bool:
     """
     if pool.get("verdict") != POOL_BREACH:
         return True
+    # A refused acquire is a backlog that has already cost a run: nothing is
+    # queued because the runs that would be waiting died at the lease.
+    if pool.get("lease_failures"):
+        return True
     live = pool.get("waiting_now")
     return live is True or (live is None and not drained)
 
@@ -846,6 +850,14 @@ def pool_numbers(pool: dict) -> list[str]:
     return lines
 
 
+def pool_refusals(pool: dict) -> str:
+    """`2 runs refused a project in the last 3h`, the periodic's third trigger."""
+    refused = pool.get("lease_failures") or 0
+    hours = pool.get("lease_failures_hours")
+    stretch = f" in the last {hours}h" if hours else ""
+    return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
+
+
 def pool_cause_text(pool: dict) -> str:
     """What to do, by cause. The four remedies differ and one of them spends
     money, so an unrecognised cause falls through to the message that asks for
@@ -857,9 +869,11 @@ def pool_cause_text(pool: dict) -> str:
         # assert one from a verdict up to a week old, and under the limit there
         # may be no run queued at all.
         queuing = " and runs are queuing" if pool.get("waiting_now") else ""
+        held = f", {pool['held_by_hand']} held by hand" if pool.get("held_by_hand") else ""
+        refused = f"; {pool_refusals(pool)}" if pool.get("lease_failures") else ""
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"
-            f"{queuing}. Consider onboarding a project."
+            f"{held}{queuing}{refused}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
         return (
@@ -1365,6 +1379,8 @@ def pool_digest_line(pool: dict) -> str:
     # waiting would be wrong on most mornings of most episodes.
     cleared = "" if live is not False else " No backlog right now."
     span = pool_span(pool)
+    if not span and pool.get("lease_failures"):
+        return f"{headline} — {pool_refusals(pool)}.{cleared}"
     if not span:
         waiting = pool.get("over_threshold") or 0
         return (

@@ -294,9 +294,10 @@ Runs still pass; /retest makes the queue longer.
 ```
 
 Those are the numbers the verdict was reached on. The periodic breaches on a
-day's row or on runs queued past p95 right now, never on the seven-day window,
-which one bad day leaves inside its own limit. A breach on only one of the two
-carries only that line.
+day's row, on runs queued past p95 right now, or on a run refused a project by
+Boskos in the last three hours; never on the seven-day window, which one bad
+day leaves inside its own limit. A breach on only one of the three carries only
+that line.
 
 The stretch quoted is the last three hours, not the worst day, which a
 week-long verdict leaves up to six days older than the incident. The three
@@ -305,9 +306,11 @@ day's row needs; otherwise the worst day is what is left to show, and the label
 says which it was.
 
 A ⏳ also needs a run that has been waiting past the p50 limit at the moment of
-the reading. Not the p95 limit, because a pool full all afternoon with every
-run waiting half an hour is the case this message is for; and not any queued
-run at all, because one triggered seconds ago is not a backlog. The remedy is
+the reading, or a refused acquire in the last three hours, which is a backlog
+that has already cost a run and leaves nothing queued to see. Not the p95
+limit, because a pool full all afternoon with every run waiting half an hour is
+the case this message is for; and not any queued run at all, because one
+triggered seconds ago is not a backlog. The remedy is
 recomputed hourly from a live count of leased projects while the verdict stands
 for a week, so a pool that filled on Monday and drained by Tuesday would
 otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The

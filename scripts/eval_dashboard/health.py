@@ -1590,12 +1590,31 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
         "free": pool.get("free"),
         "total": pool.get("total"),
+        # The periodic's third trigger and what it names: runs refused a
+        # project in its recent window, and the projects a person holds. None
+        # from an artifact written before the fields existed.
+        "lease_failures": _count(recent.get("lease_failures")),
+        "lease_failures_hours": _count(recent.get("hours")),
+        "held_by_hand": _held_count(artifact.get("held_by_hand")),
         "cause": artifact.get("cause"),
         # The cap the newest run in the window ran under. Only the
         # CONCURRENCY_CAP message quotes it, and without it that message
         # cannot say what to raise the cap from.
         "max_concurrency": artifact.get("max_concurrency"),
     }
+
+
+def _count(value) -> int | None:
+    """A non-negative integer from the artifact, or None for anything else."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _held_count(held) -> int | None:
+    """How many projects `held_by_hand` (owner to count) adds up to."""
+    if not isinstance(held, dict):
+        return None
+    counts = [_count(v) for v in held.values()]
+    return None if any(c is None for c in counts) else sum(counts)
 
 
 def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
@@ -1649,6 +1668,8 @@ def pool_evidence(pool: dict) -> str:
     # the breach that most wants explaining. Say the wait and stop.
     counted = pool["free"] is not None and pool["total"] is not None
     projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
+    if counted and pool.get("held_by_hand"):
+        projects += f", {pool['held_by_hand']} held by hand"
     return f"backed-up pool: {pool_measurement(pool)}{projects}"
 
 
@@ -1687,7 +1708,12 @@ def pool_measurement(pool: dict) -> str:
             f"{pool['over_threshold']} run{'' if pool['over_threshold'] == 1 else 's'}"
             f" waiting now past {minutes_text(pool['threshold_p95_s'])} min"
         )
-    # A BREACH always has one or the other; this is what a contract violation
+    refused = pool.get("lease_failures")
+    if refused:
+        hours = pool.get("lease_failures_hours")
+        stretch = f" in the last {hours}h" if hours else ""
+        parts.append(f"{refused} run{'' if refused == 1 else 's'} refused a project{stretch}")
+    # A BREACH always has one of the three; this is what a contract violation
     # reads as, rather than a sentence with a blank in it.
     return "; ".join(parts) or "the periodic reported a breach with no measured stretch and no live queue"
 
