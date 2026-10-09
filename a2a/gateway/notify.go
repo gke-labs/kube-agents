@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +78,17 @@ const (
 	notifyConversationRefused = "not a live conversation with that context"
 )
 
+// notifyMentionPattern and notifyMentionElements are what blocksMention
+// refuses: the mrkdwn spellings that ping (<!channel>, <!here>, <!everyone>,
+// <!subteam^…>, <@U…> or <@W…>), the bare broadcast words a mrkdwn text
+// object without verbatim may parse into one, matched as whole words in any
+// case (so @channel-ops, oncall@here.example and <!date^…> pass), and the
+// rich_text element types that ping.
+var (
+	notifyMentionPattern  = regexp.MustCompile(`(?i)<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]*>|<@[UW][A-Z0-9]+(?:\|[^>]*)?>|(?:^|[^\w@.-])@(?:here|channel|everyone)(?:$|[^\w@.-])`)
+	notifyMentionElements = []string{"broadcast", "user", "usergroup"}
+)
+
 // NotifyConversations is the gateway's side of a request aimed at a
 // conversation rather than the home channel: the context id of the
 // conversation's session record ("" when it has none), and a post into it
@@ -86,10 +99,17 @@ type NotifyConversations interface {
 }
 
 // notifyPoster is the backend half: post text into a space, new thread or
-// reply, and say where it landed. GoogleChatAdapter.PostNotify is the one
-// implementation.
+// reply, and say where it landed. GoogleChatAdapter and SlackAdapter
+// implement it; the Notifier, not the poster, holds the home-only bound.
 type notifyPoster interface {
 	PostNotify(space, thread, text string) (message, landed string, err error)
+}
+
+// notifyBlocksPoster is the optional half a backend that renders Block Kit
+// adds: one message, blocks with text as the fallback. SlackAdapter is the
+// one implementation; a request with blocks to any other backend is refused.
+type notifyBlocksPoster interface {
+	PostNotifyBlocks(home, thread, text string, blocks json.RawMessage) (message, landed string, err error)
 }
 
 // Notifier answers chat.notify requests for one backend.
@@ -97,6 +117,16 @@ type Notifier struct {
 	subject string
 	home    string
 	poster  notifyPoster
+	// threadOK is the backend's test that a requested thread may be
+	// replied on. The home channel is the bound either way: Chat's thread
+	// names its space, so it is checked against the home space (inHome);
+	// Slack's is "<channel>/<ts>", checked against the home channel, or a
+	// bare ts, which names no channel and is always posted into home
+	// (slackThreadOK).
+	threadOK func(string) bool
+	// threadTS turns an admitted thread into the one the poster takes (Slack's
+	// channel-qualified thread to its bare ts); nil leaves it as it is.
+	threadTS func(string) string
 	// convPrefix is the conversation-key prefix of this backend, and conv
 	// the gateway's conversations; nil leaves conversation requests refused.
 	convPrefix string
@@ -123,8 +153,30 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log,
-		convPrefix: gchatKeyPrefix}, nil
+	n := &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log,
+		convPrefix: gchatKeyPrefix}
+	n.threadOK = n.inHome
+	return n, nil
+}
+
+// NewSlackNotifier builds the Slack notifier. home is the configured home
+// channel's id ("C0123" or a private channel's "G0123"), or "" when there is
+// none, which leaves the route serving conversation requests only; anything
+// else is refused here, at start. A reply thread is a thread root's ts and
+// names no channel, so the notifier posts every home request into home: the
+// channel is the whole authority bound, and a ts from some other channel can
+// only ever thread (or fail to thread) inside home.
+func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Notifier, error) {
+	if home != "" && !slackIsHomeChannelID(home) {
+		return nil, fmt.Errorf("notify: home channel %q is not a Slack channel id (C... or G...)", home)
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	n := &Notifier{subject: lib.NotifySubjectSlack, home: home, poster: poster, log: log,
+		convPrefix: slackKeyPrefix}
+	n.threadOK, n.threadTS = n.slackThreadOK, slackThreadTS
+	return n, nil
 }
 
 // SetConversations arms requests aimed at a conversation the gateway holds.
@@ -337,8 +389,26 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	if n.home == "" {
 		return refuse(notifyNoHome)
 	}
-	if req.Thread != "" && !n.inHome(req.Thread) {
+	if req.Thread != "" && !n.threadOK(req.Thread) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
+	}
+	if req.Thread != "" && n.threadTS != nil {
+		req.Thread = n.threadTS(req.Thread)
+	}
+	if len(req.Blocks) > 0 {
+		if _, ok := n.poster.(notifyBlocksPoster); !ok {
+			return refuse("this backend posts text only; send the request without blocks")
+		}
+		var blocks []any
+		if err := json.Unmarshal(req.Blocks, &blocks); err != nil || len(blocks) == 0 {
+			return refuse("blocks must be a non-empty JSON array of Block Kit blocks")
+		}
+		if why := blocksMention(blocks); why != "" {
+			return refuse("blocks carry a mention (" + why + "); the notify route posts no mentions, send them as text")
+		}
+		if kind := blocksInteractive(blocks); kind != "" {
+			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers no clicks, so strip it")
+		}
 	}
 	return req, nil
 }
@@ -365,6 +435,11 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 	if req.Conversation == "" || req.ContextID == "" {
 		return refuse("a conversation request needs both the conversation and its context id")
 	}
+	if len(req.Blocks) > 0 {
+		// Raw blocks are for home-channel posts; a conversation post carries
+		// its layout in the request's chat field, which the gateway renders.
+		return refuse("a conversation request carries no blocks")
+	}
 	if !strings.HasPrefix(req.Conversation, n.convPrefix) || len(req.Conversation) == len(n.convPrefix) {
 		return refuse(fmt.Sprintf("conversation %q is not on this route's backend", req.Conversation))
 	}
@@ -388,6 +463,13 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
 func (n *Notifier) post(job notifyJob) {
+	// A conversation request never carries blocks (validateConversation),
+	// and postBlocks posts only into home, so the conversation test goes
+	// first: the order is a second guard, not the only one.
+	if len(job.req.Blocks) > 0 && job.req.Conversation == "" {
+		n.postBlocks(job)
+		return
+	}
 	thread := job.req.Thread
 	if job.req.Conversation != "" {
 		thread = job.req.Conversation
@@ -419,6 +501,109 @@ func (n *Notifier) post(job notifyJob) {
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
+}
+
+// blocksMention reports a mention anywhere in decoded Block Kit, or "": a
+// mrkdwn token that pings (<!channel>, <!here>, <!everyone>, <!subteam^…>,
+// <@U…>) in any string, or a rich_text element that does (broadcast, user,
+// usergroup). The text path escapes < and > so none of these can render
+// (toMrkdwn); blocks are posted as Block Kit, so the same bound is a refusal
+// instead, and the caller falls back to the escaped text. A link (<https://…>)
+// is not a mention and passes.
+func blocksMention(v any) string {
+	switch node := v.(type) {
+	case string:
+		if m := notifyMentionPattern.FindString(node); m != "" {
+			return strings.TrimSpace(m)
+		}
+	case []any:
+		for _, item := range node {
+			if why := blocksMention(item); why != "" {
+				return why
+			}
+		}
+	case map[string]any:
+		if kind, _ := node["type"].(string); slices.Contains(notifyMentionElements, kind) {
+			return "a " + kind + " element"
+		}
+		for _, item := range node {
+			if why := blocksMention(item); why != "" {
+				return why
+			}
+		}
+	}
+	return ""
+}
+
+// notifyInteractiveTypes are the block and element types a click or an
+// entry arrives from. The gateway acks no interactive envelope, so a click
+// on one would time out for the user; validate refuses them rather than
+// trusting the sender to strip them.
+var notifyInteractiveTypes = []string{
+	"actions", "input", "button", "overflow", "checkboxes", "radio_buttons",
+	"datepicker", "timepicker", "datetimepicker", "plain_text_input",
+	"static_select", "external_select", "users_select", "conversations_select", "channels_select",
+	"multi_static_select", "multi_external_select", "multi_users_select",
+	"multi_conversations_select", "multi_channels_select",
+}
+
+// blocksInteractive is the first interactive block or element type in v, or
+// "" when there is none.
+func blocksInteractive(v any) string {
+	switch node := v.(type) {
+	case []any:
+		for _, item := range node {
+			if kind := blocksInteractive(item); kind != "" {
+				return kind
+			}
+		}
+	case map[string]any:
+		if kind, _ := node["type"].(string); slices.Contains(notifyInteractiveTypes, kind) {
+			return kind
+		}
+		for _, item := range node {
+			if kind := blocksInteractive(item); kind != "" {
+				return kind
+			}
+		}
+	}
+	return ""
+}
+
+// slackThreadOK admits a Slack reply thread: "<channel>/<ts>" when channel
+// is home, or a bare ts. A bare ts names no channel, so it can only ever
+// thread (or fail to thread) inside home; the qualified form is what a sender
+// that knows the thread's channel sends, so a thread from a DM or another
+// channel is refused rather than posted into home.
+func (n *Notifier) slackThreadOK(thread string) bool {
+	channel, ts, qualified := strings.Cut(thread, "/")
+	if !qualified {
+		return slackIsTS(thread)
+	}
+	return channel == n.home && slackIsTS(ts)
+}
+
+// slackThreadTS is the ts of an admitted Slack thread, qualified or bare.
+func slackThreadTS(thread string) string {
+	if _, ts, qualified := strings.Cut(thread, "/"); qualified {
+		return ts
+	}
+	return thread
+}
+
+// postBlocks writes a Block Kit request as one message: blocks are not
+// chunked, so the text is only the notification and fallback, cut to one
+// chunk. validate has already refused blocks to a backend without them.
+func (n *Notifier) postBlocks(job notifyJob) {
+	poster := n.poster.(notifyBlocksPoster)
+	message, landed, err := poster.PostNotifyBlocks(n.home, job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks)
+	if err != nil {
+		n.log.Error("notify blocks post failed", "home", n.home, "thread", job.req.Thread, "err", err)
+		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+		return
+	}
+	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
+	n.log.Info("notify posted", "home", n.home, "thread", landed, "message", message, "blocks", true)
 }
 
 // inHome reports whether thread is a thread resource of the home space

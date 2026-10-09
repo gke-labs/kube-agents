@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,9 @@ import (
 // slackDMPrefix marks a DM conversation key. The whole DM is the session,
 // like Discord's — "a DM, or a thread in a group space" (gateway design).
 const slackDMPrefix = "slack:dm/"
+
+// slackKeyPrefix begins every Slack conversation key.
+const slackKeyPrefix = "slack:"
 
 // slackSeenCap bounds the at-least-once dedupe ring: Socket Mode redelivers
 // unacked envelopes, so delivered (channel, ts) pairs are remembered and
@@ -113,6 +117,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
+	// the prefix letter and at least two characters after it.
+	slackMinChannelIDLen = 3
 )
 
 // Slack token prefixes, checked at construction so a swapped pair fails at
@@ -452,11 +459,16 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// slash_commands and interactive carry a real, non-empty one
 				// that this continue throws away.
 				//
-				// Which is fine only because the app subscribes to neither,
-				// so neither ever arrives. Turning on slash commands or
-				// interactivity means acking them here first: Slack wants the
-				// envelope acked inside three seconds, and an unacked one
-				// redelivers and shows the user a timeout.
+				// The same app serves the legacy consumer under today, which
+				// does answer interactions, so an install may well have
+				// interactivity on and these envelopes do arrive. Nothing the
+				// gateway posts carries an interactive element - the agent
+				// sends the audit card through the notify route with its
+				// buttons removed - so the only clicks that land here are on
+				// messages posted under today. Answering interactions means
+				// acking them here first: Slack wants the envelope acked
+				// inside three seconds, and an unacked one redelivers and
+				// shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -576,6 +588,93 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
 	return ts, err
+}
+
+// PostNotify writes text into channel, top-level when thread is empty or as a
+// reply on thread (a thread root's ts), and returns the posted message's ts
+// and the thread it landed in: the given one, or the new message's own ts,
+// which is the root a later notify replies on. It is Post for a caller with
+// no conversation key (the chat.notify route, notify.go); it refuses a channel
+// that is not a C/G channel id, and the Notifier is what keeps it to home.
+func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	// No link or media previews: an alert's console links would each unfurl
+	// into a card (Post makes the same choice, #2820).
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// PostNotifyBlocks is PostNotify for a Block Kit message: blocks as given,
+// text as the notification and fallback. The blocks are decoded into
+// slack-go's types to be sent; one it does not know travels as Slack wrote
+// it, and Slack's own refusal (invalid_blocks) comes back as the error.
+func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	var blocks slack.Blocks
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", "", fmt.Errorf("slack: blocks: %w", err)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false), slack.MsgOptionBlocks(blocks.BlockSet...),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// slackIsHomeChannelID reports a public ("C...") or private ("G...")
+// channel id: a prefix letter and upper-case letters or digits after it. A
+// DM ("D...") is not a home channel.
+func slackIsHomeChannelID(id string) bool {
+	if len(id) < slackMinChannelIDLen || (id[0] != 'C' && id[0] != 'G') {
+		return false
+	}
+	for _, r := range id[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// slackIsTS reports a Slack message ts: digits, one dot, digits.
+func slackIsTS(ts string) bool {
+	secs, frac, ok := strings.Cut(ts, ".")
+	return ok && allDigits(secs) && allDigits(frac)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Edit replaces a previously posted message — the rolling progress line.

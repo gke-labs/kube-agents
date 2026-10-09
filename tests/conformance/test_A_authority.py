@@ -997,13 +997,15 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         )
 
     NOTIFY_PROBE = "chat.notify.gchat"
+    NOTIFY_SLACK_PROBE = "chat.notify.slack"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
     def test_A3_a_notify_has_one_writer_and_its_answer_has_one(self) -> None:
         """The chat.notify route: only the agent asks, only the gateway answers.
 
-        The gateway posts what arrives on `chat.notify.gchat` to the home
-        channel as the install's bot, so a second writer there is a second
+        The gateway posts what arrives on `chat.notify.gchat` (or, on a
+        Slack-armed gateway, `chat.notify.slack`) to the home channel as the
+        install's bot, so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer
         as the gateway's word on where the post landed, so a second writer on
         the reply namespace -- the agent itself included -- can forge it. The
@@ -1011,7 +1013,11 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         either subject.
         """
         grants = self._rendered_publish_grants()
-        for probe, want in ((self.NOTIFY_PROBE, ["agent"]), (self.NOTIFY_REPLY_PROBE, ["gateway"])):
+        for probe, want in (
+            (self.NOTIFY_PROBE, ["agent"]),
+            (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_REPLY_PROBE, ["gateway"]),
+        ):
             writers = sorted(
                 builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
             )

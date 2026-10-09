@@ -285,6 +285,26 @@ class SendTest(unittest.TestCase):
         self.assertEqual(posted, [(adapter, "[kanban] t_1 blocked", "a2a-ctx-1")])
         self.assertTrue(event._gateway_accepted)
 
+    def test_a_slack_thread_goes_out_qualified_by_its_channel(self):
+        # A Slack ts names no channel; the card's own channel rides with it so
+        # the gateway can refuse a DM's or another channel's thread rather than
+        # post it into home.
+        adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.SLACK, _Runner())
+        calls = []
+
+        async def fake_exec(*argv, **kwargs):
+            calls.append(argv)
+            return _Proc(0, b'{"message_id":"m1","thread_id":"1.2"}', b"")
+
+        with mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            sent = asyncio.run(adapter.send("D0DM", "- done", metadata={"thread_id": "1700000000.000100"}))
+            unsent = asyncio.run(adapter.send("", "- done", metadata={"thread_id": "1700000000.000100"}))
+        self.assertTrue(sent.success)
+        argv = list(calls[0])
+        self.assertEqual(argv[argv.index("--thread") + 1], "D0DM/1700000000.000100")
+        self.assertFalse(unsent.success)
+        self.assertEqual(len(calls), 1, "a Slack thread with no channel was sent")
+
     def test_no_thread_is_a_new_thread(self):
         _, calls = self._send(0, b"{}")
         self.assertNotIn("--thread", calls[0][0])

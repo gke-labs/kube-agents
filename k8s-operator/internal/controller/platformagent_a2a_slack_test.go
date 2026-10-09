@@ -665,6 +665,101 @@ func TestRotatingTheDiscordTokenRollsTheGatewayToo(t *testing.T) {
 	}
 }
 
+// TestTheSlackHomeChannelReachesTheArmedGateway: the chat.notify route's
+// Slack arm posts to slack.homeChannel, so a Slack-armed gateway carries it,
+// trimmed; an install with no home channel renders none, and its route then
+// serves conversation requests only.
+func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name, home, want string
+		present          bool
+	}{
+		{"set", "C0HOME", "C0HOME", true},
+		{"padded", "  C0HOME ", "C0HOME", true},
+		{"unset", "", "", false},
+		{"blank", "   ", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", true)
+			agent.Spec.Integration.Slack.HomeChannel = tc.home
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aSlackHomeChannelEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (present=%v), want %q (present=%v)", a2aSlackHomeChannelEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+	// Chat wins the single-backend gateway: with both enabled, Slack is not
+	// the gateway's backend and its home channel is not rendered there.
+	both := chatAndSlackTestAgent("next")
+	both.Spec.Integration.Slack.HomeChannel = "C0HOME"
+	if _, ok := envMapOf(buildA2AGatewayDeployment(both).Spec.Template.Spec.Containers[0].Env)[a2aSlackHomeChannelEnvVar]; ok {
+		t.Errorf("%s rendered on a gateway Chat holds", a2aSlackHomeChannelEnvVar)
+	}
+}
+
+// TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed: the agent is told
+// to route Slack's proactive posts through chat.notify exactly when the
+// gateway holds Slack AND the home channel is a channel id, and the kanban
+// notifier to send a card's report back to its conversation whenever the
+// gateway arms Slack's route (home channel unset or a channel id). Otherwise
+// posts would go to a subject nobody answers. Chat holding the gateway routes
+// Chat, never both.
+func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
+	withSlackHome := func(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
+		agent.Spec.Integration.Slack.HomeChannel = home
+		return agent
+	}
+	for _, tc := range []struct {
+		name               string
+		agent              *agentv1alpha1.PlatformAgent
+		home, conversation bool
+	}{
+		{"today with slack and home", withSlackHome(slackTestAgent("", true), "C0HOME"), false, false},
+		{"skew with slack and home", withSlackHome(slackTestAgent("later", true), "C0HOME"), false, false},
+		{"next with slack, public channel", withSlackHome(slackTestAgent("next", true), "C0HOME"), true, true},
+		{"next with slack, private channel", withSlackHome(slackTestAgent("next", true), "G0PRIV"), true, true},
+		{"next with slack, no home channel", slackTestAgent("next", true), false, true},
+		{"next with slack, a DM", withSlackHome(slackTestAgent("next", true), "D0DM"), false, false},
+		{"next with slack, a name", withSlackHome(slackTestAgent("next", true), "#ops"), false, false},
+		{"next without slack", withSlackHome(slackTestAgent("next", false), "C0HOME"), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
+			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+				got, ok := env[name]
+				if ok != want {
+					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				}
+				if ok && got.Value != a2aNotifyPlatformSlack {
+					t.Errorf("%s = %q, want %q", name, got.Value, a2aNotifyPlatformSlack)
+				}
+			}
+			if (tc.home || tc.conversation) && legacySlackConsumer(tc.agent) {
+				t.Error("the notify route and the legacy Hermes slack platform both render")
+			}
+			// The audit relay reads the home channel from the agent's env; under
+			// next it rides with the home route, trimmed and validated.
+			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
+				t.Errorf("SLACK_HOME_CHANNEL = %q (present=%v), want the home channel id beside %s", home.Value, ok, a2aNotifyPlatformEnvVar)
+			}
+		})
+	}
+	// Chat holds the gateway when both are enabled: the agent is routed to
+	// Chat on both variables, never to Slack.
+	both := chatAndSlackTestAgent("next")
+	both.Spec.Integration.Slack.HomeChannel = "C0HOME"
+	both.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAAA"
+	env := envMapOf(brokerContainerNamed(buildPodTemplateSpec(both, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)
+	for _, name := range []string{a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
+		if got := env[name].Value; got != a2aNotifyPlatformGchat {
+			t.Errorf("Chat and Slack: %s = %q, want %q", name, got, a2aNotifyPlatformGchat)
+		}
+	}
+}
+
 // TestDisablingSlackScalesTheArmedGatewayToZero: Slack is the only backend
 // of a running gateway, and the admin disables it on the CR. The gateway
 // takes the dark path every other last-backend loss takes (#2481): the same
