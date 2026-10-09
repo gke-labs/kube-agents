@@ -1709,9 +1709,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(row["age_proof"], {"what": "Available=False", "since": "2026-09-08T00:00:00Z"})
         self.assertIn("; owner proves age: Available=False since 2026-09-08T00:00:00Z", row["classifications"][0]["evidence"])
         self.assertTrue(next(i for i in result["sections"]["warnings"] if i["object"] == PAYMENTS)["predates_upgrade"])
-        # With no False condition, the newest ReplicaSet's creation is the proof the owner can offer.
+        # With no False condition the owner proves nothing; its ReplicaSet's age is not proof.
         payments["status"] = {"conditions": [{"type": "Available", "status": "True", "lastTransitionTime": "2026-10-01T00:00:00Z"}]}
-        self.assertEqual(ur.owner_age_proofs(workloads, READS["seeded-a"]["owners"])[PAYMENTS], ("current ReplicaSet created", "2026-09-25T17:02:46Z"))
+        self.assertNotIn(PAYMENTS, ur.owner_age_proofs(workloads))
+        self.assertEqual(ur.owner_rollouts(READS["seeded-a"]["owners"])[PAYMENTS], "2026-09-25T17:02:46Z")
         # An Available=False transition inside the window (a probe-less loop's) proves nothing.
         payments["status"] = {"conditions": [{"type": "Available", "status": "False", "lastTransitionTime": "2026-10-08T17:24:34Z"}]}
         with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "workloads": workloads}}):
@@ -1721,9 +1722,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(row["age_proof"], {"what": "Available=False", "since": "2026-10-08T17:24:34Z"})
         self.assertEqual((row["predates_upgrade"], row.get("recreated_only")), (False, True))
 
-    def test_available_deployment_with_an_old_replicaset_proves_age(self):
+    def test_available_deployment_with_an_old_replicaset_has_no_owner_evidence(self):
         # Four replicas; one OOM-killed on a node the default-pool drain rebuilt; conditions True; ReplicaSet months
-        # old. The recreation carries the crash over, and the old ReplicaSet is the owner's proof that it is old.
+        # old. A pod can run for months on an old ReplicaSet and fail only on the rebuilt node: no proof of age.
         def fleet_reads(created, ready_at):
             dep = {"kind": "Deployment", "metadata": {"name": "api-fleet", "namespace": "seeded-debug"}, "spec": {"replicas": 4, "template": {"metadata": {"labels": {"app": "api-fleet"}}, "spec": {"containers": [{"name": "api", "image": "eclipse-temurin:8u302-jre"}]}}}, "status": {"conditions": [{"type": "Available", "status": "True", "lastTransitionTime": "2026-07-01T00:10:00Z"}, {"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable", "lastTransitionTime": "2026-07-01T00:10:00Z"}]}}
             rs = {"kind": "ReplicaSet", "metadata": {"name": "api-fleet-5d8f9c7b6", "namespace": "seeded-debug", "creationTimestamp": "2026-07-01T00:00:00Z", "ownerReferences": [{"kind": "Deployment", "name": "api-fleet"}]}}
@@ -1739,20 +1740,15 @@ class LedgerAndGuardsTest(unittest.TestCase):
         with mock.patch.dict(READS, {"seeded-a": reads}):
             first, _ = self.collect()
         row = next(s for r in first["reviews"] for s in r["what_failed"] if s["object"] == obj)
-        self.assertEqual((row["onset_source"], row["onset"], row["recreated_pods"], row.get("recreated_only"), row["predates_upgrade"]), (ur.ONSET_FROM_POD, "2026-10-07T04:05:00Z", ["api-fleet-5d8f9c7b6-k2m4p"], None, True))
-        self.assertEqual(row["age_proof"], {"what": "current ReplicaSet created", "since": "2026-07-01T00:00:00Z"})
-        self.assertEqual({(c["entry"], c["confidence"]) for c in row["classifications"]}, {(14, ur.HIGH)})
-        self.assertIn("; owner proves age: current ReplicaSet created since 2026-07-01T00:00:00Z", row["classifications"][0]["evidence"])
+        self.assertEqual((row["onset_source"], row["onset"], row["recreated_pods"], row.get("recreated_only"), row["predates_upgrade"], row["age_proof"]), (ur.ONSET_FROM_POD, "2026-10-07T04:05:00Z", ["api-fleet-5d8f9c7b6-k2m4p"], True, False, None))
+        self.assertEqual({(c["entry"], c["confidence"]) for c in row["classifications"]}, {(14, ur.MEDIUM)})
+        self.assertIn(ur.RECREATED_DETAIL, row["classifications"][0]["detail"])
+        self.assertNotIn("owner proves age", row["classifications"][0]["evidence"])
         incident = next(i for i in first["sections"]["warnings"] if i["object"] == obj)
-        self.assertTrue(incident["predates_upgrade"])
-        # Without the ReplicaSet in the owners read there is no proof: the first-run cap applies.
-        with mock.patch.dict(READS, {"seeded-a": {**reads, "owners": READS["seeded-a"]["owners"]}}):
-            with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: fresh_home, ur.STORE_HOME_ENV: fresh_home}), redirect_stderr(io.StringIO()):
-                unproven = ur.collect(args(), run=FakeFleet(), now=NOW)
-        row = next(s for r in unproven["reviews"] for s in r["what_failed"] if s["object"].endswith("api-fleet-5d8f9c7b6"))
-        self.assertEqual((row.get("recreated_only"), row["predates_upgrade"]), (True, False))
-        self.assertEqual({c["confidence"] for c in row["classifications"]}, {ur.MEDIUM})
-        # A later full run with a ReplicaSet created inside its window proves nothing: the stored set decides.
+        self.assertTrue(incident["recreated_only"])
+        self.assertFalse(incident["predates_upgrade"])
+        # A later full run whose stored set lacks it: new, and the high entry-14 signature is an Error; the
+        # in-window ReplicaSet is noted as a rollout and decides nothing.
         reads_without = {**READS["seeded-a"], "workloads": READS["seeded-a"]["workloads"] + [dep], "owners": READS["seeded-a"]["owners"] + [rs]}
         with mock.patch.dict(READS, {"seeded-a": reads_without}):
             self.collect(now=datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc))
@@ -1768,6 +1764,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         row = next(s for r in second["reviews"] for s in r["what_failed"] if s["object"] == obj)
         self.assertEqual((row["since"], row["predates_upgrade"], row.get("recreated_only")), (ur.SINCE_NEW, False, None))
         self.assertEqual({(c["entry"], c["confidence"]) for c in row["classifications"]}, {(14, ur.HIGH)})
+        self.assertIn("; rollout during the window: current ReplicaSet created 2026-10-15T09:02:00Z", row["classifications"][0]["evidence"])
         self.assertIn(obj, [i["object"] for i in second["sections"]["errors"]])
         # The same Deployment Available=False for a month: owner evidence, predates the upgrade.
         dep, rs, p = fleet_reads("2026-10-07T04:05:00Z", "2026-10-08T17:00:00Z")
