@@ -200,7 +200,10 @@ install sets, and neither of those creates a subscription for the detector to re
 default stays off and the installer is what turns it on. It is not free either, and what it costs is
 GCP resources rather than cluster resources: the subscription it reads comes with an audit log sink
 and a Pub/Sub topic, all three from the `drift-pubsub` Terraform module, and the sink exports the
-admin-activity audit records of every GKE cluster in the project. The
+admin-activity audit records of every GKE cluster in the project; on an install with a declared
+[`spec.scope`](#specscope), each project the scope lists gets a sink of its own into the same topic,
+and a change on a cluster there is enriched through that cluster's Cluster Agent profile and
+reported like one on the management cluster. The
 [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)
 composition instantiates the module when you set `enable_drift_pubsub = true`, and writes the field
 below when you set `enable_drift_detector = true` alongside it. Asking for the second without the
@@ -263,7 +266,7 @@ ownership is still read and reported, and you get the same cards without the ann
 
 Nothing else about the detector is exposed here. Which principals count as human, and which calls
 are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
-set by the Terraform module's log sink, not by the CR.
+set by the Terraform module's log sinks, not by the CR.
 
 ### `spec.harness.tuning`
 

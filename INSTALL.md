@@ -97,10 +97,11 @@ Four behaviours worth knowing before the first run:
   container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
-  reports it. It costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull
-  subscription — and it reaches past the clusters this install manages: the sink exports the
-  admin-activity audit records of every GKE cluster in the project, including clusters this
-  install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
+  reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub
+  topic and a pull subscription — and a sink in each project a declared scope lists, and it reaches
+  past the clusters this install manages: the sinks export the admin-activity audit records of
+  every GKE cluster in those projects, including clusters this install does not manage, and the
+  subscription retains a copy of them for 31 days. Opt out with
   `ENABLE_DRIFT_DETECTOR=false` in `install.env`. A first run records the
   `--enable-drift-detector=false` flag for you, because it is the run that writes that file; over
   an `install.env` that already exists the flag applies to one run and is recorded nowhere, which

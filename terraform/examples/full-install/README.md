@@ -76,7 +76,8 @@ install without the interview.
   (`stockout_pubsub_sink`), and publisher IAM binding.
 - Optionally (`enable_drift_pubsub = true`) the drift detector's audit-log
   ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
-  sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
+  sink exporting GKE audit logs (`drift_pubsub_sink`), one more in each project
+  the scope lists, the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
   (`drift_pubsub_subscription`), the sink-writer and agent-GSA IAM on
   them, and publisher on the topic for anything
@@ -567,8 +568,8 @@ subset of `read_only_roles`, intersected with the roles the host project got) in
 `scope.projects` names, and the chart renders the same object into the CR, so the IAM and the
 declaration cannot name different projects, and the release waits for the bindings. The block is
 rendered on every apply, empty lists included: an emptied `projects` list is the declaration that
-drops projects (their read roles are revoked and their Cluster Agent profiles retire over the
-reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
+drops projects (their read roles are revoked, their drift audit-log sinks are deleted behind the
+module's drain, and their Cluster Agent profiles retire over the reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
 `cluster_name` triple; neither changes IAM, except that an entry naming a Shared VPC service project
 by ID, or a monitored project by number, withholds its grant (below). Through the installer the value comes from
@@ -586,7 +587,9 @@ install also applies no CRDs: run `kubectl --context gke_<project>_<region>_<clu
 --server-side --force-conflicts -f charts/kube-agents/crds/` first, through the install's own context
 as `upgrade.sh` does, or a `spec.scope` the served schema does not know is pruned on write and, the
 release record then carrying it, never re-sent. The identity running the apply needs
-to set IAM policy in each project named. The release's dependency on the module orders creation,
+to set IAM policy in each project named, and, with `enable_drift_pubsub` on, to create a Log Router
+sink there, read the project's number and mint its Logging service agent
+([Drift audit-log ingress](#drift-audit-log-ingress) has what each listed project gets). The release's dependency on the module orders creation,
 not IAM propagation: a first install's one-shot inventory sweep may name a scoped project as
 `denied`, and the hourly reconcile creates its profiles once the grant has propagated.
 
@@ -650,7 +653,8 @@ and the chart renders the mapping into the CR as `spec.security.scopedServiceAcc
 `enabled` set from the same variable, so the broker is armed by this switch alone and never by
 declaring projects. Two clusters in one project share an account by design
 ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6).
-A container's member gets a pool account on that apply and nothing else: its grant is the
+A container's member gets a pool account on that apply and nothing else, no drift sink included
+(the ingress paragraph below says which projects get one): its grant is the
 container's, inherited, and it is not counted toward `scope.max_projects`. Pool membership under a
 container therefore lags where the grant and discovery do not: a project created beneath a declared
 folder since the last apply is discovered and readable, but refused by the broker until the next
@@ -784,29 +788,67 @@ publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
 Beyond the three names and that list, the module's two required inputs are
-passed and three more of its optional ones:
+passed and four more of its optional ones:
 `drift_pubsub_sink_writer_identity_override`, which the module's own
 postcondition tells an operator to set when a project's sink reports a writer
-identity the module did not derive, and the module's two timers —
+identity the module did not derive, the module's two timers —
 `drift_pubsub_sink_drain_duration`, the destroy-time wait below, and
-`drift_pubsub_logging_identity_propagation_duration`, the apply-time one. None
-has an installer key, so through the front doors all three are passthrough
-lines in `install.env`
+`drift_pubsub_logging_identity_propagation_duration`, the apply-time one, which
+the source sinks the scope adds share — and the per-project override the scope
+adds, described after the module's defaults. None has an installer key, so
+through the front doors all four are passthrough lines in `install.env`
 (`TF_VAR_drift_pubsub_sink_writer_identity_override`,
 `TF_VAR_drift_pubsub_sink_drain_duration`,
-`TF_VAR_drift_pubsub_logging_identity_propagation_duration`) rather than
+`TF_VAR_drift_pubsub_logging_identity_propagation_duration`,
+`TF_VAR_drift_pubsub_source_sink_writer_identity_overrides`) rather than
 entries in `terraform.tfvars`, which `write_tfvars_from_state` regenerates
 wholesale on every `install.sh` and `upgrade.sh` run — a hand-added key there
 is gone on the next one, and for the override that means the failure it
 cleared comes back. A hand-driven apply sets them in `terraform.tfvars`.
 Everything else is left to the module's defaults,
 which decide the 31-day retention and the cluster scope, every GKE cluster in
-the project; a caller that needs the module's remaining knobs instantiates it
+the project and in each project the scope lists; a caller that needs the module's remaining knobs instantiates it
 directly.
+
+The ingress follows the scope. The module's `source_projects` is fed from
+`scope_export_projects`, the projects the declaration lists in `scope` beyond
+`project_id` — `scope.projects` and the selectors' members, each less an exact
+`exclude.projects` entry, never a folder's or organisation's members, whose
+Asset-Inventory listing has no grace and would churn a sink — less
+`drift_pubsub_source_exclude_projects`, so each gets a sink of its own, in
+that project, named `drift_pubsub_sink` with `project_id` appended and routed
+into this install's topic, with that project's Logging service agent granted
+publish on the topic before the sink exists, as the host's is, and a drain of
+its own between them, so removing the project from the scope deletes its sink,
+waits, and only then revokes its grant. With no declared scope the list is
+empty and the module creates the host's trio alone.
+`drift_pubsub_source_sink_writer_identity_overrides`, a JSON object keyed by
+project ID (a string, because a `TF_VAR_` line cannot carry an HCL map and a
+blanked line has to read as no override), is the override above for a source
+project and reaches here the same way. `drift_pubsub_source_exclude_projects`,
+comma- or space-separated project IDs, keeps a listed project in the scope and
+out of the export: its clusters are still read, and no agent is minted, no
+grant made and no sink created for it. That is the lever for a project where
+the identity applying lacks what the chain needs, because Terraform stops
+scheduling new operations at the first error: the resources already running
+finish, and everything not yet started — other projects' sinks past the
+parallelism window and, on a first install, the IAM module and the chart
+release behind the cluster — waits for a second apply. The identity applying
+needs `logging.sinks.create`, the
+project's number and the Service Usage call that mints its Logging agent in
+each listed project (`roles/owner` carries them), and nothing probes for that
+before the apply: a number it cannot read fails the plan, or the apply at
+that read when the plan deferred it (a first install, or any apply that
+enables an API), and an agent or grant it cannot make stops the apply with
+the host's trio untouched and every source sink held back until the next
+apply, as
+[the module's README](../../modules/drift-pubsub/README.md#exporting-the-scopes-other-projects)
+sets out, with what the sinks leave out and whom they let publish.
 
 The module creates the sink after its publish grant and holds a wait between
 deleting the sink and deleting the topic — `drift_pubsub_sink_drain_duration`,
-two minutes by default — so that Cloud Logging never routes to a topic it
+two minutes by default; the same wait sits between a removed source project's
+sink and its grant on a scope shrink — so that Cloud Logging never routes to a topic it
 cannot reach and mails every project owner about it. That wait is why a
 destroy of this configuration pauses once the sink is gone. Raising it takes
 an apply to land before the destroy that should honour it: `time_sleep` reads
@@ -834,9 +876,11 @@ and pays the new, lower figure once — it only shortens any later one.
 [The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
 is canonical for all three orderings.
 
-Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
-`drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the
-fully-qualified path the drift detector's `--subscription` flag takes.
+Four outputs, each `null` while the flag is off: `drift_pubsub_topic`,
+`drift_pubsub_subscription`, `drift_pubsub_subscription_id`, the
+fully-qualified path the drift detector's `--subscription` flag takes, and
+`drift_pubsub_source_projects`, the scoped projects whose sinks feed the
+topic (empty with no declared scope).
 
 The subscription is the input to the drift detector of
 [`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md).
@@ -854,8 +898,8 @@ renames it would not.
 
 The two are separate variables so that a hand-driven apply can provision the
 ingress on its own, and that is the only order allowed. Turned on without the
-detector, the sink publishes every mutating call on every GKE cluster in the
-project (about 60k messages a day after the module's lease filter, per its
+detector, the sinks publish every mutating call on every GKE cluster in the
+project and in each project the scope lists (about 60k messages a day after the module's lease filter, per its
 README) into a subscription that retains them for 31 days and never expires:
 Pub/Sub storage cost and a backlog until the detector is enabled. The reverse
 is refused — a `helm_release` precondition fails the apply when
@@ -884,7 +928,9 @@ install's live trio, and since `ENABLE_DRIFT_DETECTOR` became an install
 default it is every second install in a project that arrives at that
 ambiguity rather than only one that asked for the feature. The refusal names
 the four ways out; [Remote state](#remote-state) has them, and the cost of
-getting it wrong.
+getting it wrong. It probes the host project alone: on a scoped install the
+source sinks in the listed projects are not checked, and the refusal says how
+to import one left there before applying.
 
 Through the installer front doors the two variables are one `install.env` key,
 `ENABLE_DRIFT_DETECTOR`, and it defaults to `true`: an install that says nothing
@@ -895,7 +941,7 @@ reachable on its own as a `TF_VAR_enable_drift_pubsub=true` line in
 `install.env`, the same channel `agent_ksa_name` uses (every front door sources
 that file with `set -a`, and Terraform reads `TF_VAR_*` where the generated file
 is silent), and a tfvars key beats `TF_VAR_`: a written `false` would override
-such an install and plan its sink, topic and subscription — with up to 31 days
+such an install and plan its sinks, topic and subscription — with up to 31 days
 of retained audit records nothing has acknowledged — for removal under
 `-auto-approve`, from a release note nobody read. Omission is what leaves it
 alone.
@@ -977,7 +1023,7 @@ What each one does that raw Terraform cannot:
 | The helm provider reports a release destroyed when it cannot reach the cluster                           | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched |
 | A Pub/Sub topic or subscription that already exists makes the create 409                                 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                       |
 | The stockout topic, subscription and sink survive a partial teardown and 409 the same way                | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                                  |
-| The drift trio does too, but the detector is on by default, so every second install in a project hits it | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio                                                                                                                                                |
+| The drift trio does too, but the detector is on by default, so every second install in a project hits it | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio; the source sinks a scoped install owns in the listed projects are not probed, and the refusal prints the import for them                      |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`

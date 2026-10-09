@@ -719,7 +719,7 @@ variable "stockout_pubsub_sink" {
 }
 
 variable "enable_drift_pubsub" {
-  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which is the enable_drift_detector variable below; with this flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write this variable into terraform.tfvars only when ENABLE_DRIFT_DETECTOR is true, so that an install already turning the ingress on through a TF_VAR_enable_drift_pubsub line in install.env keeps it: a tfvars key beats TF_VAR_, and writing false unconditionally would destroy that install's sink, topic and subscription on its next upgrade."
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink (and, on an install whose scope lists other projects, one more in each of them, routed into the same topic, which needs logging.sinks.create, the project's number and its Logging service agent there), the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default) and in each project the scope lists. The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which is the enable_drift_detector variable below; with this flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write this variable into terraform.tfvars only when ENABLE_DRIFT_DETECTOR is true, so that an install already turning the ingress on through a TF_VAR_enable_drift_pubsub line in install.env keeps it: a tfvars key beats TF_VAR_, and writing false unconditionally would destroy that install's sinks, topic and subscription on its next upgrade."
   type        = bool
   default     = false
 }
@@ -754,8 +754,32 @@ variable "drift_pubsub_sink_writer_identity_override" {
   default     = null
 }
 
+variable "drift_pubsub_source_exclude_projects" {
+  description = "Projects the scope lists whose audit logs the drift topic must NOT receive, comma- or space-separated project IDs. Each stays in the scope (its clusters are still read and get Cluster Agent profiles) and gets no drift audit-log sink, no Logging service agent mint and no publish grant: the lever for a project where the identity applying cannot mint the agent or write the sink, which would otherwise stop the apply at that project. Empty, the default, exports every project scope_export_projects lists. Reaches a front-door install as a TF_VAR_drift_pubsub_source_exclude_projects line in install.env."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p == "" || can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", p))])
+    error_message = "drift_pubsub_source_exclude_projects is a comma- or space-separated list of GCP project IDs (6 to 30 characters: lowercase letters, digits and hyphens, starting with a letter)."
+  }
+}
+
+variable "drift_pubsub_source_sink_writer_identity_overrides" {
+  description = "Per project the scope lists, keyed by project ID, the principal to grant roles/pubsub.publisher on the drift topic instead of the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives for that project's sink: drift_pubsub_sink_writer_identity_override for a source project. Only used when enable_drift_pubsub is true and the scope lists projects. A JSON object, {\"<project>\": \"serviceAccount:...\"}, rather than a map, because through the front doors it is a TF_VAR_ line in install.env (TF_VAR_drift_pubsub_source_sink_writer_identity_overrides='{\"<project>\":\"serviceAccount:...\"}') and a blanked line exports \"\", which a map-typed variable refuses as HCL and this one reads as no override, as its string sibling does. Include the \"serviceAccount:\" prefix. Set only when an apply's postcondition has told you to."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" || (can(tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))) && alltrue([for project, member in tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides)) : member == "" || can(regex("^serviceAccount:.+@.+$", member))]))
+    error_message = "drift_pubsub_source_sink_writer_identity_overrides is a JSON object of project ID to principal, each principal carrying the \"serviceAccount:\" prefix (or empty for no override), or an empty string."
+  }
+}
+
 variable "drift_pubsub_sink_drain_duration" {
-  description = "How long a destroy waits, after deleting the drift sink, before removing the topic and the sink's publish grant. Only used when enable_drift_pubsub is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The module's 120s default is a chosen margin rather than a measured convergence time, so raise it if the mail still arrives and lower it only to trade that risk for a faster teardown. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_drain_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive. Setting it is not enough on its own: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, and uninstall.sh runs no apply before the destroy -- so a value raised and taken straight to uninstall.sh waits the 120s already in state and the mail arrives anyway. Run upgrade.sh (or lifecycle.sh apply) in between. Raising it after a teardown has already mailed is therefore too late for that teardown; the time to set it is at install."
+  description = "How long a destroy waits, after deleting the drift sink, before removing the topic and the sink's publish grant, and how long a scope shrink waits between deleting a removed project's sink and revoking its grant. Only used when enable_drift_pubsub is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The module's 120s default is a chosen margin rather than a measured convergence time, so raise it if the mail still arrives and lower it only to trade that risk for a faster teardown. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_drain_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive. Setting it is not enough on its own: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, and uninstall.sh runs no apply before the destroy -- so a value raised and taken straight to uninstall.sh waits the 120s already in state and the mail arrives anyway. Run upgrade.sh (or lifecycle.sh apply) in between. Raising it after a teardown has already mailed is therefore too late for that teardown; the time to set it is at install."
   type        = string
   default     = "120s"
 }

@@ -110,7 +110,7 @@ states it for users.
 
 `ENABLE_DRIFT_DETECTOR` is the exception to the paragraph above, and the only one:
 its shipped default is `true`, so an omission provisions rather than destroys — a
-Log Router sink exporting every GKE cluster in the project, a Pub/Sub topic and a
+Log Router sink exporting every GKE cluster in the project (one more per project a declared scope lists), a Pub/Sub topic and a
 subscription that retains a copy of those records for 31 days. Nothing is lost by
 leaving it unset, and an environment that wants the detector need not set it. It is
 in the table because it is the only way to say no: the reconcile regenerates

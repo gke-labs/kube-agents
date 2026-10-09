@@ -941,6 +941,14 @@ resource "google_service_account" "agent" {
             proc.stderr,
         )
         self.assertIn("ENABLE_DRIFT_DETECTOR=false", proc.stderr)
+        # The source sinks a scoped install owns in the projects it lists, which the guard
+        # does not probe: the refusal names the address and the import ID, both derived from
+        # the names this state would create.
+        self.assertIn(
+            "terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' "
+            "projects/<listed project>/sinks/platform-agent-drift-audit-sink-test-project",
+            proc.stderr,
+        )
 
     def test_guard_drift_adoption_checks_the_names_this_state_would_create(self):
         """A second install that already named its own trio must pass: the

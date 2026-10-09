@@ -308,6 +308,19 @@ check "slack_tokens_present" {
   }
 }
 
+# A warning rather than a refusal, for the same reason as slack_tokens_present:
+# an exclusion written before its project joins the scope, or left after it
+# leaves, is a legitimate order of operations. A misspelled one is not, and
+# its only other trace is the drift_pubsub_source_projects output: the
+# subtraction removes nothing, and the project's audit logs leave for the
+# host topic against the operator's stated intent, with the apply green.
+check "drift_source_exclusions_name_listed_projects" {
+  assert {
+    condition     = length(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects))) == 0
+    error_message = "drift_pubsub_source_exclude_projects names ${join(", ", sort(tolist(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects)))))}, which the scope does not list beyond the host (scope_export_projects: ${join(", ", module.kube_agents_iam.scope_export_projects)}), so the entry excludes nothing. A misspelled project ID keeps its sink; check the spelling against SCOPE_PROJECTS."
+  }
+}
+
 # Bearer token for the pod-local Session KV server on 127.0.0.1:8699. Both the
 # sandbox container (which serves and calls it) and the credential-proxy
 # container (whose event watcher posts to it) read this one value.
@@ -534,6 +547,17 @@ module "chat_pubsub" {
 # helm_release precondition below, because the harness block that carries
 # enabled is written only when this flag is on, so the composition would
 # otherwise accept the second variable and silently do nothing with it.
+# The per-project override arrives as a JSON string (the variable says why: a
+# TF_VAR_ line that is blanked exports "", which a map refuses) and the module
+# takes a map; "" is no override.
+locals {
+  # The exclusions as a set, from the comma- or space-separated string a
+  # TF_VAR_ line can carry; blank is none.
+  drift_pubsub_source_exclude_projects               = toset([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p if p != ""])
+  drift_pubsub_source_projects                       = sort(tolist(setsubtract(toset(module.kube_agents_iam.scope_export_projects), local.drift_pubsub_source_exclude_projects)))
+  drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))
+}
+
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
@@ -557,6 +581,21 @@ module "drift_pubsub" {
   # fails on an unbindable Logging agent, or whose teardown still mails, has
   # only this composition to lengthen them in.
   logging_identity_propagation_duration = var.drift_pubsub_logging_identity_propagation_duration
+  # The drift ingress follows the scope: one sink per project the plan lists
+  # in it from the declaration alone, into this install's topic, so a change
+  # on a scoped project's cluster reaches the detector like one on the
+  # management cluster's. scope_export_projects, not the pool's set: a
+  # container member the Asset index skips for one plan would otherwise lose
+  # its sink and the records until the next plan (the output's description).
+  # Less drift_pubsub_source_exclude_projects, the per-project way to keep
+  # reading a project's clusters without exporting its logs, for a project
+  # where the applying identity cannot mint the Logging agent or write the
+  # sink. Empty on an install with no declared scope, where the module creates
+  # the host's sink alone. The per-project override is the host's
+  # sink_writer_identity_override for a source project, keyed by its ID, and
+  # reaches here the same way.
+  source_projects                       = local.drift_pubsub_source_projects
+  source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides
 
   # Defers data.google_project.this inside the module to apply time whenever
   # any member of required_apis has a planned change, which makes the sink's

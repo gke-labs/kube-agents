@@ -110,6 +110,11 @@ output "drift_pubsub_subscription_id" {
   value       = try(module.drift_pubsub[0].subscription_id, null)
 }
 
+output "drift_pubsub_source_projects" {
+  description = "The projects beyond project_id whose audit logs the drift topic also receives, one sink each named drift_pubsub_sink with project_id appended: the projects the declaration lists at plan time (the IAM module's scope_export_projects: scope.projects and the selectors' members, never a container's Asset-Inventory members) less drift_pubsub_source_exclude_projects. Empty with no declared scope; null when enable_drift_pubsub is false."
+  value       = try(module.drift_pubsub[0].source_projects, null)
+}
+
 output "scoped_service_accounts" {
   description = "Map from project id to the pool member's service account for it, one per project the plan listed in scope while scoped_pool_enabled is true, and empty otherwise. The key is what the credential broker matches on, so the two are directly comparable. The accounts hold no IAM grant as of 2026-08-12; see scoped_pool.tf."
   value       = module.kube_agents_iam.scoped_service_accounts

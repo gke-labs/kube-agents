@@ -21,7 +21,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 ## GCP project
 
-- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics and subscriptions, Log Router sinks, KMS keyrings, and IAM service accounts.
+- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics and subscriptions, Log Router sinks, KMS keyrings, and IAM service accounts. An install that will declare other projects in its scope needs, in each of them, the right to set IAM policy, to read the project, to mint its Logging service agent and to create a Log Router sink (`roles/owner` carries all of them) ([Multi-project](/kube-agents/deploy/multi-project/)).
 - Billing enabled on that project.
 - The `Owner` role (`roles/owner`), or `Editor` (`roles/editor`) combined with `Project IAM Admin` (`roles/resourcemanager.projectIamAdmin`) and `Service Account Admin` (`roles/iam.serviceAccountAdmin`), for the user running the installer (or a scoped set covering the resources above). The install provisions project-level IAM role bindings (`google_project_iam_member`) and Workload Identity member bindings (`google_service_account_iam_member` with `roles/iam.workloadIdentityUser`); the basic `Editor` role alone lacks `resourcemanager.projects.setIamPolicy` and `iam.serviceAccounts.setIamPolicy`, so an installer running with `Editor` alone fails during IAM provisioning.
 

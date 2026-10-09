@@ -26,6 +26,22 @@ costs no ordering. That link is pinned instead by the `triggers` assertion in
 where its real cost shows: lose the reference and the wait stops being re-paid
 when the identity is re-minted or the duration is raised.
 
+The scope's other projects get the same chain, one sink each in its own project
+into the host topic, each behind an identity wait and a drain of its own rather
+than the host's: a
+source sink is destroyed on its own when its project leaves the scope, and a
+drain that stays in the plan waits for nothing, so the wait has to leave with
+the sink it guards:
+
+    google_project_service_identity.source_logging
+      -> time_sleep.source_logging_identity
+        -> google_pubsub_topic_iam_member.source_sink_writer
+          -> time_sleep.source_sink_drain
+            -> google_logging_project_sink.source_drift_audit
+
+The first arrow is the same triggers reference the host's wait carries, pinned
+the same way; the other three are `depends_on` edges, and with the host's three
+they are what REQUIRED_EDGES pins.
 The chain roots at the service identity rather than at the topic because the
 grant has nothing to bind until Service Usage has minted the Logging agent;
 the topic is upstream of the grant too, by reference, so it needs no pinning
@@ -115,6 +131,11 @@ DRAIN = ("time_sleep", "sink_drain")
 SINK = ("google_logging_project_sink", "drift_audit")
 IDENTITY_WAIT = ("time_sleep", "logging_identity")
 SERVICE_IDENTITY = ("google_project_service_identity", "logging")
+SOURCE_GRANT = ("google_pubsub_topic_iam_member", "source_sink_writer")
+SOURCE_SINK = ("google_logging_project_sink", "source_drift_audit")
+SOURCE_SERVICE_IDENTITY = ("google_project_service_identity", "source_logging")
+SOURCE_DRAIN = ("time_sleep", "source_sink_drain")
+SOURCE_IDENTITY_WAIT = ("time_sleep", "source_logging_identity")
 
 # The chain's first link, which is a reference rather than a depends_on and so
 # cannot be read out of REQUIRED_EDGES below: the wait keys its own triggers on
@@ -123,6 +144,13 @@ SERVICE_IDENTITY = ("google_project_service_identity", "logging")
 # rewrites. The tftest asserts the trigger's value, which a hand-built string
 # of the right shape satisfies; this asserts that the attribute is read at all.
 IDENTITY_REFERENCE = f"{SERVICE_IDENTITY[0]}.{SERVICE_IDENTITY[1]}.id"
+# The source waits read their own project's identity, indexed by the for_each
+# key, so the reference is the resource address and `.id` around that index.
+SOURCE_IDENTITY_REFERENCE = (f"{SOURCE_SERVICE_IDENTITY[0]}.{SOURCE_SERVICE_IDENTITY[1]}", ".id")
+WAITS_AND_THEIR_REFERENCES = (
+    (IDENTITY_WAIT, (IDENTITY_REFERENCE,)),
+    (SOURCE_IDENTITY_WAIT, SOURCE_IDENTITY_REFERENCE),
+)
 
 # Each resource, the address it must declare a depends_on edge to, and what
 # removing that edge costs, in the order the chain runs. The reason each edge
@@ -142,11 +170,22 @@ REQUIRED_EDGES = (
     (GRANT, IDENTITY_WAIT, _UNBOUND_AGENT),
     (DRAIN, GRANT, _MAIL),
     (SINK, DRAIN, _MAIL),
+    (SOURCE_GRANT, SOURCE_IDENTITY_WAIT, _UNBOUND_AGENT),
+    (SOURCE_DRAIN, SOURCE_GRANT, _MAIL),
+    (SOURCE_SINK, SOURCE_DRAIN, _MAIL),
 )
 
-# The sink's own attribute the grant must not read: doing so is what orders the
-# grant after the sink.
-SINK_WRITER_ATTRIBUTE = f"{SINK[0]}.{SINK[1]}.writer_identity"
+# The source sinks must not hang off the host's drain: it is never destroyed on
+# a scope shrink, so a source sink behind it would lose its grant the second
+# after it was deleted.
+SOURCE_SINK_MUST_NOT_DEPEND_ON = f"{DRAIN[0]}.{DRAIN[1]}"
+
+# Each grant and the sink attribute it must not read: doing so is what orders
+# the grant after the sink.
+GRANTS_AND_THEIR_SINKS = (
+    (GRANT, SINK),
+    (SOURCE_GRANT, SOURCE_SINK),
+)
 
 
 def _resource_body(tokens: list, resource_type: str, name: str) -> list:
@@ -220,27 +259,42 @@ class DriftPubsubOrdering(unittest.TestCase):
                     f"not text",
                 )
 
-    def test_the_wait_reaches_the_service_identity_by_reference(self) -> None:
-        body = _resource_body(self.tokens, *IDENTITY_WAIT)
-        self.assertIn(
-            IDENTITY_REFERENCE,
-            _code_text(body),
-            f"{IDENTITY_WAIT[0]}.{IDENTITY_WAIT[1]} must read {IDENTITY_REFERENCE} -- it is "
-            f"the chain's first link and the wait declares no depends_on, so a trigger "
-            f"keyed on anything else (a hand-built \"projects/<project>/services/...\" "
-            f"string included) leaves nothing ordering the wait after the mint and nothing "
-            f"re-paying it when the identity is re-minted",
+    def test_each_wait_reaches_its_service_identity_by_reference(self) -> None:
+        for wait, parts in WAITS_AND_THEIR_REFERENCES:
+            with self.subTest(wait=wait[1]):
+                text = _code_text(_resource_body(self.tokens, *wait))
+                for part in parts:
+                    self.assertIn(
+                        part,
+                        text,
+                        f"{wait[0]}.{wait[1]} must read {''.join(parts)} -- it is the chain's "
+                        f"first link and the wait declares no depends_on, so a trigger keyed on "
+                        f"anything else (a hand-built \"projects/<project>/services/...\" string "
+                        f"included) leaves nothing ordering the wait after the mint and nothing "
+                        f"re-paying it when the identity is re-minted",
+                    )
+
+    def test_a_source_sink_has_its_own_drain_not_the_hosts(self) -> None:
+        references = _depends_on_references(_resource_body(self.tokens, *SOURCE_SINK))
+        self.assertNotIn(
+            SOURCE_SINK_MUST_NOT_DEPEND_ON,
+            references or [],
+            "a source sink behind the host's drain is unguarded on a scope shrink: the host's "
+            "drain is not destroyed then, so nothing waits between that sink's deletion and "
+            "its grant's revocation; see the section comment in main.tf",
         )
 
     def test_the_grant_does_not_read_the_identity_off_the_sink(self) -> None:
-        body = _resource_body(self.tokens, *GRANT)
-        self.assertNotIn(
-            SINK_WRITER_ATTRIBUTE,
-            _code_text(body),
-            "the publish grant reads writer_identity off the sink again, which orders the "
-            "grant after the sink and reopens the apply-side window; derive the identity "
-            "from the project number instead (local.expected_sink_writer_identity)",
-        )
+        for grant, sink in GRANTS_AND_THEIR_SINKS:
+            with self.subTest(grant=grant[1]):
+                body = _resource_body(self.tokens, *grant)
+                self.assertNotIn(
+                    f"{sink[0]}.{sink[1]}.writer_identity",
+                    _code_text(body),
+                    f"{grant[0]}.{grant[1]} reads writer_identity off {sink[1]} again, which orders "
+                    "the grant after the sink and reopens the apply-side window; derive the identity "
+                    "from the project number instead (the expected_sink_writer_identity locals)",
+                )
 
 
 if __name__ == "__main__":

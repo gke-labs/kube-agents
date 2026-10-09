@@ -948,6 +948,10 @@ guard_drift_adoption() {
     IFS='|' read -r addr group noun name <<<"$line"
     warn "  gcloud $group delete $name --project $project"
   done
+  local sink_name
+  sink_name=$(tfvar drift_pubsub_sink)
+  warn "An install with a declared scope also owns a sink named '${sink_name}-${project}' in each project the scope lists, which this guard does not look for. Import or delete those the same way before applying, or the apply stops on a 409 in that project:"
+  warn "  terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' projects/<listed project>/sinks/${sink_name}-${project}"
   warn "Or leave the detector off for this install: ENABLE_DRIFT_DETECTOR=false in install.env."
   exit 1
 }

@@ -311,3 +311,233 @@ run "a_minutes_drain_duration_reaches_the_drain" {
     error_message = "an accepted duration must reach time_sleep unchanged: ${time_sleep.sink_drain.destroy_duration}"
   }
 }
+
+# The scope's other projects: each gets a sink of its own, in its project,
+# into the host topic, publishing as its own Logging service agent, which the
+# host topic grants publish to before the sink exists. The host project passed
+# among them is ignored, since its sink is the module's own.
+run "a_source_project_gets_its_own_sink_grant_and_identity_into_the_host_topic" {
+  command = plan
+
+  variables {
+    source_projects = ["drift-project-2", "drift-project-1"]
+    cluster_names   = ["prod-a"]
+  }
+
+  override_data {
+    target = data.google_project.source["drift-project-2"]
+    values = {
+      number = "210987654321"
+    }
+  }
+
+  assert {
+    condition     = keys(google_logging_project_sink.source_drift_audit) == ["drift-project-2"]
+    error_message = "one source sink per project beyond the host, and none for the host itself: ${jsonencode(keys(google_logging_project_sink.source_drift_audit))}"
+  }
+
+  assert {
+    condition     = google_pubsub_topic_iam_member.source_sink_writer["drift-project-2"].member == "serviceAccount:service-210987654321@gcp-sa-logging.iam.gserviceaccount.com"
+    error_message = "the source grant must name the SOURCE project's Logging service agent, from its number: ${google_pubsub_topic_iam_member.source_sink_writer["drift-project-2"].member}"
+  }
+
+  assert {
+    condition     = google_pubsub_topic_iam_member.source_sink_writer["drift-project-2"].project == "drift-project-1" && google_pubsub_topic_iam_member.source_sink_writer["drift-project-2"].role == "roles/pubsub.publisher"
+    error_message = "the source grant lives on the host topic, in the host project, as roles/pubsub.publisher"
+  }
+
+  assert {
+    condition     = google_project_service_identity.source_logging["drift-project-2"].project == "drift-project-2"
+    error_message = "the Logging service agent is minted in the source project, where the sink is"
+  }
+
+  assert {
+    condition     = google_logging_project_sink.source_drift_audit["drift-project-2"].project == "drift-project-2" && google_logging_project_sink.source_drift_audit["drift-project-2"].name == "platform-agent-drift-audit-sink-drift-project-1"
+    error_message = "the source sink sits in the source project under sink_name with the host project appended: ${google_logging_project_sink.source_drift_audit["drift-project-2"].project}/${google_logging_project_sink.source_drift_audit["drift-project-2"].name}"
+  }
+
+  assert {
+    condition     = google_logging_project_sink.source_drift_audit["drift-project-2"].unique_writer_identity == true
+    error_message = "a source sink without unique_writer_identity publishes as the identity every Google Cloud customer shares, and the host grant could not be narrower than that"
+  }
+
+  assert {
+    condition     = startswith(google_logging_project_sink.source_drift_audit["drift-project-2"].filter, "logName=\"projects/drift-project-2/logs/cloudaudit.googleapis.com%2Factivity\"\nresource.type=\"k8s_cluster\"")
+    error_message = "the source sink's filter must name the SOURCE project's activity log and carry the shared clauses: ${google_logging_project_sink.source_drift_audit["drift-project-2"].filter}"
+  }
+
+  assert {
+    condition     = !strcontains(google_logging_project_sink.source_drift_audit["drift-project-2"].filter, "cluster_name") && strcontains(google_logging_project_sink.source_drift_audit["drift-project-2"].filter, "coordination")
+    error_message = "cluster_names names clusters in the host project and must not narrow a source sink, while the lease carve-out applies to every sink: ${google_logging_project_sink.source_drift_audit["drift-project-2"].filter}"
+  }
+
+  assert {
+    condition     = startswith(google_logging_project_sink.drift_audit.filter, "logName=\"projects/drift-project-1/logs/cloudaudit.googleapis.com%2Factivity\"") && strcontains(google_logging_project_sink.drift_audit.filter, "cluster_name")
+    error_message = "the host sink keeps its own project's log name and its cluster_names clause: ${google_logging_project_sink.drift_audit.filter}"
+  }
+
+  assert {
+    condition     = jsonencode(output.source_projects) == jsonencode(["drift-project-2"]) && output.source_sink_name == "platform-agent-drift-audit-sink-drift-project-1"
+    error_message = "the outputs must report the source projects less the host and the one source sink name"
+  }
+
+  assert {
+    condition     = time_sleep.source_sink_drain["drift-project-2"].destroy_duration == "120s" && time_sleep.source_sink_drain["drift-project-2"].create_duration == null
+    error_message = "each source project has a drain of its own, waiting on destroy alone and for the host's duration"
+  }
+
+  assert {
+    condition     = time_sleep.source_logging_identity["drift-project-2"].create_duration == "60s" && time_sleep.source_logging_identity["drift-project-2"].destroy_duration == null
+    error_message = "each source project has a Logging-agent wait of its own, delaying the apply alone and for the host's duration"
+  }
+
+  assert {
+    condition     = try(time_sleep.source_logging_identity["drift-project-2"].triggers["duration"], null) == "60s"
+    error_message = "the source wait must be keyed on its duration, as the host's is, or raising it is an in-place update that runs no delay"
+  }
+}
+
+# The host wait's sentinel run, for a source project: only a reference to the
+# source project's own identity can carry the overridden id into the trigger.
+run "a_source_identity_wait_is_keyed_on_that_projects_identity" {
+  command = plan
+
+  variables {
+    source_projects = ["drift-project-2"]
+  }
+
+  override_data {
+    target = data.google_project.source["drift-project-2"]
+    values = {
+      number = "210987654321"
+    }
+  }
+
+  override_resource {
+    target          = google_project_service_identity.source_logging["drift-project-2"]
+    override_during = plan
+    values = {
+      id = "sentinel-only-the-source-resource-can-supply-this"
+    }
+  }
+
+  assert {
+    condition     = try(time_sleep.source_logging_identity["drift-project-2"].triggers["logging_service_identity"], null) == "sentinel-only-the-source-resource-can-supply-this"
+    error_message = "the source wait must read google_project_service_identity.source_logging[<project>].id itself: the reference is what orders it after that project's mint and re-pays it on a re-mint"
+  }
+}
+
+run "with_no_source_projects_the_module_is_the_host_sink_alone" {
+  command = plan
+
+  assert {
+    condition     = length(google_logging_project_sink.source_drift_audit) == 0 && length(google_pubsub_topic_iam_member.source_sink_writer) == 0 && length(google_project_service_identity.source_logging) == 0 && length(time_sleep.source_sink_drain) == 0
+    error_message = "an install with no scope must plan nothing beyond the host's trio"
+  }
+}
+
+run "a_source_sink_publishing_as_anything_else_fails_its_postcondition" {
+  command = plan
+
+  variables {
+    source_projects = ["drift-project-2"]
+  }
+
+  override_data {
+    target = data.google_project.source["drift-project-2"]
+    values = {
+      number = "210987654321"
+    }
+  }
+
+  override_resource {
+    target          = google_logging_project_sink.source_drift_audit["drift-project-2"]
+    override_during = plan
+    values = {
+      writer_identity = "serviceAccount:p210987654321-77@gcp-sa-logging.iam.gserviceaccount.com"
+    }
+  }
+
+  expect_failures = [google_logging_project_sink.source_drift_audit["drift-project-2"]]
+}
+
+run "the_per_project_override_moves_the_source_grant_and_its_postcondition_together" {
+  command = plan
+
+  variables {
+    source_projects = ["drift-project-2"]
+    source_sink_writer_identity_overrides = {
+      "drift-project-2" = "serviceAccount:p210987654321-77@gcp-sa-logging.iam.gserviceaccount.com"
+      "drift-project-9" = "serviceAccount:ignored@example.iam.gserviceaccount.com"
+    }
+  }
+
+  override_data {
+    target = data.google_project.source["drift-project-2"]
+    values = {
+      number = "210987654321"
+    }
+  }
+
+  override_resource {
+    target          = google_logging_project_sink.source_drift_audit["drift-project-2"]
+    override_during = plan
+    values = {
+      writer_identity = "serviceAccount:p210987654321-77@gcp-sa-logging.iam.gserviceaccount.com"
+    }
+  }
+
+  assert {
+    condition     = google_pubsub_topic_iam_member.source_sink_writer["drift-project-2"].member == "serviceAccount:p210987654321-77@gcp-sa-logging.iam.gserviceaccount.com"
+    error_message = "the per-project override must redirect that project's grant: ${google_pubsub_topic_iam_member.source_sink_writer["drift-project-2"].member}"
+  }
+
+  assert {
+    condition     = length(google_pubsub_topic_iam_member.source_sink_writer) == 1
+    error_message = "an override keyed on a project outside source_projects must create nothing"
+  }
+}
+
+run "a_source_override_without_the_serviceAccount_prefix_is_refused" {
+  command = plan
+
+  variables {
+    source_projects = ["drift-project-2"]
+    source_sink_writer_identity_overrides = {
+      "drift-project-2" = "service-210987654321@gcp-sa-logging.iam.gserviceaccount.com"
+    }
+  }
+
+  expect_failures = [var.source_sink_writer_identity_overrides]
+}
+
+run "a_source_project_that_is_not_a_project_id_is_refused" {
+  command = plan
+
+  variables {
+    source_projects = ["example.com:legacy"]
+  }
+
+  expect_failures = [var.source_projects]
+}
+
+# Two names joined can pass the bound each one meets alone; the refusal names
+# the joined name rather than letting the API refuse it.
+run "a_source_sink_name_over_the_cap_is_refused_before_the_api_sees_it" {
+  command = plan
+
+  variables {
+    source_projects = ["drift-project-2"]
+    # 92 characters: under the cap alone, over it once "-drift-project-1" is appended.
+    sink_name = "platform-agent-drift-audit-sink-with-a-name-that-the-host-project-suffix-pushes-past-the-ca"
+  }
+
+  override_data {
+    target = data.google_project.source["drift-project-2"]
+    values = {
+      number = "210987654321"
+    }
+  }
+
+  expect_failures = [google_logging_project_sink.source_drift_audit["drift-project-2"]]
+}

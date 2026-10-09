@@ -1,6 +1,6 @@
 # Drift Audit-Log Pub/Sub Routing Module
 
-Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe — plus, where `topic_publishers` is set, publisher on the topic for each member it names.
+Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe — plus, where `topic_publishers` is set, publisher on the topic for each member it names, and, where `source_projects` names other projects, a sink in each of them routed into the same topic.
 
 The detector cannot read audit logs from the Kubernetes API. On GKE the control plane is managed, so the API server's audit backend is not the operator's to configure and the stream surfaces only in Cloud Logging — hence a sink rather than an informer.
 
@@ -20,7 +20,21 @@ Deriving the identity means a project where Logging returns some other writer id
 
 Deriving it also makes the grant's `member` a function of a data source, where reading it off the sink made it a function of a resource already in state. A caller that defers that read defers the member with it, and `member` is ForceNew: with `depends_on = [google_project_service.required]` on the module — which is how full-install calls it — any plan that adds or removes an API leaves `data.google_project.this` unread until apply, and the binding is planned for replacement while the sink stays live. That is this section's own window on another trigger, unfixed; setting the override pins the member and avoids it meanwhile. Narrowing the caller's `depends_on` to the APIs this module needs does not work, because Terraform resolves an indexed `depends_on` reference to the whole resource.
 
-Three of the four links in that chain are `depends_on` edges, pinned by [`tests/test_drift_pubsub_ordering.py`](../../../tests/test_drift_pubsub_ordering.py); removing one is otherwise invisible, since no plan can show the ordering. The fourth — the wait after the Service Usage call — is a reference inside the wait's own `triggers` rather than an edge, so it shows up in a plan as a value and the module's `terraform test` suite pins it there, along with the second trigger key that makes a raised duration take effect.
+Three of the four links in that chain are `depends_on` edges, and the source sinks below carry the same chain each, with a wait and a drain of their own; every edge is pinned by [`tests/test_drift_pubsub_ordering.py`](../../../tests/test_drift_pubsub_ordering.py), since removing one is otherwise invisible — no plan can show the ordering. The fourth link — the wait after the Service Usage call, the host's and each source project's — is a reference inside the wait's own `triggers` rather than an edge, so it shows up in a plan as a value and the module's `terraform test` suite pins it there, along with the second trigger key that makes a raised duration take effect.
+
+## Exporting the scope's other projects
+
+An install whose `PlatformAgent` declares a `spec.scope` discovers clusters in projects beyond the one it runs in ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)). Admin Activity audit logs are per project by construction — a project-level sink exports its own project's entries and nothing else — so each such project needs a sink of its own, and `source_projects` is that list. For every project it names, less `project_id`, the module creates the host's pieces again in the host's order: the project's Logging service agent minted up front, `roles/pubsub.publisher` on the host topic for that agent, derived from the project's number so that the grant precedes the sink, a `time_sleep` drain of that project's own, and a sink in that project whose destination is the host topic. The drain is per project rather than the host's because a source sink is destroyed on its own — the project removed from the scope or excluded — while the host's drain stays in the plan and a drain that stays waits for nothing; keyed on the project, it leaves with the sink it guards, so a shrink deletes that sink, waits, and only then revokes its grant, in the source project whose owners the mail would otherwise reach. One topic and one subscription, because the detector already routes each record by the project, location and cluster it names and reads the cluster through the Cluster Agent profile the reconcile wrote for it; what it joins is bounded by which projects' records reach the subscription, and these sinks are what decide that.
+
+Each source sink is named `sink_name` with `project_id` appended (`source_sink_name` in the outputs), because a source project may hold a sink of another install's: its own, under `sink_name`, when it is that install's management project, or another install's source sink when two installs list it. Its filter is the host's shared clauses and the lease carve-out; `cluster_names` does not reach it, since those are bare names in `project_id` and a cluster of the same name elsewhere is another cluster. `source_sink_writer_identity_overrides`, keyed by project ID, is `sink_writer_identity_override` for a source project, with the same postcondition behind it and the same way out; its failure mails every owner of the _source_ project, and the message says which.
+
+The full-install composition feeds `source_projects` from the projects its declaration lists at plan time — `scope.projects` and the selectors' members, each less an exact `exclude.projects` entry (`kube-agents-iam`'s `scope_export_projects`) — less its `drift_pubsub_source_exclude_projects`, the per-project way to keep reading a project's clusters without exporting its logs. A folder's or organisation's members are never among them, even while the scoped service account pool lists them: that listing is one Cloud Asset Inventory answer with no grace, and a member the index omitted for one plan would lose its sink under an auto-approved apply and its records until the next plan recreated it, with the apply green. A container's members are discovered at runtime and are not exported here; an aggregated sink on the folder or organisation would cover them in one piece and is its own design, since Logging documents no writer-identity form for such a sink, so its grant could not precede it, and `include_children` would export every project under the container, excluded ones included.
+
+The identity applying this needs, in each source project, `resourcemanager.projects.get` to read the number, the Service Usage call that mints the project's Logging service agent, and `logging.sinks.create`; `roles/owner` carries all three, and the identity that bound the scope's read roles there ordinarily does. Nothing in the composition probes for them beforehand, and what a missing one costs depends on which. A number that cannot be read fails the plan when the plan can make the read, and otherwise the apply at that project's read, with the host's pieces and everything independent of it already created: the composition's `depends_on` defers the module's data sources whenever a required API changes, the first install included, as the section above says of the host's own read. An agent that cannot be minted stops the apply with the other projects' agents in place and every source grant and sink held back; a grant that cannot be made leaves the other grants in place and every source sink held back (each grant waits on all of the agents and each drain on all of the grants, since `depends_on` orders whole resources, not instances); a sink that cannot be created stops at that project alone. The host's pieces are untouched in every case. The next apply after the permission is granted, or the project dropped, creates what was held back.
+
+A source project's `logging.googleapis.com` has to be enabled for its sink and its service agent; every project has it on unless someone turned it off, and nothing here enables it there — the composition enables APIs in `project_id` alone.
+
+What the sinks are to the detector is also what bounds who can write to it. On an install the sinks are the topic's only publishers, and `unique_writer_identity` makes each publish as its project's Logging service agent — per project, not per sink — so whoever can create a sink in a project whose agent holds publish on the topic can route entries of their choosing into it. Without a scope that is the host project's `logging.sinks.create` holders; with one it is theirs in every source project too. The detector classifies on the principal inside each record, so that is the set of people who could make it report a change nobody made, the same caution the composition's README gives for `topic_publishers`.
 
 ## What this module does not do
 
@@ -51,7 +65,7 @@ Set the variable to `false` to export the unfiltered stream while debugging.
 
 The caller must have `pubsub.googleapis.com` and `logging.googleapis.com` enabled on the project. [`full-install`](../../examples/full-install/) enables both when it instantiates this module (`enable_drift_pubsub = true`; `logging.googleapis.com` is unconditional there, and `pubsub.googleapis.com` is enabled whenever any of its Pub/Sub-backed features is on). A standalone caller enables them itself: no module in this repository calls `google_project_service`.
 
-Two more follow from the ordering above, and `full-install` already satisfies both. The module reads the project number, so `cloudresourcemanager.googleapis.com` must be enabled and the applying identity needs `resourcemanager.projects.get`; and it mints the Logging service agent through Service Usage, so it takes a `google-beta` provider configuration from the root.
+Two more follow from the ordering above, and `full-install` already satisfies both; the section on the scope's other projects says what a project listed in `source_projects` needs on top. The module reads the project number, so `cloudresourcemanager.googleapis.com` must be enabled and the applying identity needs `resourcemanager.projects.get`; and it mints the Logging service agent through Service Usage, so it takes a `google-beta` provider configuration from the root.
 
 ## Usage
 
@@ -61,6 +75,12 @@ module "drift_pubsub" {
   project_id                     = "my-gcp-project"
   detector_service_account_email = "kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
 }
+```
+
+`source_projects` defaults to empty, which exports `project_id` alone. Name the projects an install's scope lists to export theirs into the same topic, one sink each:
+
+```hcl
+  source_projects = ["corp-payments-stage", "corp-analytics-prod"]
 ```
 
 `cluster_names` defaults to empty, which exports every GKE cluster in the project through one sink and leaves the detector to route on `resource.labels.cluster_name`. Set it to narrow the export:
@@ -85,8 +105,8 @@ The flag takes either form — this fully-qualified path, or the bare `subscript
 qualifies with `--project`. `--project` is required either way, because the detector's credentials
 are resolved against it.
 
-`topic_publishers` defaults to empty, which leaves the sink's writer identity as the topic's only
-publisher — the shape the section above assumes. Each member listed here takes
+`topic_publishers` defaults to empty, which leaves the sinks' writer identities — the host's and each source project's — as the topic's only
+publishers — the shape the sections above assume. Each member listed here takes
 `roles/pubsub.publisher` on the topic as well:
 
 ```hcl

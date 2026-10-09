@@ -113,3 +113,40 @@ output "scope_lookup_only_hosts" {
   EOT
   value       = sort(tolist(local.scope_lookup_only_hosts))
 }
+
+output "scope_discovered_projects" {
+  description = <<-EOT
+    The projects beyond project_id whose clusters the plan lists in the
+    scope, sorted: scope.projects and the selectors' members, each less an
+    exact exclude.projects entry, and each declared container's listed
+    members while the scoped service account pool lists them
+    (scope_container_members; otherwise a container's members are discovered
+    at runtime and are not here). The pool's own set less the host, for a
+    caller that wants that set; the drift ingress follows scope_export_projects
+    below instead, and the next output says why. tests/test_scoped_sa_pool_iam.py
+    pins the pool's half and tests/test_scope_iam.py this one. Known at plan time:
+    it is computed from the module's inputs alone, so the composition's
+    module-level depends_on does not defer it.
+  EOT
+  value       = sort(tolist(setsubtract(local.scoped_pool_projects, toset([var.project_id]))))
+}
+
+output "scope_export_projects" {
+  description = <<-EOT
+    The projects beyond project_id whose audit logs the drift ingress exports,
+    sorted: scope.projects and the selectors' members, each less an exact
+    exclude.projects entry, and nothing a Cloud Asset Inventory search listed.
+    The pool's set (scope_discovered_projects) also carries each declared
+    container's listed members, and that listing has no grace: an index that
+    omits a member for one plan would destroy that project's sink under an
+    auto-approved apply and recreate it on the next, and the Log Router exports
+    nothing in between, so the drift detector would go blind to that project
+    with the apply green. The pool pays a re-minted account for the same gap;
+    the sink would pay the signal. A container's members are therefore not
+    exported here; the drift-pubsub README names the aggregated container
+    sink as the design that would cover them. tests/test_scope_iam.py pins
+    this set and that the composition feeds the sinks from it. Known at plan
+    time, as scope_discovered_projects is.
+  EOT
+  value       = sort(tolist(setsubtract(local.scope_listed_projects, toset([var.project_id]))))
+}
