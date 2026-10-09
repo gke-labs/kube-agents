@@ -247,7 +247,7 @@ NOT_BEHIND_REASON = "no master-behind or pool-skew candidate this run; there is 
 # upgrade running now; §3 suppresses the version checks on it, so nothing is
 # due to be scheduled and the drain this check grades is already under way.
 NOT_APPLICABLE_IN_FLIGHT_REASON = "an upgrade is in flight (the cluster or a node pool is RECONCILING), so no further upgrade is due this run; whether the running one completes is the next run's to grade, when it has settled or is still in flight"
-UNEVALUATED_VERSION_NOT_JUDGED = "master-behind was not judged on this cluster this run (no baseline, or a version that did not parse), so whether an upgrade is due is unknown"
+UNEVALUATED_VERSION_NOT_JUDGED = "master-behind or pool-skew was not judged on this cluster this run (no baseline, or a version that did not parse), so whether an upgrade is due is unknown"
 UNEVALUATED_REPORT_ERROR_FORMAT = "the reporter could not read the cluster: {message}"
 UNEVALUATED_BUDGET_SPENT = "the collector's readiness budget ({budget}s across the fleet) was spent before this cluster's reporter run could start"
 UNEVALUATED_TIMED_OUT = "the readiness reporter ran past its budget ({seconds}s) for this cluster and was stopped"
@@ -279,20 +279,24 @@ UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT = "node pool(s) {pools} would exceed the versi
 # Joins the clauses of one cause: every blocking budget, with the skew clause
 # before them when both block.
 CAUSE_SEPARATOR = "; "
-# The ledger renders `impact` through a 1500-character clip (audit_report.py's
-# MAX_TEXT_CHARS, applied in the renderer and nowhere earlier), and the arm's
-# tail -- the held drain and the forced eviction, or the refused move -- is
-# the last thing in the sentence. So the impact names a few budgets, pools and
-# workloads and counts the rest, stepping down the ladder until it fits under
-# a cap set below the renderer's, with a names-free form as the floor; the
-# excerpt carries every name under its own clip.
+# The ledger clips `impact` at 1500 characters and the evidence excerpt at
+# 2000 (audit_report.py's MAX_TEXT_CHARS and MAX_EXCERPT_CHARS, applied in the
+# renderer and nowhere earlier), and the arm's tail -- the held drain and the
+# forced eviction, or the refused move -- is the last thing in the impact. So
+# both texts name a few budgets, pools and workloads and count the rest,
+# stepping down a ladder until they fit under caps set below the renderer's,
+# with a names-free form as the floor; every count points at the readiness
+# report the collector keeps, which lists every one.
 IMPACT_MAX_CHARS = 1400
 IMPACT_NAMED_LADDER = (3, 1)
-IMPACT_MORE_FORMAT = "and {n} more"
-IMPACT_MORE_BUDGETS_FORMAT = "and {n} more drain-blocking PodDisruptionBudget(s), named in the evidence"
-IMPACT_COUNTED_FORMAT = "{n} (named in the evidence)"
-IMPACT_BUDGETS_COUNT_FORMAT = "{n} drain-blocking PodDisruptionBudget(s), named in the evidence, refuse eviction of {workloads}"
-IMPACT_WORKLOADS_COUNT_FORMAT = "{n} workload(s)"
+EXCERPT_MAX_CHARS = 1950
+EXCERPT_NAMED_LADDER = (None, 8, 5, 3, 1)
+EXCERPT_FORMAT = "readiness.status={status}: {cause}"
+CAUSE_MORE_FORMAT = "and {n} more"
+CAUSE_MORE_BUDGETS_FORMAT = "and {n} more drain-blocking PodDisruptionBudget(s); the readiness report at {path} lists every one"
+CAUSE_COUNTED_FORMAT = "{n} (listed in the readiness report at {path})"
+CAUSE_BUDGETS_COUNT_FORMAT = "{n} drain-blocking PodDisruptionBudget(s), listed in the readiness report at {path}, refuse eviction of {workloads}"
+CAUSE_WORKLOADS_COUNT_FORMAT = "{n} workload(s)"
 UPGRADE_BLOCKED_PDB_CLAUSE_WORKLOADS_FALLBACK = "its workload"
 # Behind clusters run least recently reported first, so a budget spent inside
 # a wide project lands on a different tail each week instead of the same
@@ -1295,7 +1299,7 @@ def _named(items: list[str], cap: int | None) -> str:
     """`items` joined, naming the first `cap` and counting the rest; None names all."""
     if cap is None or len(items) <= cap:
         return ", ".join(items)
-    return ", ".join([*items[:cap], IMPACT_MORE_FORMAT.format(n=len(items) - cap)])
+    return ", ".join([*items[:cap], CAUSE_MORE_FORMAT.format(n=len(items) - cap)])
 
 
 def _budget_clause(budget: dict, named: int | None) -> str:
@@ -1308,16 +1312,17 @@ def _budget_clause(budget: dict, named: int | None) -> str:
     )
 
 
-def _cause_text(cause: Cause, named: int | None) -> str:
+def _cause_text(cause: Cause, named: int | None, path: str) -> str:
     """The cause clause: the ceiling first when it blocks, then the budgets.
     `named` caps the pools, budgets and per-budget workloads it names and
-    counts the rest; None names all, which is the excerpt's form."""
+    counts the rest, pointing at the readiness report at `path`; None names
+    all."""
     parts = []
     if cause.pools:
         parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=_named(cause.pools, named)))
     parts.extend(_budget_clause(b, named) for b in cause.budgets[:named])
     if named is not None and len(cause.budgets) > named:
-        parts.append(IMPACT_MORE_BUDGETS_FORMAT.format(n=len(cause.budgets) - named))
+        parts.append(CAUSE_MORE_BUDGETS_FORMAT.format(n=len(cause.budgets) - named, path=path))
     return CAUSE_SEPARATOR.join(parts)
 
 
@@ -1327,28 +1332,39 @@ def _workloads_text(cause: Cause, named: int | None) -> str:
 
 
 def _counted_workloads(cause: Cause) -> str:
-    return IMPACT_WORKLOADS_COUNT_FORMAT.format(n=len(cause.evicted)) if cause.evicted else UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+    return CAUSE_WORKLOADS_COUNT_FORMAT.format(n=len(cause.evicted)) if cause.evicted else UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
 
 
-def _counted_cause_text(cause: Cause) -> str:
-    """The cause with counts in place of names: the floor the ledger's clip
-    can never reach, since nothing in it grows with the fleet."""
+def _counted_cause_text(cause: Cause, path: str) -> str:
+    """The cause with counts in place of names: the floor no clip can reach,
+    since nothing in it grows with the fleet."""
     parts = []
     if cause.pools:
-        parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=IMPACT_COUNTED_FORMAT.format(n=len(cause.pools))))
+        parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=CAUSE_COUNTED_FORMAT.format(n=len(cause.pools), path=path)))
     if cause.budgets:
-        parts.append(IMPACT_BUDGETS_COUNT_FORMAT.format(n=len(cause.budgets), workloads=_counted_workloads(cause)))
+        parts.append(CAUSE_BUDGETS_COUNT_FORMAT.format(n=len(cause.budgets), path=path, workloads=_counted_workloads(cause)))
     return CAUSE_SEPARATOR.join(parts)
 
 
-def _bounded_impact(cause: Cause, cluster: str, lag: str) -> str:
+def _bounded_impact(cause: Cause, cluster: str, lag: str, path: str) -> str:
     """The arm's sentence, kept under the ledger's clip: names down the
     ladder, then counts alone, so the tail always renders."""
     for named in IMPACT_NAMED_LADDER:
-        text = cause.impact_format.format(cluster=cluster, lag=lag, cause=_cause_text(cause, named), workloads=_workloads_text(cause, named))
+        text = cause.impact_format.format(cluster=cluster, lag=lag, cause=_cause_text(cause, named, path), workloads=_workloads_text(cause, named))
         if len(text) <= IMPACT_MAX_CHARS:
             return text
-    return cause.impact_format.format(cluster=cluster, lag=lag, cause=_counted_cause_text(cause), workloads=_counted_workloads(cause))
+    return cause.impact_format.format(cluster=cluster, lag=lag, cause=_counted_cause_text(cause, path), workloads=_counted_workloads(cause))
+
+
+def _bounded_excerpt(cause: Cause, path: str) -> str:
+    """The candidate's evidence, kept under the ledger's evidence clip: every
+    name when they fit, else the first eight, five, three or one and a count,
+    then counts alone; what it does not name, the report at `path` does."""
+    for named in EXCERPT_NAMED_LADDER:
+        text = EXCERPT_FORMAT.format(status=READINESS_BLOCKED, cause=_cause_text(cause, named, path))
+        if len(text) <= EXCERPT_MAX_CHARS:
+            return text
+    return EXCERPT_FORMAT.format(status=READINESS_BLOCKED, cause=_counted_cause_text(cause, path))
 
 
 def _applicable_causes(lag: str) -> tuple[bool, bool]:
@@ -1387,7 +1403,7 @@ def _lag_phrase(entry: dict) -> str:
     return LAG_BEHIND
 
 
-def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
+def _upgrade_blocked_hit(entry: dict, member: dict, report_path: str) -> dict | None:
     readiness = member.get("readiness") or {}
     if readiness.get("status") != READINESS_BLOCKED:
         return None
@@ -1398,11 +1414,11 @@ def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
         return None
     return {
         "object": f"Cluster/{entry['_bare_name']}",
-        # The excerpt names every budget, pool and workload; the impact is
-        # bounded so its tail survives the ledger's clip.
-        "excerpt": f"readiness.status={READINESS_BLOCKED}: {_cause_text(cause, None)}",
+        # Both texts are bounded under the ledger's clips; what they count
+        # rather than name, the readiness report at `report_path` lists.
+        "excerpt": _bounded_excerpt(cause, report_path),
         "severity": CRITICAL,
-        "impact": _bounded_impact(cause, entry["_bare_name"], lag),
+        "impact": _bounded_impact(cause, entry["_bare_name"], lag, report_path),
     }
 
 
@@ -1436,8 +1452,8 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
 
     Run by `collect_fleet` as the second phase, after every project's ten
     metadata checks are in, so a reporter never holds a worker those reads
-    wait for. A cluster with no `master-behind` or `pool-skew` candidate gets
-    the check as `checks_not_applicable`: current, with no upgrade whose
+    wait for. A cluster that `master-behind` and `pool-skew` both judged and
+    neither flagged gets the check as `checks_not_applicable`: current, with no upgrade whose
     completion could be blocked, or mid-upgrade (`RECONCILING`), with nothing
     further due and the running one the next run's to grade; either reason is
     the same answer until the cluster changes, which is what the field is
@@ -1461,12 +1477,13 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
         # "Not applicable" is a judgement about the cluster, so it needs the
         # version checks to have judged it: a cluster whose baseline could not
         # be fetched or whose version did not parse has no candidate because
-        # nobody looked, and that is a gap, not a current cluster.
-        # `master-behind` is the judgement that counts: the upgrade this check
-        # asks about is the control plane's, and a clean `pool-skew` beside an
-        # unfetched baseline says nothing about whether one is due.
+        # nobody looked, and that is a gap, not a current cluster. "Judged"
+        # takes the same two checks that decide "behind" (`BEHIND_CHECKS`): a
+        # clean `pool-skew` beside an unfetched baseline says nothing about the
+        # control plane, and a clean `master-behind` beside a pool nobody could
+        # read says nothing about the pool.
         ran = {c.get("check") for c in entry.get("commands") or []}
-        if MASTER_BEHIND_CHECK in ran:
+        if all(check in ran for check in BEHIND_CHECKS):
             # A cluster mid-upgrade has no candidate because §3 suppresses
             # them, not because it is current: say which.
             reason = NOT_APPLICABLE_IN_FLIGHT_REASON if entry.get("_in_flight") else NOT_BEHIND_REASON
@@ -1661,7 +1678,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         # whatever another member did to the process exit code.
         record = _record(shlex.join(argv), result._replace(rc=0))
         entry["commands"].append({"check": UPGRADE_BLOCKED_CHECK, **record})
-        hit = _upgrade_blocked_hit(entry, member)
+        hit = _upgrade_blocked_hit(entry, member, output)
         if hit is not None:
             entry["candidates"].append(_emit(UPGRADE_BLOCKED_CHECK, hit))
 

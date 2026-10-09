@@ -114,7 +114,7 @@ This stream's targets are GKE control-plane and node-pool metadata, with one in-
 
 - Every entry in `manifest.clusters` carries an `outcome`. `"collected"` comes with a `commands` list — copy that list verbatim into the cluster's `checks_run`. A project whose `clusters list` failed contributes one `project/<id>` entry at `"gate-failed"` instead, naming what gcloud said: its clusters were never enumerated, so put that project in `scope.skipped` with the error as the reason rather than leaving it out of the document, which would read as a project holding no clusters. The same `project/<id>` entry sits beside that project's collected clusters when `clusters list` answered but warned that some zones did not respond: the clusters it returned are covered, the ones in the silent zones are not, and `scope.skipped` is where that loss is reported. One target is not a project at all: `project/UNENUMERATED_PROJECTS` appears when `gcloud projects list` failed or returned a filtered list, or `--project` skipped discovery, so the rest of the fleet was never named. Treat it exactly like a failed project — `scope.skipped` with the collector's error as the reason — because the clusters it stands for are the ones this run cannot speak for. Every cluster entry also carries an `autopilot` boolean — the mode, already resolved; take it from there rather than re-deriving it from `clusters list`. It changes no check's coverage (§1 point 6), only the remediation `kind` of a node-pool finding (3.2, 3.5, 3.6, 3.9). The `project/<id>` entry stands for a project rather than a cluster, so it carries no mode.
 - A `commands` list missing `master-behind` or `stale-image-type` means that check had no baseline to judge against: `get-server-config` failed for the location (both go), or its response lacked what that one check reads (the cluster's channel roster, default version or `validMasterVersions`; or `validImageTypes`). A `currentMasterVersion` that does not parse drops `master-behind`, `pool-skew` and `fleet-spread` the same way. A node pool whose `version` does not parse drops `pool-skew`, and one with no `config.imageType` drops `stale-image-type`, together with that check's candidates on the cluster; confirm those checks with the commands under their headings. Whether 3.8 flags a freeze, and at what severity, rests on 3.1 and 3.2, so a cluster under an in-effect blocking exclusion also drops `blocking-exclusion` when either of them dropped and neither found a critical or major: confirm 3.1 and 3.2 by hand, then grade 3.8 from what they found. A blocking exclusion whose `startTime` or `endTime` does not parse drops `blocking-exclusion` too; read its window with the command under 3.8. Write a `limitations` note naming only the slug or slugs absent from `commands`, rather than treating the cluster as unreachable; every other check on it is still fully collected.
-- `upgrade-blocked` (3.11) is in one of three places on every collected cluster: in `commands`, when the cluster had a `master-behind` or `pool-skew` candidate and the readiness reporter graded it; in the entry's `checks_not_applicable`, with the reason, in the two cases 3.11's _Not applicable_ bullet names; or in `checks_unevaluated`, with the reason, when the reporter could not grade a behind cluster or when `master-behind` itself was never judged (no baseline, an unparsable version). Copy the first two into the same field of the document; the third is a `limitations` line naming the check and the reason, as 3.11 says.
+- `upgrade-blocked` (3.11) is in one of three places on every collected cluster: in `commands`, when the cluster had a `master-behind` or `pool-skew` candidate and the readiness reporter graded it; in the entry's `checks_not_applicable`, with the reason, in the two cases 3.11's _Not applicable_ bullet names; or in `checks_unevaluated`, with the reason, when the reporter could not grade a behind cluster or when 3.1 `master-behind` or 3.2 `pool-skew` was never judged (no baseline, a version that did not parse). Copy the first two into the same field of the document; the third is a `limitations` line naming the check and the reason, as 3.11 says.
 - Candidates sit inside each cluster entry, at `manifest.clusters[].candidates`; the manifest has no top-level `candidates` key, so code that reads one and falls back to an empty list publishes nothing. Every one of those entries is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed, including `pool-skew`'s per-condition severity fork and `blocking-exclusion`'s escalation alongside a critical/major version finding on the same cluster. What is still yours to write is the `recommendation` (§5) and, for a `kind: manifest` remediation, the manifest file itself (§4).
 - A manifest with a top-level `error` and no clusters is §1.3's empty-fleet case: do not call `finish`, and report the error as your one-line summary. Two things produce it, and the collector exits non-zero for both. Project discovery named no project — neither the active project nor `projects list` answered, or both answered and named nothing. Or at least one project failed its `clusters list` and no project returned a cluster, so the manifest holds `project/<id>` entries and no collected cluster, only any `out-of-scope` entries the answering projects listed; the error counts the failed projects and quotes the first.
 - The collector closes with the count on stderr: `N cluster(s) collected[, K project(s) unread]; M candidate(s) to report`, with the per-check breakdown. `M` is what `findings` owes: every candidate is reported, and none is a `resolved_because` entry — that key is for a previous ledger finding this run's collector no longer emits.
@@ -250,8 +250,8 @@ each is waiting for whoever schedules it.
   plane (the control-plane move drains no node), or a skew ceiling alone on a cluster whose only
   lag is a pool behind its control plane (the pool's move is what closes the skew, and 3.2 carries
   the pool). The collector records the check as run there and emits no candidate.
-- **Not applicable**, in two cases and no other. A cluster 3.1 judged and found current, with no
-  3.2 candidate either, has no upgrade whose completion could be blocked; a `RECONCILING` one,
+- **Not applicable**, in two cases and no other. A cluster 3.1 and 3.2 both judged, with no candidate
+  from either, has no upgrade whose completion could be blocked; a `RECONCILING` one,
   whose version checks §3 suppresses, is declared in the same case with its own reason (an
   upgrade is in flight; nothing further is due; the next run grades it once it has settled). A behind cluster on no release channel has an
   upgrade but no target version for the reporter to grade it against, so its row comes back
@@ -260,11 +260,12 @@ each is waiting for whoever schedules it.
   writes `upgrade-blocked` into that entry's `checks_not_applicable` with the reason; copy the
   entry into the document's `checks_not_applicable` verbatim, or the ledger stays partial on a
   current fleet. It is the one check in this audit the collector ever declares inapplicable, and
-  it never declares it on a cluster 3.1 did not judge, nor on a channel cluster whose target the
-  reporter failed to fetch this run: those entries have the check in `checks_unevaluated` instead.
+  it never declares it on a cluster 3.1 or 3.2 did not judge, nor on a channel cluster whose
+  target the reporter failed to fetch this run: those entries have the check in
+  `checks_unevaluated` instead.
 - **Unevaluated:** a behind cluster the reporter could not grade — its objects could not be
   read, the reporter failed for that cluster or ran out of its four-minute budget, or it graded
-  `blocked` for a cause this check does not know — and a cluster 3.1 never judged, carry
+  `blocked` for a cause this check does not know — and a cluster 3.1 or 3.2 never judged, carry
   `upgrade-blocked` in the entry's `checks_unevaluated` with the reason. A `blocked` grade whose
   cause is node-pool skew is a finding even when the budget read failed beside it, when the
   ceiling can block the upgrade due (a behind control plane, or a pool ahead of it): the skew is
@@ -279,10 +280,11 @@ each is waiting for whoever schedules it.
   and a skew ceiling stops the upgrade outright.
 - **Object and evidence:** `object` is `Cluster/<cluster>`, like every finding in this audit (§2:
   `namespace` is `""`), so the finding keeps one identity week over week. The candidate's
-  `excerpt` carries every blocking budget in name order, each with its field, the workloads it
+  `excerpt` carries the blocking budgets in name order, each with its field, the workloads it
   covers and `disruptionsAllowed`, taken from the `members[].readiness.pdbs.blocking[]` entries;
-  when a skew ceiling blocks on the same row, the pool clause comes first and the budgets follow
-  it. Paste it as it is.
+  past what the ledger's evidence clip can hold it names the first eight and counts the rest,
+  pointing at the readiness report that lists every one. When a skew ceiling blocks on the same
+  row, the pool clause comes first and the budgets follow it. Paste it as it is.
 - **Impact:** the candidate's, whose tail names the mechanism for its cause, and the two causes
   make different claims. A budget delays the upgrade and costs the workload its pod; it does not
   stop the upgrade: a surge upgrade respects the budget for up to an hour per node and then
@@ -290,7 +292,8 @@ each is waiting for whoever schedules it.
   held, not stopped: PodDisruptionBudget `<namespace>/<budget>` (`maxUnavailable: 0`,
   disruptionsAllowed 0) refuses eviction of `<workload>`, so GKE holds each node's drain for up to
   an hour and then evicts `<workload>` anyway." With many budgets it names three and counts the
-  rest, the evidence naming them all, so the tail stays inside the ledger's clip. A skew ceiling
+  rest, pointing at the readiness report that lists every one, so the tail stays inside the
+  ledger's clip. A skew ceiling
   does stop it. For skew: "`<cluster>` is `<n>` minor(s) behind and its upgrade would not
   complete: node pool(s) `<pool>` would exceed
   the version-skew ceiling against the target control plane, so GKE will not move the control

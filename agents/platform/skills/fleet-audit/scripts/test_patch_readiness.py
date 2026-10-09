@@ -2000,7 +2000,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertLessEqual(len(hit["impact"]), pr.IMPACT_MAX_CHARS)
         self.assertTrue(hit["impact"].endswith("anyway."), hit["impact"])
         self.assertEqual(hit["impact"].count("PodDisruptionBudget seeded-upgrade/chart-"), 3)
-        self.assertIn("and 9 more drain-blocking PodDisruptionBudget(s), named in the evidence", hit["impact"])
+        self.assertIn(f"and 9 more drain-blocking PodDisruptionBudget(s); the readiness report at {self.report_path('lag')} lists every one", hit["impact"])
         self.assertIn("evicts Deployment/chart-00-api, StatefulSet/chart-00-db, Deployment/chart-01-api, and 21 more anyway", hit["impact"])
         for i in range(12):
             self.assertIn(f"seeded-upgrade/chart-{i:02d}-pdb", hit["excerpt"])
@@ -2013,10 +2013,41 @@ class UpgradeBlockedTest(unittest.TestCase):
         full = next(c for c in by["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
         cause = pr._readiness_cause(self.member("lag", pdbs=budgets)["readiness"])
         with mock.patch.object(pr, "IMPACT_MAX_CHARS", len(full["impact"]) // 3):
-            counted = pr._bounded_impact(cause, "lag", pr.LAG_MINORS_FORMAT.format(n=1))
-        self.assertIn("4 drain-blocking PodDisruptionBudget(s), named in the evidence, refuse eviction of 1 workload(s)", counted)
+            counted = pr._bounded_impact(cause, "lag", pr.LAG_MINORS_FORMAT.format(n=1), self.report_path("lag"))
+        self.assertIn(f"4 drain-blocking PodDisruptionBudget(s), listed in the readiness report at {self.report_path('lag')}, refuse eviction of 1 workload(s)", counted)
         self.assertNotIn("chart-", counted)
         self.assertTrue(counted.endswith("evicts 1 workload(s) anyway."), counted)
+
+    def test_the_excerpt_names_eight_budgets_and_counts_the_rest_past_the_ledgers_evidence_clip(self):
+        """The ledger clips evidence at 2000 characters: sixteen plain budgets
+        overran it, and the impact's count form sent the reader to names the
+        clip had removed. The excerpt now names what fits and counts the rest,
+        and both texts point at the readiness report that lists every one."""
+        budgets = [
+            {**self.BUDGET, "pdb": f"seeded-upgrade/chart-{i:02d}-pdb", "workloads": [{"kind": "Deployment", "namespace": "seeded-upgrade", "name": f"chart-{i:02d}-api"}]}
+            for i in range(16)
+        ]
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=budgets)])
+        hit = next(c for c in by["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertLessEqual(len(hit["excerpt"]), pr.EXCERPT_MAX_CHARS)
+        self.assertEqual(hit["excerpt"].count("PodDisruptionBudget seeded-upgrade/chart-"), 8)
+        self.assertIn("seeded-upgrade/chart-07-pdb", hit["excerpt"])
+        self.assertNotIn("seeded-upgrade/chart-08-pdb", hit["excerpt"])
+        self.assertIn(f"and 8 more drain-blocking PodDisruptionBudget(s); the readiness report at {self.report_path('lag')} lists every one", hit["excerpt"])
+        self.assertIn(f"and 13 more drain-blocking PodDisruptionBudget(s); the readiness report at {self.report_path('lag')} lists every one", hit["impact"])
+        self.assertTrue(hit["impact"].endswith("anyway."), hit["impact"])
+
+    def test_a_cluster_whose_pool_skew_was_not_judged_is_unevaluated_not_declared(self):
+        """`BEHIND_CHECKS` makes a cluster behind on either candidate, so "judged"
+        takes both: a pool whose version did not parse left 3.2 unjudged, and a
+        clean 3.1 beside it does not make the cluster current."""
+        c = cluster(name="odd", master=self.CURRENT, node_pools=[pool(), pool("odd", version="1.29")])
+        by = self.collect([c], [])
+        entry = by["odd"]
+        self.assertNotIn("pool-skew", self.ran(entry))
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn(pr.UNEVALUATED_VERSION_NOT_JUDGED, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+        self.assertEqual(self.calls, [])
 
     def test_behind_clusters_run_least_recently_reported_first_and_a_skipped_one_keeps_its_turn(self):
         """A budget spent inside a wide project must not fall on the same
