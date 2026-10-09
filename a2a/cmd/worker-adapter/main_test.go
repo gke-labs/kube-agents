@@ -102,7 +102,7 @@ func TestDefaultToolSurfaceNeedsNoEgressTheFenceDenies(t *testing.T) {
 // spawner telling the adapter the pod has the broker's read-only wrappers;
 // Bash joins the surface and the system prompt says what the fence is.
 func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
-	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL"} {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvProfileExecutor} {
 		t.Setenv(key, "")
 		_ = os.Unsetenv(key)
 	}
@@ -128,7 +128,7 @@ func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
 	// The delegate tool is on by default (its switch is A2A_DELEGATE_TOOL,
 	// not the cluster view), so it is expected here too: appended to
 	// allowed, and its prompt is all there is since the view is off.
-	if strings.Contains(allowed, "Bash") || !strings.Contains(disallowed, "Bash") || !strings.Contains(allowed, delegateToolID) || prompt != delegatePrompt {
+	if strings.Contains(allowed, "Bash") || !strings.Contains(disallowed, "Bash") || !strings.Contains(allowed, delegateToolID) || prompt != noClusterPrompt+"\n\n"+delegatePrompt {
 		t.Fatalf("view off: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
 	}
 	t.Setenv(lib.EnvClusterView, "true")
@@ -150,14 +150,15 @@ func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
 	}
 	// Both prompts apply with the view on and the delegate tool on (its
 	// default): joined, not one replacing the other.
-	if !strings.Contains(prompt, clusterViewPrompt) || !strings.Contains(prompt, "policy rule") || !strings.Contains(prompt, "delegate") {
+	if !strings.Contains(prompt, clusterViewPrompt) || !strings.Contains(prompt, "policy rule") || !strings.Contains(prompt, "delegate") || strings.Contains(prompt, noClusterPrompt) {
 		t.Fatalf("view on prompt = %q", prompt)
 	}
 	// An A2A_ALLOWED_TOOLS override without Bash wins over the view: Bash
-	// stays disallowed, and the view's own prompt is not appended. The
+	// stays disallowed, and the view's own prompt is not appended. Nor is
+	// the no-cluster line, since the pod still holds the view's shims. The
 	// delegate tool is unaffected by this override -- A2A_DELEGATE_TOOL is
 	// its only switch -- so it still joins the allowed list and its prompt
-	// is still the one that shows up.
+	// is the one that shows up.
 	t.Setenv("A2A_ALLOWED_TOOLS", "Read,Grep")
 	allowed, disallowed, prompt = flags(harnessCommand())
 	if allowed != "Read,Grep,"+delegateToolID || !strings.Contains(disallowed, "Bash") || prompt != delegatePrompt {
@@ -497,5 +498,49 @@ func TestBothPromptsWhenTheViewAndTheToolAreOn(t *testing.T) {
 	}
 	if n := strings.Count(strings.Join(argv, " "), "--append-system-prompt"); n != 1 {
 		t.Fatalf("append-system-prompt given %d times", n)
+	}
+}
+
+// A session turn with no cluster view is told it has none and that the pod
+// holds no cluster credentials or tools to search, which is what kept a turn
+// that couldn't reach the cluster (a wake, once its delegate tool is off)
+// from rummaging its filesystem and narrating it into the answer. With the
+// view, the view's own prompt says what it has instead, and an AgentProfile's
+// pod, which reaches clusters its own way, isn't told it has none.
+func TestASessionWithNoClusterViewIsToldNotToSearchThePod(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", lib.EnvProfileExecutor} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	prompt := func() string {
+		argv := harnessCommand()
+		for i, arg := range argv {
+			if arg == "--append-system-prompt" && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	t.Setenv("A2A_DELEGATE_TOOL", "off") // the wake shape once its tool is off
+	t.Setenv(lib.EnvClusterView, "")
+	if p := prompt(); !strings.Contains(p, noClusterPrompt) || strings.Contains(p, delegatePrompt) {
+		t.Errorf("wake with no view: prompt = %q", p)
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	if p := prompt(); strings.Contains(p, noClusterPrompt) || !strings.Contains(p, clusterViewPrompt) {
+		t.Errorf("with the view: prompt = %q", p)
+	}
+	// A view pod whose override leaves Bash out still holds the shims, so
+	// it isn't told they're absent.
+	t.Setenv("A2A_ALLOWED_TOOLS", "Read,Grep")
+	if p := prompt(); strings.Contains(p, noClusterPrompt) || strings.Contains(p, clusterViewPrompt) {
+		t.Errorf("view on, override without Bash: prompt = %q", p)
+	}
+	t.Setenv("A2A_ALLOWED_TOOLS", "")
+	_ = os.Unsetenv("A2A_ALLOWED_TOOLS")
+	t.Setenv(lib.EnvClusterView, "")
+	t.Setenv(lib.EnvProfileExecutor, "true")
+	if p := prompt(); strings.Contains(p, noClusterPrompt) {
+		t.Errorf("an AgentProfile's pod was told it has no cluster access: prompt = %q", p)
 	}
 }
