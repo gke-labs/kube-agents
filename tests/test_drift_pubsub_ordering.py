@@ -1,4 +1,4 @@
-"""The drift-pubsub module creates its sink last and destroys it first.
+"""The drift sink is created last, destroyed first, and its topic outlives the cluster.
 
 Cloud Logging starts exporting the moment a sink exists and keeps exporting for
 some minutes after one is deleted. An export that lands outside the window
@@ -7,8 +7,8 @@ where the topic exists and the sink's publish grant is in place mails an
 holding roles/owner on the project -- `topic_permission_denied` on apply,
 `topic_not_found` on destroy.
 
-One chain of four links carries all of the module's ordering, and is the whole
-of the fix:
+Two orderings carry this, in two files. Inside the module, one chain of four
+links:
 
     google_project_service_identity.logging
       -> time_sleep.logging_identity                    (the apply-side wait)
@@ -57,10 +57,22 @@ regression this file exists to catch. The fourth link is the exception that
 proves the split: being a reference rather than an edge, it shows up in the
 plan as a value, so the tftest can and does pin it.
 
-That division is why there are only two tests here. The drain's shape and the
-sink's postcondition are values, and the tftest suite reaches both; asserting
-them again here would duplicate it without covering anything the plan cannot
-see.
+That division is why the module's share of this file is three tests rather
+than a transcription of its suite. The drain's shape and the sink's
+postcondition are values, and the tftest suite reaches both; asserting them
+again here would duplicate it without covering anything the plan cannot see.
+
+The other two tests are the composition's, and the module cannot express what
+they pin. `full-install`'s `gke_cluster` declares `depends_on` on the ingress
+module, which reverses their teardown: Terraform destroys dependents before
+dependencies, so the cluster goes first and the topic last. Without that edge
+the topic is deleted while the control plane is still up and still emitting
+matching audit records -- measured on a CI teardown at topic t+124s against a
+last record at t+366s -- and each one mails the owners. The edge exists only
+for the destroy, so nothing an apply or a plan prints will show it missing.
+Its companion asserts the other half: that the ingress module references
+nothing cluster-side, which is both what makes the edge legal (otherwise it is
+a cycle) and what the detector's GSA used to smuggle back in.
 
 The second assertion is the specific way the fix gets undone. The grant used to
 read `google_logging_project_sink.drift_audit.writer_identity`, which is what
@@ -125,6 +137,20 @@ CLUSTER_MODULE = "gke_cluster"
 IAM_MODULE = "kube_agents_iam"
 IAM_MODULE_REFERENCE = f"{_MODULE}.{IAM_MODULE}"
 
+# The detector's own access, which moved out of the module to break the
+# dependency above and so is no longer guaranteed by instantiating it. Both
+# have to exist and both have to bind to the module's subscription; a merge
+# that drops one leaves a detector that starts, is denied on every pull, and
+# stays Ready -- the silent mode the detector's `enabled` default exists to
+# avoid. Nothing else in the repository asserts they are there.
+SUBSCRIPTION_GRANT = "google_pubsub_subscription_iam_member"
+DETECTOR_GRANTS = (
+    ("detector_subscriber", "roles/pubsub.subscriber"),
+    ("detector_viewer", "roles/pubsub.viewer"),
+)
+SUBSCRIPTION_REFERENCE = f"{_MODULE}.{INGRESS_MODULE}[0].subscription_id"
+COMPOSITION_PATH = "terraform/examples/full-install/main.tf"
+
 GRANT = ("google_pubsub_topic_iam_member", "sink_writer")
 DRAIN = ("time_sleep", "sink_drain")
 SINK = ("google_logging_project_sink", "drift_audit")
@@ -164,15 +190,17 @@ REQUIRED_EDGES = (
 SINK_WRITER_ATTRIBUTE = f"{SINK[0]}.{SINK[1]}.writer_identity"
 
 
-def _resource_body(tokens: list, resource_type: str, name: str) -> list:
+def _resource_body(
+    tokens: list,
+    resource_type: str,
+    name: str,
+    where: str = "terraform/modules/drift-pubsub/main.tf",
+) -> list:
     """The tokenized body of one top-level resource block, as (token, depth)."""
     for labels, body in _blocks(tokens, _RESOURCE, _RESOURCE_LABELS):
         if labels == [resource_type, name]:
             return body
-    raise AssertionError(
-        f"terraform/modules/drift-pubsub/main.tf declares no "
-        f'resource "{resource_type}" "{name}"'
-    )
+    raise AssertionError(f'{where} declares no resource "{resource_type}" "{name}"')
 
 
 def _depends_on_references(body: list) -> list | None:
@@ -209,6 +237,15 @@ def _module_body(tokens: list, name: str) -> list:
         f"terraform/examples/full-install/main.tf declares no "
         f'module "{name}"'
     )
+
+
+def _block_strings(body: list) -> list:
+    """Every string literal in a block, which _code_text deliberately drops.
+
+    The role names this file checks are values rather than syntax, so they are
+    the one thing the code-only view cannot see.
+    """
+    return [value for (kind, value), _depth in body if kind == _STR]
 
 
 def _code_text(body: list) -> str:
@@ -287,6 +324,28 @@ class DriftPubsubOrdering(unittest.TestCase):
             f"after it mails the project's owners (#2426). The edge is for the destroy "
             f"order, so no apply and no plan will show it missing",
         )
+
+    def test_the_composition_still_grants_the_detector_its_subscription(self) -> None:
+        for name, role in DETECTOR_GRANTS:
+            with self.subTest(grant=name):
+                body = _resource_body(
+                    self.composition, SUBSCRIPTION_GRANT, name, COMPOSITION_PATH
+                )
+                code = _code_text(body)
+                self.assertIn(
+                    SUBSCRIPTION_REFERENCE,
+                    code,
+                    f"{SUBSCRIPTION_GRANT}.{name} must bind to {SUBSCRIPTION_REFERENCE}; "
+                    f"these grants left the module so that it could stay independent of "
+                    f"the cluster, which also means instantiating the module no longer "
+                    f"produces them and nothing but this test does",
+                )
+                self.assertIn(
+                    role,
+                    _block_strings(body),
+                    f"{SUBSCRIPTION_GRANT}.{name} must grant {role}. Losing it is silent: "
+                    f"the detector starts, is denied on every pull, and the pod stays Ready",
+                )
 
     def test_the_ingress_does_not_depend_on_the_iam_module(self) -> None:
         body = _module_body(self.composition, INGRESS_MODULE)

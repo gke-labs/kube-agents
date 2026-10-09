@@ -382,8 +382,32 @@ module "gke_cluster" {
   # has gone quiet -- which is also the whole of it when create_cluster is
   # false and no cluster is in this state's destroy graph at all.
   #
-  # On apply it means the ingress is built before the cluster, which costs
-  # nothing: a sink with no cluster to watch exports nothing.
+  # On apply it means the ingress is built before the cluster. That is correct
+  # -- a sink with no cluster to watch exports nothing -- but it is not free,
+  # in two ways worth knowing before anyone widens the edge.
+  #
+  # It serialises what used to run in parallel. The cluster is the install's
+  # long pole, and it now waits for the whole ingress, including
+  # time_sleep.logging_identity's own wait. A greenfield install with
+  # enable_drift_pubsub on is longer by roughly the ingress's critical path.
+  # The ingress's documented "Service account ... does not exist" failure also
+  # now aborts before the cluster is requested rather than after it is built,
+  # which makes the retry cheaper and the first failure earlier.
+  #
+  # And a module-level depends_on defers every data source inside the module
+  # whenever a target has a planned change -- the mechanism the drift_pubsub
+  # call below and the scope_resolver call document for themselves. Here that
+  # reaches data.google_container_cluster.existing, which exists only when
+  # create_cluster is false, so on a bring-your-own-cluster install an apply
+  # whose only change is in the ingress defers that read to apply time and
+  # with it the Workload Identity and NetworkPolicy postconditions, which are
+  # written to refuse a plan rather than fail partway through one. Narrowing
+  # the edge does not avoid it: Terraform resolves an indexed depends_on
+  # reference to the whole resource, and a root depends_on cannot name
+  # anything finer than a module. It is the price of the ordering rather than
+  # an oversight, and it is confined to the case where the ordering buys
+  # nothing anyway -- an external cluster outlives the destroy, so the drain
+  # is doing the work there.
   depends_on = [google_project_service.required, module.drift_pubsub]
 }
 

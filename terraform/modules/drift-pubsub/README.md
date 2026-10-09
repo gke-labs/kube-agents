@@ -76,6 +76,16 @@ resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
 }
+
+# Both roles, not just subscriber: subscriber carries subscriptions.consume
+# but not subscriptions.get, and the detector reads the ack deadline at
+# startup. See "Lowering ack_deadline_seconds" below.
+resource "google_pubsub_subscription_iam_member" "detector_viewer" {
+  project      = "my-gcp-project"
+  subscription = module.drift_pubsub.subscription_id
+  role         = "roles/pubsub.viewer"
+  member       = "serviceAccount:kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
+}
 ```
 
 A caller upgrading from a version that made those grants itself needs `moved` blocks for the two
