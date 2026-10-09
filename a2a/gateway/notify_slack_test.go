@@ -163,6 +163,9 @@ func TestSlackNotifyPostsBlocksAsOneMessage(t *testing.T) {
 	if blocks := stub.forms[0].Get("blocks"); !strings.Contains(blocks, "3 findings") {
 		t.Errorf("blocks on the wire = %q", blocks)
 	}
+	if stub.forms[0].Get("unfurl_links") != "false" || stub.forms[0].Get("unfurl_media") != "false" {
+		t.Errorf("a notify card unfurls: unfurl_links=%q unfurl_media=%q", stub.forms[0].Get("unfurl_links"), stub.forms[0].Get("unfurl_media"))
+	}
 	if text := stub.forms[0].Get("text"); len([]rune(text)) > discordChunk+1 {
 		t.Errorf("fallback text is %d runes, over one chunk", len([]rune(text)))
 	}
@@ -319,6 +322,18 @@ func TestSlackNotifyChecksAQualifiedThreadsChannel(t *testing.T) {
 	}
 	if len(p.all()) != 1 {
 		t.Errorf("a refused thread posted: %+v", p.all())
+	}
+}
+
+// TestSlackNotifyTextPostsDoNotUnfurl: a text notify (an alert, a card's
+// report) carries console links; none of them unfurls into a preview.
+func TestSlackNotifyTextPostsDoNotUnfurl(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	if _, _, err := adapter.PostNotify(testSlackHome, "", "see https://console.cloud.google.com/x"); err != nil {
+		t.Fatal(err)
+	}
+	if len(stub.forms) != 1 || stub.forms[0].Get("unfurl_links") != "false" || stub.forms[0].Get("unfurl_media") != "false" {
+		t.Fatalf("forms = %v, want unfurl_links=false and unfurl_media=false", stub.forms)
 	}
 }
 

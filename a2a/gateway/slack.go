@@ -600,7 +600,10 @@ func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// No link or media previews: an alert's console links would each unfurl
+	// into a card (Post makes the same choice, #2820).
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
 	if thread != "" {
 		opts = append(opts, slack.MsgOptionTS(thread))
 	}
@@ -626,7 +629,8 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return "", "", fmt.Errorf("slack: blocks: %w", err)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false), slack.MsgOptionBlocks(blocks.BlockSet...)}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false), slack.MsgOptionBlocks(blocks.BlockSet...),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
 	if thread != "" {
 		opts = append(opts, slack.MsgOptionTS(thread))
 	}
