@@ -1,55 +1,65 @@
 # GKE Environment Discovery Report
 
-This is the first-time environment scan for project `onboarding-demo-prod`: one cluster, four
-workloads, six findings.
+This is the first-time environment scan for project `onboarding-criticals-prod`: one cluster, six
+workloads, seven findings.
 
 ## GKE Fleet Discovery
 
 | Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
 | :----------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
-| prod-east | us-east1 | RUNNING | 1.33.4-gke.1245000 | default-pool / e2-standard-4 (3 nodes) | disabled | Cloud Logging only | kubectl apply from CI |
+| prod-central | us-central1 | RUNNING | 1.33.4-gke.1245000 | default-pool / e2-standard-4 (4 nodes) | disabled | Cloud Logging only | kubectl apply from CI |
 
 ## Workloads Inventory
 
 | Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
 | :------ | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
-| prod-east | payments | checkout | Deployment | 3/3 | yes/yes | Burstable | none | yes |
-| prod-east | payments | cart | Deployment | 2/2 | yes/no | Burstable | none | yes |
-| prod-east | web | frontend | Deployment | 3/3 | yes/no | Burstable | none | yes |
-| prod-east | data | orders-db | StatefulSet | 1/1 | yes/yes | requests only, no memory limit | none | yes |
+| prod-central | billing | invoice-worker | Deployment | 2/2 | yes/yes | Burstable | none | yes |
+| prod-central | ci | release-bot | Deployment | 1/1 | yes/yes | Burstable | none | yes |
+| prod-central | shop | quote-api | Deployment | 0/1 | yes/yes | Guaranteed | none | yes |
+| prod-central | shop | pricing-engine | Deployment | 0/2 | yes/yes | Burstable | none | yes |
+| prod-central | shop | gift-cards | Deployment | 3/3 | yes/no | Burstable | none | yes |
+| prod-central | data | orders-db | StatefulSet | 1/1 | yes/yes | requests only, no memory limit | none | yes |
 
 ## Prioritized SRE Remediation Plan
 
 ### Priority 1 — Security & Identity Hardening
 
-- `payments/checkout` mounts a static service account key for a project-editor service account from
-  the Secret `checkout-gcp-key`. Anyone who can read that Secret holds editor on the project. Move
+- `billing/invoice-worker` mounts a static service account key for a project-editor service account
+  from the Secret `invoice-gcp-key`. Anyone who can read that Secret holds editor on the project. Move
   the workload to Workload Identity and delete the key. (severity: high)
-- Workload Identity is disabled on `prod-east`, which is why workloads there authenticate with
-  exported keys. Enable it on the cluster and its node pool. (severity: high)
+- The ClusterRoleBinding `ci-cluster-admin` grants `cluster-admin` to the ServiceAccount
+  `ci/release-bot`, whose token is mounted into the running `release-bot` pod. Anything that runs
+  code in that pod controls the whole cluster. Bind a namespaced Role with only the verbs the
+  release job uses. (severity: high)
 
 ### Priority 2 — Workload Reliability & Probes
 
-- `payments/cart` has no readinessProbe, so a replica still warming up receives traffic. Add one.
+- `shop/quote-api`, the only replica of a serving Deployment, is in CrashLoopBackOff: its container
+  is OOMKilled at its 256Mi limit and has restarted 47 times, so the service has no ready endpoint.
+  Raise the memory limit or fix the leak. (severity: high)
+- `shop/pricing-engine` has 0 of 2 replicas running: both pods are stuck in
+  CreateContainerConfigError because the ConfigMap `pricing-rules` they read does not exist, so the
+  service has no ready endpoint. Restore the ConfigMap. (severity: high)
+- `shop/gift-cards` has no readinessProbe, so a replica still warming up receives traffic. Add one.
   (severity: medium)
-- `web/frontend` has no readinessProbe either. Add one. (severity: medium)
 - `data/orders-db` sets memory requests but no memory limit, so it can take memory from its
   neighbours until the node evicts them. Set a limit. (severity: medium)
 
 ### Priority 3 — Observability & Telemetry
 
-- Managed Service for Prometheus is not enabled on `prod-east`; nothing collects workload metrics.
+- Managed Service for Prometheus is not enabled on `prod-central`; nothing collects workload metrics.
   Enable it. (severity: low)
 
 ## Machine-Readable Findings
 
 ```findings
-{"check": "sa-key-in-secret", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "payments", "object": "checkout", "title": "checkout mounts a static project-editor service account key from a Secret", "detail": "Secret checkout-gcp-key holds a JSON key for a service account with roles/editor, mounted at /var/secrets/google", "severity_hint": "high"}
-{"check": "workload-identity-off", "project": "onboarding-demo-prod", "cluster": "prod-east", "object": "prod-east", "title": "Workload Identity is not enabled on the cluster", "detail": "workloadIdentityConfig is absent from the cluster", "severity_hint": "high"}
-{"check": "probes-readiness", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "payments", "object": "cart", "title": "cart Deployment has no readinessProbe", "detail": "2 replicas, no readinessProbe on any container", "severity_hint": "medium"}
-{"check": "probes-readiness", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "web", "object": "frontend", "title": "frontend Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "medium"}
-{"check": "no-memory-limit", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "data", "object": "orders-db", "title": "orders-db StatefulSet has no memory limit", "detail": "resources.requests.memory is 2Gi, resources.limits.memory is unset", "severity_hint": "medium"}
-{"check": "managed-prometheus", "project": "onboarding-demo-prod", "cluster": "prod-east", "object": "prod-east", "title": "Managed Service for Prometheus is not enabled", "detail": "monitoringConfig.managedPrometheusConfig.enabled is false", "severity_hint": "low"}
+{"check": "sa-key-in-secret", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "billing", "object": "invoice-worker", "title": "invoice-worker mounts a static project-editor service account key from a Secret", "detail": "Secret invoice-gcp-key holds a JSON key for a service account with roles/editor, mounted at /var/secrets/google; Workload Identity is disabled on the cluster", "severity_hint": "high"}
+{"check": "rbac-cluster-admin", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "ci", "object": "release-bot", "title": "ServiceAccount release-bot is bound to cluster-admin", "detail": "ClusterRoleBinding ci-cluster-admin binds ClusterRole cluster-admin to ServiceAccount ci/release-bot; its token is automounted into the running release-bot pod", "severity_hint": "high"}
+{"check": "crashloop-backoff", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "shop", "object": "quote-api", "title": "quote-api Deployment is in CrashLoopBackOff, OOMKilled", "detail": "1 replica, 0 ready; the container is OOMKilled at its 256Mi memory limit and has restarted 47 times; the Service has no ready endpoint", "severity_hint": "high"}
+{"check": "create-container-config-error", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "shop", "object": "pricing-engine", "title": "pricing-engine pods are stuck in CreateContainerConfigError", "detail": "2 replicas, 0 running; configmap \"pricing-rules\" not found; the Service has no ready endpoint", "severity_hint": "high"}
+{"check": "probes-readiness", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "shop", "object": "gift-cards", "title": "gift-cards Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "medium"}
+{"check": "no-memory-limit", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "data", "object": "orders-db", "title": "orders-db StatefulSet has no memory limit", "detail": "resources.requests.memory is 2Gi, resources.limits.memory is unset", "severity_hint": "medium"}
+{"check": "managed-prometheus", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "prod-central", "title": "Managed Service for Prometheus is not enabled", "detail": "monitoringConfig.managedPrometheusConfig.enabled is false", "severity_hint": "low"}
 ```
 
-scanned=1 clusters, 4 workloads findings=6 elapsed=412s
+scanned=1 clusters, 6 workloads findings=7 elapsed=438s

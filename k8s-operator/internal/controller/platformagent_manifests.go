@@ -4619,6 +4619,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
 		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
+
+		// The findings queue's pacing limits (`findings_queue.pacing_limits`,
+		// read by the `no_agent` scripts `findings_nudge.py` and
+		// `bootstrap_handoff.py`, which passes them to the first inventory
+		// report's selection): how many findings are added to chat, and from
+		// which UTC hour. Each is parsed as a whole number, and a value that
+		// does not parse, is negative, or is not an hour falls back to its
+		// default, so an arbitrary value bounds a count of chat messages and
+		// reaches nothing else. Kept apart from the block above so gofmt does not realign it.
+		"FINDINGS_DAILY_CRITICALS":        {},
+		"FINDINGS_FIRST_REPORT_CRITICALS": {},
+		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
+		"FINDINGS_NONCRITICAL_MAX":        {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

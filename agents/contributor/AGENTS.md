@@ -30,9 +30,9 @@ Agents **do not review one another's work unless asked to by a human.** Review
 and approval are human responsibilities (assisted by `kube-agents-bot`); merge
 is external automation applied once a human approves (see the root
 `AGENTS.md`). A review a human asks you for is a comment, never a verdict: see
-[Hard rules](#hard-rules). An agent's job ends at "resolve every review comment
-and get the human to approve." The only coordination _between_ agents is the
-claim, below.
+[Hard rules](#hard-rules). An agent's job ends at "answer every review comment,
+resolve the ones a commit fixed, and get the human to approve." The only
+coordination _between_ agents is the claim, below.
 
 ## The loop
 
@@ -42,21 +42,45 @@ cycle.
 
 1. **Own open pull requests first.** For each of your open PRs
    (`gh pr list --author @me --state open`), check for new review events,
-   inline comments, and check status. Address every finding - fix and push, or
-   answer it in the thread - and resolve each thread only once it is genuinely
-   resolved, per the bar in the root `AGENTS.md`. After fixing findings,
-   trigger a fresh review yourself: comment `/review` for a narrow re-check of
-   the diff, or `/review all` for a wider re-check when the changes are
-   substantial. After an edit to the pull request body alone, comment
-   `/review fresh` instead: a plain `/review` on an unchanged commit re-cuts
-   the earlier review without reading the body again. A green pass is what
-   puts the change in front of a human reviewer, so trigger it yourself rather
-   than waiting. If `lgtm` is present,
-   you are done only when the full merge gate holds - `lgtm` _and_ `approved`
-   present and the required checks passing (and `ok-to-test` applied when Prow
-   does not trust the author). The system then merges; you never do. `lgtm` alone is not the
-   finish line: verify the rest before moving on. If `do-not-merge/hold` is
-   present, read the comment explaining why and wait.
+   inline comments, and check status. Answer every finding in its thread. On
+   the first review, fix and push. On a later round, decline by default: fix
+   a 🟠 Medium only when it is a `behaviour` finding on code your PR added and
+   the fix is one mechanical edit per site that adds no file, helper, branch,
+   flag, dependency or regex alternative; otherwise reply
+   `declined: <reason about this change>` or `deferred to #N`, record it in
+   **Self-Review**, and leave the thread open - a human's approval, or
+   their reply in the thread that accepts the decline, is the ruling, and
+   then you resolve it citing that; a reply that asks for the fix owes the
+   fix, thread open. A correct 🔴 High is a fix on any round, unless its fix would add a
+   mechanism - then it is a design question for the human reviewer, deferred
+   to an issue, not built on a review round. Resolve only a thread a commit
+   fixed, you showed factually wrong, or a human ruled on as above, per the
+   bar in the root `AGENTS.md`.
+   Bring the body current in the same push as the fix, before any re-read.
+   You get at most two re-reads of your own before green: after a push that
+   fixed something, comment `/review` for a narrow re-check of the diff, or
+   `/review all` for a wider re-check when the changes are substantial; after
+   an edit to the pull request body alone, comment `/review fresh` instead,
+   since a plain `/review` on an unchanged commit re-cuts the earlier review
+   without reading the body again. A merge of `main` or a rebase that changes
+   nothing of yours earns none. At the third reviewed commit, or after a
+   round that pushed nothing - every finding declined, deferred or refuted -
+   comment `/request-review` if no human is on it yet (_who counts_, in
+   [green is settled](../../docs/pull-request-workflow.md#green-is-settled)),
+   and stop. A green
+   `AI Review` check is settled: type no `/review` in any form after it, and
+   do not mark a draft ready or close and reopen to buy one; answer each open
+   🟠 Medium by reply, push a fix only for one you would have fixed unasked,
+   and wait for the human the green summons. Their changes-requested review,
+   a `/review` that is not yours, or a diff grown past twice the green head's
+   size owes one more; nothing else does
+   ([the stop rule](../../docs/pull-request-workflow.md#green-is-settled)). If
+   `lgtm` is present, you are done only when the full merge gate holds -
+   `lgtm` _and_ `approved` present and the required checks passing (and
+   `ok-to-test` applied when Prow does not trust the author). The system then
+   merges; you never do. `lgtm` alone is not the finish line: verify the rest
+   before moving on. If `do-not-merge/hold` is present, read the comment
+   explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
    in progress, continue it. Skip any issue carrying `needs-human` - it is
    blocked on a human, not on you (see [Escalating to
@@ -158,20 +182,33 @@ label, not a comment, is the signal to resume.
 
 Opening a PR starts `kube-agents-bot`. The path to merge:
 
-1. Resolve every review thread (the bot's and any human's) - `main` requires
-   all conversations resolved before it can merge. Resolve a thread only once
-   genuinely resolved, per the root `AGENTS.md`.
-2. Trigger a green bot pass yourself - comment `/review` (or `/review all`
-   for a wider re-check) after a push, and `/review fresh` after an edit to
-   the body alone, since a plain `/review` on an unchanged commit re-cuts the
-   earlier review without reading the body again. A green pass is what puts
-   the change in front of a human reviewer: clean on the first review, or nothing above Medium and the
-   description answered (the body edited, not just its thread resolved) on a
-   later one, per
-   [what the check means](../../docs/pull-request-workflow.md#what-the-check-means); `/request-review` assigns one immediately when a review
-   never arrives or you have answered a finding you disagree with. It reacts
-   👀 to the comment when it requested someone and 😕 when it declined; the
-   workflow run's annotations say why.
+1. Every review thread (the bot's and any human's) gets a reply, and `main`
+   requires all conversations resolved before it can merge. Resolve a thread
+   only once genuinely resolved, per the root `AGENTS.md`; a declined bot
+   finding stays open with its reply until a human rules on it - an approval,
+   or a reply in the thread that accepts the decline; a reply that asks for
+   the fix owes it - then resolve it, citing the ruling.
+2. Reach a human reviewer: a green bot pass - clean on the first review, or
+   nothing above Medium and the description answered (the body edited, not
+   just its thread resolved) on a later one, per
+   [what the check means](../../docs/pull-request-workflow.md#what-the-check-means) -
+   or the bot's third round, whichever comes first. Comment `/review` after a
+   push that fixed something (`/review all` for a wider re-check, and
+   `/review fresh` after an edit to the body alone, since a plain `/review` on
+   an unchanged commit re-cuts the earlier review without reading the body
+   again), at most twice; at the third reviewed commit, or after a round that
+   pushed nothing, comment `/request-review` if no human is on it yet, and
+   stop; the workflow's hand-off comment (opening
+   `<!-- auto-request-review:handoff -->`) means one was requested already,
+   so stop - the command on the comment's first line, then a line telling the
+   reviewer where the fix for any 🔴 High is and that the bot re-runs on
+   their `/review`. `/request-review` also assigns one immediately when a
+   review never arrives. It reacts 👀 to the comment when it requested someone
+   and 😕 when it declined; the workflow run's annotations say why. Once the
+   check is green or a reviewer is requested, self-service is over: reply in
+   each thread and wait. A reply from them gets a reply; only their
+   changes-requested review or their `/review` owes one more round (step 1 of
+   the loop).
 3. Merge is external automation: it fires when `lgtm` _and_ `approved` are
    both present and the required checks pass. You never merge.
 

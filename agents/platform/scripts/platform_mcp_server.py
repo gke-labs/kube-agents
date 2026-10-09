@@ -1121,7 +1121,7 @@ def get_ranked_findings() -> str:
     The whole open backlog, ordered worst first: actionable before unactionable,
     then by rank score, then a deterministic tie-break.
 
-    This is what the backlog document and the daily nudge are rendered from. The
+    This is what the backlog document and the nudge are rendered from. The
     order is decided here — do not re-rank it.
     """
     return _findings_call("GET", "/v1/findings/ranked")
@@ -1163,8 +1163,12 @@ def mark_finding_surfaced(finding_id: str, chat_id: str = "", thread_id: str = "
     """
     Record that a finding was named in a message that has already been sent.
 
-    Call this after the send, not before: it advances the surface count a
-    publisher uses to decide what to repeat.
+    Call this after the send, not before: it advances the surface count and
+    the time the finding was last named. It does not mark the finding shown
+    for pacing: naming a finding in answer to someone's request is not an
+    addition, so it counts against no daily limit and does not hold back
+    new findings. Only the nudge and the first inventory report's delivery
+    mark findings shown.
 
     Args:
         finding_id: The finding's id.
@@ -1190,8 +1194,15 @@ def update_finding(
     The user's three decisions are 'accepted' (they are working it), 'snoozed'
     (not now, with a date) and 'dismissed' (won't fix — permanent, and the next
     sweep will not resurrect it). A lapsed snooze is returned to the list by
-    the nudge's daily run; use 'surfaced' only to end one early. A finding that
-    no longer reproduces is not set here: that is a verification outcome.
+    the nudge's next run; use 'surfaced' only to end one early. While any
+    non-critical finding the nudge named is open and undecided, the nudge adds
+    no new findings: one of these three decisions is how the user lets more
+    through. A decision covers the finding's whole item: every other open,
+    undecided finding with the same check, project and cluster (one line in
+    the nudge's message) takes it too, and their ids come back in
+    `item_rows_decided`. So one call per item the user decided is enough. A
+    finding that no longer reproduces is not set here: that is a verification
+    outcome.
 
     Args:
         finding_id: The finding's id.
@@ -1262,10 +1273,10 @@ def findings_publication(
     Read or write what a publisher remembers between runs.
 
     Two publishers: 'backlog' keeps the target_ref of the document it rewrites,
-    so the next run edits that one instead of opening a second; 'nudge' keeps
-    the content_hash it last posted, which is what 'the list changed' compares
-    against. Called with only a publisher, this reads; called with target_kind,
-    it writes.
+    so the next run edits that one instead of opening a second; 'nudge' is
+    reserved for the nudge, which reads and writes nothing here (its once-a-day
+    state is a file in its profile home). Called with only a publisher, this
+    reads; called with target_kind, it writes.
 
     Args:
         publisher: backlog | nudge.

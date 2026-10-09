@@ -42,6 +42,10 @@ diffs the trees the image ships against the copies the worker runs, so an
 edit to a shipped skill or script is caught by its effect rather than by
 what the report says. See :class:`SandboxTreeMatchesImageVerifier`.
 
+``findings_item_state`` reads the install's findings queue through the Session
+KV server in the agent pod, so a case grades a decision on the rows it planted
+by the rows' states. See :class:`FindingsItemStateVerifier`.
+
 Registered under the ``devops_bench.verifiers`` entry-point group in
 ``pyproject.toml`` (the same mechanism ``devops_bench.agents`` already uses
 for the harness), so devops-bench discovers them without a fork.
@@ -78,6 +82,7 @@ from devops_bench.verification.verifiers import ResourcePropertyVerifier
 from kube_agents_bench import (
     card_wake,
     discovery,
+    findings,
     forges,
     gateway_silence,
     github_writes,
@@ -99,7 +104,9 @@ __all__ = [
     "BootstrapFanoutVerifier",
     "BootstrapFindingsVerifier",
     "BootstrapHandoffVerifier",
+    "BootstrapReportCriticalsVerifier",
     "BootstrapReportReadVerifier",
+    "FindingsItemStateVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
@@ -135,6 +142,11 @@ _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
+# A numbered list item in the report: up to three spaces, the number, then `.`
+# or `)`. Lines indented under it, and blank lines, belong to the item.
+_NUMBERED_ITEM_RE = re.compile(r"^ {0,3}\d{1,3}[.)]\s")
+# The queue's severity word for the class the first report lists.
+_CRITICAL = "critical"
 
 # `{cluster:<slot>}` in a `forbidden_patterns` or `any_of_patterns` entry
 # stands for the cluster the runner recorded for that slot, as a frame that
@@ -3814,7 +3826,7 @@ class ExpectedFinding(BaseModel):
 
 
 class _OnboardingPollVerifier(BaseVerifier):
-    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees).
+    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees, the findings queue).
 
     A ``fail`` from an earlier poll outranks a final read that errors: a read
     that could not reach a pod does not un-observe what an earlier one saw.
@@ -4000,6 +4012,128 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
         if status in ("claimed", "running"):
             return "fail", f"the {job} run that claimed the report at {claimed} is still {status}", read
         return "fail", f"the {job} run that claimed the report at {claimed} ended {status}: {run.get('error') or 'no error recorded'}", read
+
+
+def _numbered_items(text: str) -> list[str]:
+    """The report's numbered list items, each with the lines indented under it."""
+    items: list[list[str]] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if _NUMBERED_ITEM_RE.match(line):
+            current = [line]
+            items.append(current)
+        elif current is not None and (not line.strip() or line[:1].isspace()):
+            current.append(line)
+        else:
+            current = None
+    return ["\n".join(item).strip() for item in items]
+
+
+def _names(name: str) -> re.Pattern[str]:
+    """``name`` as a whole word: not part of a longer name such as ``<name>-key``."""
+    return re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])", re.IGNORECASE)
+
+
+@VERIFIERS.register("bootstrap_report_criticals")
+class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
+    """Checks how many critical findings the onboarding report lists.
+
+    The first report lists the top critical items up to the install's limit
+    (``FINDINGS_FIRST_REPORT_CRITICALS``) and defers the rest to the findings
+    nudge. This reads, off the shell sandbox
+    (:mod:`kube_agents_bench.onboarding`), the report the worker wrote (the
+    delivered copy first) and the worker's ``INVENTORY.scores.json``, scored
+    with the sandbox's own ``inventory_findings.py`` as ``register`` would score
+    it. The critical items are this batch's, not the live queue's, gathered as
+    ``select`` gathers them, by the sandbox's own queue module: rows sharing an
+    ``fq.item_key`` (one check on one project and cluster) are one item, an
+    item is critical when any of its rows is, and a row ``fq.rolled_up`` calls
+    a provider-managed observation is not an item.
+
+    ``limit``: how many critical items the report may list. Passes when the
+    report's numbered items name exactly ``limit`` of the critical items and
+    none of the batch's non-critical findings, an item or finding being named
+    when one of its objects appears as a whole word in a numbered item or the
+    lines indented under it. A posture sentence or the roll-up line naming a
+    deferred critical does not count. A non-critical finding whose object is
+    its cluster (such as a cluster setting), a rolled-up row, and an object
+    that is also a critical row's are not looked for, so a critical item that
+    says which cluster it is on does not read as padding.
+
+    Names are looked for, not counts. The case plants single-row lines, so a
+    gathered line the SOP lets the worker name by count alone ("12
+    Deployments in ``shop``") does not arise, and such a mention is not graded:
+    it would read as not named.
+
+    ``status="error"`` when the worker scored ``limit`` or fewer items
+    critical: a report listing every critical and one capped at ``limit``
+    are then the same report, so the run cannot grade the cap. Also an error:
+    an unreadable sandbox, a scorer the sandbox cannot import, or a batch that
+    cannot be scored. No report, or one that cannot be read, is a fail.
+    """
+
+    type: Literal["bootstrap_report_criticals"]
+    limit: int = Field(ge=0)
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_scored_report(onboarding.sandbox_shell, read_timeout)
+        pod = onboarding.sandbox_pod()
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"{pod}: {read['error']}", read
+        if read.get("rows") is None:
+            return (
+                "error",
+                f"{pod}: the batch cannot be scored, so which findings are critical is unknown: {read.get('errors')}",
+                read,
+            )
+        critical: dict[tuple[str, ...], set[str]] = {}
+        others: set[str] = set()
+        for row in read["rows"]:
+            if row.get("rolled_up"):
+                continue
+            obj = str(row.get("object") or "")
+            if row.get("severity") == _CRITICAL:
+                key = tuple(str(part) for part in row.get("item_key") or ())
+                critical.setdefault(key, set()).add(obj)
+            elif obj and obj.lower() != str(row.get("cluster") or "").lower():
+                others.add(obj)
+        others -= {obj for objects in critical.values() for obj in objects}
+        labels = {key: f"{key[0]} ({', '.join(sorted(objects))})" for key, objects in critical.items()}
+        raw: dict[str, Any] = {"critical": sorted(labels.values()), "report": read.get("report")}
+        if len(critical) <= self.limit:
+            return (
+                "error",
+                f"the worker scored {len(critical)} item(s) critical, not more than the limit of {self.limit}, "
+                f"so listing every critical and listing at most {self.limit} read the same: {raw['critical']}",
+                raw,
+            )
+        report, text = read.get("report"), read.get("text") or ""
+        if report == "absent":
+            return "fail", f"there is no INVENTORY.md or INVENTORY.delivered.md on {pod}: the worker wrote no report", raw
+        if report == "unreadable":
+            return "fail", f"the report on {pod} cannot be read: {text}", raw
+        items = _numbered_items(text)
+        named = sorted(
+            labels[key]
+            for key, objects in critical.items()
+            if any(_names(name).search(item) for name in objects for item in items)
+        )
+        padded = sorted(obj for obj in others if any(_names(obj).search(item) for item in items))
+        raw.update({"named": named, "padded": padded, "items": items})
+        counts = f"name {len(named)} of the {len(critical)} item(s) the worker scored critical"
+        padding = f"; they also name {len(padded)} non-critical finding(s), which the report must not list: {padded}"
+        if len(named) != self.limit:
+            return (
+                "fail",
+                f"the report's {len(items)} numbered item(s) {counts}; expected exactly {self.limit}: {named}"
+                + (padding if padded else ""),
+                raw,
+            )
+        if padded:
+            return "fail", f"the report's {len(items)} numbered item(s) {counts}{padding}", raw
+        return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
 @VERIFIERS.register("bootstrap_handoff")
@@ -4375,3 +4509,64 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             raw,
         )
 
+
+
+# findings_queue.py: STATES, every state a row can be in.
+FindingState = Literal["queued", "surfaced", "snoozed", "accepted", "dismissed", "resolved", "stale"]
+
+
+@VERIFIERS.register("findings_item_state")
+class FindingsItemStateVerifier(_OnboardingPollVerifier):
+    """Checks the state of findings-queue rows a case planted.
+
+    Reads the rows under ``project`` from the install's findings queue, through
+    the Session KV server's own ``GET /v1/findings`` in the agent container
+    (:mod:`kube_agents_bench.findings`). Passes when every row in
+    ``finding_ids`` is in ``state``; a row in any other state fails, and the
+    reason names the state of each row not in ``state``.
+
+    A listed row the queue does not hold is ``status="error"``: the case's plant
+    is missing, so there is nothing to grade. An unreadable pod or a queue that
+    refused the read is ``status="error"`` too.
+    """
+
+    type: Literal["findings_item_state"]
+    project: str = Field(min_length=1)
+    finding_ids: list[str] = Field(min_length=1)
+    state: FindingState
+
+    @field_validator("finding_ids")
+    @classmethod
+    def _distinct_ids(cls, value: list[str]) -> list[str]:
+        if any(not finding_id.strip() for finding_id in value):
+            raise ValueError("finding_ids carries a blank id")
+        if len(set(value)) != len(value):
+            raise ValueError("finding_ids lists an id twice")
+        return value
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = findings.read_project(onboarding.agent_shell, self.project, read_timeout)
+        if read is None:
+            return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
+        if read["error"]:
+            return "error", f"the findings queue could not be read: {read['error']}", None
+        states = {str(row.get("id")): str(row.get("state")) for row in read["findings"]}
+        raw = {"states": {finding_id: states.get(finding_id) for finding_id in self.finding_ids}}
+        missing = [finding_id for finding_id in self.finding_ids if finding_id not in states]
+        if missing:
+            return (
+                "error",
+                f"the findings queue holds no row {missing} under project {self.project!r}: "
+                "the case's plant is missing, so there is nothing to grade",
+                raw,
+            )
+        wrong = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] != self.state}
+        if wrong:
+            held = len(self.finding_ids) - len(wrong)
+            return (
+                "fail",
+                f"{held} of {len(self.finding_ids)} row(s) are {self.state}; "
+                + ", ".join(f"{finding_id} is {state}" for finding_id, state in wrong.items()),
+                raw,
+            )
+        return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw

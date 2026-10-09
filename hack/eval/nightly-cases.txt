@@ -133,13 +133,13 @@
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
 # attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card. oobe-first-run-audits (the second-last entry below) makes it
+# blocked card. oobe-first-run-audits (parked 2026-10-09, below) made it
 # sixty-two (186) of seventy-six (228), counted from the lists with
 # upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
 # that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
 # waits out the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
-# chat-fanout-fleet-restarts-rows (the last entry below) makes it sixty-three
+# chat-fanout-fleet-restarts-rows (the third-last entry below) makes it sixty-three
 # (189) of seventy-seven (231), +3 more: one front-door turn and a four-card
 # fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
@@ -214,8 +214,32 @@
 # than the paragraphs above (the chat-voice trio and the declared-intent
 # trio landed beside each other, each counted without the other, and two
 # chat cases registered since without a paragraph): this case, the entry
-# before oobe-first-run-audits below, makes it sixty-one cases (183 units) of a
+# before chat-fanout-fleet-restarts-rows below, makes it sixty-one cases (183 units) of a
 # seventy-five-case, 225-unit matrix.
+#
+# 2026-10-07 adds findings-decision-covers-item: one case, three units at the
+# 200s default (one front-door turn; the plant and the teardown are a few
+# kubectl execs each). It is the last entry below: sixty-five cases (195
+# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
+# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
+# the thirteen come to ~583 serial minutes against the 480m deadline.
+#
+# 2026-10-09 parks oobe-first-run-audits: it is in no roster file, and its
+# KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py says what brings
+# it back. Its first night (ci-kube-agents-eval-nightly build
+# 2108346853085941760) held the infra lock 3144s, 2530s and 2739s, 140 minutes
+# against its 2400s hint, most of it the stack's apply waiting out the four
+# audits. The main part's infra-lock chain ran from 00:22 to 07:54 with four
+# stack repetitions still owed, and the deadline cut the night at 32 of 73
+# cases graded; the same chain without the case measured ~288 minutes. All
+# three repetitions also graded blocked: the prompt asks for a turn with no
+# tool call, and the gate's liveness rung reads an empty trajectory as no
+# agent run (bench/kube_agents_bench/scoring.py, _liveness_failures), so the
+# case cannot record a pass or a fail as written (#2699's tool_calls_optional
+# key is the open fix for that half). Counted from the lists,
+# this file is now sixty-five cases (195 units) of a seventy-nine-case,
+# 237-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -699,18 +723,15 @@
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
-# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
-# onboarding scan settles, four fleet audits start instead of waiting for their
-# schedules, one after another. The stack arms the stage with two archived
-# stand-in cards, the scan marker and the hand-off's record, and puts back the
-# oobe job the image ships;
-# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
-# because each repetition runs four real audits back to back.
-./tasks/oobe-first-run-audits/task.yaml
-
 # The agent's own observability: whether the event watcher's metrics are
 # scraped, answered from the PodMonitoring and the Cloud Monitoring series.
 ./tasks/observability-watcher-scrape-state/task.yaml
+
+# gke-platform-security skill probe: Secrets encryption is verified on
+# databaseEncryption.currentState (CURRENT_STATE_ENCRYPTED), the observed
+# state, not on databaseEncryption.state, the requested one.
+# deployer: noop, transcript-only.
+./tasks/platform-security-secrets-encryption-currentstate-probe/task.yaml
 
 # A fleet question fanned out one card per cluster, each titled with the bare
 # cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
@@ -722,3 +743,15 @@
 # --selected-namespaces, --backup-retain-days, --encryption-key). deployer:
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
+
+# The findings queue's item-wide decision: the user dismisses the one id the
+# nudge names for a gathered line, and every row of that line has to end up
+# dismissed while the line beside it stays open. prebuilt/findings-item plants
+# the rows through the Session KV server's findings routes and resolves them on
+# destroy. No fixture; the host install only.
+./tasks/findings-decision-covers-item/task.yaml
+
+# gke-upgrades skill probe: a node-pool upgrade runbook uses
+# clusters upgrade --node-pool, and the no_upgrades limits name the rolling
+# 92-day window. deployer: noop, transcript-only, one delegation round trip.
+./tasks/upgrades-freeze-runbook-probe/task.yaml

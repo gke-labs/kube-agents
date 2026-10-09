@@ -112,7 +112,9 @@ checkout the credential holder runs `git` in.
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
-`FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
+`FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
+(`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
@@ -215,7 +217,7 @@ Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
 listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
-set by the operator): it serves Prometheus counters whose label values are
+set by the operator): it serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the

@@ -7,31 +7,52 @@ import (
 )
 
 func TestIsStatusQuery(t *testing.T) {
-	// Exact phrases are the only status affordance: every executor now acts
-	// on a steer, so a status-shaped steer stolen by a wide rule is a
-	// lost correction everywhere.
+	// Exact phrases are the affordance everywhere - including narrow mode,
+	// the posture for executors that run follow-ups.
 	exact := []string{
 		"what is it doing", "What's it doing?", "status", "Status?",
 		"how's it going", "how is it going", "whats going on",
 		"any progress", "any updates?", "progress", "where are we",
 	}
-	steers := []string{
+	// Interrogative shapes match only under the wide posture, where the
+	// executor refuses follow-ups (no-resume) and a false positive costs
+	// nothing.
+	wideOnly := []string{
 		"what is the agent doing",
+		"what is kage doing",
 		"any update on the rollout",
+	}
+	// Steers the wide rule mistakes for status asks - the documented cost
+	// of the width bias, and why executors that run follow-ups get narrow.
+	wideCost := []string{
 		"any update to the config should be reverted",
 		"how about doing the upgrade instead",
+	}
+	never := []string{
 		"also check the memory limits",
 		"stop",
+		"what is the memory limit on the nats pod and can you also check its restarts", // long compound: steer
+		// Status-ish and interrogative, so only the wideMatchLenCap guard
+		// keeps it a steer: past the cap it is a composed instruction.
+		"what is the agent doing about the memory limit on the nats pod and its restarts",
 		"delete the deployment",
 	}
 	for _, s := range exact {
-		if !isStatusQuery(s) {
-			t.Errorf("expected status query: %q", s)
+		if !isStatusQuery(s, false) || !isStatusQuery(s, true) {
+			t.Errorf("expected status query in both modes: %q", s)
 		}
 	}
-	for _, s := range steers {
-		if isStatusQuery(s) {
-			t.Errorf("expected a steer, not a status query: %q", s)
+	for _, s := range append(wideOnly, wideCost...) {
+		if !isStatusQuery(s, true) {
+			t.Errorf("expected wide status query: %q", s)
+		}
+		if isStatusQuery(s, false) {
+			t.Errorf("expected narrow mode to forward as a steer: %q", s)
+		}
+	}
+	for _, s := range never {
+		if isStatusQuery(s, true) || isStatusQuery(s, false) {
+			t.Errorf("expected NOT a status query in any mode: %q", s)
 		}
 	}
 }

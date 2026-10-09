@@ -164,12 +164,19 @@ The two differ on steers: a session worker absorbs them at its next turn boundar
 while the standing front door queues them and answers each as a further turn after the
 current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher is the exact phrase set on every route. A wider
-interrogative rule applied while the fixed-route front door refused steers, where a
-stolen false positive cost nothing; the front door now queues steers and answers them,
-so a stolen one is a lost correction there too, and a status-shaped steer is a question
-the agent can answer itself. Anything no interceptor claims during a `working` task is
-a steer, per the 8/24 decision above.
+The status matcher is the exact phrase set wherever the executor runs follow-ups: a
+stolen steer there is a lost correction, and a status-shaped steer is a question the
+agent can answer itself. A wider interrogative rule (status-shaped words in an
+interrogative frame) applies only to a running task whose addressee refuses follow-ups,
+the platform executor's `cli` executor, which refuses each one `no-resume`: there a
+stolen false positive costs nothing, and a missed one is an acknowledgement followed by
+a refusal. The gateway cannot see the executor, so it learns this per addressee from
+the first `no-resume` refusal it relays, and forgets it when a later notice from that
+addressee says a follow-up was queued; the first follow-up to such an addressee after
+the gateway starts is still acknowledged and then refused. A detached task gets the
+exact phrases on either route: after a stop, the wide reading of "any update on the
+rollout" would steal a new task to replay a dead one. Anything no interceptor claims
+during a `working` task is a steer, per the 8/24 decision above.
 
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
@@ -1334,7 +1341,18 @@ half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
 the gateway arms the route on), and send to every other platform through `hermes send` as
-before.
+before. The Hermes kanban notifier, which posts a card's events into the thread the card
+subscribes to and wakes its creator when a card blocks or fails, reaches the same route
+through a send-only stand-in adapter that exists only inside the notifier
+(`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
+the platform as connected. Only the subscription's thread is forwarded, so the home-space
+rule applies: a thread of another space is refused, and a subscription with no thread is not
+delivered. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+notifier when the route is unavailable (the gateway restarting), and it holds deliveries
+unclaimed then; only a send that meets the outage before the next probe spends one unit of
+the subscription's failure budget. Once, when routed delivery first goes live on an install,
+events that are already more than six hours old are advanced past without posting: they are
+the backlog nothing could deliver before.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody

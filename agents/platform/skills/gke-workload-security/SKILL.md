@@ -2,25 +2,27 @@
 name: gke-workload-security
 description: >-
   Audits, configures, and hardens workload-level security controls for Google
-  Kubernetes Engine (GKE) applications and namespaces. Covers running cluster security
-  audits (`audit_cluster.sh`), configuring Workload Identity Federation (impersonation,
-  KSA/GSA binding, and pod setup), enforcing Network Policies (default-deny and Dataplane
+  Kubernetes Engine (GKE) applications and namespaces. Covers running security
+  audits (`audit_cluster.sh`), enforcing Network Policies (default-deny and Dataplane
   V2 logging), isolating high-risk pods inside GKE Sandbox (`gVisor`), enforcing Pod
   Security Standards (`restricted` labeling), and mounting Secret Manager secrets via
-  CSI (`SecretProviderClass`). Use when auditing cluster security posture, isolating
-  namespaces, applying pod security standards, setting up Workload Identity, or
-  configuring network policies and secret volume mounts. Don't use for cluster-wide
+  CSI (`SecretProviderClass`). Use when auditing workload security posture, isolating
+  namespaces, applying pod security standards, or
+  configuring network policies and secret volume mounts. Don't use for Workload Identity (use gke-workload-identity), cluster-wide
   control plane security, RBAC hardening, Binary Authorization, Shielded Nodes,
   or enabling platform-level GKE add-ons (use gke-platform-security instead).
 metadata:
+  version: "1.0.1"
   category: Security
 ---
 
 # GKE Workload Security
 
+> **Routing Note:** For Workload Identity KSA/GSA bindings, open `gke-workload-identity/SKILL.md`. For cluster-level security flags (`--database-encryption-key`, `--security-posture`, RBAC, Shielded Nodes, Binary Authorization), open `gke-platform-security/SKILL.md`.
+
 This skill provides workflows and best practices for securing GKE workloads. It
-covers security auditing, Identity and Access Management (Workload Identity),
-Network Security (Network Policies), and Node Security.
+covers security auditing, Network Security (Network Policies), and Node Security.
+For Workload Identity setup, use the `gke-workload-identity` skill.
 
 ## Workflows
 
@@ -48,11 +50,15 @@ script.
 scripts/audit_cluster.sh <cluster-name> <region> <project-id>
 ```
 
-### 2. Configure Workload Identity
+### 2. Configure Workload Identity (legacy GSA impersonation)
 
-Workload Identity allows Kubernetes Service Accounts (KSAs) to impersonate
-Google Service Accounts (GSAs). This is the recommended method for workloads to
-access Google Cloud APIs.
+Load the `gke-workload-identity` skill first: binding IAM roles to the
+Kubernetes Service Account (KSA) principal directly is the current default, and
+that skill diagnoses both models. Use the impersonation setup below, where a KSA
+impersonates a Google Service Account (GSA), only when a GSA must be the
+identity: an existing GSA already holds the roles the workload needs, or the
+Google Cloud API it calls does not accept Workload Identity Federation
+principals (the GKE documentation lists those limitations).
 
 **Steps:**
 
@@ -263,6 +269,6 @@ This will log connection details to Cloud Logging.
 
 -   [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
 -   [GKE Network Policies](https://cloud.google.com/kubernetes-engine/docs/how-to/network-policy)
--   [Pod Security Standards in GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/pod-security-standards)
--   [Google Secret Manager CSI Driver](https://cloud.google.com/kubernetes-engine/docs/how-to/secret-manager)
+-   [Pod Security Standards in GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/podsecurityadmission)
+-   [Google Secret Manager CSI Driver](https://cloud.google.com/secret-manager/docs/secret-manager-managed-csi-component)
 -   [GKE Dataplane V2 Network Logging](https://cloud.google.com/kubernetes-engine/docs/how-to/network-policy-logging)

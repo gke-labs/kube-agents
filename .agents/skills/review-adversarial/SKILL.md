@@ -250,9 +250,16 @@ regression test, and new error paths nothing exercises, are the usual cases.
 **Do not treat green test suites as proof of correctness**: a passing suite proves only that the
 paths it exercises work on the fixtures it supplies. For every validation check, gate, and error
 path, check whether **negative inputs** (unresolvable identifiers, malformed strings, absent fields)
-are tested against the gate, or if the tests only pass valid fixtures through the happy path. Treat
-previously resolved findings in PR history as high-risk areas where adjacent defects and edge cases
-cluster.
+are tested against the gate, or if the tests only pass valid fixtures through the happy path.
+
+**A pull request reviewed before.** On a pull request a review has already read, a line an earlier
+fix changed is read for two things — whether the thread's defect is gone, and whether anything the
+fix touched now misbehaves — and a new defect in new code counts wherever it sits. A further
+admitted input of a grammar an earlier round already named (a regex, a parser, a format check) is
+the same finding: one candidate per grammar per round, the inputs as its evidence, the structural
+alternative as a follow-up unless it is High — except a grammar that refuses (an allowlist, a
+sanitiser, a path or identity check), where each admitted input is its own finding. A test the pull
+request adds is read for whether it fails on the defect it claims, not hardened case by case.
 
 For a change that fixes something, naming the test is not enough — **run it against the pre-change
 behaviour and watch it fail.** A test that passes with the fix reverted is testing something else,

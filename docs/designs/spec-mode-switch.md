@@ -25,8 +25,9 @@ Mode *string `json:"mode,omitempty"`
 ```
 
 `mode: next` is a dev toggle, not a supported configuration. Same shape as the other
-opt-in toggles on this CRD: optional pointer field, nil-safe helper, deliberately not
-surfaced in the Helm chart. Naming note: the CRD already has a `mode` field on the
+opt-in toggles on this CRD: optional pointer field, nil-safe helper. The install surfaces
+can set it, and each one's default writes no field at all ("Choosing it at install",
+below). Naming note: the CRD already has a `mode` field on the
 Google Chat integration spec (display verbosity, `spec.integration.googleChat.mode`).
 Different path, no schema collision - named here so nobody conflates them.
 
@@ -144,12 +145,30 @@ that writes it and the helper that reads it. A third hit is a review comment.
 "What mode am I in" gets one answer per agent, computed in one place. This also means the
 delivery mechanism can change later without touching call sites.
 
-## Not in the Helm chart
+## Choosing it at install
 
-The chart does not template `mode` until graduation (stage 4, when `next` becomes the
-default posture). Until then, flipping it is a `kubectl patch` on the PlatformAgent CR.
-Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
-should survive chart upgrades.
+Every install surface can set the mode, and every one defaults to rendering no field, so
+an install that never asks renders the CR it did before the surfaces knew the field:
+
+- The chart's `platformAgent.mode`, `null` by default, which leaves `mode` out of the CR
+  (`""` does the same). `today` and `next` render as themselves; the values schema refuses
+  anything else.
+- The Terraform composition's `platform_agent_mode`, `"today"` by default, which passes
+  the chart nothing; `"next"` passes `platformAgent.mode: next`.
+- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`.
+
+A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
+passing `--mode`, which is refused when it disagrees with the file, and the run that
+applies the edit says it is a mode switch first.
+[`scripts/installer/README.md`](../../scripts/installer/README.md) is canonical for the
+key's rules.
+
+Flipping it with `kubectl patch` on the CR still works, and is how the dev installs that
+predate the chart value run. Helm patches a custom resource from the difference between
+its renders, so while the chart value stays `null` a patched mode survives chart
+upgrades; a value set through the chart and later cleared removes the field again, which
+is `today`. The next lane's eval deploy (`hack/ci-deploy.sh`) sets the mode through the
+chart value, so its smoke exercises that route.
 
 ## Switches inside `next`
 

@@ -1013,6 +1013,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/findings/ranked", None),
         ("GET", "/v1/findings", None),
         ("POST", "/v1/findings/f-1/surfaced", {}),
+        ("GET", "/v1/findings/additions", None),
         ("PATCH", "/v1/findings/f-1", {"state": "accepted"}),
         ("POST", "/v1/findings/f-1/verified", {"outcome": "resolved"}),
         ("POST", "/v1/findings/expire-snoozes", None),
@@ -4181,7 +4182,7 @@ class TestRecentReportsIndex(unittest.TestCase):
 
 
 class TestFindingsQueueApi(unittest.TestCase):
-    """The eight /v1/findings routes. The rules they enforce are pinned in
+    """The /v1/findings routes. The rules they enforce are pinned in
     test_findings_queue.py; these tests are about the HTTP surface."""
 
     def setUp(self):
@@ -4194,6 +4195,7 @@ class TestFindingsQueueApi(unittest.TestCase):
             with conn:
                 conn.execute("DELETE FROM findings")
                 conn.execute("DELETE FROM queue_publications")
+                conn.execute("DELETE FROM findings_additions")
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
@@ -4265,6 +4267,69 @@ class TestFindingsQueueApi(unittest.TestCase):
         verified = self.client.post(f"/v1/findings/{fid}/verified", json={"outcome": "resolved", "observed": "probe present"})
         self.assertEqual(verified.json()["state"], "resolved")
         self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_only_a_paced_publisher_marks_a_finding_shown(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+
+        pulled = self.client.post(f"/v1/findings/{fid}/surfaced", json={"chat_id": "spaces/AAA"}).json()
+        self.assertIsNone(pulled["first_shown_at"])
+        self.assertEqual(self.client.get("/v1/findings/additions").json()["noncritical"], 0)
+
+        refused = self.client.post(f"/v1/findings/{fid}/surfaced", json={"publisher": "someone"})
+        self.assertEqual(refused.status_code, 400)
+
+        added = self.client.post(
+            f"/v1/findings/{fid}/surfaced", json={"publisher": "nudge", "added_class": "noncritical", "run": "r1"}
+        ).json()
+        self.assertIsNotNone(added["first_shown_at"])
+        self.assertEqual(added["added_class"], "noncritical")
+        day = added["first_shown_at"][:10]
+        self.assertEqual(
+            self.client.get(f"/v1/findings/additions?day={day}").json(),
+            {"day": day, "critical": 0, "noncritical": 1},
+        )
+
+    def test_the_first_report_marks_a_critical_addition(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        added = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        ).json()
+        self.assertEqual(added["added_class"], "critical")
+        day = added["first_shown_at"][:10]
+        self.assertEqual(
+            self.client.get(f"/v1/findings/additions?day={day}").json(),
+            {"day": day, "critical": 1, "noncritical": 0},
+        )
+
+    def test_the_first_report_may_not_mark_a_dismissed_finding(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        self.client.patch(f"/v1/findings/{fid}", json={"state": "dismissed"})
+
+        refused = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        )
+
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("dismissed", refused.json()["detail"])
+        self.assertEqual(self.client.get("/v1/findings/additions").json()["critical"], 0)
+
+    def test_a_decision_on_one_id_covers_its_gathered_line(self):
+        self._register(self._finding(), self._finding(object="Deployment/cart"))
+        first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+
+        dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
+
+        self.assertEqual(dismissed["item_rows_decided"], [second])
+        self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_additions_refuse_a_day_that_is_not_a_date(self):
+        for day in ("yesterday", "2026-99-99"):
+            self.assertEqual(self.client.get(f"/v1/findings/additions?day={day}").status_code, 400, day)
 
     def test_unknown_findings_are_404(self):
         self.assertEqual(self.client.post("/v1/findings/nope/surfaced", json={}).status_code, 404)

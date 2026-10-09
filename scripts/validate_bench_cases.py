@@ -164,11 +164,24 @@ KNOWN_UNREGISTERED = {
     # still needs first: Compute network permission for the CI runners,
     # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
     # room on the main part's infra-lock chain, measured with
-    # oobe-first-run-audits in it (or stack cases moved to a second project).
+    # oobe-first-run-audits in it if that parked case returns first (or stack
+    # cases moved to a second project).
     # The entry goes when the case joins hack/eval/nightly-cases.txt.
     "networking-audit-subnet-range-exhaustion": (
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
+    ),
+    # Parked out of hack/eval/nightly-cases.txt on 2026-10-09 after its first
+    # night (build 2108346853085941760): its three repetitions held the infra
+    # lock 140 minutes and the deadline cut the main part, and each graded
+    # blocked, because its no-tool turn leaves an empty trajectory, which the
+    # gate's liveness rung reads as no agent run. The entry goes when the case
+    # can record a pass or a fail (#2699's tool_calls_optional would let its
+    # reply pass that rung) and the main part's infra-lock chain has room for
+    # it (or it runs on a job of its own); #2806 tracks both.
+    "oobe-first-run-audits": (
+        "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
+        "nightly, and its empty trajectory grades every repetition blocked"
     ),
 }
 
@@ -394,6 +407,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: whether the run that delivered the report completed is the
     # whole assertion.
     "bootstrap_delivered": (),
+    # This repository, sandbox-reading: how many of the batch's critical
+    # findings the onboarding report lists, against `limit`.
+    "bootstrap_report_criticals": ("limit",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
@@ -402,6 +418,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # This repository, agent-pod-reading: the states of findings-queue rows a
+    # case planted. The rows it names are the assertion; with none it could
+    # only pass.
+    "findings_item_state": ("finding_ids",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
