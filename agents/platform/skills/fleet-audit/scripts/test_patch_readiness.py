@@ -1959,6 +1959,27 @@ class UpgradeBlockedTest(unittest.TestCase):
         # over the model's, as it does for master-behind.
         self.assertTrue(hit["impact_authoritative"])
 
+    def test_a_behind_cluster_blocked_by_skew_and_a_budget_is_published_as_refused_and_names_both(self):
+        """Round 7 walked this row on a pool-ahead cluster. On a cluster behind
+        on its control plane the budget arm answered first, so `finish`
+        published "held, not stopped" over a move GKE refuses: the ceiling
+        governs, and the budget is what waits behind it."""
+        row = self.member("lag", pdbs=[self.BUDGET], skew=["old-pool"])
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [row])
+        hit = next(c for c in by["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertEqual(
+            hit["excerpt"],
+            "readiness.status=blocked: node pool(s) old-pool would exceed the version-skew ceiling against the target control plane; "
+            "PodDisruptionBudget seeded-upgrade/pinned-batch-runner (maxUnavailable: 0, disruptionsAllowed 0) refuses eviction of Deployment/pinned-batch-runner",
+        )
+        self.assertIn("would not complete", hit["impact"])
+        self.assertIn(
+            "will not move the control plane until the pool moves, and once it has, holds each node's drain for up to an hour and then evicts Deployment/pinned-batch-runner anyway",
+            hit["impact"],
+        )
+        self.assertNotIn("not stopped", hit["impact"])
+        self.assertTrue(hit["impact_authoritative"])
+
     def test_a_static_cluster_spelled_unspecified_is_not_applicable_too(self):
         row = self.member("static", status="unknown", gap=None)
         row["channel"] = "UNSPECIFIED"

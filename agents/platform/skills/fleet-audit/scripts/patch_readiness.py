@@ -263,8 +263,17 @@ UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK = "the workload"
 UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT = (
     "{cluster} is {lag} and its upgrade would not complete: {cause}, so GKE will not move the control plane until the pool moves."
 )
+# Both at once: the ceiling is the governing claim, since GKE refuses the move
+# before any drain starts, and the budget is what waits behind it, so the tail
+# says both in that order and never "held, not stopped".
+UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT = (
+    "{cluster} is {lag} and its upgrade would not complete: {cause}, so GKE will not move the control plane until the pool moves, and once it has, holds each node's drain for up to an hour and then evicts {workloads} anyway."
+)
 UPGRADE_BLOCKED_PDB_CAUSE_FORMAT = "PodDisruptionBudget {pdb} ({field}, disruptionsAllowed {allowed}) refuses eviction of {workloads}"
 UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT = "node pool(s) {pools} would exceed the version-skew ceiling against the target control plane"
+# Joins the clauses of one cause: every blocking budget, with the skew clause
+# before them when both block.
+CAUSE_SEPARATOR = "; "
 # The lag phrase comes from the cluster's own candidate (what put it in
 # `behind`), not from the reporter's row: the reporter's gap counts the
 # lowest component against its target and reads 0 for a patch lag.
@@ -1212,19 +1221,24 @@ def _workload_name(workload: object) -> str:
     return str(workload)
 
 
-def _readiness_cause(readiness: dict, *, prefer_skew: bool = False) -> tuple[str, str, str] | None:
+def _readiness_cause(readiness: dict, *, control_plane_only: bool = False) -> tuple[str, str, str] | None:
     """Why the reporter graded a member blocked, as (impact format, cause,
-    workloads) in the two forms 3.11 flags; None for a block that rests on a
+    workloads) in the forms 3.11 flags; None for a block that rests on a
     maintenance exclusion alone, which is 3.8's subject and neither a held
-    drain nor a refused move. `workloads` names what the budget arm's forced
+    drain nor a refused move. `workloads` names what the budget's forced
     eviction removes, every covered workload once in budget order, and is
-    empty for skew, whose tail names no workload. A budget comes first unless
-    the caller says the upgrade due is the control plane's (`prefer_skew`),
-    which no budget can block and a skew ceiling can."""
+    empty when skew alone blocks, whose tail names no workload. A skew
+    ceiling outranks a budget: GKE refuses the control-plane move before any
+    drain starts, so a row carrying both is a refused upgrade, not a held
+    one, and its cause names the ceiling first and every budget after it.
+    With `control_plane_only` the upgrade due is the control plane's alone
+    (a pool ahead of it), which evicts no pod: a budget cannot block it and
+    is left out, so skew is the one cause there."""
     pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)]
     skew = (readiness.get("skew") or {}).get("blocking") or []
-    if prefer_skew and skew:
-        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)), ""
+    skew_cause = UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)) if skew else ""
+    if control_plane_only:
+        return (UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, skew_cause, "") if skew else None
     if pdbs:
         # Every blocking budget, in name order: the reporter lists them in
         # the API's order, and a cause that named only the first would make
@@ -1240,9 +1254,12 @@ def _readiness_cause(readiness: dict, *, prefer_skew: bool = False) -> tuple[str
             for p in ordered
         ]
         evicted = list(dict.fromkeys(_workload_name(w) for p in ordered for w in p.get("workloads") or []))
-        return UPGRADE_BLOCKED_IMPACT_PDB_FORMAT, "; ".join(clauses), ", ".join(evicted) or UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+        workloads = ", ".join(evicted) or UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+        if skew:
+            return UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT, CAUSE_SEPARATOR.join([skew_cause, *clauses]), workloads
+        return UPGRADE_BLOCKED_IMPACT_PDB_FORMAT, CAUSE_SEPARATOR.join(clauses), workloads
     if skew:
-        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)), ""
+        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, skew_cause, ""
     return None
 
 
@@ -1278,14 +1295,12 @@ def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
     lag = _lag_phrase(entry)
     # On a cluster whose only version candidate is a pool ahead of its
     # control plane, the upgrade due is the control plane's, which evicts no
-    # pod: a budget cannot block it, a skew ceiling can, so skew is read
-    # first there and a budget alone is the check running clean.
-    found = _readiness_cause(readiness, prefer_skew=lag == LAG_POOL_AHEAD)
+    # pod: a budget cannot block it, a skew ceiling can, so a budget alone is
+    # the check running clean there and skew is the one cause read.
+    found = _readiness_cause(readiness, control_plane_only=lag == LAG_POOL_AHEAD)
     if found is None:
         return None
     impact_format, cause, workloads = found
-    if lag == LAG_POOL_AHEAD and impact_format is UPGRADE_BLOCKED_IMPACT_PDB_FORMAT:
-        return None
     return {
         "object": f"Cluster/{entry['_bare_name']}",
         "excerpt": f"readiness.status={READINESS_BLOCKED}: {cause}",
