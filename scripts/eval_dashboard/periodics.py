@@ -892,7 +892,7 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     at the same fleet tree (trees of different kinds are not compared), SUPERSEDED_SILENCE
     when it failed later (its own note is the current story; nothing
     recovered), None otherwise. A later pass that never reached them (busy,
-    not reached), or applied another tree, is None."""
+    not reached), or applied another tree of the same kind, is None."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return None
