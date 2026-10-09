@@ -153,10 +153,11 @@ the first Sunday tick.
 
 A third trigger reviews a cluster soon after its upgrade rather than at the weekend. It is a
 second roster entry, `upgrade-retrospective-after-upgrade`, whose prompt is the SOP's
-after-upgrade route: the collector run with `--after-upgrade`, which selects the clusters whose
-`UPGRADE_MASTER` or `UPGRADE_NODES` operation reached `DONE` since the collector's last review and
-is not recorded in its ledger as reviewed, as a scoped run (§3.2) that posts its lines and files no
-ledger issue. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
+after-upgrade route: the collector run with `--after-upgrade`, which selects the clusters with an
+`UPGRADE_MASTER` or `UPGRADE_NODES` operation that reached `DONE` at least fifteen minutes before
+the run (the same floor the watch applies, so a second cluster's fresher operation waits for the
+next wake rather than being reviewed before its pods settle) and is not in the ledger's reviewed
+operations, as a scoped run (§3.2) that posts its lines and files no ledger issue. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
 `no_agent` script, `upgrade_retrospective_watch.py`, which runs every fifteen minutes on the gateway
 pod, reads the roster projects' operations through the sandbox hop the readiness watch uses
 (`sandbox_exec` as its default principal, read only) and, when an operation reached `DONE` at least
@@ -170,8 +171,8 @@ same operation finds it reviewed and prints nothing. The review lands fifteen to
 after `DONE` plus the job's start: the replacement pods have had time to settle, and the events of
 the operation's last half hour are still inside the API server's hour; events emitted earlier in a
 long drain are already gone, which is why (B) reads pod and node state first and treats events as
-corroboration. The Sunday run stays the fleet-wide baseline and the only run that files the ledger
-issue; it reports an operation the after-upgrade job already reviewed as such. The watch and the
+corroboration. The Sunday run stays the fleet-wide baseline and the only scheduled run that files
+the ledger issue (the fleet-wide on-demand route is a full run too, and files it); it reports an operation the after-upgrade job already reviewed as such. The watch and the
 second entry are the last part of the second work item (§5), after the scheduled run and the
 on-demand route.
 
@@ -188,8 +189,13 @@ A question that names a cluster the last run did not review forces that cluster 
 ### 3.2 Scope: new or upgraded since the last run
 
 The ledger holds, per cluster, the control-plane version, every node pool's version, the time of
-the last run, and the symptom set seen at the last full run (owner, category, reason and onset, no
-tenant text). The before side of the catalogue's diff is established two ways, and the stronger one
+the last run, the symptom set seen at the last full run (owner, category, reason and onset, no
+tenant text), and the operations reviewed (id, type, target and end time, kept while inside the
+selection window). A scoped run writes only the reviewed operations of the clusters it reviewed
+and its report; versions, last-run time and the symptom set are the full run's, so the next Sunday
+still selects the cluster on the operation's end time, refreshes its baseline, and reports the
+operation as already reviewed by the after-upgrade route; a second wake for an operation already
+in that list prints nothing. The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
 each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
 symptom carries its own onset. The default is the pod's own evidence: a Pending pod's start, a
@@ -309,12 +315,16 @@ Rows overlap, and a symptom carries exactly one entry, so the rows are tried in 
 the first that holds wins; the order is the most specific discriminator first, so a finding id (the
 manifest derives it from the check id, cluster, namespace and object) never flips between runs on
 the same evidence: 7 (a webhook named), 6 (a removed API named), 19 (a PersistentVolume's node
-affinity, an attach or mount failure) before 12 (any other selector or affinity miss), 18 (a
-scheduling message that names `nvidia.com/gpu`, or a driver error text in a container whose image
-or command names a GPU driver component) before 14 and 15, 14 (the pool's cgroup mode and the
-runtime floor are facts of the pool and the image) before 15 (several processes), then 20, 17, 2
-and 1. An `OOMKilled` container on a migrated pool with an old runtime that also runs several
-processes is entry 14, with entry 15 named in the evidence as a second cause.
+affinity, an attach or mount failure), 18 (a scheduling message that names `nvidia.com/gpu`, or a
+driver error text in a container whose image or command names a GPU driver component), 14 (the
+pool's cgroup mode and the runtime floor are facts of the pool and the image) before 15 (several
+processes), then 20, 17, 2 (`Insufficient cpu` or `memory` in the clause for the pool the pod
+targets, after a node-pool operation), 1, and 12 last. Row 12 is the generic one: the scheduler
+writes a `didn't match Pod's node affinity/selector` clause for every node group a pinned pod does
+not target, beside the clause that says why its own pool refused it, so row 12 holds only when every
+clause is a selector or affinity miss, which is a selector that names a label the pool lost. An
+`OOMKilled` container on a migrated pool with an old runtime that also runs several processes is
+entry 14, with entry 15 named in the evidence as a second cause.
 
 A match is _sure_ (`high`) when the signature names the entry's own mechanism and the pool the
 object sits on had an operation in the window: a webhook named in the rejection, a selector that
@@ -374,9 +384,12 @@ variable to different directories and a store rooted there is written at one pat
 another. Under the root: `reports/<timestamp>.md`, `upgrade-retro-report.md` beside `reports/` pointing
 at the latest full run, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
 pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
-there. Two triggers write the same files, so one run holds an exclusive lock on `.lock` under the
-root for its duration and a second run, scheduled or on demand, prints one line and exits without
-writing (a dry run reads without the lock). Reports are named by their finish time in UTC, full
+there. Three triggers write the same files, so one run holds an exclusive lock on `.lock` under the
+root for its duration; a second run, scheduled, after-upgrade or on demand, waits for it up to
+twenty minutes (an after-upgrade wake can land in the same minute as the Sunday run), and only a
+run still locked out after that prints one line and exits without writing (a dry run reads without
+the lock). An after-upgrade run that waited and then finds its operations already in the reviewed
+list prints nothing. Reports are named by their finish time in UTC, full
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
