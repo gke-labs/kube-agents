@@ -365,9 +365,12 @@ CREATE TABLE intercepted_events(
   occurrences INTEGER NOT NULL DEFAULT 1,
   notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
+  session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+For installs with no chat platform enabled or external consoles, `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
 
 ##### Two bounds, not one
 
@@ -387,14 +390,18 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### A pre-release table, and no migration
 
-`init_db` runs `CREATE TABLE IF NOT EXISTS` and nothing else: there is no `ALTER TABLE` for
-`cluster`, `object_uid` or `delivery_error` anywhere in the tree. The table has never been in a release, so the
-only databases carrying an earlier shape are dev installs that ran an intermediate commit of the
-change that introduced it, and a migration maintained for a shape no user has is machinery that
-outlives its reason.
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
+for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
+startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
+before the table ever shipped in a release, so the only databases carrying an earlier shape
+without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
+introduced the table (#426), and a migration maintained for a pre-release shape no released
+install has is machinery that outlives its reason.
 
-**If you have such an install, you must drop the table before rolling the image.** `CREATE TABLE IF
-NOT EXISTS` is a no-op against it, so the columns never appear, and how badly that ends depends on
+**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
+NOT EXISTS` is a no-op against a pre-0.2.0 table missing those three columns, so they never appear, and how badly that ends depends on
 which column is missing:
 
 - **No `cluster`** — the ledger stops recording anything. `record_intercepted_event` names the

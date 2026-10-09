@@ -1019,6 +1019,10 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/findings/expire-snoozes", None),
         ("GET", "/v1/findings/publication/backlog", None),
         ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
+        ("GET", "/v1/intercepted-events", None),
+        ("GET", "/v1/sessions/sess-1/tasks", None),
+        ("GET", "/v1/tasks", None),
+        ("GET", "/v1/tasks/t-1", None),
     )
 
     def setUp(self):
@@ -1067,6 +1071,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 path.split("?")[0]
                 .replace("sess-1", "{session_id}")
                 .replace("f-1", "{finding_id}")
+                .replace("t-1", "{task_id}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -5097,6 +5102,389 @@ class TestStallInject(unittest.TestCase):
             [line for line in card.splitlines() if line.startswith("## ")],
             ["## What's wrong", "## Why", "## What to do"],
         )
+
+
+class TestReadOnlyActivityFeed(unittest.TestCase):
+    """Read-only HTTP activity feed for intercepted events and kanban tasks."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.kanban_path = self.root / "kanban.db"
+
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM intercepted_events")
+            conn.execute("DELETE FROM alert_quota")
+
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.kanban_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _create_kanban_schema(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    body TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    priority INTEGER,
+                    session_id TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    last_heartbeat_at REAL,
+                    result TEXT,
+                    last_failure_error TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    profile TEXT,
+                    status TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    outcome TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    run_id INTEGER,
+                    kind TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    author TEXT,
+                    body TEXT,
+                    created_at REAL
+                );
+                """
+            )
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_intercepted_events_feed_returns_statuses_and_paginates_by_since_id(self, _mock_trigger):
+        r1 = self.client.post(
+            "/sessions/k8s-evt-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "type": "Warning",
+                        "reason": "BackOff",
+                        "namespace": "prod",
+                        "involvedObject": {"kind": "Pod", "name": "api-7b9f-abcde", "uid": "u1"},
+                        "message": "Back-off restarting failed container",
+                        "cluster": "gke-1",
+                    }
+                )
+            },
+        )
+        self.assertEqual(r1.status_code, 200)
+
+        id_undelivered = session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="db",
+            object_uid="u2",
+            object_kind="StatefulSet",
+            reason="FailedScheduling",
+            message="0/3 nodes available",
+            severity="Critical",
+            occurrences=1,
+            notified=True,
+            session_id="k8s-evt-2",
+        )
+        session_kv_server.mark_delivery_failed(id_undelivered, "chat post failed")
+
+        session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="worker",
+            object_uid="u3",
+            object_kind="Pod",
+            reason="Pulled",
+            message="Successfully pulled image",
+            severity="Info",
+            occurrences=1,
+            notified=False,
+            session_id="k8s-evt-3",
+        )
+        session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="cache",
+            object_uid="u4",
+            object_kind="Pod",
+            reason="Unhealthy",
+            message="Readiness probe failed",
+            severity="Warning",
+            occurrences=2,
+            notified=False,
+            session_id="k8s-evt-4",
+        )
+
+        initial = self.client.get("/v1/intercepted-events?limit=2").json()
+        self.assertTrue(initial["truncated"])
+        self.assertEqual(len(initial["events"]), 2)
+        self.assertEqual(initial["events"][0]["session_id"], "k8s-evt-4")
+        self.assertEqual(initial["events"][0]["status"], "suppressed")
+        self.assertEqual(initial["events"][1]["session_id"], "k8s-evt-3")
+        self.assertEqual(initial["events"][1]["status"], "filtered")
+
+        first_id = id_undelivered - 1
+        polled = self.client.get(f"/v1/intercepted-events?since_id={first_id - 1}&limit=10").json()
+        self.assertFalse(polled["truncated"])
+        self.assertEqual(
+            [(e["session_id"], e["status"]) for e in polled["events"]],
+            [
+                ("k8s-evt-1", "injected"),
+                ("k8s-evt-2", "undelivered"),
+                ("k8s-evt-3", "filtered"),
+                ("k8s-evt-4", "suppressed"),
+            ],
+        )
+        self.assertEqual(polled["next_since_id"], polled["events"][-1]["id"])
+
+    def test_kanban_task_feeds_and_detail(self):
+        # Before kanban.db exists: empty list feed with board=False, 404 on detail
+        empty_sess = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        self.assertEqual(empty_sess, {"tasks": [], "truncated": False, "board": False})
+        empty_all = self.client.get("/v1/tasks").json()
+        self.assertEqual(empty_all, {"tasks": [], "truncated": False, "board": False})
+        self.assertEqual(self.client.get("/v1/tasks/t_1").status_code, 404)
+
+        self._create_kanban_schema()
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at, started_at, completed_at, result) "
+                "VALUES ('t_1', 'Triage prod', 'triage body', 'cluster-a', 'done', 1, 'k8s-evt-1', 100.0, 101.0, 120.0, 'Root cause found')"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at, started_at, last_heartbeat_at) "
+                "VALUES ('t_2', 'Open PR', 'pr body', 'platform', 'in_progress', 1, 'k8s-evt-1', 121.0, 122.0, 130.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
+                "VALUES ('t_1', 'cluster-a', 'completed', 101.0, 120.0, 'completed', 'Found bad env var')"
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES ('t_1', 1, 'heartbeat', 'checking pod logs', 110.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES ('t_1', 'cluster-a', ' verified replicaset', 115.0)"
+            )
+
+        sess_feed = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        self.assertTrue(sess_feed["board"])
+        self.assertFalse(sess_feed["truncated"])
+        self.assertEqual([t["id"] for t in sess_feed["tasks"]], ["t_1", "t_2"])
+        self.assertEqual(sess_feed["tasks"][0]["summary"], "Found bad env var")
+        self.assertEqual(sess_feed["tasks"][0]["result"], "Root cause found")
+
+        by_assignee = self.client.get("/v1/tasks?since=125&assignee=platform").json()
+        self.assertEqual([t["id"] for t in by_assignee["tasks"]], ["t_2"])
+
+        detail = self.client.get("/v1/tasks/t_1").json()
+        self.assertEqual(detail["task"]["id"], "t_1")
+        self.assertEqual(detail["task"]["body"], "triage body")
+        self.assertEqual(len(detail["runs"]), 1)
+        self.assertEqual(len(detail["events"]), 1)
+        self.assertEqual(len(detail["comments"]), 1)
+        self.assertEqual(self.client.get("/v1/tasks/no-such-task").status_code, 404)
+
+    def test_init_db_adds_session_id_column_idempotently_to_legacy_ledger(self):
+        import sqlite3
+
+        legacy_db = self.root / "legacy_session_kv.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                """
+                CREATE TABLE intercepted_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
+                    namespace   TEXT NOT NULL DEFAULT '',
+                    workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
+                    object_kind TEXT NOT NULL DEFAULT '',
+                    reason      TEXT NOT NULL DEFAULT '',
+                    message     TEXT NOT NULL DEFAULT '',
+                    severity    TEXT NOT NULL DEFAULT '',
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    notified    INTEGER NOT NULL DEFAULT 0,
+                    delivery_error TEXT NOT NULL DEFAULT '',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO intercepted_events (cluster, namespace, workload, reason, severity) "
+                "VALUES ('gke-1', 'prod', 'old-pod', 'BackOff', 'Warning')"
+            )
+
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+            row_id = session_kv_server.record_intercepted_event(
+                cluster="gke-1",
+                namespace="prod",
+                workload="new-pod",
+                object_uid="uid-new",
+                object_kind="Pod",
+                reason="BackOff",
+                message="restarting",
+                severity="Warning",
+                occurrences=1,
+                notified=True,
+                session_id="k8s-evt-migrated",
+            )
+            self.assertIsNotNone(row_id)
+            feed = self.client.get("/v1/intercepted-events").json()
+            by_name = {e["name"]: e["session_id"] for e in feed["events"]}
+            self.assertEqual(by_name["old-pod"], "")
+            self.assertEqual(by_name["new-pod"], "k8s-evt-migrated")
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_drift_and_stall_injects_stamp_session_id_in_feed(self, _mock_trigger):
+        drift_resp = self.client.post(
+            "/sessions/drift-sess-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "kind": "gitops-drift",
+                        "cluster": "gke-1",
+                        "insert_id": "ins-1",
+                        "principal": "alice@example.com",
+                        "verb": "patch",
+                        "resource": {
+                            "group": "apps",
+                            "version": "v1",
+                            "resource": "deployments",
+                            "namespace": "prod",
+                            "name": "checkout",
+                        },
+                    }
+                )
+            },
+        )
+        self.assertEqual(drift_resp.status_code, 200)
+
+        stall_resp = self.client.post(
+            "/sessions/stall-sess-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "kind": "controller-stall",
+                        "cluster": "gke-1",
+                        "namespace": "prod",
+                        "objects": [
+                            {
+                                "object": "Deployment/checkout",
+                                "heuristic": "stale-condition",
+                                "stalled_for": "15m",
+                            }
+                        ],
+                    }
+                )
+            },
+        )
+        self.assertEqual(stall_resp.status_code, 200)
+
+        feed = self.client.get("/v1/intercepted-events").json()
+        by_reason = {e["reason"]: e["session_id"] for e in feed["events"]}
+        self.assertEqual(by_reason[session_kv_server.DRIFT_LEDGER_REASON], "drift-sess-1")
+        self.assertEqual(by_reason[session_kv_server.STALL_LEDGER_REASON], "stall-sess-1")
+
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_post_initial_alert")
+    @patch.object(session_kv_server, "mark_delivery_failed")
+    def test_headless_install_with_chat_disabled_keeps_status_injected(
+        self, mock_mark_failed, mock_post, mock_create_session, mock_start_turn, *_
+    ):
+        managed_cfg = self.root / "managed-config.yaml"
+        managed_cfg.write_text(
+            "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        with patch.object(session_kv_server, "MANAGED_CONFIG_PATH", str(managed_cfg)):
+            row_id = session_kv_server.record_intercepted_event(
+                cluster="gke-1",
+                namespace="prod",
+                workload="api",
+                object_uid="u-headless",
+                object_kind="Pod",
+                reason="BackOff",
+                message="restarting",
+                severity="Warning",
+                occurrences=1,
+                notified=True,
+                session_id="k8s-evt-headless",
+            )
+            session_kv_server.trigger_agent_troubleshooter("k8s-evt-headless", "alert", {}, row_id)
+            mock_post.assert_not_called()
+            mock_mark_failed.assert_not_called()
+            mock_create_session.assert_called_once()
+            mock_start_turn.assert_called_once()
+
+            feed = self.client.get("/v1/intercepted-events").json()
+            self.assertEqual(feed["events"][0]["session_id"], "k8s-evt-headless")
+            self.assertEqual(feed["events"][0]["status"], "injected")
+
+    def test_out_of_range_since_id_and_since_return_400_instead_of_500(self):
+        overflow = (1 << 63)
+        for bad in (-1, overflow):
+            with self.subTest(bad=bad):
+                r_events = self.client.get(f"/v1/intercepted-events?since_id={bad}")
+                self.assertEqual(r_events.status_code, 400)
+                r_tasks = self.client.get(f"/v1/tasks?since={bad}")
+                self.assertEqual(r_tasks.status_code, 400)
+
+    def test_kanban_db_path_uses_hermes_resolver_and_falls_back_to_agent_home(self):
+        import types
+
+        with patch.object(session_kv_server, "KANBAN_DB_PATH", None):
+            package = types.ModuleType("hermes_cli")
+            module = types.ModuleType("hermes_cli.kanban_db")
+            module.kanban_db_path = lambda: Path("/opt/data/kanban/boards/ops/kanban.db")
+            package.kanban_db = module
+            with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": module}):
+                self.assertEqual(
+                    session_kv_server._kanban_db_path(),
+                    "/opt/data/kanban/boards/ops/kanban.db",
+                )
+
+            with patch.dict(sys.modules, {"hermes_cli": None, "hermes_cli.kanban_db": None}), patch.dict(
+                os.environ,
+                {"PLATFORM_AGENT_HOME": "/custom/home", "HERMES_HOME": "/custom/home/profiles/platform"},
+            ):
+                self.assertEqual(
+                    session_kv_server._kanban_db_path(),
+                    "/custom/home/kanban.db",
+                )
+
+
 
 if __name__ == "__main__":
     # Clean up temp database file on exit
