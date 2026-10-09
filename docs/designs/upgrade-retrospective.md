@@ -315,6 +315,9 @@ signatures:
 | `Insufficient cpu` / `memory` on a Pending pod after a node-pool operation                | 2     |
 | a budget with no allowance left on a drained node; a node operation past an hour per node | 1     |
 | `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API     | 6     |
+| every replica of a workload unavailable inside one `UPGRADE_NODES` span, all on its pool  | 3     |
+| a pool two minors from its control plane, or one pool on two kubelet versions, standing   | 5     |
+| more than a day after the last window close or exclusion end                              |       |
 
 Rows overlap, and a symptom carries exactly one entry, so the rows are tried in a fixed order and
 the first that holds wins; the order is the most specific discriminator first, so a finding id (the
@@ -349,10 +352,15 @@ API server sets agrees with it, a pod phase or container state, a node condition
 status; and wherever the excerpt travels, the guard, the manifest candidate, the ledger issue, it is
 quoted as the object's own text, not stated as the review's finding. A symptom that matches nothing is reported as a
 Warning, unclassified, rather than dropped: the report is a record of the upgrade, not only of the
-catalogue's part of it. The entries not in the table (3, 4,
-5, 8, 9, 10, 11, 13, 16) have no symptom a single read identifies with confidence; they are the
-ones the readiness checks have to catch before the upgrade, and the report says so under (C) when a
-cluster's symptoms are unclassified.
+catalogue's part of it. The entries not in the table (4, 8, 9, 10, 11, 13, 16) have no symptom a
+single read identifies with confidence; they are the ones the readiness checks have to catch before
+the upgrade, and the report says so under (C) when a cluster's symptoms are unclassified. Entries 3
+and 5 joined the table from the catalogue's gap review: entry 3 is a Deployment's `Available=False`
+transition, or a StatefulSet with no ready replica, inside one `UPGRADE_NODES` span with every pod
+on that pool (high; medium when the pods were in the zone it drained), keyed by the operation like a
+budget hold; entry 5 is read from the cluster describe and the maintenance policy, medium, and only
+once the skew has stood more than a day after the latest window close or exclusion end (while a
+window is open or an exclusion active it is an Info line).
 
 ### 3.5 Mitigation set up, not only described
 
