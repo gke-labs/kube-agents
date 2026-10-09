@@ -186,6 +186,10 @@ READINESS_TIMEOUT_SECONDS = 1500
 # has left; a project the budget cannot reach is left unread and named rather
 # than started, and the next sweep starts at it.
 TICK_BUDGET_SECONDS = 2700
+# The version table's share of the budget: what it does not use by then is the
+# readiness runs', so a table that does not fit never starves the report, which
+# is the tick's deliverable; the projects it did not reach are read first tomorrow.
+TABLE_BUDGET_SECONDS = 900
 MIN_PROJECT_RUN_SECONDS = 120
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} ran"
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
@@ -539,7 +543,7 @@ def load_ledger(path: Path) -> dict:
     for version, entry in data[TARGETS_KEY].items():
         shape_ok = (
             isinstance(version, str)
-            and VERSION_KEY_RE.match(version) is not None
+            and VERSION_KEY_RE.fullmatch(version) is not None
             and isinstance(entry, dict)
             and isinstance(entry.get(PENDING_KEY), list)
             and all(isinstance(c, str) for c in entry[PENDING_KEY])
@@ -686,8 +690,8 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
 
 def versions_by_project(names: list[str], deadline: float, resume_from: str | None) -> tuple[dict, str | None]:
     """The version table, one sandbox run per project under its own timeout and
-    what is left of the tick's budget before ``deadline``, merged into one
-    envelope. A project whose run failed, or that the budget did not reach, is a
+    what is left of the table's share of the budget before ``deadline``, merged
+    into one envelope. A project whose run failed, or that the budget did not reach, is a
     read error with no location, the shape a failed ``clusters list`` has, so
     the table counts as partial: nothing is retired, and the ledger's pending
     clusters of that project are carried forward. The second value is the first
@@ -876,7 +880,7 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger = load_ledger(ledger_path)
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions, table_unrun = versions_by_project(names, deadline, ledger.get(TABLE_RESUME_KEY))
+    versions, table_unrun = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger.get(TABLE_RESUME_KEY))
     ledger[TABLE_RESUME_KEY] = table_unrun
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors

@@ -471,6 +471,23 @@ class Budget(Base):
     def test_the_budget_leaves_room_under_the_kill(self) -> None:
         self.assertLess(watch.TICK_BUDGET_SECONDS + watch.MIN_PROJECT_RUN_SECONDS, HERMES_NO_AGENT_KILL_SECONDS)
         self.assertGreater(watch.TICK_BUDGET_SECONDS, watch.VERSION_TABLE_TIMEOUT_SECONDS + watch.READINESS_TIMEOUT_SECONDS)
+        self.assertGreater(watch.TICK_BUDGET_SECONDS - watch.TABLE_BUDGET_SECONDS, watch.READINESS_TIMEOUT_SECONDS, "the readiness runs keep at least one full run after the table's share")
+
+    def test_a_table_that_outgrows_its_share_leaves_the_readiness_runs_theirs(self) -> None:
+        self.seed(TARGET, NOW - timedelta(days=8), ["p1/us-central1-a/a", "p2/us-central1-a/b"])
+        versions, readiness = self.two_projects()
+        # started, table p1, table p2 (past the table's share), readiness p1, readiness p2 (both inside the tick's)
+        late = watch.TABLE_BUDGET_SECONDS - 10.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, late, late, late):
+            sandbox = FakeSandbox(versions, readiness)
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["p1"])
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["p1", "p2"])
+        self.assertIn("the version table was partial (1 read error(s), exit 0)", out)
+        self.assertIn(f"scheduled refresh {TARGET}, 2 cluster(s) pending (a, b): 0 blocked, 2 ready;", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+        self.assertEqual(self.ledger()["table_resume_from"], "p2")
 
     def test_a_project_the_budget_cannot_reach_is_left_unread_and_named(self) -> None:
         versions, readiness = self.two_projects()
@@ -568,7 +585,8 @@ class Budget(Base):
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
     def test_a_project_s_timeout_shrinks_to_what_is_left_of_the_budget(self) -> None:
-        with self.monotonic_readings(0.0, 2000.0):
+        # started, table p1 (inside the table's share), readiness p1 (700 s left of the tick's budget)
+        with self.monotonic_readings(0.0, 0.0, 2000.0):
             sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
@@ -576,7 +594,7 @@ class Budget(Base):
         self.assertEqual([c[2] for c in sandbox.calls if c[0] == "versions"], [watch.VERSION_TABLE_TIMEOUT_SECONDS])
 
     def test_a_project_with_the_budget_to_spare_keeps_its_full_timeout(self) -> None:
-        with self.monotonic_readings(0.0, 100.0):
+        with self.monotonic_readings(0.0, 0.0, 100.0):
             sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
             self.run_tick(sandbox)
         self.assertEqual([c[2] for c in sandbox.calls if c[0] == "readiness"], [watch.READINESS_TIMEOUT_SECONDS])
@@ -766,7 +784,7 @@ class Failures(Base):
         self.assertEqual(out, "")
 
     def test_a_ledger_key_that_is_not_a_version_is_refused_not_overwritten(self) -> None:
-        for key in ("../../scratch/x", "latest", "1.35", "1.35.8-gke.1225000/.."):
+        for key in ("../../scratch/x", "latest", "1.35", "1.35.8-gke.1225000/..", "1.35.8-gke.1225000\n"):
             with self.subTest(key=key):
                 self.home.mkdir(parents=True, exist_ok=True)
                 self.marker().unlink(missing_ok=True)
@@ -774,7 +792,7 @@ class Failures(Base):
                 sandbox = FakeSandbox(envelope([member("a", "lagging")]))
                 code, out = self.run_tick(sandbox)
                 self.assertEqual(code, 0)
-                self.assertIn(f"has a malformed entry for {key}; refusing to overwrite it", out)
+                self.assertIn(f"has a malformed entry for {key.strip()}", out)
                 self.assertEqual(sandbox.calls, [])
                 self.assertFalse((self.home / "reports").exists())
 

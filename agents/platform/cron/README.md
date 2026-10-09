@@ -199,7 +199,8 @@ project that holds a pending cluster with its own timeout, so one project the
 sandbox cannot finish leaves only its own clusters ungraded and the others'
 versions still reported. The whole tick keeps to forty-five minutes of the
 hour Hermes gives a `no_agent` script: the version table and the readiness
-runs go project by project, each run gets what the budget has left, a project
+runs go project by project, the table within the first fifteen minutes and the
+readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach is left unread and named in the line (a version none
 of whose projects ran is not recorded and is retried tomorrow), and the next
 sweep starts at that project, so a budget that never reaches the end of the
