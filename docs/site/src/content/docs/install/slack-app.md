@@ -80,17 +80,7 @@ Do it after the switch rather than before, because the `today` listener answers 
 
 ### For `spec.mode: today` (the Hermes listener)
 
-The Hermes listener needs more than the gateway: slash commands, reactions, files, and the assistant surface. Its manifest is the one `hermes slack manifest` prints, which needs an installed pod, so set the app up in two passes:
-
-1. Create the app **From scratch**, turn on **Socket Mode**, and create the app-level token (below).
-2. Add the bot scopes listed in [`INSTALL.md` Step 5](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue), install the app, copy the bot token (below), and run the installer with Slack enabled.
-3. Once the install is up, print the full manifest and paste it into the app's **App Manifest** page:
-
-   ```bash
-   kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
-   ```
-
-   `INSTALL.md` Step 5 covers its options (`--no-assistant`, `--slashes-only`). A manifest that turns on Slack's [agent view](/kube-agents/concepts/chatops/#agent-view) cannot be undone, so read that section before you apply one.
+The Hermes listener needs more than the gateway: slash commands, reactions, files, and the assistant surface. Its manifest is the one `hermes slack manifest` prints. [`INSTALL.md` Step 5](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) owns the procedure: create the app from that manifest (**Create New App → From a manifest**), which the command prints on an install where Slack is not configured yet, and its options (`--no-assistant`, `--slashes-only`). A manifest that turns on Slack's [agent view](/kube-agents/concepts/chatops/#agent-view) cannot be undone, so read that section before you apply one.
 
 ## Get the tokens
 
