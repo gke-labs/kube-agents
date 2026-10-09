@@ -376,8 +376,9 @@ def pool_advisable(pool: dict, drained: bool = False) -> bool:
     reads later as already said, and the next live queue under the same cause
     would go unannounced.
 
-    A breach needs a live backlog, because the verdict lasts a week while the
-    remedy is read fresh each hour. Unknown is not a refusal -- an unreadable
+    A breach needs a live backlog, or a refused acquire in the periodic's
+    recent window, because the verdict lasts a week while the remedy is read
+    fresh each hour. Unknown is not a refusal -- an unreadable
     queue withholds nothing, and `pool_cause_text` drops the diagnosis instead
     -- except after the queue was last seen drained, when a Deck that fails
     every other hour would announce a jam nothing has measured since.
@@ -880,7 +881,7 @@ def pool_cause_text(pool: dict) -> str:
         if isinstance(free, int) and free > 0:
             return (
                 f"*Smoke gate: pool was full* — {free} of {figure(pool.get('total'))} projects"
-                f" are free now{held}. Consider onboarding a project."
+                f" are free now{held}{queuing}. Consider onboarding a project."
             )
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"

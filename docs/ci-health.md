@@ -326,7 +326,9 @@ and apportions no blame. `pool full` keeps its remedy either way and drops "and
 runs are queuing" whenever Deck did not see a backlog — the leased count is this
 hour's, the queue is Deck's. A refusal keeps the cause for three hours, so once
 the pool has drained the header reads `pool was full` with the free count
-instead of calling the projects leased.
+instead of calling the projects leased — unless a run is waiting past the p50
+limit with projects free, when the live diagnosis wins and the refusal is a
+line under it.
 
 A drained queue also ends what the jam said. The verdict holds for a week, so a
 pool that fills every afternoon would otherwise be announced on Monday and

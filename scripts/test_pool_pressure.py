@@ -1132,6 +1132,27 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("WITHIN THRESHOLD", out)
         self.assertNotIn("LEASE FAILED", out)
 
+    def test_a_run_queued_past_p50_over_free_projects_outranks_a_refusal(self):
+        """The round-trip of the override: a refusal in the window, the pool
+        drained, and a run queued twenty minutes with projects free is the
+        control-plane shape, at the p50 bar the chat bot calls a backlog."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            created = SATURATED_AS_OF - timedelta(minutes=20)
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [{
+                    "metadata": {"creationTimestamp": created.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                    "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 2700}]}},
+                    "status": {"state": "triggered"},
+                }]}, fh)
+            with open(os.path.join(tmp, "boskos.json"), "w") as fh:
+                json.dump({"current": {"busy": 20, "free": 15}, "owner": {}}, fh)
+            code, out = run(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("CONTROL PLANE, not capacity. 15 project(s) were free", out)
+        self.assertIn("2 run(s) in the last 3h asked Boskos", out, "the refusal still leads")
+
     def test_a_quiet_day_is_green_and_reports_no_leaks(self):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_OK, code)

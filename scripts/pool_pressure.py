@@ -1485,6 +1485,9 @@ def summarise(
 
     queue: Optional[LiveQueue] = live.value if live.ok else None
     live_breach = [w for w in queue.waiting if w.minutes > p95_limit] if queue else []
+    # A backlog at the p50 bar, the bar the health bot and docs/ci-health.md
+    # use for "runs are waiting now": what a refusal yields to in cause().
+    live_backlog = any(w.minutes > p50_limit for w in queue.waiting) if queue else False
 
     pool_state: Optional[PoolState] = pool.value if pool.ok else None
     concurrency = latest_max_concurrency(waits)
@@ -1517,7 +1520,7 @@ def summarise(
     # still reported, under `max_concurrency` and `pool.stranded`.
     leaked = leaked_leases(pool_state, queue)
     cause_label, cause_text = (
-        cause(pool_state, queue, concurrency, len(recent_failed), leaked, bool(live_breach))
+        cause(pool_state, queue, concurrency, len(recent_failed), leaked, live_backlog)
         if breached
         else (None, [])
     )
@@ -1946,8 +1949,8 @@ def cause(
     what the projects are doing, because the remedy differs when two of them
     are a repair or a leak (#2747). It is evidence about that moment only, so
     a live reading that contradicts it wins: `live_backlog` (a run queued past
-    the limit right now) over projects sitting free is the control plane or
-    the cap, diagnosed below with the refusal still stated first.
+    the p50 limit right now) over projects sitting free is the control plane
+    or the cap, diagnosed below with the refusal still stated first.
     """
     refused = [
         f"{lease_failures} run(s) in the last {RECENT_WINDOW_HOURS}h asked Boskos for a"

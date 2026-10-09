@@ -1056,10 +1056,17 @@ class PoolNote(RunHarness):
     def test_a_refusal_breach_over_a_drained_pool_does_not_call_it_full(self):
         # The cause stays CAPACITY for three hours after a refusal, and the
         # free count is this hour's; "all leased" over seven free is false.
-        note = pool_note(free=7, lease_failures=2, lease_failures_hours=3)
+        note = pool_note(free=7, lease_failures=2, lease_failures_hours=3, waiting_now=False)
         self.assertEqual(
             post_health.pool_cause_text(note),
             "*Smoke gate: pool was full* — 7 of 30 projects are free now. Consider onboarding a project.",
+        )
+        # With a live backlog the clause rides here too: the reader must see
+        # that runs are queuing over free projects, not only the remedy.
+        self.assertEqual(
+            post_health.pool_cause_text(note | {"waiting_now": True}),
+            "*Smoke gate: pool was full* — 7 of 30 projects are free now and runs are queuing."
+            " Consider onboarding a project.",
         )
 
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
