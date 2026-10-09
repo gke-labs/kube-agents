@@ -905,7 +905,7 @@ def test_worker_commands_after_result_the_window_is_per_card():
     )
     res = _RETRY.verify(5.0)
     assert res.status == "pass"
-    assert "on card t_a and its children" in res.reason and "on card t_b and its children" in res.reason
+    assert "in the lineage of card t_a" in res.reason and "in the lineage of card t_b" in res.reason
     _stash_terminal(
         [
             _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=10, agent="cluster-a", task="t_a"),
@@ -915,7 +915,7 @@ def test_worker_commands_after_result_the_window_is_per_card():
     )
     res = _RETRY.verify(5.0)
     assert res.status == "fail"
-    assert "kubectl patch deploy kube-dns" in res.reason and "1 on card t_b and its children" in res.reason
+    assert "kubectl patch deploy kube-dns" in res.reason and "1 in the lineage of card t_b" in res.reason
 
 
 def test_worker_commands_after_result_a_child_card_shares_its_parents_window():
@@ -929,7 +929,13 @@ def test_worker_commands_after_result_a_child_card_shares_its_parents_window():
     _stash_terminal(entries, parents={"t_b": "t_a"})
     res = _RETRY.verify(5.0)
     assert res.status == "fail"
-    assert "on card t_a and its children" in res.reason
+    assert "in the lineage of card t_a" in res.reason
+    # The image's dependency repair can point the parent back at the child
+    # as well; a cycle is still one lineage, named by its smallest card id.
+    _stash_terminal(entries, parents={"t_b": "t_a", "t_a": "t_b"})
+    res = _RETRY.verify(5.0)
+    assert res.status == "fail"
+    assert "in the lineage of card t_a" in res.reason
     _stash_terminal(entries)
     assert _RETRY.verify(5.0).status == "pass"
 
