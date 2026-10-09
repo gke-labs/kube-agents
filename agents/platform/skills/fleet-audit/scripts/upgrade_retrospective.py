@@ -220,6 +220,11 @@ MESSAGE_EXCERPT_CHARS = 400
 # and the files are read by the SOP's run and the readiness watch.
 FILE_MODE = 0o666
 TEMP_SUFFIX = ".tmp"
+# The lock and the store's directories are made with the umask cleared: a
+# hand run over `kubectl exec` lands as root while the tick runs as uid 1000,
+# and a 0600 root lock or a 0755 root directory would refuse every later run.
+LOCK_FILE_MODE = 0o644
+STORE_DIR_MODE = 0o777
 
 # Project discovery, as `collect.py`'s `discover_fleet`: `--project`, else
 # the active gcloud project plus every project `gcloud projects list`
@@ -245,12 +250,22 @@ DRAIN_HOLD_PER_NODE = timedelta(hours=1)
 OPERATION_METRIC_NODES_TOTAL = "NODES_TOTAL"
 OPERATION_METRIC_PDB_DELAY = "NODE_PDB_DELAY_SECONDS"
 DRAIN_HELD_PREFIX = "drain held by the budget on "
+# A budget at zero only because its covered pods are not ready: the hold is
+# real, the thing to fix is the covered pods' own incident, not the budget.
+BUDGET_DOWNSTREAM_DETAIL_FORMAT = "spec {spec} allows disruption; at zero because {not_ready} of {expected} covered pod(s) are not ready, the covered pods' own incident"
+BUDGET_DOWNSTREAM_BEFORE = "A budget at disruptionsAllowed 0 only while its covered pods are not ready; the spec allows disruption."
+BUDGET_DOWNSTREAM_MITIGATE_BEFORE = "Nothing on the budget: make the covered pods schedulable and ready (their own incident) and the budget allows disruption again."
+BUDGET_DOWNSTREAM_MITIGATE_AFTER = "The drain resumes once the covered pods are ready; the budget needs no change."
 DRAIN_HELD_MEASURED_FORMAT = "{pool} ({metric} {seconds} s, measured by GKE)"
 DRAIN_HELD_ESTIMATED_FORMAT = "{pool} (estimated from the operation's duration, {minutes} min over {nodes} node(s); no progress metrics)"
 NO_PROGRESS_METRICS_TEXT = "no progress metrics"
 
 CLUSTER_KEY_SEPARATOR = "/"
 NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
+# A pod's placement pins: its nodeSelector and the `In` expressions of its
+# required node-affinity terms, as the scheduler reads them.
+AFFINITY_REQUIRED_KEY = "requiredDuringSchedulingIgnoredDuringExecution"
+AFFINITY_OPERATOR_IN = "In"
 CGROUP_V2_MODE = "EFFECTIVE_CGROUP_MODE_V2"
 CGROUP_V1_MODE = "EFFECTIVE_CGROUP_MODE_V1"
 
@@ -315,6 +330,7 @@ ARCHIVE_SUBDIR = "archive"
 CRASH_RECORD_TEXT = "{path} sits beside no live state file: a crash record, not a re-baseline. Restore it as the ledger or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
 RESET_LEDGER_TEXT = "archived {count} crash record(s) under {archive}; the next run starts fresh."
 RESET_LEDGER_NOTHING_TEXT = "no crash record to archive."
+RESET_LEDGER_DRY_RUN_TEXT = "would archive {count} crash record(s) under {archive}: {names}; nothing moved (--dry-run)."
 # The full-run refresh of every fleet cluster's symptom set: pods for the
 # symptoms, nodes for the pools, owners so the keys match the review's.
 REFRESH_READS = ("pods", "nodes", "owners")
@@ -1025,6 +1041,10 @@ def list_operations(project: str, since: datetime, *, run: RunFn) -> tuple[list[
     The filter is also applied here, so a gcloud that ignores it changes nothing."""
     parsed, error = run_json(operations_argv(project, since), run=run)
     if error:
+        # The same API that made `clusters list` an empty project refuses this
+        # listing with the same words: empty, not a failed read.
+        if any(marker in error for marker in API_DISABLED_MARKERS):
+            return [], None
         return [], error
     if not isinstance(parsed, list):
         return [], "operations list returned JSON that is not a list"
@@ -1123,10 +1143,21 @@ def empty_guards() -> dict:
     return {"version": GUARDS_VERSION, "updated_at": None, "guards": []}
 
 
+def make_store_dir(path: Path) -> None:
+    """A store directory writable by whichever uid runs next (`STORE_DIR_MODE`,
+    the umask cleared for the call): a directory root made under its umask
+    on a hand run would refuse the tick's writes after the fleet was read."""
+    mask = os.umask(0)
+    try:
+        path.mkdir(mode=STORE_DIR_MODE, parents=True, exist_ok=True)
+    finally:
+        os.umask(mask)
+
+
 def write_json_atomically(path: Path, doc: object) -> None:
     """A temporary file beside `path`, fsynced, renamed over it: a reader sees
     the whole document or the previous one, never a splice."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_store_dir(path.parent)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=TEMP_SUFFIX)
     umask = os.umask(0)
     os.umask(umask)
@@ -1449,6 +1480,7 @@ def _pod_detail(pod: dict) -> dict:
         "images": [c.get("image", "") for c in containers],
         "labels": meta.get("labels") or {},
         "node_selector": spec.get("nodeSelector") or {},
+        "node_pins": pod_pins(spec),
         "api_markers": _api_marker_hits(pod),
         "api_marker_sources": _api_marker_sources(pod),
         "started": status.get("startTime") or meta.get("creationTimestamp"),
@@ -1765,12 +1797,11 @@ def event_symptoms(events: list[dict], window_start: datetime, resolver: Resolve
 
 def _selector_matches(selector: dict, labels: dict) -> bool:
     """A label selector evaluated in full: `matchLabels` and `matchExpressions`
-    (In, NotIn, Exists, DoesNotExist). An empty selector matches nothing here:
-    a budget with no selector covers no pod this collector can name."""
+    (In, NotIn, Exists, DoesNotExist). As `policy/v1` reads a budget's: an
+    empty selector matches every pod in the namespace; the callers keep an
+    absent (null) selector, which matches none, away from here."""
     match = (selector or {}).get("matchLabels") or {}
     expressions = (selector or {}).get("matchExpressions") or []
-    if not match and not expressions:
-        return False
     if not all(labels.get(k) == v for k, v in match.items()):
         return False
     for expr in expressions:
@@ -1786,24 +1817,60 @@ def _selector_matches(selector: dict, labels: dict) -> bool:
     return True
 
 
-def _selector_pool_set(selector: dict, label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
-    """The pools a nodeSelector names: by the pool label, or by any label the
-    pools carry -- the same mapping the Pending-pod gate reads."""
-    pool = (selector or {}).get(NODEPOOL_LABEL, "")
-    return {pool} if pool else _selector_pools(selector, label_pools)
+def pod_pins(spec: dict) -> list[dict[str, list[str]]]:
+    """A pod spec's placement pins as the scheduler reads them: one mapping of
+    label to allowed values per required node-affinity term (terms are
+    alternatives), each merged with the nodeSelector (a conjunction). A spec
+    with no required term is one term; a spec that pins nothing is []."""
+    base = {key: [value] for key, value in sorted((spec.get("nodeSelector") or {}).items())}
+    required = ((spec.get("affinity") or {}).get("nodeAffinity") or {}).get(AFFINITY_REQUIRED_KEY) or {}
+    pins: list[dict[str, list[str]]] = []
+    for term in list(required.get("nodeSelectorTerms") or []) or [{}]:
+        pin = {key: list(values) for key, values in base.items()}
+        for expr in term.get("matchExpressions") or []:
+            key, values = expr.get("key"), expr.get("values") or []
+            if expr.get("operator") != AFFINITY_OPERATOR_IN or not key or not values:
+                continue
+            pin[key] = sorted(set(values) & set(pin[key])) if key in pin else sorted(set(values))
+        if pin:
+            pins.append(pin)
+    return pins
 
 
-def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_selector: dict, pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
+def pins_of_selector(selector: dict | None) -> list[dict[str, list[str]]]:
+    return pod_pins({"nodeSelector": selector or {}})
+
+
+def _pinned_pools(pins: list[dict[str, list[str]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
+    """The pools a pod's pins name: by the pool label directly, else by any
+    label the pools' nodes carry; the union over the terms. Empty when
+    nothing pins, and when the pins resolve to every pool there is: a label
+    every node carries (`kubernetes.io/os`) is no preference."""
+    universe = set().union(*label_pools.values()) if label_pools else set()
+    pools: set[str] = set()
+    for pin in pins:
+        term: set[str] | None = None
+        for key, values in pin.items():
+            matching = set(values) if key == NODEPOOL_LABEL else {pool for value in values for pool in label_pools.get((key, value), set())}
+            term = matching if term is None else term & matching
+        pools |= term or set()
+    if universe and pools >= universe:
+        return set()
+    return pools
+
+
+def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_pins: list[dict[str, list[str]]], pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
     """The pools a budget's pod belongs to: where it sits, else the pools its
-    own or its owner's nodeSelector names (by the pool label or any pool
-    label), else, for a Pending pod, the pool whose drain was running when it
+    own or its owner's pins name (nodeSelector or required node affinity, by
+    the pool label or any pool label; a label every node carries names
+    none), else, for a Pending pod, the pool whose drain was running when it
     was created (the replica the drain displaced)."""
     spec = pod.get("spec") or {}
     placed = node_pool.get(spec.get("nodeName") or "", "")
     if placed:
         return {placed}
-    for selector in (spec.get("nodeSelector") or {}, owner_selector or {}):
-        pools = _selector_pool_set(selector, label_pools)
+    for pins in (pod_pins(spec), owner_pins or []):
+        pools = _pinned_pools(pins, label_pools)
         if pools:
             return pools
     created = parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
@@ -1812,10 +1879,13 @@ def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_selector: dic
     return set()
 
 
-def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict], pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, owner_selectors: dict[str, dict] | None = None, resolver: Resolver | None = None, label_pools: dict[tuple[str, str], set[str]] | None = None) -> list[dict]:
+def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict], pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, owner_pins: dict[str, list[dict[str, list[str]]]] | None = None, resolver: Resolver | None = None, label_pools: dict[tuple[str, str], set[str]] | None = None) -> list[dict]:
     """Entry 1's after-signal: a budget allowing no disruption whose pods
     belong to a pool an `UPGRADE_NODES` touched in the window -- where they
-    sit, or, for the replicas the drain displaced, where they came from."""
+    sit, or, for the replicas the drain displaced, where they came from. A
+    budget whose spec allows disruption and sits at zero only because its
+    covered pods are not ready is marked downstream: the hold is real, the
+    thing to fix is the pods' own incident."""
     node_pool = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
     out = []
     for pdb in pdbs:
@@ -1823,23 +1893,33 @@ def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded
         if status.get("disruptionsAllowed") != 0:
             continue
         namespace, name = meta.get("namespace", ""), meta.get("name", "")
-        selector = (pdb.get("spec") or {}).get("selector") or {}
-        covered = [p for p in pods if (p.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, (p.get("metadata") or {}).get("labels") or {})]
+        # policy/v1: an empty selector covers every pod in the namespace, an
+        # absent one covers none.
+        selector = (pdb.get("spec") or {}).get("selector")
+        covered = [] if selector is None else [p for p in pods if (p.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, (p.get("metadata") or {}).get("labels") or {})]
         pools = set()
         for p in covered:
             meta = p.get("metadata") or {}
-            owner_selector: dict = {}
+            pins: list[dict[str, list[str]]] = []
             if resolver is not None:
                 kind, oname = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
-                owner_selector = (owner_selectors or {}).get(_object_ref(meta.get("namespace", ""), kind, oname), {})
-            pools |= _covered_pod_pools(p, node_pool, owner_selector, pool_spans or {}, label_pools or {})
+                pins = (owner_pins or {}).get(_object_ref(meta.get("namespace", ""), kind, oname), [])
+            pools |= _covered_pod_pools(p, node_pool, pins, pool_spans or {}, label_pools or {})
         pools = sorted(pools - {""})
         touched = [pool for pool in pools if pool in upgraded_pools]
         if not touched:
             # A budget nothing drained in the window is the readiness
             # report's before-signal, not this report's failure.
             continue
+        spec = {k: v for k, v in (pdb.get("spec") or {}).items() if k != "selector"}
+        expected, healthy = status.get("expectedPods"), status.get("currentHealthy")
+        forbids = _budget_allows_no_disruption(spec, expected if isinstance(expected, int) else (len(covered) or None))
         out.append({
+            "spec": spec,
+            "spec_forbids": forbids,
+            "budget_downstream": not forbids,
+            "expected_pods": expected,
+            "not_ready": (expected - healthy) if isinstance(expected, int) and isinstance(healthy, int) else None,
             "kind": "PodDisruptionBudget",
             "namespace": namespace,
             "name": name,
@@ -1931,13 +2011,8 @@ def pool_labels(cluster: dict, nodes: list[dict]) -> dict[tuple[str, str], set[s
 
 
 def _selector_pools(selector: dict, label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
-    """The pools whose labels satisfy every pair of a nodeSelector; empty when
-    a pair matches no pool or the selector is empty."""
-    pools: set[str] | None = None
-    for key, value in (selector or {}).items():
-        matching = set(label_pools.get((key, value), set()))
-        pools = matching if pools is None else pools & matching
-    return pools or set()
+    """`_pinned_pools` for a bare nodeSelector."""
+    return _pinned_pools(pins_of_selector(selector), label_pools)
 
 
 def _classification(entry: int | None, confidence: str, evidence: str, detail: str = "") -> dict:
@@ -1980,7 +2055,10 @@ def _scopes_of(symptom: dict) -> dict[str, list[tuple[str, bool, str | None]]]:
 
 def _selector_detail(symptom: dict) -> str:
     selector = symptom.get("node_selector") or {}
-    return "selector " + ",".join(f"{k}={v}" for k, v in sorted(selector.items())) if selector else "node affinity"
+    if selector:
+        return "selector " + ",".join(f"{k}={v}" for k, v in sorted(selector.items()))
+    terms = [",".join(f"{k} In [{'|'.join(v)}]" for k, v in sorted(pin.items())) for pin in symptom.get("node_pins") or [] if pin]
+    return "node affinity " + " or ".join(terms) if terms else "node affinity"
 
 
 def _image_host(image: str) -> str:
@@ -2006,15 +2084,14 @@ def _gate_open(symptom: dict, entry: int, ctx: Context) -> bool:
     pools.discard("")
     if pools:
         return any(pool in ctx.upgraded_pools for pool in pools)
-    # No node: a Pending pod names its pool through its nodeSelector -- the
-    # pool label, or any label the pools' nodes carry; only a pod with no
-    # pool preference counts any upgraded pool, and an event row with no pool
-    # evidence at all stays closed.
-    selector = symptom.get("node_selector") or {}
-    selector_pool = selector.get(NODEPOOL_LABEL, "")
-    if selector_pool:
-        return selector_pool in ctx.upgraded_pools
-    preferred = _selector_pools(selector, ctx.label_pools)
+    # No node: a Pending pod names its pool through its pins (nodeSelector or
+    # required node affinity) -- the pool label, or any label the pools' nodes
+    # carry; only a pod with no pool preference counts any upgraded pool, and
+    # an event row with no pool evidence at all stays closed.
+    pins = symptom.get("node_pins")
+    if pins is None:
+        pins = pins_of_selector(symptom.get("node_selector"))
+    preferred = _pinned_pools(pins, ctx.label_pools)
     if preferred:
         return any(pool in ctx.upgraded_pools for pool in preferred)
     if symptom["category"] == CATEGORY_EVENT:
@@ -2048,10 +2125,12 @@ def _dropped_label(symptom: dict, ctx: Context) -> str:
     """The selector label the catalogue lists as dropped at or before the
     minor of the pool the pod targets (its control plane's when it names no
     pool), or "" when it names none."""
-    selector = symptom.get("node_selector") or {}
-    pool = selector.get(NODEPOOL_LABEL) or next(iter(sorted(_selector_pools(selector, ctx.label_pools))), "")
+    pins = symptom.get("node_pins")
+    if pins is None:
+        pins = pins_of_selector(symptom.get("node_selector"))
+    pool = next(iter(sorted(_pinned_pools(pins, ctx.label_pools))), "")
     parsed = parse_version(ctx.pool_versions.get(pool) or ctx.control_plane or "")
-    for label in sorted(selector):
+    for label in sorted({key for pin in pins for key in pin}):
         dropped_at = DROPPED_NODE_LABELS.get(label)
         if dropped_at and parsed and (parsed[0], parsed[1]) >= dropped_at:
             return LABEL_DROPPED_FORMAT.format(label=label, major=dropped_at[0], minor=dropped_at[1])
@@ -2236,7 +2315,10 @@ def _match_budget(symptom: dict, entry: int, ctx: Context) -> dict | None:
     named = next(iter(held)) if held else next(iter(touched))
     info = touched[named]
     source = f"{OPERATION_METRIC_PDB_DELAY} {info['pdb_delay_s']} s" if info.get("pdb_delay_s") is not None else NO_PROGRESS_METRICS_TEXT
-    detail = f"budget {symptom['name']}" + (f"; {DRAIN_HELD_PREFIX}{', '.join(held.values())}" if held else "")
+    detail = f"budget {symptom['name']}"
+    if symptom.get("budget_downstream"):
+        detail += ": " + BUDGET_DOWNSTREAM_DETAIL_FORMAT.format(spec=json.dumps(symptom.get("spec") or {}, sort_keys=True), not_ready="?" if symptom.get("not_ready") is None else symptom["not_ready"], expected="?" if symptom.get("expected_pods") is None else symptom["expected_pods"])
+    detail += f"; {DRAIN_HELD_PREFIX}{', '.join(held.values())}" if held else ""
     return _classification(entry, HIGH, f"disruptionsAllowed=0 with pods on {', '.join(touched)}; UPGRADE_NODES {info['operation']} on {named} took {info['longest_s'] // SECONDS_PER_MINUTE} min over {info['nodes']} node(s); {source}", detail)
 
 
@@ -2652,7 +2734,9 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
-    owner_selectors = {obj["object"]: (spec.get("nodeSelector") or {}) for obj, spec, _ in pod_specs_by_owner(reads.get("workloads") or [], reads.get("pods") or [], resolver).values()}
+    specs_by_owner = pod_specs_by_owner(reads.get("workloads") or [], reads.get("pods") or [], resolver)
+    owner_selectors = {obj["object"]: (spec.get("nodeSelector") or {}) for obj, spec, _ in specs_by_owner.values()}
+    owner_pins = {obj["object"]: pod_pins(spec) for obj, spec, _ in specs_by_owner.values()}
     # A FailedScheduling or BackOff event on a workload the pod list already
     # reports as Pending or crash-looping says the same thing twice.
     oom_nodes = {node for s in pods for node in (s.get("oom_nodes") or {}).values() if node}
@@ -2663,7 +2747,8 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     ]
     for e in events:
         e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
-    symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_selectors, resolver, ctx.label_pools)
+        e.setdefault("node_pins", owner_pins.get(e["object"], []))
+    symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_pins, resolver, ctx.label_pools)
     symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, nodes, now)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
@@ -2684,14 +2769,19 @@ def mitigation_lines(symptom: dict, classification: dict) -> dict:
     entry = classification["entry"]
     row = MITIGATIONS[entry]
     subject = symptom["object"] + (f" ({classification['detail']})" if classification.get("detail") else "")
+    before, mitigate_before, mitigate_after = row["before"], row["mitigate_before"], row["mitigate_after"]
+    if entry == ENTRY_BUDGET and symptom.get("budget_downstream"):
+        # The catalogue's row describes a budget whose spec forbids disruption;
+        # this one allows it and is at zero behind its covered pods.
+        before, mitigate_before, mitigate_after = BUDGET_DOWNSTREAM_BEFORE, BUDGET_DOWNSTREAM_MITIGATE_BEFORE, BUDGET_DOWNSTREAM_MITIGATE_AFTER
     return {
         "entry": entry,
         "title": row["title"],
         "object": symptom["object"],
-        "before_signal": f"For {subject}: {row['before']}",
+        "before_signal": f"For {subject}: {before}",
         "read_today": row["read_today"],
-        "mitigate_before": row["mitigate_before"],
-        "mitigate_after": row["mitigate_after"],
+        "mitigate_before": mitigate_before,
+        "mitigate_after": mitigate_after,
     }
 
 
@@ -2915,8 +3005,8 @@ def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
         obj = _object_of(namespace, "PodDisruptionBudget", name)
         full_spec = pdb.get("spec") or {}
         spec = {k: v for k, v in full_spec.items() if k != "selector"}
-        selector = full_spec.get("selector") or {}
-        covered = [w for w in workloads if w.get("kind") in ("Deployment", "StatefulSet") and (w.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, _template_labels(w))]
+        selector = full_spec.get("selector")
+        covered = [] if selector is None else [w for w in workloads if w.get("kind") in ("Deployment", "StatefulSet") and (w.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, _template_labels(w))]
         replicas = sum((w.get("spec") or {}).get("replicas") or 0 for w in covered) if covered else None
         if status.get("disruptionsAllowed") == 0:
             if _budget_allows_no_disruption(spec, replicas):
@@ -4365,7 +4455,7 @@ def write_report(path: Path, text: str, *, link: bool = True) -> None:
     """The report through a temporary file, the latest link through a
     temporary symlink, each renamed into place: a reader never sees half.
     A scoped run writes no link: the link always names a fleet-wide report."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_store_dir(path.parent)
     temporary = path.with_name(path.name + REPORT_TEMP_SUFFIX)
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
@@ -4393,7 +4483,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters, writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run; with nothing to review it prints nothing and writes nothing. Not with --full or --cluster")
-    parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing")
+    parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing; with --reset-ledger, list the crash records and move none")
     return parser
 
 
@@ -4403,20 +4493,35 @@ def acquire_lock(path: Path, *, wait: timedelta | None = None, poll: timedelta |
     after that. The handle keeps the lock until it is closed."""
     wait = LOCK_WAIT if wait is None else wait
     poll = LOCK_POLL_INTERVAL if poll is None else poll
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 -- held for the run
+    make_store_dir(path.parent)
+    # Read-only on purpose: flock(2) needs no writable descriptor, and a lock
+    # another uid created must still open for everyone after; the umask is
+    # cleared so the file is LOCK_FILE_MODE whoever creates it.
+    mask = os.umask(0)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CREAT, LOCK_FILE_MODE)
+    finally:
+        os.umask(mask)
+    handle = os.fdopen(descriptor, "r", encoding="utf-8")  # noqa: SIM115 -- held for the run
     deadline = clock() + wait.total_seconds()
     while True:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
-        except OSError:
+        except BlockingIOError:
+            # Contention, the one error the wait is for.
             remaining = deadline - clock()
             if remaining <= 0:
                 handle.close()
                 return None
             sleep(min(poll.total_seconds(), remaining))
-    os.utime(path, None)
+        except OSError:
+            # A filesystem that refuses the lock is not another run holding it.
+            handle.close()
+            raise
+    # The "since" stamp; a file another uid owns refuses it and keeps its own.
+    with contextlib.suppress(OSError):
+        os.utime(path, None)
     return handle
 
 
@@ -4427,17 +4532,20 @@ def lock_held_line(path: Path, waited: timedelta | None = None) -> str:
         since = "unknown"
     return LOCK_HELD_TEXT.format(path=path, since=since, minutes=int((waited or timedelta(0)).total_seconds() // SECONDS_PER_MINUTE))
 
-def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, guards_path: Path | None = None) -> str:
+def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, guards_path: Path | None = None, move: bool = True) -> str:
     """Archive the crash records beside the ledger and guards files (the
     store's, or the paths --ledger/--guards name). The archive keeps them
-    readable; only the operator's choice to run this clears the block."""
+    readable; only the operator's choice to run this clears the block. With
+    `move` False (--dry-run) the records are listed and nothing moves."""
     ledger_file = ledger_path or store / LEDGER_FILENAME
     guards_file = guards_path or store / GUARDS_FILENAME
     records = sorted(ledger_file.parent.glob(ledger_file.name + UNREADABLE_GLOB_SUFFIX)) + sorted(guards_file.parent.glob(guards_file.name + UNREADABLE_GLOB_SUFFIX))
     if not records:
         return RESET_LEDGER_NOTHING_TEXT
     archive = store / ARCHIVE_SUBDIR / now.strftime(REPORT_TS_FORMAT)
-    archive.mkdir(parents=True, exist_ok=True)
+    if not move:
+        return RESET_LEDGER_DRY_RUN_TEXT.format(count=len(records), archive=archive, names=", ".join(r.name for r in records))
+    make_store_dir(archive)
     for record in records:
         shutil.move(str(record), str(archive / record.name))  # across filesystems too
     return RESET_LEDGER_TEXT.format(count=len(records), archive=archive)
@@ -4446,7 +4554,7 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.reset_ledger:
-        print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None))
+        print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
         return 0
     lock = None
     if not args.dry_run:
