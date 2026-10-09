@@ -228,6 +228,30 @@ func TestSlackNotifyRefusesMentionsInBlocks(t *testing.T) {
 	if len(stub.forms) != 0 {
 		t.Errorf("a refused request posted: %d posts", len(stub.forms))
 	}
+	// Whole words only: a handle, an address or Slack's date token that merely
+	// contains a broadcast word is not a mention.
+	for name, text := range map[string]string{
+		"handle":     "ping @channel-ops about it",
+		"address":    "mail oncall@here.example",
+		"date token": "since <!date^1700000000^{date}|Nov 14>",
+		"plain word": "everyone here saw the channel",
+	} {
+		blocks := `[{"type":"section","text":{"type":"mrkdwn","text":"` + text + `"}}]`
+		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); got.Error != "" {
+			t.Errorf("%s: %q was refused as a mention: %+v", name, text, got)
+		}
+	}
+	for name, text := range map[string]string{
+		"labelled here":    "<!here|here> now",
+		"labelled subteam": "<!subteam^S1|oncall> look",
+		"labelled user":    "<@W123|bob>",
+		"parenthesised":    "(@channel) drift",
+	} {
+		blocks := `[{"type":"section","text":{"type":"mrkdwn","text":"` + text + `"}}]`
+		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); got.Error == "" {
+			t.Errorf("%s: %q was not refused", name, text)
+		}
+	}
 	link := `[{"type":"section","text":{"type":"mrkdwn","text":"<https://github.com/o/r/issues/1|ledger #1>"}}]`
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(link)}); got.Error != "" {
 		t.Errorf("a link was refused as a mention: %+v", got)

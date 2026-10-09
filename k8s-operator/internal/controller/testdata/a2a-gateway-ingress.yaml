@@ -17,18 +17,18 @@ metadata:
   namespace: test-ns
 spec:
   ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: gke-gmp-system
-    ports:
-    - port: 9096
-      protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9096
+          protocol: TCP
   podSelector:
     matchLabels:
       app: test-agent-a2a-gateway
   policyTypes:
-  - Ingress
+    - Ingress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -43,18 +43,18 @@ metadata:
   namespace: test-ns
 spec:
   ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: gke-gmp-system
-    ports:
-    - port: 9096
-      protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9096
+          protocol: TCP
   podSelector:
     matchLabels:
       app: test-agent-a2a-gateway
   policyTypes:
-  - Ingress
+    - Ingress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -69,18 +69,18 @@ metadata:
   namespace: test-ns
 spec:
   ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: gke-gmp-system
-    ports:
-    - port: 9096
-      protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9096
+          protocol: TCP
   podSelector:
     matchLabels:
       app: test-agent-a2a-gateway
   policyTypes:
-  - Ingress
+    - Ingress
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -101,13 +101,13 @@ spec:
         kubeagents.x-k8s.io/a2a-component: gateway
     spec:
       containers:
-      - name: gateway
-        ports:
-        - containerPort: 8099
-          name: inject
-        - containerPort: 8098
-          name: a2a
-        - containerPort: 9096
-          name: a2a-metrics
-        resources: {}
+        - name: gateway
+          ports:
+            - containerPort: 8099
+              name: inject
+            - containerPort: 8098
+              name: a2a
+            - containerPort: 9096
+              name: a2a-metrics
+          resources: {}
 status: {}

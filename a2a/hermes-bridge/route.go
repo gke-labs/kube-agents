@@ -48,13 +48,12 @@ const (
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
-// the agent side spells it with (Hermes's, and lib.NotifyPlatformGchat's).
-// Slack's route is recorded the same way and is delivered once the gateway
-// arms its notify route for Slack. A conversation on any other door (inject,
-// the A2A door, Discord) has no notify route, and no route is recorded for it.
+// the agent side spells it with (Hermes's, and lib's NotifyPlatform names).
+// A conversation on any other door (inject, the A2A door, Discord) has no
+// notify route, and no route is recorded for it.
 var routePlatforms = map[string]string{
 	"gchat:": lib.NotifyPlatformGchat,
-	"slack:": "slack",
+	"slack:": lib.NotifyPlatformSlack,
 }
 
 // errNoChatConversation is an authority that names no chat conversation the

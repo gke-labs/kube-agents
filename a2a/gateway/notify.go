@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -77,12 +78,14 @@ const (
 	notifyConversationRefused = "not a live conversation with that context"
 )
 
-// notifyMentionTokens and notifyMentionElements are what blocksMention
-// refuses: the mrkdwn spellings that ping, the bare broadcast words a mrkdwn
-// text object without verbatim may parse into one, and the rich_text element
-// types that do.
+// notifyMentionPattern and notifyMentionElements are what blocksMention
+// refuses: the mrkdwn spellings that ping (<!channel>, <!here>, <!everyone>,
+// <!subteam^…>, <@U…> or <@W…>), the bare broadcast words a mrkdwn text
+// object without verbatim may parse into one, matched as whole words in any
+// case (so @channel-ops, oncall@here.example and <!date^…> pass), and the
+// rich_text element types that ping.
 var (
-	notifyMentionTokens   = []string{"<!", "<@", "@here", "@channel", "@everyone"}
+	notifyMentionPattern  = regexp.MustCompile(`(?i)<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]*>|<@[UW][A-Z0-9]+(?:\|[^>]*)?>|(?:^|[^\w@.-])@(?:here|channel|everyone)(?:$|[^\w@.-])`)
 	notifyMentionElements = []string{"broadcast", "user", "usergroup"}
 )
 
@@ -510,12 +513,8 @@ func (n *Notifier) post(job notifyJob) {
 func blocksMention(v any) string {
 	switch node := v.(type) {
 	case string:
-		// Lowercased: Slack reads the broadcast words in any case.
-		lower := strings.ToLower(node)
-		for _, token := range notifyMentionTokens {
-			if strings.Contains(lower, token) {
-				return token
-			}
+		if m := notifyMentionPattern.FindString(node); m != "" {
+			return strings.TrimSpace(m)
 		}
 	case []any:
 		for _, item := range node {
