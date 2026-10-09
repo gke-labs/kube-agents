@@ -33,13 +33,14 @@ Neither reads versions against a target.
 ```
 
 - `--cluster` is repeatable and, when given, restricts the report to those clusters, as
-  `<location>/<name>` or a bare name; every other member of the projects is skipped, reads
-  included, and the rollout record is neither read nor written, since a narrowed read would file
-  every member it did not name as gone. A spec that matches no cluster in the projects is an
-  error line and exit 1, not an empty table; one cluster named in both forms is one request, not
-  a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error (exit 2): the flag
-  speaks to the rollout record, which a narrowed run does not touch. The fleet-audit collector
-  passes the clusters it found behind.
+  `<location>/<name>` or a bare name and in no other form: a spec with an empty half (`/prod`,
+  `prod/`) is a usage error (exit 2), not a bare name. Every other member of the projects is
+  skipped, reads included, and the rollout record is neither read nor written, since a narrowed
+  read would file every member it did not name as gone. A spec that matches no cluster in the
+  projects is an error line and exit 1, not an empty table; one cluster named in both forms is
+  one request, not a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error
+  (exit 2): the flag speaks to the rollout record, which a narrowed run does not touch. The
+  fleet-audit collector passes the clusters it found behind.
 - `--project` is repeatable and, when given, is the whole scope; on an install with a declared scope each one must be a
   project the `fleet_scope` tool lists and the `collector_args` must be passed beside it, or the script refuses. Otherwise `--scope-projects`, passed once as one
   comma-separated list, is the whole scope: the install's declared scope as the platform_control `fleet_scope`
