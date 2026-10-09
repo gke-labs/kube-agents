@@ -122,11 +122,33 @@ jobs:
           fi
           # 404 is the one answer that means "not provisioned yet". Anything
           # else that is not 200 is an API failure, and skipping on it would
-          # report an unreachable environment as an absent one.
-          code="$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${GITHUB_API_URL}/repos/${REPOSITORY}/environments/${TARGET}")"
+          # report an unreachable environment as an absent one. A transient
+          # failure -- a 5xx, a 403 or 429 rate limit, or curl failing to get
+          # an answer at all (000) -- is retried with backoff first, so one
+          # blip does not red the deploy; the last answer still decides.
+          max_attempts=5
+          first_backoff_seconds=2
+          request_timeout_seconds=20
+          backoff="${first_backoff_seconds}"
+          attempt=1
+          while :; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+              --max-time "${request_timeout_seconds}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${REPOSITORY}/environments/${TARGET}")" || code="000"
+            case "${code}" in
+              000 | 403 | 429 | 5??) ;;
+              *) break ;;
+            esac
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              break
+            fi
+            echo "GET environments/${TARGET} returned HTTP ${code} (attempt ${attempt}/${max_attempts}); retrying in ${backoff}s."
+            sleep "${backoff}"
+            attempt=$((attempt + 1))
+            backoff=$((backoff * 2))
+          done
           case "${code}" in
             200)
               echo "exists=true" >> "${GITHUB_OUTPUT}"
@@ -137,7 +159,7 @@ jobs:
               echo "result=skipped" >> "${GITHUB_OUTPUT}"
               ;;
             *)
-              echo "::error title=Could not look up ${TARGET}::GET environments/${TARGET} returned HTTP ${code}, so whether the environment exists is unknown."
+              echo "::error title=Could not look up ${TARGET}::GET environments/${TARGET} returned HTTP ${code} (000 means no response) after ${attempt} attempt(s), so whether the environment exists is unknown."
               exit 1
               ;;
           esac

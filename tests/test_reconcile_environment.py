@@ -421,6 +421,80 @@ class ReconcileWorkflowTest(unittest.TestCase):
         self.assertEqual(missing, [], f"never reaches the renderer: {missing}")
 
 
+_FAKE_CURL = """#!/usr/bin/env bash
+calls="${FAKE_DIR}/calls"
+echo call >> "${calls}"
+n="$(wc -l < "${calls}")"
+answer="$(sed -n "${n}p" "${FAKE_DIR}/answers")"
+[ -n "${answer}" ] || answer="$(tail -n 1 "${FAKE_DIR}/answers")"
+if [ "${answer}" = "transport" ]; then
+  printf '000'
+  exit 7
+fi
+printf '%s' "${answer}"
+"""
+
+
+class PreflightLookupTest(unittest.TestCase):
+    """The existence check, run against a fake GitHub API.
+
+    404 is the only answer that skips. A transient failure is retried, and one
+    that outlasts the retries fails the job: reading an unreachable environment
+    as an absent one would skip a deploy that should have happened.
+    """
+
+    def setUp(self):
+        doc = _doc(_RECONCILE_WF)
+        steps = doc["jobs"]["preflight"]["steps"]
+        self.script = next(s for s in steps if s.get("id") == "exists")["run"]
+
+    def _run(self, answers):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp)
+            (fake / "answers").write_text("\n".join(answers) + "\n")
+            (fake / "calls").write_text("")
+            for name, body in (("curl", _FAKE_CURL), ("sleep", "#!/bin/sh\nexit 0\n")):
+                (fake / name).write_text(body)
+                (fake / name).chmod(0o755)
+            output = fake / "github_output"
+            output.write_text("")
+            env = {
+                **os.environ,
+                "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_DIR": str(fake),
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_API_URL": "https://api.github.invalid",
+                "GH_TOKEN": "token",
+                "REPOSITORY": "gke-labs/kube-agents",
+                "TARGET": "autopush-next",
+                "SKIP_UNCONFIGURED": "true",
+            }
+            proc = subprocess.run(["bash", "-c", self.script], env=env, capture_output=True, text=True, check=False)
+            calls = len((fake / "calls").read_text().splitlines())
+            return proc.returncode, output.read_text(), calls
+
+    def test_200_exists(self):
+        self.assertEqual(self._run(["200"]), (0, "exists=true\n", 1))
+
+    def test_404_is_the_only_skip(self):
+        self.assertEqual(self._run(["404"]), (0, "exists=false\nresult=skipped\n", 1))
+
+    def test_a_transient_failure_is_retried(self):
+        self.assertEqual(self._run(["500", "transport", "429", "403", "200"]), (0, "exists=true\n", 5))
+
+    def test_a_persistent_failure_fails_closed(self):
+        code, output, calls = self._run(["500"])
+        self.assertEqual((code, output), (1, ""))
+        self.assertGreater(calls, 1)
+
+    def test_a_bad_credential_fails_without_retrying(self):
+        self.assertEqual(self._run(["401"]), (1, "", 1))
+
+    def test_unset_skip_answers_yes_without_asking(self):
+        self.script = self.script.replace('"${SKIP_UNCONFIGURED}"', '"false"', 1)
+        self.assertEqual(self._run(["404"]), (0, "exists=true\n", 0))
+
+
 class DriftWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.doc = _doc(_DRIFT_WF)
