@@ -1156,7 +1156,7 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        self.assertEqual(len(calls), 6, self.kubectl_args)
+        self.assertEqual(len(calls), 7, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
 
@@ -1164,12 +1164,17 @@ exit 0
         # When the operator's finalizer fails to clear in time, the script strips
         # the finalizer and manually cleans cluster-scoped RBAC (minimal,
         # tokenreview, callout tokenreview) and the next-mode JetStream PVC (#2795).
-        # PVC deletion uses --wait=false to avoid blocking teardown and filters
-        # on the instance label to mirror the controller's ownership check.
+        # PVC deletion uses --wait=false to avoid blocking teardown, and both the
+        # A2A callout ClusterRoleBinding and JetStream PVC filter on the instance
+        # label to mirror the controller's ownership checks.
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(
-            "delete clusterrolebinding kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent kubeagents:a2a-callout-tokenreview:kubeagents-system:agent --ignore-not-found",
+            "delete clusterrolebinding kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete clusterrolebinding -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=kubeagents:a2a-callout-tokenreview:kubeagents-system:agent --ignore-not-found",
             self.kubectl_args,
         )
         self.assertIn(
@@ -1209,6 +1214,10 @@ exit 0
                 proc, _ = self._run_delete(wedged=True, agent_name=long_agent)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(len(expected_label), expected_len)
+                self.assertIn(
+                    f"delete clusterrolebinding -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=kubeagents:a2a-callout-tokenreview:kubeagents-system:{long_agent} --ignore-not-found",
+                    self.kubectl_args,
+                )
                 self.assertIn(
                     f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=data-{long_agent}-a2a-nats-0 --ignore-not-found --wait=false",
                     self.kubectl_args,

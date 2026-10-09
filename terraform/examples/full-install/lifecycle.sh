@@ -225,6 +225,7 @@ readonly DRIFT_ADOPTION_TARGETS=(
 # collection is the last word of the gcloud group above -- topics,
 # subscriptions, sinks -- so the array needs no fourth spelling of it.
 readonly DRIFT_IMPORT_ID_FORMAT='projects/%s/%s/%s'
+readonly K8S_LABEL_VALUE_MAX_LENGTH=63
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -1139,22 +1140,25 @@ delete_agent_cr() {
     # platformagent_a2a_callout.go): cluster-scoped RBAC and the next-mode
     # JetStream PVC that no owner reference reaps when the finalizer is stripped.
     agent_name="${ref##*/}"
+    inst_label="${namespace}-${agent_name}"
+    if [ "${#inst_label}" -gt "$K8S_LABEL_VALUE_MAX_LENGTH" ]; then
+      inst_label="${inst_label:0:$K8S_LABEL_VALUE_MAX_LENGTH}"
+      while [[ "$inst_label" =~ [-_.]$ ]]; do
+        inst_label="${inst_label%?}"
+      done
+    fi
     kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
       "kubeagents:minimal:${namespace}:${agent_name}" \
       "kubeagents:tokenreview:${namespace}:${agent_name}" \
-      "kubeagents:a2a-callout-tokenreview:${namespace}:${agent_name}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
+      -l "app.kubernetes.io/instance=${inst_label}" \
+      --field-selector "metadata.name=kubeagents:a2a-callout-tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
     kubectl --context "$CLUSTER_CONTEXT" delete clusterrole \
       "kubeagents:minimal:${namespace}:${agent_name}" \
       "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    inst_label="${namespace}-${agent_name}"
-    if [ "${#inst_label}" -gt 63 ]; then
-      inst_label="${inst_label:0:63}"
-      while [[ "$inst_label" =~ [-_.]$ ]]; do
-        inst_label="${inst_label%?}"
-      done
-    fi
     kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
       -l "app.kubernetes.io/instance=${inst_label}" \
       --field-selector "metadata.name=data-${agent_name}-a2a-nats-0" \
