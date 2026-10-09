@@ -236,7 +236,7 @@ each is waiting for whoever schedules it.
 - **Command:** the collector runs it; do not re-implement the detection, and do not run it by hand
   on a cluster the collector collected. For every cluster with a 3.1 or 3.2 candidate, the
   collector runs the `fleet-upgrade-verification` skill's reporter once, for that cluster alone —
-  `python3 <skills>/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --project <p> --cluster <loc>/<cluster> --readiness --output /opt/data/scratch/upgrade-readiness_<p>_<cluster>.json --state-dir /opt/data/scratch/upgrade-readiness-state/<p>` — and joins its `members[]` row to the cluster. The `commands` entry it records for `upgrade-blocked` is that invocation, path and all; copy it with the rest. The report stays at that path if you
+  `python3 <skills>/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --project <p> --cluster <loc>/<cluster> --readiness --output /opt/data/scratch/upgrade-readiness_<p>_<loc>_<cluster>.json --state-dir /opt/data/scratch/upgrade-readiness-state/<p>` — and joins its `members[]` row to the cluster. The `commands` entry it records for `upgrade-blocked` is that invocation, path and all; copy it with the rest. The report stays at that path if you
   need the row behind a candidate.
 - **Flag when:** a behind cluster's `readiness.status` is `blocked` **and** the block comes from
   `readiness.pdbs.blocking` (a drain-blocking PodDisruptionBudget) or `readiness.skew.blocking`.
