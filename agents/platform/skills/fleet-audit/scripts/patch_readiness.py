@@ -1304,8 +1304,8 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     completion could be blocked, or mid-upgrade (`RECONCILING`), with nothing
     further due and the running one the next run's to grade; either reason is
     the same answer until the cluster changes, which is what the field is
-    for. When at least one cluster is behind, the reporter runs once for the
-    project and each behind cluster is joined to its `members[]` row.
+    for. The reporter then runs once per behind cluster (`--cluster
+    <location>/<name>`), and that cluster is joined to its `members[]` row.
     A row graded `blocked` by a budget or by skew is a candidate; a row graded
     `blocked` by an exclusion alone, or `ready`, is a check that ran and found
     nothing. A row graded `unknown` on a cluster with no release channel and

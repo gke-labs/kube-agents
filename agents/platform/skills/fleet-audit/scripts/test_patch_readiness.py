@@ -2189,7 +2189,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         self.assertEqual(self.calls, [])
 
-    def test_a_mixed_project_runs_the_reporter_once_and_declares_only_the_current_cluster(self):
+    def test_a_mixed_project_runs_the_reporter_for_the_behind_cluster_only_and_declares_the_current_one(self):
         by = self.collect(
             [cluster(name="lag", master=self.BEHIND), cluster(name="cur", master=self.CURRENT)],
             [self.member("lag", pdbs=[self.BUDGET]), self.member("cur", status="ready", gap=0)],

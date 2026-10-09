@@ -259,7 +259,7 @@ each is waiting for whoever schedules it.
   it never declares it on a cluster 3.1 did not judge, nor on a channel cluster whose target the
   reporter failed to fetch this run: those entries have the check in `checks_unevaluated` instead.
 - **Unevaluated:** a behind cluster the reporter could not grade — its objects could not be
-  read, the reporter failed for the project or ran out of its four-minute budget, or it graded
+  read, the reporter failed for that cluster or ran out of its four-minute budget, or it graded
   `blocked` for a cause this check does not know — and a cluster 3.1 never judged, carry
   `upgrade-blocked` in the entry's `checks_unevaluated` with the reason. A `blocked` grade whose
   cause is node-pool skew is a finding even when the budget read failed beside it: the skew is
