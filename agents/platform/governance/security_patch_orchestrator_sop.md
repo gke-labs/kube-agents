@@ -275,7 +275,8 @@ each is waiting for whoever schedules it.
   `namespace` is `""`), so the finding keeps one identity week over week. The candidate's
   `excerpt` carries every blocking budget in name order, each with its field, the workloads it
   covers and `disruptionsAllowed`, taken from the `members[].readiness.pdbs.blocking[]` entries;
-  paste it as it is.
+  when a skew ceiling blocks on the same row, the pool clause comes first and the budgets follow
+  it. Paste it as it is.
 - **Impact:** the candidate's, whose tail names the mechanism for its cause, and the two causes
   make different claims. A budget delays the upgrade and costs the workload its pod; it does not
   stop the upgrade: a surge upgrade respects the budget for up to an hour per node and then
@@ -285,9 +286,16 @@ each is waiting for whoever schedules it.
   an hour and then evicts `<workload>` anyway." A skew ceiling does stop it. For skew: "`<cluster>`
   is `<n>` minor(s) behind and its upgrade would not complete: node pool(s) `<pool>` would exceed
   the version-skew ceiling against the target control plane, so GKE will not move the control
-  plane until the pool moves." Never write "would not complete" or "stalls" on the budget arm: an
-  operator reads it as a drain that waits for them, and the forced eviction is what they need to
-  know about.
+  plane until the pool moves." When both block on one row, the ceiling governs, because GKE
+  refuses the move before any drain starts, and the tail names both in that order: "`<cluster>`
+  is `<n>` minor(s) behind and its upgrade would not complete: node pool(s) `<pool>` would exceed
+  the version-skew ceiling against the target control plane; PodDisruptionBudget
+  `<namespace>/<budget>` (`maxUnavailable: 0`, disruptionsAllowed 0) refuses eviction of
+  `<workload>`, so GKE will not move the control plane until the pool moves, and once it has,
+  holds each node's drain for up to an hour and then evicts `<workload>` anyway." Never write
+  "would not complete" or "stalls" on the budget arm: an operator reads it as a drain that waits
+  for them, and the forced eviction is what they need to know about. Never write "held, not
+  stopped" on a row the reporter graded refused.
 - **Remediation:** `kind: manual`, and for a budget the fix is not filed here a second time. The
   obtainability audit owns PodDisruptionBudgets: its 3.4 `blocking-pdb` reports the same budget
   daily in its own ledger as `critical`, with the `maxUnavailable: 1` manifest that `/remediate`
@@ -297,7 +305,8 @@ each is waiting for whoever schedules it.
   here is sent to the finding that carries the manifest rather than refused with no pointer. Never
   propose deleting a PodDisruptionBudget, which trades a held drain for an unprotected workload.
   For skew, name the pool and the version it has to reach before the control plane can move; no
-  other ledger carries that.
+  other ledger carries that. When both block, do both: the pool and its version here, and the
+  pointer to the obtainability finding for the budget.
 
 **Why this is a join and not a new detector.** Drain safety is the obtainability audit's subject,
 and its 3.4 already finds these budgets daily. What no run produced before is the pairing: that
