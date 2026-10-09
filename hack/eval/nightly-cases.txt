@@ -731,13 +731,9 @@
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
 
-<<<<<<< HEAD
 # The findings queue's item-wide decision: the user dismisses the one id the
 # nudge names for a gathered line, and every row of that line has to end up
 # dismissed while the line beside it stays open. prebuilt/findings-item plants
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-covers-item/task.yaml
-
-=======
->>>>>>> 0b52a91f (fix(bench): hold the drift-noise case out of the nightly, and close three more findings)

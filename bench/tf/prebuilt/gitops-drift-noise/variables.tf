@@ -182,9 +182,10 @@ variable "churn_principals" {
   validation {
     condition = length(var.churn_principals) > 0 && alltrue([
       for p in var.churn_principals :
-      startswith(p, "system:") || endswith(lower(p), ".gserviceaccount.com")
+      (startswith(p, "system:") || endswith(lower(p), ".gserviceaccount.com"))
+      && can(regex("^[^\"\\\\[:space:]]+$", p))
     ])
-    error_message = "every churn principal must be one Classify drops: a system: prefix or a .gserviceaccount.com suffix. One that reaches the human tier would file a card the case grades as unfiltered noise."
+    error_message = "every churn principal must be one Classify drops: a system: prefix or a .gserviceaccount.com suffix, folded as Classify folds it. Quotes, backslashes and whitespace are excluded as well: these are rendered into a bash array literal, where one quote unbalances the tokenising of every line after it."
   }
 }
 
@@ -224,6 +225,11 @@ variable "settle_seconds" {
   EOT
   type        = number
   default     = 120
+
+  validation {
+    condition     = var.settle_seconds >= 30 && floor(var.settle_seconds) == var.settle_seconds
+    error_message = "settle_seconds must be a whole number of at least 30. Zero is the dangerous value, not an invalid one: sleep 0 returns at once, the ledger is read before anything could have been pulled and classified, and a healthy filter and a broken one both show no rows -- the false green this settle exists to prevent."
+  }
 }
 
 variable "card_timeout_seconds" {
@@ -251,6 +257,11 @@ variable "card_timeout_seconds" {
   EOT
   type        = number
   default     = 1800
+
+  validation {
+    condition     = var.card_timeout_seconds >= 15 && floor(var.card_timeout_seconds) == var.card_timeout_seconds
+    error_message = "card_timeout_seconds must be a whole number of at least 15, the poll's own step. A fractional value makes bash's -lt a test error, errexit does not fire on a while condition, and the wait collapses to a single probe that reports ingress-silent for a record published a second earlier."
+  }
 }
 
 variable "prow_build_id" {
