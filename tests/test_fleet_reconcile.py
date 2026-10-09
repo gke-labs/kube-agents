@@ -866,8 +866,9 @@ class HoldTest(unittest.TestCase):
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", stdout):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back after the release")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later terminations are held after the raise, as after the handler's")
         finally:
+            boskos_pool._DEFERRED.clear()
             signal.signal(signal.SIGINT, previous)
         self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
         # The apply that happened is on record and on stdout before the raise.
@@ -957,6 +958,10 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(boskos.released, [P7], "released although the signal landed before the handlers were held")
 
     def test_a_signal_held_back_is_raised_on_the_unblock_in_that_frame(self):
+        # The unblock raises the way the handler does: later terminations
+        # stay held until the next unblock at depth 0, so the code catching
+        # the raise reaches its next deferred region, or finishes its drain,
+        # without a second raise landing in between.
         previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
         try:
             boskos_pool._hold_signals(True)
@@ -966,8 +971,18 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._DEFERRED, [signal.SIGINT])
             with self.assertRaises(boskos_pool.Terminated):
                 boskos_pool._hold_signals(False)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
             self.assertEqual(boskos_pool._DEFERRED, [])
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals are held after the raise")
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)
+            self.assertEqual(boskos_pool._DEFERRED, [signal.SIGINT], "a second signal after the raise is held, not raised")
+            boskos_pool._hold_signals(True)
+            with self.assertRaises(boskos_pool.Terminated):
+                boskos_pool._hold_signals(False)
+            boskos_pool._hold_signals(True)
+            boskos_pool._hold_signals(False)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back once an unblock finds nothing held")
         finally:
             boskos_pool._DEFERRED.clear()
             boskos_pool._HOLD_DEPTH = 0
@@ -989,8 +1004,11 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._HOLD_DEPTH, 1)
             with self.assertRaises(boskos_pool.Terminated):
                 boskos_pool._hold_signals(False)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
             self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "held again across the unwinding from that raise")
+            boskos_pool._hold_signals(True)
+            boskos_pool._hold_signals(False)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back once an unblock finds nothing held")
         finally:
             boskos_pool._DEFERRED.clear()
             boskos_pool._HOLD_DEPTH = 0
@@ -2287,6 +2305,119 @@ class WorkersTest(unittest.TestCase):
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
         self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
+
+    def test_a_termination_during_the_worker_start_still_drains(self):
+        # Signals reach the main thread alone, and the workers are started
+        # before it arms the drain: a termination landing while the last
+        # start() returns, with both applies already running, must still
+        # raise the flag, interrupt the applies and wait for the holds. The
+        # patched start holds the main thread inside the last worker's start
+        # until both fake applies run, then sends the signal from there, so
+        # the handler runs in that gap with no timing involved.
+        started = threading.Barrier(3)
+        last_worker = "fleet-reconcile-1"
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                started.wait(timeout=5)
+                for _ in range(100):
+                    if reconcile.terminating():
+                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                    time.sleep(0.02)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        real_start = threading.Thread.start
+
+        def start(thread):
+            real_start(thread)
+            if thread.name == last_worker:
+                started.wait(timeout=5)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        try:
+            with mock.patch.object(threading.Thread, "start", start), mock.patch.object(
+                boskos_pool.urllib.request, "urlopen", boskos
+            ), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+        finally:
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+            reconcile._TERMINATING.clear()
+        self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED})
+
+    def test_a_second_termination_during_the_drain_after_one_in_the_worker_start_is_held(self):
+        # A termination the handler raises leaves later ones held, so the
+        # drain cannot be interrupted; one the start's unblock raises must
+        # get the same drain, from its first statement. The first signal
+        # lands inside the last worker's start; the second is sent from the
+        # main thread as the drain's first statement is entered, the
+        # earliest point the code catching the raise can be observed, so a
+        # raise that reached the catch with the live handler armed would
+        # escape here, before the flag is raised or a child interrupted.
+        started = threading.Barrier(3)
+        last_worker = "fleet-reconcile-1"
+        seen = []
+        real_begin = reconcile._begin_termination
+
+        def begin_termination():
+            seen.append(signal.getsignal(signal.SIGINT))
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)
+            real_begin()
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                started.wait(timeout=5)
+                for _ in range(100):
+                    if reconcile.terminating():
+                        time.sleep(0.2)
+                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                    time.sleep(0.02)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        real_start = threading.Thread.start
+
+        def start(thread):
+            real_start(thread)
+            if thread.name == last_worker:
+                started.wait(timeout=5)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        try:
+            with mock.patch.object(threading.Thread, "start", start), mock.patch.object(
+                reconcile, "_begin_termination", begin_termination
+            ), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+            held = list(boskos_pool._DEFERRED)
+        finally:
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+            reconcile._TERMINATING.clear()
+        self.assertEqual(seen, [boskos_pool._defer], "the drain's first statement ran with later terminations held")
+        self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED})
+        self.assertEqual(held, [signal.SIGINT], "the second termination was held across the drain")
 
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
         # The forward reaches the children alive at that instant; a worker
