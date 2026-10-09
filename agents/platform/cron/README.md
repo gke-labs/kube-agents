@@ -495,6 +495,62 @@ retiring it follows the two-step path below like any other id; deleting the
 entry outright would leave the volume's copy firing against a script the next
 image no longer ships.
 
+## `upgrade-retrospective` looks back after the weekend's upgrades
+
+The other audits say what an upgrade _would_ break. Nothing on the roster said
+what one _did_ break, so the same surprise waited for the next cluster. This
+entry is the fleet-audit stream that fills that gap: at 18:00 UTC on Sunday,
+after the maintenance windows most fleets set at night or at the weekend and
+before Monday's audits, the Platform Agent follows
+`governance/upgrade_retrospective_sop.md`. The SOP runs the deterministic
+collector, `skills/fleet-audit/scripts/upgrade_retrospective.py`, with `--full`
+and one `--project` per roster project (the management project and every
+project a Cluster Agent profile names, read with `list_cluster_profiles`), so
+the scheduled run reads the reconciler's roster rather than every project the
+credential can list. The collector keeps a ledger of versions per cluster,
+reviews every cluster that is new or was upgraded since the last run, reads
+pods, nodes, events and budgets, classifies what it finds against the upgrade
+failure catalogue, and writes the three-section report (Errors, Warnings, Info)
+to `/opt/data/upgrade-retrospective/` on the shell sandbox's volume, with
+`upgrade-retro-report.md` pointing at the newest full run. The SOP's half is
+the judgement: it grades every incident by the seven checks in its section 3,
+tailors the catalogue's mitigation text to the cluster's own objects, files the
+stream's one ledger issue where a repository is configured, and posts one chat
+line per reviewed cluster with its counts and top finding. A quiet weekend, with
+no cluster new or upgraded, posts nothing.
+
+Two things set it apart from the streams beside it. With no GitHub repository
+in `managed_repos` it runs the collector alone: the SOP skips `start` and
+`finish`, the report on the volume is the record, and the chat lines say so,
+where the streams beside it take the skill's no-forge path (`start` and `finish`
+with no ledger issue, the findings kept in the report store). The Chat Agent's
+first-run stage (`agents/chat/scripts/oobe.py`) marks this job due after the four
+fleet audits it starts once the first inventory scan settles, so a fresh
+install's first report is a baseline of every cluster it manages. And it never
+opens a pull request on its own: an Error files at
+`major`, a Warning at `minor`, nothing at `critical`, every remediation is
+`manual` naming the manifest and the change, and none of its check slugs is on
+`MAJOR_SWEEP_CHECKS`, so `finish` has nothing to promote. A fix stays a user's
+"apply" in chat, through `submit-suggestion`.
+
+The same report answers a question. `agents/platform/CAPABILITIES.md` and the
+persona's delegation list route "how did the upgrades go", "did anything break",
+"anything to fix before we upgrade" to the SOP's on-demand section, which answers
+from the saved report when it is newer than the last upgrade operation on the
+clusters the question covers and runs the collector first when it is not: a
+fleet-wide question as a full run, a question about named clusters as a scoped
+one (`--cluster`), which writes a `-scoped` report, moves no link and touches no
+ledger. A second run while one holds the store's lock prints one line and writes
+nothing.
+
+`risk: low`, as every audit: the run's only writes are the collector's files on
+the volume, the ledger issue through `audit_report.py`, and the chat message,
+and the `high` tier's command allowlist would refuse the collector itself, a
+Python script. `deliver: chat`, so the Chat Agent owns the thread a reply lands
+in. The daily readiness watch, once it ships, reads the collector's `guards.json`
+beside the ledger and names each live guard in its next report, which is how a
+failure one upgrade caused reaches the operator planning the next.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two
