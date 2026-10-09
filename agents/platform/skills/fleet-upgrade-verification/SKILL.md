@@ -55,8 +55,10 @@ Neither reads versions against a target.
   location, and the target column says which baseline was used, for example
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
-  status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one), and the
-  `rollout` block described below.
+  status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one) and, on a
+  full run only, the `rollout` block and the per-member `progress` fields described below. A
+  `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
+  note where the progress section would be.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
@@ -105,8 +107,11 @@ the pools that do parse. A note reading `upgrade in flight` means the cluster or
 
 ## Track a rollout across runs
 
-Every run records its per-member result and compares itself with the previous run for the same
-target, so two runs during a rollout show what moved between them. The record lives at
+Every full run records its per-member result and compares itself with the previous run for the
+same target, so two runs during a rollout show what moved between them. A `--cluster` run does
+neither: it prints a note in place of the progress section, and its JSON carries no `rollout`
+block and no per-member `progress`, `unchanged_since` or `unchanged_for_seconds`. The record
+lives at
 `/opt/data/state/fleet-upgrade-verification/<target>.json` (`channel-default.json` for a run
 without `--target-version`), on the persistent volume the shell sandbox keeps between turns;
 `--state-dir` points it elsewhere. Each target has its own record, so a run against a different
@@ -149,7 +154,7 @@ from the record when its project was read cleanly (the cluster is gone), carried
 its project failed to read or was not in this run's `--project` scope, so a failed read never
 loses a record or manufactures a stall. A record the script cannot read is reported on stderr and
 replaced by a new baseline; a record it cannot write sets exit code 1 with the table still
-printed. In the JSON, each member carries `progress`, `unchanged_since` and
+printed. In a full run's JSON, each member carries `progress`, `unchanged_since` and
 `unchanged_for_seconds`, and the top-level `rollout` block has the record path, both run
 timestamps, whether the rollout counted as active and why, a count per progress value, and the
 members missing this run.
