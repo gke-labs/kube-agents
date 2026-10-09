@@ -433,6 +433,12 @@ type probeReport struct {
 	SubmittedAt  string `json:"submittedAt,omitempty"`
 	AgeSeconds   int    `json:"ageSeconds,omitempty"`
 	Detached     bool   `json:"detached,omitempty"`
+	// ContextID is the conversation's A2A contextId, from its session
+	// record; absent when there is no record. An executor keys its state on
+	// it (the bridge's api executor runs every task of the conversation in
+	// the Hermes session derived from it), which is how a harness finds the
+	// kanban cards a turn filed without asking the agent.
+	ContextID string `json:"contextId,omitempty"`
 	// ExecutorState is "" when the stream holds no event for the task.
 	ExecutorState string `json:"executorState,omitempty"`
 	Final         bool   `json:"final,omitempty"`
@@ -1862,6 +1868,7 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 		Backend:        state.Backend,
 		InjectOnly:     state.InjectOnly,
 		GraceSeconds:   int(state.Grace / time.Second),
+		ContextID:      state.ContextID,
 		Active:         state.Active,
 		TaskID:         state.TaskID,
 		AgeSeconds:     int(state.Age / time.Second),

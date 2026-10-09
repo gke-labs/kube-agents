@@ -520,7 +520,9 @@ Layout:
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
   its labels - the A2A gateway, the capability verifier, session pods by the spawner's
   labels, the provision Job,
-  and the hand-applied seed Job), and ~~**no pod-network peer for 8222 or 9222**~~ **no
+  and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
+  `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,
+  which need not be the agent's), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
   below)**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
@@ -624,8 +626,13 @@ keyed on the agent's own ServiceAccount and carries the blackboard grants and no
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
-janitor yet. The designed shape is one entry per
-`AgentProfile` rendered from the CR's bus grants, which arrives with the CRD.
+janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
+operator has one for itself, keyed on the manager's own ServiceAccount: publish on
+`a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
+profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
+grants and no subjects. The callout derives that profile pod's task subjects from the
+profile, and its consumer names and inbox from the attested pod name (see the subagent
+profiles spec for why a static entry cannot work there).
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
@@ -709,7 +716,10 @@ object.
 
 **What ships today is coarser than that sentence, and the gap is deliberate.** The
 condition is on the `PlatformAgent`, not on an `AgentProfile`, because the profile CRD
-does not exist yet.
+did not exist yet. **Amended 10/6:** it exists now, and its conditions (`IdentityReady`,
+`CardPublished`) say whether the profile's entry is rendered, not whether the callout is
+serving it. The per-profile reading of this condition arrives with the dispatcher, which is
+the first thing that needs it.
 
 **Amended 9/16: the second half of the sentence is enforced now (as written here; the
 9/17 amendment narrows what the gate reads).** "Nothing dispatches before that condition

@@ -1726,8 +1726,8 @@ Mutation(
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskSupervisorSubject(pod, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive a session a grant on its own supervisor subject -- the "
         "helpful-looking change that lets a worker adapter finalise itself "
@@ -1778,12 +1778,32 @@ Mutation(
     Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskInSubject(pod, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
         "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
+        "A3-profile-pod-writes-its-own-supervisor-subject",
+        "a2a/authcallout/profile_narrowing.go",
+        ("\tg := executorGrants(profile, pod)\n",
+         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "derive an AgentProfile's pods a grant on their profile's supervisor "
+        "subject, the janitor's. A profile pod could then end its own task, or "
+        "a sibling's, and have it read as the janitor declaring it dead",
+    ),
+    Mutation(
+        "A3-profile-pod-writes-its-own-in-subject",
+        "a2a/authcallout/profile_narrowing.go",
+        ("\tg := executorGrants(profile, pod)\n",
+         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
+        "derive an AgentProfile's pods a publish grant on their profile's in "
+        "subject. Every pod of the profile could then steer or cancel any of "
+        "the profile's tasks as if from the requester",
     ),
     Mutation(
         "A3-session-gains-publish-on-anothers-in-subject",
