@@ -233,6 +233,11 @@ LAST_TICK_KEY = "last_tick"
 # versions are due then.
 TABLE_RUNS_KEY = "table_runs"
 READINESS_RUNS_KEY = "readiness_runs"
+# The report script keys members by the project id it resolved, so a project the
+# roster spells as a number must be keyed the same way in the watch's own read
+# errors and stamps; the id is learned from the first successful table run.
+PROJECT_IDS_KEY = "project_ids"
+REPORT_PROJECTS_KEY = "projects"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
@@ -550,13 +555,13 @@ def unlisted_projects(read_errors: list) -> set[str]:
     return {error.get(MEMBER_ID_KEYS[0]) for error in read_errors if error.get(MEMBER_ID_KEYS[0]) and not error.get(MEMBER_ID_KEYS[1])}
 
 
-def prune_read_projects(ledger: dict, pending: dict[str, list[str]], names: list[str], read_errors: list) -> None:
+def prune_read_projects(ledger: dict, pending: dict[str, list[str]], names: list[str], read_errors: list, ids: dict[str, str]) -> None:
     """A project the table listed this tick is the truth for its clusters: a
     ledger version keeps, from that project, only the clusters the table still
     shows below it. Without this a version whose clusters upgraded kept its
     stale list while the table stayed partial, and a later carry-forward
     reported those clusters as pending again."""
-    read = set(names) - unlisted_projects(read_errors)
+    read = {ids.get(name, name) for name in names} - unlisted_projects(read_errors)
     unconfigured = {
         (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
         for error in read_errors
@@ -599,7 +604,7 @@ def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_err
 
 
 def empty_ledger() -> dict:
-    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}, TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}}
+    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}, TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}, PROJECT_IDS_KEY: {}}
 
 
 def announced(ledger: dict) -> dict:
@@ -635,7 +640,7 @@ def load_ledger(path: Path) -> dict:
     # hand the None back on the next due or retired version.
     if data[ANNOUNCED_KEY].get(ANNOUNCED_UNGRADED_KEY) is None:
         data[ANNOUNCED_KEY][ANNOUNCED_UNGRADED_KEY] = {}
-    for key in (TABLE_RUNS_KEY, READINESS_RUNS_KEY):
+    for key in (TABLE_RUNS_KEY, READINESS_RUNS_KEY, PROJECT_IDS_KEY):
         runs = data.get(key)
         data[key] = {k: v for k, v in runs.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(runs, dict) else {}
     return data
@@ -796,7 +801,7 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
         merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
 
 
-def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, str], now: datetime) -> dict:
+def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, str], now: datetime, ids: dict[str, str]) -> dict:
     """The version table, one sandbox run per project under its own timeout and
     what is left of the table's share of the budget before ``deadline``, merged
     into one envelope. A project whose run failed, or that the budget did not reach, is a
@@ -809,6 +814,10 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
     unrun: list[str] = []
     cut_short: list[str] = []
     failed: dict[str, Exception] = {}
+
+    def keyed(project: str) -> str:
+        return ids.get(project, project)
+
     for project in ordered_projects(names, last_runs):
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
@@ -825,7 +834,7 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
             last_runs[project] = iso(now)
             failed[project] = exc
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
+                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
             )
             continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -833,10 +842,13 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
             failed[project] = exc
             error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=error)}
+                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=error)}
             )
             continue
         last_runs[project] = iso(now)
+        resolved = envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY) or []
+        if len(resolved) == 1 and isinstance(resolved[0], str) and resolved[0]:
+            ids[project] = resolved[0]
         merge_envelope(merged, envelope)
     if failed and len(failed) == len(names):
         # No project read at all is the sandbox or the credential, not a
@@ -847,17 +859,17 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
     # cut-short run comes and goes beside the projects never reached.
     for project in unrun:
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRUN, MESSAGE_KEY: TABLE_UNRUN_DETAIL.format(project=project)}
+            {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRUN, MESSAGE_KEY: TABLE_UNRUN_DETAIL.format(project=project)}
         )
     for project in cut_short:
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRUN, MESSAGE_KEY: TABLE_CUT_SHORT_DETAIL.format(project=project)}
+            {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRUN, MESSAGE_KEY: TABLE_CUT_SHORT_DETAIL.format(project=project)}
         )
     return merged
 
 
 def readiness_by_project(
-    pending: dict[str, list[str]], due: dict[str, str], deadline: float, last_runs: dict[str, str], now: datetime
+    pending: dict[str, list[str]], due: dict[str, str], deadline: float, last_runs: dict[str, str], now: datetime, ids: dict[str, str]
 ) -> tuple[dict, dict[str, str], dict[str, str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
@@ -869,6 +881,9 @@ def readiness_by_project(
     finished. All are read errors in the envelope, so the report names them.
     ``last_runs`` is stamped for a run that completed or hit its own cap, so
     the least recently run projects go first next time."""
+    # Member keys carry the id the report resolved; the run is asked for by the
+    # roster's spelling where one is known for that id.
+    spelled = {resolved: given for given, resolved in ids.items()}
     needed = {project_of(key) for version in due for key in pending[version]}
     merged = empty_envelope()
     failures: dict[str, str] = {}
@@ -880,7 +895,7 @@ def readiness_by_project(
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = run_report([project], readiness=True, timeout=timeout)
+            envelope = run_report([spelled.get(project, project)], readiness=True, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < READINESS_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not an attempt, not
@@ -943,7 +958,7 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         "```",
         "",
     ]
-    errors = report.get(ERRORS_KEY) or []
+    errors = version_slice(report, clusters)[ERRORS_KEY]
     if errors:
         lines.append("Reads that failed during this run, and so are not graded:")
         lines.append("")
@@ -1022,11 +1037,11 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger = load_ledger(ledger_path)
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger[TABLE_RUNS_KEY], now)
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger[TABLE_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
-    prune_read_projects(ledger, pending, names, read_errors)
+    prune_read_projects(ledger, pending, names, read_errors, ledger[PROJECT_IDS_KEY])
     carry_forward_unlisted(pending, ledger, read_errors)
     if dry_run:
         due, would_retire = decide(ledger, pending, now, days, retire=complete, dry_run=True)
@@ -1048,7 +1063,7 @@ def tick(dry_run: bool = False) -> list[str]:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     if due:
-        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now)
+        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:
                 del ledger[TARGETS_KEY][version]

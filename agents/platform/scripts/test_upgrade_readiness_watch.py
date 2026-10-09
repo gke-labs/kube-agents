@@ -55,6 +55,7 @@ class FakeSandbox:
         table_failing_projects: set | None = None,
         timeout_projects: set | None = None,
         table_timeout_projects: set | None = None,
+        aliases: dict | None = None,
     ):
         self.versions = versions
         self.readiness = readiness or versions
@@ -64,6 +65,8 @@ class FakeSandbox:
         self.table_failing_projects = table_failing_projects or set()
         self.timeout_projects = timeout_projects or set()
         self.table_timeout_projects = table_timeout_projects or set()
+        # A project asked for by number answers with the id the report resolves, as the script does.
+        self.aliases = aliases or {}
         self.calls: list[tuple[str, list[str], float]] = []
 
     def run(self, argv, *, timeout, check, stdin=None):
@@ -85,11 +88,11 @@ class FakeSandbox:
             raise subprocess.TimeoutExpired(argv, timeout)
         body = self.readiness if wanted else self.versions
         # Both hops run once per project: answer with that project's slice.
-        projects = {report_argv[i + 1] for i, flag in enumerate(report_argv) if flag == watch.PROJECT_FLAG}
+        projects = {self.aliases.get(report_argv[i + 1], report_argv[i + 1]) for i, flag in enumerate(report_argv) if flag == watch.PROJECT_FLAG}
         members = [m for m in body["report"]["members"] if m["project"] in projects]
         errors = [e for e in body["report"].get("errors") or [] if e.get("project") in projects]
         exit_code = body.get("exit", 0) if errors else 0
-        body = dict(body, exit=exit_code, report=dict(body["report"], members=members, errors=errors))
+        body = dict(body, exit=exit_code, report=dict(body["report"], members=members, errors=errors, projects=sorted(projects)))
         return subprocess.CompletedProcess(argv, 0, stdout=f"noise\n{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="")
 
     def kinds(self) -> list[str]:
@@ -540,6 +543,8 @@ class Budget(Base):
         self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
         self.assertIn(f"new target version {OLDER_TARGET}, 1 cluster(s) pending (b): not run to completion; the tick budget was spent before p2 finished; retried tomorrow, starting there", out)
         self.assertNotIn("none graded", out)
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertNotIn("p2", text, "the version's report lists only its own projects' read errors")
         self.assertIsNone(self.ledger()["targets"][OLDER_TARGET]["last_report_at"])
         self.assertEqual(self.ledger()["announced"].get("ungraded", {}), {})
         self.assertFalse((self.home / "reports" / OLDER_TARGET).exists())
@@ -708,6 +713,27 @@ class Budget(Base):
         self.assertIn("the version table was partial", outs[0])
         self.assertEqual(outs[1], "", "a day the budget merely stopped short posts nothing new")
         self.assertEqual(outs[2], "", "a day a run was cut short posts nothing new either")
+
+    def test_a_project_given_by_number_is_keyed_by_the_id_the_report_resolves(self) -> None:
+        versions = envelope([member("a", "lagging", project="my-proj"), member("b", "lagging", project="other")])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready"), member("b", "lagging", project="other", readiness="ready")])
+        env = {watch.PROJECTS_ENV: "123456,other"}
+        with mock.patch.dict(os.environ, env):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj", "other": "other"})
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a", "other/us-central1-a/b"])
+        # The number's table fails next week: its clusters are carried forward under the id, not dropped.
+        ledger = self.ledger()
+        ledger["targets"][TARGET]["last_report_at"] = (NOW - timedelta(days=8)).isoformat()
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        with mock.patch.dict(os.environ, env):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, table_failing_projects={"123456"})
+            code, out = self.run_tick(sandbox)
+        self.assertIn("2 cluster(s) pending (a, b): 0 blocked, 2 ready;", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a", "other/us-central1-a/b"])
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["123456", "other"], "the readiness run is asked for by the roster's spelling")
 
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
