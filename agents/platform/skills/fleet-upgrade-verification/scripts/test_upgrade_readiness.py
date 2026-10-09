@@ -544,6 +544,21 @@ class KubeSystemReachTest(unittest.TestCase):
         blocking, outage = self._one([gate])
         self.assertEqual((blocking, len(outage)), ([], 1))
 
+    def test_a_dead_clusterrole_gate_blocks_whatever_its_selector_says(self):
+        # Admission matches a cluster-scoped object before it reads the namespace selector,
+        # and the bootstrap hook reconciles the ClusterRoles first.
+        excluded = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "kube-public"]}]}
+        gate = scoped(hook("kyverno.example.com", [rule(["roles", "rolebindings", "clusterroles", "clusterrolebindings"], operations=("CREATE", "UPDATE"), groups=("rbac.authorization.k8s.io",))], policy="Fail"), excluded)
+        blocking, outage = self._one([gate])
+        self.assertEqual(outage, [])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE clusterroles", "UPDATE clusterroles", "CREATE clusterrolebindings", "UPDATE clusterrolebindings"])
+
+    def test_a_clusterrole_gate_pinned_to_an_unserved_version_is_sent_nothing(self):
+        gate = hook("opa.example.com", [rule(["clusterroles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"], ["CREATE clusterroles"])
+
     def test_a_selector_this_reader_cannot_evaluate_errs_toward_blocking(self):
         gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchExpressions": [{"key": "tier", "operator": "Gt", "values": ["1"]}]})
         blocking, _ = self._one([gate])
@@ -586,7 +601,7 @@ class KubeSystemReachTest(unittest.TestCase):
         blocking, _ = self._one([gate])
         self.assertEqual(blocking[0]["upgrade_path"], ["CREATE pods"])
 
-    def test_the_control_plane_write_list_is_pinned(self):
+    def test_the_control_plane_write_lists_are_pinned(self):
         self.assertEqual(
             r.CONTROL_PLANE_KUBE_SYSTEM_WRITES,
             (
@@ -594,6 +609,15 @@ class KubeSystemReachTest(unittest.TestCase):
                 ("rbac.authorization.k8s.io", "v1", "roles", "UPDATE", "Namespaced"),
                 ("rbac.authorization.k8s.io", "v1", "rolebindings", "CREATE", "Namespaced"),
                 ("rbac.authorization.k8s.io", "v1", "rolebindings", "UPDATE", "Namespaced"),
+            ),
+        )
+        self.assertEqual(
+            r.CONTROL_PLANE_CLUSTER_WRITES,
+            (
+                ("rbac.authorization.k8s.io", "v1", "clusterroles", "CREATE", "Cluster"),
+                ("rbac.authorization.k8s.io", "v1", "clusterroles", "UPDATE", "Cluster"),
+                ("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "CREATE", "Cluster"),
+                ("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "UPDATE", "Cluster"),
             ),
         )
 

@@ -201,14 +201,16 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   whose cell names the live rules as failing their requests now and the pinned rule alone as sent
   nothing; `objectSelector` and `matchConditions` are not evaluated, and `namespaceSelector`
   is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
-  able to match. A dead webhook off the node path is graded `blocked` all the same when its
+  able to match. A dead webhook off the node path is graded `blocked` all the same when its rules match a
+  bootstrap RBAC write a new master's start-up reconciles and fatals without, so the
+  control-plane upgrade cannot complete: a ClusterRole or ClusterRoleBinding write, whatever the
+  `namespaceSelector` says, because admission matches a cluster-scoped object before it reads the
+  selector (`CONTROL_PLANE_CLUSTER_WRITES` in the script); or a Role or RoleBinding write when the
   `namespaceSelector` admits `kube-system` or `kube-public` (absent or empty admits every
   namespace; a requirement the reader cannot evaluate counts as admitting; the two namespaces
-  are judged on their default `kubernetes.io/metadata.name` label alone) and its rules match a
-  Role or RoleBinding write in `rbac.authorization.k8s.io` (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`
-  in the script), because a new master's start-up reconciles the bootstrap Roles and
-  RoleBindings in both namespaces and fatals when it cannot, so the control-plane upgrade
-  cannot complete; its cell names that write and the namespaces admitted. A ConfigMap gate is
+  are judged on their default `kubernetes.io/metadata.name` label alone;
+  `CONTROL_PLANE_KUBE_SYSTEM_WRITES`). Its cell names the write and, for the namespaced rows, the
+  namespaces admitted. A ConfigMap gate is
   not on that list: the start-up ConfigMap write the Jetstack outage deadlocked on left the
   start-up path in Kubernetes 1.17, and its successor retries. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's

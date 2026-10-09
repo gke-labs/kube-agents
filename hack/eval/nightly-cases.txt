@@ -229,8 +229,8 @@
 # every cluster in the project (one red repetition on a dev install with
 # thirty-odd clusters took 29 minutes of agent time; the pool projects hold
 # the seeded fleet and the host). Counted from the lists with it, the last
-# entry below: sixty-three cases (189 units) of a seventy-seven-case,
-# 231-unit matrix.
+# entry below: sixty-five cases (195 units) of a seventy-nine-case,
+# 237-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -747,12 +747,13 @@
 # The readiness report's fail-closed webhook source: the fleet-upgrade-verification
 # skill's --readiness table grades a fail-closed admission webhook whose
 # backend the API server cannot reach, as a blocker when its rules reach the
-# upgrade's path or, with a namespace selector admitting kube-system or
-# kube-public, the Role and RoleBinding writes a new master reconciles there,
-# and as an outage otherwise. The planted gate on seeded-b (role
-# readiness-failclosed-webhook) matches ConfigMaps only, which neither list
-# carries, so the case grades the declared line's "no": the gate sits in the no-backend slot and
-# never among the blockers. Read-only chat prompt; nothing to mutate. Nightly
-# from its first merge; a presubmit seat is a later pull request that cites
-# its record.
+# upgrade's path or a bootstrap RBAC write a new master reconciles (cluster-scoped
+# always; in kube-system or kube-public when its namespace selector admits that
+# namespace), and as an outage otherwise. The planted gate on seeded-b (role
+# readiness-failclosed-webhook) matches ConfigMaps only, which no graded list
+# carries, so the case grades the gate's line as "blocks the upgrade: no" beside
+# "yes" for the budget and the exclusion, reads the worker's commands for the
+# readiness run, and requires the missing backend named. Read-only chat prompt;
+# nothing to mutate. Nightly from its first merge; a presubmit seat is a later
+# pull request that cites its record.
 ./tasks/upgrades-fleet-readiness-failclosed-webhook/task.yaml

@@ -233,9 +233,10 @@ Four ways a workload breaks on a new version:
   case where the backend is unreachable now, on the webhook's rules (the writes a node drain and a
   node join make, listed with their sources as `UPGRADE_PATH_TARGETS` in
   `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`) and on its
-  `kube-system` reach (a dead webhook whose namespace selector admits `kube-system` or `kube-public`
-  and whose rules match the bootstrap Roles and RoleBindings a new master's `rbac/bootstrap-roles`
-  hook reconciles in those two namespaces, `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
+  bootstrap-RBAC reach (a dead webhook whose rules match the ClusterRoles and ClusterRoleBindings a
+  new master's `rbac/bootstrap-roles` hook reconciles, which no namespace selector exempts, or the
+  Roles and RoleBindings it reconciles in `kube-system` and `kube-public` when the selector admits
+  that namespace, `CONTROL_PLANE_CLUSTER_WRITES` and `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
   Jetstack outage deadlocked on left the start-up path in Kubernetes 1.17, and the leader-election
   Leases are already on the node path's list); the object selector, match conditions,
   cluster-scoped reach and the would-fail-once-drained backend are still unread.

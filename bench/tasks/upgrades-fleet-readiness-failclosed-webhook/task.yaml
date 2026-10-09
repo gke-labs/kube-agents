@@ -3,8 +3,10 @@
 # request its rules match. The table grades the member blocked when those rules reach
 # a write a node drain or a node join makes (`UPGRADE_PATH_TARGETS` in the skill's
 # `scripts/upgrade_readiness.py` is the list, with the package behind each write), or when
-# its namespace selector admits kube-system or kube-public and the rules reach the bootstrap
-# Role and RoleBinding writes a new master reconciles there (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`);
+# the rules reach a bootstrap RBAC write a new master reconciles: a ClusterRole or
+# ClusterRoleBinding write whatever the namespace selector says, or a Role or RoleBinding write
+# in kube-system or kube-public when the selector admits that namespace
+# (`CONTROL_PLANE_CLUSTER_WRITES`, `CONTROL_PLANE_KUBE_SYSTEM_WRITES`);
 # otherwise it names the webhook as a current outage without grading on it. The upgrade-scenario
 # campaign reproduced the pod-gating form end to end on GKE (the drain's replacement pods
 # refused until the webhook was deleted).
@@ -86,9 +88,9 @@ domain: upgrades
 owner: maintainers
 
 # Named by ROLE, not cluster: bench/tf/fleet/fixtures.json. The gate the case is about,
-# plus the budget and the exclusion whose lines the first two objectives expect. The
-# checks' `fixture_roles` name the gate's role alone: every pattern is about slot b's
-# lines, and the three roles share the slot.
+# plus the budget and the exclusion whose lines the first two objectives expect; each
+# check's `fixture_roles` names the role its object comes from, and the three roles share
+# slot b.
 fixtures:
   - readiness-failclosed-webhook
   - readiness-drain-blocked
@@ -144,10 +146,12 @@ verification_spec:
       forbidden_patterns:
         - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!no\s*$)'
 
-  # The gate's backend, named somewhere in the reply: the Service the configuration points
-  # at, or the line's backend field, or the words. Main's agent can find this by hand survey
-  # too; it is here so a reply that calls the gate harmless without having resolved its
-  # backend does not pass on the verdict alone.
+  # The gate's backend, resolved: the gate's own line says `backend: missing`, or the reply
+  # names the Service the configuration points at, which does not exist. Main's agent can
+  # find this by hand survey too; it is here so a reply that calls the gate harmless without
+  # having resolved its backend does not pass on the verdict alone. Phrases any other
+  # webhook's line or any other sentence could carry (`backend: missing` on another webhook,
+  # `does not exist` about a channel) are not accepted.
   - name: the-reply-names-the-missing-backend
     role: objective
     mode: assert
@@ -156,14 +160,9 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - readiness-failclosed-webhook
-      any_of_phrases:
-        [
-          "nonexistent-admission-gate",
-          "backend: missing",
-          "no backend",
-          "does not exist",
-          "no ready endpoints",
-        ]
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; backend: missing'
+        - "(?<![a-z0-9-])nonexistent-admission-gate(?![a-z0-9-])"
 
   # No line on any cluster blames the gate, under any of its names (the configuration
   # seeded-fail-closed-gate, the webhook gate.seeded.invalid, the Service

@@ -160,16 +160,11 @@ KNOWN_UNREGISTERED = {
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
-    # three greens on the fix), and belongs in the nightly. #2755 lists what it
-    # still needs first: Compute network permission for the CI runners,
-    # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
-    # room on the main part's infra-lock chain, measured with
-    # oobe-first-run-audits in it (or stack cases moved to a second project).
-    # The entry goes when the case joins hack/eval/nightly-cases.txt.
-    "networking-audit-subnet-range-exhaustion": (
-        "#2755: stack case held out of the nightly until runner Compute "
-        "permission, a scheduled plant sweep and infra-lock room land"
-    ),
+    # three greens on the fix), and belongs in the nightly; held out only
+    # because the nightly's infra-lock chain has no room for another stack
+    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
+    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -579,37 +574,70 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
-def _strings_under(raw: Any) -> list[str]:
-    """Every string in a value: the scalar itself, a list's items, a mapping's
-    values, nested to any depth, in document order. The tree is finite by the
-    time this runs: validate_case() refuses a file whose anchor is aliased from
-    inside its own value before any rule walks it (`_alias_cycle`)."""
+def _children(raw: Any) -> list[tuple[str, Any]] | None:
+    """The (key path step, child) pairs of a container `safe_load` builds, or
+    None for a scalar. A mapping (`!!map`) steps by key; a sequence by index,
+    and so does a tuple, since `!!omap` and `!!pairs` load as a list of
+    (key, value) tuples and the tuple is a container in its own right; a
+    `!!set` loads as a Python set of scalars, stepped in sorted order."""
+    if isinstance(raw, dict):
+        return [(f".{key}", item) for key, item in raw.items()]
+    if isinstance(raw, (list, tuple)):
+        return [(f"[{i}]", item) for i, item in enumerate(raw)]
+    if isinstance(raw, (set, frozenset)):
+        return [(f"[{i}]", item) for i, item in enumerate(sorted(raw, key=repr))]
+    return None
+
+
+def _strings_under(raw: Any, _seen: set[int] | None = None) -> list[str]:
+    """Every string in a value: the scalar itself, a sequence's items, a
+    mapping's values, nested to any depth, in document order. A container is
+    read once however many paths reach it: an anchor aliased from several
+    places (`safe_load` builds one object, reached by each) is one value, and
+    every finding is per key, so reading it per path would only repeat the
+    finding, and on a fan-out of nested anchors would take exponential time.
+    The same set bounds the walk on a cycle, which validate_case() has refused
+    before any rule runs (`_alias_cycle`)."""
     if isinstance(raw, str):
         return [raw]
-    if not isinstance(raw, (list, dict)):
+    seen = set() if _seen is None else _seen
+    if id(raw) in seen:
         return []
-    items = raw if isinstance(raw, list) else raw.values()
-    return [s for item in items for s in _strings_under(item)]
+    children = _children(raw)
+    if children is None:
+        return []
+    seen.add(id(raw))
+    return [s for _, item in children for s in _strings_under(item, seen)]
 
 
-def _alias_cycle(raw: Any, path: str = "", ancestors: frozenset[int] = frozenset()) -> str | None:
+def _alias_cycle(raw: Any, path: str = "", _on_path: set[int] | None = None, _done: set[int] | None = None) -> str | None:
     """The key path of the first value that is a container already on the path
     down to it, or None. `safe_load` builds such a value from a YAML anchor
     aliased from inside itself (`checks: &c [*c]`, `expected_findings: &m
-    [{object: *m}]`); every rule here walks the tree, so one such file would
-    end any of them in a RecursionError, and devops-bench refuses the same file
-    at spec load, after the cluster lease. An anchor reused beside itself is a
-    shared value, not a cycle, and is not reported."""
-    if not isinstance(raw, (list, dict)):
+    [{object: *m}]`, `required_phrases: &c !!pairs [{"": *c}]`); every rule
+    here walks the tree, so one such file would end any of them in a
+    RecursionError, and devops-bench refuses the same file at spec load, after
+    the cluster lease. An anchor reused beside itself is a shared value, not a
+    cycle, and is not reported; a container once proven acyclic is not walked
+    again from a second path, so a fan-out of nested anchors is walked once per
+    container, not once per path."""
+    on_path = set() if _on_path is None else _on_path
+    done = set() if _done is None else _done
+    # Both sets hold container ids only, so a scalar is never in either.
+    if id(raw) in done:
         return None
-    if id(raw) in ancestors:
+    if id(raw) in on_path:
         return path
-    below = ancestors | {id(raw)}
-    for key, item in enumerate(raw) if isinstance(raw, list) else raw.items():
-        step = f"{path}[{key}]" if isinstance(raw, list) else (f"{path}.{key}" if path else str(key))
-        found = _alias_cycle(item, step, below)
+    children = _children(raw)
+    if children is None:
+        return None
+    on_path.add(id(raw))
+    for step, item in children:
+        found = _alias_cycle(item, path + step if path or step.startswith("[") else step[1:], on_path, done)
         if found is not None:
             return found
+    on_path.discard(id(raw))
+    done.add(id(raw))
     return None
 
 
