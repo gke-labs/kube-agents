@@ -6861,6 +6861,7 @@ def _webhook_verdicts(text: str) -> dict[str, str]:
         # closed set, a budget's backend called ready
         _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "missing", "no")),
         _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "ready", "yes")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudgets", "not applicable", "yes")),
         _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "absent", "no")) + "\nThe Service seeded-upgrade/nonexistent-admission-gate does not exist.",
         # the pinned Deployment that shares the budget's name, correctly not a blocker beside the budget's yes
         _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "deployment", "not applicable", "no")),
@@ -6938,6 +6939,8 @@ def test_webhook_readiness_declared_lines_refused(text, failing):
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no (but it rejects ConfigMaps now)")), {_WEBHOOK_GATE}),
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no, unless the rules widen")), {_WEBHOOK_GATE}),
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), {_WEBHOOK_GATE}),
+        # a look-alike name on another cluster, blamed, is another object: no objective reads it
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("copy-seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), set()),
         # a token that merely starts with `no` is still a blame
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "none")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "not yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
@@ -6947,3 +6950,28 @@ def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, fa
     verdicts = _webhook_verdicts(text)
     assert {objective for objective, status in verdicts.items() if status == "fail"} == failing, verdicts
     assert set(verdicts.values()) <= {"pass", "fail"}, verdicts
+
+
+_WEBHOOK_RUN = "the-readiness-run-happened"
+_WEBHOOK_RUN_PATTERNS = next(e["check"]["required_patterns"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+
+
+# The run objective reads the invocation, not the interpreter: the script's name, however reached,
+# followed by the mode flag on the same command.
+@pytest.mark.parametrize(
+    "command, matches",
+    [
+        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /opt/data/scratch/r.json", True),
+        ("python3 -u /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version 1.33 --readiness", True),
+        ("./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3.14 fleet_upgrade_report.py --readiness", True),
+        ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && uv run fleet_upgrade_report.py --readiness", True),
+        ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3 -m fleet_upgrade_report --readiness", True),
+        ("kubectl get pdb,validatingwebhookconfigurations -A -o json", False),
+        ("grep -n readiness /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py", False),
+        ("cat fleet_upgrade_report.py | grep -- --readiness", False),
+        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version 1.33", False),
+    ],
+)
+def test_webhook_readiness_run_objective_reads_the_invocation_not_the_interpreter(command, matches):
+    assert any(re.search(pattern, command) for pattern in _WEBHOOK_RUN_PATTERNS) is matches, command
