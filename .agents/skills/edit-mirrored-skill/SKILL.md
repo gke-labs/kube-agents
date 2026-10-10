@@ -30,12 +30,20 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
   `google/skills`. If a sync reports that upstream renamed or removed the skill, stop and ask a
   maintainer.
 - Keep one patch per reason. Fold a follow-up edit into the patch with the same reason.
-- Put an upstream sync in its own pull request, with no other edit.
+- Put an upstream sync in its own pull request, with no other edit than the patches it needs to
+  pass the checks (conflict resolutions, a `make shellcheck` fix).
 - Never delete a patch to get past a conflict. Drop one only when upstream's new text covers its
   `Why:`, and say so in the pull request.
 - Keep `MSG=` to plain words: the Makefile passes it through the shell, so backticks and double
   quotes break. Edit the `Subject:` line in the patch afterwards if it needs code formatting.
 - Run `make skills-check` before committing; commit the shipped skill and its overlay together.
+- Treat a skill's scripts like its Markdown: edit the shipped script and record it with
+  `make skills-refresh`. `make shellcheck` lints the shipped `gke-*` scripts. Fix a finding in a
+  patch; add `# shellcheck disable=SCnnnn # reason` (also in a patch) only for a false positive, or
+  when the fix would change what upstream's script does. If a sync brings in a new finding, add that
+  patch in the same pull request. Put tests for those scripts in `tests/`
+  ([Where Tests Go](../../../AGENTS.md#where-tests-go)); a file in the skill folder that no patch
+  produces fails `make skills-check`.
 - Run `make docs-generate` when a skill is added or a frontmatter `description` changes, and
   commit the regenerated skill catalogue. Run `make docs-check` before pushing.
 - Expect the `Docker Build` check (the platform image build), not `make skills-check`, to run every
@@ -44,8 +52,9 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
   a patch.
 - Follow the eval loop ([`.agents/rules/eval_driven_development.md`](../../rules/eval_driven_development.md))
   for any change to what the agent reads: adding, changing or removing a patch or `append.md`, or a
-  sync. A change that leaves every shipped skill byte-identical states that exemption in one line
-  under **Live validation**.
+  sync. A change that leaves every shipped skill byte-identical, or a patch that only fixes a lint
+  finding in a script without changing what it does, states that exemption in one line under
+  **Live validation**.
 - Leave stopping mirroring (deleting a skill's copy, lock and overlay) to a maintainer.
 
 # Workflow
@@ -67,8 +76,8 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
      this line, so state the intent, not the edit. Name a related earlier patch if there is one.
    - `Local-Issue:`: the issue that asked for it, not the pull request.
    - `Retire-When:`: the upstream change that makes the patch unnecessary, or `never; <reason>`.
-   - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, or
-     `none (specific to this repository)`.
+   - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, `none filed yet` if the
+     fix is general but not reported yet, or `none (specific to this repository)`.
 
 ## Add or edit the appended section
 
@@ -103,36 +112,27 @@ a skill otherwise, patch it at its current pin ("Make a change").
    - To drop the patch because upstream now covers its `Why:`, resolve to upstream's text.
    - Remove every conflict marker, then run `make skills-continue SKILL=<skill>`.
 4. Any other failure is an error, not a conflict: read the message.
-5. Copy the sync's final report into the pull request: retired patches with their `Why:`, dropped
+5. Run `make shellcheck`; clear a new finding in an upstream script as the scripts rule above says.
+6. Copy the sync's final report into the pull request: retired patches with their `Why:`, dropped
    patches and the reason, any `append.md` note, and the patch count, share of lines changed and
    conflicts resolved. Question a retired patch whose `Retire-When:` says never.
-6. To abandon a sync, delete `.skill-sync/<skill>/`. Nothing outside it has changed.
+7. To abandon a sync, delete `.skill-sync/<skill>/`. Nothing outside it has changed.
 
 ## Start mirroring
 
 - Adopt an upstream `gke-*` skill this repository does not ship with
   `make skills-sync SKILL=<skill>`, then add it to `SKILL_GROUPS` in `scripts/generate_docs.py`
   and run `make docs-generate`.
-- Move a skill this repository ships without a lock onto the overlay:
-  1. Choose `REF`. Nothing records the commit the skill was copied from: take the last commit on
-     upstream's `main` before the newest `sync-upstream-skills.py` commit in
-     `git log -- agents/platform/skills/<skill>`.
-  2. Run `make skills-import SKILL=<skill> REF=<commit>`.
-  3. Diff `third_party/google-skills/<skill>/` against the shipped skill. Every difference must
-     trace to a `SKILL_SUBSTITUTIONS`, `SKILL_FILE_SUBSTITUTIONS` or `SKILL_FOOTERS` entry in
-     `scripts/sync-upstream-skills.py`, or to a known local edit. If any other hunk remains, `REF`
-     is wrong: delete the copy and lock and import again with another commit.
-  4. Run `make skills-generate SKILL=<skill>`. This resets the shipped skill to the copy; the
-     local text stays in `HEAD`.
-  5. Each refresh writes one patch. For each reason, re-apply only that reason's hunks from
+- If `skills-sync` or `skills-status` reports a `gke-*` skill that ships without a lock, it is
+  either this repository's own skill (rename it) or a hand copy of upstream's. For a copy:
+  1. Run `make skills-import SKILL=<skill> REF=<commit>` with the upstream commit it was copied
+     from. If the remaining differences are not all local edits, `REF` is wrong: delete the copy
+     and lock and import again.
+  2. Run `make skills-generate SKILL=<skill>`; the local text stays in `HEAD`.
+  3. For each reason, re-apply that reason's hunks from
      `git diff HEAD -- agents/platform/skills/<skill>/` and run
-     `make skills-refresh SKILL=<skill> MSG="<reason>"`. Restore a footer as the appended section.
-     Repeat until that diff is empty, so the shipped skill is byte-identical again.
-  6. Fill in each patch's header as in "Make a change", step 5; copy each registry entry's comment
-     into its patch's `Why:`.
-  7. Delete the skill's registry entries, the snippet constants only they use, and the tests in
-     `scripts/test_sync_upstream_skills.py` that assert them. That script rejects an entry for a
-     locked skill.
+     `make skills-refresh SKILL=<skill> MSG="<reason>"`. Stop when that diff is empty.
+  4. Fill in each patch's header as in "Make a change", step 5.
 
 ## Fix a failing check
 

@@ -147,7 +147,7 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         ' --project="$PROJECT" --quiet',
     ): (
         frozenset({"sensitive_env_export"}),
-        "this repository's SKILL_SUBSTITUTIONS text in scripts/sync-upstream-skills.py; "
+        "this repository's per-target kubeconfig patch in agents/platform/skill-overlays/gke-basics/; "
         "agents/platform/AGENTS.md and the compliance audit SOP teach the same export, so "
         "all of them change together",
     ),
