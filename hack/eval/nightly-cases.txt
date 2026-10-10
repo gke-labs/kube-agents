@@ -755,3 +755,13 @@
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# A /session crashloop question is answered under the persona's rule for its
+# access (#2858): with the session cluster view on, a GKE skill, kubectl and
+# the session's own answer; with it off, as on the next lane today, the
+# skill check skips and the pod-search safeguard and the relayed answer are
+# graded (the task's VIEW ON OR OFF note says how it tells). Real only on
+# the next lane's inject transport; on the api lane every check passes
+# without testing anything (its TRANSPORT note). deployer: noop; reads the
+# seeded fleet's crashloop-workload role.
+./tasks/session-crashloop-question-loads-a-skill/task.yaml

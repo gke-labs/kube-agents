@@ -130,6 +130,47 @@ class SpecToolRegistryTest(unittest.TestCase):
         "agents/platform/skills/gke-basics/references/mcp-usage.md",
     )
 
+    # Claude Code harness tools the session worker runs under, by the name its
+    # stream-json carries (the name a `tool_called` check on a session case
+    # matches). Nothing here defines them; each needs evidence in the worker
+    # source (test_the_session_harness_tools_still_have_evidence_in_the_worker):
+    #
+    # * a built-in on the adapter's `defaultAllowedTools` constant in
+    #   a2a/cmd/worker-adapter/main.go, the surface every session gets;
+    # * `Bash`, from the same file's `clusterViewAllowedTools`, the surface a
+    #   session gets only with the cluster view (`Bash(kubectl:*)` and
+    #   `Bash(gcloud:*)`, both the Bash tool); `defaultDisallowedTools`
+    #   disallows it otherwise, which is what lets a case read a Bash call as
+    #   "the view was on";
+    # * the delegate MCP tool, as main.go's `delegateToolID` composes it:
+    #   "mcp__" + DelegateMCPServer + "__" + DelegateToolName, both halves
+    #   from a2a/worker-adapter/mcp.go;
+    # * `Skill`, which is deliberately on no allowlist: the harness runs a
+    #   skill whose frontmatter carries only name and description without a
+    #   permission rule (a2a/cmd/worker-adapter/skill_allowlist_test.go). Its
+    #   evidence is the session persona telling the model to load skills
+    #   "with the Skill tool" and the persona build (a2a/cmd/session-persona)
+    #   cutting each skill's frontmatter down to the two fields that tool
+    #   runs unprompted. Neither proves the harness exposes the tool, only
+    #   that this repository relies on it; the eval is what proves the rest.
+    SESSION_HARNESS_TOOLS = {"Read", "Glob", "Grep", "Bash", "mcp__a2a__delegate", "Skill"}
+    WORKER_ADAPTER_MAIN = "a2a/cmd/worker-adapter/main.go"
+    WORKER_ADAPTER_MCP = "a2a/worker-adapter/mcp.go"
+    SKILL_TOOL_EVIDENCE = (
+        "a2a/persona/session/persona.md",
+        "a2a/cmd/session-persona/transform.go",
+    )
+
+    # Trajectory markers a transport writes as entries of its own, not tool
+    # calls. A spec may name one in `tool_called` (wrapped in `none`, it says
+    # "this record is not the inject transport's"). Evidence of each is a
+    # constant the inject transport passes to `self._record` and a constant
+    # scoring's `_inject_record` reads it by
+    # (test_the_transport_markers_still_have_evidence_in_writer_and_reader).
+    TRANSPORT_MARKERS = {"inject.task"}
+    INJECT_TRANSPORT = "bench/kube_agents_bench/inject_transport.py"
+    SCORING = "bench/kube_agents_bench/scoring.py"
+
     def _mcp_server_aliases(self):
         """Alias → the local server script it launches, from every agent config.
 
@@ -253,7 +294,13 @@ class SpecToolRegistryTest(unittest.TestCase):
         return wanted
 
     def test_every_spec_tool_name_resolves_to_a_registry(self):
-        registry = self._registered_mcp_tools() | self._remote_mcp_tools() | self.HERMES_BUILTIN_TOOLS
+        registry = (
+            self._registered_mcp_tools()
+            | self._remote_mcp_tools()
+            | self.HERMES_BUILTIN_TOOLS
+            | self.SESSION_HARNESS_TOOLS
+            | self.TRANSPORT_MARKERS
+        )
         unresolved = [
             f"{path.parent.name}: {name}"
             for path, name in self._spec_tool_names()
@@ -315,6 +362,76 @@ class SpecToolRegistryTest(unittest.TestCase):
                 f"{alias}__{tool}" in corpus or f"`{tool}`" in corpus,
                 f"{alias}/{tool} is allowlisted as a remote MCP tool but the personas "
                 "and skill references carry no evidence of it — stale allowlist entry",
+            )
+
+    @staticmethod
+    def _go_string_const(source, name):
+        """The value of a Go `name = "literal"` constant, or None."""
+        found = re.search(rf'^\s*{name}\s*=\s*"([^"]*)"\s*$', source, re.M)
+        return found.group(1) if found else None
+
+    def _session_harness_evidence(self):
+        """Every harness tool name the worker source gives evidence of."""
+        main = (REPO_ROOT / self.WORKER_ADAPTER_MAIN).read_text(errors="replace")
+        mcp = (REPO_ROOT / self.WORKER_ADAPTER_MCP).read_text(errors="replace")
+        evidenced = set()
+
+        allowed = self._go_string_const(main, "defaultAllowedTools")
+        self.assertTrue(allowed, f"{self.WORKER_ADAPTER_MAIN} no longer defines defaultAllowedTools as a literal")
+        evidenced.update(t.strip() for t in allowed.split(",") if t.strip())
+        view = re.search(r'^\s*clusterViewAllowedTools\s*=\s*defaultAllowedTools\s*\+\s*"([^"]*)"\s*$', main, re.M)
+        if view:
+            # `Bash(kubectl:*)` is the Bash tool with a permission rule.
+            evidenced.update(t.strip().split("(")[0] for t in view.group(1).split(",") if t.strip())
+
+        server = self._go_string_const(mcp, "DelegateMCPServer")
+        tool = self._go_string_const(mcp, "DelegateToolName")
+        self.assertTrue(server and tool, f"{self.WORKER_ADAPTER_MCP} no longer names the delegate server and tool")
+        composed = re.search(
+            r'delegateToolID\s*=\s*"mcp__"\s*\+\s*workeradapter\.DelegateMCPServer\s*\+\s*"__"'
+            r"\s*\+\s*workeradapter\.DelegateToolName",
+            main,
+        )
+        if composed:
+            evidenced.add(f"mcp__{server}__{tool}")
+
+        corpora = [(REPO_ROOT / rel).read_text(errors="replace") for rel in self.SKILL_TOOL_EVIDENCE]
+        if all("the Skill tool" in corpus for corpus in corpora):
+            evidenced.add("Skill")
+        return evidenced
+
+    def test_the_session_harness_tools_still_have_evidence_in_the_worker(self):
+        evidenced = self._session_harness_evidence()
+        # Read alone is on the allowlist today; an extraction that went empty
+        # would leave only the Skill/delegate branches, which this catches.
+        self.assertIn("Read", evidenced, "the defaultAllowedTools extraction found nothing")
+        for name in sorted(self.SESSION_HARNESS_TOOLS):
+            self.assertIn(
+                name,
+                evidenced,
+                f"{name} is registered as a session harness tool but the worker adapter, "
+                "its delegate server and the session persona carry no evidence of it — "
+                "stale registry entry",
+            )
+
+    def test_the_transport_markers_still_have_evidence_in_writer_and_reader(self):
+        transport = (REPO_ROOT / self.INJECT_TRANSPORT).read_text(errors="replace")
+        scoring = (REPO_ROOT / self.SCORING).read_text(errors="replace")
+        reader = re.search(r"^def _inject_record\(.*?(?=^\S)", scoring, re.M | re.S)
+        self.assertIsNotNone(reader, f"{self.SCORING} no longer defines _inject_record")
+        for marker in sorted(self.TRANSPORT_MARKERS):
+            literal = re.escape(json.dumps(marker))
+            writers = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", transport, re.M)
+            self.assertTrue(
+                any(f"self._record({const}," in transport for const in writers),
+                f"{marker} is registered as a transport marker but {self.INJECT_TRANSPORT} "
+                "no longer writes it — stale registry entry",
+            )
+            readers = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", scoring, re.M)
+            self.assertTrue(
+                any(re.search(rf"\b{const}\b", reader.group(0)) for const in readers),
+                f"{marker} is registered as a transport marker but scoring's _inject_record "
+                "no longer reads it — stale registry entry",
             )
 
 

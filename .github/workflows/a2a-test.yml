@@ -32,6 +32,13 @@ on:
       # This job runs `make -C k8s-operator envtest-path`, so it depends on
       # that Makefile as surely as on its own sources.
       - "k8s-operator/Makefile"
+      # cmd/session-persona's tests read these from outside the module: the
+      # cluster skills the worker image ships a session copy of, and the
+      # broker policy the session's read tables must stay a subset of. An
+      # edit to either alone has to run those tests.
+      - "agents/cluster/skills/**"
+      - "agents/platform/scripts/command_policy.py"
+      - "agents/platform/scripts/credential_proxy.py"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -65,6 +72,9 @@ jobs:
               - "a2a/**"
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
+              - "agents/cluster/skills/**"
+              - "agents/platform/scripts/command_policy.py"
+              - "agents/platform/scripts/credential_proxy.py"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'
