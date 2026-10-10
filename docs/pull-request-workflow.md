@@ -125,7 +125,9 @@ package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two release
 release two behind reports a different set of findings than CI.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
-place, and the comment above the target says why.
+place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
+place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
+fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 

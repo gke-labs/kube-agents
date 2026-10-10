@@ -30,12 +30,20 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
   `google/skills`. If a sync reports that upstream renamed or removed the skill, stop and ask a
   maintainer.
 - Keep one patch per reason. Fold a follow-up edit into the patch with the same reason.
-- Put an upstream sync in its own pull request, with no other edit.
+- Put an upstream sync in its own pull request, with no other edit than the patches it needs to
+  pass the checks (conflict resolutions, a `make shellcheck` fix).
 - Never delete a patch to get past a conflict. Drop one only when upstream's new text covers its
   `Why:`, and say so in the pull request.
 - Keep `MSG=` to plain words: the Makefile passes it through the shell, so backticks and double
   quotes break. Edit the `Subject:` line in the patch afterwards if it needs code formatting.
 - Run `make skills-check` before committing; commit the shipped skill and its overlay together.
+- Treat a skill's scripts like its Markdown: edit the shipped script and record it with
+  `make skills-refresh`. `make shellcheck` lints the shipped `gke-*` scripts. Fix a finding in a
+  patch; add `# shellcheck disable=SCnnnn # reason` (also in a patch) only for a false positive, or
+  when the fix would change what upstream's script does. If a sync brings in a new finding, add that
+  patch in the same pull request. Put tests for those scripts in `tests/`
+  ([Where Tests Go](../../../AGENTS.md#where-tests-go)); a file in the skill folder that no patch
+  produces fails `make skills-check`.
 - Run `make docs-generate` when a skill is added or a frontmatter `description` changes, and
   commit the regenerated skill catalogue. Run `make docs-check` before pushing.
 - Expect the `Docker Build` check (the platform image build), not `make skills-check`, to run every
@@ -44,8 +52,9 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
   a patch.
 - Follow the eval loop ([`.agents/rules/eval_driven_development.md`](../../rules/eval_driven_development.md))
   for any change to what the agent reads: adding, changing or removing a patch or `append.md`, or a
-  sync. A change that leaves every shipped skill byte-identical states that exemption in one line
-  under **Live validation**.
+  sync. A change that leaves every shipped skill byte-identical, or a patch that only fixes a lint
+  finding in a script without changing what it does, states that exemption in one line under
+  **Live validation**.
 - Leave stopping mirroring (deleting a skill's copy, lock and overlay) to a maintainer.
 
 # Workflow
@@ -67,8 +76,8 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
      this line, so state the intent, not the edit. Name a related earlier patch if there is one.
    - `Local-Issue:`: the issue that asked for it, not the pull request.
    - `Retire-When:`: the upstream change that makes the patch unnecessary, or `never; <reason>`.
-   - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, or
-     `none (specific to this repository)`.
+   - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, `none filed yet` if the
+     fix is general but not reported yet, or `none (specific to this repository)`.
 
 ## Add or edit the appended section
 
@@ -103,10 +112,11 @@ a skill otherwise, patch it at its current pin ("Make a change").
    - To drop the patch because upstream now covers its `Why:`, resolve to upstream's text.
    - Remove every conflict marker, then run `make skills-continue SKILL=<skill>`.
 4. Any other failure is an error, not a conflict: read the message.
-5. Copy the sync's final report into the pull request: retired patches with their `Why:`, dropped
+5. Run `make shellcheck`; clear a new finding in an upstream script as the scripts rule above says.
+6. Copy the sync's final report into the pull request: retired patches with their `Why:`, dropped
    patches and the reason, any `append.md` note, and the patch count, share of lines changed and
    conflicts resolved. Question a retired patch whose `Retire-When:` says never.
-6. To abandon a sync, delete `.skill-sync/<skill>/`. Nothing outside it has changed.
+7. To abandon a sync, delete `.skill-sync/<skill>/`. Nothing outside it has changed.
 
 ## Start mirroring
 
