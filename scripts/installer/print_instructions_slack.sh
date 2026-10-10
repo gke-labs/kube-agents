@@ -35,7 +35,7 @@ if is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
   echo -e "[ ] 2. Send a DM or mention the Bot in Slack:"
   echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
   echo -e ""
-  echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container (if pairing mode enabled):"
+  echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve a pairing code, only if you set the Hermes Slack DM policy to pairing yourself (the install uses the allowlist):"
   echo -e "       ${C_WHITE}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -- hermes pairing approve slack <PAIRING_CODE>${C_RESET}"
   echo -e ""
   echo -e "[ ] 4. ${C_YELLOW}[Optional]${C_RESET} Register the native slash commands so Slack autocompletes them:"

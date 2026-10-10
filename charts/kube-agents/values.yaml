@@ -1134,6 +1134,7 @@ platformAgent:
       # Bot/app tokens are read from credentials.secretName under the
       # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys.
       enabled: false
+      # Slack member IDs (U0123ABCD), not emails. Empty list = all users allowed.
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""

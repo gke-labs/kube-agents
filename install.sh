@@ -785,8 +785,9 @@ Flags for AI Agents & Automation:
                                 workspace the agent serves. The relay keys each one by
                                 the team it authenticates as
   --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
-  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
-                                agent. Empty allows all users
+  --slack-allowed-users=USERS   Comma-separated Slack member IDs (e.g. U0123ABCD; not
+                                emails) allowed to talk to the agent. Empty allows
+                                every workspace member
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
@@ -5778,7 +5779,7 @@ main() {
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
-    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+    prompt_read "Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
@@ -5866,7 +5867,7 @@ main() {
     # toggle.
     echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
-    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<member IDs, e.g. U0123ABCD>, re-run with --slack-bot-token and --slack-app-token"
     echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
