@@ -980,17 +980,18 @@ def _graded_resource_names(targets: tuple) -> set[str]:
 
 
 def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
-    """The graded resources a pinned rule names with operations (or a scope) no graded row carries,
-    labelled at the resource, since the served version is the resource's and not the row's; a
-    subresource is labelled by its parent, whose group-version it is served under."""
-    graded = _graded_resources(targets)
+    """What a pinned rule names when no graded row carries its operations or scope, labelled at
+    the resource, since the served version is the resource's and not the row's; a subresource is
+    labelled by its parent, whose group-version it is served under, and a pair the server does not
+    serve at all (`policy/pods`) by the words the rule spells, so every pinned rule has a label and
+    the cell can say the server sends it nothing."""
     labels: list[str] = []
     for rule in rules:
         if any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets):
             continue
         for group in rule.get("apiGroups") or []:
             for spec in rule.get("resources") or []:
-                if not isinstance(spec, str) or (group, _resource_parent(spec)) not in graded:
+                if not isinstance(spec, str):
                     continue
                 template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
                 label = template.format(resource=_resource_parent(spec), group=group)
@@ -1121,16 +1122,18 @@ def describe_webhook_finding(finding: dict) -> str:
     rules = LIST_SEPARATOR.join(finding.get("rules") or []) or RULE_NONE
     if finding["upgrade_path"]:
         matches = LIST_SEPARATOR.join(finding["upgrade_path"])
-    elif finding.get("version_pinned") and finding.get("live_rules"):
+    elif finding.get("pinned_rules") and finding.get("live_rules"):
+        # The sentence follows the rules the pin judged; the labels say what they name.
         matches = WEBHOOK_MIXED_MATCHES.format(
             rules=rules,
             live=LIST_SEPARATOR.join(finding["live_rules"]),
-            pinned=LIST_SEPARATOR.join(finding["version_pinned"]),
+            pinned=LIST_SEPARATOR.join(finding.get("version_pinned") or finding["pinned_rules"]),
             served=VERSION_V1,
-            pinned_rules=LIST_SEPARATOR.join(finding.get("pinned_rules") or []),
+            pinned_rules=LIST_SEPARATOR.join(finding["pinned_rules"]),
         )
-    elif finding.get("version_pinned"):
-        matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, pinned=LIST_SEPARATOR.join(finding["version_pinned"]), served=VERSION_V1)
+    elif finding.get("pinned_rules"):
+        matches = WEBHOOK_PINNED_MATCHES.format(
+            rules=rules, pinned=LIST_SEPARATOR.join(finding.get("version_pinned") or finding["pinned_rules"]), served=VERSION_V1)
     else:
         matches = WEBHOOK_OUTAGE_MATCHES.format(rules=rules)
     return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)

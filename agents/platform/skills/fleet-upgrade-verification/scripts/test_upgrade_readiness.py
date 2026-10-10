@@ -639,6 +639,14 @@ class KubeSystemReachTest(unittest.TestCase):
         self.assertEqual(blocking, [])
         self.assertEqual(outage[0]["version_pinned"][0], "CREATE pods")
         self.assertIn("so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        # A pair the server does not serve at all is pinned by the same separation and labelled by
+        # the words the rule spells, so the cell still says the server sends it nothing; the
+        # finding's rules and its cell agree.
+        gate = hook("typo.example.com", [rule(["pods"], groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"], outage[0]["live_rules"]), ([], ["pods in policy"], []))
+        self.assertEqual(outage[0]["pinned_rules"], ["CREATE pods in policy at v1beta1"])
+        self.assertIn("the server serves pods in policy at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
         # A spelling naming every resource, or a resource off every list, is still not pinned:
         # their served versions are not this rule's to know.
         for spec, groups in (("*", ("",)), ("*/*", ("",)), ("*/status", ("",)), ("configmaps", ("",))):
