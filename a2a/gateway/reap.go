@@ -265,38 +265,184 @@ func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
 	return false
 }
 
-// buildRehydrationPrimer folds the context's tasks from JetStream into a
-// transcript primer for a fresh pod — the next incarnation's first input.
-// Task-stream retention bounds how far back this reaches, deliberately: a
-// three-day-silent thread restarting with fresh context beats a bot that
-// suddenly remembers June. Session files are cache; the stream is the
-// record.
-func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord) string {
-	var b strings.Builder
-	b.WriteString("Transcript primer, replayed from the task stream for this conversation:\n")
-	found := 0
+// buildRehydrationPrimer folds the conversation's earlier turns into a
+// transcript primer for a fresh pod, the next incarnation's first input
+// (the worker reads it as lib.EnvPrimerFile and puts it ahead of the new
+// message). Every turn is a fresh pod, so this is all a session knows of the
+// conversation before it. Each human turn contributes what the user asked
+// (TaskRef.Request, the copy session-state keeps until AskTTL) and each task
+// its result from JetStream, labelled by who answered. current is the task
+// the pod is being started for, left out so the new message is not
+// replayed as history.
+//
+// It also returns the people behind every turn it replays (each turn's
+// requester and steer authors), the mark when one of them is no longer on
+// record, and the oldest turn's start. The pod reads what they said, so a
+// delegation from it is checked against them too (seedSessionAuthors, in
+// ensureSessionPod), exactly as a wake carries its parent's set. Task-stream retention bounds how far back this
+// reaches, deliberately: a three-day-silent thread restarting with fresh
+// context beats a bot that suddenly remembers June. Session files are cache;
+// the stream is the record.
+func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord, current string) (primer string, authors []TaskRequester, unknown bool, since time.Time) {
+	var turns []string
+	var people [][]TaskRequester // each kept turn's requester and steer authors
+	var started []time.Time
+	var overflow []bool
 	for _, ref := range rec.Tasks {
-		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
-		if err != nil {
-			continue // aged out of retention, or never produced events
+		if ref.ID == current {
+			continue
 		}
-		found++
-		fmt.Fprintf(&b, "\n--- task %s (%s)\n", task.ID, task.State)
-		if art := task.Artifact(lib.ArtifactResult); art != nil {
-			// truncateRunes, not a byte cut: the primer is annotated onto
-			// the next pod and marshalled to JSON on the way, where invalid
-			// UTF-8 becomes U+FFFD rather than an error. spawn.go's outer
-			// truncateRunes only guards the primer's tail; a byte cut here
-			// lands mid-transcript and survives it.
-			text := truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
-			b.WriteString(text)
-			b.WriteString("\n")
+		// A turn whose people are no longer on record (cleared by the ask
+		// bound, with its Request, or written before the fields existed)
+		// is left out whole. The pod must not read text whose authors the
+		// delegation check can't count; counting them as unknown instead
+		// would refuse every delegation in any conversation older than
+		// A2A_ASK_TTL, for good.
+		if ref.Requester == nil {
+			continue
+		}
+		var said, answered, ended string
+		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
+			said = ref.Request
+		}
+		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
+		if err != nil && !isTaskNotFound(err) {
+			// The stream didn't answer (a transport error, a consumer
+			// refusal, the turn's budget running out): leave the turn out
+			// rather than replay it as asked and never answered.
+			continue
+		}
+		if err == nil {
+			if art := task.Artifact(lib.ArtifactResult); art != nil && len(ref.Children) == 0 {
+				// truncateRunes, not a byte cut: the primer is annotated onto
+				// the next pod and marshalled to JSON on the way, where invalid
+				// UTF-8 becomes U+FFFD rather than an error. spawn.go's outer
+				// truncateRunes only guards the primer's tail; a byte cut here
+				// lands mid-transcript and survives it.
+				answered = truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
+			}
+			ended = primerTurnEnd(task)
+			// A turn that asked to delegate ended with the hand-off line
+			// ("delegated to <addressee>"), which is never a deliverable.
+			// With a child it is skipped above, and the child's labelled
+			// answer follows; refused, its real end is on the record.
+			if state, reason, handOff := rec.handOffEnd(ref.ID, task.State); handOff {
+				answered = ""
+				ended = string(state) + ": " + truncateRunes(reason, primerTurnEndCap)
+			}
+		}
+		// A task aged out of retention, or one that never produced a
+		// result, still leaves what the user asked.
+		if said == "" && strings.TrimSpace(answered) == "" && ended == "" {
+			continue
+		}
+		people = append(people, append([]TaskRequester{*ref.Requester}, ref.SteerAuthors...))
+		started = append(started, ref.StartedAt)
+		overflow = append(overflow, ref.SteerAuthorsOverflow)
+		// Each turn's text is fenced the way the wake's is: a user's line
+		// that reads "You: ..." stays inside its own block and cannot pass
+		// for an earlier answer.
+		var turn strings.Builder
+		if said != "" {
+			turn.WriteString("\n" + primerFenced("The user said", said))
+		}
+		if strings.TrimSpace(answered) != "" {
+			who := "You answered"
+			switch {
+			case ref.Role == taskRoleChild:
+				who = "The " + ref.Addressee + " agent, which you delegated to, answered"
+			case ref.Addressee == targetPlatform:
+				// A turn from before /session routed this conversation.
+				who = "The " + targetPlatform + " agent answered"
+			}
+			turn.WriteString("\n" + primerFenced(who, answered))
+		}
+		if ended != "" {
+			turn.WriteString("\n" + primerFenced("That turn ended without finishing", ended))
+		}
+		turns = append(turns, turn.String())
+	}
+	if len(turns) == 0 {
+		return "", nil, false, time.Time{}
+	}
+	primer, first := primerFromTurns(turns)
+	// Only the turns the primer carries count: a turn dropped to fit is
+	// text the pod never reads, and counting its people would overflow the
+	// incarnation's set in a busy conversation and refuse every delegation.
+	for i := first; i < len(turns); i++ {
+		authors = append(authors, people[i]...)
+		unknown = unknown || overflow[i]
+		if !started[i].IsZero() && (since.IsZero() || started[i].Before(since)) {
+			since = started[i]
 		}
 	}
-	if found == 0 {
+	return primer, authors, unknown, since
+}
+
+// primerHeader and primerOmitted open the primer; the second only when
+// earlier turns were dropped to fit.
+const (
+	primerHeader  = "Transcript primer, replayed from the task stream for this conversation:\n"
+	primerOmitted = "\n(Earlier turns are omitted to fit.)\n"
+)
+
+// primerFromTurns joins the turns oldest first, keeping the newest that fit
+// primerCap and dropping whole turns from the front, since a follow-up needs
+// the most recent context most. spawn.go's truncateRunes stays as the
+// backstop for a single turn larger than the cap. It returns the primer and
+// the index of the first turn it kept, so the caller counts the people of
+// the kept turns only.
+func primerFromTurns(turns []string) (string, int) {
+	budget := primerCap - len(primerHeader) - len(primerOmitted)
+	start, size := len(turns), 0
+	for start > 0 && size+len(turns[start-1]) <= budget {
+		start--
+		size += len(turns[start])
+	}
+	if start == len(turns) {
+		start = len(turns) - 1 // one turn alone past the cap: the backstop cuts it
+	}
+	var b strings.Builder
+	b.WriteString(primerHeader)
+	if start > 0 {
+		b.WriteString(primerOmitted)
+	}
+	for _, t := range turns[start:] {
+		b.WriteString(t)
+	}
+	return b.String(), start
+}
+
+// primerTurnEnd says how a turn that didn't complete ended (failed,
+// canceled or rejected), with the executor's reason when the terminal
+// carried one, so a follow-up such as "did that work?" can be answered. A
+// completed or still-open task says nothing.
+func primerTurnEnd(task *lib.Task) string {
+	switch task.State {
+	case lib.StateFailed, lib.StateCanceled, lib.StateRejected:
+	default:
 		return ""
 	}
-	return b.String()
+	end := string(task.State)
+	if task.FinalMessage != nil {
+		if reason := strings.TrimSpace(joinTextParts(task.FinalMessage.Parts)); reason != "" {
+			end += ": " + truncateRunes(reason, primerTurnEndCap)
+		}
+	}
+	return end
+}
+
+// primerTurnEndCap bounds the reason quoted for a turn that didn't finish:
+// enough for the executor's reason token and a line of detail.
+const primerTurnEndCap = 300
+
+// primerFenced is one turn of the primer: its label, then the text in a
+// fence longer than any backtick run in it, so no line of the text can close
+// the block (the wake's fencing, wakeFence and breakBacktickRuns).
+func primerFenced(label, text string) string {
+	text = breakBacktickRuns(strings.TrimSpace(text), wakeFenceMax-1)
+	fence := wakeFence(text)
+	return label + ":\n" + fence + "\n" + text + "\n" + fence + "\n"
 }
 
 // noFirstEventPastGrace is the one test for "this task has produced nothing

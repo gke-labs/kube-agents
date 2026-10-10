@@ -376,11 +376,14 @@ the turn, each stored hashed the same way and capped at eight - past the cap the
 refuses rather than silently drop an author; and against every hashed author whose text has
 reached the session's current incarnation, requesters and steerers of every turn alike, capped at
 sixteen and cleared with the requester copy at `A2A_ASK_TTL` - a cleared or overflowed set refuses
-rather than admits. That third check is inert today: each turn gets a fresh one-task incarnation,
-so no turn yet sees an earlier turn's author in it; it becomes load-bearing once #2370's cross-turn
-memory lets a pod carry what an earlier turn in the same conversation said, at which point the
-bound it should hold is the whole conversation, not one incarnation - #2370 is where that question
-is decided. One live child per conversation, a detached-but-still-running one counting as live:
+rather than admits. That third check is load-bearing: each turn gets a fresh one-task
+incarnation, but the incarnation reads the transcript primer (below, "Rehydrate"), which carries
+every earlier turn the stream still holds. So when the pod is started, the requesters and steer
+authors of every turn the primer replays join the set. A turn whose requester is no longer on
+record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
+reads text whose authors the check can't count. The bound is the conversation as the primer
+carries it, not one incarnation. What else a session carries across incarnations is
+#2370. One live child per conversation, a detached-but-still-running one counting as live:
 the delegating turn's own repeat is ignored and logged, while a later turn's request reaching the
 gateway while that child still runs is refused with a notice naming the running task
 (`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
@@ -438,9 +441,11 @@ says so instead) or if another task already holds the conversation (waking would
 task's own pod); otherwise the wake is an ordinary session spawn and counts against
 `A2A_MAX_SESSIONS` like any other - refused at the cap, the child's result still stands as
 already relayed, and the room gets the standard cap notice rather than a second one. The wake
-inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod starts
-with no memory of the turn that delegated, so its text opens with what the human asked: the label
-`You were asked:` and the human's message that started the chain, fenced. It is the root turn's
+inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod is a fresh
+incarnation that reads the transcript primer like any other, and its text also opens with what the
+human asked, so the wake is self-contained: a worker image that doesn't read the primer, during a
+mixed rollout, still has the request and the result. The cost is reading them twice. It opens
+with the label `You were asked:` and the human's message that started the chain, fenced. It is the root turn's
 message, carried down a longer chain, never an intermediate wake's gateway-authored text. Then
 `You delegated to platform (task …), which completed.` (or failed, or was rejected), then the
 result, capped at `lib.DelegateTextCap` and fenced under the label
@@ -638,7 +643,17 @@ a new delegation in its conversation (above) until its own terminal, or a heal, 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream - `tasks/get`, which folds each
 task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
-the new pod as its first input. If the harness's own session file
+the new pod as its first input. The primer carries both sides of each earlier turn: what
+the user asked (the copy session-state keeps until `AskTTL`) and each result, labelled by
+who answered, and how a turn that didn't finish ended (failed, stopped or rejected, with the
+executor's reason), each fenced so a user's text can't pass for an earlier answer. A turn past
+`A2A_ASK_TTL` is left out. It keeps the
+newest turns that fit 8 KiB and says when earlier ones were dropped. The pod gets it as a
+downward-API file from its own annotation, and the worker puts it ahead of the new message,
+framed as history rather than instructions. The annotation is readable by anyone who can get
+pods in the install namespace, and the copy of the user's text on it isn't cleared at
+`A2A_ASK_TTL` the way session-state's is; it goes when the pod is reaped. Earlier results were
+already on the same annotation. Moving the primer to a per-pod Secret is tracked separately. If the harness's own session file
 happens to survive (it usually won't), `--resume` is a shortcut - correctness never
 depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a

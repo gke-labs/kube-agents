@@ -710,8 +710,8 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
-	// The wake's pod starts with no memory of the parent's (one task per
-	// pod; the rehydration primer has no reader yet), but its text carries
+	// The wake's pod is a fresh incarnation (one task per pod). It reads
+	// the transcript primer like any other, and its text also carries
 	// the child's result, and the child's ask was written by the parent's
 	// incarnation. So the wake's incarnation starts from the parent's set,
 	// taken before freshIncarnation rotates it away.
