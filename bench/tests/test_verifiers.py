@@ -6968,6 +6968,15 @@ _WEBHOOK_RUN_PATTERNS = next(e["check"]["required_patterns"] for e in _WEBHOOK_S
         ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3.14 fleet_upgrade_report.py --readiness", True),
         ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && uv run fleet_upgrade_report.py --readiness", True),
         ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3 -m fleet_upgrade_report --readiness", True),
+        # whatever stands ahead of the script is the worker's business
+        ("timeout 900 python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /opt/data/scratch/fleet_readiness.json", True),
+        ("KUBECONFIG=/opt/data/.kubeconfigs/x python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        ("env PYTHONUNBUFFERED=1 python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        ("nohup python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /tmp/r.json &", True),
+        ("time python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
+        ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
+        ('bash -lc "python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness"', True),
         ("kubectl get pdb,validatingwebhookconfigurations -A -o json", False),
         ("grep -n readiness /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py", False),
         ("cat fleet_upgrade_report.py | grep -- --readiness", False),
@@ -6976,7 +6985,9 @@ _WEBHOOK_RUN_PATTERNS = next(e["check"]["required_patterns"] for e in _WEBHOOK_S
         ('grep -rn "fleet_upgrade_report.py --readiness" /opt/data/profiles/platform/skills/', False),
         ('echo "run fleet_upgrade_report.py --readiness first"', False),
         ("sed -n '/fleet_upgrade_report.py --readiness/p' /opt/data/profiles/platform/skills/fleet-upgrade-verification/SKILL.md", False),
-        ("cat SKILL.md | grep fleet_upgrade_report.py --readiness", False),
+        # a usage call is not a run
+        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --help", False),
+        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --help --readiness", False),
     ],
 )
 def test_webhook_readiness_run_objective_reads_the_invocation_not_the_interpreter(command, matches):

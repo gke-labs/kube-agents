@@ -193,10 +193,12 @@ verification_spec:
         - '(?m)^[^\n:]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*:[^\n]*; blocks the upgrade: (?!no\b)'
 
   # The route: the skill's readiness run, in a delegated worker's commands, however it was
-  # invoked: the script's name, by any path or as a module, is the command word of a command
-  # or of a segment after `&&`, `;` or `|`, after an optional interpreter and its flags, and
-  # the mode flag follows it on that segment. A name inside another command's argument (a
-  # quoted string a grep or an echo carries, an `=` value) is a mention, not a run. A reply that
+  # invoked. The script's name, by any path or as a module, is a bare word of a command or of
+  # a segment after `&&`, `;` or `|`, with the mode flag a later bare word of that segment:
+  # whatever stands ahead of it (an interpreter and its flags, `timeout`, `env`, a `NAME=value`,
+  # `nohup`) is the worker's business, and a `sh -c` string is read through its quote. A name
+  # inside another command's quoted argument (a grep, an echo, a sed) is a mention, not a run,
+  # and a `--help` on the segment is a usage call, not a run. A reply that
   # reaches the right verdicts by a hand kubectl survey passes the line checks and fails this
   # one; the persona routes a fleet readiness question to this one run.
   - name: the-readiness-run-happened
@@ -205,7 +207,7 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - '(?:^|[;&|]\s*)(?:\S*python[\d.]*\s+(?:-\S+\s+)*|uv\s+run\s+(?:-\S+\s+)*)?\S*fleet_upgrade_report(?:\.py)?\b[^\n|;&]*\s--readiness\b'
+        - '(?m)(?:^|[;&|])(?:[^"'';&|\n]|"[^"\n]*"|''[^''\n]*'')*?(?:(?:ba|z|da)?sh\s+-\S*c\s+["''](?:[^"''\n;&|]*?\s)?)?(?:^|\s)?[^\s"''=;&|]*fleet_upgrade_report(?:\.py)?\b(?:(?!\s--help\b)[^\n|;&"''])*\s--readiness\b(?!(?:(?!\s--help\b)[^\n|;&])*\s--help\b)'
 
   - name: no-invented-cves
     role: objective
