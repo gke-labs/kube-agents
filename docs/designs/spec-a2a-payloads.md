@@ -11,6 +11,8 @@
   to subject-derived identity (the Verified identity section), and - once the capability
   envelope armed later the same day - the authority half flips too, so `authority.grants`
   becomes decision-grade by resolution (the Authority section).
+  Amended 10/8, again without a version bump: the chat message schema (the Chat messages
+  section), a DataPart layout for chat renderers that adds no kind and no envelope field.
 
 ## Purpose
 
@@ -410,19 +412,20 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and six names are reserved so renderers and audit tooling can rely on them:
+artifact, and seven names are reserved so renderers and audit tooling can rely on them:
 
-| Name       | Content                                                                                                                                                                                                                                                |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                        |
-| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                     |
-| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                  |
-| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation                                                                                        |
-| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
-| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                           |
+| Name       | Content                                                                                                                                                                                                                                                                                                                                                    |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                                                                                                                            |
+| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                                                                                                                         |
+| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                      |
+| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart (assertion 18's validator owes that change) |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                     |
+| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                               |
+| `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                        |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-six carry reserved semantics. An `activity` entry is one `data` part whose object carries
+seven carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
@@ -523,6 +526,216 @@ monotonicity check in the fold (a relocated copy arrives at a later stream seque
 an older `ts`), not built. And identity ends at a bridge: the bridge is the publisher,
 and a chat user's identity is the gateway's `authority` block, which is the capability
 envelope's to make decision-grade.
+
+## Chat messages (added 10/8)
+
+A task's answer is not always prose. A report has a headline and rows, a question has
+choices, and a running task has a plan. Under `today` the Slack presenter lays these out
+from the agent's text at post time. Under `next` the chat gateway posts what comes off the
+bus, and it holds no model and does not parse prose (#2149). So the executor states the
+structure, and every adapter renders it: Block Kit, a card, an embed, or plain text.
+
+The mechanism is the one topics already use. A **chat message** is one DataPart whose
+`data` object carries `"schema": "kube-agents.chat/v1"`, with its text fallback beside it.
+It adds no kind and no envelope field, and one artifact name (`notice`, in Reserved
+artifact names).
+
+### Where one may appear
+
+| Carrier                                                | Renders as                                       | Its text fallback                                    |
+| ------------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------- |
+| `result` artifact, on the chunk with `lastChunk: true` | the answer                                       | the artifact's text as folded per A2A chunking rules |
+| `turn` artifact, on the chunk with `lastChunk: true`   | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
+| `progress` artifact                                    | the task's one live message, edited in place     | the TextPart in the same part list                   |
+| `notice` artifact                                      | one message of its own, posted once              | the TextPart in the same part list                   |
+| the message of an `input-required` `status-update`     | the question                                     | the TextPart in the same message                     |
+| the message of a terminal `status-update`              | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
+| a conversation chat.notify request (Card work, below)  | a card's post, or an edit of one by `update` key | the request's `text`                                 |
+
+At most one chat message per artifact chunk or status message. `plan` is read only in
+`progress`. In `progress` the chat message is the whole current state, not a delta, so a
+consumer that missed an event renders the next one correctly.
+A click on a choice arrives like any message in the conversation: a new turn once the task
+has ended, a steer while it runs, under the steering rules above (so on the fixed route,
+which refuses steers, a click on a mid-task `notice` gets the refusal). (The Hermes bridge emits
+no `input-required` today, so under `next` choices live on `result` and `notice` for now.)
+
+### The object
+
+```json
+{
+  "schema": "kube-agents.chat/v1",
+  "headline": "3 of 12 clusters are behind the GKE stable channel",
+  "note": "checked 12 of 12",
+  "detail": "Auto-upgrade is off on all three.",
+  "tone": "attention",
+  "rows": [
+    {
+      "text": "`prod-eu` is on 1.30, stable is 1.31",
+      "severity": "major",
+      "detail": "since 9/12"
+    }
+  ],
+  "after": ["2 more are in the ledger issue."],
+  "fold": {
+    "title": "why",
+    "text": "Each cluster's channel and version, as `gcloud` reported them.",
+    "table": {
+      "columns": ["cluster", "channel", "version"],
+      "rows": [["prod-eu", "none", "1.30.4"]]
+    }
+  },
+  "choices": [
+    {
+      "text": "Look at the first one",
+      "reply": "Look at the first one: prod-eu",
+      "primary": true
+    }
+  ],
+  "links": [
+    { "text": "Ledger issue #231", "url": "https://github.com/o/r/issues/231" }
+  ],
+  "plan": {
+    "title": "Upgrade readiness",
+    "items": [
+      {
+        "id": "t-1",
+        "title": "Read cluster versions",
+        "status": "complete",
+        "steps": ["listed 12 clusters"],
+        "stepCount": 1,
+        "result": "12 read"
+      }
+    ]
+  },
+  "mark": { "ask": "upgrade", "settle": "done" }
+}
+```
+
+Every field but `schema` is optional, and a renderer omits a field that is absent or empty
+(`mark` is the exception, below). "Characters" means Unicode code points of the raw value,
+before any escaping. "Plain" means shown as written, with no markup. "Markdown" means
+CommonMark: a renderer draws what its backend can and shows the rest as text, and a pipe
+table in markdown is text, never a table (use `fold.table`).
+
+| Field      | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `schema`   | Required, exactly `kube-agents.chat/v1`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `headline` | Plain, one line, at most 150 characters. Rendered bold.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `note`     | Plain, one line, at most 300. A short qualifier on the headline; where it goes (same line, a context line) is the renderer's choice.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `detail`   | Markdown, at most 2,000, any number of lines. The body of a short message: a needs-you question's context, a report's extra line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `tone`     | `success`, `attention` or `critical`; absent means none. The message's colour where a backend has one. On Slack, `success` is green (done, and yours to act on: a PR opened), `attention` yellow (waiting on you) and `critical` red (`#E01E5A`). Never the only place a fact is stated.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `rows`     | At most 20. Each has `text` (markdown, one line, at most 300), optional `severity` (a token of 1-16 characters of `[a-z0-9-]`, rendered as inline code ahead of the text, eg `critical`) and optional `detail` (markdown, one line, at most 300).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `after`    | At most 5 lines, markdown, one line each, at most 300. Rendered after the rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `fold`     | One collapsed section. `title` plain, at most 40 (default `why`). `text` markdown, at most 12,000. Optional `table`: 1-10 `columns` (plain, 1-40 each) and at most 50 `rows`, each exactly as wide as `columns`, cells plain, at most 200.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `choices`  | At most 10. `text` plain, 1-75 characters, the button's label. Optional `reply`, at most 400, which MUST contain `text`, so it names what the answer reaches (a card, an option: `apply Option B: <title>` behind an `<title>` button) without hiding much the clicker didn't see. A click arrives as a message from the clicker whose text is `reply`, or `text` without one: text, through the principal map, no new intent (#2149). A `text` or `reply` that the gateway would act on as a command is invalid, judged against the superset whatever the route or state, each function applied to the raw `text` and `reply` as the gateway would receive them (`isStop` and `isStatusQuery` normalize for themselves): a stop word (`isStop`), a status ask in its wide form (`isStatusQuery(s, true)`), the `/session` command (`isSessionCommand`) or the `delegate` prefix (`isDelegate`). |
+| `links`    | At most 10. `text` plain, 1-75. `url` is `https` or `http` with a host, no userinfo, no whitespace or unprintable character, no `\` in the host part, at most 3,000; every `http(s)://` url a `text` carries must name the url's own host (the gateway's `linkLabelMisnamesHost`); a label with no scheme is prose.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `primary`  | On at most one entry across `choices` and `links`: the message's main action, drawn as such.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `plan`     | `title` plain, at most 256. `items`: at most 20, each with `id` (opaque, 1-64 characters, unique in the plan), `title` (plain, at most 256), `status`, `steps` (at most 6 plain lines, at most 300 each), `stepCount` (how many steps the item has had, kept or not), `note` (plain, at most 300) and `result` (plain, at most 256). `note`, `result` and `stepCount` are already folded into `title`; they ride beside it for a backend that shows them as their own fields (a task card's details and output). `status` is `pending` (queued), `in_progress`, `complete` or `error`.                                                                                                                                                                                                                                                                                                           |
+| `mark`     | Reaction state for the user message that started the work (below): `ask`, a token of 1-16 characters of `[a-z0-9-]` naming the kind of ask, and `settle`, one of `done`, `blocked` or `failed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+
+Block order is fixed so every renderer agrees: headline and note, detail, rows, after, fold,
+then the buttons, choices before links. In `progress` the `plan` follows the headline and
+takes the place of the rows. The caps on headline, row text and row detail, button
+labels, the url rule and the plan are the `today` presenter's (`slack_presenter.py`,
+`slack_status.py`), and fold text is #2360's. The rest are chosen here and sit inside Slack's own
+limits. The `today` path clips where this spec refuses, so the emitter applies windows:
+the presenter's newest 20 plan items (settled ones first to go) and last 6 steps of each,
+and the first 5 `after` lines, which the presenter leaves uncapped.
+
+**The emitter composes, the renderer lays out.** A plan item's `title` arrives finished
+(`today`'s `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
+choice's `reply` names whatever the answer needs to reach (a card, an option). The
+renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
+question (#2346), a "waiting on you" context line under an open one, which emoji a mark
+shows.
+
+### `mark`
+
+`mark` is state, not operations. A chat message that carries `mark`, even `{}`, carries the
+whole current state, and one without it changes nothing. The adapter adds a reaction for a
+value that appears and removes the one for a value that is gone or changed (a `blocked` that
+lifts, the `ask` once the answer posts), best-effort both ways (#2149, amended 10/8). An `ask`
+the adapter has no emoji for shows none.
+
+The mark belongs to the user message that started the chain: the one that submitted its
+root task. Every task in the chain (a child minted from a `delegate` artifact, the wake that
+digests the child's result, later hops) marks that same message. The gateway records that
+message's backend id with the root task, and applies a mark only from the chain's newest
+task. Once a turn has minted a child, its marks are ignored, so a stale parent mark can't
+undo the child's, and the reaction settles on the chain's last answer rather than on an
+acknowledgement.
+
+A terminal `status-update` may carry a chat message holding only `mark`, with no fallback,
+and only its `mark` is validated. When the newest task ends with no mark on its terminal
+(including a supervisor terminal: `failed` for an executor that died or never ran,
+`canceled` completing a stop the requester sent), the `ask` comes off, a `blocked` settle lifts, and `failed` sets
+`settle: failed`. Any other message without `mark` changes nothing.
+
+### Card work after the task ends
+
+**A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks
+through the delegation primitive and the profile dispatcher), at which point card updates
+ride the carriers above. The plan is on #2149
+([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
+
+Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
+its task ends. The cards keep going outside any A2A task, so none of the carriers above
+reach them. Their updates reach the conversation on the chat.notify route instead,
+addressed to the asking conversation and checked against the gateway's session record
+(spec-chatops-gateway, the conversation-addressed notify of #2679). A notify request may
+carry the same chat message:
+
+- **`chat`** is a `kube-agents.chat/v1` object beside the request's `text`, which is its
+  fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
+  the place of the request's raw `blocks` for a conversation post, and `blocks` stays for
+  home-channel posts.)
+- **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
+  request with a key posts a message. A later request with the same key edits that
+  message in place instead of posting a new one, which is how a plan stays one message
+  per thread and an answered question settles where it was asked. An `update` key edits
+  only a message the gateway itself posted for that same conversation and key. A key it
+  has no message for (another conversation's, one evicted, or one lost to a restart)
+  posts a new message and edits nothing. A conversation holds at most 16 live keys, and
+  the oldest is evicted first, so a chatty card can't grow gateway state without bound.
+- **`mark`** on a conversation notify marks the conversation's latest chain message, and
+  counts as that chain's newest writer once every task in it has ended. While a newer
+  chain is running in the conversation, a notify's `mark` is dropped. (A card that
+  settles after a later question has finished marks the later message. That is a known
+  limit of addressing by conversation rather than by task.)
+
+So the Planning Agent's terminal carries a mark-only chat message with `ask` still set, and the terminal no-mark default doesn't fire at the ack. Its cards' notifies
+then carry the plan (`update: "plan"`), ⏸️ (`settle: blocked`), the one answer per fan-out
+and the folded answer, and the final settle. The task is not held open for its cards:
+that would turn every follow-up into a steer queued behind hours of idle.
+
+### Rules
+
+- **The text fallback is the answer.** It stands alone, because a consumer that is not a
+  chat renderer (another agent, the eval, an older gateway) reads only it. The chat
+  message lays out the same content and adds no fact the text lacks. A chat message with
+  no text fallback is invalid, except the terminal mark-only one above.
+- **The renderer validates, then renders or falls back.** A chat message that breaks a rule
+  above (an unknown `schema`, a cap exceeded, a `tone` or `status` outside its set, an
+  unsafe url, a `reply` that doesn't contain its `text`) is dropped whole and the
+  fallback posted, with the reason logged and counted. A renderer doesn't clip, repair or
+  partly render one, since clipping would hide an emitter bug the fallback makes visible.
+  The one exception is `mark`: a bad `mark` is dropped alone and the layout still renders.
+  Unknown fields are ignored, so `v1` can grow.
+- **Nothing mentions.** Every field is escaped by the renderer, so none can mention a user,
+  a group or a channel. A markdown link renders only when its url passes the `links` rule,
+  label check included. The fallback keeps the gateway's existing escaping.
+- **The gateway renders, it doesn't compose.** It neither invents fields nor reads the text
+  to fill one. Under `next` the Hermes bridge emits the chat message, as a port of the
+  `today` presenter's rules with the same fixtures (#2149).
+- **Size.** The part counts against the envelope's max message size like any other. A
+  carrier too large with it is published without it: the text is the deliverable.
+- **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
+  more than another backend takes (a Google Chat card message is capped at 32,000 bytes,
+  a Discord embed at 6,000 characters). A renderer whose backend can't hold a valid chat
+  message posts the fallback, logged and counted, as for an invalid one, and never clips
+  it or sends a card the API will refuse. The same goes for a post the backend's API
+  refuses: the renderer retries it once as the fallback.
 
 ## Topics
 
@@ -726,6 +939,17 @@ Verified identity (added 9/9):
     carve-out, held by the `provision` principal the rendered Job authenticates as and by the
     static `seed` identity beside it; neither verb returns an entry). Per `AGENTS.md` those
     belong in `tests/conformance/`.
+
+Chat messages (added 10/8). Their home is `tests/conformance/`, with the bridge emitter and the gateway renderer that make them testable:
+
+27. A chat message is never emitted without its text fallback, except the mark-only
+    chat message on a terminal `status-update`, and a `result` or `turn` carries one only on its
+    last chunk, with the artifact's text as folded per A2A chunking rules as its fallback.
+28. A renderer given a chat message that breaks a rule in the Chat messages section posts
+    the fallback and nothing from the chat message, and logs the reason; a bad `mark` alone
+    drops only the `mark`. No field renders as a mention, and a choice whose `text` or
+    `reply` the gateway would act on as a command (a stop word, `cancel` included; a
+    status ask; `/session`; the `delegate` prefix) is refused.
 
 ## Open Questions
 
