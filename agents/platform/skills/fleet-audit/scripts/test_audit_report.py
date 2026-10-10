@@ -9037,6 +9037,8 @@ class TestRenderBudget(BaseTestCase):
         dropped = audit_report._render_check_evidence(clusters, AUDIT, 400)
         self.assertNotIn("</details>", "\n".join(dropped))
         self.assertIn("omitted here", "\n".join(dropped))
+        # It counts the (cluster, check) pairs and says so.
+        self.assertRegex("\n".join(dropped), r"The commands behind this run's \d+ check\(s\)")
         self.assertIn("stored report", "\n".join(dropped))
         self.assertEqual(audit_report._render_check_evidence(clusters, AUDIT, 10), [])
 
@@ -9177,7 +9179,7 @@ class TestRenderBudget(BaseTestCase):
         self.assertLess(len(rendered), 4000)
         self.assertIn("truncated", rendered.lower())
 
-    def test_selection_is_a_prefix_of_the_sorted_order(self):
+    def test_selection_takes_the_most_severe_band_first(self):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
@@ -9189,6 +9191,44 @@ class TestRenderBudget(BaseTestCase):
     def test_at_least_one_finding_always_renders(self):
         rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
+
+    def test_a_target_late_in_the_alphabet_keeps_a_row_when_the_body_truncates(self):
+        early = [
+            {**f, "cluster": cluster}
+            for cluster in ("alpha", "bravo")
+            for f in bulk_findings(4, prefix=f"{cluster}")
+        ]
+        late = [{**f, "cluster": "zulu"} for f in bulk_findings(2, prefix="zulu")]
+        findings = early + late
+        one = len("\n".join(audit_report.render_finding(early[0]))) + 2 + len(early[0]["id"]) + 3
+        rendered, omitted = audit_report.select_rendered_findings(findings, one * 4)
+        clusters = [f["cluster"] for f in rendered]
+        self.assertIn("zulu", clusters)
+        self.assertEqual(len(rendered) + len(omitted), len(findings))
+        # The fair-share order decides membership only. Both lists keep the
+        # display order.
+        self.assertEqual(rendered, audit_report.sort_findings(rendered))
+        self.assertEqual(omitted, audit_report.sort_findings(omitted))
+
+    def test_fair_share_never_moves_a_finding_across_a_severity_band(self):
+        # Without bands, the cycle would take zulu's critical, then alpha's
+        # minor before alpha's second critical.
+        findings = (
+            [{**f, "cluster": "alpha"} for f in bulk_findings(2, severity="critical", prefix="ac")]
+            + [{**f, "cluster": "alpha"} for f in bulk_findings(2, severity="minor", prefix="am")]
+            + [{**f, "cluster": "zulu"} for f in bulk_findings(1, severity="critical", prefix="zc")]
+        )
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        self.assertEqual(
+            [(f["severity"], f["cluster"]) for f in order],
+            [
+                ("critical", "alpha"),
+                ("critical", "zulu"),
+                ("critical", "alpha"),
+                ("minor", "alpha"),
+                ("minor", "alpha"),
+            ],
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -9258,6 +9298,126 @@ class TestFindingAnchors(BaseTestCase):
         self.assertNotIn("href", title)
 
 
+class TestCheckEvidenceCollapse(BaseTestCase):
+    """One evidence row per check and command, not one per cluster.
+
+    A check that reads a project-wide surface once gives every cluster the
+    same command. One row per cluster repeated that string, and the table is
+    the first section the body budget drops.
+    """
+
+    NAMES = ("prod-us-east", "stage-eu", "zz-late")
+
+    def clusters(self, command=None, reason=None):
+        out = []
+        for name in self.NAMES:
+            entry = {"name": name, "location": "us-east1", "project": "acme"}
+            entry["checks_run"] = [
+                {"check": "netpol-missing", "command": command or f"kubectl --context {name} get netpol -A"}
+            ]
+            if reason:
+                entry["checks_not_applicable"] = [{"check": "privileged-container", "reason": reason}]
+            out.append(entry)
+        return out
+
+    def rows(self, lines, check):
+        return [line for line in lines if f"| `{check}` |" in line]
+
+    def test_one_shared_command_is_one_row_that_names_every_cluster(self):
+        lines = audit_report._render_check_evidence(
+            self.clusters(command="gcloud compute networks subnets list-usable"), AUDIT, 10**6
+        )
+        rows = self.rows(lines, "netpol-missing")
+        self.assertEqual(len(rows), 1)
+        for name in self.NAMES:
+            self.assertIn(f"`{name}`", rows[0])
+        # The count stays the number of (cluster, check) pairs.
+        self.assertIn(f"How this run checked the fleet ({len(self.NAMES)} checks)", "\n".join(lines))
+
+    def test_one_shared_reason_is_one_row_that_names_every_cluster(self):
+        lines = audit_report._render_check_evidence(
+            self.clusters(reason="Autopilot blocks privileged pods."), AUDIT, 10**6
+        )
+        rows = self.rows(lines, "privileged-container")
+        self.assertEqual(len(rows), 1)
+        for name in self.NAMES:
+            self.assertIn(f"`{name}`", rows[0])
+        self.assertIn(f"Not applicable ({len(self.NAMES)})", "\n".join(lines))
+
+    def test_a_command_that_names_its_cluster_keeps_one_row_per_cluster(self):
+        lines = audit_report._render_check_evidence(self.clusters(), AUDIT, 10**6)
+        rows = self.rows(lines, "netpol-missing")
+        self.assertEqual(
+            rows,
+            [
+                f"| `{name}` | `netpol-missing` | `kubectl --context {name} get netpol -A` |"
+                for name in self.NAMES
+            ],
+        )
+
+
+class TestScopePhrase(BaseTestCase):
+    """The ledger counts its targets by kind, not all as clusters.
+
+    `scope.clusters` holds projects and subnets too. Before this, a run that
+    read two clusters and one project said "Audited 3 cluster(s)", which
+    overstates the coverage of the fleet's clusters.
+    """
+
+    COST = "fleet-wide-cost-analysis"
+    COMPUTE = "gce-compute-fleet-audit"
+
+    def targets(self, *names):
+        return [{"name": name, "location": "us-east1", "project": "acme"} for name in names]
+
+    def test_a_cluster_only_stream_keeps_its_text(self):
+        self.assertEqual(
+            audit_report.scope_phrase(AUDIT, self.targets("prod-us-east", "stage-eu")),
+            "2 cluster(s)",
+        )
+        self.assertEqual(audit_report.scope_phrase(AUDIT, []), "0 cluster(s)")
+
+    def test_project_entries_are_counted_as_projects(self):
+        targets = self.targets("prod-us-east", "stage-eu", "project/acme-prod")
+        self.assertEqual(
+            audit_report.scope_phrase(self.COST, targets), "2 cluster(s) and 1 project(s)"
+        )
+        self.assertEqual(
+            audit_report.scope_phrase(self.COST, targets, "audited"),
+            "2 audited cluster(s) and 1 project(s)",
+        )
+        self.assertEqual(
+            audit_report.scope_phrase(self.COMPUTE, self.targets("project/a", "project/b")),
+            "2 project(s)",
+        )
+
+    def test_a_qualified_cluster_counts_as_a_cluster_without_a_subnet_scope(self):
+        targets = self.targets("acme/us-east1/prod", "acme/europe-west1/stage")
+        self.assertEqual(audit_report.scope_phrase(self.COST, targets), "2 cluster(s)")
+
+    def test_skipped_targets_are_counted_by_kind(self):
+        doc = make_doc(
+            findings=[make_finding()],
+            audit=self.COST,
+            skipped=[
+                {"cluster": "stage-eu", "reason": "unreachable"},
+                {"cluster": "project/acme-stage", "reason": "permission denied"},
+            ],
+        )
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("**Coverage is partial.** 1 cluster(s) and 1 project(s) could not be audited", body)
+
+    def test_the_ledger_scope_line_and_the_clean_comment_count_by_kind(self):
+        targets = self.targets("prod-us-east", "project/acme-prod")
+        doc = make_doc(findings=[make_finding()], audit=self.COST, clusters=targets)
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("Audited 1 cluster(s) and 1 project(s) on ", body)
+        clean = audit_report.render_clean_comment(
+            self.COST, make_doc(findings=[], audit=self.COST, clusters=targets), NOW, gaps=[]
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s): ", clean)
+
+
 class TestIndexOverhead(BaseTestCase):
     """The index is reserved out of the budget, not charged to a finding.
 
@@ -9305,6 +9465,35 @@ class TestIndexOverhead(BaseTestCase):
         )
         reserved = audit_report.index_overhead(findings, states, urls)
         self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+
+    def test_the_reservation_bounds_the_table_of_a_fair_share_selection(self):
+        # A rendered set is a prefix of the fair-share order, not of the
+        # display order. Here the display order puts the short `alpha` rows
+        # first, but a truncated selection alternates alpha and zulu, so the
+        # table shows the wide zulu rows too. The reservation must cover each
+        # table that a selection can show.
+        cap = audit_report.MAX_DELTA_ROWS
+        wide = "z" + "-wide" * 18
+        alpha = [{**f, "cluster": "alpha"} for f in bulk_findings(cap + 10, prefix="a")]
+        zulu = [
+            {**f, "id": f"{wide}-{i:03d}", "cluster": "zulu"}
+            for i, f in enumerate(bulk_findings(cap + 10, prefix="z"))
+        ]
+        findings = alpha + zulu
+        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+        urls = {f["id"]: "https://github.com/an-org/a-repository/pull/12345" for f in zulu}
+        reserved = audit_report.index_overhead(findings, states, urls)
+        one = len("\n".join(audit_report.render_finding(alpha[0], state=audit_report.STATE_PR_OPEN)))
+        for count in (cap // 2, cap, cap + cap // 2):
+            with self.subTest(count=count):
+                rendered, _ = audit_report.select_rendered_findings(
+                    findings, one * count, states=states, pr_urls=urls
+                )
+                table = sum(
+                    len(audit_report._index_row(f, states[f["id"]], urls.get(f["id"]))) + 1
+                    for f in rendered[:cap]
+                )
+                self.assertGreaterEqual(reserved, table)
 
     def test_the_reservation_bounds_a_table_that_hits_the_row_cap(self):
         findings = bulk_findings(audit_report.MAX_DELTA_ROWS + 20)
@@ -10024,12 +10213,11 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(len(refusals), 1)
         reason = refusals[0]["reasons"][0]
-        self.assertIn("not recorded as a collaborator", reason)
-        self.assertIn("`authorAssociation: NONE`", reason)
-        # The refusal reports the association it read, not a permission it
-        # never queried. The old wording claimed the commenter "does not have
-        # write access", which was untrue of the App that tripped this path.
-        self.assertNotIn("does not have write access", reason)
+        # The refusal gives the forge's write-access answer. It does not cite
+        # `authorAssociation`, because the harness makes that value from the
+        # answer.
+        self.assertIn("@drive-by does not have write access to this repository, so", reason)
+        self.assertNotIn("authorAssociation", reason)
         self.assertEqual(refusals[0]["comment_id"], "IC_1")
 
     def test_a_non_manifest_target_is_refused(self):
@@ -10537,6 +10725,64 @@ class TestReconcileRemediationPrs(BaseTestCase):
         self.assertEqual(set(by_finding), {"a", "b", "c"})
         self.assertTrue(all(v is None for v in by_finding.values()))
         self.assertEqual(urls, {})
+
+    def test_a_merged_pr_claims_only_the_findings_its_body_names(self):
+        # The pull request merged a fix for `a`. Later `b`, a different check,
+        # writes the same file and so lands on the same branch. The ledger
+        # must not link `b` to that pull request, but promotion still sees it.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        merged = pr(
+            9, branch, state="MERGED", merged_at="2026-08-03T00:00:00Z",
+            body=audit_report.delta_block(["a"]),
+        )
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [merged]
+        )
+        claimed, urls = audit_report.claimed_prs(by_finding)
+        self.assertEqual(claimed["a"]["number"], 9)
+        self.assertIsNone(claimed["b"])
+        self.assertNotIn("b", urls)
+        self.assertEqual(by_finding["b"]["number"], 9)
+        plan = audit_report.promotion_candidates(self.findings[:2], by_finding)
+        self.assertEqual(plan.promote, [])
+
+    def test_a_human_closed_pr_claims_only_the_findings_its_body_names(self):
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        closed = pr(9, branch, state="CLOSED", body=audit_report.delta_block(["a"]))
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [closed]
+        )
+        claimed, _ = audit_report.claimed_prs(by_finding)
+        self.assertEqual(claimed["a"]["number"], 9)
+        self.assertIsNone(claimed["b"])
+        self.assertEqual(by_finding["b"]["number"], 9)
+
+    def test_a_settled_pr_with_an_unjoinable_body_still_covers_the_group(self):
+        # No delta block, or one under an older id scheme: this run cannot
+        # tell which findings the pull request named, so it keeps the branch
+        # join and opens no new fix on a branch a human settled.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        old_scheme = audit_report.delta_block(["a"]).replace(
+            f"audit-id-scheme: {audit_report.ID_SCHEME}", "audit-id-scheme: 1"
+        )
+        for state, body in (("MERGED", ""), ("MERGED", old_scheme), ("CLOSED", "")):
+            with self.subTest(state=state, body=body):
+                settled = pr(9, branch, state=state, body=body)
+                by_finding, _ = audit_report.reconcile_remediation_prs(
+                    AUDIT, self.findings, [settled]
+                )
+                claimed, _ = audit_report.claimed_prs(by_finding)
+                self.assertEqual(claimed["a"]["number"], 9)
+                self.assertEqual(claimed["b"]["number"], 9)
+
+    def test_an_open_pr_covers_the_whole_group_whatever_its_body_names(self):
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        live = pr(9, branch, body=audit_report.delta_block(["a"]))
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [live]
+        )
+        claimed, _ = audit_report.claimed_prs(by_finding)
+        self.assertEqual(claimed["b"]["number"], 9)
 
 
 class TestOpenRemediationPr(HarnessTestCase):
@@ -11391,6 +11637,84 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         )
         self.assertEqual(self.run_finish(doc), 0, self.err)
         self.assertEqual(self.stdout_json()["prs_still_open"], [])
+
+    def settled_mixed_group(self, state, merged_at=None, labels=()):
+        """A settled pull request that names `a`, and a new `b` on the same file.
+
+        Runs `finish` and returns (a's id, b's id, the ledger body).
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        a = make_finding(fid="a")
+        b = make_finding(fid="b", check="privileged-container", title="Privileged container")
+        doc = make_doc(findings=[a, b])
+        a_id = audit_report.derive_finding_id(dict(a))
+        b_id = audit_report.derive_finding_id(dict(b))
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        settled = pr(
+            5, branch, state=state, merged_at=merged_at,
+            body=audit_report.delta_block([a_id]),
+        )
+        settled["labels"] = [{"name": name} for name in labels]
+        self.harness.replies["proposal-list"] = proposals_view([settled])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        bodies = self.harness.bodies_for("issue-create")
+        self.assertEqual(len(bodies), 1)
+        return a_id, b_id, bodies[0]
+
+    def finding_block(self, body, fid):
+        block = body.split(f"<!-- finding:{fid} -->", 1)[1]
+        return block.split("Evidence — reproduce with:", 1)[0]
+
+    def state_line(self, body, fid):
+        block = body.split(f"<!-- finding:{fid} -->", 1)[1]
+        return next(line for line in block.splitlines() if line.startswith("- **State:**"))
+
+    def test_a_human_closed_pr_on_a_mixed_group_opens_nothing_and_claims_only_its_finding(self):
+        # Promoting `b` would open its whole group, `a` too, on the closed
+        # pull request's branch: the human close would be overruled.
+        a_id, b_id, body = self.settled_mixed_group("CLOSED")
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertIn("pull/5", self.state_line(body, a_id))
+        self.assertNotIn("pull/5", self.state_line(body, b_id))
+        self.assertNotIn(b_id, json.dumps(self.harness.forge_calls("proposal-comment")))
+        # The ledger says why the sweep opened nothing for `b`.
+        self.assertIn(
+            "No pull request for this finding: a pull request on the same branch, "
+            "closed by a person, blocks an automatic one — "
+            f"https://github.com/acme/fleet/pull/5. A `/remediate {b_id}` proposes a fix "
+            "for every finding in the group that still reproduces.",
+            self.finding_block(body, b_id),
+        )
+        self.assertNotIn("blocks an automatic one", self.finding_block(body, a_id))
+
+    def test_a_merged_pr_on_a_mixed_group_opens_nothing_and_comments_only_on_its_finding(self):
+        a_id, b_id, body = self.settled_mixed_group("MERGED", merged_at="2026-07-01T00:00:00Z")
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertIn("pull/5", self.state_line(body, a_id))
+        self.assertNotIn("pull/5", self.state_line(body, b_id))
+        comments = json.dumps(self.harness.forge_calls("proposal-comment"))
+        self.assertIn(a_id, comments)
+        self.assertNotIn(b_id, comments)
+        self.assertIn(
+            "a pull request on the same branch, merged, blocks an automatic one — "
+            "https://github.com/acme/fleet/pull/5.",
+            self.finding_block(body, b_id),
+        )
+
+    def test_the_block_line_falls_back_to_the_number_without_a_url(self):
+        note = audit_report._blocked_note(
+            "b", {"number": 5, "state": "MERGED", "url": ""}, "merge request"
+        )
+        self.assertIn("blocks an automatic one — #5.", note)
+
+    def test_a_harness_closed_pr_on_a_mixed_group_blocks_nothing(self):
+        # A stale close does not block the sweep, so the ledger names no block.
+        a_id, b_id, body = self.settled_mixed_group(
+            "CLOSED", labels=(audit_report.STALE_CLOSED_LABEL,)
+        )
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+        self.assertNotIn("blocks an automatic one", body)
 
     def test_the_ledger_is_rewritten_once_the_pull_request_exists(self):
         # The body was rendered before the PR had a number, so it could not
@@ -22045,7 +22369,7 @@ class _FrozenDatetime(datetime):
         return NOW if tz is None else NOW.astimezone(tz)
 
 
-BASE_HELD_COMMENT = '### `compliance-audit` found nothing — but did not account for 1 previous finding, so the ledger stays open\n\nThe Security & RBAC Posture Audit run on 2026-08-01 09:30 UTC found **0 findings** across 1 audited cluster(s): `prod-us-east`.\n\n**This is not an all-clear.** This ledger reported each finding below, and this run\'s own `checks_run` says the check that found it ran again on that cluster — yet the document neither reports the finding again nor carries a `resolved_because` entry saying what that check showed. From here "fixed" and "not written down" are the same absence, so nothing has been reported as resolved, no remediation pull request has been closed, and the ledger stays open. It closes on the next run that reports each of these again, or says per finding why it is gone; `start` lists them under `carried`.\n\n- `cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding` — debug-binding grants cluster-admin — `ClusterRoleBinding/debug-binding` in `prod-us-east` / _cluster-scoped_; `cluster-admin-binding` ran there as `kubectl get clusterrolebindings -o json \\| jq \'.items[] \\| select(.roleRef.name=="cluster-admin")\' xxxxxxxxxxxxxxxxxxxx…`\n\n<details>\n<summary>How this run checked the fleet (1 checks)</summary>\n\nOne row per check that ran, with the command that ran it, as reported by the audit. The harness cannot confirm a command was issued — these are re-runnable so that it does not have to be taken on trust.\n\n| Cluster | Check | Command |\n| ------- | ----- | ------- |\n| `prod-us-east` | `cluster-admin-binding` | `kubectl get clusterrolebindings -o json \\| jq \'.items[]\'` |\n\n</details>'
+BASE_HELD_COMMENT = '### `compliance-audit` found nothing — but did not account for 1 previous finding, so the ledger stays open\n\nThe Security & RBAC Posture Audit run on 2026-08-01 09:30 UTC found **0 findings** across 1 audited cluster(s): `prod-us-east`.\n\n**This is not an all-clear.** This ledger reported each finding below, and this run\'s own `checks_run` says the check that found it ran again on that cluster — yet the document neither reports the finding again nor carries a `resolved_because` entry saying what that check showed. From here "fixed" and "not written down" are the same absence, so nothing has been reported as resolved, no remediation pull request has been closed, and the ledger stays open. It closes on the next run that reports each of these again, or says per finding why it is gone; `start` lists them under `carried`.\n\n- `cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding` — debug-binding grants cluster-admin — `ClusterRoleBinding/debug-binding` in `prod-us-east` / _cluster-scoped_; `cluster-admin-binding` ran there as `kubectl get clusterrolebindings -o json \\| jq \'.items[] \\| select(.roleRef.name=="cluster-admin")\' xxxxxxxxxxxxxxxxxxxx…`\n\n<details>\n<summary>How this run checked the fleet (1 checks)</summary>\n\nOne row per check and command, with the clusters it ran on, as reported by the audit. A command that answers for several clusters gets one row. The harness cannot confirm a command was issued — these are re-runnable so that it does not have to be taken on trust.\n\n| Clusters | Check | Command |\n| -------- | ----- | ------- |\n| `prod-us-east` | `cluster-admin-binding` | `kubectl get clusterrolebindings -o json \\| jq \'.items[]\'` |\n\n</details>'
 
 
 class TestGcloudEnumCasing(unittest.TestCase):
@@ -23058,8 +23382,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
-    stderr line but the per-call `forge ...` trace are what `gh` produced. One
-    call is new — the `proposal-update` that labels a pull request
+    stderr line but the per-call `forge ...` trace are what `gh` produced. Two
+    calls are new on the findings path — the `capabilities` read that asks for
+    `fileUrl`, and the `proposal-update` that labels a pull request
     `proposal-create` cannot. `identity`, which reads who wrote a comment, is
     asked only of a conversation that has comments, and none of these
     transcripts reads one.
@@ -24046,6 +24371,189 @@ class TestPhaseTimers(HarnessTestCase):
         )
         self.assertEqual((envelope["inspect_s"], envelope["publish_s"]), (812.4, 21.0))
         self.assertNotIn("collect_s", envelope)
+
+
+class TestManifestRemediationLinks(HarnessTestCase):
+    """Manifest remediation links on the ledger use `capabilities.fileUrl` when present."""
+
+    GITHUB_TEMPLATE = "https://github.com/o/r/blob/{ref}/{path}"
+    GITLAB_TEMPLATE = "https://host/g/p/-/blob/{ref}/{path}"
+    SHA = "0123456789abcdef0123456789abcdef01234567"
+    PATH = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def test_github_and_gitlab_templates_fill_ref_and_path(self):
+        finding = make_finding(
+            remediation={"kind": "manifest", "path": self.PATH, "note": "apply netpol"}
+        )
+        for template, expected_prefix in (
+            (self.GITHUB_TEMPLATE, f"https://github.com/o/r/blob/{self.SHA}/"),
+            (self.GITLAB_TEMPLATE, f"https://host/g/p/-/blob/{self.SHA}/"),
+        ):
+            with self.subTest(template=template):
+                text = "\n".join(
+                    audit_report.render_finding(
+                        finding, file_url=template, file_ref=self.SHA
+                    )
+                )
+                self.assertIn(
+                    f"- **Remediation (manifest):** [`{self.PATH}`]({expected_prefix}{self.PATH}) — apply netpol",
+                    text,
+                )
+                body = audit_report.render_issue_body(
+                    make_doc(findings=[finding]),
+                    generated_at=NOW,
+                    file_url=template,
+                    file_ref=self.SHA,
+                ).body
+                self.assertIn(f"[`{self.PATH}`]({expected_prefix}{self.PATH})", body)
+
+    def test_path_and_ref_segments_are_percent_encoded_with_slashes_kept(self):
+        path = "clusters/prod us/netpol#1%a.yaml"
+        ref = "release/2026#1%a"
+        target = audit_report.format_file_url(self.GITHUB_TEMPLATE, path, ref=ref)
+        self.assertEqual(
+            target,
+            "https://github.com/o/r/blob/release/2026%231%25a/clusters/prod%20us/netpol%231%25a.yaml",
+        )
+
+    def test_missing_or_incomplete_template_keeps_bare_path_link(self):
+        finding = make_finding(
+            remediation={"kind": "manifest", "path": self.PATH, "note": "n"}
+        )
+        for bad_template in (
+            None,
+            "",
+            "https://github.com/o/r/blob/{path}",
+            "https://github.com/o/r/blob/{ref}",
+            "https://github.com/o/r/blob/{ref}/{path}/{other}",
+        ):
+            with self.subTest(template=bad_template):
+                text = "\n".join(
+                    audit_report.render_finding(
+                        finding, file_url=bad_template, file_ref=self.SHA
+                    )
+                )
+                self.assertIn(
+                    f"- **Remediation (manifest):** [`{self.PATH}`]({self.PATH}) — n",
+                    text,
+                )
+
+    def test_select_rendered_findings_charges_the_expanded_url_against_the_budget(self):
+        findings = [
+            make_finding(
+                fid=f"netpol-missing.prod-us-east.payments.namespace-p{i}",
+                cluster=f"cluster-{i:02d}",
+                obj=f"Namespace/p{i}",
+            )
+            for i in range(25)
+        ]
+        bare_rendered, _ = audit_report.select_rendered_findings(findings, 8000)
+        expanded_rendered, _ = audit_report.select_rendered_findings(
+            findings,
+            8000,
+            file_url=self.GITHUB_TEMPLATE,
+            file_ref=self.SHA,
+        )
+        self.assertLess(len(expanded_rendered), len(bare_rendered))
+
+    def test_finish_reads_capabilities_once_and_fills_links_including_relink(self):
+        self.touch(self.PATH)
+        self.harness.replies = {
+            "capabilities": {
+                "fileUrl": "https://github.com/acme/fleet/blob/{ref}/{path}"
+            },
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/42"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+            "proposal-list": {
+                "proposals": [
+                    {
+                        "number": 8,
+                        "title": "fix",
+                        "url": "https://github.com/acme/fleet/pull/8",
+                        "state": "OPEN",
+                        "headRefName": "platform-agent/fix-compliance-audit-payments-netpol-12756a4288",
+                        "body": '<!-- audit-findings: ["netpol-missing.prod-us-east.payments.namespace-payments"] -->\n<!-- audit-id-scheme: 6 -->',
+                        "labels": ["agent:audit", "audit:compliance-audit"],
+                    }
+                ],
+                "count": 1,
+                "truncated": False,
+            },
+        }
+        doc = make_doc()
+        doc["declared_intent_searched"] = [f"acme/fleet@{self.SHA}"]
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("capabilities")), 1)
+        expected_link = (
+            f"[`{self.PATH}`](https://github.com/acme/fleet/blob/{self.SHA}/{self.PATH})"
+        )
+        created_body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(expected_link, created_body)
+        relinked_body = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn(expected_link, relinked_body)
+
+    def test_finish_falls_back_to_rev_parse_head_and_bare_path_when_capabilities_omits_file_url(self):
+        self.touch(self.PATH)
+        self.harness.replies = {
+            "capabilities": {
+                "fileUrl": "https://gitlab.example.com/group/fleet/-/blob/{ref}/{path}"
+            },
+            "rev-parse HEAD": f"{self.SHA}\n",
+            "issue-create": created("issue", "https://gitlab.example.com/group/fleet/-/issues/42"),
+        }
+        doc = make_doc(findings=[make_finding(check="privileged-container", obj="Pod/root")])
+        doc.pop("declared_intent_searched", None)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        created_body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(
+            f"[`{self.PATH}`](https://gitlab.example.com/group/fleet/-/blob/{self.SHA}/{self.PATH})",
+            created_body,
+        )
+
+        # When `capabilities` omits `fileUrl`, the bare path link stands.
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        self.harness.replies = {
+            "capabilities": {},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/43"),
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        fallback_body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(f"[`{self.PATH}`]({self.PATH})", fallback_body)
+
+    def test_harness_sha_outranks_model_declared_sha_and_settled_pr_is_not_reported_refreshed(self):
+        record_sha = "b" * 40
+        probe_sha = "c" * 40
+        model_sha = "d" * 40
+        data = {"declared_intent_searched": [f"acme/fleet@{model_sha}"]}
+        record = {"searched": [f"acme/fleet@{record_sha}"]}
+        probe = type("P", (), {"base_sha": probe_sha})()
+        self.assertEqual(
+            audit_report._repo_file_ref("acme/fleet", None, data, record, probe),
+            record_sha,
+        )
+        self.assertEqual(
+            audit_report._repo_file_ref("acme/fleet", None, data, None, probe),
+            probe_sha,
+        )
+        self.assertEqual(
+            audit_report._repo_file_ref("acme/fleet", None, data, None, None),
+            model_sha,
+        )
+
+        # If a promoted `/remediate` over a settled PR fails to open a replacement
+        # PR, `_remediation_outcomes` must not report the settled PR as refreshed.
+        requests = audit_report.RemediateRequests(["b"], [], {})
+        plan = audit_report.PromotionPlan(promote=["b"], withheld=[], already_open=[])
+        for state in ("MERGED", "CLOSED"):
+            out = audit_report._remediation_outcomes(
+                requests,
+                plan,
+                {"b": {"url": "https://github.com/acme/fleet/pull/5", "state": state}},
+                [],
+            )
+            self.assertIn("no pull request was opened", out["b"])
+            self.assertNotIn("refreshed", out["b"])
 
 
 if __name__ == "__main__":

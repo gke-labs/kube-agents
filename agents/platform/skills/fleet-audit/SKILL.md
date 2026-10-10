@@ -945,6 +945,9 @@ the previous run's ids and titles, which is how a finding is known to be new or 
 | `refused`            | `fix refused`                         | Reproduces; a **human closed** the fix     | Nothing. The close stands until someone says `/remediate`    |
 | `withdrawn`          | `fix withdrawn, awaiting re-proposal` | Reproduces; the **harness closed** the fix | Treats it as having no pull request — it is promotable again |
 
+An `open` finding can also sit on a branch whose merged pull request, or one a person closed, does
+not name it. Its state line then names that pull request, which blocks the automatic promotion.
+
 Every row above says "reproduces", and that is not an accident: **a finding that stopped reproducing
 is not in the document at all**, so it has no row in the ledger to carry a state. Two further states
 exist in the code — `resolved` and `resolved-merged` — but neither is ever rendered here. A
@@ -1126,8 +1129,17 @@ the files, not on a finding id, and that is load-bearing: ids are regenerated ev
 named after one of them gets renamed the day that finding resolves — orphaning the open pull request
 and opening a duplicate against the same file.
 
-The branch name is the only join key. There is no state file: `finish` reconstructs the entire
-finding-to-pull-request mapping from one listing of the stream's pull requests.
+The branch finds the pull request. For a merged or closed pull request, its delta block limits
+which findings it claims (when the body has no delta block under the current `ID_SCHEME`, the pull
+request claims its whole group). There is no state file: `finish` reconstructs the entire
+finding-to-pull-request mapping from one listing of the stream's pull requests. An open pull request
+claims its whole group. A finding that the delta block of a merged pull request, or of one a person
+closed, does not name shows on the ledger with no pull request, and its state line links that pull
+request: it still blocks the automatic promotion, and a `/remediate` proposes a fix for every finding
+in the group that still reproduces. A pull request the harness closed as stale blocks nothing. In
+the finding's detail block, a `manifest` remediation path links to the file at the audited repository
+commit when the forge's `capabilities` response supplies a `fileUrl` template, and stays a bare path
+otherwise.
 
 ## Size
 
@@ -1136,7 +1148,9 @@ targets 60,000 and will truncate the ledger's findings section to stay under it.
 you must not work around:
 
 - **Findings are rendered severity-first**, so truncation only ever eats the least-severe end.
-  Criticals are structurally safe.
+  Criticals are structurally safe. In a band, the cut takes one finding per target in turn: no
+  target gets a second row before every target in the band has one. A band with fewer slots than
+  targets still drops the targets late in the alphabet.
 - **The title's counts stay true.** If the body omits findings it says so explicitly. Never
   hand-trim your document to make it fit — the counts are how a reader learns the real total.
 - **Truncation does not make a run `partial`** — see [Partial coverage](#partial-coverage), which
@@ -1160,7 +1174,9 @@ is left, so on a body near the limit it is the findings that yield — and it is
 it can cost is bounded.
 
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
-`checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the
+`checks_run` entry — one row per check and command, naming every cluster it ran on, so a shared
+project-wide command is one row. Not-applicable checks collapse the same way, one row per check and
+reason. It is rendered last, against whatever budget the
 findings left, and is dropped whole rather than half if it does not fit: a partial evidence table
 reads as a short one, and "this run ran three checks" is a worse lie than saying nothing. A dropped
 table leaves a notice pointing at the run's stored report, where `fleet-audit-reports` reads every
@@ -1170,7 +1186,8 @@ command back. You do not write this section; you supply the commands and the har
 
 If the audit finds nothing, still call `finish` with `"findings": []` and a populated
 `scope.clusters`. With complete coverage the harness answers any `/remediate` still standing
-unanswered in the thread, comments the date, the clusters covered and the same _How this run
+unanswered in the thread, comments the date, the targets covered (counted by kind: clusters,
+subnets, projects) and the same _How this run
 checked the fleet_ table the ledger body carries, closes the ledger issue **as completed**, and
 closes every remediation pull request still open for the stream. The answers come first,
 deliberately: a reply posted after the close would land on an issue nobody is watching. The table
