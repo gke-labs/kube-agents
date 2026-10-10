@@ -216,7 +216,7 @@ COLLECTED_OUTCOME = "collected"
 # (as `CLUSTERS_LISTED_KEY`) to tell a fleet with no clusters from a run that
 # lost them, so the cluster checks' kind gap does not pin the run partial.
 CLUSTERS_LISTED_KEY = "clusters_listed"
-# §1's scope is every project the credential can see. These four are copied
+# §1's scope is the declared scope the agent passes, else every project the credential can see. These four are copied
 # from `fleet_waste.py`, whose discovery this mirrors: a failed or narrowed
 # project listing is one `project/UNENUMERATED_PROJECTS` target, so the loss
 # is a row the document accounts for rather than a fleet that shrank to one
@@ -226,6 +226,37 @@ NO_PROJECT_IN_SCOPE_ERROR = (
     "no project in scope: there is no active gcloud project and `gcloud projects list` "
     "returned none, so this credential sees nothing to audit"
 )
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 SCOPED_RUN_NOTE = (
     "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
     "project in this fleet was named or read, and this run cannot speak for their clusters."
@@ -593,17 +624,34 @@ def not_running_entry(c: dict, project: str) -> dict:
 
 
 class NoProjectInScope(Exception):
-    """Discovery named no project at all, which is not a fleet of empty projects."""
+    """The run has no project to read, which is not a fleet of empty projects:
+    discovery named none, or, under a declared scope, the holder refused the
+    run (nothing readable, the flags missing on a scoped sandbox, or a
+    `--project` the scope does not list) and the message says which."""
 
 
 def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
-    """The active project plus every other listed project, or the one
-    `--project` names; a copy of `fleet_waste.get_target_projects`, which
+    """The one `--project` names, else the declared scope the SOP passed from
+    the fleet_scope tool (`--scope-projects`), else the active project plus
+    every other listed project; a copy of `fleet_waste.get_target_projects`, which
     carries the reasoning. The second value is set when the scope is provably
     short of the fleet and becomes an `UNENUMERATED_PROJECTS_TARGET` entry.
     Raises `NoProjectInScope` when the credential sees no project."""
     if cli_project:
+        override_error = declared_scope.override_error(cli_project)
+        if override_error:
+            raise NoProjectInScope(override_error)
         return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
+
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is no fleet, reported as such
+        # rather than widened to the listing.
+        if not declared_scope.projects:
+            raise NoProjectInScope(declared_scope.empty_error())
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return list(declared_scope.projects), declared_scope.note()
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -2447,11 +2495,12 @@ def _before(deadline: float) -> bool:
 
 def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     """Whether a target's error is the discovery entry's note on what a run
-    skipped -- a `--project` scope or a filtered listing -- rather than a
-    failure that explains why nothing was collected."""
+    skipped -- a `--project` scope, a filtered listing, or the declared
+    projects the install could not read -- rather than a failure that explains
+    why nothing was collected."""
     if entry.get("name") != UNENUMERATED_PROJECTS_TARGET:
         return False
-    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE)
+    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
@@ -2622,8 +2671,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="audit only this project; omit to discover every project the credential can see")
+    parser.add_argument("--project", help="audit only this project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else every project the credential can see")
+    fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0

@@ -31,8 +31,11 @@ the first one happened to need.
 
 What this file does for the checks it covers:
 
-  1. Discovers every project the caller can see (`gcloud projects list`,
-     or the one `--project` names) and enumerates each one's clusters
+  1. Discovers the install's scope: the projects the agent passes from the platform_control
+     `fleet_scope` tool (`--scope-projects`); without them, on an install that declares no
+     scope, every project the caller can see (`gcloud projects list`) or the one `--project`
+     names, and on a sandbox whose operator says a scope is declared, nothing: the run
+     refuses and names the tool. Then enumerates each project's clusters
      (`gcloud container clusters list`), naming every cluster
      `<project>/<location>/<name>` because a bare name is unique only inside
      one project and location.
@@ -161,6 +164,45 @@ QUALIFIED_TARGET_SEPARATOR = "/"
 # named. Uppercase because a GCP project id cannot be, so no real project can
 # collide with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+# Where the image and the shell sandbox ship the platform scripts the collectors
+# share (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own `scripts/` for a run from the
+# repository, which a copy run from three or fewer directories below `/` does
+# not have. One list: `_import_platform_script` walks the same one lazily for
+# the broker path.
+PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+PLATFORM_SCRIPT_DIR_DEPTH = 3
+
+
+def _platform_script_dirs() -> tuple[str, ...]:
+    checkout = Path(__file__).resolve().parents
+    beside = (
+        (str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts"),)
+        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
+        else ()
+    )
+    return (*PLATFORM_SCRIPT_DIRS, *beside)
+
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in _platform_script_dirs():
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 # What that same target stands for when the operator narrowed the scope on
 # purpose. `--project` skips discovery, so a scoped run reads one project and
 # names no other; without a row saying so, `finish` resolves every ledger
@@ -204,11 +246,6 @@ GIT_DIR_NAME = ".git"
 # them. The lease marker above the workspace names the repository; the broker
 # endpoint is the one every other content-mode call uses.
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
-# Where the platform scripts the broker client lives in are found, in the order
-# `audit_report.py` appends them: the image's defaults, the volume's copy, then
-# the repository checkout this file sits in (for tests and local runs).
-PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
-PLATFORM_SCRIPT_DIR_DEPTH = 3
 # How a leased workspace directory names its repository: `owner__name`.
 REPO_DIR_SEPARATOR = "__"
 # What `broker_repo` returns for a content-mode workspace it cannot resolve to a
@@ -545,13 +582,29 @@ class Discovery(NamedTuple):
 
 
 def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Discovery:
-    """The project scope. `--project` scopes the run to one project; without
-    one it is the active project plus every project `gcloud projects list`
-    returns -- the scope `fleet_drift.discover_fleet` and
-    `patch_readiness.discover_fleet` use, so every collector audits the same
-    fleet. Discovery names projects and lists none of them."""
+    """The project scope. `--project` scopes the run to one project; else the
+    declared scope the SOP passed from the fleet_scope tool (`--scope-projects`)
+    is the sweep as given, with a declared project the install could not read
+    (`--scope-unread`) as the one note; without either it is the active project
+    plus every project `gcloud projects list` returns -- the scope
+    `fleet_drift.discover_fleet` and `patch_readiness.discover_fleet` use, so
+    every collector audits the same fleet. Discovery names projects and lists
+    none of them."""
     if base_project:
+        override_error = declared_scope.override_error(base_project)
+        if override_error:
+            return Discovery([], override_error, None)
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
+
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is a run that read no project,
+        # reported as such rather than widened to the listing.
+        if not declared_scope.projects:
+            return Discovery([], declared_scope.empty_error(), None)
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return Discovery(list(declared_scope.projects), None, declared_scope.note())
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -9348,19 +9401,13 @@ def _import_platform_script(name: str):
     """Import one of the platform scripts the broker path needs, or None.
 
     Lazy, and only on the content-mode path: a directory-mode run needs
-    nothing outside this skill's own scripts, and must not start depending on
-    the platform scripts being importable.
+    nothing outside this skill's own scripts beyond `fleet_scope_args`, which
+    every mode imports at load because every mode parses the scope flags, and
+    must not start depending on the rest being importable.
     """
     import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
 
-    checkout = Path(__file__).resolve().parents
-    # A copy run from three or fewer directories below `/` has no checkout.
-    beside = (
-        [str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts")]
-        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
-        else []
-    )
-    for directory in (*PLATFORM_SCRIPT_DIRS, *beside):
+    for directory in _platform_script_dirs():
         if directory not in sys.path:
             sys.path.append(directory)
     try:
@@ -9960,10 +10007,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--project",
         help=(
-            "single project to audit; omit to audit the active project and every "
+            "single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with "
+            "its collector_args); omit to sweep --scope-projects when given, else the active project and every "
             "project `gcloud projects list` returns"
         ),
     )
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument(
         "--workspace",
         help=(
@@ -9981,6 +10030,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

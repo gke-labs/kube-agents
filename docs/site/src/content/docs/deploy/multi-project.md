@@ -26,23 +26,30 @@ describe.
 Once IAM access is granted, the two layers of the harness discover projects
 differently:
 
-- **Platform Agent operations, governance audits, and upgrade checks (IAM
-  only):** The Platform Agent can immediately inspect resources in the target
+- **Platform Agent operations, governance audits, and upgrade checks (IAM, and
+  `spec.scope` where one is declared):** The Platform Agent can immediately inspect resources in the target
   project via `gcloud`, and scheduled governance audits and fleet upgrade checks
-  automatically discover every project the agent's identity can list
-  (`gcloud projects list` unioned with the host project), so the IAM grant is
-  what sets their scope. Audits that target GKE clusters name each one
+  sweep the install's declared scope: every project the hourly reconciler's
+  snapshot resolved it to and could read, which the agent reads through its
+  platform tools and hands to each collector, so `spec.scope`
+  is what sets their scope too, and a project the identity can list but the
+  scope never named is not swept. Every install the installer or the Terraform
+  composition makes declares a scope: the chart renders `spec.scope` on each,
+  empty lists included, so with no `SCOPE_*` key set the audits sweep the
+  host project alone, and a project reached by an IAM grant alone is not swept
+  until it is named there. Two installs declare none: a `PlatformAgent` applied by hand without a `scope` block, and a `helm install` on the chart's default values, where `platformAgent.scope` is `null` and the chart renders no block. There the audits discover every project the agent's identity can list (`gcloud projects list` unioned with the host project), so the IAM grant sets their scope. Audits that target GKE clusters name each one
   `<project>/<location>/<name>`, and the project-level audits name their targets
   `project/<id>` (and subnets `<project>/<region>/<subnet>`), so identically named
   resources in different projects never collide. If the project listing fails or
   a project cannot be read (or an audit run is narrowed to named projects), the
-  run still covers what it can reach and reports the result as partial. A
+  run still covers what it can reach and reports the result as partial, as it
+  does for a declared project the reconciler could not read. A
   project whose own relevant API is disabled counts as empty.
 - **Cluster Agent profiles, specialist routing, and Kubernetes event watching
-  (`spec.scope` or chat onboarding):** Unlike the governance audits, the hourly
+  (`spec.scope` or chat onboarding):** The hourly
   Cluster Agent reconciler (`cluster_agent_reconcile.py`) does **not** enumerate
   every project from `gcloud projects list` — by default it lists only the host
-  project. For clusters in another project to get dedicated
+  project, and its snapshot is what bounds the audits above. For clusters in another project to get dedicated
   [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles (`cluster-*`),
   appear on the Planning Agent's specialist roster, and have their Kubernetes
   warning events watched by `k8s-event-watcher`, you either declare the project
@@ -67,7 +74,10 @@ SCOPE_PROJECTS=<OTHER_PROJECT_ID>
 
 That one apply binds the read roles in the project and adds it to
 `spec.scope.projects`, which covers Steps 2 and 4 below; Step 3 (enabling the
-APIs) and the Verify section still apply. `SCOPE_EXCLUDE_PROJECTS` and
+APIs) and the Verify section still apply. It is also what brings the project
+into the scheduled audits: a role granted by hand in another project widened
+them before they followed the scope, and on an installer-made install, which
+always carries a `spec.scope` block, it no longer does. `SCOPE_EXCLUDE_PROJECTS` and
 `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`) declare exclusions the
 same way. The field and every key that sets it are described under
 [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope).
@@ -152,8 +162,9 @@ gcloud services enable \
 
 ### 4. Onboard clusters for Cluster Agent profiles and event watching (choose one approach)
 
-Granting IAM access in Step 2 is sufficient for Platform Agent CLI queries and
-scheduled governance audits. To also create per-cluster
+Granting IAM access in Step 2 is sufficient for Platform Agent CLI queries;
+scheduled governance audits follow `spec.scope` when one is declared (see above),
+and reach the project once it is declared, which Option A also does. To also create per-cluster
 [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles and enable
 real-time Kubernetes event watching on clusters in another project, choose one
 of the following approaches:
@@ -239,9 +250,10 @@ On an install made with `install.sh`:
 1. Remove the project from `SCOPE_PROJECTS` and add any chat-onboarded cluster
    in it to `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`), then run
    `./upgrade.sh --upgrade-mode=full`. The apply revokes the read roles the
-   installer bound there, and the reconciler retires the project's Cluster
-   Agent profiles over two clean runs; an excluded cluster loses its profile on
-   the next run.
+   installer bound there, the reconciler retires the project's Cluster
+   Agent profiles over two clean runs, and the scheduled audits drop the
+   project on their next run after the reconciler's next hourly run has rewritten the scope snapshot; an excluded cluster loses its profile on the
+   next run.
 2. Revoke any binding you made by hand. A folder-level grant cannot be revoked
    for one project alone; move the project out of the folder or grant per
    project instead.
@@ -258,7 +270,8 @@ On an install you manage with Helm or `kubectl` directly:
    produced is kept (listed under `unmanaged` in `fleet_scope.json`), so
    dropping the project alone leaves it in place; an excluded cluster loses its
    profile on the next run.
-3. Revoke the IAM bindings on the target project so the Platform Agent and its
-   scheduled audits stop querying it. A folder-level grant cannot be revoked for
-   one project alone; move the project out of the folder or grant per project
-   instead.
+3. Revoke the IAM bindings on the target project so the Platform Agent stops
+   querying it. The scheduled audits stopped when the project left `spec.scope`;
+   on a `PlatformAgent` with no `scope` block they stop here. A folder-level
+   grant cannot be revoked for one project alone; move the project out of the
+   folder or grant per project instead.

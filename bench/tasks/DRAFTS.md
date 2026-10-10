@@ -226,6 +226,8 @@ with the agent's service account denied the listing. Phase 1 of the scope (#1846
 mechanism it grades: a project the install was told to manage and cannot list is reported as
 `denied`, never folded into a clean fleet. A second case for the `ok` variant, where the sweep covers
 the second project's cluster through its Cluster Agent profile, is written once the fixture exists.
+`fleet-audit-sweeps-the-declared-scope` is parked the same way: its fixture is a third project the
+agent's service account can list but the scope does not declare, so a sweep that reads it is the red.
 
 ## The two cross-cutting failure cases
 

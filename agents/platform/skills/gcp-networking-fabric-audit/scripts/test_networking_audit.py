@@ -5,6 +5,8 @@ import io
 import json
 import tempfile
 import unittest
+import subprocess
+from unittest import mock
 from unittest.mock import patch
 
 import os
@@ -12,6 +14,16 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 import networking_audit
+
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+_fleet_scope_args = networking_audit.fleet_scope_args  # the collector's own import; one module, one path
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 class TestNetworkingAudit(unittest.TestCase):
     def setUp(self):
@@ -1035,6 +1047,153 @@ class CheckRoutingTest(unittest.TestCase):
         )
         validate(self, doc["findings"], doc["scope"]["skipped"], doc["scope"]["clusters"], ["p1"])
 
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    ENV = {networking_audit.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        networking_audit.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        networking_audit.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        notes: list[str] = []
+        networking_audit.declared_scope.set("payments-prod,ops-mgmt", "payments-staging=denied")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))):
+            self.assertEqual(networking_audit.get_target_projects(None, notes), ["ops-mgmt", "payments-prod"])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("payments-staging (denied)", notes[0])
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        notes: list[str] = []
+        networking_audit.declared_scope.set("ops-mgmt", "")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(networking_audit.get_target_projects(None, notes), ["ops-mgmt"])
+        self.assertEqual(notes, [])
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def fake(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (0, "ops-mgmt\nother\n", "")
+            return (0, "ops-mgmt\n", "")
+        networking_audit.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=fake):
+            self.assertEqual(networking_audit.get_target_projects(None, []), ["ops-mgmt", "other"])
+
+    def test_the_passed_scope_outranks_a_monitored_projects_variable(self):
+        # An operator's MONITORED_PROJECT_IDS narrows a listing; a scope the SOP
+        # passed from the fleet_scope tool is the whole scope, env or no env.
+        networking_audit.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, {**self.ENV, networking_audit.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(networking_audit.get_target_projects(None, []), ["ops-mgmt"])
+
+    def test_a_project_id_outside_the_declared_scope_is_refused(self):
+        errors: list[str] = []
+        networking_audit.declared_scope.set("ops-mgmt,payments-prod", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(networking_audit.get_target_projects("payments-prod", errors), ["payments-prod"])
+            self.assertEqual(networking_audit.get_target_projects("acme-only", errors), [])
+        self.assertTrue(any("declared scope does not list" in e for e in errors))
+
+    def test_a_project_id_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
+        errors: list[str] = []
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            networking_audit.declared_scope.set(None, None)
+            self.assertEqual(networking_audit.get_target_projects("123456789012", errors), [])
+        self.assertIn("got no collector_args", errors[0])
+
+    def test_a_project_number_whose_describe_fails_is_reported_as_unresolved_not_outside(self):
+        errors: list[str] = []
+        networking_audit.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(networking_audit.get_target_projects("123456789012", errors), [])
+        self.assertTrue(any("could not be resolved" in e for e in errors), errors)
+        self.assertFalse(any("declared scope does not list" in e for e in errors), errors)
+
+    def test_the_top_level_error_carries_every_listing_reason(self):
+        # A numeric --project-id whose describe fails records two reasons; the
+        # one with the remedy must not sit only in a skipped row.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "networking.json")
+            networking_audit.declared_scope.set("ops-mgmt", None)
+            with mock.patch.dict(os.environ, self.ENV), mock.patch.object(sys, "argv", [networking_audit.__file__, "--project-id", "123456789012", "--scope-projects", "ops-mgmt", "--output", out]), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")), self.assertRaises(SystemExit):
+                networking_audit.main()
+            with open(out, encoding="utf-8") as f:
+                document = json.load(f)
+            self.assertIn("could not resolve", document["error"])
+
+    def test_a_flagless_run_on_a_scoped_sandbox_exits_non_zero_with_a_top_level_error(self):
+        # As the other seven collectors: a declared scope with nothing to sweep
+        # is a failed run, not an exit-0 document with two skipped rows.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "networking.json")
+            with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), \
+                    mock.patch.object(sys, "argv", [networking_audit.__file__, "--output", out]), \
+                    mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))), \
+                    self.assertRaises(SystemExit) as caught:
+                networking_audit.main()
+            self.assertEqual(caught.exception.code, 1)
+            with open(out, encoding="utf-8") as f:
+                document = json.load(f)
+            self.assertIn("fleet_scope", document["error"])
+            self.assertEqual(document["scope"]["clusters"], [])
+
+    def test_without_a_declared_scope_an_unresolved_project_number_proceeds_as_before(self):
+        # The refusal of an unresolved number belongs to the declared-scope
+        # case alone; a checkout or an install with no scope keeps main's
+        # behaviour, the raw number with the describe failure recorded.
+        notes: list[str] = []
+        networking_audit.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(networking_audit.get_target_projects("123456789012", notes), ["123456789012"])
+        self.assertFalse(any("could not resolve" in n for n in notes), notes)
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(networking_audit.declared_scope, "set", side_effect=SystemExit(0)) as handed, \
+                mock.patch.object(sys, "argv", [networking_audit.__file__, "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"]), self.assertRaises(SystemExit):
+            networking_audit.main()
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        errors: list[str] = []
+        networking_audit.declared_scope.set(None, "payments-staging=denied")
+        with mock.patch.dict(os.environ, {**self.ENV, networking_audit.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))):
+            self.assertEqual(networking_audit.get_target_projects(None, errors), [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no project this install could read", errors[0])
+
+    def test_an_unresolved_declaration_is_not_the_declared_sweep(self):
+        # main picks the unenumerated row's tail from sweep_is_declared; under
+        # the fixed unresolved row the fleet's size is unknown, so the tail
+        # must stay the unknown one.
+        networking_audit.declared_scope.set("ops-mgmt", f"{networking_audit.fleet_scope_args.UNRESOLVED_SCOPE_ROW}=unresolved")
+        self.assertFalse(networking_audit.declared_scope.sweep_is_declared(""))
+        self.assertEqual(networking_audit.fleet_scope_args.DECLARED_SCOPE_TAIL if networking_audit.declared_scope.sweep_is_declared("") else networking_audit.UNENUMERATED_TAIL, networking_audit.UNENUMERATED_TAIL)
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, networking_audit.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1060,7 +1060,7 @@ absent key is a key the agent may write, and it is read back by exactly one modu
 The fourth is `KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json`, where the reconcile finds the
 [`spec.scope`](#specscope) declaration. The container env carries it too, for the same reason as
 `HERMES_HOME_MODE`: a line the agent writes into the PVC `.env` would otherwise outrank it and hand
-the reconcile a declaration the agent authored. Its one reader is `agents/platform/scripts/cluster_agent_reconcile.py`.
+the reconcile a declaration the agent authored. Its readers are `agents/platform/scripts/cluster_agent_reconcile.py`, which resolves it every hour, and the platform MCP server's `fleet_scope` tool (through `fleet_scope_targets.py`), which reads it when no reconcile snapshot answers, or when the last snapshot recorded no boundary.
 
 The fifth is `RECONCILE_PROJECT=`, pinned empty. The reconcile reads that variable as the management
 project ahead of the metadata server, and a management project that changes identity retires the

@@ -26,16 +26,22 @@ Neither reads versions against a target.
 
 ```bash
 ./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
+  <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
   [--project <project>]... [--target-version <version>] [--rollout-in-progress] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
-- `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
-  union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
-  (comma- or whitespace-separated) when set, or with every project visible to
-  `gcloud projects list` plus gcloud's configured project when `MONITORED_PROJECT_IDS` is unset
-  or blank.
+- `--project` is repeatable and, when given, is the whole scope; on an install with a declared scope each one must be a
+  project the `fleet_scope` tool lists and the `collector_args` must be passed beside it, or the script refuses. Otherwise `--scope-projects`, passed once as one
+  comma-separated list, is the whole scope: the install's declared scope as the platform_control `fleet_scope`
+  tool reports it. Call that tool first and paste its `collector_args`, which spells each flag once
+  (`declared: false` means the fallback that follows). `--scope-unread` sets no scope: it names the declared
+  projects the install could not read, recorded as a coverage gap, and alone it means a declared scope with
+  nothing readable, which the script reports instead of enumerating. Without `--project` or a declared scope the script
+  takes the union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
+  (comma- or whitespace-separated) when set, otherwise with every project visible to `gcloud projects list`
+  plus gcloud's configured project when it is unset or blank.
 - `--target-version` sets one target for every member, in the `MAJOR.MINOR.PATCH-gke.BUILD` form
   the fleet reports (`1.31.4-gke.1183000`); the `-gke.BUILD` suffix is optional and reads as build
   0 without it. Without the flag, each member is measured against its own release channel's
@@ -47,8 +53,8 @@ Neither reads versions against a target.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
-The script runs `gcloud container clusters list`, `gcloud container get-server-config`,
-`gcloud projects list` and `gcloud config get-value project` (plus `gcloud projects describe` for a
+The script runs `gcloud container clusters list`, `gcloud container get-server-config` and, when neither
+`--project` nor a declared scope is passed, `gcloud config get-value project` and `gcloud projects list` (plus `gcloud projects describe` for a
 project whose `clusters list` was refused as API-disabled or whose configured identifier is a
 project number), each with a 60-second timeout, and
 with `--readiness` one `gcloud container clusters get-credentials` and one `kubectl get` per member.

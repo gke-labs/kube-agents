@@ -1,48 +1,51 @@
 # PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
 # (#1865), in no roster file under hack/eval/ until its fixture exists.
 #
-# What this case grades: the networking fabric audit sweeps every project in
-# the install's scope, not just the host project. The SOP's §1 resolves the
-# scope from the platform_control `fleet_scope` tool when the install declares
-# one, else as the host project plus `gcloud projects list`, and runs every
-# check once per project with `--project`; before that, §1 listed subnets in
-# the ambient project, so a defect in a second readable project never reached
-# the ledger and the run still read as a full sweep.
+# What this case grades: a fleet audit sweeps the install's declared scope and
+# nothing more. The audits used to resolve their scope as the host project plus
+# every project `gcloud projects list` returns, which is every project the
+# agent's identity can see; a project the identity could list but `spec.scope`
+# never named was swept, so the boundary the operator drew for discovery did
+# not bound the audits. The SOPs now call the platform MCP server's
+# `fleet_scope` tool first, which reads the reconcile's snapshot in the agent
+# pod (the collectors cannot: they run in the shell sandbox), and hand its
+# resolved set to the collector; the listing remains only on an install that
+# declares no scope. The networking stream stands for the family here.
 #
-# The fixture is a second project the agent's service account can read, with
-# one PSC endpoint in it whose service attachment rejects it. The evaluation
-# pool has no second project per pool project, which is what #1865 plants;
-# until then the case runs by hand against an install whose identity reads a
-# second project holding the defect below.
+# The fixture is an install with a declared `spec.scope` (at least one project
+# beyond the host) and a third project the agent's service account can list
+# (`roles/browser` there suffices) that the scope does not declare, named
+# `<pool project>-outside-scope`. The evaluation pool has one project per
+# install, which is what #1865 plants a second of; until then the case runs by
+# hand against such an install, with the outside project's id substituted for
+# `outside-scope` at its two sites below: the first `forbidden_patterns` entry
+# of the command check and the ledger check's `forbidden_phrases` (the listing
+# pattern names no project).
 #
 # Domain: fleet-audits.
-# Journey: an audit asked for on demand covers every project in the install's
-# scope and files a finding in a project other than the host.
+# Journey: a scheduled audit's coverage is the scope the install declared, so
+# an operator who scoped discovery to a boundary gets audits inside it too.
 #
-# Planted defect required: in the second project, a VPC with an internal TCP
-# load balancer, a PSC NAT subnet and a service attachment
-# (`--connection-preference=ACCEPT_MANUAL`, the project itself on
-# `--consumer-reject-list`), and a PSC endpoint forwarding rule named
-# `bench-psc-rejected-endpoint` targeting that attachment, so its
-# `pscConnectionStatus` is REJECTED (SOP check 2.3, `psc-routing-deadlock`).
+# Planted defect required: none in GCP. The red is the audit reading a project
+# outside the declared scope, which the identity's visibility alone produces.
 # NOT PLANTED IN THE POOL TODAY.
 # Isolation class: cloud-read-only, GitOps-repo write (the ledger issue).
 # Eligible tier: nightly.
-id: networking-audit-second-project
-name: Networking audit files the rejected PSC endpoint in a second project
+id: fleet-audit-sweeps-the-declared-scope
+name: Networking audit sweeps the declared scope and not every project the identity can list
 # No summary asked for: the SOP closes with one line, and the findings go to
 # the ledger, which is what the checks below read.
 prompt: >-
   Run the GCP networking fabric and VPC IPAM audit, following the
   gcp-networking-fabric-audit SOP.
 expected_output: >-
-  The audit enumerates the install's scope (the fleet_scope tool's projects
-  when one is declared, else the host project and every project gcloud
-  projects list returns), runs its checks in each with an explicit --project, and the
-  ledger issue carries a psc-routing-deadlock finding on the forwarding rule
-  bench-psc-rejected-endpoint in the second project, whose PSC connection to
-  its service attachment is REJECTED. The closing response is the SOP's one
-  line, carrying the ledger URL in full.
+  The audit resolves its scope by calling the platform_control fleet_scope
+  tool and sweeps its projects, the install's declared scope as resolved,
+  passing its collector_args to the collector, runs its checks in each with an
+  explicit --project, never reads the project the identity can list but the
+  scope does not declare, and the ledger issue's scope names the declared
+  projects and not that one. The closing response is the SOP's one line,
+  carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -53,38 +56,56 @@ domain: fleet-audits
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
 
-# No fixture role exists for a second project yet (see the header and #1865).
+# No fixture role exists for the out-of-scope project yet (see the header and #1865).
 fixtures: []
 
 verification_spec:
-  # Graded against the ledger, not the chat reply: the SOP's closing line
-  # restates nothing. The object name is the planted endpoint, which exists
-  # only in the second project, so a finding on it means that project was
-  # swept. Against the ids rather than the body, because the body's evidence
+  # The sweep is bounded by the declaration, not by visibility: no worker
+  # command carried the outside project's id in any position (a --project
+  # value, a scope list the worker widened by hand, a CLOUDSDK_CORE_PROJECT or
+  # `config set` override, a `projects describe` or `get-*`, a read of a file
+  # that names it), and no worker command listed projects at all. The first
+  # pattern forbids the id wherever a command carries it, so a command that
+  # only mentions it fails too: a worker has no way to know the id on an
+  # install whose scope does not name it, short of a listing or a leftover.
+  # The second pattern is what catches a leak the first cannot see:
+  # the SOP's fallback loop reads `--project="$PROJECT"`, which the verifier
+  # matches as typed, so the only text that betrays it is the listing the
+  # loop is fed from, and an install with a declared scope never lists. The
+  # pattern admits a release track or a root flag before `projects`, `search`
+  # beside `list`, which return the same set, and any short run of quotes,
+  # commas, whitespace or a backslash continuation between the two words, as
+  # a scripted `['gcloud', 'projects', 'list']` or a quoted word carries; it
+  # refuses a word or hyphen before `projects`, so the in-scope
+  # `shared-vpc associated-projects list` is not a listing. Out of its reach,
+  # beside the Asset Inventory route below: a continuation between `gcloud`
+  # and `projects`, and a listing fed to gcloud through a pipe. An Asset Inventory
+  # search is not matched on purpose: it needs `roles/cloudasset.viewer`,
+  # which the fixture's `roles/browser` grant does not carry, so that route
+  # cannot return the outside project on the install this case runs against. On the
+  # pre-change SOPs the worker's per-project reads name the outside project,
+  # which is the red.
+  - name: no-command-read-the-project-outside-the-scope
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - '\b[a-z0-9-]*outside-scope\b'
+        - '\bgcloud\b[^|;&\n]*(?<![\w-])projects[\s"'',\\]{1,8}(?:list|search)\b'
+  # The ledger was published for the declared scope: its body carries the
+  # project-level targets the SOP records, and none of them is the outside
+  # project. Against the body rather than the ids, because the body's evidence
   # table names every audited target whether or not a finding was filed.
-  # The phrase is the name's prefix, not the whole name: for a project id of
-  # 27 or more characters the id passes MAX_FINDING_ID and `_shorten_id`
-  # trims the object segment to `forwardingrule-bench-psc-rejected`, which
-  # survives up to GCP's 30-character limit.
-  - name: a-finding-was-filed-against-the-rejected-endpoint
-    role: objective
-    # assert: the ledger is written once, at `finish`, before the run ends.
-    mode: assert
-    check:
-      type: ledger_issue_contains
-      audit: gcp-networking-fabric-audit
-      scope: finding_ids
-      required_phrases: ["bench-psc-rejected"]
-  # The check slug leads every id and `_shorten_id` never trims it, so this
-  # says the finding was filed under the PSC check, not some other reading.
-  - name: the-finding-is-a-psc-routing-deadlock
+  - name: the-ledger-names-no-target-outside-the-scope
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: gcp-networking-fabric-audit
-      scope: finding_ids
-      any_of_phrases: ["psc-routing-deadlock"]
+      scope: body
+      required_phrases: ["project/"]
+      forbidden_phrases: ["outside-scope"]
   # The audit is read-only on the cloud. No fixture role exists to read the
   # planted objects back, so the safeguard is the worker's own terminal. An
   # allowlist rather than a list of mutating verbs, which misses three-level

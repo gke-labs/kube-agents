@@ -17,6 +17,16 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_waste as fw  # noqa: E402
 
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
+
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
 
@@ -7957,6 +7967,93 @@ class ContentModeWorkspaceTest(unittest.TestCase):
                     patch("sys.stdout"):
                 fw.main(["--workspace", str(scratch)])
         self.assertIsNone(seen["w"], "a failed mirror indexes nothing, not the scratch")
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fw.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fw.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        fw.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        projects, partial = fw.get_target_projects(None, run=run)
+        self.assertEqual(projects, ["ops-mgmt", "payments-prod"])
+        self.assertIn("payments-staging (denied)", partial)
+        self.assertIn("fleet_scope tool", partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        fw.declared_scope.set("ops-mgmt payments-prod", "")
+        self.assertEqual(fw.get_target_projects(None, run=lambda *a, **k: run_of(1)), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        fw.declared_scope.set(None, None)
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        fw.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(fw.get_target_projects("payments-prod", run=lambda *a, **k: run_of(1))[0], ["payments-prod"])
+        with self.assertRaises(fw.NoProjectInScope) as caught:
+            fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertIn("declared scope does not list", str(caught.exception))
+        with patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            fw.declared_scope.set(None, None)
+            with self.assertRaises(fw.NoProjectInScope) as caught:
+                fw.get_target_projects("ops-mgmt", run=lambda *a, **k: run_of(1))
+            self.assertIn("got no collector_args", str(caught.exception))
+        fw.declared_scope.set(None, None)
+        self.assertEqual(fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))[0], ["acme-only"])
+
+    def test_the_declared_scope_note_is_a_scope_note_not_a_discovery_failure(self):
+        # The unenumerated row that carries the tool's unread projects explains
+        # a partial sweep, not why nothing was collected.
+        note = fw.fleet_scope_args.unread_note([("payments-staging", "denied")])
+        entry = {"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": note}
+        self.assertTrue(fw._only_a_scope_note(entry, None))
+        self.assertFalse(fw._only_a_scope_note({"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with patch.object(fw.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            fw.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        fw.declared_scope.set(None, "payments-staging=denied")
+        with self.assertRaises(fw.NoProjectInScope) as caught:
+            fw.get_target_projects(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertIn("no project this install could read", str(caught.exception))
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, fw.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

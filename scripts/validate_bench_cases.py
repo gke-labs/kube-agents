@@ -225,9 +225,18 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "fleet-audit-sweeps-the-declared-scope": (
+        "#1865: needs an install with a declared scope and a third GCP project the "
+        "agent's service account can list but the scope does not declare; the "
+        "evaluation fleet has one project per install today, so no CI tier can run "
+        "it; run it by hand against such an install, substituting the outside "
+        "project's id at the case's two sites: the command check's first forbidden "
+        "pattern and the ledger check's forbidden phrase"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
-        "service account can read, holding a PSC endpoint its service attachment "
+        "service account can read, declared in the install's spec.scope.projects (or an "
+        "install that declares none), holding a PSC endpoint its service attachment "
         "rejects; the evaluation fleet has one project per install today, so no "
         "CI tier can run it; run it by hand against an install with such a project"
     ),

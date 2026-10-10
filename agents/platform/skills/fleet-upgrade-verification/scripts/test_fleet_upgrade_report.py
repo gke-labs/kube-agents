@@ -8,12 +8,24 @@ import shutil
 import sys
 import tempfile
 import unittest
+import subprocess
+from unittest import mock
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
+
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+_fleet_scope_args = report.fleet_scope_args  # the collector's own import; one module, one path
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 
 def cluster(name, location, master, pools, channel="REGULAR", status="RUNNING"):
@@ -873,6 +885,129 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    ENV = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        report.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        report.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        notes: list[str] = []
+        report.declared_scope.set("payments-prod,ops-mgmt", "payments-staging=denied")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))):
+            self.assertEqual(report.get_target_projects(None, notes), ["ops-mgmt", "payments-prod"])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("payments-staging (denied)", notes[0])
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        notes: list[str] = []
+        report.declared_scope.set("ops-mgmt", "")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(report.get_target_projects(None, notes), ["ops-mgmt"])
+        self.assertEqual(notes, [])
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def fake(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (0, "ops-mgmt\nother\n", "")
+            return (0, "ops-mgmt\n", "")
+        report.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=fake):
+            self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt", "other"])
+
+    def test_the_passed_scope_outranks_a_monitored_projects_variable(self):
+        # An operator's MONITORED_PROJECT_IDS narrows a listing; a scope the SOP
+        # passed from the fleet_scope tool is the whole scope, env or no env.
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt"])
+
+    def test_a_project_outside_the_declared_scope_is_refused(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt,payments-prod", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+            self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
+        self.assertTrue(any("declared scope does not list" in e for e in errors))
+
+    def test_a_project_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
+        errors: list[str] = []
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            report.declared_scope.set(None, None)
+            self.assertEqual(report.get_target_projects(["123456789012"], errors), [])
+        self.assertIn("got no collector_args", errors[0])
+
+    def test_a_project_number_whose_describe_fails_is_reported_as_unresolved_not_outside(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(report.get_target_projects(["123456789012"], errors), [])
+        self.assertTrue(any("could not be resolved" in e for e in errors), errors)
+        self.assertFalse(any("declared scope does not list" in e for e in errors), errors)
+
+    def test_without_a_declared_scope_an_unresolved_project_number_proceeds_as_before(self):
+        # The refusal of an unresolved number belongs to the declared-scope
+        # case alone; a checkout or an install with no scope keeps main's
+        # behaviour, the raw number with the describe failure recorded.
+        notes: list[str] = []
+        report.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(report.get_target_projects(["123456789012"], notes), ["123456789012"])
+        self.assertFalse(any("could not resolve" in n for n in notes), notes)
+
+    def test_a_blank_project_says_so_under_a_declared_scope(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(report.get_target_projects([""], errors), [])
+        self.assertTrue(any("no value" in e for e in errors), errors)
+        # Without a declared scope the usage line main prints is the answer;
+        # this remedy would name a scope the install does not have.
+        report.declared_scope.set(None, None)
+        errors = []
+        self.assertEqual(report.get_target_projects([""], errors), [])
+        self.assertEqual(errors, [])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(report.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        errors: list[str] = []
+        report.declared_scope.set(None, "payments-staging=denied")
+        with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}):
+            self.assertEqual(report.get_target_projects(None, errors), [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no project this install could read", errors[0])
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, report.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

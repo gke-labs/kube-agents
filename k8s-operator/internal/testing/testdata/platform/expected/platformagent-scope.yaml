@@ -668,6 +668,8 @@ spec:
               value: us-central1-a
             - name: KUBE_CONTEXT_NAME
               value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBEAGENTS_SCOPE_DECLARED
+              value: "true"
             - name: SANDBOX_IMAGE_TREES
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
