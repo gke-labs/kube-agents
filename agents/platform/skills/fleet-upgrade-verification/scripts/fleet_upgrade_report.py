@@ -215,11 +215,18 @@ KUBECTL_TIMEOUT_SECONDS = 60
 # Error text from the first `kubectl get` after which the second read, against the same
 # kubeconfig, would fail the same way and only spend a second timeout: kubectl's transport
 # prefix, which a connection failure, a credential-plugin failure (`getting credentials:`) and a
-# certificate failure (`tls:`) all carry; a dial or resolver failure; or run_cmd's own deadline,
-# which a slow server also trips. The note names that class, not an unreachable server, and
-# kubectl's message stays in the error row so the operator reads which it was.
-FIRST_READ_SKIP_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
-WEBHOOK_READ_SKIPPED = f"skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline)"
+# certificate failure (`tls:`) all carry, and a dial or resolver failure. run_cmd's own deadline
+# is not one: in the agent sandbox kubectl is the credential-proxy client, whose broker may hold
+# a request in its admission queue for up to its slot wait before kubectl runs, so the deadline
+# measures the queue as often as the server, and a second read enters the queue afresh. The note
+# names the class, not an unreachable server, and kubectl's message stays in the error row.
+FIRST_READ_SKIP_MARKERS = ("Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
+WEBHOOK_READ_SKIPPED = "skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure)"
+# The credential-proxy shim keeps the first --max-output-bytes of a command's stdout, drains the
+# rest, exits 0 and writes this line to stderr; a list cut there is unparsable JSON, and the
+# error row says so rather than blaming the server.
+PROXY_TRUNCATION_MARKER = "credential proxy output truncated"
+KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
 # The member's note names the one cause its reads failed for, so an operator goes to the
 # step that failed: the directory, the credentials, the first read, the second read, or the
 # second read skipped because the first failed before the server answered it (the note names
@@ -231,8 +238,12 @@ NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDB
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
 NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
-# Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
-# custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
+# Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out or cut
+# at the proxy's cap, a custom role without webhook-configuration reads) costs the webhook rule
+# only, never the PDBs. The webhook read lists every Service and EndpointSlice in the cluster
+# though only the referenced Services are consulted; a read proportional to the webhooks (the
+# configurations first, then each referenced Service and its slices) is the change that removes
+# the cluster-size bound, and is not made here.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
 KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices"
 KUBECONFIG_ENV = "KUBECONFIG"
@@ -592,6 +603,8 @@ def _kubectl_items(resources: str, env: dict) -> tuple[list | None, str | None]:
     try:
         data = json.loads(stdout) if stdout.strip() else {}
     except ValueError as e:
+        if PROXY_TRUNCATION_MARKER in stderr:
+            return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd))
         return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
@@ -608,8 +621,9 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
     `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
     (`directory_error`); a first read that failed before the server answered it (a connection,
-    credential-plugin or certificate failure, or the deadline) skips the second rather than
-    spend a second timeout on it (`webhook_skipped`, with `webhook_error` saying so); otherwise
+    credential-plugin or certificate failure; not the deadline, which in the sandbox measures the
+    credential proxy's queue) skips the second rather than spend a second timeout on it
+    (`webhook_skipped`, with `webhook_error` saying so); otherwise
     each read fails alone, grading only its own rule `unknown`, and any
     failure makes the run exit 1.
     """

@@ -178,7 +178,8 @@ webhook without a visible backend, GKE's own URL-backed ones included, as a bloc
 - **Fail-closed webhooks**, from a second read with the same kubeconfig: `kubectl get
 validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices -A -o json`.
   It is a read of its own so that a failure there grades only this rule `unknown` and never costs
-  the PDB result. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
+  the PDB result. In the agent sandbox the credential proxy cuts a list past its output cap on the
+  largest clusters; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
   `admissionregistration.k8s.io/v1` defaults to `Fail`) and its backend is a Service the API
   server cannot reach: the Service does not exist, no Service port equals the webhook's port (443
   when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an

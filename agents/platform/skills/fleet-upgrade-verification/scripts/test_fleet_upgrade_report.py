@@ -1137,7 +1137,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
-        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the 60 s deadline); webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure); webhooks not graded", by_name["seeded-a"]["note"])
         self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
         self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
         self.assertIn("| read failed | read skipped |", text)
@@ -1170,6 +1170,41 @@ class ReadinessTest(unittest.TestCase):
         self.assertIsNone(read["credentials_error"])
         self.assertIn("cannot create kubeconfig directory", read["error"])
         self.assertEqual(read["error"], read["webhook_error"])
+
+    def test_a_first_read_killed_by_the_deadline_does_not_skip_the_webhook_read(self):
+        # In the sandbox the deadline measures the credential proxy's admission queue as often as
+        # the server, and a second read enters that queue afresh.
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return -1, "", f"timed out after {report.KUBECTL_TIMEOUT_SECONDS} seconds"
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("timed out after", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+
+    def test_a_list_cut_at_the_proxy_cap_is_named_as_such(self):
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 0, '{"items": []}', ""
+            return 0, '{"items": [{"kind": "Service", "metadata": {"na', f"{report.PROXY_TRUNCATION_MARKER}\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertEqual((read["items"], read["error"]), ([], None))
+        self.assertIsNone(read["webhook_items"])
+        self.assertIn("cut at the credential proxy's output cap", read["webhook_error"])
+        self.assertNotIn("unparsable", read["webhook_error"])
 
     def test_webhook_read_failure_leaves_the_pdb_rule_graded(self):
         fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_webhook_read=["robot-host"])
