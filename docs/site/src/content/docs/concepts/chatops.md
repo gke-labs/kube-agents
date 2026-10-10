@@ -117,6 +117,51 @@ With `KAGE_SLACK_UX` on, the alert for a crash-looping workload reads as one lin
 
 With `KAGE_SLACK_UX` on, the harness's own messages stay out of the way on Slack. Scheduled reports arrive without the `Cronjob Response` header, job ID and footer. The long-turn heartbeat, if it is enabled for Slack, says the agent is still working without naming the tool running. The agent does not announce that it is back after a restart, post the session-database warnings (the error stays in the log), or append Hermes' tip about its queueing setting. Its replies about restarting, shutting down, stopping, being busy with an earlier message, a command sent while it is working, a `/steer` it could not take, or the model provider failing or turning a request down are written plainly in its own voice, with no console commands or error text. That covers the English replies; an install set to another display language gets Hermes' translation of the restart and stop replies. Other chat platforms are unchanged, and with the flag off nothing changes.
 
+## How a chat question is answered under `next`
+
+Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from the default `today` mode is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
+
+The commands below assume the default resource names (`platform-agent`) and the `kubeagents-system` namespace. The gateway logs one JSON object per line.
+
+1. **The gateway takes the message.** It refuses a sender the channel's allowed-users list does not admit, posts a status line in the thread that reads `⏳ submitted…`, and publishes the message as a task for the `platform` addressee. When at least as many requests are already waiting or running as the bridge runs at once (10 by default), the status line says how many are ahead of yours instead: `⏳ queued — 10 requests are ahead of yours; I'll start on it as soon as there's room`. Each message that starts a turn logs an `ingress` line with its `taskId`, `conversation` and `addressee`:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"ingress"'
+   ```
+
+2. **The bridge hands it to the Planning Agent.** The `hermes-bridge` container in the agent pod takes the task from the bus and sends its text to the Hermes API server in the same pod, which runs it as a turn under the `default` profile: the Planning Agent (on an install that enables the experimental `platformFrontDoor`, the Platform Agent instead). Every message in one thread lands in the same Hermes session, so a turn sees the thread's earlier turns. The status line changes to `⚙️ working`. The bridge logs which executor it runs when it starts, and a `task accepted` line for each task:
+
+   ```bash
+   kubectl logs deployment/platform-agent-gateway -n kubeagents-system -c hermes-bridge | grep -E 'hermes bridge consuming|task accepted'
+   ```
+
+   The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread, and a card it files does not report back to the thread.
+
+3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message and the status line becomes `✅ completed`. The turn has ended; the work has not. The gateway logs the end of the turn:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"task terminal"'
+   ```
+
+   A message sent while a turn is still running is queued as the next turn in the same session (`✏️ got it, I'll take that next`); the `cli` executor refuses it instead. One sent after the acknowledgement starts a new turn.
+
+4. **The specialist works the card.** The kanban dispatcher in the agent pod starts the specialist against its own profile, with the same identity, permissions and cluster access it has under `today` ([Security and IAM](/kube-agents/reference/security-and-iam/) is canonical). No setting is needed to let it read a cluster. To inspect the cards and read one:
+
+   ```bash
+   kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban list
+   kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban show <task_id>
+   ```
+
+5. **The answer comes back to the thread.** Before each turn the bridge records which conversation its Hermes session answers, so the card is addressed to that conversation. As the specialist works, the gateway posts each progress note into the thread or DM you asked in, and then the card's result. Two things differ from delivery under `today`: each progress note is a message of its own rather than a line added to one message, because the gateway posts but does not edit, and a file the card produced is not attached. If the card blocks or fails, the Planning Agent says so in the same thread. The gateway posts only into a conversation it is still holding, the one whose session record carries the card's context, and refuses anything else. It logs each post it makes:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep -E '"msg":"(chat.notify route armed|notify posted|notify refused)'
+   ```
+
+   At startup `chat.notify route armed` should carry `"conversations":true`. Each `notify posted` line names the conversation it posted into in its `thread` field, the same key as the `conversation` field on the question's `ingress` line.
+
+The short-lived session pods that [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) describes are a different path. The gateway starts one only for a message that begins with the word `delegate` (`delegate: check prod-east`), which runs that one task in its own pod, or for a conversation moved onto its session route with the `/session` command. Such a pod reads the cluster only when the operator runs with `A2A_SESSION_CLUSTER_VIEW=true`. Any other message follows the steps above, which that setting does not affect.
+
 ## Proactive alerts (both channels)
 
 The harness doesn't only reply to messages. A cluster event posted to the in-pod triage endpoint (`inject_message` in [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)) opens a thread unprompted: it posts the alert first, then runs the triage turn in the thread that alert created. On Slack with `KAGE_SLACK_UX` on, the triage then [edits the alert itself](#buttons). The first-run inventory report arrives the same way, into the thread `bootstrap_onboarding` bound. On Slack, with `KAGE_SLACK_UX` on, the inventory report is also reshaped on its way, into a card with one number on it: a headline saying what was scanned and how many things it found to look at, a line under it when the report says something could not be scanned, every finding the report lists a row each, led by their severity when the report labels it and with the sentence under each kept, the report's line about critical findings it held back, when it has one, then a button to fix the first one and, when it found more than it shows, one to see them all. Clicking one answers as your turn in the thread; a click from someone the agent does not answer changes nothing. Where Slack refuses the card, or the post fails for any other reason, the report is posted as text with the same headline and findings, and its closing lines, or a line asking to see them all, in place of the buttons. A report that does not parse to that shape is posted as written. Where an unprompted message lands:
