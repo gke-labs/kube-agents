@@ -1,76 +1,11 @@
 ---
 title: Uninstall
-description: Remove the Platform Agent, operator, and provisioned GCP resources.
+description: Remove an install, its provisioned GCP resources, and what a teardown leaves behind.
 ---
 
-There are two levels of cleanup: removing just the Platform Agent (keeping the cluster and operator), or a full teardown of everything the installer created.
+`uninstall.sh` removes an install made by `install.sh` or the install engine: the Helm releases, the GCP resources the engine created, and the cluster when the install created it. [What a teardown leaves](#what-a-teardown-leaves) lists what survives it. Installs made another way are under [Other installs](#other-installs).
 
-## Uninstall the Platform Agent only
-
-Use this to remove the agent while leaving the GKE cluster and operator in place.
-
-1. **Delete the `PlatformAgent` CR.**
-
-   ```bash
-   kubectl delete platformagent platform-agent -n kubeagents-system --ignore-not-found=true
-   ```
-
-   If deletion hangs on a controller finalizer (e.g. the operator or its webhook is offline), clear the finalizer and retry:
-
-   ```bash
-   kubectl patch platformagent platform-agent -n kubeagents-system \
-     --type=merge -p '{"metadata":{"finalizers":null}}'
-   ```
-
-   **Note:** the `kubeagents.x-k8s.io/finalizer` finalizer is what deletes the agent's **cluster-scoped** RBAC — the minimal and tokenreview `ClusterRole` and `ClusterRoleBinding` pairs that Kubernetes cannot garbage-collect via owner references. Under `spec.mode: next`, the finalizer also deletes the auth callout's cluster-scoped ClusterRoleBinding (`kubeagents:a2a-callout-tokenreview:<namespace>:<name>`) and the NATS JetStream PersistentVolumeClaim (`data-<agent>-a2a-nats-0`). Bypassing the finalizer leaves these behind, so delete them manually (names are derived from the CR's namespace and name):
-
-   ```bash
-   kubectl delete clusterrolebinding \
-     kubeagents:minimal:kubeagents-system:platform-agent \
-     kubeagents:tokenreview:kubeagents-system:platform-agent \
-     kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent \
-     --ignore-not-found=true
-   kubectl delete clusterrole \
-     kubeagents:minimal:kubeagents-system:platform-agent \
-     kubeagents:tokenreview:kubeagents-system:platform-agent \
-     --ignore-not-found=true
-   kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
-   ```
-
-2. **Delete unmanaged or integration secrets (optional).**
-
-   ```bash
-   kubectl delete secret github-app-credentials a2a-slack-principal-map \
-     -n kubeagents-system --ignore-not-found=true
-   ```
-
-   `github-app-credentials` only exists if you configured the GitHub integration. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
-
-   **Note on `platform-agent-secrets`:** If installed via Terraform or with Helm's `platformAgent.credentials.create=true`, the core `platform-agent-secrets` Secret is managed by the Helm release rather than owned by the CR. Deleting only the CR leaves it in place for re-installations, and Helm will recreate it on the next upgrade. If `platformAgent.credentials.create=false` (the Helm default), the Secret is externally managed and will not be recreated by Helm. To purge credentials without a full teardown, delete it explicitly:
-
-   ```bash
-   kubectl delete secret platform-agent-secrets -n kubeagents-system --ignore-not-found=true
-   ```
-
-Once the CR is gone, the operator's finalizer first removes the cluster-scoped RBAC (and the JetStream PVC under `next`), then Kubernetes garbage-collects the namespaced resources the CR owns — the agent's Deployment, StatefulSet, Service, ServiceAccount, PersistentVolumeClaims, and ConfigMaps.
-
-### What `spec.mode: next` leaves behind
-
-Under the unsupported dev toggle `spec.mode: next`, toggling the mode back to `today` (`kubectl edit platformagent platform-agent`) tears down the stage-1 A2A stack (the gateway, verifier, and callout Deployments, along with their NetworkPolicies), but intentionally preserves two stateful items:
-
-1. **The generated NATS credentials Secret** (`<agent>-a2a-nats-creds`, e.g. `platform-agent-a2a-nats-creds`): Kept so toggling `next` back on does not re-roll bus passwords or invalidate client credentials.
-2. **The NATS JetStream PersistentVolumeClaim** (`data-<agent>-a2a-nats-0`, e.g. `data-platform-agent-a2a-nats-0`): JetStream's file store is the audit substrate; flipping a mode is not license to destroy audit evidence.
-
-In addition, any user-created Slack principal map Secret (`a2a-slack-principal-map`) is not owned by the CR or operator and is left untouched.
-
-To discard these stateful remnants after flipping to `today` (or when performing manual cleanup):
-
-```bash
-kubectl delete secret platform-agent-a2a-nats-creds a2a-slack-principal-map -n kubeagents-system --ignore-not-found=true
-kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
-```
-
-When deleting the `PlatformAgent` CR itself (rather than flipping to `today`), the operator's finalizer deletes the NATS JetStream PVC and the generated credentials Secret is garbage-collected via owner reference; only the user-created `a2a-slack-principal-map` Secret needs manual deletion.
+On an install made by `install.sh` the `PlatformAgent` resource and its credentials Secret (`platform-agent-secrets`) belong to the Helm release, so deleting either by hand is undone by a later upgrade that re-renders the release, and leaves the install out of step with its state until then. To remove the agent, tear the install down.
 
 ## Full teardown
 
@@ -115,6 +50,65 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ```
 
 Substitute `<RELEASE_VERSION>` with a release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases). A release copy of the script tears an install down with its own release's engine, so the version you fetch is the version that runs — unless `--source-ref` names another one, as it does above, where the point is to run the engine of the release that built the install.
+
+## Other installs
+
+An install made with Helm alone, such as the published chart or a GitOps sync, has no Terraform state, so `uninstall.sh` exits 3 and removes nothing. Remove the release (or the GitOps application that owns it). `helm uninstall` runs the chart's pre-delete hook, which deletes the `PlatformAgent` and waits for its finalizer while the operator is still running. A tool that skips Helm hooks, or a release with `platformAgent.cleanupHook.enabled=false`, needs that done by hand first:
+
+```bash
+kubectl delete platformagent platform-agent -n kubeagents-system --wait --timeout=180s
+helm uninstall <release> -n kubeagents-system
+```
+
+The finalizer removes the agent's cluster-scoped RBAC, and Kubernetes garbage-collects the namespaced objects the resource owns. The namespace, the CRDs and the shell sandbox's volumes stay, as below. So does `platform-agent-secrets` when the release did not create it (`platformAgent.credentials.create=false`, the chart default); delete it with the namespace.
+
+An install whose `PlatformAgent` was applied with `kubectl` ([Method 2 in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#method-2-manual-kubernetes-cluster-deployment)) comes apart the same way: delete the `PlatformAgent` and wait, then remove the operator (`make undeploy` and `make uninstall` in `k8s-operator/`). Removing the operator first strands the resource on its finalizer.
+
+A workspace registered by hand in another Hermes harness ([Manual install](/kube-agents/install/manual/)) is removed in that harness: unregister the `platform` agent, and the `chat` front door if you registered it, remove any scheduled jobs you wired by hand, and delete the copied `agents/platform` and `agents/chat` directories.
+
+## What a teardown leaves
+
+On GCP the teardown keeps the Cloud KMS key rings and keys (GCP cannot delete them; the next install adopts them) and the Terraform state bucket, `gs://<project>-kube-agents-tfstate`. Delete the bucket yourself if the project will not host kube-agents again:
+
+```bash
+gcloud storage rm -r gs://<project>-kube-agents-tfstate
+```
+
+The service accounts, IAM bindings, the Google Chat Pub/Sub topic and subscription, and the rest of the resources in the Terraform state are destroyed, except the project's APIs, which stay enabled. On a cluster the install did not create, the cluster-level settings it turned on stay: CMEK database encryption, the Workload Identity pool, node pools moved to the GKE metadata server, and Calico NetworkPolicy. Your `install.env` stays too, and so do the Slack app and the Google Chat app, which you configured outside the install.
+
+A cluster the install created is deleted with everything in it. On a cluster it did not create, Helm removes its releases and leaves the namespaces it installed into, `kubeagents-system` and, when the install brought cert-manager, `cert-manager`, along with the kube-agents CRDs, since Helm never deletes a chart's `crds/`. Anything in `kubeagents-system` that Helm did not create is still there: the shell sandbox's two volumes, `data-platform-agent-shell-0` and `sshd-platform-agent-shell-0`, which its StatefulSet keeps on purpose; a registry pull Secret you created, the GitLab token Secret the installer creates after the apply, and, on the unsupported `spec.mode: next`, the gateway's `a2a-slack-principal-map` and `discord-bot` Secrets if you created them. Once the teardown has finished, remove them with the namespace; delete the CRDs only when no other install on the cluster uses them, since that deletes every `PlatformAgent` on it:
+
+```bash
+kubectl delete namespace kubeagents-system
+kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io
+```
+
+### What `spec.mode: next` leaves behind
+
+The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`: its finalizer deletes the JetStream volume, `data-platform-agent-a2a-nats-0`, and the rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps that volume and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
+
+```bash
+kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system
+kubectl delete secret platform-agent-a2a-nats-creds a2a-slack-principal-map -n kubeagents-system --ignore-not-found=true
+```
+
+## If deleting the `PlatformAgent` hangs
+
+The teardown deletes the `PlatformAgent` first and clears its finalizer itself if the operator does not. Deleting it by hand while the operator or its webhook is offline can hang on the `kubeagents.x-k8s.io/finalizer` finalizer. Clear it:
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system \
+  --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
+The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.mode: next`, the JetStream volume, so a cleared finalizer leaves them behind. A teardown that clears it also deletes the `kubeagents:minimal:…` ClusterRole and binding, but not the others or the volume. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name: `kubeagents:minimal:kubeagents-system:platform-agent` and `kubeagents:tokenreview:kubeagents-system:platform-agent`, and under `next` the callout's binding `kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent`. This removes them all:
+
+```bash
+for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do
+  kubectl delete "$o"
+done
+kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
+```
 
 ## Where to go next
 
