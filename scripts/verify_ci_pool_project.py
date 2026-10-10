@@ -678,6 +678,9 @@ FLEET_RECONCILER_ROLES = {
     # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
     # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
     "roles/compute.instanceAdmin.v1",
+    # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
+    # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
+    "roles/compute.securityAdmin",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
