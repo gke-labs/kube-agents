@@ -107,7 +107,11 @@ One conjunction never reaches rung 3: an empty `trajectory` together with `token
 exactly 0 is the never-ran signature — no tool ran and no model call was billed — and
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
-429s, #1137's unestablishable tunnels); this covers the ones it cannot, such as a transport
+429s, #1137's unestablishable tunnels), and the launcher writes it too, on a record with no scores
+map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
+attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
+is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
+signature covers the producers no one names, such as a transport
 failure that comes back as an empty success with no error string. A second marker,
 `KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
 (`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
@@ -120,7 +124,7 @@ the catastrophic score grades the world outside the record — the cluster, and 
 the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
-one still blocks at rung 2. The near-misses still block at rung 3:
+one without the marker still blocks at rung 2. The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
@@ -133,10 +137,13 @@ reduces to correctness. A task with no spec at all produces no correctness and i
 **The inject lane sets aside what its transport cannot show.** A record from the harness's inject
 transport carries the task's lifecycle envelope as its trajectory (`inject.task`, `inject.post`,
 `inject.edit`, `a2a.status-update`) and, when the door showed the task's tool-call trace, an
-`a2a.activity` marker followed by the task's calls in the api path's shape. There are never card
-ids to read worker logs by (the trace carries calls without their results) and never a worker's
-tagged entries, so `worker_commands`, `worker_agents` and a `tool_called` in the `workers` or
-`all` scope are blind on every such record; a router-scope `tool_called` is blind only when the
+`a2a.activity` marker followed by the task's calls in the api path's shape. The trace carries
+calls without their results, so it names no card. The delegation wait reads the cards from the
+pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
+can carry the delegated workers' tagged entries and token counts. The scorer still treats
+`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+every such record, a policy that stays until `scoring.py` grades them on records that carry the
+workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); a router-scope `tool_called` is blind only when the
 door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
@@ -158,7 +165,7 @@ no objective check remains the repetition is `not_applicable` — a fifth outcom
 `blocked`, `pass` and `fail`, outside every rate — and a case with no scored repetition and at
 least one such is **not graded on transport** (the `Rung` member and the build-log word are both
 `NOT_GRADED_ON_TRANSPORT`), never a collapse and never infrastructure. Three edges: a scoreless
-record is a crashed scoring pass on any transport and is not re-read; a record on the api
+record is not re-read, and without the marker it is a crashed scoring pass on any transport; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
 whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,
@@ -176,9 +183,11 @@ it could fail a call that happened or pass a safeguard over one. One exception r
 a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
 _failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
 the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. The worker
-half is keyed on the transport alone (`_inject_record()`) and stays until a later change rebuilds
-the delegation wait for this path and takes those entries out of `worker_blind_checks`. A record
-from a door that cannot show the trace carries no marker and is graded as before. A case whose
+half is keyed on the transport alone (`_inject_record()`). The delegation wait for this path is
+rebuilt, but the worker half stays until `scoring.py` takes those entries out of
+`worker_blind_checks` for a record that carries the workers. A record from a door that cannot show
+the trace carries no marker and is graded as before; the harness keeps the workers' entries off
+such a record, so they cannot make it look like one whose door showed a trace. A case whose
 _premise_ needs the chat front door is a different matter from
 a check the transport blinds, and is the lane roster's
 ([`docs/eval-gate-roster.md`](../eval-gate-roster.md), "The inject lane").
@@ -962,15 +971,14 @@ It lives in **`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow 
 `hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not in this repo, which is why no change
 here can alter its schedule, budget or identity. What it has to be:
 
-| Requirement                                                   | Why                                                                                                                                                                                                                                                                                       |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would.                                                    |
-| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                                                                     |
-| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                                                                    |
-| Sets `PULL_PULL_SHA` from the checkout                        | A periodic has none, and `hack/ci-deploy.sh` falls back to the literal `latest`, so every night tags its build `pr-local-latest`. The evidence's own `commit` does not depend on it: `hack/ci-eval-pr.sh` stamps `record` with the checkout's HEAD when Prow supplies no `PULL_BASE_SHA`. |
-| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                                                                            |
-| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                                                                              |
-| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                                                                               |
+| Requirement                                                   | Why                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would. |
+| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                  |
+| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                 |
+| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                         |
+| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                           |
+| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                            |
 
 **Why nightly and not per-merge.** This was specified as a postsubmit and the arithmetic overturned
 it. `main` takes about ten merges a day — 310 in the thirty days to 2026-08-26 — and the job
@@ -1023,9 +1031,8 @@ reproduced here — a copy in a second repository is a copy that goes stale, and
 the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
-the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, `PULL_PULL_SHA` from the checkout (the
-table above), and `EVAL_REPETITIONS` only if the job overrides the script's default — with their
-comments, and nothing removed. That is a
+the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
+job overrides the script's default — with their comments, and nothing removed. That is a
 deliberate choice over factoring: the two jobs must agree on how a single run is produced, and a
 copy that is obviously a copy fails loudly under `diff` where a subtly different harness does not.
 It duplicates ~140 lines of Boskos lease, heartbeat and cleanup logic, and the right fix is to move
@@ -1149,12 +1156,6 @@ periodics:
               # Wider fan-out than the presubmit's 4: the nightly runs alone on
               # the model quota at this hour (see the timeout comment above).
               export EVAL_TASK_PARALLELISM="6"
-              # A periodic has no PULL_PULL_SHA, and ci-deploy.sh falls back to
-              # the literal "latest", so every night would tag its build
-              # pr-local-latest. extra_refs has already checked out main's
-              # head. (The evidence's commit does not depend on this: the
-              # script stamps record with HEAD when PULL_BASE_SHA is absent.)
-              export PULL_PULL_SHA="$(git rev-parse HEAD)"
               # The one line that makes this job a baseline recorder.
               # Unset, bench-gate record appends into the git checkout and
               # the append dies with the workspace -- which is exactly what

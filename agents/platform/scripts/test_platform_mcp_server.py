@@ -686,7 +686,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -711,7 +711,7 @@ class TestSendNotification(unittest.TestCase):
         # Verify hermes was called with explicit threaded path target
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "slack:space123:thread123", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -733,7 +733,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -754,7 +754,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to slack", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "slack:C12345", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -774,7 +774,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -796,11 +796,11 @@ class TestSendNotification(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 2)
         mock_run.assert_any_call(
             ["hermes", "send", "--to", "slack:C12345", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
         mock_run.assert_any_call(
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
 
@@ -1225,6 +1225,13 @@ class TestFindingsQueueTools(unittest.TestCase):
                 ("PUT", "/v1/findings/publication/backlog"),
             ],
         )
+
+    def test_marking_surfaced_never_claims_to_be_a_paced_publisher(self):
+        # Only a paced publisher may mark a finding shown; a model naming one in
+        # answer to a pull must not spend a day's budget or stop additions.
+        platform_mcp_server.mark_finding_surfaced("f-1", "spaces/AAA", "spaces/AAA/threads/T")
+        _, _, body = self.captured[-1]
+        self.assertEqual(body, {"chat_id": "spaces/AAA", "thread_id": "spaces/AAA/threads/T"})
 
     def test_update_sends_only_the_fields_the_caller_set(self):
         platform_mcp_server.update_finding("f-1", pr_state="merged")

@@ -675,6 +675,9 @@ PROW_RUNNER_ROLES = {
 # docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
 FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 FLEET_RECONCILER_ROLES = {
+    # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
+    # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
+    "roles/compute.instanceAdmin.v1",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",

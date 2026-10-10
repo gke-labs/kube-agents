@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -120,13 +120,14 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # list is how a real finding gets silenced.
 #
 # The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
-# copies of google/skills that scripts/sync-upstream-skills.py deletes and
-# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
-# hooks rewrite SKILL.md only, so a directive or fix written into one of their
-# .sh files lasts until the next sync and the target goes red on a tree nobody
-# edited by hand. A warning in one of them is fixed upstream, not here.
+# copies of google/skills that scripts/skill_overlay.py generates from the copy
+# in third_party/google-skills/ plus a patch overlay (AGENTS.md, Skills
+# Guidelines). A warning in one of them is fixed upstream, or in a patch when it
+# cannot wait, not by a directive written into the generated file.
 SHELLCHECK_PATHSPEC := *.sh
-SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
+# third_party/google-skills/ holds byte-identical copies of the same upstream skills
+# (scripts/skill_overlay.py), so it is left out for the same reason.
+SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-* :!third_party/google-skills/*
 SHELLCHECK_SEVERITY := warning
 SHELLCHECK_EXCLUDE := SC1090,SC1091
 
@@ -135,7 +136,7 @@ shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-*
 		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
 		exit 1; \
 	}
-	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' $(foreach p,$(SHELLCHECK_SKIP_PATHSPEC),'$(p)') | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
 
 # ruff's error-only rules: syntax errors (E9), comparisons that are always
 # wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
@@ -654,6 +655,35 @@ test-integration: ## Run just the integration seam tests; CI reaches them throug
 # job in validate.yml, alongside the other repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
+
+# Mirrored gke-* skills: an exact copy of google/skills at a pinned commit, this repository's
+# changes as patch files, and the generated skill the image ships
+# (docs/designs/upstream-skill-overlays.md). Each target wraps scripts/skill_overlay.py.
+SKILL_OVERLAY := python3 scripts/skill_overlay.py
+
+skills-sync: ## Sync one mirrored skill to google/skills (SKILL=name [REF=commit]); adopts a skill not yet mirrored.
+	@$(SKILL_OVERLAY) sync $(SKILL) $(if $(REF),--ref $(REF))
+
+skills-continue: ## Resume a skill sync that stopped on a conflict (SKILL=name).
+	@$(SKILL_OVERLAY) continue $(SKILL)
+
+skills-import: ## Start mirroring a skill this repository already ships (SKILL=name REF=commit); the shipped skill is unchanged.
+	@$(SKILL_OVERLAY) import $(SKILL) --ref $(REF)
+
+skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG="..."] [PATCH=nnnn to fold]).
+	@$(SKILL_OVERLAY) refresh $(SKILL) $(if $(PATCH),--patch $(PATCH)) $(if $(MSG),--message "$(MSG)")
+
+skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
+	@$(SKILL_OVERLAY) generate $(SKILL)
+
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, offline.
+	@$(SKILL_OVERLAY) check
+
+skills-status: ## List mirrored skills google/skills has moved past, and upstream skills not mirrored.
+	@$(SKILL_OVERLAY) status
+
+skills-verify-upstream: ## Compare each upstream copy with google/skills at its locked commit ([BASE=ref] skips when no copy or lock changed).
+	@$(SKILL_OVERLAY) verify-upstream $(if $(BASE),--changed-since $(BASE))
 
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as

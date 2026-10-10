@@ -125,16 +125,16 @@ func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 	}
 }
 
-// The case the field exists for (#2324): the limit raised to 2Gi and nothing
-// else. Admitted, with one note: GKE Autopilot without bursting sets the limit
-// equal to the 512Mi default request, so there the raise has no effect.
-func TestCredentialProxyTwoGiLimitIsAdmittedWithTheLimitWithoutRequestNote(t *testing.T) {
+// The case the field exists for (#2324): the limit raised past the 2Gi default
+// and nothing else. Admitted, with one note: GKE Autopilot without bursting sets
+// the limit equal to the 512Mi default request, so there the raise has no effect.
+func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	if err != nil {
-		t.Fatalf("a 2Gi memory limit was refused: %v", err)
+		t.Fatalf("a 3Gi memory limit was refused: %v", err)
 	}
 	if len(warnings) != 1 {
 		t.Fatalf("expected one warning, got %v", warnings)
@@ -223,10 +223,10 @@ func TestCredentialProxyLimitEqualToTheRequestIsNotNoted(t *testing.T) {
 func TestCredentialProxyRequestAboveTheDefaultLimitIsRefused(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.memory")
-	if !strings.Contains(msg, "operator's default 1Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
+	if !strings.Contains(msg, "operator's default 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
 		t.Errorf("message %q does not name the default limit it collides with", msg)
 	}
 }
@@ -458,4 +458,40 @@ func TestCredentialProxyLongResourceNameKeepsTheReason(t *testing.T) {
 			t.Errorf("the refusal does not say %q: %q", want, msg)
 		}
 	}
+}
+
+func apiAuthResourcesAgent(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		Spec: agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: override},
+			},
+		}},
+	}
+}
+
+// The webhook refuses a spec.deployment.agentAPIAuth.resources override at apply,
+// on the field the override crossed, so a webhook-on install is told at admission
+// what the reconciler would otherwise only report as Degraded a moment later.
+func TestAgentAPIAuthCrossedPairIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), apiAuthResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.agentAPIAuth.resources.requests.memory")
+	if !strings.Contains(msg, "exceeds the 4Gi memory limit set beside it") {
+		t.Errorf("message %q does not name the crossed limit", msg)
+	}
+}
+
+// An unknown resource name under the sidecar override is refused at admission too,
+// naming the agentAPIAuth field path rather than the credential proxy's.
+func TestAgentAPIAuthUnknownResourceNameIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), apiAuthResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}))
+	assertFieldError(t, err, "spec.deployment.agentAPIAuth.resources.limits.nvidia.com/gpu")
 }

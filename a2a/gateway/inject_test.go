@@ -3244,6 +3244,28 @@ func TestInjectProbeDescribesTheInstantTheWaitEnded(t *testing.T) {
 	}
 }
 
+// TestInjectProbeCarriesTheConversationsContextID: the read route reports
+// the A2A contextId the conversation's record carries, the one every task it
+// publishes carries, so a harness can find what an executor keyed on it (the
+// bridge's api executor's Hermes session, and the kanban cards that session
+// filed) without a turn. A conversation with no record has no contextId and
+// the key is absent rather than empty.
+func TestInjectProbeCarriesTheConversationsContextID(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-probe-context", injectTestAuthor, "answer me")
+	origin := r.awaitTask(t, "platform")
+	if origin.ContextID == "" {
+		t.Fatal("the published task carries no contextId; the rig is not exercising the record")
+	}
+	got := r.probe(t, reply.Conversation, reply.TaskID)
+	if got.Probe.ContextID != origin.ContextID {
+		t.Fatalf("probe contextId = %q, want the published task's %q", got.Probe.ContextID, origin.ContextID)
+	}
+	if raw := r.probeRaw(t, injectKeyPrefix+"case-probe-context-none", ""); raw["contextId"] != nil {
+		t.Fatalf("a conversation with no record reported contextId %s, want the key absent", raw["contextId"])
+	}
+}
+
 // TestInjectASecondPostWaitsForTheEarlierTurnToEnd: a POST is answered at
 // the accept, before its turn has ended (the end-of-turn record write and the
 // turn signal come after). A second POST on the same key inside that gap

@@ -1235,7 +1235,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
             "render_install_env.sh writes these into install.env for the "
             "reconcile path, but deploy-environment.yml's provision step never "
             "puts them in the environment install.sh reads — so a "
-            "destroy-and-rebuild of autopush or staging installs without them: "
+            "destroy-and-rebuild of a long-lived environment installs without them: "
             f"{missing}",
         )
 
@@ -1254,11 +1254,11 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 self.assertIn(name, step_env)
 
     def test_the_guard_is_armed_for_the_long_lived_environments_only(self):
-        """The dropdown's two long-lived options, and neither ephemeral one."""
+        """The dropdown's three long-lived options, and neither ephemeral one."""
         workflow = yaml.safe_load(self._WORKFLOW.read_text())
         dispatch = workflow[True]["workflow_dispatch"]
         options = dispatch["inputs"]["github_environment"]["options"]
-        self.assertEqual(sorted(options), ["autopush", "nightly", "rc", "staging"])
+        self.assertEqual(sorted(options), ["autopush", "autopush-next", "nightly", "rc", "staging"])
 
         expression = None
         for job in workflow["jobs"].values():
@@ -1266,7 +1266,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 if step.get("name") == self._STEP:
                     expression = step["env"]["LONG_LIVED_ENVIRONMENT"]
         self.assertIsNotNone(expression)
-        for env_name in ("autopush", "staging"):
+        for env_name in ("autopush", "autopush-next", "staging"):
             self.assertIn(
                 f"'{env_name}'",
                 expression,

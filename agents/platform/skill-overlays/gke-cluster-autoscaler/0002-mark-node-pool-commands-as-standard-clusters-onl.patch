@@ -1,0 +1,19 @@
+Subject: Mark node pool commands as Standard clusters only
+
+Why: node pool commands do not apply to Autopilot clusters; without the qualifier the fleet audit SOP recommended them for Autopilot members.
+Local-Issue: #1018 (fixed in #1226)
+Upstream-Issue: none filed yet
+Retire-When: upstream marks node pool commands as Standard only
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -21,7 +21,7 @@ description: >-
+ ## Provisioning Enablement
+ - **Modern GKE (1.33.3+):** Use ComputeClasses (`spec.nodePoolAutoCreation.enabled: true`). Cluster-level Node Auto Provisioning not required.
+ - **Older GKE:** `gcloud container clusters update <C> --enable-autoprovisioning --max-cpu=200 --max-memory=800`
+-- **Manual Pools:** `gcloud container node-pools update <P> --enable-autoscaling --min-nodes=1 --max-nodes=10`
++- **Manual Pools (Standard clusters only):** `gcloud container node-pools update <P> --enable-autoscaling --min-nodes=1 --max-nodes=10`
+ 
+ ## Optimization & Tuning
+ - **Fast Scale-Down / Consolidation:** Switch cluster profile (`gcloud container clusters update <C> --autoscaling-profile=optimize-utilization`) AND reduce delay in ComputeClass (`spec.autoscalingPolicy.consolidationDelayMinutes: 5`).

@@ -128,11 +128,11 @@
     },
     {
       "id": "findings-morning-nudge",
-      "name": "Findings Queue Morning Nudge",
+      "name": "Findings Queue Nudge",
       "schedule": {
         "kind": "cron",
-        "expr": "0 12 * * *",
-        "display": "0 12 * * *"
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
       },
       "prompt": "",
       "skills": [],

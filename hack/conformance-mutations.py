@@ -475,6 +475,42 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-slack-remove-allowlist-widened",
+        "agents/platform/scripts/credential_proxy.py",
+        ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',
+         'SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove", "pins.remove"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "exempt a second remove the same way the first was, one name added to "
+        "a set that reads as already settled",
+    ),
+    Mutation(
+        "B1-slack-remove-exemption-case-folded",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            method not in SLACK_REMOVE_ALLOWLIST\n",
+         "            method.lower() not in SLACK_REMOVE_ALLOWLIST\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "case-fold the exemption to match the verb rule beside it, which "
+        "forwards `Reactions.Remove` past the gate",
+    ),
+    Mutation(
+        "B1-slack-verb-rule-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ('DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})\n',
+         'DESTRUCTIVE_SLACK_VERBS = frozenset({"kick", "archive"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "replace the remove refusal with the allowlist rather than adding the "
+        "allowlist beside it",
+    ),
+    Mutation(
+        "B1-slack-method-shape-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if not SLACK_METHOD_SHAPE.fullmatch(method):\n",
+         "        if not method:\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "drop the shape check as redundant beside the verb rule, which reads "
+        "only the text after the last dot and so forwards `chat.delete#x`",
+    ),
+    Mutation(
         "B2-second-pull-requests-write",
         ".github/workflows/conformance.yml",
         ("permissions:\n  contents: read\n\njobs:\n  conformance:\n",
@@ -707,6 +743,36 @@ Mutation(
         "default branch holds, which is how the build broke in the first place; "
         "the SHA itself lives in an ARG, so the ref token is what a careless "
         "edit removes",
+    ),
+    Mutation(
+        "C4-skills-unchecked",
+        ".github/workflows/validate.yml",
+        ("run: make skills-check", "run: true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "drop the offline lock check from validate, which a CI cleanup that "
+        "sees a step with no failures could do; the pins would then go unread",
+    ),
+    Mutation(
+        "C4-skills-check-silenced",
+        ".github/workflows/validate.yml",
+        ("run: make skills-check", "run: make skills-check || true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "keep the step but discard its exit code, so a lock mismatch reports green",
+    ),
+    Mutation(
+        "C4-skills-check-skips-lock",
+        "scripts/skill_overlay.py",
+        ("            require_mirrored(skill)\n            verify_copy(skill)\n",
+         "            require_mirrored(skill)\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "drop the lock check from `check` while tidying the loop, so a hand-edited copy passes",
+    ),
+    Mutation(
+        "C4-skills-make-noop",
+        "Makefile",
+        ("SKILL_OVERLAY := python3 scripts/skill_overlay.py", "SKILL_OVERLAY := true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "point the make variable at a no-op, so every skills-* target succeeds without running",
     ),
     Mutation(
         "C5-minted-write-verb",
@@ -1254,6 +1320,91 @@ Mutation(
         "naming a cloud identity is still honoured",
     ),
     Mutation(
+        "A3-a2a-google-token-any-client",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif string(info.Aud) != v.clientID && string(info.Azp) != v.clientID {",
+         "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a Google access token issued for any OAuth client, so a token "
+        "a developer granted some other app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-google-email-unverified",
+        "a2a/gateway/a2adoor_google.go",
+        ('\tif string(info.EmailVerified) != "true" {', "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a token whose email Google has not verified, so the principal "
+        "is an address its holder never proved they own",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || email == "" {', '\tif email == "" {'),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "resolve an id that did not come through the door's Google check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-google-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aGoogleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "admit every Google-verified email, so anyone with a Google account "
+        "and the install's public client id signs in",
+    ),
+    Mutation(
+        "A3-a2a-google-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif err == nil && !d.googleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any Google account that "
+        "can mint a token for the install's client creates door conversations "
+        "and submissions that evict an allowed developer's",
+    ),
+    Mutation(
+        "A3-a2a-google-any-bearer-to-google",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif !strings.HasPrefix(token, a2aGoogleAccessTokenPrefix) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster",
+        "send every non-static bearer to Google's tokeninfo again, so a mistyped "
+        "door token or another secret pasted into Authorization leaves the cluster",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-spellable",
+        "a2a/gateway/a2adoor_google.go",
+        ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "drop the leading colon, so an eval caller \"google\" naming the context "
+        "\"<email>:<ctx>\" spells a developer's conversation key with the "
+        "static token",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-colon-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif strings.Contains(caller, ":") {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller contain a colon, so the static token's holder can "
+        "name themselves \":google:<email>\" and read that developer's tasks",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-empty-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif caller == "" {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller be empty, so its conversation key starts a2a:: "
+        "like a Google caller's and the two namespaces meet",
+    ),
+    Mutation(
+        "A3-a2a-google-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend {"),
+        "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
         "A3-slack-allowlist-skipped",
         "a2a/gateway/gchat.go",
         ('\tif authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {',
@@ -1605,8 +1756,8 @@ Mutation(
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskSupervisorSubject(pod, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive a session a grant on its own supervisor subject -- the "
         "helpful-looking change that lets a worker adapter finalise itself "
@@ -1614,14 +1765,65 @@ Mutation(
         "infrastructure",
     ),
     Mutation(
-        "A3-session-per-task-wildcard",
+        "A3-bridge-sends-a-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.gchat",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the notify subject, so a task the "
+        "bridge runs can post its result to the home channel directly -- it "
+        "shares the agent's pod and reads as the same workload. The gateway "
+        "then posts as the install's bot for a second principal",
+    ),
+    Mutation(
+        "A3-agent-answers-its-own-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifyReplySubjects)\n"),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the notify reply namespace, the symmetric-"
+        "looking grant (it already reads there). The agent can then forge the "
+        "gateway's answer about where a post landed",
+    ),
+    Mutation(
+        "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskInSubject(pod, "*"),\n\t\t},'),
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the notify subject, so a "
+        "session can post its result to the home channel itself. The gateway "
+        "then posts as the install's bot for whatever runs in a session pod",
+    ),
+    Mutation(
+        "A3-session-per-task-wildcard",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
         "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
+        "A3-profile-pod-writes-its-own-supervisor-subject",
+        "a2a/authcallout/profile_narrowing.go",
+        ("\tg := executorGrants(profile, pod)\n",
+         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "derive an AgentProfile's pods a grant on their profile's supervisor "
+        "subject, the janitor's. A profile pod could then end its own task, or "
+        "a sibling's, and have it read as the janitor declaring it dead",
+    ),
+    Mutation(
+        "A3-profile-pod-writes-its-own-in-subject",
+        "a2a/authcallout/profile_narrowing.go",
+        ("\tg := executorGrants(profile, pod)\n",
+         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
+        "derive an AgentProfile's pods a publish grant on their profile's in "
+        "subject. Every pod of the profile could then steer or cancel any of "
+        "the profile's tasks as if from the requester",
     ),
     Mutation(
         "A3-session-gains-publish-on-anothers-in-subject",

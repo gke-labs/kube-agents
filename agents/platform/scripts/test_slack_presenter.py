@@ -28,9 +28,9 @@ MARKUP_REPEATS = 10_000
 
 
 class FlagTest(unittest.TestCase):
-    def test_off_by_default(self):
+    def test_on_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(sp.enabled())
+            self.assertTrue(sp.enabled())
 
     def test_on_values(self):
         for value in ("1", "true", "TRUE", " yes ", "on"):
@@ -45,11 +45,34 @@ class FlagTest(unittest.TestCase):
 
 class ArrivalReactionTest(unittest.TestCase):
     CASES = (
-        # question / check -> eyes
-        ("is checkout-gateway restarting? it looks like it's crashlooping?", "eyes"),
-        ("why is the node pool at 90%?", "eyes"),
+        # investigate -> mag
+        ("is checkout-gateway restarting? it looks like it's crashlooping?", "mag"),
+        ("why is the node pool at 90%?", "mag"),
+        ("what are these 502 errors on checkout?", "mag"),
+        ("is checkout crashlooping?", "mag"),
+        ("diagnose the pending pods on seeded-a", "mag"),
+        # fleet -> globe_with_meridians
+        ("which clusters have pods restarting right now?", "globe_with_meridians"),
+        ("check all clusters for unready nodes", "globe_with_meridians"),
+        ("is ingress healthy across the fleet?", "globe_with_meridians"),
+        ("<@U0KAGE> list each of our clusters", "globe_with_meridians"),
+        # upgrade or version -> arrow_up
+        ("<@U0KAGE> what version is seeded-b on", "arrow_up"),
+        ("upgrade seeded-c to 1.31", "arrow_up"),
+        ("which clusters are behind their release channel default?", "arrow_up"),
+        ("is anything out of date?", "arrow_up"),
+        # cost -> moneybag
+        ("what did seeded-a cost last month?", "moneybag"),
+        ("where is our GKE spend going?", "moneybag"),
+        ("are we over budget on all clusters?", "moneybag"),
+        # security -> shield
+        ("run a security audit on seeded-b", "shield"),
+        ("any CVEs in the checkout image?", "shield"),
+        ("who has cluster-admin? check the RBAC", "shield"),
+        ("is the dashboard exposed to the internet?", "shield"),
+        # nothing more specific -> eyes
         ("check the ingress certs on seeded-a", "eyes"),
-        ("<@U0KAGE> what version is seeded-b on", "eyes"),
+        ("how many nodes does seeded-a have?", "eyes"),
         # change -> hammer_and_wrench
         ("fix it", "hammer_and_wrench"),
         ("can you fix the crashlooping pod?", "hammer_and_wrench"),
@@ -59,7 +82,7 @@ class ArrivalReactionTest(unittest.TestCase):
         ("open a PR for the memory limit", "hammer_and_wrench"),
         ("open a pull request with that change", "hammer_and_wrench"),
         ("scale the web deployment down to 2", "hammer_and_wrench"),
-        ("upgrade seeded-c to 1.31", "hammer_and_wrench"),
+        ("fix the version skew on seeded-c", "hammer_and_wrench"),
         # board -> clipboard
         ("board", "clipboard"),
         ("what's running right now?", "clipboard"),
@@ -85,6 +108,9 @@ class ArrivalReactionTest(unittest.TestCase):
         self.assertEqual(sp.arrival_reaction("the prefix looks odd"), "eyes")
         self.assertEqual(sp.arrival_reaction("downstream latency"), "eyes")
         self.assertEqual(sp.arrival_reaction("the statusline plugin"), "eyes")
+        self.assertEqual(sp.arrival_reaction("the costume party"), "eyes")
+        self.assertEqual(sp.arrival_reaction("an oomph of bloom"), "eyes")
+        self.assertEqual(sp.arrival_reaction("the clusterrole binding"), "eyes")
 
     def test_change_beats_incident_and_question(self):
         self.assertEqual(sp.arrival_reaction("prod is down, roll back now"), "hammer_and_wrench")
@@ -101,7 +127,8 @@ class ArrivalReactionTest(unittest.TestCase):
 
 class SettleReactionTest(unittest.TestCase):
     def test_outcomes(self):
-        self.assertEqual(sp.settle_reaction("done"), "white_check_mark")
+        # Done leaves no reaction: the answer in the thread says it.
+        self.assertIsNone(sp.settle_reaction("done"))
         self.assertEqual(sp.settle_reaction("blocked"), "double_vertical_bar")
         self.assertEqual(sp.settle_reaction("failed"), "x")
         self.assertIsNone(sp.settle_reaction("cancelled"))
@@ -116,11 +143,13 @@ class SettleReactionTest(unittest.TestCase):
         for kind in ("crashed", "timed_out", "status", "heartbeat", "archived", "unblocked"):
             self.assertIsNone(sp.settle_for_kanban_kind(kind), kind)
 
-    def test_no_reaction_is_a_removal(self):
+    def test_every_reaction_is_distinct(self):
         names = set(sp.SETTLE_REACTIONS.values()) | {
-            sp.REACTION_QUESTION, sp.REACTION_CHANGE, sp.REACTION_BOARD, sp.REACTION_INCIDENT,
+            sp.REACTION_QUESTION, sp.REACTION_INVESTIGATE, sp.REACTION_FLEET, sp.REACTION_UPGRADE,
+            sp.REACTION_COST, sp.REACTION_SECURITY, sp.REACTION_CHANGE, sp.REACTION_BOARD,
+            sp.REACTION_INCIDENT,
         }
-        self.assertEqual(len(names), 7)
+        self.assertEqual(len(names), 11)
 
 
 class SplitAnswerTest(unittest.TestCase):

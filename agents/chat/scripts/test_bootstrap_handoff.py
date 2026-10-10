@@ -81,6 +81,9 @@ class SharedNamesTest(unittest.TestCase):
         self.assertEqual(h.PRIORITIZE_INSTRUCTIONS_PATHS, g.PRIORITIZE_INSTRUCTIONS_PATHS)
         self.assertEqual(h.CLUSTER_AUDIT_INSTRUCTIONS_PATHS, g.CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
 
+    def test_the_limits_path_is_the_one_select_reads(self):
+        self.assertEqual(h.LIMITS_PATH, inventory_findings.DEFAULT_LIMITS_PATH)
+
 
 class MarkerTest(unittest.TestCase):
     def test_a_marker_with_a_space_after_the_equals_sign_still_names_the_sweep(self):
@@ -94,6 +97,41 @@ class MarkerTest(unittest.TestCase):
             path = Path(d) / "m"
             path.write_text("task_id = t_abc\nfiled_at=123\n")
             self.assertEqual(h._read_marker(path), {"task_id": "t_abc", "filed_at": "123"})
+
+
+class ScanMarkerTest(unittest.TestCase):
+    """read_scan_marker, the one reader of the gate's marker for the hand-off and the oobe stage."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.marker = Path(self._tmp.name) / ".bootstrap_scan_filed"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_an_id_and_an_epoch_stamp_are_read(self):
+        self.marker.write_text("task_id=t_s\nfiled_at=1000\n")
+        self.assertEqual(h.read_scan_marker(self.marker, now=2000), ("t_s", 1000.0))
+
+    def test_no_readable_id_is_none(self):
+        for text in ("filed_at=1000\n", "task_id=\nfiled_at=1000\n", "task_id = t_s # note\n"):
+            with self.subTest(text=text):
+                self.marker.write_text(text)
+                self.assertIsNone(h.read_scan_marker(self.marker, now=2000))
+
+    def test_a_stamp_that_is_not_epoch_seconds_falls_back_to_the_files_age(self):
+        mtime = 1500.0
+        for stamp in ("", "garbage", "nan", "inf", "-5", "1000000000000"):
+            with self.subTest(stamp=stamp):
+                self.marker.write_text(f"task_id=t_s\nfiled_at={stamp}\n")
+                os.utime(self.marker, (mtime, mtime))
+                self.assertEqual(h.read_scan_marker(self.marker, now=2000), ("t_s", mtime))
+
+
+    def test_a_marker_gone_before_its_age_is_read_is_none(self):
+        self.marker.write_text("task_id=t_s\nfiled_at=garbage\n")
+        with mock.patch.object(Path, "stat", side_effect=FileNotFoundError(self.marker)):
+            self.assertIsNone(h.read_scan_marker(self.marker, now=2000))
 
 
 class FindingLinesTest(unittest.TestCase):
@@ -358,6 +396,36 @@ class HandOffTest(unittest.TestCase):
         (self.d / "INVENTORY.md").unlink()
         self.assertIsNone(self._run_roster([]))
         self.assertFalse((self.d / "INVENTORY.md").exists())
+        # Nothing is selected, so nothing reads the limits.
+        self.assertFalse((self.d / "INVENTORY.limits.json").exists())
+
+    def test_the_ranking_card_gets_the_limits_this_pod_is_set_to(self):
+        _board(self.board, clusters=_all_done())
+        with mock.patch.dict(os.environ, {"FINDINGS_FIRST_REPORT_CRITICALS": "3"}):
+            self.assertEqual(self._run(), "t_rank1")
+        limits = json.loads((self.d / "INVENTORY.limits.json").read_text())
+        self.assertEqual(limits["first_report_criticals"], 3)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "limits.json"
+            path.write_text(json.dumps(limits))
+            self.assertEqual(inventory_findings.read_limits(str(path)).first_report_criticals, 3)
+        # Not in the body, the card's identity: a changed limit would archive a live card.
+        self.assertNotIn("3", h._prioritize_body())
+
+    def test_an_unset_limit_writes_the_default(self):
+        _board(self.board, clusters=_all_done())
+        with mock.patch.dict(os.environ, {"FINDINGS_FIRST_REPORT_CRITICALS": ""}):
+            self._run()
+        limits = json.loads((self.d / "INVENTORY.limits.json").read_text())
+        self.assertEqual(limits["first_report_criticals"], inventory_findings.fq.DEFAULT_FIRST_REPORT_CRITICALS)
+
+    def test_no_ranking_card_without_the_limits_file(self):
+        _board(self.board, clusters=_all_done())
+        real = h.write_raw
+        with mock.patch.object(h, "write_raw", lambda d, text, path=h.RAW_PATH: path != h.LIMITS_PATH and real(d, text, path)):
+            self.assertIsNone(self._run())
+        self.assertEqual(self.filed, [])
+        self.assertEqual(self._run(), "t_rank1")
 
     def test_the_no_coverage_report_lists_only_the_first_gaps(self):
         raw = "# r\n\n## Gaps\n\n" + "".join(f"- gap {i}\n" for i in range(25)) + "\n## Machine-Readable Findings\n"
@@ -451,6 +519,14 @@ class HandOffTest(unittest.TestCase):
     def test_a_marker_without_filed_at_times_out_from_its_own_timestamp(self):
         _board(self.board, clusters=_all_done() + [("t_stuck", "ready", None, "")])
         self.scan_marker.write_text(f"task_id={SWEEP}\n")
+        old = NOW - 10 * h.DEADLINE_SECONDS
+        os.utime(self.scan_marker, (old, old))
+        self.assertEqual(self._run(), "t_rank1")
+
+    def test_a_filed_at_in_milliseconds_times_out_from_its_own_timestamp(self):
+        # Read as seconds it would lie in the far future, and the deadline would never arrive.
+        _board(self.board, clusters=_all_done() + [("t_stuck", "ready", None, "")])
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={int(NOW * 1000)}\n")
         old = NOW - 10 * h.DEADLINE_SECONDS
         os.utime(self.scan_marker, (old, old))
         self.assertEqual(self._run(), "t_rank1")
@@ -691,6 +767,10 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(argv[-1], h.RAW_PATH)
         self.assertEqual(kw["principal"], "agent")
         inventory_findings.parse_block(kw["stdin"])
+        argv, kw = calls[1]
+        self.assertEqual(argv[-1], h.LIMITS_PATH)
+        self.assertEqual(kw["principal"], "agent")
+        self.assertIn("first_report_criticals", json.loads(kw["stdin"]))
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
 
 

@@ -6493,9 +6493,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         reservations = []
         real_reserve = executor.reserve_child_memory
 
-        def spy_reserve(caller=None, yield_when=None, deadline=None):
-            reservations.append({"yield_when": yield_when, "deadline": deadline})
-            return real_reserve(caller=caller, yield_when=yield_when, deadline=deadline)
+        def spy_reserve(caller=None, yield_when=None, deadline=None, queued_at=None):
+            reservations.append({"yield_when": yield_when, "deadline": deadline, "queued_at": queued_at})
+            return real_reserve(
+                caller=caller, yield_when=yield_when, deadline=deadline, queued_at=queued_at
+            )
 
         yield_deadlines = []
         real_await = executor._await_covered_refreshers
@@ -6516,6 +6518,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(yield_deadlines))
         self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
         self.assertIsNotNone(reservations[1]["yield_when"])
+        # The second leg is handed the first's arrival, so the one admission
+        # is observed from it; the first measures its own.
+        self.assertIsNone(reservations[0]["queued_at"])
+        self.assertIsNotNone(reservations[1]["queued_at"])
+        self.assertLessEqual(reservations[1]["queued_at"], reservations[1]["deadline"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
         # Reworded for the leg it ran on: stepped aside, with the budget's
         # figures, never `_admit`'s text naming the full wait bound.
@@ -7231,6 +7238,27 @@ class SlackRelayTest(unittest.TestCase):
         """
         relay = self.relay()
         for method in ("chat.delete", "conversations.kick", "conversations.archive", "files.remove"):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call("T123", method, {})
+
+    def test_removing_the_bots_own_reaction_is_the_one_remove_that_passes(self):
+        """`reactions.remove` takes off only the token's own reaction.
+
+        The exemption is the exact method name. Every other `*.remove` and
+        `*.delete` is still refused, and so is a case variant of the exempt
+        name: the verb rule case-folds, the exemption does not.
+        """
+        relay = self.relay()
+        self.assertTrue(relay.api_call("T123", "reactions.remove", {})["ok"])
+        for method in (
+            "chat.delete",
+            "bookmarks.remove",
+            "pins.remove",
+            "Reactions.Remove",
+            "reactions.REMOVE",
+            " reactions.remove",
+        ):
             with self.subTest(method=method):
                 with self.assertRaises(ValueError):
                     relay.api_call("T123", method, {})
@@ -9236,6 +9264,27 @@ class TwoForgeInstallTest(unittest.TestCase):
             two = credential_proxy.providers.Registry()
         with mock.patch.object(credential_proxy, "forge_registry", return_value=two):
             self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "gitlab"))
+
+    def test_a_pin_is_one_repository_on_one_forge_however_the_paths_coincide(self):
+        # The pinned base names its host: on a broker serving GitHub and GitLab,
+        # `acme/infra` on each is a different repository with its own base, a
+        # nested GitLab path pins as the forge reads it, and `www.gitlab.com`
+        # is gitlab.com.
+        pins = credential_proxy.parse_pinned_bases(json.dumps([
+            {"repository": "https://github.com/acme/infra", "branch": "release"},
+            {"repository": "https://gitlab.com/acme/infra", "branch": "main"},
+            {"repository": "https://www.gitlab.com/acme/platform/fleet", "branch": "stable"},
+        ]))
+        self.assertEqual({
+            ("github.com", "acme/infra"): "release",
+            ("gitlab.com", "acme/infra"): "main",
+            ("gitlab.com", "acme/platform/fleet"): "stable",
+        }, pins)
+        pinned = credential_proxy.providers.pinned_base
+        self.assertEqual("release", pinned(pins, "github.com", "acme/infra"))
+        self.assertEqual("main", pinned(pins, "gitlab.com", "acme/infra"))
+        self.assertEqual("stable", pinned(pins, "gitlab.com", "acme/platform/fleet"))
+        self.assertIsNone(pinned(pins, "github.com", "acme/platform/fleet"))
 
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()

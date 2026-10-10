@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -457,6 +458,83 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		}
 	})
 
+	// The agreed rule between #2473 and #2494: a gateway whose last backend
+	// goes is scaled to zero replicas, not deleted, and it keeps its fence.
+	// Only cleanupA2A takes the fence away. Red if the zero path removes
+	// the fence or skips a fence the cache did not apply.
+	t.Run("a gateway scaled to zero keeps it", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "true")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil || !state.gatewayDark {
+			t.Fatalf("precondition: want a dark pass (state=%+v err=%v)", state, err)
+		}
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+			t.Fatalf("precondition: the dark gateway was deleted, not scaled: %v", err)
+		}
+		if got := ptr.Deref(dep.Spec.Replicas, -1); got != 0 {
+			t.Fatalf("precondition: the dark gateway asks for %d replicas, want 0", got)
+		}
+		assertA2AGatewayFence(t, ctx, cl, agent)
+	})
+
+	// The same pass over a cache that has not seen the gateway yet (or has
+	// lost it for a moment) while the API server holds it at zero replicas:
+	// the absent path's fence removal must not run on a stale NotFound. The
+	// fence stands in the cache, so the pass confirms live, finds the
+	// gateway, and takes the zero path, applying the fence itself because
+	// the fences pass, reading the same cache, did not. Red if the absent
+	// path's removal runs, or if the zero path skips that apply.
+	t.Run("a stale cache miss on a dark pass keeps it", func(t *testing.T) {
+		t.Setenv(a2aInjectBackendEnvVar, "true")
+		t.Setenv(a2aAgentDoorEnvVar, "")
+		agent := a2aTestAgent()
+		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		gatewayRendered(t, cl, agent)
+		assertA2AGatewayFence(t, ctx, cl, agent)
+		// The fence edited by hand to admit everyone: only an apply on this
+		// pass puts the collector-only rule back, so the assertion below
+		// tells a pass that applied the fence from one that merely left it.
+		tampered := &networkingv1.NetworkPolicy{}
+		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), tampered); err != nil {
+			t.Fatal(err)
+		}
+		tampered.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+		if err := cl.Update(ctx, tampered); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(a2aInjectBackendEnvVar, "")
+		gatewayKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+		r.APIReader = cl
+		r.Client = staleDeploymentClient{Client: cl, key: gatewayKey}
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil || !state.gatewayDark {
+			t.Fatalf("precondition: want a dark pass (state=%+v err=%v)", state, err)
+		}
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, gatewayKey, dep); err != nil {
+			t.Fatalf("precondition: the gateway is gone: %v", err)
+		}
+		if got := ptr.Deref(dep.Spec.Replicas, -1); got != 0 {
+			t.Errorf("the gateway the live read found asks for %d replicas on a dark pass, want 0", got)
+		}
+		assertA2AGatewayFence(t, ctx, cl, agent)
+	})
+
 	// The gateway and its callout both taken away by hand: the callout is
 	// re-applied with no serving replica, so the next pass holds the gateway,
 	// and the fence goes with it.
@@ -626,4 +704,18 @@ func TestTheA2AGatewayFenceIsAppliedOncePerPass(t *testing.T) {
 		}
 	}
 	assertA2AGatewayFence(t, ctx, cl, agent)
+}
+
+// staleDeploymentClient answers NotFound for one Deployment, as an informer
+// that has not caught up would, and passes every other read through.
+type staleDeploymentClient struct {
+	client.Client
+	key types.NamespacedName
+}
+
+func (c staleDeploymentClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*appsv1.Deployment); ok && key == c.key {
+		return errors.NewNotFound(appsv1.Resource("deployments"), key.Name)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }

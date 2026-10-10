@@ -3199,6 +3199,8 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
 				{Name: a2aBusUserEnv, Value: "gateway"},
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
+				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
+				{Name: a2aNotifyConversationsEnvVar, Value: "google_chat"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -3239,7 +3241,11 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// would choose the principal. And a surviving A2A_BUS_TOKEN_FILE would be
 	// the file the CLI presents as a token instead of the projected one, which
 	// it prefers unconditionally and with no fallback.
-	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv} {
+	// A2A_NOTIFY_PLATFORM is the fourth: on this install Chat is not armed,
+	// so the operator renders no value, and a plugin's would reroute the
+	// agent's proactive posts to a route with no gateway behind it.
+	// A2A_NOTIFY_CONVERSATIONS is the fifth, for the same reason.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
@@ -3253,7 +3259,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
@@ -3280,6 +3286,14 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		}
 		if !found {
 			t.Error("today dropped a plugin's NATS_URL; the reservation must be gated on the A2A surface")
+		}
+		// The one exception: A2A_NOTIFY_PLATFORM is dropped on today as well,
+		// because there it would reroute every Google Chat post from hermes
+		// send to a chat.notify route the install does not have.
+		for _, e := range c.Env {
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar {
+				t.Errorf("a plugin's %s survived on a today install: %q", e.Name, e.Value)
+			}
 		}
 	}
 }
@@ -3448,7 +3462,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// this test against the two-argument signature on main.
 	agent := a2aTestAgent()
 	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
-	doc, err := renderA2AAuthMap(agent)
+	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}
@@ -4706,7 +4720,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // which is how a CONSUMER.CREATE grant becomes a read of a stream the subject
 // list withholds), and no reach into the buckets.
 func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
-	doc, err := renderA2AAuthMap(a2aTestAgent())
+	doc, err := renderA2AAuthMap(a2aTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}
@@ -4726,11 +4740,11 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 		"a2a.topics.shared.annotations",
 	}
 	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
-	wantPublish = append(wantPublish, "_INBOX."+a2aAgentBusUser+".>")
+	wantPublish = append(wantPublish, "chat.notify.gchat", "_INBOX."+a2aAgentBusUser+".>")
 	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
 		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
 	}
-	if want := []string{"a2a.topics.>", "_INBOX." + a2aAgentBusUser + ".>"}; !reflect.DeepEqual(agent.Grants.Subscribe, want) {
+	if want := []string{"a2a.topics.>", "chat.notify.reply.agent.>", "_INBOX." + a2aAgentBusUser + ".>"}; !reflect.DeepEqual(agent.Grants.Subscribe, want) {
 		t.Errorf("agent subscribe allow-list changed.\n got: %q\nwant: %q", agent.Grants.Subscribe, want)
 	}
 
@@ -4856,7 +4870,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -4866,6 +4880,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
 		"chat.console.*.out",
+		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
 		// the request id. No read of the bucket by any path, and nothing
 		// under `cap.hop.>` -- the gateway mints each successor's root
@@ -5422,7 +5437,7 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 			// Whether a wildcard further in covers a subject the row does
 			// not record is asked by subject matching in the caller.
 			if !grantNamespaceAllowed(g) {
-				t.Errorf("%s %s holds %q, which names no namespace the bus reads and is neither console door subject (%s, %s)", user, section, g, consoleInbound, consoleOutbound)
+				t.Errorf("%s %s holds %q, which names no namespace the bus reads and is none of the chat door subjects %q", user, section, g, chatDoorSubjects)
 				continue
 			}
 			if g == bareJetStreamAPI {
@@ -5851,17 +5866,28 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 }
 
 // The console chat door, in the one spelling every check here shares. Two
-// exact subjects, not a namespace: these are the only chat.* grants the
-// render produces, so admitting the "chat" namespace wholesale in rule 2
-// would be wider than the thing being held.
+// exact subjects, not a namespace: the render's other chat.* grants are the
+// notify route's, held by their own check below, so admitting the "chat"
+// namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
 	consoleOutbound = "chat.console.*.out"
 )
 
+// The chat.notify route's two subjects, spelled here independently of the
+// render's constants so a renamed constant cannot carry the check with it.
+const (
+	notifyRequest = "chat.notify.gchat"
+	notifyReply   = "chat.notify.reply.agent.>"
+)
+
+// chatDoorSubjects is every chat.* grant the render may produce, each
+// admitted as an exact subject.
+var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyReply}
+
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
-// two console door subjects.
+// chat door subjects: the console's two and the notify route's two.
 //
 // The door is deliberately not a namespace here. Admitting "chat" would stop
 // refusing chat.gchat.>, chat.console.*.status or chat.console.*.in.x by
@@ -5871,7 +5897,7 @@ const (
 // this one refuses everything in chat.* that is not the door, and the door
 // test decides which principal may hold the door itself.
 func grantNamespaceAllowed(g string) bool {
-	if g == consoleInbound || g == consoleOutbound {
+	if slices.Contains(chatDoorSubjects, g) {
 		return true
 	}
 	first, _, _ := strings.Cut(g, ".")
@@ -5890,6 +5916,8 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 	}{
 		{consoleInbound, true},
 		{consoleOutbound, true},
+		{notifyRequest, true},
+		{notifyReply, true},
 		{"a2a.task.>", true},
 		{"agents.hb.>", true},
 		{"$JS.API.STREAM.INFO.a2a", true},
@@ -5903,6 +5931,13 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.console.*.status", false},
 		{"chat.console.*.in.x", false},
 		{"chat.console.>", false},
+		// The notify route admits its two subjects and nothing around them:
+		// a sibling backend not yet routed, the namespace wildcard, the reply
+		// namespace widened to every principal, and one literal inside it.
+		{"chat.notify.slack", false},
+		{"chat.notify.>", false},
+		{"chat.notify.reply.>", false},
+		{"chat.notify.reply.agent.x", false},
 		{"chat.>", false},
 		{"chat", false},
 		// And the wildcards that cover every namespace at once.
@@ -7571,6 +7606,108 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 	if got, want := lastFence, a2aSessionNetpolName(agent); got != want {
 		t.Errorf("the last fence the teardown deletes is %q, want %q; a fence deleted after the session "+
 			"fence is left behind forever on an install refused on its first reconcile", got, want)
+	}
+}
+
+// notifyDoorViolations is the chat.notify route's half of the door check:
+// the agent alone may publish a notify and read the answers, and the gateway
+// alone may read a notify and publish the answers. Matched by overlap, so a
+// wildcard that would reach either subject counts as holding it.
+func notifyDoorViolations(ids []a2aIdentity) []string {
+	rules := []struct {
+		verb, pattern, owner string
+		grants               func(a2aIdentity) []string
+	}{
+		{"publish", notifyRequest, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
+	}
+	var out []string
+	for _, id := range ids {
+		for _, r := range rules {
+			if id.user == r.owner {
+				continue
+			}
+			for _, g := range r.grants(id) {
+				if subjectPatternsOverlap(g, r.pattern) {
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader is the property the
+// notify route's authorization rests on. The gateway posts what arrives on
+// chat.notify.gchat to the home channel as the install's bot, so only the
+// agent may publish there; the agent reads the answer as the gateway's word
+// on where the post landed, so only the gateway may publish on the reply
+// namespace. And each direction has exactly one reader: a second subscriber
+// on the request would see every proactive post, and one on the replies could
+// tell which threads alerts went to.
+func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	ids := a2aIdentities(a2aTestAgent())
+	for _, v := range notifyDoorViolations(ids) {
+		t.Error(v)
+	}
+	holds := func(user, verb, pattern string) bool {
+		for _, id := range ids {
+			if id.user != user {
+				continue
+			}
+			list := id.publish
+			if verb == "subscribe" {
+				list = id.subscribe
+			}
+			return slices.ContainsFunc(list, func(g string) bool { return subjectPatternsOverlap(g, pattern) })
+		}
+		return false
+	}
+	for _, want := range []struct{ user, verb, pattern string }{
+		{a2aAgentBusUser, "publish", notifyRequest},
+		{a2aAgentBusUser, "subscribe", notifyReply},
+		{"gateway", "subscribe", notifyRequest},
+		{"gateway", "publish", notifyReply},
+	} {
+		if !holds(want.user, want.verb, want.pattern) {
+			t.Errorf("%s cannot %s %s; the notify route needs it", want.user, want.verb, want.pattern)
+		}
+	}
+	// The agent must not be able to answer its own notifies: a forged
+	// answer is how a caller would claim a post landed where it did not.
+	if holds(a2aAgentBusUser, "publish", notifyReply) {
+		t.Errorf("the agent can publish on %s", notifyReply)
+	}
+
+	// Mutations: a second writer by literal grant, and a second reader by
+	// wildcard. The same check over each modified set must report it.
+	for _, m := range []struct {
+		user, verb, grant string
+	}{
+		{a2aBridgeUser, "publish", "chat.notify.gchat"},
+		{"web", "subscribe", "chat.notify.reply.>"},
+	} {
+		mutated := slices.Clone(ids)
+		found := false
+		for i := range mutated {
+			if mutated[i].user != m.user {
+				continue
+			}
+			found = true
+			if m.verb == "publish" {
+				mutated[i].publish = append(slices.Clone(mutated[i].publish), m.grant)
+			} else {
+				mutated[i].subscribe = append(slices.Clone(mutated[i].subscribe), m.grant)
+			}
+		}
+		if !found {
+			t.Fatalf("no %s identity to mutate", m.user)
+		}
+		if v := notifyDoorViolations(mutated); len(v) != 1 || !strings.Contains(v[0], fmt.Sprintf("%s %s %q", m.user, m.verb, m.grant)) {
+			t.Errorf("%s %s %q was not reported exactly once; got %q", m.user, m.verb, m.grant, v)
+		}
 	}
 }
 

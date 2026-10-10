@@ -68,7 +68,7 @@ ownership check, and pinning it would have encoded that gap as an intention.
 
 ## Known violations are expected failures
 
-Twelve assertions currently fail. They are decorated `@known_violation`, which
+Eleven assertions currently fail. They are decorated `@known_violation`, which
 is `unittest.expectedFailure` plus a registration, so CI is green and the gap
 still has a name, a line number and a citation. Fixing the control turns the
 expected failure into an _unexpected success_, which unittest reports as a
@@ -83,7 +83,7 @@ reads with an anchor string that `test_harness_selfcheck.py` verifies. Rename
 a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
-Two sets of inputs are not registered. The group-B workflow tests glob
+Three sets of inputs are not registered. The group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
@@ -99,11 +99,16 @@ digest on a `docker://` ref, and the fork-guard check on every auto-triggered
 credentialed workflow, run under `make test-python` in
 `tests/test_workflow_pins_and_fork_guards.py`.
 
-The other is the site's content tree, which D2 walks for the read-only
+Another is the site's content tree, which D2 walks for the read-only
 switch. `_harness.site_pages()` raises when the tree is missing or holds no
 page, the security reference under it is registered so the self-check names
 the tree when it moves, and the test requires the pages to name the broker's
 other variables before it reads their silence on this one.
+
+The third is the mirrored `gke-*` skills, which C4 globs under
+`agents/platform/skills/` to require an `upstream.lock` beside each one. The
+test asserts the glob is non-empty, and `gke-basics`'s lock is registered and
+required to be in the set, so the self-check names the tree when it moves.
 
 ## Invariant → test → bucket → historical attack
 
@@ -131,6 +136,11 @@ currently fails.
 | A3  | the eval inject door renders only under the operator's flag                | 1        | `test_A3_the_inject_door_renders_only_under_the_operator_flag`                      | a door mapping a body-supplied principal, rendered on an install that never asked for it                                                                                                                                                                 |
 | A3  | the eval door's flag is not a field a customer can set                     | 1        | `test_A3_the_inject_flag_is_not_a_field_a_customer_can_set`                         | "render the eval door" reachable from a `PlatformAgent`, which the operator would be obliged to honour                                                                                                                                                   |
 | A3  | the eval door cannot assert a cloud principal                              | 1        | `test_A3_the_inject_door_cannot_assert_a_cloud_principal`                           | a map entry pointing the eval door at a real identity: an identity-minting door the day publisher identity arms                                                                                                                                          |
+| A3  | a Google token is bound to the install's client and a verified email       | 1        | `test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email`        | a token a developer granted some other app, or one for an unproven address, signing them in at the door                                                                                                                                                  |
+| A3  | the A2A door refuses an account off its allowlist before holding state     | 1        | `test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state`        | any Google account filling the door's bounded state and evicting an allowed developer's                                                                                                                                                                  |
+| A3  | the gateway admits only a prefixed, allowlisted Google email               | 1        | `test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email`                 | an author that never passed the Google check, or any verified account, asserted as a principal                                                                                                                                                           |
+| A3  | no eval caller can spell a Google caller                                   | 1        | `test_A3_no_eval_caller_can_spell_a_google_caller`                                  | the static token's holder naming themselves after a developer and reading their tasks                                                                                                                                                                    |
+| A3  | the Google class's roster does not resolve through the chat map            | 1        | `test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map`             | a door caller's id resolving as a chat identity                                                                                                                                                                                                          |
 | A3  | caller-supplied `--as` refused, all five flags, both separators            | 1        | `test_A3_rejects_caller_supplied_as`                                                | impersonation asserted by the caller                                                                                                                                                                                                                     |
 | A3  | `--kuberc` refused                                                         | 1        | `test_A3_rejects_kuberc`                                                            | **slice 2a**: a YAML file injecting `as: system:admin` with nothing in argv                                                                                                                                                                              |
 | A3  | `--flags-file` refused                                                     | 1        | `test_A3_rejects_gcloud_flags_file`                                                 | the same attack in gcloud's spelling, found first                                                                                                                                                                                                        |
@@ -145,6 +155,7 @@ currently fails.
 | A3  | the supervisor holds no publish on an executor's `…events`                 | 1        | `test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject`           | the pre-split render: every executor's subject two-writer, so a forged supervisor terminal has somewhere to land                                                                                                                                         |
 | A3  | the executor's derived grant does not reach its own `…in`                  | 1        | `test_A3_the_executors_grant_does_not_reach_its_own_in_subject`                     | the per-task wildcard `a2a.tasks.{addressee}.{taskId}.>`, which lets a worker steer and cancel itself as if from the user                                                                                                                                |
 | A3  | `…events` has no rendered writer (the executor's is derived)               | 1        | `test_A3_the_events_subject_has_no_rendered_writer`                                 | static `worker` held `a2a.tasks.*.*.events` for every addressee (gke-labs/kube-agents#1316). Closed by A5: the static half is `bridge`, whose grant names one addressee literally, and the callout half is `agent`, which holds no task-plane publish    |
+| A3  | the chat.notify subject has one writer, its reply namespace one            | 1        | `test_A3_a_notify_has_one_writer_and_its_answer_has_one`                            | a second principal able to make the install's bot speak in the home channel, or anyone, the agent included, forging the gateway's answer on where a post landed                                                                                          |
 | A4  | the operator cannot escalate its own grants                                | 1        | `test_A4_the_operator_cannot_escalate_its_own_grants`                               | a controller with RBAC CRUD and `escalate` makes every ceiling advisory                                                                                                                                                                                  |
 | A4  | the chart grants the same ceiling as the kustomize role                    | 1        | `test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role`                   | a ceiling asserted on one install path only                                                                                                                                                                                                              |
 | A4  | triggering is delegation                                                   | 1        | `test_A4_triggering_is_covered_by_the_A3_inject_finding`                            | see A3 above — the one instance in this codebase                                                                                                                                                                                                         |
@@ -155,6 +166,7 @@ currently fails.
 | B1  | the shipped denylist refuses credential disclosure                         | 1        | `test_B1_the_shipped_denylist_refuses_credential_disclosure`                        | `gcloud auth print-access-token`, `gh auth token`, `kubectl config view --raw`                                                                                                                                                                           |
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
 | B1  | the agent cannot force-push                                                | 1 **KV** | `test_B1_the_agent_cannot_merge_or_approve`                                         | `git push --force origin main` matches no denylist rule; the git verb and lease machinery constrain where git writes, not this flag — a watched branch is still rewritable                                                                               |
+| B1  | the Slack relay removes nothing but the bot's own reaction                 | 1        | `test_B1_the_slack_relay_removes_nothing_but_its_own_reaction`                      | a second exemption beside `reactions.remove`, or the exemption case-folded: the workspace bot token deleting a message or a pin nobody can put back                                                                                                      |
 | B2  | no workflow approves or merges a pull request                              | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                             | a model verdict causing a merge                                                                                                                                                                                                                          |
 | B2  | `pull-requests: write` has exactly six holders                             | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
 | B2  | a certified predicate in a human-only path                                 | **3**    | —                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
@@ -205,7 +217,7 @@ currently fails.
 | C4  | every third-party action is pinned to a commit                             | 1        | `test_C4_every_third_party_action_is_pinned_to_a_commit`                            | a retagged release silently changing what CI runs                                                                                                                                                                                                        |
 | C4  | the agent base image is pinned by digest                                   | 1        | `test_C4_the_agent_base_image_is_pinned_by_digest`                                  | — (the one reference this repo gets right)                                                                                                                                                                                                               |
 | C4  | every hermes plugin install is pinned to a commit                          | 1        | `test_C4_every_hermes_plugin_install_is_pinned_to_a_commit`                         | an upstream default branch shipping a plugin manifest the pinned installer cannot read, breaking every image build                                                                                                                                       |
-| C4  | upstream skills are pinned and verified                                    | 1 **KV** | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
+| C4  | upstream skills are pinned and verified                                    | 1        | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
 | C4  | every shipped image is pinned by digest                                    | 1 **KV** | `test_C4_every_shipped_image_is_pinned_by_digest`                                   | `DefaultPlatformAgentVersion = "latest"`                                                                                                                                                                                                                 |
 | C5  | no minted role grants a write verb                                         | 1        | `test_C5_no_minted_role_grants_a_write_verb`                                        | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                                                                |
 | C5  | the leader role stays confined to coordination                             | 1        | `test_C5_the_leader_role_stays_confined_to_coordination`                            | —                                                                                                                                                                                                                                                        |
@@ -281,9 +293,15 @@ handling), zero genuine survivors, zero stale — measured 2026-09-25 against
 this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
 KILLED when it was added on 2026-09-30, `D1-gateway-role-reaches-secrets` and
 `D1-platform-role-reaches-secrets`, both KILLED when they were added on 2026-10-05,
-and the four `C1-a2a-gateway-*` mutations, KILLED when they were added on
-2026-10-06; re-run the harness rather than trusting these numbers, which is the
-sentence this paragraph exists to make cheap.
+the four `C1-a2a-gateway-*` mutations and the three `B1-slack-*` mutations, all
+KILLED when they were added on 2026-10-06, `B1-slack-method-shape-dropped`, KILLED
+when it was added on 2026-10-07, `A3-agent-answers-its-own-notify` (KILLED) and
+`A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
+they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
+`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
+`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07;
+re-run the harness rather than trusting these numbers, which is the sentence this
+paragraph exists to make cheap.
 Note that the summary line the harness prints accounts for 113 of the 115: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,

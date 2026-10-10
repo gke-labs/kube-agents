@@ -17,12 +17,17 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -49,7 +54,8 @@ import (
 // The rendered container is the agent container with the bridge's own settings
 // on top, exactly as ci-deploy.sh built the declared one: the agent's env and
 // mounts (it runs Hermes against the agent's profile state on the agent's PVC),
-// its securityContext, resources, pull policy and envFrom; then the bus address,
+// its securityContext, pull policy and envFrom (not its resources, which are
+// the bridge's own: a2aRenderedBridgeResources); then the bus address,
 // the static `bridge` principal's password, the concurrency, the activity
 // secret and AGENT_SHARED_STATE_SETUP=skip. It never gets the bus token: the
 // pod's ServiceAccount is the agent's principal, and the bridge authenticates
@@ -90,6 +96,13 @@ const (
 	// with the remedy named (recreate TASKS or lower maxSessions).
 	a2aRenderedBridgeDefaultConcurrency = 10
 
+	// a2aBridgeResourcesOperatorEnvVar overrides the rendered bridge's
+	// resources: a corev1.ResourceRequirements in JSON, used whole. Unset, or
+	// not one the operator can use, the bridge gets
+	// a2aRenderedBridgeDefaultResources under api and a copy of the agent
+	// container's under cli (a2aRenderedBridgeResources).
+	a2aBridgeResourcesOperatorEnvVar = "A2A_BRIDGE_RESOURCES"
+
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
 	// BRIDGE_CONCURRENCY: an operator setting, like the other next-only
 	// knobs, since no CR field carries it. Unset, the bridge's own default.
@@ -99,8 +112,8 @@ const (
 
 	// a2aBridgeExecutorOperatorEnvVar pins the rendered bridge's
 	// BRIDGE_EXECUTOR. Unset, the bridge's shipped default decides (api,
-	// since the agent's API_SERVER_KEY is copied); CI pins `cli` here until
-	// the api executor is graded.
+	// since the operator sets the bridge's API_SERVER_KEY), and the next eval lane
+	// leaves it unset so it measures that default.
 	a2aBridgeExecutorOperatorEnvVar = "A2A_BRIDGE_EXECUTOR"
 
 	// The bridge's own environment contract (a2a/cmd/hermes-bridge/main.go),
@@ -108,6 +121,15 @@ const (
 	a2aBridgeNATSURLEnvVar      = "NATS_URL"
 	a2aBridgeNATSUserEnvVar     = "NATS_USER"
 	a2aBridgeNATSPasswordEnvVar = "NATS_PASSWORD"
+
+	// a2aBusyNoticeAtEnvVar is the gateway's busy-notice threshold: how many
+	// fixed-route tasks have to be ahead of a new turn before the gateway
+	// says the system is busy (Config.BusyNoticeAt in a2a/gateway). Read from
+	// the CONTROLLER's environment and rendered onto the gateway under the
+	// same name, the override shape A2A_STRICT_EVENTS_WRITER has, since no CR
+	// field carries it. Unset, or not a count of at least one, the render
+	// uses the bridge's worker count (a2aBusyNoticeAt says why).
+	a2aBusyNoticeAtEnvVar = "A2A_BUSY_NOTICE_AT"
 )
 
 // a2aBridgeDeclared reports whether the CR declares its own bridge sidecar:
@@ -211,6 +233,24 @@ func a2aRenderedBridgeConcurrency() string {
 	return strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
 }
 
+// a2aBusyNoticeAt is the gateway's A2A_BUSY_NOTICE_AT: the operator's own
+// A2A_BUSY_NOTICE_AT when it is a count of at least one, else the bridge's
+// worker count for this CR (a2aBridgeConcurrency, the number the TASKS budget
+// reads: the rendered bridge's, 10 by default, or a declared sidecar's). The
+// fixed addressee's executor runs that many tasks at once, so a turn with
+// that many ahead of it is the first one that waits, and that is when the
+// notice says so. A value that is not a count falls back rather than passing
+// through: the gateway refuses one at boot, and a typo in an informational
+// knob must not crash-loop the gateway.
+func a2aBusyNoticeAt(agent *agentv1alpha1.PlatformAgent) string {
+	if v := os.Getenv(a2aBusyNoticeAtEnvVar); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return strconv.Itoa(n)
+		}
+	}
+	return strconv.Itoa(a2aBridgeConcurrency(agent))
+}
+
 // a2aBridgeSidecars is every sidecar the bridge readers consider: the CR's
 // declared ones, plus the rendered bridge's settings when the operator renders
 // it. The TASKS budget and the activity hook read this rather than
@@ -283,6 +323,11 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		}}},
 		{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()},
 		a2aActivitySecretEnv(agent),
+		// The bearer the agent's API server accepts (the managed .env pins the
+		// same). Set here rather than inherited: the agent container's entry
+		// can come from an AgentPlugin's env, and a blank or unresolvable one
+		// would silently switch the bridge to its cli executor.
+		{Name: a2aBridgeAPIServerKeyEnvVar, Value: loopbackAgentAPIKey},
 	}
 	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
@@ -291,8 +336,9 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 }
 
 // a2aBridgeDroppedAgentEnv are agent env names the bridge must not inherit:
-// its own settings (replaced above), and the agent's bus identity, which names
-// the `agent` principal and its inbox rather than the bridge's.
+// its own settings (replaced above, API_SERVER_KEY among them, so no plugin
+// value picks its executor), and the agent's bus identity, which names the
+// `agent` principal and its inbox rather than the bridge's.
 var a2aBridgeDroppedAgentEnv = map[string]bool{
 	sharedStateSetupEnvVar:      true,
 	a2aBridgeNATSURLEnvVar:      true,
@@ -302,6 +348,7 @@ var a2aBridgeDroppedAgentEnv = map[string]bool{
 	a2aBridgeExecutorEnvVar:     true,
 	a2aActivitySecretEnvVar:     true,
 	a2aBusUserEnv:               true,
+	a2aBridgeAPIServerKeyEnvVar: true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent
@@ -324,7 +371,7 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 		}
 	}
 
-	return corev1.Container{
+	c := corev1.Container{
 		Name:            a2aBridgeContainerName,
 		Image:           a2aBridgeImage(agentContainer.Image),
 		ImagePullPolicy: agentContainer.ImagePullPolicy,
@@ -332,6 +379,147 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 		EnvFrom:         agentContainer.EnvFrom,
 		VolumeMounts:    mounts,
 		SecurityContext: agentContainer.SecurityContext.DeepCopy(),
-		Resources:       *agentContainer.Resources.DeepCopy(),
+	}
+	// Sized for the executor the bridge will actually run, read from the
+	// finished env the way the bridge binary and the activity hook read it
+	// (a2aBridgeRunsAPIExecutor). The bridge sets its own API_SERVER_KEY, so
+	// that is the operator's A2A_BRIDGE_EXECUTOR, else api.
+	c.Resources = a2aRenderedBridgeResources(agentContainer.Resources, !a2aBridgeRunsAPIExecutor(c))
+	return c
+}
+
+// a2aRenderedBridgeDefaultResources sizes the rendered bridge for the api
+// executor, the default: a Go relay to the agent container's API server, where
+// the turn itself runs. Measured idle at 1m CPU and 4-5Mi on three next
+// installs (gke-labs#2748). The request is sized to be livable as a ceiling,
+// because GKE Autopilot without Pod bursting sets each limit to its request:
+// one answer at the bridge's 8 MiB response cap takes about 80MiB to read,
+// decode and publish, and three at once about 113MiB. The limit gives ten at
+// once room where bursting is on. The cli executor runs
+// a one-shot hermes chat per task (about 430Mi each, up to BRIDGE_CONCURRENCY
+// of them) and doesn't fit these (a2aRenderedBridgeResources).
+func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
 	}
 }
+
+// a2aRenderedBridgeResources is the rendered bridge's resources. The
+// operator's A2A_BRIDGE_RESOURCES wins when it reads as exactly one usable
+// ResourceRequirements (a2aBridgeResourcesRefusal); a value it can't use is
+// logged once and ignored. Otherwise it depends on the executor the bridge
+// will run (cli says so; the caller reads it from the container's env). Under api,
+// the default, the bridge gets a2aRenderedBridgeDefaultResources rather than a
+// copy of the agent container's, which doubled the agent pod's requests and
+// left next pods unschedulable on clusters sized for today (gke-labs#2748).
+// Under cli it keeps the copy it had before #2748: a cli bridge runs a
+// hermes chat per task, which the api defaults can't hold, so an install that
+// pinned cli before A2A_BRIDGE_RESOURCES existed upgrades with its bridge
+// unchanged. That case is logged once, pointing at the override.
+func a2aRenderedBridgeResources(agentResources corev1.ResourceRequirements, cli bool) corev1.ResourceRequirements {
+	fallback := a2aRenderedBridgeDefaultResources()
+	if cli {
+		fallback = *agentResources.DeepCopy()
+	}
+	raw := os.Getenv(a2aBridgeResourcesOperatorEnvVar)
+	if raw == "" {
+		if cli {
+			a2aCLIBridgeWithoutResourcesLogged.Do(func() {
+				logf.Log.WithName("platformagent-controller").Info(
+					"The rendered bridge runs the cli executor with no " + a2aBridgeResourcesOperatorEnvVar + ", so it copies the agent container's resources. Set " + a2aBridgeResourcesOperatorEnvVar + " to size it: about 430Mi of memory per BRIDGE_CONCURRENCY worker, plus headroom.")
+			})
+		}
+		return fallback
+	}
+	// Strict, and exactly one value: a misspelled key that decoded to nothing
+	// would render the bridge with no resources at all, and anything after
+	// the first value (a second object, a stray closer, text) would be
+	// dropped unread.
+	var r corev1.ResourceRequirements
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&r)
+	if err == nil {
+		if extra := dec.Decode(new(json.RawMessage)); extra != io.EOF {
+			err = fmt.Errorf("it has content after the first JSON value")
+		}
+	}
+	if err == nil {
+		err = a2aBridgeResourcesRefusal(r)
+	}
+	if err != nil {
+		if _, seen := a2aRefusedBridgeResources.LoadOrStore(raw, true); !seen {
+			logf.Log.WithName("platformagent-controller").Info(
+				"Ignoring "+a2aBridgeResourcesOperatorEnvVar+": it is not a usable ResourceRequirements in JSON, so the rendered bridge gets the resources it would get without it",
+				"value", raw, "error", err.Error())
+		}
+		return fallback
+	}
+	return r
+}
+
+// a2aCLIBridgeWithoutResourcesLogged logs the cli-without-override case once
+// per operator process.
+var a2aCLIBridgeWithoutResourcesLogged sync.Once
+
+// a2aBridgeResourcesRefusal says why the API server would refuse r on the
+// bridge container, or why it would leave the bridge unsized, or nil. The
+// rules are the credential proxy override's (ValidateCredentialProxyResources):
+// cpu, memory and ephemeral-storage only, no negative quantity, no zero limit,
+// no quantity past what an int64 carries, no claims, and no request above its
+// limit. The proxy's Autopilot warnings and floor are its own and not
+// carried. A value the server refuses would fail every agent Deployment
+// update, so it is caught here and refused instead.
+func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
+	if len(r.Requests) == 0 && len(r.Limits) == 0 {
+		return fmt.Errorf("it sets neither requests nor limits")
+	}
+	if len(r.Claims) > 0 {
+		return fmt.Errorf("claims are not supported on the bridge")
+	}
+	// Requests before limits, names in order, so a value with two faults is
+	// always refused for the same one.
+	for _, sl := range []struct {
+		side string
+		list corev1.ResourceList
+	}{{"request", r.Requests}, {"limit", r.Limits}} {
+		side, list := sl.side, sl.list
+		for _, name := range sortedResourceNames(list) {
+			q := list[name]
+			if !slices.Contains(acceptedContainerResourceNames, name) {
+				return fmt.Errorf("%s is not cpu, memory or ephemeral-storage", name)
+			}
+			if q.Sign() < 0 {
+				return fmt.Errorf("the %s %s %s is negative", name, side, q.String())
+			}
+			if side == "limit" && q.IsZero() {
+				return fmt.Errorf("the %s limit is zero", name)
+			}
+			// Past int64 the scheduler and kubelet read a wrapped figure,
+			// zero or negative, so the quantity isn't what was written.
+			if slices.Contains(byteCountResources, name) && q.Cmp(maxByteCount) > 0 {
+				return fmt.Errorf("the %s %s %s is more bytes than an int64 holds", name, side, q.String())
+			}
+			if name == corev1.ResourceCPU && q.Cmp(*maxCPUMilli) > 0 {
+				return fmt.Errorf("the cpu %s %s is more millicores than an int64 holds", side, q.String())
+			}
+		}
+	}
+	for name, req := range r.Requests {
+		if lim, ok := r.Limits[name]; ok && req.Cmp(lim) > 0 {
+			return fmt.Errorf("the %s request %s is above its limit %s", name, req.String(), lim.String())
+		}
+	}
+	return nil
+}
+
+// a2aRefusedBridgeResources holds each refused A2A_BRIDGE_RESOURCES value
+// already logged.
+var a2aRefusedBridgeResources sync.Map

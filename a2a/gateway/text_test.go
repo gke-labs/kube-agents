@@ -8,30 +8,33 @@ import (
 
 func TestIsStatusQuery(t *testing.T) {
 	// Exact phrases are the affordance everywhere - including narrow mode,
-	// the posture for executors that absorb steers.
+	// the posture for executors that run follow-ups.
 	exact := []string{
 		"what is it doing", "What's it doing?", "status", "Status?",
 		"how's it going", "how is it going", "whats going on",
 		"any progress", "any updates?", "progress", "where are we",
 	}
 	// Interrogative shapes match only under the wide posture, where the
-	// executor refuses steers and a false positive costs nothing.
+	// executor refuses follow-ups (no-resume) and a false positive costs
+	// nothing.
 	wideOnly := []string{
-		"what is the agent doing", // the live miss that created this test
+		"what is the agent doing",
 		"what is kage doing",
 		"any update on the rollout",
 	}
 	// Steers the wide rule mistakes for status asks - the documented cost
-	// of the width bias, and why steer-absorbing executors get narrow.
+	// of the width bias, and why executors that run follow-ups get narrow.
 	wideCost := []string{
 		"any update to the config should be reverted",
 		"how about doing the upgrade instead",
 	}
 	never := []string{
 		"also check the memory limits",
-		"actually, focus on the kube-system namespace instead",
 		"stop",
 		"what is the memory limit on the nats pod and can you also check its restarts", // long compound: steer
+		// Status-ish and interrogative, so only the wideMatchLenCap guard
+		// keeps it a steer: past the cap it is a composed instruction.
+		"what is the agent doing about the memory limit on the nats pod and its restarts",
 		"delete the deployment",
 	}
 	for _, s := range exact {

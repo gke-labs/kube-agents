@@ -63,6 +63,49 @@ locals {
   github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
   github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
 
+  # A GitLab GitOps repository is declared through the forges/repositories
+  # lists, never the github alias: one gitlab forge, carrying the Secret the
+  # installer creates, and the repository on it as the gitops role. The
+  # operator derives the broker's allowedPaths from the repository's group.
+  # Two lists, each merged in on its own: one conditional carrying both would
+  # have no single type to unify with its empty arm.
+  gitops_is_gitlab = var.gitops_forge == "gitlab"
+  gitlab_forges = [merge(
+    { name = "gitlab", provider = "gitlab", credentialsRef = { name = var.gitlab_token_secret_name } },
+    var.gitops_host != "" ? { host = var.gitops_host } : {}
+  )]
+  gitlab_repositories = [{ forge = "gitlab", repository = var.gitlab_repo, role = "gitops" }]
+
+  # The CR's spec.integration, as one local so the tests can read it.
+  platform_agent_integration = merge(
+    var.enable_google_chat ? {
+      googleChat = {
+        enabled          = true
+        topicName        = module.chat_pubsub[0].topic_name
+        subscriptionName = module.chat_pubsub[0].subscription_name
+        allowedUsers     = var.google_chat_allowed_users
+        homeChannel      = var.google_chat_home_channel
+        mode             = var.google_chat_mode
+      }
+    } : {},
+    var.enable_slack ? {
+      slack = {
+        enabled         = true
+        allowedUsers    = var.slack_allowed_users
+        homeChannel     = var.slack_home_channel
+        homeChannelName = var.slack_home_channel_name
+      }
+    } : {},
+    local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
+    local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
+    (!local.gitops_is_gitlab && (local.github_org != "" || var.github_repo != "")) ? {
+      github = merge(
+        local.github_org != "" ? { org = local.github_org } : {},
+        var.github_repo != "" ? { gitRepo = var.github_repo } : {}
+      )
+    } : {}
+  )
+
   required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis, local.selector_apis))
 
   # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
@@ -509,6 +552,12 @@ module "drift_pubsub" {
   sink_writer_identity_override = var.drift_pubsub_sink_writer_identity_override
   sink_drain_duration           = var.drift_pubsub_sink_drain_duration
 
+  # The module's two timers are both chosen margins against something GCP
+  # documents no bound for, so both are exposed: an operator whose apply still
+  # fails on an unbindable Logging agent, or whose teardown still mails, has
+  # only this composition to lengthen them in.
+  logging_identity_propagation_duration = var.drift_pubsub_logging_identity_propagation_duration
+
   # Defers data.google_project.this inside the module to apply time whenever
   # any member of required_apis has a planned change, which makes the sink's
   # publish grant "(known after apply)" and -- member being ForceNew -- plans
@@ -745,7 +794,10 @@ resource "helm_release" "kube_agents" {
         }
       } : {}
     )
-    platformAgent = {
+    # merge(), so "today" adds no key and the values this composition hands the
+    # chart stay what they were before platform_agent_mode existed; the chart
+    # leaves spec.mode out of the CR while its value is null.
+    platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
       # the variable that admitted it: a cluster that later gains Dataplane V2
@@ -858,33 +910,10 @@ resource "helm_release" "kube_agents" {
         create = true
         data   = local.credentials
       }
-      integration = merge(
-        var.enable_google_chat ? {
-          googleChat = {
-            enabled          = true
-            topicName        = module.chat_pubsub[0].topic_name
-            subscriptionName = module.chat_pubsub[0].subscription_name
-            allowedUsers     = var.google_chat_allowed_users
-            homeChannel      = var.google_chat_home_channel
-            mode             = var.google_chat_mode
-          }
-        } : {},
-        var.enable_slack ? {
-          slack = {
-            enabled         = true
-            allowedUsers    = var.slack_allowed_users
-            homeChannel     = var.slack_home_channel
-            homeChannelName = var.slack_home_channel_name
-          }
-        } : {},
-        (local.github_org != "" || var.github_repo != "") ? {
-          github = merge(
-            local.github_org != "" ? { org = local.github_org } : {},
-            var.github_repo != "" ? { gitRepo = var.github_repo } : {}
-          )
-        } : {}
-      )
-    }
+      integration = local.platform_agent_integration
+      }, var.platform_agent_mode == "today" ? {} : {
+      mode = var.platform_agent_mode
+    })
     # The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA,
     # minty rule ConfigMap, github-app-credentials Secret); the GCP half is
     # module.github_minter above. The App private key still has to be imported
@@ -978,6 +1007,21 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
+    }
+
+    # A gitlab install has no GitHub App: the minter would mint for a
+    # repository the agent does not use, and github_repo would render the
+    # github alias beside the gitlab lists, which the CRD refuses.
+    precondition {
+      condition     = !local.gitops_is_gitlab || (var.gitlab_repo != "" && var.github_repo == "" && !var.enable_github_minter)
+      error_message = "gitops_forge = \"gitlab\" needs gitlab_repo set, and github_repo and enable_github_minter left unset: a GitLab install has no GitHub App."
+    }
+
+    # The reverse: GitLab inputs under the default forge would be dropped,
+    # applying a CR with no GitOps repository and no error.
+    precondition {
+      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "")
+      error_message = "gitlab_repo and gitops_host apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
     }
 
     # What this refuses is an install that asks for the detector without the

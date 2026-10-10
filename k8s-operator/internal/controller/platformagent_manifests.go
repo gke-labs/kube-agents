@@ -247,12 +247,15 @@ const (
 	// so one core is roughly 45x the observed use rather than a budget for the watcher alone.
 	//
 	// GOMAXPROCS has been cgroup-aware since Go 1.25 and k8s-operator builds with 1.27
-	// (k8s-operator/go.mod), so dropping this limit from 2 to 1 sets the
+	// (k8s-operator/go.mod), so this 1 CPU limit makes the Go runtime set the
 	// k8s-event-watcher's GOMAXPROCS to 1. Go rounds up, so choosing 1 rather than 500m
-	// keeps GOMAXPROCS=1 while preserving a full core of burst.
+	// keeps GOMAXPROCS=1 while preserving a full core of burst. These are defaults:
+	// spec.deployment.agentAPIAuth.resources overrides any of them per key
+	// (resolveAgentAPIAuthResources), so an override of limits.cpu moves GOMAXPROCS too.
 	//
-	// Memory limit must stay at 2Gi: the event watcher reads this limit via Downward API
-	// (EVENT_WATCHER_MEMORY_LIMIT_BYTES) to set GOMEMLIMIT to half of it.
+	// Memory limit defaults to 2Gi. The event watcher reads whatever limit is rendered,
+	// via the Downward API (EVENT_WATCHER_MEMORY_LIMIT_BYTES), to set GOMEMLIMIT to half
+	// of it, so raising limits.memory raises the soft limit with it.
 	agentAPIAuthCPULimit              = "1"
 	agentAPIAuthMemoryLimit           = "2Gi"
 	agentAPIAuthEphemeralStorageLimit = "2Gi"
@@ -1022,13 +1025,26 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // process: a burst of cards spawns them until the cgroup OOM killer intervenes, which
 // kills a child rather than the container and so produces no restart and no event.
 //
-// The operator does NOT render this default for the default profile —
-// agents/chat/config.yaml carries the same number, which is what caps an install that
-// runs the image without the operator too. The constant exists so the CR override below
-// can be compared against it, and so the two files can be kept in step. The one place it
-// IS rendered is frontDoorKanban, where there is no image copy to defer to: the platform
-// profile's config declares no `kanban` key at all.
-const defaultKanbanMaxInProgress = 2
+// The operator pins the resolved cap (resolveKanbanMaxInProgress: the CR's value, else this
+// one) in the managed scope, so it applies on every load over whatever the agent's own
+// config.yaml holds. agents/chat/config.yaml carries the same number for an install that
+// runs the image without the operator, and TestChatConfigCapsTheBoardAndWakesOnFailuresOnly
+// keeps the two in step.
+//
+// Deferring the untuned case to that file, which an earlier shape did, did not work on an
+// existing volume: the image template reaches it only for keys it is missing (step 2d's
+// fill-only back-fill), so a volume seeded at 2 kept 2 after this constant became 6.
+//
+// One slot of the cap is guaranteed to each class of card, user and background
+// (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
+// measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
+// gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
+// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
+// eight, shared with the listing pools).
+// TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
+// admitting at least this many.
+const defaultKanbanMaxInProgress = 6
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.
@@ -1238,8 +1254,8 @@ const (
 var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 
 // resolveKanbanMaxInProgress is the live board-wide worker cap: the CR's
-// spec.harness.tuning.maxInProgress, or the number agents/chat/config.yaml already
-// carries for an install that does not set it.
+// spec.harness.tuning.maxInProgress, or defaultKanbanMaxInProgress when it says nothing.
+// renderConfigYAML pins it in the managed scope.
 func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxInProgress != nil {
 		return *limits.MaxInProgress
@@ -1262,17 +1278,19 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 // off it would be dead config on every install, and the whole claim of an experimental
 // flag is that an install which does not set it is untouched.
 //
-// Without it the front door silently reverts to upstream Hermes: unbounded dispatch, a
-// 60s tick, and `completed` back in the wake set, with spec.harness.tuning.maxInProgress
-// quietly having no effect at all.
-func frontDoorKanban(agent *agentv1alpha1.PlatformAgent) map[string]any {
+// Without it the front door silently reverts to upstream Hermes: a 60s tick and
+// `completed` back in the wake set.
+//
+// `max_in_progress` is not in the block. The managed scope pins it, and that scope is
+// machine-global, so the pin lands on this profile as it lands on the default one; a copy
+// here would be one operator setting on two routes (see buildConfigMapData).
+func frontDoorKanban() map[string]any {
 	return map[string]any{
 		"dispatch_in_gateway":            true,
 		"auto_subscribe_on_create":       true,
 		"dispatch_interval_seconds":      kanbanDispatchIntervalSeconds,
 		"dispatch_stale_timeout_seconds": kanbanDispatchStaleTimeoutSeconds,
 		"wake_on_events":                 slices.Clone(kanbanWakeOnEvents),
-		"max_in_progress":                resolveKanbanMaxInProgress(agent),
 	}
 }
 
@@ -1326,7 +1344,7 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	return map[string]any{
 		"platform_toolsets": platformToolsets,
 		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
-		"kanban":            frontDoorKanban(agent),
+		"kanban":            frontDoorKanban(),
 	}
 }
 
@@ -1509,35 +1527,12 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 // spec.harness.tuning.default, for the same machine-global reason: one profile's turn
 // budget must not become every profile's.
 //
-// The maxInProgress cap is the CR's override only. Its default lives in
-// agents/chat/config.yaml (defaultKanbanMaxInProgress), so an unset CR leaves the image's
-// number in force rather than having the operator restate it on every reconcile.
+// spec.harness.tuning.maxInProgress is NOT here. It is board-wide, so renderConfigYAML pins
+// it in the managed scope. It used to ride this overlay, only when the CR set it, and that
+// left the live cap to the agent's own config.yaml: an unset CR fell back to whatever the
+// volume was first seeded with, and a removed override left its value behind.
 func renderDefaultProfileOverlayYAML(agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) string {
-	overlay := renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, nil)
-
-	tuning := agentTuning(agent)
-	if tuning == nil || tuning.MaxInProgress == nil {
-		return overlay
-	}
-
-	var parsed map[string]any
-	if overlay != "" {
-		if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
-			return overlay
-		}
-	}
-	if parsed == nil {
-		parsed = map[string]any{}
-	}
-	parsed = mergeMaps(parsed, map[string]any{
-		"kanban": map[string]any{"max_in_progress": *tuning.MaxInProgress},
-	})
-
-	data, err := yaml.Marshal(parsed)
-	if err != nil {
-		return overlay
-	}
-	return string(data)
+	return renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, nil)
 }
 
 // pluginConfigIssues reports problems with a plugin's spec.config: YAML that does not
@@ -1710,18 +1705,19 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // merging into it — a list is a leaf too, so `platform_toolsets.cli` rendered here
 // rewrote every specialist's toolset list to the front door's two-tool delegation
 // surface, and `agent.disabled_toolsets` took the specialists' terminal away. Nothing
-// profile-shaped may be rendered here for that reason: toolsets, disabled toolsets,
-// kanban tuning, terminal cwd, mcp servers, the plugin roster and the memory provider
-// are each profile's own, and stay in that profile's config.yaml in the image.
+// profile-shaped may be rendered here for that reason: toolsets, disabled toolsets, the
+// dispatcher's tick and wake set, terminal cwd, mcp servers, the plugin roster and the
+// memory provider are each profile's own, and stay in that profile's config.yaml in the
+// image.
 //
 // WHAT BELONGS HERE is the intersection of two tests: identical for every profile in
 // the pod, AND beyond the agent's own repair once broken. That is the model endpoint —
 // an agent that repoints base_url at nothing cannot be told to put it back, because
 // being told requires the endpoint — and the chat platform wiring that carries the
 // human's only channel to it. `approvals.cron_mode` rides along as a third: it is
-// uniform by design, and Hermes' own default is `deny`. Everything else is recoverable
-// the way it was broken, by a human telling the agent to fix its own config, and so
-// stays writable.
+// uniform by design, and Hermes' own default is `deny`. `kanban.max_in_progress` is a
+// fourth, for the reason given where it is set. Everything else is recoverable the way it
+// was broken, by a human telling the agent to fix its own config, and so stays writable.
 //
 // Keys this function says nothing about stay the image's, and stay writable: that is
 // what keeps `/sethome`, the monitoring install id and saved slash-command preferences
@@ -1871,6 +1867,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// declared (a2aActivityHook); absent otherwise, so a today
 		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
+		// The board-wide kanban worker cap. Always rendered; see where it is set.
+		Kanban struct {
+			MaxInProgress int `json:"max_in_progress"`
+		} `json:"kanban"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1922,6 +1922,24 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	}
 
 	cfg.Hooks = a2aActivityHook(agent)
+
+	// The kanban worker cap: the CR's spec.harness.tuning.maxInProgress, else
+	// defaultKanbanMaxInProgress. It meets the uniformity test because it is not a
+	// profile's setting at all. The board is shared by every profile in the pod
+	// (kanban.db), and every dispatch entry point reads the cap from whichever profile it
+	// runs as: the gateway's dispatcher from the profile it is homed at, `hermes kanban
+	// dispatch` from the caller's. A pin gives them all the same number, where a profile
+	// key gave each its own or, on a profile that declared none, Hermes' memory-derived
+	// default. It is the operator's to own rather than the agent's because the failure it
+	// prevents, a burst of workers taken by the OOM killer, raises no restart and no
+	// event, so the agent cannot see what it would be repairing.
+	//
+	// It is pinned rather than merged into the profile's config because a merged value
+	// is only as good as the file it lands in: the image template reaches an existing
+	// volume only for keys it is missing, so a volume seeded at 2 kept 2 when the default
+	// became 6. A pin is applied over the persisted config on every load, whatever that
+	// file's history.
+	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -2903,6 +2921,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
+		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
+		// every install, not only while the A2A surface is up: on a today
+		// install a plugin's value would reroute Google Chat posts from
+		// hermes send to a chat.notify route that does not exist there. The
+		// operator renders them only under next, after this merge.
+		kept := extEnvs[:0]
+		for _, e := range extEnvs {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
+				kept = append(kept, e)
+			}
+		}
+		extEnvs = kept
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}
@@ -3068,6 +3098,22 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: a2aAgentBusUser,
 			},
 		)
+	}
+	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
+	// so the agent-side callers that used to `hermes send` a proactive post
+	// route it to the gateway's chat.notify home channel instead. This names
+	// the platform they reroute; the bus identity above is what sends it.
+	// Only with a home channel the route posts to: otherwise every proactive
+	// post would be refused, and on a Chat-and-Slack install the agent would
+	// count Chat as a platform to post to ahead of Slack.
+	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
+	}
+	// A kanban card's report back to the gateway conversation it was filed
+	// in rides the same route whenever the gateway arms it, home channel or
+	// not; only the kanban notifier reads this.
+	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -3664,6 +3710,9 @@ func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *co
 	if pool := scopedSAPoolJSON(agent); pool != "" {
 		data[scopedSAPoolKey] = pool
 	}
+	if forges := vcsForgesJSON(agent); forges != "" {
+		data[vcsForgesKey] = forges
+	}
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -3711,8 +3760,8 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // and not only a non-empty check. The detector refuses an all-digits --project
 // outright (looksLikeProjectNumber in cmd/drift-detector/main.go), because the
 // join matches it against each audit record's project_id, which is always the ID;
-// start-services.sh always passes --in-cluster and --profiles-dir, so the join is
-// always on and that refusal is always reachable. Nothing else reading the triple
+// start-services.sh always passes --in-cluster, which is what keys that refusal,
+// so it is always reachable. Nothing else reading the triple
 // minds a number -- the gcloud bootstrap in buildCredentialProxyEnv takes one, and
 // so do GKE_PROJECT_ID and KUBE_CONTEXT_NAME -- so an install can carry a numeric
 // projectId, be healthy in every other respect, and get the restart loop the
@@ -3797,6 +3846,36 @@ func driftDetectorHarness(agent *agentv1alpha1.PlatformAgent) (project, location
 func asNativeSidecar(c corev1.Container) corev1.Container {
 	c.RestartPolicy = ptr.To(corev1.ContainerRestartPolicyAlways)
 	return c
+}
+
+// resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
+// override over the operator's defaults, one key at a time, so a CR that sets
+// only limits.memory keeps every other default. A nil override returns the
+// defaults unchanged, which the goldens and the chart's quota preflight carry.
+// ValidateAgentAPIAuthResources reads the same merged result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	resolved := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
+			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
+			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
+			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
+		},
+	}
+	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
+		return resolved
+	}
+	override := deployment.AgentAPIAuth.Resources
+	for name, quantity := range override.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range override.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
 }
 
 // buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
@@ -3936,21 +4015,14 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			TimeoutSeconds:      3,
 			FailureThreshold:    3,
 		},
-		Resources: corev1.ResourceRequirements{
-			// Memory request covers the watcher's informer and dedup caches, which
-			// scale with the number of watched clusters.
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-			},
-			// Why these values are what they are: see the agentAPIAuth* constant
-			// declarations at the top of this file.
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-				corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-				corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-			},
-		},
+		// The defaults are the agentAPIAuth* constants at the top of this file;
+		// spec.deployment.agentAPIAuth.resources overrides any key of them
+		// (resolveAgentAPIAuthResources). The memory request covers the watcher's
+		// dedup and scale-up memos and the initial list it holds only until
+		// delivered (watcher.go, Run). The event watcher reads the memory limit
+		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
+		// half of it, so a raised limit raises the soft limit with no other change.
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4123,6 +4195,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 	} else {
 		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"})
 	}
+	// Declared here, in the managed set, so mergeCredentialProxyEnv reserves
+	// the name: a CR env entry must not point the broker at a configuration
+	// the operator did not render.
+	envVars = append(envVars, buildVCSForgesEnv(agent)...)
 	// What the broker's own Pod changes about its configuration. The agent-API
 	// front door is gone — it stayed in the agent Pod, so none of its three
 	// variables are set here — Envoy listens on the Pod IP rather than loopback,
@@ -4344,6 +4420,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// one, or, naming the same subscription, refuse the broker's start.
 		legacyGoogleChatSubscriptionEnvVar,
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		// The forge configuration is reserved whether or not the operator
+		// renders one. It names which forges the broker builds and where
+		// their tokens are, so a CR that could set it could hand the broker a
+		// forge no declaration admitted -- or, on a GitHub-only install where
+		// the operator sets nothing, point it at a file that is not there and
+		// keep it from starting.
+		vcsForgesEnv,
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container
 		// the sidecar split into, and an operator who set it to 127.0.0.1
@@ -4492,7 +4575,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//
 	// KAGE_SLACK_UX switches between code paths already in the image, all of
 	// them about Slack. It is compared against `FLAG_ON_VALUES` in
-	// `slack_presenter.py`; any other value is off, the image default. It names
+	// `slack_presenter.py`; unset is on, the image default, and any other value
+	// is off, so passing it through is how an install opts out. It names
 	// no path, URL, credential or image, and no value of it adds a destination
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's
@@ -4566,6 +4650,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
 		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
+
+		// The findings queue's pacing limits (`findings_queue.pacing_limits`,
+		// read by the `no_agent` scripts `findings_nudge.py` and
+		// `bootstrap_handoff.py`, which passes them to the first inventory
+		// report's selection): how many findings are added to chat, and from
+		// which UTC hour. Each is parsed as a whole number, and a value that
+		// does not parse, is negative, or is not an hour falls back to its
+		// default, so an arbitrary value bounds a count of chat messages and
+		// reaches nothing else. Kept apart from the block above so gofmt does not realign it.
+		"FINDINGS_DAILY_CRITICALS":        {},
+		"FINDINGS_FIRST_REPORT_CRITICALS": {},
+		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
+		"FINDINGS_NONCRITICAL_MAX":        {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

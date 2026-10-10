@@ -913,6 +913,17 @@ class BaseTestCase(unittest.TestCase):
     def stdout_json(self):
         return json.loads(self.out.strip())
 
+    def stdout_json_without_publish_timer(self):
+        """The JSON line without `publish_s`, which reads a real clock.
+
+        The test still checks that the timer is there and is not negative.
+        """
+        payload = self.stdout_json()
+        publish_s = payload.pop(audit_report.PUBLISH_SECONDS_KEY)
+        self.assertIsInstance(publish_s, float)
+        self.assertGreaterEqual(publish_s, 0)
+        return payload
+
     def write_findings(self, doc):
         path = self.tmp_path / "findings.json"
         path.write_text(json.dumps(doc), encoding="utf-8")
@@ -3384,7 +3395,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "OPENED",
                 "issue_url": "https://github.com/acme/fleet/issues/7",
@@ -3446,7 +3457,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertTrue(self.harness.forge_calls("issue-comment", number=42))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "UPDATED",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -4348,7 +4359,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("branch", "-D"))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "CLEAN",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -4383,7 +4394,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.forge_calls("issue-close"))
         self.assertFalse(self.harness.forge_calls("issue-comment"))
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "CLEAN",
                 "issue_url": None,
@@ -14610,22 +14621,45 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
                         audit_report.handle_remediate(args)
                 self.assertIn("directory mode", str(caught.exception))
 
+    def setUp(self):
+        # Directory mode unless a test arms a broker: no endpoint, so the mode
+        # that `handle_remediate` decides is False.
+        env = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(audit_report.set_content_mode, False)
+
     def test_in_content_mode_a_gitlab_repository_goes_on_to_plan(self):
         # The content workspace clones from the repository's own forge, so the
         # refusal is directory mode's alone: here `remediate` reaches planning.
-        audit_report.set_content_mode(True)
-        self.addCleanup(audit_report.set_content_mode, False)
-        args = argparse.Namespace(
-            audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
-            finding=["f1"], dry_run=False, manifest_file=None, issue=None,
-        )
-        reached = RuntimeError("reached planning")
-        with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
-                patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
-                patch.object(audit_report, "read_run_record", side_effect=reached):
-            with self.assertRaises(RuntimeError) as caught:
-                audit_report.handle_remediate(args)
-        self.assertIs(reached, caught.exception)
+        # Live test on main: a new `remediate` process did not decide the mode
+        # before the refusal, so it refused every GitLab repository as
+        # "directory mode". Nothing presets the mode here; only the configured
+        # broker endpoint decides it.
+        import credential_proxy_client
+
+        # The refusal needs no answer from the broker: a broker that is down
+        # does not change the decision, and a dry run does not call it.
+        down = AssertionError("remediate asked the broker before the refusal")
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                audit_report.set_content_mode(False)
+                args = argparse.Namespace(
+                    audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
+                    finding=["f1"], dry_run=dry_run, manifest_file=None, issue=None,
+                )
+                reached = RuntimeError("reached planning")
+                with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}), \
+                        patch.object(credential_proxy_client, "workspaces_available", side_effect=down), \
+                        patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                        patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                        patch.object(audit_report, "_dry_run_repo", return_value="gitlab.com/acme/infra"), \
+                        patch.object(audit_report, "_proposal_noun", return_value="merge request"), \
+                        patch("gitops_workspace.get_managed_repos", return_value=["gitlab.com/acme/infra"]), \
+                        patch.object(audit_report, "read_run_record", side_effect=reached):
+                    with self.assertRaises(RuntimeError) as caught:
+                        audit_report.handle_remediate(args)
+                self.assertIs(reached, caught.exception)
 
     def test_a_dry_run_without_repo_refuses_what_it_resolves(self):
         # Review round 5: with no `--repo` the dry run resolved the repository
@@ -22044,6 +22078,9 @@ GOLDEN_TMP_TOKEN = "<TMP>"
 # `log()` stamps each line with the wall clock, outside the frozen `datetime`.
 GOLDEN_LOG_STAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ", re.M)
 GOLDEN_LOG_STAMP_TOKEN = "[<TS>] "
+# `publish_s` reads a real clock, outside the frozen `datetime`.
+GOLDEN_PUBLISH_TIMER_RE = re.compile(r'"publish_s": \d+(\.\d+)?')
+GOLDEN_PUBLISH_TIMER_TOKEN = '"publish_s": "<SECONDS>"'
 
 
 class _FrozenDatetime(datetime):
@@ -23060,7 +23097,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     `two_findings`' `major` finding, below the floor on this stream, is now
     named in the bodies' below-floor block, and the dry run logs it on
     stderr. So is compliance-audit gaining a declared-intent step: its bodies carry the
-    `Declared-intent search:` line every declaring stream's bodies carry. Nothing else moved.
+    `Declared-intent search:` line every declaring stream's bodies carry. The JSON line
+    carries `publish_s`, the time `finish` used to publish. It reads a real clock, so the
+    transcripts record it as a token. No transcript has `inspect_s` or `collect_s`: these
+    runs have no in-flight note and no manifest. Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
@@ -23087,6 +23127,7 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
         if text is None:
             return None
         text = text.replace(str(self.tmp_path), GOLDEN_TMP_TOKEN)
+        text = GOLDEN_PUBLISH_TIMER_RE.sub(GOLDEN_PUBLISH_TIMER_TOKEN, text)
         return GOLDEN_LOG_STAMP_RE.sub(GOLDEN_LOG_STAMP_TOKEN, text)
 
     def transcript(self, rc):
@@ -23898,6 +23939,159 @@ class TestDetectContentMode(BaseTestCase):
             self.assertIn("check the credential-proxy pod and re-run the same command", section)
         self.assertIn("From `finish`, the run is still in flight", exit_codes)
         self.assertIn("re-run `finish`, never `start`", exit_codes)
+
+
+class TestPhaseTimers(HarnessTestCase):
+    """`finish` reports how long each phase of the run took, as report data."""
+
+    def write_note(self, started_at, audit=AUDIT):
+        """Leave the in-flight note that `start` writes, with `started_at`."""
+        path = Path(audit_report.inflight_path_for(audit))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"audit": audit, "started_at": started_at}), encoding="utf-8")
+        return path
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text())
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def stamp(self, offset_s):
+        moment = datetime.fromtimestamp(time.time() + offset_s, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_inspect_s_is_the_time_from_start_to_finish(self):
+        note = self.write_note(time.time() - 120)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertGreaterEqual(payload["inspect_s"], 120)
+        self.assertLess(payload["inspect_s"], 180)
+        self.assertEqual(self.stored()["inspect_s"], payload["inspect_s"])
+        # `finish` read the note before `handle_finish` released it.
+        self.assertFalse(note.exists())
+
+    def test_publish_s_is_on_the_line_and_on_the_envelope(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        publish_s = self.stdout_json()["publish_s"]
+        self.assertIsInstance(publish_s, float)
+        self.assertGreaterEqual(publish_s, 0)
+        self.assertEqual(self.stored()["publish_s"], publish_s)
+
+    def test_the_findings_path_carries_the_timers_too(self):
+        self.write_note(time.time() - 60)
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "OPENED")
+        for key in ("inspect_s", "publish_s"):
+            with self.subTest(key=key):
+                self.assertIn(key, payload)
+                self.assertEqual(self.stored()[key], payload[key])
+
+    def test_a_run_without_a_note_or_a_manifest_has_no_inspect_or_collect_timer(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        for surface in (self.stdout_json(), self.stored()):
+            for key in ("inspect_s", "collect_s"):
+                with self.subTest(key=key):
+                    self.assertNotIn(key, surface)
+
+    def test_collect_s_is_the_collectors_own_time(self):
+        manifest = _full_manifest()
+        manifest.update(started_at=self.stamp(-30), finished_at=self.stamp(30))
+        self.harness.replies = {"issue-list": {"issues": []}}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["collect_s"], 60.0)
+        self.assertEqual(self.stored()["collect_s"], 60.0)
+
+    def test_a_manifest_without_its_stamps_gives_no_collect_timer(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("collect_s", self.stdout_json())
+        self.assertNotIn("collect_s", self.stored())
+
+    def test_a_dry_run_prints_no_timers(self):
+        self.write_note(time.time() - 60)
+        self.assertEqual(self.run_finish(make_doc(findings=[]), ["--dry-run"]), 0, self.err)
+        for key in audit_report.PHASE_TIMER_KEYS:
+            with self.subTest(key=key):
+                self.assertNotIn(f'"{key}"', self.out)
+
+    def test_a_note_that_gives_no_start_time_gives_no_inspect_timer(self):
+        now = datetime.now(timezone.utc)
+        path = Path(audit_report.inflight_path_for(AUDIT))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cases = {
+            # `_in_flight_since` uses the mtime of such a note; a timer must not.
+            "does not parse": "{",
+            "names another stream": json.dumps({"audit": "other", "started_at": now.timestamp() - 60}),
+            "has no started_at": json.dumps({"audit": AUDIT}),
+            "has a boolean": json.dumps({"audit": AUDIT, "started_at": True}),
+            "has a string": json.dumps({"audit": AUDIT, "started_at": "yesterday"}),
+            "is in the future": json.dumps({"audit": AUDIT, "started_at": now.timestamp() + 60}),
+            "is infinite": '{"audit": "%s", "started_at": -Infinity}' % AUDIT,
+            "overflows float": json.dumps({"audit": AUDIT, "started_at": 10**400}),
+            "is before datetime range": json.dumps({"audit": AUDIT, "started_at": -1e300}),
+            "is negative": json.dumps({"audit": AUDIT, "started_at": -1}),
+        }
+        for name, text in cases.items():
+            with self.subTest(note=name):
+                path.write_text(text, encoding="utf-8")
+                self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
+        path.unlink()
+        self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
+
+    def test_a_run_longer_than_the_lease_keeps_its_inspect_timer(self):
+        # While no later `start` has replaced the expired note, the note at
+        # `finish` is still this run's note.
+        now = datetime.now(timezone.utc)
+        path = Path(audit_report.inflight_path_for(AUDIT))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        elapsed = audit_report.INFLIGHT_TTL_SECONDS + 60
+        path.write_text(json.dumps({"audit": AUDIT, "started_at": now.timestamp() - elapsed}), encoding="utf-8")
+        self.assertEqual(audit_report.inspect_seconds(AUDIT, now), float(elapsed))
+        path.unlink()
+
+    def test_a_bad_manifest_stamp_gives_no_collect_timer(self):
+        good = {"started_at": "2026-08-01T09:00:00Z", "finished_at": "2026-08-01T09:10:30Z"}
+        self.assertEqual(audit_report.collector_seconds(good), 630.0)
+        cases = {
+            "no manifest": None,
+            "no started_at": {"finished_at": good["finished_at"]},
+            "no finished_at": {"started_at": good["started_at"]},
+            "a stamp that does not parse": {**good, "started_at": "soon"},
+            "a stop before the start": {**good, "finished_at": "2026-08-01T08:59:00Z"},
+        }
+        for name, manifest in cases.items():
+            with self.subTest(manifest=name):
+                self.assertIsNone(audit_report.collector_seconds(manifest))
+
+    def test_the_envelope_copies_only_the_timers_the_line_has(self):
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED", "inspect_s": 812.4, "publish_s": 21.0, "collect_s": None},
+            make_doc(),
+            NOW,
+            repo="acme/fleet",
+            issue_number=42,
+            ledger_body="body",
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=[],
+        )
+        self.assertEqual((envelope["inspect_s"], envelope["publish_s"]), (812.4, 21.0))
+        self.assertNotIn("collect_s", envelope)
 
 
 if __name__ == "__main__":

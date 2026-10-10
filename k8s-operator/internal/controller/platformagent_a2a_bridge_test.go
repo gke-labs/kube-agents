@@ -124,11 +124,37 @@ func TestANextInstallWithNoDeclaredBridgeGetsOne(t *testing.T) {
 			t.Errorf("the rendered bridge lacks the agent's mount %s", m.Name)
 		}
 	}
-	if !reflect.DeepEqual(b.SecurityContext, agentC.SecurityContext) || !reflect.DeepEqual(b.Resources, agentC.Resources) {
-		t.Error("the rendered bridge's securityContext or resources differ from the agent container's")
+	if !reflect.DeepEqual(b.SecurityContext, agentC.SecurityContext) {
+		t.Error("the rendered bridge's securityContext differs from the agent container's")
+	}
+	// Its own resources, not the agent's (gke-labs#2748).
+	if !reflect.DeepEqual(b.Resources, a2aRenderedBridgeDefaultResources()) {
+		t.Errorf("the rendered bridge's resources = %+v, want the defaults", b.Resources)
 	}
 	if b.Image != deriveImageFromOperator(agentC.Image, a2aBridgeImageName) {
 		t.Errorf("image = %q, want the agent image's registry and tag under %s", b.Image, a2aBridgeImageName)
+	}
+}
+
+// With no operator setting the rendered bridge runs the api executor, the
+// shipped default and what the next eval lane measures (hack/ci-deploy.sh sets
+// no A2A_BRIDGE_EXECUTOR): it carries no BRIDGE_EXECUTOR, and it keeps the
+// agent container's non-blank API_SERVER_KEY, which is what the bridge's
+// bridgeExecutor reads to pick api over its keyless cli fallback. The pod's
+// actual container is checked, not a2aRenderedBridgeSettings, so a copy that
+// dropped the key would show here even if the settings still listed it.
+func TestARenderedBridgeWithNoExecutorSettingRunsTheAPIExecutor(t *testing.T) {
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, "")
+	b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	env := envIndex(b)
+	if e, ok := env[a2aBridgeExecutorEnvVar]; ok {
+		t.Errorf("the rendered bridge sets %s=%q with no operator setting", a2aBridgeExecutorEnvVar, e.Value)
+	}
+	if key := env[a2aBridgeAPIServerKeyEnvVar]; strings.TrimSpace(key.Value) == "" && key.ValueFrom == nil {
+		t.Errorf("the rendered bridge has no %s, so the bridge would fall back to the cli executor", a2aBridgeAPIServerKeyEnvVar)
+	}
+	if !a2aBridgeRunsAPIExecutor(b) {
+		t.Error("the operator reads the rendered bridge as a cli bridge, so it would render no activity hook for it")
 	}
 }
 
@@ -417,5 +443,178 @@ func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
 	}
 	if _, logged := a2aRefusedBridgeExecutors.Load("Cli-refused-once"); !logged {
 		t.Error("the refused value was not logged")
+	}
+}
+
+// The rendered bridge no longer copies the agent container's resources: that
+// doubled a next pod's requests and left it unschedulable on a cluster sized
+// for today (gke-labs#2748). With the defaults its requests are an eighth of
+// the agent container's or less.
+func TestTheRenderedBridgeDoesNotDoubleThePodsRequests(t *testing.T) {
+	pod := bridgeTestPod(provisionedAgent())
+	b := containersNamed(pod, a2aBridgeContainerName)[0]
+	agentC := containersNamed(pod, "platform-agent")[0]
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		bridge, agent := b.Resources.Requests[name], agentC.Resources.Requests[name]
+		if agent.IsZero() {
+			t.Fatalf("the agent container requests no %s; the comparison is vacuous", name)
+		}
+		if bridge.MilliValue()*8 > agent.MilliValue() {
+			t.Errorf("the bridge requests %s %s, more than an eighth of the agent container's %s", bridge.String(), name, agent.String())
+		}
+	}
+	if err := a2aBridgeResourcesRefusal(a2aRenderedBridgeDefaultResources()); err != nil {
+		t.Errorf("the defaults fail the override's own check: %v", err)
+	}
+}
+
+// A2A_BRIDGE_RESOURCES replaces the defaults whole, for a cli install or one
+// that needs more. A value the operator can't use (not JSON, or a request
+// above its limit) is ignored and logged once, and the defaults stand.
+func TestTheBridgeResourcesSettingOverridesTheDefaults(t *testing.T) {
+	t.Setenv(a2aBridgeResourcesOperatorEnvVar, `{"requests":{"cpu":"500m","memory":"2Gi"},"limits":{"memory":"5Gi"}}`)
+	got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources
+	if q := got.Requests[corev1.ResourceMemory]; q.String() != "2Gi" {
+		t.Errorf("memory request = %s, want the setting's 2Gi", q.String())
+	}
+	if q := got.Limits[corev1.ResourceMemory]; q.String() != "5Gi" {
+		t.Errorf("memory limit = %s, want the setting's 5Gi", q.String())
+	}
+	if _, ok := got.Limits[corev1.ResourceCPU]; ok {
+		t.Error("the setting is used whole, but a default CPU limit was merged into it")
+	}
+
+	for _, bad := range []string{"lots", `{"requests":{"memory":"1Gi"},"limits":{"memory":"512Mi"}}`, `{"cpu":"1"}`, `{"request":{"memory":"1Gi"}}`, `{}`,
+		`{"requests":{"cpu":"-1"}}`, `{"limits":{"foo":"1"}}`, `{"requests":{"example.com/gpu":"1"}}`,
+		`{"limits":{"memory":"0"}}`, `{"limits":{"memory":"1Gi"},"claims":[{"name":"x"}]}`,
+		`{"requests":{"cpu":"10E"}}`,
+		`{"requests":{"cpu":"500m"}}{"limits":{"memory":"5Gi"}}`, `{"requests":{"cpu":"500m"}} trailing`,
+		`{"requests":{"cpu":"500m"}}}`, `{"requests":{"cpu":"500m"}}]`} {
+		t.Run(bad, func(t *testing.T) {
+			t.Setenv(a2aBridgeResourcesOperatorEnvVar, bad)
+			got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources
+			if !reflect.DeepEqual(got, a2aRenderedBridgeDefaultResources()) {
+				t.Errorf("an unusable setting rendered %+v, want the defaults", got)
+			}
+			if _, logged := a2aRefusedBridgeResources.Load(bad); !logged {
+				t.Error("the unusable setting was not logged")
+			}
+		})
+	}
+}
+
+// A cli bridge runs a hermes chat per task, which the api defaults can't hold.
+// An install that pinned cli before A2A_BRIDGE_RESOURCES existed keeps the copy
+// of the agent container's resources it had, so the upgrade changes nothing;
+// so does one whose override can't be used. A usable override still wins.
+func TestACLIBridgeWithoutAnOverrideKeepsTheAgentsResources(t *testing.T) {
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, a2aBridgeExecutorCLI)
+	for name, value := range map[string]string{"unset": "", "unusable": `{"limits":{"foo":"1"}}`} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(a2aBridgeResourcesOperatorEnvVar, value)
+			pod := bridgeTestPod(provisionedAgent())
+			b := containersNamed(pod, a2aBridgeContainerName)[0]
+			agentC := containersNamed(pod, "platform-agent")[0]
+			if !reflect.DeepEqual(b.Resources, agentC.Resources) {
+				t.Errorf("a cli bridge with the override %s got %+v, want the agent container's %+v", name, b.Resources, agentC.Resources)
+			}
+		})
+	}
+	t.Setenv(a2aBridgeResourcesOperatorEnvVar, `{"requests":{"memory":"2Gi"},"limits":{"memory":"5Gi"}}`)
+	b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	if q := b.Resources.Limits[corev1.ResourceMemory]; q.String() != "5Gi" {
+		t.Errorf("a cli bridge with a usable override has a memory limit of %s, want the override's 5Gi", q.String())
+	}
+}
+
+// The agent container's API_SERVER_KEY can come from an AgentPlugin's env, and
+// a blank or unresolvable one would switch the bridge to cli, which the api
+// defaults can't hold. The bridge sets its own key instead of inheriting it,
+// so whatever the agent container carries, the bridge runs api, is sized for
+// api, and its executor, sizing and activity hook agree.
+func TestAPluginsAPIServerKeyDoesNotReachTheBridge(t *testing.T) {
+	agentC := containersNamed(bridgeTestPod(provisionedAgent()), "platform-agent")[0]
+	for name, key := range map[string]corev1.EnvVar{
+		"blank": {Name: a2aBridgeAPIServerKeyEnvVar, Value: " "},
+		"valueFrom": {Name: a2aBridgeAPIServerKeyEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "plugin-secret"}, Key: "k", Optional: ptr.To(true)}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := agentC.DeepCopy()
+			replaced := false
+			for i := range c.Env {
+				if c.Env[i].Name == a2aBridgeAPIServerKeyEnvVar {
+					c.Env[i] = key
+					replaced = true
+				}
+			}
+			if !replaced {
+				t.Fatalf("the agent container carries no %s; the probe is vacuous", a2aBridgeAPIServerKeyEnvVar)
+			}
+			b := buildA2ABridgeContainer(provisionedAgent(), *c)
+			var keys []corev1.EnvVar
+			for _, e := range b.Env {
+				if e.Name == a2aBridgeAPIServerKeyEnvVar {
+					keys = append(keys, e)
+				}
+			}
+			if len(keys) != 1 || keys[0].Value != loopbackAgentAPIKey || keys[0].ValueFrom != nil {
+				t.Errorf("the bridge's %s = %+v, want the bridge's own %q once", a2aBridgeAPIServerKeyEnvVar, keys, loopbackAgentAPIKey)
+			}
+			if !a2aBridgeRunsAPIExecutor(b) {
+				t.Error("the bridge would run cli")
+			}
+			if !reflect.DeepEqual(b.Resources, a2aRenderedBridgeDefaultResources()) {
+				t.Errorf("the bridge got %+v, want the api defaults", b.Resources)
+			}
+		})
+	}
+}
+
+// The gateway's busy-notice threshold is the bridge's worker count: the turn
+// that finds every worker taken is the first one told it waits. It follows
+// the rendered bridge's default and the operator setting that sizes it, and a
+// declared bridge's own count; the operator's A2A_BUSY_NOTICE_AT overrides
+// all three, and a value that is not a count falls back instead of reaching
+// a gateway that would refuse it at boot.
+func TestTheBusyNoticeThresholdIsTheBridgeWorkerCount(t *testing.T) {
+	rendered := func(agent *agentv1alpha1.PlatformAgent) string {
+		t.Helper()
+		dep := buildA2AGatewayDeployment(agent)
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aBusyNoticeAtEnvVar {
+				return e.Value
+			}
+		}
+		t.Fatalf("the gateway Deployment does not render %s", a2aBusyNoticeAtEnvVar)
+		return ""
+	}
+	if got := rendered(a2aTestAgent()); got != strconv.Itoa(a2aRenderedBridgeDefaultConcurrency) {
+		t.Errorf("default threshold = %q, want the rendered bridge's %d", got, a2aRenderedBridgeDefaultConcurrency)
+	}
+
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "4")
+	if got := rendered(a2aTestAgent()); got != "4" {
+		t.Errorf("threshold with the bridge at 4 workers = %q, want 4", got)
+	}
+
+	declared := a2aTestAgent()
+	declared.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: a2aBridgeContainerName, Image: "registry.example/declared-bridge:1",
+		Env: []corev1.EnvVar{{Name: a2aBridgeConcurrencyEnvVar, Value: "3"}},
+	}}}
+	if got := rendered(declared); got != "3" {
+		t.Errorf("threshold with a declared 3-worker bridge = %q, want 3", got)
+	}
+
+	t.Setenv(a2aBusyNoticeAtEnvVar, "7")
+	if got := rendered(declared); got != "7" {
+		t.Errorf("threshold with the operator override = %q, want 7", got)
+	}
+	for _, bad := range []string{"0", "-2", "junk"} {
+		t.Setenv(a2aBusyNoticeAtEnvVar, bad)
+		if got := rendered(declared); got != "3" {
+			t.Errorf("threshold with override %q = %q, want the worker count 3", bad, got)
+		}
 	}
 }

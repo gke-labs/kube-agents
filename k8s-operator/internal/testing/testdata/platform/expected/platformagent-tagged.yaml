@@ -307,6 +307,8 @@ data:
           long_running_notifications: true
           memory_notifications: "off"
           tool_progress: "off"
+    kanban:
+      max_in_progress: 6
     model:
       api_key: none
       api_mode: chat_completions
@@ -1078,7 +1080,7 @@ spec:
             limits:
               cpu: "1"
               ephemeral-storage: 2Gi
-              memory: 1Gi
+              memory: 2Gi
             requests:
               cpu: 500m
               memory: 512Mi

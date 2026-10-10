@@ -565,17 +565,23 @@ class CallSiteTest(unittest.TestCase):
         self.assertIsNotNone(re.search(r'^reset_audit_ledgers "lease"\nreset_agent_pulls "lease" \|\| echo "WARNING', src, re.M), "lease-time call")
 
     def test_the_unit_reset_is_gated_on_the_writer_phase_and_fails_closed(self):
+        # The unwinding is skip_unit's (tests/test_ci_eval_ledger_mint.py runs
+        # run_one_unit through it): the gated block hands it every lock the
+        # unit holds and returns before devops-bench.
         unit = lifted("run_one_unit")
         gate = re.search(
-            r'if \[ "\$\(unit_phase "\$\{name\}"\)" = "1" \] && ! reset_agent_pulls "\$\{name\} rep \$\{rep\}"; then\n(.*?)\n    return 0\n  fi',
+            r'if \[ "\$\(unit_phase "\$\{name\}"\)" = "1" \]; then\n(.*?)\n      return 0\n    fi\n  fi',
             unit,
             re.DOTALL,
         )
         self.assertIsNotNone(gate, "the gated call in run_one_unit")
         body = gate.group(1)
+        self.assertIn('reset_agent_pulls "${name} rep ${rep}" || reset_rc=$?', body)
+        self.assertIn('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"', body)
+        skip = lifted("skip_unit")
         for lock in ("lock-infra", "lock-task-${name}"):
-            self.assertIn(f'lock_release "${{STATE_DIR}}/{lock}"', body)
-        self.assertIn('release_streams "${streams}"', body)
+            self.assertIn(f'lock_release "${{STATE_DIR}}/{lock}"', skip)
+        self.assertIn('release_streams "${streams}"', skip)
         self.assertLess(unit.index('reset_audit_ledgers "${name} rep ${rep}"'), unit.index("reset_agent_pulls"), "after the ledger reset")
         self.assertLess(unit.index("reset_agent_pulls"), unit.index("uv run devops-bench"), "before devops-bench")
 

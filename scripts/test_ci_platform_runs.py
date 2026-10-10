@@ -19,10 +19,13 @@ holds it rather than reading as idle, that the wait ends when the run does, and 
 wait_platform_runs tries a failed exec again inside its bound.
 """
 
+import contextlib
+import io
 import json
 import os
 import pathlib
 import re
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -30,6 +33,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -85,14 +89,14 @@ class PlatformRunsTest(unittest.TestCase):
     def _roster(self, jobs):
         (self.cron / "jobs.json").write_text(json.dumps({"jobs": jobs}))
 
-    def _wait(self, bound: int = 0, poll: int = 1, audits=AUDITS) -> str:
-        done = subprocess.run(
-            [sys.executable, "-", str(self.home), str(bound), str(poll), *audits],
-            input=SCRIPT.read_text(), capture_output=True, text=True, check=False,
-            env={**os.environ, "OOBE_STAGE_SOURCE": str(STAGE)},
-        )
-        self.assertEqual(done.returncode, 0, done.stderr)
-        return done.stdout.strip()
+    def _wait(self, bound: int = 0, poll: int = 1, audits=AUDITS, source: pathlib.Path = STAGE) -> str:
+        """The script as `python3 - <args> < ci_platform_runs.py` runs it, in this process so
+        coverage sees it: its own argv and OOBE_STAGE_SOURCE for the call, stdout captured."""
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["-", str(self.home), str(bound), str(poll), *audits]), \
+                mock.patch.dict(os.environ, {"OOBE_STAGE_SOURCE": str(source)}), contextlib.redirect_stdout(out):
+            runpy.run_path(str(SCRIPT), run_name="__main__")
+        return out.getvalue().strip()
 
     def test_a_live_run_holds_and_a_finished_stale_or_other_one_does_not(self):
         self._rows(
@@ -140,6 +144,12 @@ class PlatformRunsTest(unittest.TestCase):
     def test_nothing_on_the_streams_asked_for_goes_straight_through(self):
         self._rows([("1", "compliance-audit", "running", ago(0))])
         self.assertEqual(self._wait(audits=["stockout-prevention"]), "none going")
+
+    def test_the_stale_cutoff_is_the_stages_run_limit(self):
+        # A run the chain still waits on is one a unit waits on too.
+        stage = REPO / "agents" / "chat" / "scripts" / "oobe.py"
+        limit = eval(re.search(r"^RUN_LIMIT_SECONDS = (.+)$", stage.read_text(), re.M).group(1))
+        self.assertEqual(STALE_SECONDS, limit)
 
     def test_no_store_is_nothing_going(self):
         self.assertEqual(self._wait(), "none going")
@@ -218,12 +228,7 @@ class PlatformRunsTest(unittest.TestCase):
     def test_a_stage_not_started_does_not_read_the_stages_source(self):
         # An `oobe` job left on the roster of an image that ships no oobe.py holds nothing.
         self._stage(armed=False)
-        done = subprocess.run(
-            [sys.executable, "-", str(self.home), "0", "1", *AUDITS],
-            input=SCRIPT.read_text(), capture_output=True, text=True, check=False,
-            env={**os.environ, "OOBE_STAGE_SOURCE": str(self.home / "no-such-oobe.py")},
-        )
-        self.assertEqual(done.stdout.strip(), "none going", done.stderr)
+        self.assertEqual(self._wait(source=self.home / "no-such-oobe.py"), "none going")
 
     def test_a_roster_whose_jobs_are_not_a_list_holds(self):
         self._stage({"fired": []}, armed=False)

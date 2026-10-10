@@ -159,6 +159,12 @@ class TestSessionKvServerUtils(unittest.TestCase):
                 self.assertIn(label, session_kv_server.ALERT_DAILY_LIMITS)
 
 
+def closing_db():
+    import sqlite3
+    from contextlib import closing
+    return closing(sqlite3.connect(session_kv_server.SESSION_KV_DB_PATH))
+
+
 class TestSessionKvServerApi(unittest.TestCase):
 
     def setUp(self):
@@ -194,6 +200,58 @@ class TestSessionKvServerApi(unittest.TestCase):
         data = meta_resp.json()
         self.assertEqual(data.get("platform"), "k8s-watcher")
         self.assertIn("created_at", data)
+
+    def test_a_conversation_route_is_recorded_for_a_bridge_session(self):
+        # What the hermes-bridge records before a turn, read back where
+        # kanban_event_routing reads it, under its own key: the row's
+        # platform/chat_id/thread_id address a chat thread for other readers
+        # (send_notification) and stay unset.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "slack", "conversation": "slack:dm/D123", "context_id": "ctx-0123abcd"}
+        response = self.client.put(f"/v1/sessions/{sid}/route", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        meta = self.client.get(f"/v1/sessions/{sid}/metadata").json()
+        self.assertEqual(meta["conversation_route"],
+                         {"platform": "slack", "conversation": "slack:dm/D123", "context_id": "ctx-0123abcd"})
+        self.assertNotIn("chat_id", meta)
+        self.assertNotIn("thread_id", meta)
+        # Again on the next turn, after something else wrote the row: an
+        # upsert that keeps the other keys.
+        with closing_db() as conn:
+            row = json.loads(conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (sid,)).fetchone()[0])
+            row["kept"] = True
+            conn.execute("UPDATE session_metadata SET metadata = ? WHERE session_id = ?", (json.dumps(row), sid))
+            conn.commit()
+        body["conversation"] = "slack:C1/1712.0001"
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        meta = self.client.get(f"/v1/sessions/{sid}/metadata").json()
+        self.assertEqual(meta["conversation_route"]["conversation"], "slack:C1/1712.0001")
+        self.assertTrue(meta["kept"])
+
+    def test_a_hashed_session_takes_its_own_context(self):
+        # The bridge hashes a context id that is not path-safe
+        # (a2a/hermes-bridge/api.go, apiSessionID); the route is accepted for
+        # that session and no other.
+        import hashlib
+        ctx = "ctx/odd id"
+        sid = "a2a-h-" + hashlib.sha256(ctx.encode()).hexdigest()[:32]
+        body = {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B", "context_id": ctx}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.put("/v1/sessions/a2a-h-0000/route", json=body).status_code, 400)
+
+    def test_a_conversation_route_is_refused_outside_its_shape(self):
+        good = {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B", "context_id": "ctx-1"}
+        for sid, body, why in (
+            ("a2a-ctx-other", good, "another session's cards re-addressed to this context"),
+            ("k8s-evt-12345678", good, "an alert session cannot be re-addressed"),
+            ("a2a-ctx-1", dict(good, platform="discord"), "a backend the gateway cannot hold for notify"),
+            ("a2a-ctx-1", dict(good, conversation="slack:C1/1.2"), "a key for the other backend"),
+            ("a2a-ctx-1", dict(good, conversation="gchat:"), "an empty key"),
+            ("a2a-ctx-1", dict(good, context_id=""), "no context id"),
+            ("a2a-ctx-1", dict(good, context_id="x" * 600), "an oversized context id"),
+        ):
+            response = self.client.put(f"/v1/sessions/{sid}/route", json=body)
+            self.assertEqual(response.status_code, 400, why)
 
     def test_store_and_get_incident(self):
         # Store incident
@@ -1013,11 +1071,13 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/findings/ranked", None),
         ("GET", "/v1/findings", None),
         ("POST", "/v1/findings/f-1/surfaced", {}),
+        ("GET", "/v1/findings/additions", None),
         ("PATCH", "/v1/findings/f-1", {"state": "accepted"}),
         ("POST", "/v1/findings/f-1/verified", {"outcome": "resolved"}),
         ("POST", "/v1/findings/expire-snoozes", None),
         ("GET", "/v1/findings/publication/backlog", None),
         ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
+        ("PUT", "/v1/sessions/sess-1/route", {"platform": "slack", "conversation": "slack:dm/D1", "context_id": "c"}),
     )
 
     def setUp(self):
@@ -3570,6 +3630,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
 
     def test_flag_off_posts_the_composed_message_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
         response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
@@ -3758,6 +3819,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         return [block["type"] for block in blocks]
 
     def test_flag_off_with_a_relay_posts_no_blocks(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
         os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
         _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(self.posts, [])
@@ -4179,7 +4241,7 @@ class TestRecentReportsIndex(unittest.TestCase):
 
 
 class TestFindingsQueueApi(unittest.TestCase):
-    """The eight /v1/findings routes. The rules they enforce are pinned in
+    """The /v1/findings routes. The rules they enforce are pinned in
     test_findings_queue.py; these tests are about the HTTP surface."""
 
     def setUp(self):
@@ -4192,6 +4254,7 @@ class TestFindingsQueueApi(unittest.TestCase):
             with conn:
                 conn.execute("DELETE FROM findings")
                 conn.execute("DELETE FROM queue_publications")
+                conn.execute("DELETE FROM findings_additions")
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
@@ -4263,6 +4326,69 @@ class TestFindingsQueueApi(unittest.TestCase):
         verified = self.client.post(f"/v1/findings/{fid}/verified", json={"outcome": "resolved", "observed": "probe present"})
         self.assertEqual(verified.json()["state"], "resolved")
         self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_only_a_paced_publisher_marks_a_finding_shown(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+
+        pulled = self.client.post(f"/v1/findings/{fid}/surfaced", json={"chat_id": "spaces/AAA"}).json()
+        self.assertIsNone(pulled["first_shown_at"])
+        self.assertEqual(self.client.get("/v1/findings/additions").json()["noncritical"], 0)
+
+        refused = self.client.post(f"/v1/findings/{fid}/surfaced", json={"publisher": "someone"})
+        self.assertEqual(refused.status_code, 400)
+
+        added = self.client.post(
+            f"/v1/findings/{fid}/surfaced", json={"publisher": "nudge", "added_class": "noncritical", "run": "r1"}
+        ).json()
+        self.assertIsNotNone(added["first_shown_at"])
+        self.assertEqual(added["added_class"], "noncritical")
+        day = added["first_shown_at"][:10]
+        self.assertEqual(
+            self.client.get(f"/v1/findings/additions?day={day}").json(),
+            {"day": day, "critical": 0, "noncritical": 1},
+        )
+
+    def test_the_first_report_marks_a_critical_addition(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        added = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        ).json()
+        self.assertEqual(added["added_class"], "critical")
+        day = added["first_shown_at"][:10]
+        self.assertEqual(
+            self.client.get(f"/v1/findings/additions?day={day}").json(),
+            {"day": day, "critical": 1, "noncritical": 0},
+        )
+
+    def test_the_first_report_may_not_mark_a_dismissed_finding(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        self.client.patch(f"/v1/findings/{fid}", json={"state": "dismissed"})
+
+        refused = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        )
+
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("dismissed", refused.json()["detail"])
+        self.assertEqual(self.client.get("/v1/findings/additions").json()["critical"], 0)
+
+    def test_a_decision_on_one_id_covers_its_gathered_line(self):
+        self._register(self._finding(), self._finding(object="Deployment/cart"))
+        first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+
+        dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
+
+        self.assertEqual(dismissed["item_rows_decided"], [second])
+        self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_additions_refuse_a_day_that_is_not_a_date(self):
+        for day in ("yesterday", "2026-99-99"):
+            self.assertEqual(self.client.get(f"/v1/findings/additions?day={day}").status_code, 400, day)
 
     def test_unknown_findings_are_404(self):
         self.assertEqual(self.client.post("/v1/findings/nope/surfaced", json={}).status_code, 404)

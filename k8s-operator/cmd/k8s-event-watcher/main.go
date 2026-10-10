@@ -411,9 +411,9 @@ const initialSyncGrace = 2 * time.Minute
 // cluster is still read off each TriageEvent rather than stored here, so the
 // payload is correct regardless of how dispatchers are wired.
 //
-// Dispatch holds no dispatcher-wide lock, and does not need one. client-go
-// delivers events to a handler from a single per-informer processorListener
-// goroutine, so a given dispatcher is only ever entered by its own cluster's
+// Dispatch holds no dispatcher-wide lock, and does not need one. Each
+// cluster's watcher delivers from a single goroutine of its own (see Run in
+// watcher.go), so a given dispatcher is only ever entered by its own cluster's
 // watcher, one event at a time. Across clusters the dispatchers share nothing
 // mutable. A lock here would have served only to make one cluster's slow daemon
 // round-trip stall every other cluster.
@@ -876,7 +876,7 @@ func realMain(argv []string) error {
 		wg.Add(1)
 		go func(tc targetCluster, disp *dispatcher) {
 			defer wg.Done()
-			w := newWatcher(tc.Client, disp, tc, 0)
+			w := newWatcher(tc.Client, disp, tc)
 			log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 			// Starts at 0 and only reaches 1 once the initial list completes.

@@ -283,8 +283,10 @@ class MarkTest(FlagOn):
         blocks = self.draw(_turn())
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         (button,) = _buttons(blocks)
-        self.assertEqual(button["text"]["text"], "check it there")
-        self.assertEqual(button["value"], "check it there")
+        # A fixed label, whatever the question; the reply above keeps the question.
+        self.assertEqual(button["text"]["text"], "Try again")
+        self.assertEqual(button["value"], "Try again")
+        self.assertIn("Check it there?", blocks[0]["text"]["text"])
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
@@ -507,8 +509,7 @@ class MarkTest(FlagOn):
 class FlagOff(unittest.TestCase):
     def test_nothing_is_marked(self):
         runtime._marks.clear()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(FLAG_ENV, None)
+        with mock.patch.dict(os.environ, {FLAG_ENV: "false"}):
             runtime.note_wake(SUB, {"gave_up"}, WAKE)
         self.assertEqual(runtime._marks, {})
         self.assertIsNone(runtime.begin(_event()))

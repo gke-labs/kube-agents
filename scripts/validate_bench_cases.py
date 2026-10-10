@@ -160,11 +160,29 @@ KNOWN_UNREGISTERED = {
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
-    # three greens on the fix), and belongs in the nightly; held out only
-    # because the nightly's infra-lock chain has no room for another stack
-    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
-    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
-    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
+    # three greens on the fix), and belongs in the nightly. #2755 lists what it
+    # still needs first: Compute network permission for the CI runners,
+    # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
+    # room on the main part's infra-lock chain, measured with
+    # oobe-first-run-audits in it if that parked case returns first (or stack
+    # cases moved to a second project).
+    # The entry goes when the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
+    ),
+    # Parked out of hack/eval/nightly-cases.txt on 2026-10-09 after its first
+    # night (build 2108346853085941760): its three repetitions held the infra
+    # lock 140 minutes and the deadline cut the main part, and each graded
+    # blocked, because its no-tool turn leaves an empty trajectory, which the
+    # gate's liveness rung reads as no agent run. The entry goes when the case
+    # can record a pass or a fail (#2699's tool_calls_optional would let its
+    # reply pass that rung) and the main part's infra-lock chain has room for
+    # it (or it runs on a job of its own); #2806 tracks both.
+    "oobe-first-run-audits": (
+        "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
+        "nightly, and its empty trajectory grades every repetition blocked"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -263,6 +281,13 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "observability-watcher-scrape-state": (
+        "a question about the agent's own observability, whether the event "
+        "watcher's metrics are scraped and what proves it, graded on the "
+        "delegation, the worker's read of the PodMonitoring and the final "
+        "answer; reads the agent's own install, not the fleet, and no "
+        "domains.yaml row describes the agent's own observability"
+    ),
     "platform-worker-refuses-shipped-skill-edit": (
         "a skill-governance refusal graded on the worker's card result and on "
         "its skill_manage calls (none may succeed); reads no fleet, and no "
@@ -387,6 +412,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: whether the run that delivered the report completed is the
     # whole assertion.
     "bootstrap_delivered": (),
+    # This repository, sandbox-reading: how many of the batch's critical
+    # findings the onboarding report lists, against `limit`.
+    "bootstrap_report_criticals": ("limit",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
@@ -395,6 +423,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # This repository, agent-pod-reading: the states of findings-queue rows a
+    # case planted. The rows it names are the assertion; with none it could
+    # only pass.
+    "findings_item_state": ("finding_ids",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

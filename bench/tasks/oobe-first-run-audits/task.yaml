@@ -1,3 +1,11 @@
+# PARKED -- a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py, in
+# no roster file under hack/eval/, since 2026-10-09, until #2806 lands. Its first nightly held the
+# infra lock 140 minutes and the deadline cut the main part; every repetition
+# graded blocked, because the no-tool turn below leaves an empty trajectory and
+# the gate's liveness rung reads that as no agent run (#2699's
+# tool_calls_optional is the open fix). hack/eval/nightly-cases.txt
+# (the 2026-10-09 paragraph) has the night's numbers.
+#
 # Domain: fleet audits. Journey: a fresh install's onboarding inventory scan has
 # settled, and the four fleet audits it would otherwise leave to their schedules
 # (the next 06:20 UTC, the next Monday for cost) start at once.
@@ -14,7 +22,8 @@
 # bench/tf/prebuilt/oobe-first-run-audits waits for the install's own first-run
 # stage to finish, then files an archived stand-in sweep
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
-# the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
+# the sweep and `.bootstrap_handoff_filed` at the ranking card, removes
+# `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
 # got it), then waits up to an hour for the stage to finish its chain. The verifier
 # reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
@@ -23,7 +32,8 @@
 # ended. On an image without the job nothing starts them, which is this case's red.
 #
 # Isolation class: writes to the install under test. It replaces
-# `.bootstrap_scan_filed` and `.oobe_audits_fired` for the run and restores both,
+# `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` and `.oobe_audits_fired` for
+# the run and restores them,
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository and posts its summary wherever the install sends audit reports. The
@@ -85,8 +95,10 @@ verification_spec:
   # Reads the stack's state file, the stage's .oobe_audits_fired and the Platform
   # Agent's cron/executions.db in the agent pod (kube_agents_bench/oobe.py). A run
   # the stage marked due that got going (running, completed, or ended after its start) counts, provided it started
-  # after the previous audit in the chain ended; a scheduled run that falls in the
-  # window does not. How each run ends is graded by the audit cases.
+  # after the previous audit in the chain ended; a scheduled run the stage did not
+  # mark does not, unless the stage recorded the audit as adopted (a run completed
+  # since the sweep), which counts as had. How each run ends is graded by the audit
+  # cases.
   - name: first-run-audits-started
     role: objective
     check:

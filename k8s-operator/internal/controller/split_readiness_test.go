@@ -395,7 +395,7 @@ func TestANextInstallWithNoChatBackendIsReadyAndSaysWhy(t *testing.T) {
 		t.Errorf("got phase %q, want Ready: the gateway is withheld on purpose and everything else is up", phase)
 	}
 	if want := "Gateway, shell sandbox, credential broker, NATS, auth callout and bus provisioning are all ready; " +
-		"the A2A gateway is not rendered (no chat backend, see the A2AGateway condition)"; msg != want {
+		"the A2A gateway is not running (no chat backend, see the A2AGateway condition)"; msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
 	cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
