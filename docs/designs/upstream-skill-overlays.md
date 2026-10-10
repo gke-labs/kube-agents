@@ -1,24 +1,25 @@
 # Upstream skill overlays
 
-> **STATUS — design; partly implemented.** `scripts/skill_overlay.py`, the `make skills-*`
-> targets and both checks in `validate` run on `main`, and `gke-workload-troubleshooting` is
-> mirrored with them. The other mirrored skills still come from `scripts/sync-upstream-skills.py`
-> and its string registries, which skip any skill with an `upstream.lock`. The implementation
+> **STATUS — implemented.** `scripts/skill_overlay.py`, the `make skills-*` targets and both
+> checks in `validate` run on `main`, and every `gke-*` skill is mirrored with them;
+> `scripts/sync-upstream-skills.py` and its string registries are gone. The weekly job and robot
+> conflict flow under "Future work: scheduled sync" are not built. The implementation
 > plan is tracked in
 > [#2374](https://github.com/gke-labs/kube-agents/issues/2374); the policy questions it answers
 > were raised in [#1450](https://github.com/gke-labs/kube-agents/issues/1450).
 
 ## Context
 
-| Question   | Answer                                                                                                                                                                                                                    |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| What       | The 29 `gke-*` skills under `agents/platform/skills/` are copies of `skills/cloud/gke-*` in [`google/skills`](https://github.com/google/skills), the repository `scripts/sync-upstream-skills.py` syncs from.             |
-| Constraint | Another team maintains `google/skills`; it accepts issues but no external pull requests. Our changes (credential proxy, `$HERMES_HOME`, routing to our own skills, persona rules) live here for as long as the skills do. |
+| Question   | Answer                                                                                                                                                                                                                     |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| What       | The 29 `gke-*` skills under `agents/platform/skills/` are copies of `skills/cloud/gke-*` in [`google/skills`](https://github.com/google/skills), the repository the removed `scripts/sync-upstream-skills.py` synced from. |
+| Constraint | Another team maintains `google/skills`; it accepts issues but no external pull requests. Our changes (credential proxy, `$HERMES_HOME`, routing to our own skills, persona rules) live here for as long as the skills do.  |
 
-## What happens today
+## What happened before this design
 
-The sync script shallow-clones upstream's default branch, deletes each local `gke-*` directory,
-copies the upstream one over it, then re-applies our changes from Python string constants.
+The sync script shallow-cloned upstream's default branch, deleted each local `gke-*` directory,
+copied the upstream one over it, then re-applied our changes from Python string constants. The
+faults below are written in the present tense of that script.
 F1, F5 and F6 below are visible in the picture; the rest are what the script lacks.
 
 ```mermaid
@@ -41,7 +42,7 @@ flowchart LR
 | #   | Fault                             | Effect                                                                                                                                                                                                                                                                                                                                                                              |
 | --- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | F1  | No upstream commit recorded       | Each change is found by exact text, not line numbers, and the plain upstream text is discarded after the sync. The stored old snippet is the only trace of the common ancestor, so any upstream edit inside it — even to lines we kept — stops the sync until a person rewrites the Python string. Nor does the repo record, or let anyone verify, which upstream version it ships. |
-| F2  | Changes live in the script        | About 240 of the script's 754 lines are skill text, away from the skills they change. Substitutions edit `SKILL.md` only, and each new kind of edit has needed a new registry (`SKILL_SUBSTITUTIONS`, `SKILL_FOOTERS`; open PR #2357 adds a third, `SKILL_FILE_SUBSTITUTIONS`, and #2353 is stacked on it).                                                                         |
+| F2  | Changes live in the script        | About 240 of the script's 754 lines are skill text, away from the skills they change. Substitutions edit `SKILL.md` only, and each new kind of edit has needed a new registry (`SKILL_SUBSTITUTIONS`, `SKILL_FOOTERS`, and a third, `SKILL_FILE_SUBSTITUTIONS`, was proposed).                                                                                                      |
 | F3  | One shared file                   | Every local change and most syncs edit the script, so parallel skill PRs conflict there.                                                                                                                                                                                                                                                                                            |
 | F4  | Unregistered edits are not caught | Tests check each registered substitution and one of the five footers. A direct edit to a mirrored file passes review and is lost on the next sync.                                                                                                                                                                                                                                  |
 | F5  | Upstream adoption is mishandled   | An adopted substitution is skipped silently and stays in the script forever; an adopted footer is appended a second time (only its marker is checked).                                                                                                                                                                                                                              |
@@ -106,7 +107,7 @@ flowchart LR
 - **When to stop mirroring:** a person's decision, not a CI rule. Patch count alone is not a signal: several small patches over a small part of a skill still leave the rest getting upstream's updates.
   - Review a skill when its patches rewrite most of it, when most of its syncs conflict, or when upstream keeps moving it away from what we need.
   - To stop: delete its copy, lock and overlay; the generated skill becomes ours.
-- **`append.md`:** what `SKILL_FOOTERS` appends today. Applied after the patches rather than as one, because git treats an edit to upstream's last lines as adjacent to anything appended below them.
+- **`append.md`:** what `SKILL_FOOTERS` appended. Applied after the patches rather than as one, because git treats an edit to upstream's last lines as adjacent to anything appended below them.
 - **Generated skill:** stays where skills are today and stays committed, so reviewers, `grep`, the bench tasks and the Dockerfile read it. Contributors edit it like any other file; the presubmit fails on an edit no patch records.
 
 Patch header example:
@@ -346,9 +347,8 @@ What `make skills-check` reports when a step is skipped:
 ### Automated edits to a generated skill
 
 - A tool that edits files in place cannot run `make skills-refresh`, so its edit fails the check.
-- One does so today: Dependabot's `docker` entry in `.github/dependabot.yml` bumps `agents/platform/skills/gke-app-onboarding/assets/Dockerfile` (now `FROM node:26-slim`; upstream has `FROM node:22-slim`).
-- No registry entry records the difference, so the next run of today's script would put upstream's pin back.
-- Migration records the pin as a patch (its `Why:` says why we run a newer base image), removes the Dependabot entry for that directory, and bumps the image from then on by changing the patch.
+- One did: Dependabot's `docker` entry in `.github/dependabot.yml` bumped `agents/platform/skills/gke-app-onboarding/assets/Dockerfile` to `FROM node:26-slim`, and no registry entry recorded it, so the old script's next run would have put upstream's pin back.
+- Migration recorded the pin as a patch (its `Why:` says why the sample runs a newer base image) and removed the Dependabot entry for that directory; the image is bumped by changing the patch.
 - Any other in-place tool pointed at a mirrored skill gets the same treatment.
 
 ## Security guardrails
@@ -408,20 +408,19 @@ Four PRs implement the design: about four days for one engineer working with a c
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- | ---- |
 | 1   | `scripts/skill_overlay.py` (`sync`, `continue`, `import`, `refresh`, `generate`, `check`, `status`, `verify-upstream`), the lock format, make targets and tests. No skill migrated.                                                                          | this design | 1–2  |
 | 2   | Pilot: `gke-workload-troubleshooting` migrated (copy, lock, two patches); `third_party/google-skills/` with a docs-map tree line and exclusions; `make skills-check` and the upstream comparison as steps in `validate`; the old script skips locked skills. | PR 1        | 1    |
-| 3   | The other 28 skills migrated: copies, locks, the remaining patches, five `append.md` files, and the in-tree edits no registry records. Generated tree byte-identical to `main`.                                                                              | PR 2        | 1    |
+| 3   | The other 28 skills migrated: copies, locks, the remaining patches, five `append.md` files, and the in-tree edits no registry records; the Dependabot entry for `gke-app-onboarding` removed. Generated tree byte-identical to `main`.                       | PR 2        | 1    |
 | 4   | Old script, registries and their tests removed; references updated (list below).                                                                                                                                                                             | PR 3        | 0.5  |
 
 - Not in the estimate: the first syncs after migration. They land what upstream has added since the last sync (new skills, two renamed TPU skills), which the agent does see, so each follows the eval loop like any skill change.
 - Outside the engineer's control, and worth starting first: landing or pausing the open skill-sync PRs before PR 3.
 
-PR 4 also updates every file that names the old script or its registries:
+PR 3 rewrites the `AGENTS.md` Skills Guidelines line for the overlay. PR 4 also updates every file that names the old script or its registries:
 
-- `AGENTS.md` Skills Guidelines, which also states that every sync and patch carries the eval record above.
-- The `skill_sync` source in `tests/conformance/_harness.py` and its C4 tests, repointed at the new script.
+- The `skill_sync` source in `tests/conformance/_harness.py` and its C4 test, repointed at the new script; the test stops being a known violation.
+- The Cluster Agent's `gke-workload-security` check, moved from the old script's tests to `tests/test_skill_content.py`.
 - The `Makefile` shellcheck comment and `.prettierignore`.
 - The message in `deploy/docker/check_skill_commands.py`.
-- Comments in two bench tasks and `agents/platform/scripts/gke_endpoint.py`.
-- The Dependabot `docker` entry for `gke-app-onboarding/assets`, removed ([Automated edits](#automated-edits-to-a-generated-skill)).
+- Comments in two bench tasks, `agents/platform/scripts/gke_endpoint.py` and `scripts/skill_overlay.py`, and the `edit-mirrored-skill` skill.
 - The marker line in the five footers names the old script. Migration keeps it verbatim in `append.md` so the generated tree stays byte-identical; a follow-up rewords it.
 
 ## What this design addresses

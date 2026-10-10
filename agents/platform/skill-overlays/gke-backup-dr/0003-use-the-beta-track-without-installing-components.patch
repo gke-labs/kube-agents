@@ -1,0 +1,23 @@
+Subject: Use the beta track without installing components
+
+Why: upstream's Notes tell the agent to run `gcloud components install beta`. Here gcloud runs through the credential proxy, which refuses component installs, and the image's gcloud already carries the beta track.
+Local-Issue: none (#2359)
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; the credential proxy is this repository's
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -65,8 +65,10 @@ gcloud beta container backup-restore restores describe {restore_name} \
+ 
+ Notes:
+ 
+--   The `backup-restore` command group requires the `gcloud beta` component
+-    (`gcloud components install beta`).
++-   The `backup-restore` command group is on the `gcloud beta` track
++    (`gcloud beta container backup-restore ...`), which this image's gcloud
++    already includes. Do not run `gcloud components install`: the credential
++    proxy refuses it.
+ -   `--cluster` requires the full resource path
+     `projects/{project_id}/locations/{location}/clusters/{cluster_name}` (or
+     `projects/{project_id}/zones/{zone}/clusters/{cluster_name}` for zonal

@@ -24,9 +24,6 @@ is committed, and it is what the agent reads. `skills-refresh` writes patch bodi
 `append.md` from your edits; `skills-sync` and `skills-continue` rewrite the copy, lock, patches
 and shipped skill; `skills-generate` rebuilds the shipped skill.
 
-A `gke-*` skill without a lock is still overwritten by `scripts/sync-upstream-skills.py`; follow
-`AGENTS.md`, "Skills Guidelines", for it instead.
-
 # Rules
 
 - Never edit `third_party/google-skills/` or `upstream.lock` by hand. CI compares both with
@@ -116,26 +113,16 @@ a skill otherwise, patch it at its current pin ("Make a change").
 - Adopt an upstream `gke-*` skill this repository does not ship with
   `make skills-sync SKILL=<skill>`, then add it to `SKILL_GROUPS` in `scripts/generate_docs.py`
   and run `make docs-generate`.
-- Move a skill this repository ships without a lock onto the overlay:
-  1. Choose `REF`. Nothing records the commit the skill was copied from: take the last commit on
-     upstream's `main` before the newest `sync-upstream-skills.py` commit in
-     `git log -- agents/platform/skills/<skill>`.
-  2. Run `make skills-import SKILL=<skill> REF=<commit>`.
-  3. Diff `third_party/google-skills/<skill>/` against the shipped skill. Every difference must
-     trace to a `SKILL_SUBSTITUTIONS`, `SKILL_FILE_SUBSTITUTIONS` or `SKILL_FOOTERS` entry in
-     `scripts/sync-upstream-skills.py`, or to a known local edit. If any other hunk remains, `REF`
-     is wrong: delete the copy and lock and import again with another commit.
-  4. Run `make skills-generate SKILL=<skill>`. This resets the shipped skill to the copy; the
-     local text stays in `HEAD`.
-  5. Each refresh writes one patch. For each reason, re-apply only that reason's hunks from
+- If `skills-sync` or `skills-status` reports a `gke-*` skill that ships without a lock, it is
+  either this repository's own skill (rename it) or a hand copy of upstream's. For a copy:
+  1. Run `make skills-import SKILL=<skill> REF=<commit>` with the upstream commit it was copied
+     from. If the remaining differences are not all local edits, `REF` is wrong: delete the copy
+     and lock and import again.
+  2. Run `make skills-generate SKILL=<skill>`; the local text stays in `HEAD`.
+  3. For each reason, re-apply that reason's hunks from
      `git diff HEAD -- agents/platform/skills/<skill>/` and run
-     `make skills-refresh SKILL=<skill> MSG="<reason>"`. Restore a footer as the appended section.
-     Repeat until that diff is empty, so the shipped skill is byte-identical again.
-  6. Fill in each patch's header as in "Make a change", step 5; copy each registry entry's comment
-     into its patch's `Why:`.
-  7. Delete the skill's registry entries, the snippet constants only they use, and the tests in
-     `scripts/test_sync_upstream_skills.py` that assert them. That script rejects an entry for a
-     locked skill.
+     `make skills-refresh SKILL=<skill> MSG="<reason>"`. Stop when that diff is empty.
+  4. Fill in each patch's header as in "Make a change", step 5.
 
 ## Fix a failing check
 

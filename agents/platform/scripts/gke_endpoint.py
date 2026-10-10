@@ -46,8 +46,8 @@ DNS_ENDPOINT_FLAG = "--dns-endpoint"
 # while we run, so its answer is remembered outright.
 #
 # A cluster's endpoint configuration can change under us, and this repository
-# ships the instruction to change it: the `gke-networking` footer in
-# `scripts/sync-upstream-skills.py` tells the agent that `clusters update
+# ships the instruction to change it: the `gke-networking` footer
+# (agents/platform/skill-overlays/gke-networking/append.md) tells the agent that `clusters update
 # --enable-dns-access` is the remedy for a closed endpoint, and the reverse is
 # `--no-enable-dns-access`. Two of the three callers are long-lived — the MCP
 # server and the credential proxy — so an answer kept for the life of the
