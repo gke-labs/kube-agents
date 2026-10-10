@@ -240,6 +240,13 @@
 # key is the open fix for that half). Counted from the lists,
 # this file is now sixty-five cases (195 units) of a seventy-nine-case,
 # 237-unit matrix.
+#
+# 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
+# units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
+# plants a previous run in the report store and removes it on destroy). It is
+# the last entry below: sixty-six cases (198 units) here, of an eighty-case,
+# 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
+# case after oobe-first-run-audits was parked.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -755,3 +762,11 @@
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# The fleet-audit carry: a drift finding whose evidence and severity did not
+# change keeps the words of the previous run. prebuilt/unchanged-finding-wording
+# plants that previous run in the report store, with the collector's own
+# evidence, and removes it on destroy. Fixture: drift-outlier. A tofu case, so
+# it holds the infra lock, and its run is a full drift audit (the 900s audit
+# band of consistency-drift-outlier).
+./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml

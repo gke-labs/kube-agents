@@ -482,6 +482,11 @@ COLLECTOR_AUDITS = frozenset(
 SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
+MANIFEST_REMEDIATION_KIND = "manifest"
+MANUAL_REMEDIATION_KIND = "manual"
+# The fields `carry_unchanged_findings` copies from the previous run. Severity
+# is not in the list: the collector calculates it, so it is not wording.
+CARRIED_FINDING_FIELDS = ("title", "impact", "recommendation")
 
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
@@ -1327,6 +1332,22 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
+# The end of the note `degrade_missing_remediations` writes for a manifest
+# file that the audit did not write.
+DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run the audit.)_"
+# The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
+# fix that Config Connector reverts.
+KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
+# Text that `finish` itself writes into a remediation note. A note that holds
+# one of these is not the worker's wording, and `carry_unchanged_findings`
+# does not copy it: the pass that wrote it runs again on each run and writes
+# it again when its condition is still true.
+HARNESS_NOTE_MARKS = (
+    SHARED_ACCOUNT_SHIELD_NOTE.split("{", 1)[0],
+    DECLINED_FIX_NOTE.split("{", 1)[0],
+    DEGRADED_REMEDIATION_TAIL,
+    KCC_REVERTED_NOTE_MARK,
+)
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -2864,6 +2885,42 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         log(f"WARNING: stored report for {audit_id} has no readable ledger body; {MEMORY_UNKNOWABLE}")
         return None
     return envelope
+
+
+def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
+    """The document that the previous run of this stream stored for `repo`, or None.
+
+    Only `carry_unchanged_findings` reads this, and it reads it before the
+    dry-run split, so that a dry run shows the same wording as the real run.
+    It reads `ledger_document` when the previous run held the open ledger
+    without rewriting its body, so a held-open zero-finding run does not
+    replace the live ledger's wording with an empty document.
+    It does not do the issue checks of `read_report_memory`. Those checks
+    keep the delta correct: a store for a different issue makes the wrong
+    ids new or resolved. The carry does not count ids. It copies wording only
+    for a finding with the same id, the same evidence and the same severity,
+    so a store from an earlier issue of the same stream and repository is
+    safe to read. A store for a different repository or a different id
+    scheme is not read. A missing or unreadable store gives None, and the
+    run then uses the worker's wording, as it did before the carry existed.
+    """
+    if not repo:
+        return None
+    try:
+        path = reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    if _ledger_key(envelope.get("repo")) != _ledger_key(repo):
+        return None
+    if envelope.get("id_scheme") != ID_SCHEME:
+        return None
+    document = envelope.get("ledger_document")
+    if not isinstance(document, dict):
+        document = envelope.get("document")
+    return document if isinstance(document, dict) else None
 
 
 def invalidate_report_memory(audit_id: str, repo: str) -> None:
@@ -5426,6 +5483,105 @@ def adopt_arm_impact(findings: list[dict], manifest: dict | None) -> list[str]:
             finding["impact"] = impact
             adopted.append(str(finding.get("id") or ""))
     return adopted
+
+
+def _remediation_is_file_backed(remediation: object) -> bool:
+    """Whether `remediation` names a file that the run writes."""
+    if not isinstance(remediation, dict):
+        return False
+    return remediation.get("kind") == MANIFEST_REMEDIATION_KIND or bool(
+        str(remediation.get("path") or "").strip()
+    )
+
+
+def _harness_wrote_note(remediation: object) -> bool:
+    """Whether `finish` wrote part of the note in `remediation`."""
+    if not isinstance(remediation, dict):
+        return False
+    note = str(remediation.get("note") or "")
+    return any(mark in note for mark in HARNESS_NOTE_MARKS)
+
+
+def _remediation_may_carry(before: object, now: object) -> bool:
+    """Whether the previous run's remediation can replace this run's.
+
+    Not when one of the two names a file. A `manifest` remediation names a
+    file that this run must write: the previous path can point at nothing,
+    and an old note over a new manifest removes a real fix.
+
+    Not when the previous note is `manual` and this run's is not. That
+    direction replaces a command that the reader can run with a paragraph.
+    The other direction is safe and is the one the carry is for: a `gcloud`
+    command from the previous run stays when the worker now writes `manual`.
+
+    Not when `finish` wrote part of either note. The pass that wrote it
+    runs again after the carry, so a copied note gets the text two times,
+    or keeps a statement that is not true for this run.
+    """
+    if not isinstance(before, dict) or not isinstance(now, dict):
+        return False
+    if _remediation_is_file_backed(before) or _remediation_is_file_backed(now):
+        return False
+    if before.get("kind") == MANUAL_REMEDIATION_KIND and now.get("kind") != MANUAL_REMEDIATION_KIND:
+        return False
+    return not (_harness_wrote_note(before) or _harness_wrote_note(now))
+
+
+def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> list[str]:
+    """Keep the previous run's wording for a finding whose evidence did not change.
+
+    `previous` is the document the previous run stored (`previous_run_document`).
+    A finding with the same id, the same `evidence` and the same `severity` is
+    the same problem on the same object in the same state. The worker writes
+    new words for it on each run, and the new words are not always better: on
+    one install, each of 92 unchanged findings got new prose between two runs,
+    and 83 got a new remediation. Two of the changes were wrong. One turned a
+    `gcloud` command into a `manual` note. One proposed a zone list without
+    the only zone that had nodes. So this pass keeps `CARRIED_FINDING_FIELDS`,
+    and the remediation when `_remediation_may_carry` allows it.
+
+    "Evidence did not change" is a full comparison of the `evidence` object,
+    command and excerpt. `adopt_collector_evidence` runs first and puts the
+    collector's text in both, so on an unchanged fleet the two runs agree.
+    The store keeps a redacted copy, so this run's evidence is redacted the
+    same way before the comparison. A change in severity stops the carry: the
+    collector calculates severity, so a new severity is a new observation,
+    and the old impact can give the old reason.
+
+    The copied text did not go through `validate_findings` in this run, so
+    `normalise_finding_commands` runs on it again.
+
+    Returns the ids whose wording changed, for the caller to log.
+    """
+    if not isinstance(previous, dict) or not isinstance(previous.get("findings"), list):
+        return []
+    before_by_id = {
+        str(entry["id"]): entry
+        for entry in previous["findings"]
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    carried: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id") or "")
+        before = before_by_id.get(fid)
+        if before is None:
+            continue
+        if before.get("evidence") != _redact_document(finding.get("evidence")):
+            continue
+        if before.get("severity") != finding.get("severity"):
+            continue
+        fields = list(CARRIED_FINDING_FIELDS)
+        if _remediation_may_carry(before.get("remediation"), finding.get("remediation")):
+            fields.append("remediation")
+        changed = False
+        for field in fields:
+            if field in before and before[field] != finding.get(field):
+                finding[field] = copy.deepcopy(before[field])
+                changed = True
+        if changed:
+            normalise_finding_commands(finding)
+            carried.append(fid)
+    return carried
 
 
 def collector_flagged_ids(manifest: dict | None) -> set[str]:
@@ -13145,8 +13301,7 @@ def degrade_missing_remediations(
         remediation["kind"] = "manual"
         remediation["path"] = ""
         remediation["note"] = (f"{note} " if note else "") + (
-            f"_(The audit {reason}. Apply the recommendation above by hand, or "
-            "re-run the audit.)_"
+            f"_(The audit {reason}. {DEGRADED_REMEDIATION_TAIL}"
         )
         degraded.append(fid)
     return degraded
@@ -13597,8 +13752,8 @@ def degrade_reverted_gcloud_remediations(
         # states the end state, and an operator who has already changed the
         # file may want it to close the gap before the next sync.
         prose = (
-            f"This object is declared {where}, whose spec sets `{field}`. Config "
-            "Connector holds that field against out-of-band changes, so the "
+            f"This object is declared {where}, whose spec sets `{field}`. "
+            f"{KCC_REVERTED_NOTE_MARK}, so the "
             "command below is reverted on the next reconcile and this finding "
             "returns on the next run. Make the change in that file instead."
         )
@@ -15314,26 +15469,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"evidence: adopted the collector's command and excerpt for "
                 f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
             )
-        # A pass that reuses the previous run's wording when evidence is
-        # unchanged is planned for this spot, and this adoption has to stay
-        # below it when it lands: such a carry triggers on byte-identical
-        # evidence, evidence adoption exists to make evidence byte-identical,
-        # and between them a corrected arm sentence would never reach a
-        # finding already on the ledger.
-        for fid in adopt_arm_impact(data["findings"], manifest):
-            log(
-                f"{fid}: impact taken from the collector, which knows which arm "
-                "of the check fired."
-            )
-    # After the adoption, and ahead of the dry-run split so the preview and the
-    # real run publish the same command. `validate_findings` already ran this
-    # repair, but the DNS arm is read off `evidence.excerpt`, which was the
-    # model's prose until the adoption above put the collector's in its place.
-    for fid in repair_remediation_commands(data["findings"]):
-        log(
-            f"{fid}: its remediation was missing a flag without which the "
-            "command does not clear the finding it is published under."
-        )
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
@@ -15389,6 +15524,36 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # when `--repo` was given.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
+    # Before the dry-run split, so that the preview and the real run publish
+    # the same words. After `adopt_collector_evidence`, which makes the
+    # evidence of an unchanged finding the same on each run. Before the
+    # remediation passes of both paths, so that the notes they write are
+    # written on the remediation that the run publishes. The store is read
+    # here and not with the memory below, because the memory needs the open
+    # issue, and a dry run does not ask the forge for it. `_dry_run_repo`
+    # gives the real run its resolved repository, and a dry run the same
+    # repository on a best-effort basis.
+    previous_document = previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
+    for fid in carry_unchanged_findings(data["findings"], previous_document):
+        log(f"{fid}: unchanged since the previous run; its wording is carried forward.")
+    # After the carry: an impact sentence that tells which arm of a check
+    # fired is an observation, not wording, so a corrected one must replace
+    # a carried one.
+    for fid in adopt_arm_impact(data["findings"], manifest):
+        log(
+            f"{fid}: impact taken from the collector, which knows which arm "
+            "of the check fired."
+        )
+    # After the adoptions and the carry, and ahead of the dry-run split so the
+    # preview and the real run publish the same command. `validate_findings`
+    # already ran this repair, but the DNS arm is read off `evidence.excerpt`,
+    # which was the model's prose until the adoption above put the collector's
+    # in its place, and a carried note did not go through it in this run.
+    for fid in repair_remediation_commands(data["findings"]):
+        log(
+            f"{fid}: its remediation was missing a flag without which the "
+            "command does not clear the finding it is published under."
+        )
     # The harness's search first, then the withhold against the record. The
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is

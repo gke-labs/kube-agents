@@ -88,7 +88,7 @@ ledger open — over a coverage gap or an unaccounted previous finding — only 
 body still renders the previous run's findings. That path stores the previous body and ids forward
 instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
 ledger, and every finding the body carries would be announced as new. The document that body renders
-rides beside it as `ledger_document`, which only `finish` reads, for titles. It is known only from
+rides beside it as `ledger_document`, which only `finish` reads, for titles and for the wording carry. It is known only from
 a run that wrote the body; after a seed, whose memory has no document, it is absent until a
 findings run rewrites the body, rather than a held-open run's empty document standing in for it. `document` stays this
 run's, because it answers what this run checked and skipped, and a reader asking that must not be
@@ -164,6 +164,15 @@ issue body is not a fallback for a store that exists, because two memories with 
 is how a divergence becomes undetectable.
 
 `start` joins against the same memory for the `carried` list it hands the model, seed included.
+
+`finish` also reads that stored document (`ledger_document` where the body was carried, `document`
+otherwise) one time before the dry-run split, to keep the previous wording of a finding whose
+evidence did not change ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md)
+§3.2). That read checks only the envelope's `repo` and `id_scheme`, not the issue. The issue checks
+above keep the delta correct, and the carry counts no ids: it copies words only to a finding with
+the same id, evidence and severity. A dry run does not ask the forge for the open issue, and the
+preview must show the same words as the real run. A missing or unreadable store keeps the model's
+words.
 
 The issue body is used as the memory once, where the store has never held this ledger (every run
 still reads it, but only for the check above): no directory for the stream

@@ -14801,6 +14801,281 @@ class TestDryRunParity(HarnessTestCase):
         self.assertIn("audit-findings:", out)
 
 
+class TestCarryUnchangedFindings(unittest.TestCase):
+    """A finding whose evidence did not change keeps the previous run's words."""
+
+    FID = "single-zone-nodepool.spot._.nodepool-spot-pool"
+
+    def before(self, **overrides):
+        finding = {
+            "id": self.FID,
+            "title": "spot-pool is locked to a single zone",
+            "impact": "A zonal stockout halts autoscaling for this pool.",
+            "recommendation": {"action": "Add us-east4-b and us-east4-c."},
+            "remediation": {"kind": "manual", "note": "Add nodeLocations."},
+            "evidence": {"command": "gcloud container node-pools list", "excerpt": "a"},
+            "severity": "major",
+        }
+        finding.update(overrides)
+        return finding
+
+    def carry(self, before, now):
+        findings = [now]
+        ids = audit_report.carry_unchanged_findings(findings, {"findings": [before]})
+        return ids, findings[0]
+
+    def test_new_prose_on_the_same_evidence_is_replaced(self):
+        now = self.before(
+            title="spot-pool is a single-zone autoscaling node pool",
+            impact="This Standard cluster's Spot pool is locked to us-east4-a.",
+            recommendation={"action": "Add one or more additional zones."},
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [self.FID])
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(out["impact"], "A zonal stockout halts autoscaling for this pool.")
+        self.assertEqual(out["recommendation"], {"action": "Add us-east4-b and us-east4-c."})
+
+    def test_a_manual_note_on_both_sides_is_carried(self):
+        keep = {"kind": "manual", "note": "nodeLocations: [a, b, c]"}
+        ids, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "nodeLocations: [b, c]"}),
+        )
+        self.assertEqual(out["remediation"], keep)
+        self.assertEqual(ids, [self.FID])
+
+    def test_a_previous_gcloud_command_is_not_replaced_by_a_manual_note(self):
+        keep = {"kind": "gcloud", "note": "gcloud container clusters update c --location=l"}
+        _, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "Work it out."}),
+        )
+        self.assertEqual(out["remediation"], keep)
+
+    def test_a_new_gcloud_command_is_not_replaced_by_a_previous_manual_note(self):
+        mine = {"kind": "gcloud", "note": "gcloud container clusters update c --location=l"}
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "Work it out."}),
+            self.before(title="reworded", remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        # The prose still carries. Only the remediation stays as written.
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(ids, [self.FID])
+
+    def test_a_new_manifest_is_not_replaced_by_a_previous_manual_note(self):
+        mine = {"kind": "manifest", "path": "clusters/spot/pool.yaml", "note": "n"}
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "by hand"}),
+            self.before(title="reworded", remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(ids, [self.FID])
+
+    def test_a_previous_manifest_is_not_carried_over_a_manual_note(self):
+        # The previous path names a file that this run did not write.
+        mine = {"kind": "manual", "note": "by hand"}
+        _, out = self.carry(
+            self.before(remediation={"kind": "manifest", "path": "clusters/a.yaml", "note": "n"}),
+            self.before(remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+
+    def test_a_note_that_finish_wrote_is_not_carried(self):
+        degraded = {
+            "kind": "manual",
+            "note": "n _(The audit did not write it. "
+            + audit_report.DEGRADED_REMEDIATION_TAIL,
+        }
+        reverted = {
+            "kind": "manual",
+            "note": f"Declared at x. {audit_report.KCC_REVERTED_NOTE_MARK}, so ...",
+        }
+        declined = {
+            "kind": "manual",
+            "note": audit_report.DECLINED_FIX_NOTE.format(reason="a PR is open") + " n",
+        }
+        for written in (degraded, reverted, declined):
+            with self.subTest(note=written["note"]):
+                clean = {"kind": "manual", "note": "clean"}
+                _, out = self.carry(
+                    self.before(remediation=written), self.before(remediation=dict(clean))
+                )
+                self.assertEqual(out["remediation"], clean)
+                _, out = self.carry(
+                    self.before(remediation=clean), self.before(remediation=dict(written))
+                )
+                self.assertEqual(out["remediation"], written)
+
+    def test_the_notes_that_finish_writes_hold_their_marks(self):
+        # The marks are only useful while the passes still write them.
+        with tempfile.TemporaryDirectory() as tmp:
+            finding = self.before(
+                remediation={"kind": "manifest", "path": "missing.yaml", "note": "n"}
+            )
+            audit_report.degrade_missing_remediations([finding], Path(tmp))
+        self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]))
+
+    def test_a_carried_gcloud_note_is_normalised(self):
+        stale = self.before(
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=REGULAR",
+            }
+        )
+        now = self.before(
+            title="a rewrite",
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=regular",
+            },
+        )
+        _, out = self.carry(stale, now)
+        self.assertEqual(
+            out["remediation"]["note"],
+            "gcloud container clusters update c --release-channel=regular",
+        )
+
+    def test_changed_evidence_keeps_the_new_words(self):
+        now = self.before(
+            title="a new title",
+            evidence={"command": "gcloud container node-pools list", "excerpt": "b"},
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "a new title")
+
+    def test_a_changed_severity_keeps_the_new_words(self):
+        now = self.before(title="a new title", severity="critical")
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "a new title")
+        self.assertEqual(out["severity"], "critical")
+
+    def test_evidence_is_compared_as_the_store_keeps_it(self):
+        # The store keeps a redacted copy of the evidence.
+        excerpt = "password: hunter2correcthorse"
+        self.assertNotEqual(audit_report.redact_secrets(excerpt), excerpt)
+        stored = self.before(
+            evidence={
+                "command": "kubectl get cm",
+                "excerpt": audit_report.redact_secrets(excerpt),
+            }
+        )
+        now = self.before(
+            title="a new title", evidence={"command": "kubectl get cm", "excerpt": excerpt}
+        )
+        ids, out = self.carry(stored, now)
+        self.assertEqual(ids, [self.FID])
+        self.assertEqual(out["evidence"]["excerpt"], excerpt)
+
+    def test_a_finding_the_previous_run_did_not_have_is_not_changed(self):
+        now = self.before(id="single-zone-nodepool.other._.nodepool-x", title="fresh")
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "fresh")
+
+    def test_no_previous_document_changes_nothing(self):
+        for previous in (None, {}, {"findings": "x"}):
+            findings = [self.before(title="mine")]
+            self.assertEqual(audit_report.carry_unchanged_findings(findings, previous), [])
+            self.assertEqual(findings[0]["title"], "mine")
+
+    def test_an_identical_run_reports_nothing_carried(self):
+        ids, _ = self.carry(self.before(), self.before())
+        self.assertEqual(ids, [])
+
+
+class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
+    """`finish` reads the previous run's document and keeps its wording, in a
+    dry run and in the real run alike."""
+
+    OLD_TITLE = "Payments namespace has no NetworkPolicy (previous run)"
+    NEW_TITLE = "No NetworkPolicy selects the payments namespace (new words)"
+
+    def finding(self, title, excerpt="No resources found in payments namespace."):
+        return make_finding(
+            title=title,
+            excerpt=excerpt,
+            remediation={"kind": "manual", "note": "Apply a default-deny NetworkPolicy."},
+        )
+
+    def store(self, document, repo="acme/fleet", scheme=None, ledger_document=None):
+        directory = self.store_dir(AUDIT, repo)
+        directory.mkdir(parents=True, exist_ok=True)
+        envelope = {
+            "audit_id": AUDIT,
+            "repo": repo,
+            "issue_number": None,
+            "ledger_body": "",
+            "current_ids": [],
+            "id_scheme": audit_report.ID_SCHEME if scheme is None else scheme,
+            "document": document,
+            **({"ledger_document": ledger_document} if ledger_document is not None else {}),
+        }
+        (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+
+    def previous(self, **kwargs):
+        finding = self.finding(self.OLD_TITLE, **kwargs)
+        finding["id"] = derived_id()
+        return {"findings": [finding]}
+
+    def test_a_dry_run_shows_the_previous_wording(self):
+        self.store(self.previous())
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertNotIn(self.NEW_TITLE, self.out)
+        self.assertIn("wording is carried forward", self.err)
+
+    def test_a_held_open_run_still_carries_the_ledger_document_wording(self):
+        self.store({"findings": []}, ledger_document=self.previous())
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertNotIn(self.NEW_TITLE, self.out)
+
+    def test_the_real_run_publishes_the_previous_wording(self):
+        self.store(self.previous())
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/77"),
+        }
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]))
+        self.assertEqual(rc, 0)
+        body = self.harness.forge_calls("issue-create")[0]["body"]
+        self.assertIn(self.OLD_TITLE, body)
+        self.assertNotIn(self.NEW_TITLE, body)
+
+    def test_changed_evidence_publishes_the_new_wording(self):
+        self.store(self.previous(excerpt="an older excerpt"))
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.NEW_TITLE, self.out)
+        self.assertNotIn(self.OLD_TITLE, self.out)
+
+    def test_a_store_for_another_repository_or_scheme_is_not_read(self):
+        for repo, scheme in (("acme/other", None), ("acme/fleet", audit_report.ID_SCHEME - 1)):
+            with self.subTest(repo=repo, scheme=scheme):
+                shutil.rmtree(self.reports_dir, ignore_errors=True)
+                self.store(self.previous(), repo=repo, scheme=scheme)
+                if repo != "acme/fleet":
+                    # Copied under this repository's directory, as a moved store.
+                    shutil.copytree(self.store_dir(AUDIT, repo), self.store_dir(AUDIT))
+                rc = self.run_finish(
+                    make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"]
+                )
+                self.assertEqual(rc, 0)
+                self.assertIn(self.NEW_TITLE, self.out)
+
+    def test_no_store_publishes_the_new_wording(self):
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.NEW_TITLE, self.out)
+
+
 class TestRepoResolution(BaseTestCase):
     """The repository must be resolvable before a clone exists.
 

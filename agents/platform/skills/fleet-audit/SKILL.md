@@ -937,6 +937,11 @@ Every finding renders in exactly one state, computed fresh each run from whether
 and what pull request sits on its branch. The state itself is never stored; the report store keeps
 the previous run's ids and titles, which is how a finding is known to be new or resolved.
 
+A finding whose `evidence` and `severity` are the same as in the previous run publishes with the
+previous run's `title`, `impact` and `recommendation`, and usually its `remediation`. So new words
+for an unchanged finding do not reach the ledger. Your `manifest` remediation always stays, and so
+does a `gcloud` command where the previous run wrote `manual`.
+
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
 | `open`               | `open`                                | Reproduces; no pull request                | Nothing, unless it qualifies for auto-promotion              |

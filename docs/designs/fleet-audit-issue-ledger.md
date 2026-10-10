@@ -487,7 +487,9 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 `finish`.
 
 1. Validate the document (existing validator plus `recommendation`, the finding-id charset rule of
-   §2, and the scope rules of §7.2).
+   §2, and the scope rules of §7.2). Then keep the previous run's words for each finding whose
+   evidence and severity did not change
+   ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.2).
 2. Reconcile: one `gh pr list` call builds the finding→PR state map from head branch names.
 3. Compute the delta against the `<!-- audit-findings -->` marker of the ledger body the previous
    run stored ([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §4), unless its

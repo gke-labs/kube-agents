@@ -185,6 +185,17 @@ checks are the only ones a collector should mark: there the sentence reports whi
 the model infers from an excerpt and gets wrong. Every other check's `impact` stays the model's,
 whose rewrite is usually the better sentence.
 
+Between the two adoptions, `carry_unchanged_findings` compares each finding with the same id in the
+`document` of the previous run's stored report
+([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §4). When the `evidence` object and the
+`severity` are the same, the finding keeps the previous run's `title`, `impact` and `recommendation`.
+It also keeps the previous `remediation`, but not when either side is `manifest` or names a path,
+not when the previous one is `manual` and this run's is not, and not when `finish` wrote part of
+either note. The evidence adoption comes first because it makes the evidence of an unchanged finding
+the same on each run. The arm-specific `impact` comes after, because it is an observation, and it
+must replace carried words. The carry runs before the dry-run split, so a dry run shows the words
+the real run publishes. Changed evidence or a changed severity gives the model's new words.
+
 A `no-pdb` candidate also carries `namespace_pdbs`, the names of the budgets already in its
 namespace, and `pod_selector`, the workload's `spec.selector`, but only where that selector reaches
 no other controller's pods in the dump. Where the model left a declared finding of that check
