@@ -43,7 +43,7 @@ Each audit reads its SOP, executes read-only checks against the fleet, writes a 
 | `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself                               |
 | `ai-security-audit`           | `ai_security_audit_sop.md`           | AI inference and training workloads: exposure, model provenance, weights                       |
 | `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts                     |
-| `gcp-networking-fabric-audit` | `gcp_networking_fabric_sop.md`       | GCP networking fabric: subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor                  |
+| `gcp-networking-fabric-audit` | `gcp_networking_fabric_sop.md`       | GCP networking fabric: subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor, open firewalls  |
 | `gce-compute-fleet-audit`     | `gce_compute_fleet_sop.md`           | GCE startup-script failures, stalled MIG convergence, sole-tenant headroom, orphaned snapshots |
 
 Two properties matter more than the check lists:

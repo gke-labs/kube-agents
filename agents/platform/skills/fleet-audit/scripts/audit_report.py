@@ -427,6 +427,23 @@ AUDITS: dict[str, AuditSpec] = {
             "psc-routing-deadlock",
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
+            "firewall-world-open-ingress",
+        ),
+        # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
+        # subnet for the IPAM check, one `project/<id>` entry for the other
+        # five. This stream enumerates no clusters.
+        scopes=(
+            ("subnet", ("subnet-ip-exhaustion",)),
+            (
+                "project",
+                (
+                    "cloud-nat-exhaustion",
+                    "psc-routing-deadlock",
+                    "mtu-packet-fragmentation",
+                    "cloud-armor-false-positive",
+                    "firewall-world-open-ingress",
+                ),
+            ),
         ),
     ),
     "gce-compute-fleet-audit": AuditSpec(
@@ -473,6 +490,7 @@ COLLECTOR_AUDITS = frozenset(
         "fleet-consistency-drift",
         "fleet-wide-cost-analysis",
         "gce-compute-fleet-audit",
+        "gcp-networking-fabric-audit",
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
@@ -5241,6 +5259,15 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 f"{', '.join(repr(s) for s in sorted(collector_unevaluated))} in "
                 f"checks_unevaluated on {name!r}. Name each one and the read that "
                 "failed in `limitations`, so the run reports the gap instead of "
+                "publishing over it."
+            )
+        manifest_limitations = str(manifest_cluster.get("limitations") or "").strip()
+        if manifest_limitations and not str(cluster.get("limitations") or "").strip():
+            raise ValidationError(
+                f"scope.clusters: {name!r} has no `limitations`, but the collector "
+                f"manifest for {audit_id} records `limitations` on {name!r} "
+                f"({manifest_limitations!r}). Copy the collector's limitation "
+                "into `limitations`, so the run reports the gap instead of "
                 "publishing over it."
             )
         for slug in claimed:
@@ -13071,6 +13098,15 @@ def load_findings(path: str, audit_id: str) -> dict:
         data = json.loads(findings_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValidationError(f"--findings-file: {path} is not valid JSON: {exc}") from exc
+    # A collector manifest given as the findings document fails validation on
+    # its shape, and that message does not tell the worker what to do next.
+    if isinstance(data, dict) and "clusters" in data and not FINDINGS_DOCUMENT_KEYS & set(data):
+        raise ValidationError(
+            f"--findings-file: {path} is a collector manifest, not a findings document. "
+            f"Write the findings document from it with `audit_report.py draft --audit {audit_id} "
+            f"--manifest-file {path} --out <findings file>`, fill each recommendation, then give "
+            "that file as --findings-file and the manifest as --manifest-file."
+        )
     return validate_findings(data, audit_id)
 
 
@@ -14426,13 +14462,18 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
         ]
         if not_applicable:
             cluster["checks_not_applicable"] = not_applicable
-        # A check whose read failed neither ran nor was found inapplicable;
-        # `finish` requires it named in `limitations`.
+        # A check whose read failed neither ran nor was found inapplicable, and
+        # a check that ran can still leave part of the target undecided in the
+        # manifest entry's `limitations`; `finish` requires both in `limitations`.
         unevaluated = sorted(
             str(e.get("check")) for e in entry.get("checks_unevaluated") or [] if isinstance(e, dict) and e.get("check")
         )
-        if unevaluated:
-            cluster["limitations"] = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unevaluated)}"
+        entry_limitations = str(entry.get("limitations") or "").strip()
+        unmentioned = [c for c in unevaluated if c not in entry_limitations]
+        unevaluated_note = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unmentioned)}" if unmentioned else ""
+        limitations = "; ".join(part for part in (entry_limitations, unevaluated_note) if part)
+        if limitations:
+            cluster["limitations"] = limitations
         clusters.append(cluster)
         for candidate in entry.get("candidates") or []:
             if not isinstance(candidate, dict):

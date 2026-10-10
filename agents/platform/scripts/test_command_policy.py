@@ -1284,6 +1284,14 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_the_networking_collectors_per_gateway_nat_read_is_allowed(self):
+        # The collector scopes `get-nat-mapping-info` to one gateway with
+        # `--nat-name`; unscoped it returns every VM on the router and each
+        # gateway's ceiling would be compared against another's VMs.
+        argv = ["gcloud", "compute", "routers", "get-nat-mapping-info", "nat-router",
+                "--nat-name=nat-gw", "--region=us-central1", "--project=p", "--format=json"]
+        self.assertTrue(evaluate(argv).allowed)
+
     def test_a_leaf_read_ships_with_the_discovery_read_that_binds_its_argument(self):
         # The allowlist was derived from SOP command spellings, and a SOP
         # spelling arrives with its arguments already bound: check 2.2 reads

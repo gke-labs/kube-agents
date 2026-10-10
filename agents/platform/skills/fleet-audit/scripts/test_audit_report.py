@@ -13096,8 +13096,14 @@ class TestChecksRun(unittest.TestCase):
         self.assertEqual(audit_report.coverage_gaps(doc), [])
 
     def test_every_check_inapplicable_needs_a_collector_stream(self):
+        # Every stream runs a collector now. The test takes one out of the set
+        # to model a stream with no collector to corroborate the declarations.
         stream = "gcp-networking-fabric-audit"
-        self.assertNotIn(stream, audit_report.COLLECTOR_AUDITS)
+        patcher = patch.object(
+            audit_report, "COLLECTOR_AUDITS", audit_report.COLLECTOR_AUDITS - {stream}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         roster = audit_report.audit_target_checks(stream, "project/acme-prod")
         doc = make_doc(
             audit=stream,
@@ -16539,6 +16545,16 @@ class TestCrossCheckManifest(unittest.TestCase):
         doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
         audit_report.cross_check_manifest(doc, manifest)
 
+    def test_a_manifest_limitation_requires_limitations(self):
+        note = "firewall-world-open-ingress could not decide 1 rule(s): gke-ap-node-ssh"
+        manifest = self.manifest(limitations=note)
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("limitations", str(ctx.exception))
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = note
+        audit_report.cross_check_manifest(doc, manifest)
+
     def test_a_check_the_manifest_never_ran_is_rejected(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())
@@ -17562,6 +17578,29 @@ class TestDraftFindings(BaseTestCase):
         self.assertNotIn(na, " ".join(audit_report.coverage_gaps(validated)))
         self.assertIn(unevaluated, cluster["limitations"])
 
+    def test_a_manifest_entry_limitation_carries_into_the_draft(self):
+        """A check that ran can still leave part of the target undecided on the
+        manifest entry's `limitations`; `draft` carries that note forward and
+        does not duplicate a check already named in it."""
+        note = "firewall-world-open-ingress could not decide 1 rule(s): gke-ap-node-ssh"
+        manifest = self.manifest()
+        entry = manifest["clusters"][0]
+        entry["limitations"] = note
+        draft = audit_report.draft_findings(manifest, AUDIT)
+        for finding in draft["findings"]:
+            finding["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        validated = audit_report.validate_findings(copy.deepcopy(draft), AUDIT)
+        audit_report.cross_check_manifest(validated, manifest)
+        self.assertEqual(draft["scope"]["clusters"][0]["limitations"], note)
+        self.assertTrue(audit_report.coverage_gaps(validated))
+        checks = [c["check"] for c in entry["commands"]]
+        unevaluated = checks[-1]
+        entry["commands"] = [c for c in entry["commands"] if c["check"] != unevaluated]
+        entry["checks_unevaluated"] = [{"check": unevaluated, "reason": "forbidden"}]
+        entry["limitations"] = f"{unevaluated} could not be evaluated (forbidden)"
+        combined = audit_report.draft_findings(manifest, AUDIT)["scope"]["clusters"][0]["limitations"]
+        self.assertEqual(combined, f"{unevaluated} could not be evaluated (forbidden)")
+
     def test_the_subcommand_writes_the_draft(self):
         path = self.tmp_path / "manifest.json"
         path.write_text(json.dumps(self.manifest()), encoding="utf-8")
@@ -17815,6 +17854,14 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         Path(audit_report.manifest_path_for(AUDIT)).write_text(json.dumps({"clusters": []}))
         self.assertEqual(self.run_finish(make_doc(), ("--no-collector-manifest", "skipped it")), 2)
         self.assertIn("pass it with --manifest-file", self.err)
+
+    def test_a_manifest_given_as_the_findings_file_names_draft(self):
+        path = Path(self.workspace) / "manifest.json"
+        path.write_text(json.dumps({"version": 1, "audit": AUDIT, "clusters": []}))
+        with self.assertRaises(audit_report.ValidationError) as refused:
+            audit_report.load_findings(str(path), AUDIT)
+        self.assertIn("is a collector manifest", str(refused.exception))
+        self.assertIn("audit_report.py draft", str(refused.exception))
 
     def test_a_findings_file_written_before_start_is_refused(self):
         self.harness.replies = {"issue-list": issues_view([])}
@@ -18917,26 +18964,25 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         import fleet_waste
         import patch_readiness
 
-        # The GCE stream's collector ships in its own skill, beside its SOP.
-        spec = importlib.util.spec_from_file_location(
-            "compute_fleet_audit",
-            Path(__file__).resolve().parents[2] / "gce-compute-fleet-audit" / "scripts" / "compute_fleet_audit.py",
-        )
-        compute_fleet_audit = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(compute_fleet_audit)
+        # The GCE compute and networking collectors ship in their own skills,
+        # beside their SOPs.
+        def load(skill: str, module: str):
+            spec = importlib.util.spec_from_file_location(
+                module, Path(__file__).resolve().parents[2] / skill / "scripts" / f"{module}.py"
+            )
+            loaded = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(loaded)
+            return loaded
+
+        compute_fleet_audit = load("gce-compute-fleet-audit", "compute_fleet_audit")
+        networking_audit = load("gcp-networking-fabric-audit", "networking_audit")
 
         expected = set(collect.CHECK_TABLES) | {
             fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
-            compute_fleet_audit.AUDIT_ID,
+            compute_fleet_audit.AUDIT_ID, networking_audit.AUDIT_SLUG,
         }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
-
-    def test_streams_with_no_collector_are_not_held_to_it(self):
-        for audit in ("gcp-networking-fabric-audit",):
-            with self.subTest(audit=audit):
-                self.assertIn(audit, audit_report.AUDITS)
-                self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)
 
     def test_no_flag_is_refused_and_nothing_is_published(self):
         self.harness.replies = {"issue-list": issues_view([])}

@@ -560,6 +560,11 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # other advice entries, but with none of its flags listed here every
         # spelling the skill emits was refused -- the --max-run-duration trap
         # again. --machine-type and --region were already present above.
+        # The networking collector reads `routers get-nat-mapping-info` once
+        # per gateway, scoped with --nat-name: unscoped, the read returns every
+        # VM behind every gateway on the router. The verb was allowlisted, but
+        # without this entry the only spelling the collector emits was refused.
+        "--nat-name",
         "--tpu-version", "--chip-count", "--workload-type", "--vm-count",
         "--local-ssd", "--duration-range", "--start-time-range",
         "--end-time-range", "--location-policy",

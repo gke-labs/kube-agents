@@ -143,7 +143,8 @@ Every registered project was provisioned before the script ran this step. Measur
 
   ```bash
   FLEET_RECONCILER_SA="$(sed -n 's/^FLEET_RECONCILER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
-  for role in roles/compute.instanceAdmin.v1 roles/compute.storageAdmin roles/compute.viewer roles/container.admin \
+  for role in roles/compute.instanceAdmin.v1 roles/compute.securityAdmin roles/compute.storageAdmin \
+              roles/compute.viewer roles/container.admin \
               roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
               roles/resourcemanager.projectIamAdmin roles/serviceusage.serviceUsageConsumer; do
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \

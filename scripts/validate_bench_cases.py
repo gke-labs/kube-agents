@@ -198,6 +198,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "networking-world-open-ingress": (
+        "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
+        "every pool project (fleet re-apply); no pool project has a rule opening a "
+        "management port to the internet"
+    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "
