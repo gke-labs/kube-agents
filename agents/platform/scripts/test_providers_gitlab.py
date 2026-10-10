@@ -304,6 +304,99 @@ class ProposalTest(unittest.TestCase):
         capped = Api(mr(), WorkspaceError("not ready", status=502, code="FORGE_UNAVAILABLE"), *([page] * GitLabForge.DIFF_PAGES))
         self.assertIn("diff cut short", forge().proposal_view(capped, "acme/infra", {"number": 1, "diff": True})["diff"])
 
+    def test_gitlab_16_diffs_are_read_without_per_page(self):
+        # Live test on GitLab CE 16.11: no `raw_diffs` (404), and `diffs`
+        # answers 500 to every request that sets `per_page`. The fallback asks
+        # again without it, and pages at the size GitLab chooses.
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(20)]
+        last = [{"old_path": "z", "new_path": "z", "diff": "@@ -1 +1 @@\n"}]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), page, last,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertEqual(
+            [{"per_page": 100, "page": 1}, {"page": 1}, {"page": 2}],
+            [call[2] for call in api.calls[2:]],
+        )
+        self.assertIn("diff --git a/f19 b/f19", diff)
+        self.assertIn("diff --git a/z b/z", diff)
+        self.assertNotIn("cut short", diff)
+
+    def test_a_failure_after_the_first_diff_page_is_not_retried(self):
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(100)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404), page,
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"),
+        )
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+        self.assertEqual(4, len(api.calls))
+
+    def test_the_unsized_fallback_reads_the_same_number_of_pages(self):
+        # Review: up to 50 calls against one broker deadline. The unsized path
+        # reads at most DIFF_PAGES pages, and says how many files it showed.
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(30)]
+        pages = [[dict(item, new_path=f"p{n}-{item['new_path']}") for item in page]
+                 for n in range(GitLabForge.DIFF_PAGES)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), *pages,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertIn(f"only the first {GitLabForge.DIFF_PAGES * 30} files are shown", diff)
+        self.assertEqual(3 + GitLabForge.DIFF_PAGES, len(api.calls))
+
+    def test_the_unsized_fallback_takes_the_page_size_from_gitlab(self):
+        # Review: the page size without `per_page` is GitLab's choice (it
+        # can be 30, not 20). A full first page sets it; a shorter page ends.
+        first = [{"old_path": f"a{i}", "new_path": f"a{i}", "diff": "@@\n"} for i in range(30)]
+        second = [{"old_path": f"b{i}", "new_path": f"b{i}", "diff": "@@\n"} for i in range(29)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), first, second,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertIn("diff --git a/b28 b/b28", diff)
+        self.assertNotIn("cut short", diff)
+        self.assertEqual(5, len(api.calls))
+
+    def test_an_instance_that_ignores_page_gives_no_duplicates(self):
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(20)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), page, page,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertEqual(1, diff.count("diff --git a/f0 b/f0"))
+        self.assertEqual(5, len(api.calls))
+        # Review: the stop must say that files past the repeat are not shown.
+        self.assertIn("GitLab sent page 1 again when asked for page 2", diff)
+        self.assertIn("files after the first 20, if any, are not shown", diff)
+
+    def test_a_first_diff_page_refused_by_the_broker_is_not_retried(self):
+        # The broker's own refusals (a ceiling, a deadline) are 502 too, but
+        # not FORGE_UNAVAILABLE; asking again would fetch the same answer.
+        for code in ("FORGE_RESPONSE_TOO_LARGE", "FORGE_CALL_FAILED"):
+            with self.subTest(code=code):
+                api = Api(
+                    mr(), WorkspaceError("no route", status=404),
+                    WorkspaceError("refused", status=502, code=code),
+                )
+                with self.assertRaises(WorkspaceError):
+                    forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+                self.assertEqual(3, len(api.calls))
+
+    def test_a_retry_without_per_page_that_fails_is_not_tried_again(self):
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"),
+        )
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+        self.assertEqual(4, len(api.calls))
+
     def test_an_update_that_changes_nothing_reads_instead_of_writing(self):
         # GitLab answers 400 for an update with no parameters.
         api = Api(mr())

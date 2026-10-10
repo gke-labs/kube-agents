@@ -506,6 +506,15 @@ class GitLabForge(Forge):
         The fallback is paged, and it says so in the diff when it stops early
         or when GitLab left a file's hunks out: an omission the caller cannot
         see reads as a file the change did not touch.
+
+        On GitLab 16.11, `raw_diffs` answers 404, and `diffs` answers 500 to
+        every request that sets `per_page`. When the first page answers 5xx
+        with `per_page`, the fallback asks again without it. The page size is
+        then GitLab's choice, so the fallback does not assume one. It stops at
+        an empty page, at a page shorter than the first one, or at a page that
+        repeats the previous one. It reads at most `DIFF_PAGES` pages that way,
+        as it does with `per_page`, so the number of calls stays the same, and
+        the diff says so when it stops early.
         """
         try:
             return api("GET", f"{base}/raw_diffs", raw="text/plain")
@@ -518,10 +527,39 @@ class GitLabForge(Forge):
                 raise
         out: list[str] = []
         size = 0
+        shown = 0
+        sized = True
+        page_size = MAX_PAGE_SIZE
+        previous: list[str] = []
         for page in range(1, self.DIFF_PAGES + 1):
-            files = api(
-                "GET", f"{base}/diffs", params={"per_page": MAX_PAGE_SIZE, "page": page}
-            ) or []
+            params = {"per_page": MAX_PAGE_SIZE, "page": page} if sized else {"page": page}
+            try:
+                files = api("GET", f"{base}/diffs", params=params) or []
+            except WorkspaceError as exc:
+                # GitLab 16.11 answers 500 when `per_page` is set. Only on the
+                # first page, and only for GitLab's own 5xx: a later page that
+                # fails is a real failure, and so is a 404.
+                if not (sized and page == 1 and exc.fields.get("code") == FORGE_UNAVAILABLE):
+                    raise
+                sized = False
+                files = api("GET", f"{base}/diffs", params={"page": page}) or []
+                # GitLab chooses the page size, so the first page sets it. A
+                # later page that is shorter, or empty, is the last page. An
+                # empty first page returns below.
+                page_size = len(files)
+            paths = [str(item.get("new_path") or "") for item in files]
+            if not files:
+                return "".join(out)
+            if not sized and paths == previous:
+                # An instance that ignored `page` and sent the same page
+                # again. Files past it, if any, cannot be read, so say so.
+                out.append(
+                    f"# diff may be cut short: GitLab sent page {page - 1} again when asked "
+                    f"for page {page}, so files after the first {shown}, if any, are not shown\n"
+                )
+                return "".join(out)
+            previous = paths
+            shown += len(files)
             for item in files:
                 old, new = item.get("old_path") or "", item.get("new_path") or ""
                 out.append(f"diff --git a/{old} b/{new}\n")
@@ -537,11 +575,9 @@ class GitLabForge(Forge):
                     f"# diff cut short: stopped after {size} characters of changes\n"
                 )
                 return "".join(out)
-            if len(files) < MAX_PAGE_SIZE:
+            if len(files) < page_size:
                 return "".join(out)
-        out.append(
-            f"# diff cut short: only the first {self.DIFF_PAGES * MAX_PAGE_SIZE} files are shown\n"
-        )
+        out.append(f"# diff cut short: only the first {shown} files are shown\n")
         return "".join(out)
 
     def proposal_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:

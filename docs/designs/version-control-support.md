@@ -2407,6 +2407,11 @@ Four endpoints need naming because they are not a rename of GitHub's:
   raw diff as too large or too slow, which would fetch the same diff again; and
   it stops, saying so, once the assembled diff passes the broker's default
   response ceiling, since each page being under it does not bound ten of them.
+  On GitLab 16.11, `/diffs` answers 500 to a request that sets `per_page`. When
+  the first page answers 5xx, the fallback asks once more without `per_page`.
+  GitLab then chooses the page size, so the fallback stops at an empty page, a
+  page shorter than the first, or a page that repeats the previous one, and it
+  reads no more pages than before.
 - **Proposal creation** posts `source_branch`, `target_branch`, `title`,
   `description` to `/merge_requests`. The `draft` field is accepted and ignored
   on creation; a `Draft:` title prefix is what GitLab reads, so a draft proposal
