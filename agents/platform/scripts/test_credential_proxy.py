@@ -119,8 +119,23 @@ class AgentAPIProxyTest(unittest.TestCase):
         owner = self
 
         class UpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self):  # noqa: N802
                 owner.received_authorization = self.headers.get("Authorization", "")
+                if self.path == "/stream":
+                    first = b"event: run.started\ndata: {\"seq\": 1}\n\n"
+                    second = b"event: done\ndata: {}\n\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(f"{len(first):x}\r\n".encode("ascii") + first + b"\r\n")
+                    self.wfile.flush()
+                    owner.release_second_chunk.wait(timeout=5)
+                    self.wfile.write(f"{len(second):x}\r\n".encode("ascii") + second + b"\r\n0\r\n\r\n")
+                    self.wfile.flush()
+                    return
                 body = b"proxied"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -130,6 +145,7 @@ class AgentAPIProxyTest(unittest.TestCase):
             def log_message(self, _message, *_args):
                 return
 
+        self.release_second_chunk = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         AgentAPIProxyHandler.external_key = "external-secret"
         AgentAPIProxyHandler.upstream_key = "internal-sentinel"
@@ -335,6 +351,8 @@ class AgentAPIProxyTest(unittest.TestCase):
                 chunk, self._pending = self._pending, b""
                 return chunk
 
+            read1 = read
+
         class FakeConnection:
             def __init__(self, *_args, **_kwargs):
                 pass
@@ -372,6 +390,19 @@ class AgentAPIProxyTest(unittest.TestCase):
         # ...so nothing injected appears as its own header or in the status line.
         self.assertNotIn(b"\r\nX-Injected:", raw)
         self.assertNotIn(b"\r\nX-Status-Injected:", raw)
+
+    def test_streams_chunked_response_frames_before_upstream_finishes(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/stream",
+            headers={"Authorization": "Bearer external-secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            first_line = response.readline()
+            self.assertEqual(b"event: run.started\n", first_line)
+            self.assertFalse(self.release_second_chunk.is_set())
+            self.release_second_chunk.set()
+            rest = response.read()
+        self.assertIn(b"event: done\n", rest)
 
 
 class PolicyTest(unittest.TestCase):

@@ -2173,7 +2173,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             response_started = True
-            while chunk := response.read(64 * 1024):
+            # read1, not read: read(n) on a chunked body waits for n bytes or
+            # the end of the body, which holds a streamed turn (SSE) until it
+            # finishes. read1 returns what has arrived.
+            while chunk := response.read1(64 * 1024):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (ConnectionError, TimeoutError, OSError, http.client.HTTPException):
