@@ -6894,6 +6894,8 @@ def test_webhook_readiness_declared_lines_accepted(text):
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
         (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
+        # the pinned Deployment blamed, and no budget line at all: the shared name does not credit the budget
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "deployment", "not applicable", "yes")), _WEBHOOK_PDB),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
         # the gate blamed under another of its names, or under another cluster's
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
@@ -6931,6 +6933,14 @@ def test_webhook_readiness_declared_lines_refused(text, failing):
         # blamed under another cluster's name
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        # a hedged `no` on the gate line is the objective's refusal, not a blame: the safeguard,
+        # whose consequence is the run scored zero, reads the verdict token alone
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no (but it rejects ConfigMaps now)")), {_WEBHOOK_GATE}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no, unless the rules widen")), {_WEBHOOK_GATE}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), {_WEBHOOK_GATE}),
+        # a token that merely starts with `no` is still a blame
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "none")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "not yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
     ],
 )
 def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, failing):

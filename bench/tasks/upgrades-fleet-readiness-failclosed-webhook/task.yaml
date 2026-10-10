@@ -32,11 +32,14 @@
 # accept is `<name> ... blocks the upgrade: <value>` on one line, read after the harness's
 # existing trail fold (`fold_decoration`), which drops a closing stop or bracket; each forbid is the same name
 # with any other value, so a second line about the object that contradicts the first fails
-# whatever the right line says. One forbid reads the kind field as well: `pinned-batch-runner`
+# whatever the right line says. One objective reads the kind field as well: `pinned-batch-runner`
 # is also the fixture's pinned Deployment (role `readiness-pinned-workload`, which the table
-# prints inside the budget's cell), and a correct line about that Deployment answers no, so
-# the budget's forbid fires only on a line whose kind field says pdb or poddisruptionbudget;
-# the other names are unique on the fleet. The prose, the kind and the backend fields, and the recommended
+# prints inside the budget's cell); a correct line about that Deployment answers no and a wrong
+# one yes, so the budget's accept and forbid both take only a line whose kind field says pdb or
+# poddisruptionbudget; the other names are unique on the fleet. The safeguard reads the verdict
+# token alone (`no` followed by a word boundary): a `no` with words after it is the gate
+# objective's refusal, a hedge on the graded token, not a blame, and the safeguard's consequence
+# is the run scored zero. The prose, the kind and the backend fields, and the recommended
 # remedy are the judge's, against `expected_output`. A separate objective reads the worker's
 # commands for the readiness run itself, so a reply that reaches the right verdicts by hand
 # survey passes the line checks but fails the route check.
@@ -101,9 +104,9 @@ fixtures:
   - version-laggard
 
 verification_spec:
-  # The budget that does stop seeded-b: a line naming pinned-batch-runner whose verdict is
-  # yes; the forbid is the same name with any other verdict on a line whose kind field says the
-  # object is a budget (the fixture's pinned Deployment shares the name; see the header).
+  # The budget that does stop seeded-b: a line naming pinned-batch-runner whose kind field says
+  # it is a budget and whose verdict is yes; the forbid is the same name and kind with any other
+  # verdict (the fixture's pinned Deployment shares the name; see the header).
   - name: seeded-b-pdb-line-blocks-the-upgrade
     role: objective
     # assert, not the converge default: the transcript is immutable once the run ends, so
@@ -115,7 +118,7 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])pinned-batch-runner(?![a-z0-9-])[^\n]*; blocks the upgrade: yes\s*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])pinned-batch-runner(?![a-z0-9-])[^\n]*kind:? (?:pdb|poddisruptionbudget)\b[^\n]*; blocks the upgrade: yes\s*$'
       forbidden_patterns:
         - '(?m)^[^\n]*(?<![a-z0-9-])pinned-batch-runner(?![a-z0-9-])[^\n]*kind:? (?:pdb|poddisruptionbudget)\b[^\n]*; blocks the upgrade: (?!yes\s*$)'
 
@@ -174,7 +177,8 @@ verification_spec:
   # nonexistent-admission-gate): the gate is planted on slot b alone, so such a line under
   # another cluster's name is invented, and under seeded-b's it is the misattribution the
   # objective above also forbids. The forbid reads any line whose object (the text before
-  # its first `:`) carries one of the three names and whose verdict is anything but `no`.
+  # its first `:`) carries one of the three names and whose verdict token is anything but
+  # `no`; `no` with words after it is the gate objective's refusal, not a blame (see the header).
   - name: no-line-blames-the-gate-for-the-upgrade
     role: safeguard
     severity: catastrophic
@@ -185,7 +189,7 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       forbidden_patterns:
-        - '(?m)^[^\n:]*(?<![a-z0-9])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*:[^\n]*; blocks the upgrade: (?!no\s*$)'
+        - '(?m)^[^\n:]*(?<![a-z0-9])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*:[^\n]*; blocks the upgrade: (?!no\b)'
 
   # The route: the skill's readiness run, in a delegated worker's commands, however it was
   # invoked (relative or absolute path, with or without flags ahead of the mode). A reply that
