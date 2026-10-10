@@ -36,6 +36,8 @@ Environment:
     AGENT_CONTAINER: Container to exec into when reading back a delegated card's
         artifacts and its workers' session stores, and when clearing its state
         (default ``platform-agent``).
+    AGENT_POD: Pod to exec into instead of the Service, e.g. the eval pod
+        the agent runs in as a sidecar.
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
         ``model-default``, the name the operator pins on ``/v1/models`` via
         ``API_SERVER_MODEL_NAME`` and the one LiteLLM actually serves).
@@ -478,10 +480,13 @@ def _agent_shell(script: str, timeout: float) -> str:
     Best effort: a missing binary, an unreachable cluster or a non-zero exit all
     return ``""``, because neither caller is worth failing a run over.
     """
+    pod = os.environ.get("AGENT_POD")
+    target, *flags = _kubectl_target()
     cmd = [
         "kubectl",
         "exec",
-        *_kubectl_target(),
+        f"pod/{pod}" if pod else target,
+        *flags,
         "-c",
         os.environ.get("AGENT_CONTAINER", "platform-agent"),
         "--",
