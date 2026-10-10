@@ -1513,6 +1513,8 @@ class KubeAgentsHarness(AgentHarness):
             worker_commands=result.metadata.get("worker_commands"),
             worker_capture_gaps=worker_trajectory.gaps(result.metadata.get("worker_trajectory")),
         )
+        if out := os.environ.get("BENCH_OUTPUT_DIR"):
+            transcript.dump(Path(out) / "trajectory.json", prompt)
         return result
 
     def _execute(
