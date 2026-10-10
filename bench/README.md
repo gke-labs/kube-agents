@@ -51,7 +51,7 @@ opening turn failed in transport (1/3): RemoteDisconnected: Remote end closed co
 
 What that leaves in `results.json` is an empty answer with `KUBE_AGENTS_INFRA_FAILURE` at the head of `errors`, which the judge grades as the agent's non-answer. ([The gate](#the-gate) reads the marker and calls the repetition infrastructure, but that is the presubmit, not a local run.) Nothing in it names the sandbox, and an agent pod that went away mid-run reports the same thing.
 
-To run against a sandboxed install, pre-open the harness's local port with the `kubectl exec` relay:
+From inside the cluster, skip the forward: set `AGENT_URL=http://platform-agent.kubeagents-system:8642`. From outside, pre-open the harness's local port with the `kubectl exec` relay:
 
 ```bash
 python3 ../scripts/hermes-dashboard-tunnel.py \
