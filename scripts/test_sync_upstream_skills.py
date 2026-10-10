@@ -851,7 +851,8 @@ class WrittenPathspecsTest(unittest.TestCase):
                     and skill.name not in mirrored
                 ):
                     written.add(relative)
-        self.assertTrue(written, "no synced skills found in the tree")
+        # Empty once every gke-* skill is mirrored by scripts/skill_overlay.py; the pathspecs must
+        # then match nothing in the tree.
         self.assertEqual(matched, written)
 
     def test_recovery_commands_name_only_the_pathspecs_the_sync_writes(self):

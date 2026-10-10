@@ -493,7 +493,7 @@ func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
 		side, list := sl.side, sl.list
 		for _, name := range sortedResourceNames(list) {
 			q := list[name]
-			if !slices.Contains(credentialProxyResourceNames, name) {
+			if !slices.Contains(acceptedContainerResourceNames, name) {
 				return fmt.Errorf("%s is not cpu, memory or ephemeral-storage", name)
 			}
 			if q.Sign() < 0 {

@@ -135,6 +135,12 @@ type Config struct {
 	APIURL   string
 	APIKey   string
 	APIModel string
+	// RouteURL and RouteKey are the session-kv server the API executor
+	// records each turn's conversation route with, and its bearer
+	// (route.go). An empty RouteURL records nothing: a bridge under test
+	// calls no server it did not ask for. The daemon sets DefaultRouteURL.
+	RouteURL string
+	RouteKey string
 	// APIConnectRetry is how long a refused connection to the API server is
 	// retried before the task ends hermes-api-unreachable; zero is
 	// DefaultAPIConnectRetry.
@@ -406,6 +412,13 @@ type Bridge struct {
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
+	// routeClient records conversation routes (route.go).
+	routeClient *http.Client
+	// routesMu guards routes, the route each session last recorded
+	// (route.go), so a failed PUT that would have written the same route
+	// is not reported as a lost one.
+	routesMu sync.Mutex
+	routes   map[string]rememberedRoute
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server
@@ -440,6 +453,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
 		apiClient:   newAPIClient(),
+		routeClient: newAPIClient(),
 	}
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }

@@ -97,6 +97,17 @@ class TestProjection(ReportStatusTestCase):
         self.assertIsNone(latest["prs_opened"])
         self.assertEqual(stream["repos"][REPO]["runs"], ["20260801T093000.000000Z.json"])
 
+    def test_the_phase_timers_are_projected_and_a_missing_timer_reads_null(self):
+        self.write_latest(inspect_s=812.4, publish_s=21.0)
+        latest = self.project()["streams"][AUDIT]["repos"][REPO]["latest"]
+        self.assertEqual((latest["inspect_s"], latest["publish_s"]), (812.4, 21.0))
+        # A run without a collector manifest has no `collect_s`.
+        self.assertIn("collect_s", latest)
+        self.assertIsNone(latest["collect_s"])
+
+    def test_the_projection_names_every_timer_finish_writes(self):
+        self.assertLessEqual(set(audit_report.PHASE_TIMER_KEYS), set(report_status.LATEST_KEYS))
+
     def test_a_withheld_delta_is_carried_and_an_old_envelope_reads_null(self):
         self.write_latest(delta_known=False)
         latest = self.project()["streams"][AUDIT]["repos"][REPO]["latest"]

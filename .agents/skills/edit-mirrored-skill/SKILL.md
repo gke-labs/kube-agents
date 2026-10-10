@@ -24,9 +24,6 @@ is committed, and it is what the agent reads. `skills-refresh` writes patch bodi
 `append.md` from your edits; `skills-sync` and `skills-continue` rewrite the copy, lock, patches
 and shipped skill; `skills-generate` rebuilds the shipped skill.
 
-A `gke-*` skill without a lock is still overwritten by `scripts/sync-upstream-skills.py`; follow
-`AGENTS.md`, "Skills Guidelines", for it instead.
-
 # Rules
 
 - Never edit `third_party/google-skills/` or `upstream.lock` by hand. CI compares both with

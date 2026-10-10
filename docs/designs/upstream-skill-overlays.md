@@ -1,9 +1,10 @@
 # Upstream skill overlays
 
-> **STATUS — design; partly implemented.** `scripts/skill_overlay.py`, the `make skills-*`
-> targets and both checks in `validate` run on `main`, and `gke-workload-troubleshooting` is
-> mirrored with them. The other mirrored skills still come from `scripts/sync-upstream-skills.py`
-> and its string registries, which skip any skill with an `upstream.lock`. The implementation
+> **STATUS — implemented, apart from removing the old script.** `scripts/skill_overlay.py`, the
+> `make skills-*` targets and both checks in `validate` run on `main`, and every `gke-*` skill is
+> mirrored with them. `scripts/sync-upstream-skills.py` and its string registries are still in the
+> tree; the script refuses to run, because every registry entry names a skill with an
+> `upstream.lock`. The implementation
 > plan is tracked in
 > [#2374](https://github.com/gke-labs/kube-agents/issues/2374); the policy questions it answers
 > were raised in [#1450](https://github.com/gke-labs/kube-agents/issues/1450).
@@ -346,9 +347,8 @@ What `make skills-check` reports when a step is skipped:
 ### Automated edits to a generated skill
 
 - A tool that edits files in place cannot run `make skills-refresh`, so its edit fails the check.
-- One does so today: Dependabot's `docker` entry in `.github/dependabot.yml` bumps `agents/platform/skills/gke-app-onboarding/assets/Dockerfile` (now `FROM node:26-slim`; upstream has `FROM node:22-slim`).
-- No registry entry records the difference, so the next run of today's script would put upstream's pin back.
-- Migration records the pin as a patch (its `Why:` says why we run a newer base image), removes the Dependabot entry for that directory, and bumps the image from then on by changing the patch.
+- One did: Dependabot's `docker` entry in `.github/dependabot.yml` bumped `agents/platform/skills/gke-app-onboarding/assets/Dockerfile` to `FROM node:26-slim`, and no registry entry recorded it, so the old script's next run would have put upstream's pin back.
+- Migration recorded the pin as a patch (its `Why:` says why the sample runs a newer base image) and removed the Dependabot entry for that directory; the image is bumped by changing the patch.
 - Any other in-place tool pointed at a mirrored skill gets the same treatment.
 
 ## Security guardrails
@@ -408,7 +408,7 @@ Four PRs implement the design: about four days for one engineer working with a c
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- | ---- |
 | 1   | `scripts/skill_overlay.py` (`sync`, `continue`, `import`, `refresh`, `generate`, `check`, `status`, `verify-upstream`), the lock format, make targets and tests. No skill migrated.                                                                          | this design | 1–2  |
 | 2   | Pilot: `gke-workload-troubleshooting` migrated (copy, lock, two patches); `third_party/google-skills/` with a docs-map tree line and exclusions; `make skills-check` and the upstream comparison as steps in `validate`; the old script skips locked skills. | PR 1        | 1    |
-| 3   | The other 28 skills migrated: copies, locks, the remaining patches, five `append.md` files, and the in-tree edits no registry records. Generated tree byte-identical to `main`.                                                                              | PR 2        | 1    |
+| 3   | The other 28 skills migrated: copies, locks, the remaining patches, five `append.md` files, and the in-tree edits no registry records; the Dependabot entry for `gke-app-onboarding` removed. Generated tree byte-identical to `main`.                       | PR 2        | 1    |
 | 4   | Old script, registries and their tests removed; references updated (list below).                                                                                                                                                                             | PR 3        | 0.5  |
 
 - Not in the estimate: the first syncs after migration. They land what upstream has added since the last sync (new skills, two renamed TPU skills), which the agent does see, so each follows the eval loop like any skill change.
@@ -421,7 +421,6 @@ PR 4 also updates every file that names the old script or its registries:
 - The `Makefile` shellcheck comment and `.prettierignore`.
 - The message in `deploy/docker/check_skill_commands.py`.
 - Comments in two bench tasks and `agents/platform/scripts/gke_endpoint.py`.
-- The Dependabot `docker` entry for `gke-app-onboarding/assets`, removed ([Automated edits](#automated-edits-to-a-generated-skill)).
 - The marker line in the five footers names the old script. Migration keeps it verbatim in `append.md` so the generated tree stays byte-identical; a follow-up rewords it.
 
 ## What this design addresses

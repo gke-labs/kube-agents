@@ -39,9 +39,10 @@ import (
 // The subprocess executor stays as a fallback (Config.Executor); what this
 // one does not do, by design of the stopgap it is: steer a running turn (a
 // follow-up waits for the turn to end and runs as the next turn in the same
-// session; bridge.go, queueSteer), or bring a kanban card's completion
-// back to the thread (the API server has no push channel, so it never
-// reaches the A2A task; the subprocess loses it the same way). Both are
+// session; bridge.go, queueSteer). A kanban card's completion never reaches
+// the A2A task (the API server has no push channel); it goes back to the
+// conversation through the gateway's chat.notify route instead, on the route
+// this executor records before a task's first turn (route.go). Both are
 // named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
@@ -298,6 +299,17 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	// Recorded before the first turn, so a card any turn files finds it;
+	// every turn of the task is the same session and conversation. Best
+	// effort: the task runs either way, and a failure is said in the answer.
+	routeLost := false
+	if err := b.recordRoute(taskCtx, sessionID, run.origin); err != nil &&
+		!errors.Is(err, errNoChatConversation) && !errors.Is(err, errRouteDisabled) {
+		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
+			"task", taskID, "session", sessionID, "err", err)
+		routeLost = true
+	}
+
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
 	// this task holds the session's turn - every turn of it.
@@ -325,6 +337,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 			// A canceled task whose turn finished anyway won the race:
 			// completed wins, per the payload spec's cancel mapping, as on
 			// the subprocess path.
+			if routeLost {
+				text += routeLostNote
+			}
 			b.finalize(run, lib.StateCompleted, "", &text)
 			return
 		}

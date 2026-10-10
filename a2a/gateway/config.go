@@ -136,9 +136,9 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
-	// GchatHomeChannel is the install's Chat home space ("spaces/AAA"), the
-	// one place a chat.notify post may land (notify.go). Empty leaves the
-	// notify route unarmed.
+	// GchatHomeChannel is the install's Chat home space ("spaces/AAA"), where
+	// a chat.notify proactive post lands (notify.go). Empty leaves the route
+	// serving conversation requests only.
 	GchatHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
