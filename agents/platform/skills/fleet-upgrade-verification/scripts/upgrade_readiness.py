@@ -180,8 +180,9 @@ WILDCARD = "*"
 # The version the API server serves each write at, carried on its row: the matcher reads a
 # rule's `apiVersions` as the API server does (`*` or the request's version), so a rule pinned
 # to a version the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`,
-# `storage.k8s.io/v1beta1`) matches nothing. The pin is judged per rule (`_rule_version_pinned`):
-# a webhook whose every rule is pinned is an outage, not a blocker, whose cell says the server
+# `storage.k8s.io/v1beta1`) matches nothing. The pin is judged per rule (`_rule_version_pinned`),
+# on the resources the rule names and not on its operations or scope, since the served version is
+# the resource's: a webhook whose every rule is pinned is an outage, not a blocker, whose cell says the server
 # sends it no request at a served version (`WEBHOOK_PINNED_MATCHES`); one that pairs a pinned
 # rule with a rule the server does serve off the path fails that rule's requests now, and its
 # cell names the live rules as failing and the pinned rule alone as sent nothing
@@ -313,6 +314,10 @@ CONTROL_PLANE_CLUSTER_WRITES = (
 GRADED_TARGETS = UPGRADE_PATH_TARGETS + CONTROL_PLANE_CLUSTER_WRITES + CONTROL_PLANE_KUBE_SYSTEM_WRITES
 KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in {namespaces}"
 BOOTSTRAP_WRITE_LABEL = "{operation} {resource}"
+# A pinned rule whose operations (or scope) reach no graded row is labelled at the resource: the
+# served version is the resource's, not the row's.
+PINNED_RESOURCE_LABEL = "{resource} in {group}"
+PINNED_CORE_RESOURCE_LABEL = "{resource}"
 NAMESPACE_JOIN = ","
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
@@ -955,31 +960,51 @@ def kube_system_write_matches(hook: dict) -> list[str]:
     return labels
 
 
+def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
+    """The graded resources a pinned rule names with operations (or a scope) no graded row carries,
+    labelled at the resource, since the served version is the resource's and not the row's."""
+    labels: list[str] = []
+    for rule in rules:
+        if any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets):
+            continue
+        for group in rule.get("apiGroups") or []:
+            for spec in rule.get("resources") or []:
+                for row_group, _, resource, _, _ in targets:
+                    if group == row_group and isinstance(spec, str) and _resource_matches(spec, resource):
+                        template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
+                        label = template.format(resource=resource, group=group)
+                        if label not in labels:
+                            labels.append(label)
+    return labels
+
+
 def _pinned_labels(rules: list[dict], hook: dict) -> list[str]:
     """The graded writes `rules` name only at a version the server does not serve, labelled; a
     namespaced bootstrap write carries the namespaces the selector admits, or no namespace clause
-    when it admits neither, since what the server serves does not depend on the selector."""
+    when it admits neither, since what the server serves does not depend on the selector; a rule
+    whose operations reach no graded row is labelled at the resource."""
     return (_upgrade_path_labels(rules, read_version=False) + _cluster_write_labels(rules, read_version=False)
-            + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook), read_version=False))
+            + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook), read_version=False)
+            + _pinned_resource_labels(rules, GRADED_TARGETS))
 
 
 def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
-    """Whether the server sends this rule nothing because of its `apiVersions`: it names a
-    graded write (it would reach one of `targets` with the version check off) at a version
-    other than the one the server serves it at, and names nothing the list cannot vouch for,
-    so no wildcard group or resource and no resource off the list, whose served versions this
-    rule does not know. Decided per rule, so a webhook that pairs a pinned rule with a live
-    one is described as failing the live rule's requests, not as sent nothing."""
+    """Whether the server sends this rule nothing because of its `apiVersions`: every resource
+    it names is a graded one, which the server serves at `VERSION_V1` alone, and the rule names
+    neither `*` nor that version. The resource is read as `_resource_matches` reads it (`pods/`
+    is `pods`), and the rule's operations and scope are not read, since what the server serves
+    does not depend on them. A wildcard group or resource, or a resource off the lists, whose
+    served versions this rule does not know, is not pinned. Decided per rule, so a webhook that
+    pairs a pinned rule with a live one is described as failing the live rule's requests, not as
+    sent nothing."""
     if {WILDCARD, VERSION_V1} & set(rule.get("apiVersions") or []):
         return False
     groups = rule.get("apiGroups") or []
     specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
     if not groups or not specs or WILDCARD in groups or any(WILDCARD in spec for spec in specs):
         return False
-    on_path = {(group, resource) for group, _, resource, _, _ in targets}
-    if not all((group, spec) in on_path for group in groups for spec in specs):
-        return False
-    return any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets)
+    return all(any(group == row_group and _resource_matches(spec, resource) for row_group, _, resource, _, _ in targets)
+               for group in groups for spec in specs)
 
 
 def version_pinned_rules(hook: dict) -> list[dict]:

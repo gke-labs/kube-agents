@@ -196,7 +196,9 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   and scope, as the API server matches them: a rule's `apiVersions` must carry `*` or the version
   the server serves the write at (`v1` for every write on the list), so a rule pinned to a version
   the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing. The
-  pin is judged per rule: a webhook whose every rule is so pinned is an outage, not a blocker, whose
+  pin is judged per rule, on the resources it names and not on its operations (a graded resource at
+  an unserved version is pinned whatever the operation, and the cell then names the resource): a
+  webhook whose every rule is so pinned is an outage, not a blocker, whose
   cell says the server sends it no request at a served version rather than that its requests fail
   now, and one that pairs such a rule with a rule the server does serve off the path is an outage
   whose cell names the live rules as failing their requests now and the pinned rule alone as sent

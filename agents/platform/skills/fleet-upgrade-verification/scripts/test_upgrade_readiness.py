@@ -599,6 +599,30 @@ class KubeSystemReachTest(unittest.TestCase):
         self.assertEqual(outage[0]["version_pinned"], ["CREATE roles"])
         self.assertIn("the server serves CREATE roles at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
 
+    def test_a_pinned_rule_is_judged_on_its_resources_however_spelled_and_whatever_its_operations(self):
+        # `pods/` is `pods` here as it is in the matcher.
+        gate = hook("stale.example.com", [rule(["pods/"], versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["CREATE pods"]))
+        self.assertIn("so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        # A graded resource at an unserved version is pinned whatever the operation, since the
+        # served version is the resource's; no graded row carries DELETE rolebindings, so the
+        # label is the resource.
+        gate = hook("old.example.com", [rule(["rolebindings"], operations=("DELETE",), groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["rolebindings in rbac.authorization.k8s.io"]))
+        self.assertIn("the server serves rolebindings in rbac.authorization.k8s.io at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        for operations in (("UPDATE",), ("CONNECT",)):
+            with self.subTest(operations=operations):
+                gate = hook("old.example.com", [rule(["pods"], operations=operations, versions=("v1beta1",))], policy="Fail")
+                blocking, outage = self._one([gate])
+                self.assertEqual(blocking, [])
+                self.assertNotIn("fails its own requests now", r.describe_webhook_finding(outage[0]))
+        # A resource off every list is still not pinned: its served versions are not this rule's to know.
+        gate = hook("cm.example.com", [rule(["configmaps"], versions=("v1beta1",))], policy="Fail")
+        _, outage = self._one([gate])
+        self.assertEqual(outage[0]["version_pinned"], [])
+
     def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
         gate = hook("opa.example.com", [rule(["pods", "roles"], groups=("", "rbac.authorization.k8s.io"))], policy="Fail")
         blocking, _ = self._one([gate])
