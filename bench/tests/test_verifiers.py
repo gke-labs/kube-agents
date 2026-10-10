@@ -6963,6 +6963,7 @@ _WEBHOOK_RUN_PATTERNS = next(e["check"]["required_patterns"] for e in _WEBHOOK_S
     [
         ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /opt/data/scratch/r.json", True),
         ("python3 -u /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version 1.33 --readiness", True),
+        ("/usr/bin/python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
         ("./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
         ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3.14 fleet_upgrade_report.py --readiness", True),
         ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && uv run fleet_upgrade_report.py --readiness", True),
@@ -6971,6 +6972,11 @@ _WEBHOOK_RUN_PATTERNS = next(e["check"]["required_patterns"] for e in _WEBHOOK_S
         ("grep -n readiness /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py", False),
         ("cat fleet_upgrade_report.py | grep -- --readiness", False),
         ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version 1.33", False),
+        # the documented invocation inside another command's argument is a mention, not a run
+        ('grep -rn "fleet_upgrade_report.py --readiness" /opt/data/profiles/platform/skills/', False),
+        ('echo "run fleet_upgrade_report.py --readiness first"', False),
+        ("sed -n '/fleet_upgrade_report.py --readiness/p' /opt/data/profiles/platform/skills/fleet-upgrade-verification/SKILL.md", False),
+        ("cat SKILL.md | grep fleet_upgrade_report.py --readiness", False),
     ],
 )
 def test_webhook_readiness_run_objective_reads_the_invocation_not_the_interpreter(command, matches):
