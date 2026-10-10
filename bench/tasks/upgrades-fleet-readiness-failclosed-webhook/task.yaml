@@ -193,12 +193,13 @@ verification_spec:
         - '(?m)^[^\n:]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*:[^\n]*; blocks the upgrade: (?!no\b)'
 
   # The route: the skill's readiness run, in a delegated worker's commands, however it was
-  # invoked. The script's name, by any path or as a module, is a bare word of a command or of
-  # a segment after `&&`, `;` or `|`, with the mode flag a later bare word of that segment:
-  # whatever stands ahead of it (an interpreter and its flags, `timeout`, `env`, a `NAME=value`,
-  # `nohup`) is the worker's business, and a `sh -c` string is read through its quote. A name
-  # inside another command's quoted argument (a grep, an echo, a sed) is a mention, not a run,
-  # and a `--help` on the segment is a usage call, not a run. A reply that
+  # invoked. A command, or a segment of one after `&&`, `;` or `|`, is read as an argv the way
+  # the shell splits it; it is the run when the script's name is one of its words, by any path
+  # or as `-m fleet_upgrade_report`, with `--readiness` a later word and no `-h` or `--help`
+  # among them. What stands ahead of the script (an interpreter and its flags, `timeout`,
+  # `env`, a `NAME=value`) is the worker's business, and a `sh -c` string is read as commands
+  # of its own. A quoted mention of the invocation (a grep, an echo, a sed) is one word and so
+  # not a run; a usage call prints the help and runs nothing. A reply that
   # reaches the right verdicts by a hand kubectl survey passes the line checks and fails this
   # one; the persona routes a fleet readiness question to this one run.
   - name: the-readiness-run-happened
@@ -206,8 +207,9 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      required_patterns:
-        - '(?m)(?:^|[;&|])(?:[^"'';&|\n]|"[^"\n]*"|''[^''\n]*'')*?(?:(?:ba|z|da)?sh\s+-\S*c\s+["''](?:[^"''\n;&|]*?\s)?)?(?:^|\s)?[^\s"''=;&|]*fleet_upgrade_report(?:\.py)?\b(?:(?!\s--help\b)[^\n|;&"''])*\s--readiness\b(?!(?:(?!\s--help\b)[^\n|;&])*\s--help\b)'
+      required_runs:
+        - script: fleet_upgrade_report.py
+          flags: ["--readiness"]
 
   - name: no-invented-cves
     role: objective

@@ -6953,42 +6953,72 @@ def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, fa
 
 
 _WEBHOOK_RUN = "the-readiness-run-happened"
-_WEBHOOK_RUN_PATTERNS = next(e["check"]["required_patterns"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+_WEBHOOK_RUNS = next(e["check"]["required_runs"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+_SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
+_SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
 
 
-# The run objective reads the invocation, not the interpreter: the script's name, however reached,
-# followed by the mode flag on the same command.
+def _run_objective(command: str) -> str:
+    _stash_commands([command])
+    return WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS).verify(5.0).status
+
+
+# The run objective reads each command's argv as the shell splits it: the script by any path or
+# as a module, the mode flag a later word, no usage flag; what stands ahead is the worker's.
 @pytest.mark.parametrize(
     "command, matches",
     [
-        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /opt/data/scratch/r.json", True),
-        ("python3 -u /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version 1.33 --readiness", True),
-        ("/usr/bin/python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/r.json", True),
+        (f"python3 -u {_SCRIPT_PATH} --target-version 1.33 --readiness", True),
+        (f"/usr/bin/python3 {_SCRIPT_PATH} --readiness", True),
+        (f"{_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_versions.json", True),
         ("./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
-        ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3.14 fleet_upgrade_report.py --readiness", True),
-        ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && uv run fleet_upgrade_report.py --readiness", True),
-        ("cd /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts && python3 -m fleet_upgrade_report --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && python3.14 fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && uv run fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && python3 -m fleet_upgrade_report --readiness", True),
         # whatever stands ahead of the script is the worker's business
-        ("timeout 900 python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /opt/data/scratch/fleet_readiness.json", True),
-        ("KUBECONFIG=/opt/data/.kubeconfigs/x python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
-        ("env PYTHONUNBUFFERED=1 python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
-        ("nohup python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --output /tmp/r.json &", True),
-        ("time python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        (f"timeout 900 python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness.json", True),
+        (f"KUBECONFIG=/opt/data/.kubeconfigs/x python3 {_SCRIPT_PATH} --readiness", True),
+        (f"env PYTHONUNBUFFERED=1 python3 {_SCRIPT_PATH} --readiness", True),
+        (f"nohup python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json &", True),
+        (f"time python3 {_SCRIPT_PATH} --readiness", True),
         ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
         ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
-        ('bash -lc "python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness"', True),
+        (f'bash -lc "python3 {_SCRIPT_PATH} --readiness"', True),
+        # a quoted path, or one from a variable, is the same argv
+        (f'python3 "{_SCRIPT_PATH}" --readiness', True),
+        ('python3 "$DIR/fleet_upgrade_report.py" --readiness', True),
+        # not a run: the survey, a mention of the file, a run without the mode, a usage call
         ("kubectl get pdb,validatingwebhookconfigurations -A -o json", False),
-        ("grep -n readiness /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py", False),
+        (f"grep -n readiness {_SCRIPT_PATH}", False),
         ("cat fleet_upgrade_report.py | grep -- --readiness", False),
-        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version 1.33", False),
-        # the documented invocation inside another command's argument is a mention, not a run
+        (f"python3 {_SCRIPT_PATH} --target-version 1.33", False),
+        # the documented invocation quoted inside another command's argument is one word
         ('grep -rn "fleet_upgrade_report.py --readiness" /opt/data/profiles/platform/skills/', False),
         ('echo "run fleet_upgrade_report.py --readiness first"', False),
         ("sed -n '/fleet_upgrade_report.py --readiness/p' /opt/data/profiles/platform/skills/fleet-upgrade-verification/SKILL.md", False),
-        # a usage call is not a run
-        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness --help", False),
-        ("python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --help --readiness", False),
+        (f"python3 {_SCRIPT_PATH} --readiness --help", False),
+        (f"python3 {_SCRIPT_PATH} --help --readiness", False),
+        (f"python3 {_SCRIPT_PATH} --readiness -h", False),
+        (f"python3 {_SCRIPT_PATH} -h --readiness", False),
     ],
 )
-def test_webhook_readiness_run_objective_reads_the_invocation_not_the_interpreter(command, matches):
-    assert any(re.search(pattern, command) for pattern in _WEBHOOK_RUN_PATTERNS) is matches, command
+def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
+    assert (_run_objective(command) == "pass") is matches, command
+
+
+def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
+    from kube_agents_bench.verifiers import _shell_argvs
+
+    assert _shell_argvs('cd /x && python3 "/a b/f.py" --readiness; echo done') == [
+        ["cd", "/x"], ["python3", "/a b/f.py", "--readiness"], ["echo", "done"]]
+    assert _shell_argvs('bash -lc "python3 /x/f.py --readiness"') == [
+        ["bash", "-lc", "python3 /x/f.py --readiness"], ["python3", "/x/f.py", "--readiness"]]
+    assert _shell_argvs("python3 f.py --readiness --output 'unbalanced") == [["python3", "f.py", "--readiness", "--output", "'unbalanced"]]
+
+
+def test_worker_commands_required_run_names_what_did_not_run():
+    _stash_commands(["kubectl get pdb -A", 'grep -rn "fleet_upgrade_report.py --readiness" /opt'])
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
+    res = v.verify(5.0)
+    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason

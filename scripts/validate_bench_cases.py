@@ -387,7 +387,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),
-    "worker_commands": ("required_patterns", "forbidden_patterns"),
+    "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs"),
     "worker_agents": ("required_agents",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
