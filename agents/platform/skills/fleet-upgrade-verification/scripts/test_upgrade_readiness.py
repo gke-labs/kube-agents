@@ -632,6 +632,13 @@ class KubeSystemReachTest(unittest.TestCase):
         gate = hook("exec.example.com", [rule(["pods/exec"], operations=("CONNECT",), versions=("v1beta1",))], policy="Fail")
         _, outage = self._one([gate])
         self.assertEqual(outage[0]["version_pinned"], ["pods"])
+        # A rule naming two graded groups and a graded resource from each also names the pairs that
+        # do not exist (policy/pods); the server sends it nothing either way.
+        gate = hook("two.example.com", [rule(["pods", "poddisruptionbudgets"], operations=("CREATE", "UPDATE"), groups=("", "policy"), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"][0], "CREATE pods")
+        self.assertIn("so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
         # A spelling naming every resource, or a resource off every list, is still not pinned:
         # their served versions are not this rule's to know.
         for spec, groups in (("*", ("",)), ("*/*", ("",)), ("*/status", ("",)), ("configmaps", ("",))):
@@ -639,6 +646,14 @@ class KubeSystemReachTest(unittest.TestCase):
                 gate = hook("wild.example.com", [rule([spec], groups=groups, versions=("v1beta1",))], policy="Fail")
                 _, outage = self._one([gate])
                 self.assertEqual(outage[0]["version_pinned"], [])
+
+    def test_each_graded_resource_lives_in_one_graded_group(self):
+        # `_rule_version_pinned` judges a rule's groups and resources separately, which is sound
+        # while no graded resource name exists under two graded groups.
+        groups_by_resource: dict[str, set[str]] = {}
+        for group, _, resource, _, _ in r.GRADED_TARGETS:
+            groups_by_resource.setdefault(r._resource_parent(resource), set()).add(group)
+        self.assertEqual({name: groups for name, groups in groups_by_resource.items() if len(groups) > 1}, {})
 
     def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
         gate = hook("opa.example.com", [rule(["pods", "roles"], groups=("", "rbac.authorization.k8s.io"))], policy="Fail")

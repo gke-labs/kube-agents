@@ -971,6 +971,14 @@ def _graded_resources(targets: tuple) -> set[tuple[str, str]]:
     return {(group, _resource_parent(resource)) for group, _, resource, _, _ in targets}
 
 
+def _graded_groups(targets: tuple) -> set[str]:
+    return {group for group, _, _, _, _ in targets}
+
+
+def _graded_resource_names(targets: tuple) -> set[str]:
+    return {_resource_parent(resource) for _, _, resource, _, _ in targets}
+
+
 def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
     """The graded resources a pinned rule names with operations (or a scope) no graded row carries,
     labelled at the resource, since the served version is the resource's and not the row's; a
@@ -1006,19 +1014,22 @@ def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
     it names is a graded one, which the server serves at `VERSION_V1` alone, and the rule names
     neither `*` nor that version. A spelling is read by the resource it names (`pods/`, `pods/*`
     and `pods/exec` are `pods`, served under its group-version), and the rule's operations and
-    scope are not read, since what the server serves does not depend on them. A wildcard group,
-    a spelling naming every resource (`*`, `*/*`, `*/status`) or a resource off the lists, whose
-    served versions this rule does not know, is not pinned. Decided per rule, so a webhook that
-    pairs a pinned rule with a live one is described as failing the live rule's requests, not as
-    sent nothing."""
+    scope are not read, since what the server serves does not depend on them. The groups and the
+    resources are judged separately rather than as pairs: a rule naming two groups and a resource
+    from each also names the pairs that do not exist (`policy/pods`), which the server sends
+    nothing for either, and every graded resource lives in one graded group (pinned by a test),
+    so a named pair that exists is graded. A wildcard group, a spelling naming every resource
+    (`*`, `*/*`, `*/status`) or a group or resource off the lists, whose served versions this
+    rule does not know, is not pinned. Decided per rule, so a webhook that pairs a pinned rule
+    with a live one is described as failing the live rule's requests, not as sent nothing."""
     if {WILDCARD, VERSION_V1} & set(rule.get("apiVersions") or []):
         return False
     groups = rule.get("apiGroups") or []
     specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
     if not groups or not specs or WILDCARD in groups or any(_resource_parent(spec) == WILDCARD for spec in specs):
         return False
-    graded = _graded_resources(targets)
-    return all((group, _resource_parent(spec)) in graded for group in groups for spec in specs)
+    return (all(group in _graded_groups(targets) for group in groups)
+            and all(_resource_parent(spec) in _graded_resource_names(targets) for spec in specs))
 
 
 def version_pinned_rules(hook: dict) -> list[dict]:
