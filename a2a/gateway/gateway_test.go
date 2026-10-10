@@ -176,6 +176,10 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// started is closed when Run is entered, so a test can know the gateway
+	// has established its initial subscriptions and started the adapter.
+	started   chan struct{}
+	startOnce sync.Once
 	// stopped is closed when Run returns, so a test can assert that a
 	// backend was actually told to stop rather than left running.
 	stopped  chan struct{}
@@ -190,11 +194,13 @@ func newFakeAdapter() *fakeAdapter {
 		inbox:    make(chan InboundMessage, 16),
 		roster:   []string{"1001"},
 		complete: true,
+		started:  make(chan struct{}),
 		stopped:  make(chan struct{}),
 	}
 }
 
 func (a *fakeAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	a.startOnce.Do(func() { close(a.started) })
 	defer a.stopOnce.Do(func() { close(a.stopped) })
 	for {
 		select {
@@ -328,7 +334,13 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
+	runErr := make(chan error, 1)
+	go func() { runErr <- g.Run(ctx) }()
+	select {
+	case <-adapter.started:
+	case err := <-runErr:
+		t.Fatalf("g.Run exited early: %v", err)
+	}
 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
@@ -1216,7 +1228,13 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
+	runErr := make(chan error, 1)
+	go func() { runErr <- g.Run(ctx) }()
+	select {
+	case <-adapter.started:
+	case err := <-runErr:
+		t.Fatalf("g.Run exited early: %v", err)
+	}
 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel}, spawn
 }
@@ -1269,7 +1287,13 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
+	runErr := make(chan error, 1)
+	go func() { runErr <- g.Run(ctx) }()
+	select {
+	case <-adapter.started:
+	case err := <-runErr:
+		t.Fatalf("g.Run exited early: %v", err)
+	}
 	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel}, spawn
 }
 
