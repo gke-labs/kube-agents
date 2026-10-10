@@ -29,7 +29,8 @@ same commit, so the operator takes its registry and tag from the agent image ins
 `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
 table as `nats` and `nats-box`, so `make mirror-images` copies them; the chart does not set their
 env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at
-the copies by hand.
+the copies itself, through the operator's environment
+([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,

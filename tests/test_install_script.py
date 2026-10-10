@@ -5949,6 +5949,19 @@ class ChatInterviewInheritsAndStillAsksTest(unittest.TestCase):
         # configured gets, rather than option 1.
         self.assertIn('chat_choice="${chat_choice:-4}"', chat_block)
 
+    def test_choosing_both_says_google_chat_holds_the_next_gateway(self):
+        """Under spec.mode next, Google Chat holds the A2A gateway when both
+        are enabled, so Slack is not on the gateway at all. The menu's "Both"
+        arm is where an installer who added Slack to the pre-selected Google
+        Chat makes that choice."""
+        arms = self._SOURCE.split('case "$chat_choice" in', 1)
+        self.assertEqual(2, len(arms), "the chat_choice case statement moved")
+        both_arm = arms[1].split("    3)\n", 1)[1].split(";;", 1)[0]
+        self.assertIn('slack_enabled="true"', both_arm)
+        self.assertIn('google_chat_enabled="true"', both_arm)
+        self.assertIn("Google Chat holds the A2A gateway", both_arm)
+        self.assertIn("choose Slack alone", both_arm)
+
 
 class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
     """Pressing enter through the Slack interview must not clear the install.
@@ -9865,6 +9878,24 @@ class DomainScopedFlagsTest(unittest.TestCase):
         help_text = proc.stdout + proc.stderr
         self.assertIn("--slack-bot-token=TOKENS", help_text)
         self.assertRegex(help_text, r"Comma-separated Slack bot tokens")
+
+    def test_the_help_text_says_next_takes_one_bot_token(self):
+        """Under spec.mode next the A2A gateway authenticates one bot token, so
+        a list fails there with nothing in the PlatformAgent's status. The help
+        text is where a caller choosing the tokens reads the flag."""
+        proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        help_text = " ".join((proc.stdout + proc.stderr).split())
+        self.assertIn(
+            "Under --mode=next the A2A gateway serves one workspace: pass one token",
+            help_text,
+        )
 
 
 class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):

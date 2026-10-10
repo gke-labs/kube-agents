@@ -127,6 +127,16 @@ Only run the real install after I say yes.
 
    The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential broker before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container in the `platform-agent-credential-proxy` pod rather than the relay reporting the error.
 
+   If you enabled Slack, check that the credential broker authenticated the bot token ([Slack app setup](/kube-agents/install/slack-app/#verify) has the full check, including a test DM):
+
+   ```bash
+   kubectl logs deployment/platform-agent-credential-proxy -n kubeagents-system -c envoy-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
+   ```
+
+   `Slack relay enabled workspaces=1` (one per bot token) means the bot is connected. `Slack bot token authentication failed` names the Slack error for a token Slack refused, and `Slack relay initialization failed; retrying` repeats every 30 seconds until one token authenticates. The pattern leaves out `Slack relay operation failed`, which is one Slack call the agent made failing later, not the connection.
+
+   An install made with `--mode=next` runs more pods and reports more conditions, and with Slack as its only chat platform its Slack connects from a different pod: check it with [Verify a `spec.mode: next` install](#verify-a-specmode-next-install) as well.
+
 5. **Talk to the agent.**
 
    With Google Chat or Slack enabled, DM the app. Both are opt-in and off by default, so an install that enabled neither talks to the agent over `kubectl exec` instead — the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes, with your cluster, region, project and namespace already filled in:
@@ -139,6 +149,80 @@ Only run the real install after I say yes.
    Drop `--dns-endpoint` on a cluster that publishes no externally reachable DNS endpoint, where `gcloud` rejects it. `-p platform` reaches the Platform Agent directly; a bare `hermes` reaches the Planning Agent front door, which is where a chat message would have landed. [ChatOps](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled) covers the difference and what a chat-less install does not exercise.
 
 </Steps>
+
+## Verify a `spec.mode: next` install
+
+`--mode=next` installs with `spec.mode: next`, which puts the A2A stack in front of the agent: the NATS bus, its auth callout, the capability verifier, the A2A console and the A2A gateway, which takes the chat backend. [Common flags and toggles](#common-flags-and-toggles) covers the flag and how a later run keeps the mode. These checks come after step 4's, against the same namespace and the `PlatformAgent` named `platform-agent`.
+
+1. **Confirm the mode.**
+
+   ```bash
+   kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
+   ```
+
+   It prints `next`. An empty line means `today`, and nothing below applies.
+
+2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and, once a chat backend is configured, the A2A gateway. A first boot can take over fifteen minutes.
+
+   ```bash
+   kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=25m
+   ```
+
+   While it waits, the phase reads `Provisioning` and the `Ready` condition's message names the workload it is waiting on. That is a slow start. `phase: Degraded` with reason `A2AProvisionFailed` is a broken one: the provisioning Job failed, and its pod log says why.
+
+3. **Read the A2A conditions.**
+
+   ```bash
+   kubectl get platformagent platform-agent -n kubeagents-system \
+     -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\n"}{end}'
+   ```
+
+   A healthy `next` install shows the three rows below, and the `Ready` message reads `Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready`:
+
+   | Type                  | Status | Reason                 |
+   | --------------------- | ------ | ---------------------- |
+   | `Ready`               | `True` | `Reconciled`           |
+   | `BusProvisioned`      | `True` | `ProvisionJobComplete` |
+   | `BusCredentialsReady` | `True` | `CalloutServing`       |
+
+   `A2AGateway` and `A2AVerifier` appear only when something is wrong. `A2AGateway` `False` with `NoChatBackend` means no chat backend is enabled, so the operator runs no A2A gateway; with `WaitingForReplica` a backend has come back and the gateway's replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
+
+4. **List the A2A pods.** Every pod the A2A stack runs carries the label `app.kubernetes.io/part-of=a2a-next`, so this lists them apart from step 4's pods:
+
+   ```bash
+   kubectl get pods -n kubeagents-system -l app.kubernetes.io/part-of=a2a-next
+   ```
+
+   | Pod                                     | How many                      | Expected state                                                                           |
+   | --------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------- |
+   | `platform-agent-a2a-nats-0`             | 1                             | `Running`                                                                                |
+   | `platform-agent-a2a-callout-…`          | 2                             | `Running`                                                                                |
+   | `platform-agent-a2a-verifier-…`         | 2                             | `Running`                                                                                |
+   | `platform-agent-a2a-console-…`          | 1                             | `Running`                                                                                |
+   | `platform-agent-a2a-gateway-…`          | 1, with a chat backend only   | `Running`                                                                                |
+   | `platform-agent-a2a-provision-<hash>-…` | 1 per run, more if it retries | `Completed`; a failed attempt stays `Error`; all removed 24 hours after the Job finishes |
+   | `<profile>-<animal>-<hex>`              | 1 per session                 | `Running` while the session's task runs                                                  |
+
+   The A2A gateway creates a session pod only for a conversation switched to `/session` or a message that starts with `delegate`; other tasks run in the agent pod. It runs up to `spec.harness.tuning.maxSessions` (10 by default) at once, and a fresh install has none.
+
+5. **Check the agent's bridge.** The operator adds a `hermes-bridge` container to the agent pod once the bus is provisioned, so the `platform-agent-gateway` pod is replaced once during a first boot. The bridge takes tasks off the bus and runs them on the agent's API server.
+
+   ```bash
+   kubectl get deployment platform-agent-gateway -n kubeagents-system -o jsonpath='{.spec.template.spec.containers[*].name}{"\n"}'
+   kubectl logs deployment/platform-agent-gateway -n kubeagents-system -c hermes-bridge | grep 'hermes bridge consuming'
+   ```
+
+   The first command lists `hermes-bridge` among the containers. The second prints one JSON line with `"msg":"hermes bridge consuming"`, `"profile":"platform"` and `"executor":"api"`. `"executor":"cli"` means the operator sets `A2A_BRIDGE_EXECUTOR=cli`, and the bridge runs each task as its own `hermes chat` process instead. A `PlatformAgent` that declares its own `hermes-bridge` sidecar in `spec.deployment.sidecars` keeps it, the operator adds none, and that sidecar's executor is whatever its own environment selects.
+
+6. **Check Slack**, if you enabled it. With Slack as the only chat platform enabled, the A2A gateway holds Slack's Socket Mode connection and the credential broker's Slack relay from step 4 does not run. First confirm which backend the gateway took:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"a2a gateway starting"'
+   ```
+
+   `"backend":"slack"` means the gateway holds Slack; check the connection with the `next` steps in [Slack app setup](/kube-agents/install/slack-app/#verify). `"backend":"gchat"` means Google Chat is enabled too and holds the gateway: Slack is then answered by the Hermes Slack platform, as under `today`, and step 4's check applies instead. A Slack failure under `next` shows only in the gateway's log, never in the `PlatformAgent`'s `.status`: a refused token logs `chat backend stopped; restarting it, the console stays up` and the gateway retries with a backoff, while the pod stays `Running`.
+
+Startup reads differently under `next`. On a first boot the operator creates the A2A gateway only once an auth callout replica is serving, and adds the bridge only once the provisioning Job has completed, so for the first several minutes there is no gateway pod and the agent pod has no `hermes-bridge` container; the `Ready` message names what is still missing. The A2A gateway reads the Slack tokens from the install's Secret and dials Slack itself, so the one-off `slack connect timed out after 30s` from step 4 is not expected under `next`. If it does appear, the Hermes Slack platform is running, which under `next` means Google Chat is enabled as well.
 
 ## What just happened
 
@@ -162,6 +246,7 @@ Changing your mind later is the same engine: running the installer with `--menu`
 - On a later run, the chat flags must agree with `install.env`. `upgrade.sh` renders Slack and Google Chat from that file and takes no chat flag, so `install.sh` refuses `--enable-slack`, `--enable-google-chat` or a `--slack-*`, `--google-chat-allowed-users`, `--google-chat-home-channel`, `--google-chat-mode` or `--chat-topic-name` value that disagrees with a key the file sets; change the key instead. A key the file does not set is recorded there with the value the run applies, except the Slack tokens, which later runs recover from the cluster. [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md#the-install-configuration-installenv) has the full rule.
 - `--agent-namespace=NAME` — the namespace the agent and operator are installed into; `kubeagents-system` unless you say otherwise.
 - `--mode=today|next` — the `PlatformAgent`'s [`spec.mode`](/kube-agents/operator/platformagent-crd/); `today` unless you say otherwise. `next` also renders the NATS bus and the A2A gateway, an unsupported development stack. The first install records the mode in `install.env` as `PLATFORM_AGENT_MODE`; with an `install.env` you wrote yourself, `--mode` appends the key when the file sets none. To switch a running install, edit that key and re-run `install.sh` or a full `upgrade.sh`, which say it is a mode switch before they apply it; a `--mode` that disagrees with the file is refused, because the next run would switch back. [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md) is canonical for the key.
+- With `--mode=next`, Slack is answered by the A2A gateway only when it is the one chat platform enabled. With Google Chat enabled too, Google Chat holds the gateway and Slack stays on the Hermes Slack platform. The interactive installer's chat menu pre-selects **Google Chat** on a first install, so choose **Slack (Socket Mode App)** there, or pass `--enable-slack` without `--enable-google-chat`; on an install whose `install.env` already records `GOOGLE_CHAT_ENABLED=true`, set it to `false` there instead. The A2A gateway also serves one Slack workspace: pass one bot token in `--slack-bot-token`. With a comma-separated list the gateway fails to authenticate, Slack goes unanswered, and only the gateway pod's log says why.
 - `--enable-gke-backup-plan` — provisions the GKE Backup plan for the cluster. Left unset, the composition's own default decides.
 - `--enable-drift-detector=false` — installs without out-of-band change detection. The default is `true`: a cluster reconciled from a GitOps repository is one where a change made outside that repository is worth reporting, and nothing else reports it. Turning it on costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull subscription — and it reaches past the clusters this install manages: the sink exports the admin-activity audit records of every GKE cluster in the project, including clusters this install does not manage, and the subscription retains a copy of them for 31 days. On this first install the flag sticks: `install.sh` writes `install.env` and records the value you passed. It never rewrites that key afterwards, so on a later run the same flag applies to that run alone — which is why the durable opt-out is an `ENABLE_DRIFT_DETECTOR=false` line in `install.env`. [`spec.harness.driftDetector`](/kube-agents/operator/platformagent-crd/) has the rest: what the detector reports, what it drops, and why the file is the place to opt out.
 - `--gitops-org=ORG`, `--gitops-repo=REPO`, `--github-app-id=ID`, `--github-pem-path=PATH` — configures GitOps PR automation via the in-cluster GitHub token minter (Minty). When `--github-pem-path` is provided, `install.sh` imports the private key into Cloud KMS during install; alternatively, pre-provision the key AOT beforehand (see [Token minter](/kube-agents/deploy/token-minter/)).
@@ -169,6 +254,22 @@ Changing your mind later is the same engine: running the installer with `--menu`
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 
 Run the installer with `--help` (e.g. `./install.sh --help`) for the full list.
+
+### Operator settings
+
+Some operator behaviour is set by environment variables on the operator's controller manager, such as `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE`, the images a mirrored `spec.mode: next` install points at its own registry. `install.sh` has no flag for them. Set them in the chart's `operator.extraEnv` list, which is appended after the variables the chart renders and so wins over them. On an install made with `install.sh`, put the list in a `TF_VAR_extra_helm_values` line in `install.env`, which every later `install.sh` and `upgrade.sh` run reads:
+
+```bash
+TF_VAR_extra_helm_values='{operator={extraEnv=[{name="A2A_NATS_IMAGE",value="<REGISTRY>/nats:<TAG>"},{name="A2A_PROVISION_IMAGE",value="<REGISTRY>/nats-box:<TAG>"}]}}'
+```
+
+The value is an HCL object that Helm merges over the chart values the composition computes, so the same line can carry other chart keys; there is one such line, so put every extra value in it. Do not edit `terraform/examples/full-install/terraform.tfvars` for this: the installer regenerates that file on every run. Check it took after the next run:
+
+```bash
+kubectl get deployment kube-agents-controller-manager -n kubeagents-system -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' | grep '^A2A_'
+```
+
+On a hand-driven Terraform apply, set `extra_helm_values` in `terraform.tfvars` instead; on a bare Helm install, set `operator.extraEnv` in your values file.
 
 ## Upgrade
 

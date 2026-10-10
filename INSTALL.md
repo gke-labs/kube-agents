@@ -624,10 +624,11 @@ helm upgrade kube-agents ./charts/kube-agents \
 
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
-On an install that came from `install.sh`, put the same value in `extra_helm_values` in
-`terraform/examples/full-install/terraform.tfvars` as well. The next `upgrade.sh` or `install.sh`
-re-run regenerates that file from `install.env`, which does not record this setting, and reverts a
-value set only on the Helm release.
+On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead (it
+is the default; `--enable-gvisor=true` on a re-run records the same). The next `upgrade.sh` or
+`install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
+`agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
+set only on the Helm release or only in `terraform.tfvars` is reverted.
 
 Installing the chart directly with `helm install` gives you a sandbox the agent cannot log into: the
 chart cannot generate an `authorized_keys`-form public key, so `platform-agent-shell-authorized-keys`
@@ -966,8 +967,12 @@ kubectl get pods -n kubeagents-system
 
 `Ready` means the gateway, the shell sandbox and the credential broker are all up. A first boot can
 take over fifteen minutes. The site's quickstart
-[Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is and
-which startup errors to ignore. If a pod stays unready, see
+[Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is,
+which startup errors to ignore, and how to check that Slack connected. On an install made with
+`--mode=next`, `Ready` also waits for the NATS bus, the auth callout, the bus provisioning Job's
+first run and, with a chat backend, the A2A gateway; run the quickstart's "Verify a
+`spec.mode: next` install" checks as well, for those, the verifier and console it does not wait
+on, the conditions, and the Slack check that applies under `next`. If a pod stays unready, see
 [Troubleshooting & Common FAQ](#troubleshooting--common-faq).
 
 ### After the first chat message: the inventory report
