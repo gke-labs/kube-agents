@@ -1137,7 +1137,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
-        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure); webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable); webhooks not graded", by_name["seeded-a"]["note"])
         self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
         self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
         self.assertIn("| read failed | read skipped |", text)
@@ -1190,6 +1190,21 @@ class ReadinessTest(unittest.TestCase):
         self.assertFalse(read["webhook_skipped"])
         self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
         self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+
+    def test_the_shims_broker_down_line_skips_the_webhook_read(self):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            return 1, "", "credential proxy unavailable: [Errno 111] Connection refused\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertTrue(read["webhook_skipped"])
+        self.assertTrue(read["webhook_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES])
 
     def test_a_list_cut_at_the_proxy_cap_is_named_as_such(self):
         def fake_run(cmd, *args, **kwargs):

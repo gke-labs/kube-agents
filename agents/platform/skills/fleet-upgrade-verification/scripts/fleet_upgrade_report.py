@@ -219,9 +219,12 @@ KUBECTL_TIMEOUT_SECONDS = 60
 # is not one: in the agent sandbox kubectl is the credential-proxy client, whose broker may hold
 # a request in its admission queue for up to its slot wait before kubectl runs, so the deadline
 # measures the queue as often as the server, and a second read enters the queue afresh. The note
-# names the class, not an unreachable server, and kubectl's message stays in the error row.
-FIRST_READ_SKIP_MARKERS = ("Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
-WEBHOOK_READ_SKIPPED = "skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure)"
+# names the class, not an unreachable server, and kubectl's message stays in the error row. In
+# the sandbox the shim prints its own line when it cannot reach the broker (`credential proxy
+# unavailable: ...`), which the second call would print again. Matched without case: the errno
+# text behind the shim's line is capitalised.
+FIRST_READ_SKIP_MARKERS = ("unable to connect to the server", "i/o timeout", "connection refused", "no such host", "credential proxy unavailable")
+WEBHOOK_READ_SKIPPED = "skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable)"
 # The credential-proxy shim keeps the first --max-output-bytes of a command's stdout, drains the
 # rest, exits 0 and writes this line to stderr; a list cut there is unparsable JSON, and the
 # error row says so rather than blaming the server.
@@ -621,8 +624,9 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
     `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
     (`directory_error`); a first read that failed before the server answered it (a connection,
-    credential-plugin or certificate failure; not the deadline, which in the sandbox measures the
-    credential proxy's queue) skips the second rather than spend a second timeout on it
+    credential-plugin or certificate failure, or the credential proxy unreachable; not the
+    deadline, which in the sandbox measures the credential proxy's queue) skips the second rather
+    than spend a second timeout on it
     (`webhook_skipped`, with `webhook_error` saying so); otherwise
     each read fails alone, grading only its own rule `unknown`, and any
     failure makes the run exit 1.
@@ -641,7 +645,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
         result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return result
     result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
-    if result["error"] and any(marker in result["error"] for marker in FIRST_READ_SKIP_MARKERS):
+    if result["error"] and any(marker in result["error"].lower() for marker in FIRST_READ_SKIP_MARKERS):
         result["webhook_skipped"] = True
         result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
         return result
