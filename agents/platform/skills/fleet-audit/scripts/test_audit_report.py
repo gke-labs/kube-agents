@@ -9412,10 +9412,36 @@ class TestScopePhrase(BaseTestCase):
         doc = make_doc(findings=[make_finding()], audit=self.COST, clusters=targets)
         body = render_body(doc, generated_at=NOW)
         self.assertIn("Audited 1 cluster(s) and 1 project(s) on ", body)
+        clean_doc = make_doc(findings=[], audit=self.COST, clusters=targets)
         clean = audit_report.render_clean_comment(
-            self.COST, make_doc(findings=[], audit=self.COST, clusters=targets), NOW, gaps=[]
+            self.COST, clean_doc, NOW, gaps=[]
         )
         self.assertIn("across 1 audited cluster(s) and 1 project(s): ", clean)
+        partial = audit_report.render_clean_comment(
+            self.COST, clean_doc, NOW, gaps=["cluster `stage`: unreachable"]
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s):", partial)
+        lost = audit_report.render_clean_comment(
+            self.COST, clean_doc, NOW, gaps=[audit_report.LOST_MEMORY_GAP]
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s):", lost)
+        held = audit_report.render_held_comment(
+            self.COST,
+            clean_doc,
+            [
+                {
+                    "id": "idle-pool.prod-us-east..nodepool-np",
+                    "title": "t",
+                    "check": "idle-nodepool",
+                    "cluster": "prod-us-east",
+                    "namespace": "",
+                    "object": "NodePool/np",
+                    "commands": ["kubectl get nodes"],
+                }
+            ],
+            NOW,
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s):", held)
 
 
 class TestIndexOverhead(BaseTestCase):
@@ -24426,6 +24452,8 @@ class TestManifestRemediationLinks(HarnessTestCase):
             "https://github.com/o/r/blob/{path}",
             "https://github.com/o/r/blob/{ref}",
             "https://github.com/o/r/blob/{ref}/{path}/{other}",
+            "https://github.com/o/r/blob/{ref}/{path}#{ref[a]}",
+            "https://github.com/o/r/blob/{ref}/{path}?{ref.x}",
         ):
             with self.subTest(template=bad_template):
                 text = "\n".join(
@@ -24437,6 +24465,59 @@ class TestManifestRemediationLinks(HarnessTestCase):
                     f"- **Remediation (manifest):** [`{self.PATH}`]({self.PATH}) — n",
                     text,
                 )
+
+    def test_generated_and_newly_written_manifests_keep_bare_path_link(self):
+        generated = make_finding(
+            remediation={
+                "kind": "manifest",
+                "path": "clusters/prod/payments/checkout-pdb.yaml",
+                "note": f"{audit_report.GENERATED_FIX_NOTE} Written.",
+            }
+        )
+        text = "\n".join(
+            audit_report.render_finding(
+                generated, file_url=self.GITHUB_TEMPLATE, file_ref=self.SHA
+            )
+        )
+        self.assertIn(
+            "[`clusters/prod/payments/checkout-pdb.yaml`](clusters/prod/payments/checkout-pdb.yaml)",
+            text,
+        )
+
+        # A candidate whose collector entry has no existing declaration at the
+        # remediation path is also kept as a bare path in `render_issue_body`.
+        new_file = make_finding(
+            obj="Namespace/payments",
+            remediation={"kind": "manifest", "path": self.PATH, "note": "new"},
+        )
+        manifest = {
+            "audit": AUDIT,
+            "clusters": [
+                {
+                    "name": "prod-us-east",
+                    "candidates": [
+                        {
+                            "check": "netpol-missing",
+                            "namespace": "payments",
+                            "object": "Namespace/payments",
+                            "declaration": None,
+                        }
+                    ],
+                }
+            ],
+        }
+        unlinked = audit_report._unlinked_manifest_paths(
+            [new_file], manifest, {}, None
+        )
+        self.assertIn(self.PATH, unlinked)
+        body = audit_report.render_issue_body(
+            make_doc(findings=[new_file]),
+            generated_at=NOW,
+            file_url=self.GITHUB_TEMPLATE,
+            file_ref=self.SHA,
+            unlinked_paths=unlinked,
+        ).body
+        self.assertIn(f"[`{self.PATH}`]({self.PATH})", body)
 
     def test_select_rendered_findings_charges_the_expanded_url_against_the_budget(self):
         findings = [
@@ -24527,7 +24608,8 @@ class TestManifestRemediationLinks(HarnessTestCase):
         model_sha = "d" * 40
         data = {"declared_intent_searched": [f"acme/fleet@{model_sha}"]}
         record = {"searched": [f"acme/fleet@{record_sha}"]}
-        probe = type("P", (), {"base_sha": probe_sha})()
+        probe = audit_report._RepositoryProbe("acme/fleet", Path("/tmp"))
+        probe._workspace = type("W", (), {"base_sha": probe_sha})()
         self.assertEqual(
             audit_report._repo_file_ref("acme/fleet", None, data, record, probe),
             record_sha,
@@ -24536,10 +24618,13 @@ class TestManifestRemediationLinks(HarnessTestCase):
             audit_report._repo_file_ref("acme/fleet", None, data, None, probe),
             probe_sha,
         )
+        # An unopened probe never opens a broker workspace just to read `base_sha`.
+        unopened = audit_report._RepositoryProbe("acme/fleet", Path("/tmp"))
         self.assertEqual(
-            audit_report._repo_file_ref("acme/fleet", None, data, None, None),
+            audit_report._repo_file_ref("acme/fleet", None, data, None, unopened),
             model_sha,
         )
+        self.assertEqual(unopened._attempts, 0)
 
         # If a promoted `/remediate` over a settled PR fails to open a replacement
         # PR, `_remediation_outcomes` must not report the settled PR as refreshed.

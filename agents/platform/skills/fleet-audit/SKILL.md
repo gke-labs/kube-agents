@@ -1138,8 +1138,8 @@ closed, does not name shows on the ledger with no pull request, and its state li
 request: it still blocks the automatic promotion, and a `/remediate` proposes a fix for every finding
 in the group that still reproduces. A pull request the harness closed as stale blocks nothing. In
 the finding's detail block, a `manifest` remediation path links to the file at the audited repository
-commit when the forge's `capabilities` response supplies a `fileUrl` template, and stays a bare path
-otherwise.
+commit when the forge's `capabilities` response supplies a `fileUrl` template and the file exists at
+that commit, and stays a bare path for a newly written file or when `fileUrl` is absent.
 
 ## Size
 

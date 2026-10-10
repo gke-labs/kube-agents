@@ -8922,7 +8922,7 @@ def format_file_url(file_url: str | None, path: str, ref: str = DEFAULT_FILE_REF
     encoded_path = urllib.parse.quote(str(path), safe="/")
     try:
         return file_url.format(ref=encoded_ref, path=encoded_path)
-    except (KeyError, ValueError, IndexError):
+    except Exception:  # noqa: BLE001 -- a template `str.format` rejects for any reason keeps the bare path
         return path
 
 
@@ -8936,6 +8936,7 @@ def render_finding(
     blocked_by: dict | None = None,
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> list[str]:
     fid = str(finding.get("id", ""))
     # Every free-text field is clipped, not only the evidence. The body budget
@@ -9004,8 +9005,14 @@ def render_finding(
     lines.append("")
     if kind == "manifest":
         path = str(remediation.get("path", ""))
-        target = format_file_url(file_url, path, ref=file_ref)
-        note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
+        raw_note = str(remediation.get("note", ""))
+        is_new_file = (
+            raw_note.startswith(GENERATED_FIX_NOTE)
+            or str(finding.get("check") or "") == GENERATED_FIX_CHECK
+            or path in unlinked_paths
+        )
+        target = path if is_new_file else format_file_url(file_url, path, ref=file_ref)
+        note = clip_text(raw_note, MAX_NOTE_CHARS)
         suffix = f" — {note}" if note else ""
         lines.append(f"- **Remediation (manifest):** [`{path}`]({target}){suffix}")
     elif kind == "gcloud":
@@ -9090,6 +9097,7 @@ def select_rendered_findings(
     blocked_by: dict[str, dict] | None = None,
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
@@ -9126,6 +9134,7 @@ def select_rendered_findings(
             blocked_by=(blocked_by or {}).get(fid),
             file_url=file_url,
             file_ref=file_ref,
+            unlinked_paths=unlinked_paths,
         )
         cost = len("\n".join(rendered)) + 2
         cost += len(fid) + 3  # its slot in the hidden delta block
@@ -9411,6 +9420,7 @@ def _render_findings(
     blocked_by: dict[str, dict] | None = None,
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -9454,6 +9464,7 @@ def _render_findings(
         blocked_by=blocked_by,
         file_url=file_url,
         file_ref=file_ref,
+        unlinked_paths=unlinked_paths,
     )
 
     # A one-row-per-finding index, so the state of the whole stream is legible
@@ -9493,6 +9504,7 @@ def _render_findings(
                 blocked_by=blocked_by.get(fid),
                 file_url=file_url,
                 file_ref=file_ref,
+                unlinked_paths=unlinked_paths,
             )
 
     if omitted:
@@ -10095,6 +10107,7 @@ def render_issue_body(
     blocked_by: dict[str, dict] | None = None,
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -10192,6 +10205,7 @@ def render_issue_body(
             blocked_by=blocked_by,
             file_url=file_url,
             file_ref=file_ref,
+            unlinked_paths=unlinked_paths,
         )
 
     findings_lines, omitted = select(0)
@@ -12900,7 +12914,6 @@ class _RepositoryProbe:
         self.repo, self.root = repo, root
         self._session = None
         self._workspace = None
-        self.base_sha = ""
         # Why the broker could not be asked, once it could not.
         self.unavailable = ""
         # Why the last answer was a yes nobody saw: a call that failed or a
@@ -12917,6 +12930,15 @@ class _RepositoryProbe:
         self._paths: dict[str, tuple[bool, str]] = {}
         self._unreadable = False
 
+    @property
+    def base_sha(self) -> str:
+        """The commit SHA of the already-opened broker workspace, or empty."""
+        return str(getattr(self._workspace, "base_sha", "") or "")
+
+    def known_absent(self, path: str) -> bool:
+        """Whether an earlier `has_path` call already found `path` absent."""
+        return path in self._paths and not self._paths[path][0]
+
     def broker(self):
         # Asked twice at most: once for the Config Connector scan and once
         # more at planning, so one refused open does not end generation.
@@ -12928,7 +12950,6 @@ class _RepositoryProbe:
 
                 self._session = credential_proxy_client.Workspace.open(proxy_endpoint(), self.repo)
                 self._workspace = self._session.__enter__()
-                self.base_sha = str(getattr(self._workspace, "base_sha", "") or "")
             except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
                 self.unavailable = f"{type(exc).__name__}: {exc}"
                 log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
@@ -14033,13 +14054,8 @@ def _repo_file_ref(
         sha = sha.strip()
         if sha and _ledger_key(slug.strip()) == key:
             return sha
-    if probe is not None:
-        if getattr(probe, "base_sha", ""):
-            return str(probe.base_sha)
-        if content_mode():
-            workspace = probe.broker()
-            if workspace is not None and getattr(workspace, "base_sha", ""):
-                return str(workspace.base_sha)
+    if probe is not None and getattr(probe, "base_sha", ""):
+        return str(probe.base_sha)
     if not content_mode() and root is not None:
         sha = _head_sha(root)
         if sha:
@@ -14052,6 +14068,43 @@ def _repo_file_ref(
         if sha and _ledger_key(slug.strip()) == key:
             return sha
     return DEFAULT_FILE_REF
+
+
+def _unlinked_manifest_paths(
+    findings: list[dict],
+    manifest: dict | None,
+    planned: dict[str, tuple[str, str]],
+    probe: "_RepositoryProbe | None" = None,
+) -> frozenset[str]:
+    """Manifest paths newly written in this run, which do not exist at `file_ref`."""
+    declared_by_id = {
+        _candidate_identity(entry, candidate): str(
+            (candidate.get("declaration") or {}).get("path") or ""
+        )
+        if isinstance(candidate.get("declaration"), dict)
+        and candidate.get("check") != GENERATED_FIX_CHECK
+        else ""
+        for entry, candidate in _candidates(manifest)
+    }
+    unlinked: set[str] = {path for path, _ in planned.values()}
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        if remediation.get("kind") != "manifest":
+            continue
+        path = str(remediation.get("path") or "")
+        if not path:
+            continue
+        if (
+            str(remediation.get("note") or "").startswith(GENERATED_FIX_NOTE)
+            or str(finding.get("check") or "") == GENERATED_FIX_CHECK
+            or (probe is not None and probe.known_absent(path))
+        ):
+            unlinked.add(path)
+            continue
+        cid = derive_finding_id(finding)
+        if cid in declared_by_id and declared_by_id[cid] != path:
+            unlinked.add(path)
+    return frozenset(unlinked)
 
 
 class _Copy(NamedTuple):
@@ -16098,6 +16151,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         if remaining and has_run_record(audit_id, repo):
             raise ValidationError(unwritten_refusal_message(remaining, skipped))
         write_generated_fixes(findings, planned, root)
+        unlinked_paths = _unlinked_manifest_paths(findings, manifest, planned, probe)
         file_url = (
             _repo_file_url(repo)
             if any((f.get("remediation") or {}).get("kind") == "manifest" for f in findings)
@@ -16661,6 +16715,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         blocked_by=blocked_by,
         file_url=file_url,
         file_ref=file_ref,
+        unlinked_paths=unlinked_paths,
     )
     if rendered.partial:
         log(
@@ -16829,6 +16884,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 blocked_by=blocked_by,
                 file_url=file_url,
                 file_ref=file_ref,
+                unlinked_paths=unlinked_paths,
             ).body
             relinked = try_forge("issue-update", repo, {"number": number, "body": relink})
             if relinked is not None:
