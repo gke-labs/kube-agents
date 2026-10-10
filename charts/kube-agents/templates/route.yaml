@@ -1,0 +1,27 @@
+{{- $openshift := .Values.openshift | default dict }}
+{{- $route := $openshift.route | default dict }}
+{{- if and $openshift.enabled $route.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ .Release.Name }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  {{- if $route.host }}
+  host: {{ $route.host | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ default "platform-agent" .Values.platformAgent.name }}
+    weight: 100
+  port:
+    targetPort: {{ default "api" $route.targetPort }}
+  {{- if $route.tls }}
+  tls:
+    termination: {{ default "edge" $route.tls.termination }}
+    insecureEdgeTerminationPolicy: Redirect
+  {{- end }}
+{{- end }}
