@@ -230,7 +230,7 @@ NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and web
 NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
-NOTE_WEBHOOK_READ_SKIPPED = f"webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline); webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
 # custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
