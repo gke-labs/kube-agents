@@ -1,0 +1,104 @@
+# The run namespace for the Slack live check. launch.py applies this before its
+# first Job (idempotent) and deletes the namespace when the run ends; it fills the
+# placeholders in with string.Template. The GSA, its secretAccessor grants on the
+# two token secrets, and its workloadIdentityUser binding to this ServiceAccount
+# are the cluster manager's and are not here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: slack-live-check
+    # The Job's pod meets the restricted profile; nothing else should run here.
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${SERVICE_ACCOUNT}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: slack-live-check
+  annotations:
+    # Workload Identity: the metadata server hands this pod the GSA's token, and
+    # the GSA can read the two token secrets and nothing else.
+    iam.gke.io/gcp-service-account: ${GSA_EMAIL}
+# The pod talks to no Kubernetes API, and GKE's metadata server identifies it
+# without a mounted ServiceAccount token.
+automountServiceAccountToken: false
+---
+# The Job reaches the gateway only through Slack, never in-cluster. Nothing may
+# reach the harness, and it may reach only DNS, the metadata server (for the
+# Workload Identity token) and public HTTPS (slack.com and
+# secretmanager.googleapis.com). NetworkPolicy cannot name a host, so "public
+# HTTPS" is 443 to anything outside the private ranges, the same fence the
+# chart's LiteLLM policy uses (charts/kube-agents/templates/litellm.yaml), where
+# the reasoning for each peer is written down.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: slack-live-check
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: slack-live-check
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 80
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
