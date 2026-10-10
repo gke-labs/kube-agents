@@ -960,21 +960,34 @@ def kube_system_write_matches(hook: dict) -> list[str]:
     return labels
 
 
+def _resource_parent(spec: str) -> str:
+    """The resource a spelling names, without its subresource: `pods/exec` and `pods/*` are
+    served under `pods`' group-version, so the served version of the parent is theirs."""
+    return spec.partition("/")[0]
+
+
+def _graded_resources(targets: tuple) -> set[tuple[str, str]]:
+    """(group, resource) for every graded row, the subresource dropped."""
+    return {(group, _resource_parent(resource)) for group, _, resource, _, _ in targets}
+
+
 def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
     """The graded resources a pinned rule names with operations (or a scope) no graded row carries,
-    labelled at the resource, since the served version is the resource's and not the row's."""
+    labelled at the resource, since the served version is the resource's and not the row's; a
+    subresource is labelled by its parent, whose group-version it is served under."""
+    graded = _graded_resources(targets)
     labels: list[str] = []
     for rule in rules:
         if any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets):
             continue
         for group in rule.get("apiGroups") or []:
             for spec in rule.get("resources") or []:
-                for row_group, _, resource, _, _ in targets:
-                    if group == row_group and isinstance(spec, str) and _resource_matches(spec, resource):
-                        template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
-                        label = template.format(resource=resource, group=group)
-                        if label not in labels:
-                            labels.append(label)
+                if not isinstance(spec, str) or (group, _resource_parent(spec)) not in graded:
+                    continue
+                template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
+                label = template.format(resource=_resource_parent(spec), group=group)
+                if label not in labels:
+                    labels.append(label)
     return labels
 
 
@@ -991,9 +1004,10 @@ def _pinned_labels(rules: list[dict], hook: dict) -> list[str]:
 def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
     """Whether the server sends this rule nothing because of its `apiVersions`: every resource
     it names is a graded one, which the server serves at `VERSION_V1` alone, and the rule names
-    neither `*` nor that version. The resource is read as `_resource_matches` reads it (`pods/`
-    is `pods`), and the rule's operations and scope are not read, since what the server serves
-    does not depend on them. A wildcard group or resource, or a resource off the lists, whose
+    neither `*` nor that version. A spelling is read by the resource it names (`pods/`, `pods/*`
+    and `pods/exec` are `pods`, served under its group-version), and the rule's operations and
+    scope are not read, since what the server serves does not depend on them. A wildcard group,
+    a spelling naming every resource (`*`, `*/*`, `*/status`) or a resource off the lists, whose
     served versions this rule does not know, is not pinned. Decided per rule, so a webhook that
     pairs a pinned rule with a live one is described as failing the live rule's requests, not as
     sent nothing."""
@@ -1001,10 +1015,10 @@ def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
         return False
     groups = rule.get("apiGroups") or []
     specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
-    if not groups or not specs or WILDCARD in groups or any(WILDCARD in spec for spec in specs):
+    if not groups or not specs or WILDCARD in groups or any(_resource_parent(spec) == WILDCARD for spec in specs):
         return False
-    return all(any(group == row_group and _resource_matches(spec, resource) for row_group, _, resource, _, _ in targets)
-               for group in groups for spec in specs)
+    graded = _graded_resources(targets)
+    return all((group, _resource_parent(spec)) in graded for group in groups for spec in specs)
 
 
 def version_pinned_rules(hook: dict) -> list[dict]:

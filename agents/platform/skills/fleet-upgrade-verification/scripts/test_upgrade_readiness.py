@@ -618,10 +618,27 @@ class KubeSystemReachTest(unittest.TestCase):
                 blocking, outage = self._one([gate])
                 self.assertEqual(blocking, [])
                 self.assertNotIn("fails its own requests now", r.describe_webhook_finding(outage[0]))
-        # A resource off every list is still not pinned: its served versions are not this rule's to know.
-        gate = hook("cm.example.com", [rule(["configmaps"], versions=("v1beta1",))], policy="Fail")
+        # The parent of a graded subresource is a graded resource: the pre-1.25 PDB-policy gate,
+        # bare or with every subresource, is sent nothing at policy/v1beta1. The bare spelling
+        # reaches no row and is labelled at the resource; `/*` reaches the status row.
+        gate = hook("pdb.example.com", [rule(["poddisruptionbudgets"], operations=("CREATE", "UPDATE"), groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["poddisruptionbudgets in policy"]))
+        self.assertIn("the server serves poddisruptionbudgets in policy at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        gate = hook("pdb.example.com", [rule(["poddisruptionbudgets/*"], operations=("UPDATE",), groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["UPDATE poddisruptionbudgets/status"]))
+        # A subresource is served under its parent's group-version.
+        gate = hook("exec.example.com", [rule(["pods/exec"], operations=("CONNECT",), versions=("v1beta1",))], policy="Fail")
         _, outage = self._one([gate])
-        self.assertEqual(outage[0]["version_pinned"], [])
+        self.assertEqual(outage[0]["version_pinned"], ["pods"])
+        # A spelling naming every resource, or a resource off every list, is still not pinned:
+        # their served versions are not this rule's to know.
+        for spec, groups in (("*", ("",)), ("*/*", ("",)), ("*/status", ("",)), ("configmaps", ("",))):
+            with self.subTest(spec=spec):
+                gate = hook("wild.example.com", [rule([spec], groups=groups, versions=("v1beta1",))], policy="Fail")
+                _, outage = self._one([gate])
+                self.assertEqual(outage[0]["version_pinned"], [])
 
     def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
         gate = hook("opa.example.com", [rule(["pods", "roles"], groups=("", "rbac.authorization.k8s.io"))], policy="Fail")
