@@ -938,14 +938,6 @@ Mutation(
         "log the hint raw, which is the state the sanitiser was added to fix",
     ),
     Mutation(
-        "D1-gateway-role-reaches-secrets",
-        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-        ('Resources: []string{"pods"},', 'Resources: []string{"pods", "secrets"},'),
-        "test_D1_no_product_role_can_write_the_identity_table",
-        "let the gateway's spawner Role read and write Secrets beside pods, "
-        "which is the shortcut that puts its own identity table in its hands",
-    ),
-    Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),

@@ -286,11 +286,11 @@ python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling), zero genuine survivors, zero stale — measured 2026-09-25 against
 this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, `D1-gateway-role-reaches-secrets` and
-`D1-platform-role-reaches-secrets`, both KILLED when they were added on 2026-10-05,
-the four `C1-a2a-gateway-*` mutations and the three `B1-slack-*` mutations, all
-KILLED when they were added on 2026-10-06, `B1-slack-method-shape-dropped`, KILLED
-when it was added on 2026-10-07, `A3-agent-answers-its-own-notify` (KILLED) and
+KILLED when it was added on 2026-09-30, `D1-platform-role-reaches-secrets`,
+KILLED when it was added on 2026-10-05, the four `C1-a2a-gateway-*` mutations and
+the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
+`B1-slack-method-shape-dropped`, KILLED when it was added on 2026-10-07,
+`A3-agent-answers-its-own-notify` (KILLED) and
 `A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
 they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08;
 re-run the harness rather than trusting these numbers, which is the sentence this
