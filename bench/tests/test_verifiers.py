@@ -6785,3 +6785,261 @@ def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text
     v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
     transcript.set(final_message, [], final_message=final_message)
     assert v.verify(1.0).success is matches, final_message
+
+
+# ------------------------------- the fail-closed webhook readiness case's lines
+#
+# The readiness case's declared lines, read out of its task file: one fixed-form
+# line per object, every value one word from a closed set. seeded-b's budget and
+# exclusion lines must answer yes, its gate line must say the backend is missing
+# and answer no, and no line anywhere may blame the gate. Same fold and grounding
+# as the zonal case.
+
+_WEBHOOK_CASE = TASKS / "upgrades-fleet-readiness-failclosed-webhook" / "task.yaml"
+_WEBHOOK_SPEC = yaml.safe_load(_WEBHOOK_CASE.read_text(encoding="utf-8"))
+_WEBHOOK_PDB = "seeded-b-pdb-line-blocks-the-upgrade"
+_WEBHOOK_EXCLUSION = "seeded-b-exclusion-line-blocks-the-upgrade"
+_WEBHOOK_GATE = "seeded-b-gate-line-does-not-block"
+_WEBHOOK_BACKEND = "the-reply-names-the-missing-backend"
+_WEBHOOK_NO_BLAME = "no-line-blames-the-gate-for-the-upgrade"
+_WEBHOOK_OBJECTIVES = (_WEBHOOK_PDB, _WEBHOOK_EXCLUSION, _WEBHOOK_GATE, _WEBHOOK_BACKEND, _WEBHOOK_NO_BLAME)
+
+
+def _webhook_case_verdict(objective: str, text: str):
+    check = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="webhook-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_WEBHOOK_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+def _webhook_line(obj: str, kind: str, backend: str, blocks: str, cluster: str = "seeded-b") -> str:
+    return f"{cluster}/{obj}: kind {kind}; backend: {backend}; blocks the upgrade: {blocks}"
+
+
+_WEBHOOK_PDB_LINE = _webhook_line("pinned-batch-runner", "pdb", "not applicable", "yes")
+_WEBHOOK_EXCLUSION_LINE = _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "yes")
+_WEBHOOK_GATE_LINE = _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no")
+
+
+def _webhook_report(pdb: str = _WEBHOOK_PDB_LINE, exclusion: str = _WEBHOOK_EXCLUSION_LINE, gate: str = _WEBHOOK_GATE_LINE, *extra: str) -> str:
+    return "\n".join(line for line in (pdb, exclusion, gate, *extra) if line)
+
+
+def _webhook_verdicts(text: str) -> dict[str, str]:
+    return {objective: _webhook_case_verdict(objective, text).status for objective in _WEBHOOK_OBJECTIVES}
+
+
+# The checks read one token per object: the verdict, on any line that names the object.
+# Everything else about the line's rendering is free, so each of these passes every
+# objective: the renderings the runs produced, and the ones the prompt's own words invite.
+@pytest.mark.parametrize(
+    "text",
+    [
+        _webhook_report(),
+        # a bullet and a stop, bold, a numbered list, the names in backticks, a `:` after `kind`
+        "\n".join("- " + line + "." for line in _webhook_report().splitlines()),
+        "\n".join("**" + line + "**" for line in _webhook_report().splitlines()),
+        "\n".join(f"{n}. {line}" for n, line in enumerate(_webhook_report().splitlines(), 1)),
+        "\n".join("`" + line.split(":", 1)[0] + "`:" + line.split(":", 1)[1] for line in _webhook_report().splitlines()),
+        _webhook_report().replace("kind ", "kind: "),
+        # the prefix the three rounds of runs wrote: the cluster alone, the project and the
+        # cluster, the project alone, the cluster's full id, a context's `_` joins
+        _webhook_report().replace("seeded-b/", "haoxuw-gke-dev/seeded-b/"),
+        _webhook_report().replace("seeded-b/", "haoxuw-gke-dev/"),
+        _webhook_report().replace("seeded-b/", "haoxuw-gke-dev-seeded-b-us-central1-a/"),
+        _webhook_report().replace("seeded-b/", "gke_haoxuw-gke-dev_us-central1-a_seeded-b/"),
+        # the object with its namespace before it, the webhook under its webhook name, the
+        # webhook with its webhook name after its configuration's, a parenthetical after the name
+        _webhook_report(pdb=_webhook_line("seeded-upgrade/pinned-batch-runner", "pdb", "not applicable", "yes")),
+        _webhook_report(gate=_webhook_line("gate.seeded.invalid", "webhook", "missing", "no")),
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate/gate.seeded.invalid", "webhook", "missing", "no")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner (seeded-upgrade, maxUnavailable 0)", "pdb", "not applicable", "yes")),
+        # the kind and the backend fields are the judge's: a long kind, a word outside the
+        # closed set, a budget's backend called ready
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "missing", "no")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "ready", "yes")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudgets", "not applicable", "yes")),
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "absent", "no")) + "\nThe Service seeded-upgrade/nonexistent-admission-gate does not exist.",
+        # the pinned Deployment that shares the budget's name, correctly not a blocker beside the budget's yes
+        _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "deployment", "not applicable", "no")),
+        # lines about other objects are ignored: a pool, a live webhook, another cluster's
+        # budget, another cluster's healthy webhook; so is prose between the lines
+        _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("no-surge-pool", "pool", "not applicable", "yes"), _webhook_line("warden-validating", "webhook", "ready", "no"), _webhook_line("inference-server", "pdb", "not applicable", "no", cluster="seeded-a"), _webhook_line("gmp-operator.gmp-system.monitoring.googleapis.com", "webhook", "ready", "no", cluster="seeded-a")),
+        "seeded-b is blocked by its budget and its exclusion.\n\n" + _WEBHOOK_GATE_LINE + "\n\nThe gate matches ConfigMaps only.\n" + _WEBHOOK_PDB_LINE + "\n" + _WEBHOOK_EXCLUSION_LINE,
+    ],
+)
+def test_webhook_readiness_declared_lines_accepted(text):
+    assert _webhook_verdicts(text) == {objective: "pass" for objective in _WEBHOOK_OBJECTIVES}, text
+
+
+@pytest.mark.parametrize(
+    "text, failing",
+    [
+        # each right line with the wrong verdict
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(exclusion=_webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        # the gate called harmless without its backend named anywhere
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "ready", "no")), _WEBHOOK_BACKEND),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "not applicable", "no")), _WEBHOOK_BACKEND),
+        # a line missing
+        (_webhook_report(pdb=""), _WEBHOOK_PDB),
+        (_webhook_report(exclusion=""), _WEBHOOK_EXCLUSION),
+        (_webhook_report(gate=""), _WEBHOOK_GATE),
+        # a second line about the same object that contradicts the right one
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
+        # the pinned Deployment blamed, and no budget line at all: the shared name does not credit the budget
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "deployment", "not applicable", "yes")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
+        # the gate blamed under another of its names, or under another cluster's
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-upgrade/nonexistent-admission-gate", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), _WEBHOOK_NO_BLAME),
+        # a verdict with anything around it: a hedge, a qualifier, a trailing clause, a mark
+        # that is not a closer
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "probably no")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no (but it rejects ConfigMaps now)")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no, unless the rules widen")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), _WEBHOOK_GATE),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "yes (maxUnavailable 0)")), _WEBHOOK_PDB),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "not yes")), _WEBHOOK_PDB),
+        # a longer name that is not the object
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate-2", "webhook", "missing", "no")), _WEBHOOK_GATE),
+        # the previous shape's line, or prose with the same words: no line carries the token
+        ("seeded-b: upgrade blockers: PDB seeded-upgrade/pinned-batch-runner, Maintenance exclusion hold-the-minor-lag; fail-closed webhooks with no backend: seeded-fail-closed-gate; any of them blocks the upgrade: no", _WEBHOOK_GATE),
+        ("seeded-b is blocked by its budget; seeded-fail-closed-gate has no backend and does not block the upgrade.", _WEBHOOK_GATE),
+        ("seeded-b is blocked by its budget; seeded-fail-closed-gate has no backend and does not block the upgrade.", _WEBHOOK_PDB),
+    ],
+)
+def test_webhook_readiness_declared_lines_refused(text, failing):
+    # `fail`, not merely not-`pass`: an `error` (an unrecorded slot) would also be not-pass.
+    assert _webhook_case_verdict(failing, text).status == "fail", (failing, text)
+
+
+# One wrong line fails its own objective and nothing else, so a red says which line.
+@pytest.mark.parametrize(
+    "text, failing",
+    [
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), {_WEBHOOK_PDB}),
+        (_webhook_report(exclusion=""), {_WEBHOOK_EXCLUSION}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "ready", "no")), {_WEBHOOK_BACKEND}),
+        # the misattribution the case exists for: the gate line answering yes, or the gate
+        # blamed under another cluster's name
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        # a hedged `no` on the gate line is the objective's refusal, not a blame: the safeguard,
+        # whose consequence is the run scored zero, reads the verdict token alone
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no (but it rejects ConfigMaps now)")), {_WEBHOOK_GATE}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no, unless the rules widen")), {_WEBHOOK_GATE}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), {_WEBHOOK_GATE}),
+        # a look-alike name on another cluster, blamed, is another object: no objective reads it
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("copy-seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), set()),
+        # a token that merely starts with `no` is still a blame
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "none")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "not yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+    ],
+)
+def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, failing):
+    verdicts = _webhook_verdicts(text)
+    assert {objective for objective, status in verdicts.items() if status == "fail"} == failing, verdicts
+    assert set(verdicts.values()) <= {"pass", "fail"}, verdicts
+
+
+_WEBHOOK_RUN = "the-readiness-run-happened"
+_WEBHOOK_RUNS = next(e["check"]["required_runs"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+_SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
+_SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
+
+
+def _run_objective(command: str) -> str:
+    _stash_commands([command])
+    return WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS).verify(5.0).status
+
+
+# The run objective reads each command's argv as the shell splits it: the script by any path or
+# as a module, the mode flag a later word, no usage flag; what stands ahead is the worker's.
+@pytest.mark.parametrize(
+    "command, matches",
+    [
+        (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/r.json", True),
+        (f"python3 -u {_SCRIPT_PATH} --target-version 1.33 --readiness", True),
+        (f"/usr/bin/python3 {_SCRIPT_PATH} --readiness", True),
+        (f"{_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_versions.json", True),
+        ("./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && python3.14 fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && uv run fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && python3 -m fleet_upgrade_report --readiness", True),
+        # whatever stands ahead of the script is the worker's business
+        (f"timeout 900 python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness.json", True),
+        (f"KUBECONFIG=/opt/data/.kubeconfigs/x python3 {_SCRIPT_PATH} --readiness", True),
+        (f"env PYTHONUNBUFFERED=1 python3 {_SCRIPT_PATH} --readiness", True),
+        (f"nohup python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json &", True),
+        (f"time python3 {_SCRIPT_PATH} --readiness", True),
+        ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
+        ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
+        (f'bash -lc "python3 {_SCRIPT_PATH} --readiness"', True),
+        # a shell string is read as commands of its own, whatever it joins and whatever wraps the shell
+        (f'bash -lc "cd {_SCRIPTS_DIR} && python3 fleet_upgrade_report.py --readiness"', True),
+        (f"sh -c 'cd {_SCRIPTS_DIR}; python3 fleet_upgrade_report.py --readiness'", True),
+        (f"(cd {_SCRIPTS_DIR} && python3 fleet_upgrade_report.py --readiness)", True),
+        (f'timeout 600 bash -c "python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness.json"', True),
+        (f'nohup bash -c "python3 {_SCRIPT_PATH} --readiness" > /tmp/readiness.log 2>&1 &', True),
+        (f'env KUBECONFIG=/opt/data/.kubeconfigs/x sh -c "python3 {_SCRIPT_PATH} --readiness"', True),
+        # a quoted path, or one from a variable, is the same argv
+        (f'python3 "{_SCRIPT_PATH}" --readiness', True),
+        ('python3 "$DIR/fleet_upgrade_report.py" --readiness', True),
+        # not a run: the survey, a mention of the file, a run without the mode, a usage call
+        ("kubectl get pdb,validatingwebhookconfigurations -A -o json", False),
+        (f"grep -n readiness {_SCRIPT_PATH}", False),
+        ("cat fleet_upgrade_report.py | grep -- --readiness", False),
+        (f"python3 {_SCRIPT_PATH} --target-version 1.33", False),
+        # the documented invocation quoted inside another command's argument is one word
+        ('grep -rn "fleet_upgrade_report.py --readiness" /opt/data/profiles/platform/skills/', False),
+        ('echo "run fleet_upgrade_report.py --readiness first"', False),
+        ("sed -n '/fleet_upgrade_report.py --readiness/p' /opt/data/profiles/platform/skills/fleet-upgrade-verification/SKILL.md", False),
+        ('echo "run python3 fleet_upgrade_report.py --readiness && read the table"', False),
+        ('echo "run fleet_upgrade_report.py --readiness; then read the table"', False),
+        (f"python3 {_SCRIPT_PATH} --readiness --help", False),
+        (f"python3 {_SCRIPT_PATH} --help --readiness", False),
+        (f"python3 {_SCRIPT_PATH} --readiness -h", False),
+        (f"python3 {_SCRIPT_PATH} -h --readiness", False),
+    ],
+)
+def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
+    assert (_run_objective(command) == "pass") is matches, command
+
+
+def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
+    from kube_agents_bench.verifiers import WorkerRun, _shell_argvs
+
+    assert _shell_argvs('cd /x && python3 "/a b/f.py" --readiness; echo done') == [
+        ["cd", "/x"], ["python3", "/a b/f.py", "--readiness"], ["echo", "done"]]
+    assert _shell_argvs('bash -lc "python3 /x/f.py --readiness"') == [
+        ["bash", "-lc", "python3 /x/f.py --readiness"], ["python3", "/x/f.py", "--readiness"]]
+    # quotes protect the operators inside them; the shell string is then read as its own commands
+    assert _shell_argvs('bash -lc "cd /x && python3 f.py --readiness"') == [
+        ["bash", "-lc", "cd /x && python3 f.py --readiness"], ["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs('echo "a && b"') == [["echo", "a && b"]]
+    assert _shell_argvs("(cd /x && python3 f.py --readiness)") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    # a wrapped shell is unwrapped wherever it stands
+    assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs("python3 f.py --readiness --output 'unbalanced") == [["python3", "f.py", "--readiness", "--output", "'unbalanced"]]
+    # a script is a bare name and a flag one word, refused at case load otherwise
+    for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
+        with pytest.raises(ValueError):
+            WorkerRun(**bad)
+
+
+def test_worker_commands_required_run_names_what_did_not_run():
+    _stash_commands(["kubectl get pdb -A", 'grep -rn "fleet_upgrade_report.py --readiness" /opt'])
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
+    res = v.verify(5.0)
+    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason

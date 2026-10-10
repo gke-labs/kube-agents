@@ -58,6 +58,7 @@ import http.client
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
@@ -1211,6 +1212,98 @@ _NO_WORKER_COMMANDS_REASON = (
 _MAX_NAMED_COMMANDS = 5
 
 
+# A command line is read as the shell reads it: tokenised first, quotes honoured, so a quoted
+# path is one word and a quoted sentence is one word too (which is what tells a run of a script
+# from a mention of it), and only then split into segments at the operator tokens the shell
+# starts a new command on. A token made of these characters alone is such an operator.
+_SHELL_OPERATOR_CHARS = frozenset("&|;()")
+_SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
+_USAGE_FLAGS = ("-h", "--help")
+
+
+class WorkerRun(BaseModel):
+    """One program run a case requires of a worker: a script by its basename (or its module stem
+    under ``-m``) and the flags that have to follow it on the same shell segment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    script: str
+    flags: list[str] = Field(default_factory=list)
+
+    @field_validator("script")
+    @classmethod
+    def _script_is_a_bare_name(cls, script: str) -> str:
+        # The argv is matched by basename, so a path never matches and an empty name matches
+        # any word ending in a slash; both are refused at case load, like a pattern that does
+        # not compile.
+        if not script or os.path.basename(script) != script:
+            raise ValueError(f"script must be a bare file name, the basename a worker's argv carries, not {script!r}")
+        return script
+
+    @field_validator("flags")
+    @classmethod
+    def _flags_are_words(cls, flags: list[str]) -> list[str]:
+        for flag in flags:
+            if not flag or any(char.isspace() for char in flag):
+                raise ValueError(f"each flag must be one word, not {flag!r}")
+        return flags
+
+
+def _shell_words(command: str) -> list[str]:
+    """The command line as the shell's words, quotes honoured and removed, operators
+    (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
+    quotes do not balance is split on whitespace instead."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return command.split()
+
+
+def _shell_argvs(command: str) -> list[list[str]]:
+    """Each segment of a command line as an argv: the line is tokenised first, so a quoted path
+    is one word and a quoted sentence one word whatever it contains, then split where the shell
+    starts a new command. A shell program anywhere on a segment (``bash -c``, under ``timeout``,
+    ``nohup`` or an ``env``) carries a command line in the word after its ``-c``-style flag,
+    which is read the same way and yields its own argvs."""
+    argvs: list[list[str]] = []
+    argv: list[str] = []
+    for word in [*_shell_words(command), ";"]:
+        if word and set(word) <= _SHELL_OPERATOR_CHARS:
+            if argv:
+                argvs.append(argv)
+            argv = []
+            continue
+        argv.append(word)
+    for argv in list(argvs):
+        for index, word in enumerate(argv):
+            if os.path.basename(word) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+                continue
+            for flag_index in range(index + 1, len(argv) - 1):
+                flag = argv[flag_index]
+                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                    argvs.extend(_shell_argvs(argv[flag_index + 1]))
+                    break
+            break
+    return argvs
+
+
+def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
+    """Whether one argv runs ``run.script``: the script is a word of the argv by its basename
+    (``python3 -m <stem>`` counts), every one of ``run.flags`` is a later word, and no word is a
+    usage flag, which prints the help and runs nothing. What stands ahead of the script (an
+    interpreter and its flags, a ``timeout``, an ``env``, a ``NAME=value``) is not read."""
+    if any(word in _USAGE_FLAGS for word in argv):
+        return False
+    stem = run.script.rsplit(".", 1)[0]
+    for index, word in enumerate(argv):
+        is_script = os.path.basename(word) == run.script or (index > 0 and argv[index - 1] == "-m" and word == stem)
+        if is_script and all(flag in argv[index + 1:] for flag in run.flags):
+            return True
+    return False
+
+
 @VERIFIERS.register("worker_commands")
 class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
@@ -1225,6 +1318,11 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
+    ``required_runs``: each names a script (by basename, or module stem under
+    ``-m``) and flags; some command's shell segment, read as an argv, must run
+    it with those flags after it and no ``-h``/``--help`` (:func:`_argv_runs`).
+    An argv tells a quoted mention of the invocation from a run, where a pattern
+    over the text cannot.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
@@ -1236,6 +1334,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     type: Literal["worker_commands"]
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    required_runs: list[WorkerRun] = Field(default_factory=list)
 
     @field_validator("required_patterns", "forbidden_patterns")
     @classmethod
@@ -1269,13 +1368,18 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits = [
             (p, c) for p in self.forbidden_patterns for c in commands if re.search(p, c)
         ]
-        if missing or hits:
+        argvs = [argv for c in commands for argv in _shell_argvs(c)]
+        unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
+        if missing or hits or unrun:
             parts = []
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s)"
                 )
+            if unrun:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
+                parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:120]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
@@ -1292,7 +1396,8 @@ class WorkerCommandsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=(
                 f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
-                f"required pattern(s) matched, none of {len(self.forbidden_patterns)} forbidden"
+                f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
+                f"none of {len(self.forbidden_patterns)} forbidden"
             ),
         )
 

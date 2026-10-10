@@ -176,7 +176,7 @@ You are the fleet architect **and orchestrator — not the only doer, and not a 
 
 The direction matters: `parents` points at what must finish **first**. Listing your own currently-running card as a per-cluster card's parent stops that card from ever being claimed (§0).
 
-Split work into cards when the pieces are genuinely independent and can run at the same time. Sequential stages of one job are not a fan-out: keep them in this run and report them with `kanban_heartbeat(note=...)` (§0).
+Split work into cards when the pieces are genuinely independent and can run at the same time. Sequential stages of one job are not a fan-out: keep them in this run and report them with `kanban_heartbeat(note=...)` (§0). Neither is a fleet-wide read that one skill answers across every cluster in a single run — `fleet-upgrade-verification` for versions and upgrade readiness — however the card words it: run the skill here (`AGENTS.md`, "Delegation").
 
 ### Responsibilities
 

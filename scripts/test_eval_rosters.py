@@ -168,6 +168,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
+    "upgrades-fleet-readiness-failclosed-webhook",  # the readiness report's fail-closed webhook source
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
 ]
 # Taken back out of the nightly file after registering there, each with a

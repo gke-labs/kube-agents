@@ -1,0 +1,219 @@
+# The webhook source of fleet-upgrade-verification's --readiness table: a fail-closed
+# admission webhook whose backend the API server cannot reach. Such a webhook rejects every
+# request its rules match. The table grades the member blocked when those rules reach
+# a write a node drain or a node join makes (`UPGRADE_PATH_TARGETS` in the skill's
+# `scripts/upgrade_readiness.py` is the list, with the package behind each write), or when
+# the rules reach a bootstrap RBAC write a new master reconciles: a ClusterRole or
+# ClusterRoleBinding write whatever the namespace selector says, or a Role or RoleBinding write
+# in kube-system or kube-public when the selector admits that namespace
+# (`CONTROL_PLANE_CLUSTER_WRITES`, `CONTROL_PLANE_KUBE_SYSTEM_WRITES`);
+# otherwise it names the webhook as a current outage without grading on it. The upgrade-scenario
+# campaign reproduced the pod-gating form end to end on GKE (the drain's replacement pods
+# refused until the webhook was deleted).
+#
+# The planted gate matches ConfigMaps only, so this case grades the second half: the agent
+# must find the webhook and its missing backend unprompted, and must not present it as what
+# stops the upgrade -- seeded-b's blockers are its budget and its maintenance exclusion.
+#
+# The prompt names no webhook, no Service and no namespace, and none of the SOP vocabulary
+# the sibling case upgrades-fleet-readiness-exclusion lists: the agent has to find the
+# webhook, not confirm it.
+#
+# What the deterministic checks read, and what they leave to the judge. The prompt asks for
+# one fixed-form line per object, and the checks read one token from it: the verdict,
+# `blocks the upgrade: <yes|no>`, on any line that names the object. Nothing else on the line
+# is graded -- not the cluster prefix, the kind field or the backend field -- because three
+# rounds of runs rendered the same correct judgement three ways (`seeded-b/<object>`,
+# `<project>/<cluster>/<object>`, `<project>/<object>`, the webhook named by its webhook
+# rather than its configuration), and anchoring on the rendering graded the agent's
+# formatting rather than its judgement. The object names are the fixture's and appear nowhere
+# in the prompt, so a line naming one is the agent having read the object; the verdict token
+# is one word from a closed set, so there is no room for a hedge on the graded part. Each
+# accept is `<name> ... blocks the upgrade: <value>` on one line, read after the harness's
+# existing trail fold (`fold_decoration`), which drops a closing stop or bracket; each forbid is the same name
+# with any other value, so a second line about the object that contradicts the first fails
+# whatever the right line says. One objective reads the kind field as well: `pinned-batch-runner`
+# is also the fixture's pinned Deployment (role `readiness-pinned-workload`, which the table
+# prints inside the budget's cell); a correct line about that Deployment answers no and a wrong
+# one yes, so the budget's accept and forbid both take only a line whose kind field says pdb or
+# poddisruptionbudget, singular or plural as kubectl prints it; the other names are unique on
+# the fleet. The safeguard reads the verdict
+# token alone (`no` followed by a word boundary): a `no` with words after it is the gate
+# objective's refusal, a hedge on the graded token, not a blame, and the safeguard's consequence
+# is the run scored zero. The prose, the kind and the backend fields, and the recommended
+# remedy are the judge's, against `expected_output`. A separate objective reads the worker's
+# commands for the readiness run itself, so a reply that reaches the right verdicts by hand
+# survey passes the line checks but fails the route check.
+#
+# Planted defect required: on slot b, the ValidatingWebhookConfiguration
+# seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
+# rules on ConfigMaps only (which neither graded list carries, so the script keeps it an
+# outage), namespaceSelector naming the seeded-upgrade namespace and objectSelector limited to
+# the fleet's own objects (both confine the fail-closed gate to the fleet's own namespace on a
+# shared cluster), client_config pointing at Service
+# seeded-upgrade/nonexistent-admission-gate, which does not exist (role
+# readiness-failclosed-webhook).
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with gcloud container
+# and kubectl get and writes only its own record and per-member kubeconfig files).
+id: upgrades-fleet-readiness-failclosed-webhook
+name: Fleet upgrade readiness finds the fail-closed webhook with no backend
+prompt: >-
+  For every cluster in this project, check whether it is ready to take the
+  upgrade to its release channel's default version, and tell me per cluster
+  what would stop the upgrade. Read the state; do not change, upgrade, or
+  remove anything. End your answer with one line per object you examined
+  that could stop an upgrade -- every PodDisruptionBudget that would block a
+  node drain, every maintenance exclusion in effect, and every fail-closed
+  admission webhook whose backend you checked -- in exactly this form, no
+  other words on the line: "<cluster>/<object name>: kind
+  <pdb|exclusion|webhook>; backend: <ready|missing|not applicable>; blocks
+  the upgrade: <yes|no>". Name a webhook by its configuration's name, and
+  write "not applicable" as the backend of anything that is not a webhook.
+  Write each name exactly as the API shows it, with no brackets, quotes or
+  parentheses around it; put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-b it names
+  the validating webhook configuration seeded-fail-closed-gate (webhook
+  gate.seeded.invalid), says its failure policy is Fail and that the Service it
+  calls, seeded-upgrade/nonexistent-admission-gate, does not exist, so every
+  request it matches (ConfigMap creation in seeded-upgrade) is rejected now. It
+  does not present that webhook as what stops seeded-b's upgrade, because it
+  matches nothing a node upgrade needs; seeded-b's blockers, the
+  PodDisruptionBudget pinned-batch-runner and the maintenance exclusion
+  hold-the-minor-lag, are named separately. It recommends restoring the
+  webhook's backend or narrowing or relaxing the webhook as an operator
+  decision, and performs nothing. It cites no CVE identifiers. No mutation of
+  any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json. The gate the case is about,
+# plus the budget and the exclusion whose lines the first two objectives expect; each
+# check's `fixture_roles` names the role its object comes from, and the three roles share
+# slot b.
+fixtures:
+  - readiness-failclosed-webhook
+  - readiness-drain-blocked
+  - version-laggard
+
+verification_spec:
+  # The budget that does stop seeded-b: a line naming pinned-batch-runner whose kind field says
+  # it is a budget and whose verdict is yes; the forbid is the same name and kind with any other
+  # verdict (the fixture's pinned Deployment shares the name; see the header).
+  - name: seeded-b-pdb-line-blocks-the-upgrade
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the run ends, so
+    # polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-drain-blocked
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])pinned-batch-runner(?![a-z0-9-])[^\n]*kind:? (?:pdb|poddisruptionbudgets?)\b[^\n]*; blocks the upgrade: yes\s*$'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])pinned-batch-runner(?![a-z0-9-])[^\n]*kind:? (?:pdb|poddisruptionbudgets?)\b[^\n]*; blocks the upgrade: (?!yes\s*$)'
+
+  # The exclusion that does stop seeded-b: a line naming hold-the-minor-lag whose verdict is
+  # yes; the forbid is the same name with any other verdict.
+  - name: seeded-b-exclusion-line-blocks-the-upgrade
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - version-laggard
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])hold-the-minor-lag(?![a-z0-9-])[^\n]*; blocks the upgrade: yes\s*$'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])hold-the-minor-lag(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!yes\s*$)'
+
+  # The objective this case exists for: a line naming the gate, by its configuration or its
+  # webhook, whose verdict is no. Neither name is in the prompt, so the line is the discovery
+  # proof; `no` is the agent having kept a dead gate on ConfigMaps out of the upgrade's path.
+  # The forbid is either name with any other verdict.
+  - name: seeded-b-gate-line-does-not-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-failclosed-webhook
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; blocks the upgrade: no\s*$'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!no\s*$)'
+
+  # The gate's backend, resolved: the gate's own line says `backend: missing`, or the reply
+  # names the Service the configuration points at, which does not exist. Main's agent can
+  # find this by hand survey too; it is here so a reply that calls the gate harmless without
+  # having resolved its backend does not pass on the verdict alone. Phrases any other
+  # webhook's line or any other sentence could carry (`backend: missing` on another webhook,
+  # `does not exist` about a channel) are not accepted.
+  - name: the-reply-names-the-missing-backend
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-failclosed-webhook
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; backend: missing'
+        - "(?<![a-z0-9-])nonexistent-admission-gate(?![a-z0-9-])"
+
+  # No line on any cluster blames the gate, under any of its names (the configuration
+  # seeded-fail-closed-gate, the webhook gate.seeded.invalid, the Service
+  # nonexistent-admission-gate): the gate is planted on slot b alone, so such a line under
+  # another cluster's name is invented, and under seeded-b's it is the misattribution the
+  # objective above also forbids. The forbid reads any line whose object (the text before
+  # its first `:`) carries one of the three names and whose verdict token is anything but
+  # `no`; `no` with words after it is the gate objective's refusal, not a blame (see the header).
+  - name: no-line-blames-the-gate-for-the-upgrade
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-failclosed-webhook
+      forbidden_patterns:
+        - '(?m)^[^\n:]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*:[^\n]*; blocks the upgrade: (?!no\b)'
+
+  # The route: the skill's readiness run, in a delegated worker's commands, however it was
+  # invoked. A command, or a segment of one after `&&`, `;` or `|`, is read as an argv the way
+  # the shell splits it; it is the run when the script's name is one of its words, by any path
+  # or as `-m fleet_upgrade_report`, with `--readiness` a later word and no `-h` or `--help`
+  # among them. What stands ahead of the script (an interpreter and its flags, `timeout`,
+  # `env`, a `NAME=value`) is the worker's business, and a `sh -c` string is read as commands
+  # of its own. A quoted mention of the invocation (a grep, an echo, a sed) is one word and so
+  # not a run; a usage call prints the help and runs nothing. A reply that
+  # reaches the right verdicts by a hand kubectl survey passes the line checks and fails this
+  # one; the persona routes a fleet readiness question to this one run.
+  - name: the-readiness-run-happened
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: fleet_upgrade_report.py
+          flags: ["--readiness"]
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
