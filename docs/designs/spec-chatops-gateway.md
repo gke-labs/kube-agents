@@ -507,7 +507,8 @@ with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <tex
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there, and
-the ack says so. The way back is answered even on an install whose spawner has since been disarmed, so a
+the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
+adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
@@ -1452,13 +1453,35 @@ frozen gateway goes quiet instead, because it reaches Chat only through the brok
 relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
 behaviour documented (2026-10-06).
 
-**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
-threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
-channel mention binds the session to the mention message's own ts as thread root, with
-no thread-creation failure mode to handle. Session semantics are unchanged: the whole
-DM is one conversation, a channel is not a session, a thread in it is.
+**Conversation keys.** `slack:{channel}/{thread_ts}` for a channel thread and
+`slack:dm/{channel}/{thread_ts}` for a DM thread. Slack threads are implicit - replying
+with a `thread_ts` creates one - so a channel mention binds the session to the mention
+message's own ts as thread root, with no thread-creation failure mode to handle. A DM is
+keyed the same way, to match the Hermes Slack platform on `today` (2026-10-08): a
+top-level DM is a new conversation rooted on its own ts, and its placeholder, status
+edits and answer post in that thread; a DM typed inside a thread is that thread's
+conversation, so it steers the running task or follows up in the same context, as a
+channel thread reply does. Two top-level questions are two conversations. On Slack a
+thread is the session in a DM as in a channel. So `stop`, a status question and
+`/session` act on the thread they are typed in. A `stop` or a status question typed at
+the top of the DM is a conversation with nothing running in it, so it starts no task
+and its reply says to send it in the question's thread instead; the adapter marks such
+a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
+gateway keys the reply on that mark, not on the conversation's task history, so a
+`stop` in a thread with nothing running (a question refused at the session cap, say)
+gets the plain "nothing is running". A top-level status question matches the exact
+status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
+A bare `/session` asks for the next message in its thread.
 
-**Which messages become turns.** DMs carry every message. A channel message must
+The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
+is keyed that way. It is the form a DM record from before DMs threaded carries, so such
+a record relays its task's terminal into the DM where the ask was, and a message sent
+since starts its own thread rather than steering or stopping that task. It is also what
+`openDirect` returns, which makes a post the user did not ask for a new top-level
+message; a reply under it roots its own conversation.
+
+**Which messages become turns.** DMs carry every message, in a thread or not; a DM
+thread needs no task started in it to carry a reply. A channel message must
 mention the bot, and the ask's own ts is the thread the session will live in. A thread
 reply is a turn when it mentions the bot or the thread is a session thread - one the
 gateway has started a task in. That is what lets a session thread carry every message
