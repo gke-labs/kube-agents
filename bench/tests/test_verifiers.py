@@ -6985,6 +6985,13 @@ def _run_objective(command: str) -> str:
         ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
         ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
         (f'bash -lc "python3 {_SCRIPT_PATH} --readiness"', True),
+        # a shell string is read as commands of its own, whatever it joins and whatever wraps the shell
+        (f'bash -lc "cd {_SCRIPTS_DIR} && python3 fleet_upgrade_report.py --readiness"', True),
+        (f"sh -c 'cd {_SCRIPTS_DIR}; python3 fleet_upgrade_report.py --readiness'", True),
+        (f"(cd {_SCRIPTS_DIR} && python3 fleet_upgrade_report.py --readiness)", True),
+        (f'timeout 600 bash -c "python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness.json"', True),
+        (f'nohup bash -c "python3 {_SCRIPT_PATH} --readiness" > /tmp/readiness.log 2>&1 &', True),
+        (f'env KUBECONFIG=/opt/data/.kubeconfigs/x sh -c "python3 {_SCRIPT_PATH} --readiness"', True),
         # a quoted path, or one from a variable, is the same argv
         (f'python3 "{_SCRIPT_PATH}" --readiness', True),
         ('python3 "$DIR/fleet_upgrade_report.py" --readiness', True),
@@ -6997,6 +7004,8 @@ def _run_objective(command: str) -> str:
         ('grep -rn "fleet_upgrade_report.py --readiness" /opt/data/profiles/platform/skills/', False),
         ('echo "run fleet_upgrade_report.py --readiness first"', False),
         ("sed -n '/fleet_upgrade_report.py --readiness/p' /opt/data/profiles/platform/skills/fleet-upgrade-verification/SKILL.md", False),
+        ('echo "run python3 fleet_upgrade_report.py --readiness && read the table"', False),
+        ('echo "run fleet_upgrade_report.py --readiness; then read the table"', False),
         (f"python3 {_SCRIPT_PATH} --readiness --help", False),
         (f"python3 {_SCRIPT_PATH} --help --readiness", False),
         (f"python3 {_SCRIPT_PATH} --readiness -h", False),
@@ -7008,13 +7017,25 @@ def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
 
 
 def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
-    from kube_agents_bench.verifiers import _shell_argvs
+    from kube_agents_bench.verifiers import WorkerRun, _shell_argvs
 
     assert _shell_argvs('cd /x && python3 "/a b/f.py" --readiness; echo done') == [
         ["cd", "/x"], ["python3", "/a b/f.py", "--readiness"], ["echo", "done"]]
     assert _shell_argvs('bash -lc "python3 /x/f.py --readiness"') == [
         ["bash", "-lc", "python3 /x/f.py --readiness"], ["python3", "/x/f.py", "--readiness"]]
+    # quotes protect the operators inside them; the shell string is then read as its own commands
+    assert _shell_argvs('bash -lc "cd /x && python3 f.py --readiness"') == [
+        ["bash", "-lc", "cd /x && python3 f.py --readiness"], ["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs('echo "a && b"') == [["echo", "a && b"]]
+    assert _shell_argvs("(cd /x && python3 f.py --readiness)") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    # a wrapped shell is unwrapped wherever it stands
+    assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs("python3 f.py --readiness --output 'unbalanced") == [["python3", "f.py", "--readiness", "--output", "'unbalanced"]]
+    # a script is a bare name and a flag one word, refused at case load otherwise
+    for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
+        with pytest.raises(ValueError):
+            WorkerRun(**bad)
 
 
 def test_worker_commands_required_run_names_what_did_not_run():

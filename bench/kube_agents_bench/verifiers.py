@@ -1212,10 +1212,11 @@ _NO_WORKER_COMMANDS_REASON = (
 _MAX_NAMED_COMMANDS = 5
 
 
-# A command line's segments, split where the shell starts a new command; the text of each is
-# split into words as the shell would, so a quoted path is one word and a quoted sentence is
-# one word too, which is what tells a run of a script from a mention of it.
-_SHELL_SEGMENT_RE = re.compile(r"\s*(?:&&|\|\||[;|&])\s*")
+# A command line is read as the shell reads it: tokenised first, quotes honoured, so a quoted
+# path is one word and a quoted sentence is one word too (which is what tells a run of a script
+# from a mention of it), and only then split into segments at the operator tokens the shell
+# starts a new command on. A token made of these characters alone is such an operator.
+_SHELL_OPERATOR_CHARS = frozenset("&|;()")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 _USAGE_FLAGS = ("-h", "--help")
 
@@ -1229,28 +1230,62 @@ class WorkerRun(BaseModel):
     script: str
     flags: list[str] = Field(default_factory=list)
 
+    @field_validator("script")
+    @classmethod
+    def _script_is_a_bare_name(cls, script: str) -> str:
+        # The argv is matched by basename, so a path never matches and an empty name matches
+        # any word ending in a slash; both are refused at case load, like a pattern that does
+        # not compile.
+        if not script or os.path.basename(script) != script:
+            raise ValueError(f"script must be a bare file name, the basename a worker's argv carries, not {script!r}")
+        return script
+
+    @field_validator("flags")
+    @classmethod
+    def _flags_are_words(cls, flags: list[str]) -> list[str]:
+        for flag in flags:
+            if not flag or any(char.isspace() for char in flag):
+                raise ValueError(f"each flag must be one word, not {flag!r}")
+        return flags
+
+
+def _shell_words(command: str) -> list[str]:
+    """The command line as the shell's words, quotes honoured and removed, operators
+    (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
+    quotes do not balance is split on whitespace instead."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return command.split()
+
 
 def _shell_argvs(command: str) -> list[list[str]]:
-    """Each segment of a command line as an argv: split where the shell starts a new command
-    (``&&``, ``||``, ``;``, ``|``, ``&``), then into words as the shell would (a quoted path is
-    one word, a quoted sentence one word); a segment whose quotes do not balance is split on
-    whitespace. The string a ``sh -c`` carries is a command line of its own and yields its argvs."""
+    """Each segment of a command line as an argv: the line is tokenised first, so a quoted path
+    is one word and a quoted sentence one word whatever it contains, then split where the shell
+    starts a new command. A shell program anywhere on a segment (``bash -c``, under ``timeout``,
+    ``nohup`` or an ``env``) carries a command line in the word after its ``-c``-style flag,
+    which is read the same way and yields its own argvs."""
     argvs: list[list[str]] = []
-    for segment in _SHELL_SEGMENT_RE.split(command):
-        if not segment.strip():
+    argv: list[str] = []
+    for word in [*_shell_words(command), ";"]:
+        if word and set(word) <= _SHELL_OPERATOR_CHARS:
+            if argv:
+                argvs.append(argv)
+            argv = []
             continue
-        try:
-            argv = shlex.split(segment)
-        except ValueError:
-            argv = segment.split()
-        if not argv:
-            continue
-        argvs.append(argv)
-        if os.path.basename(argv[0]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-            for index, word in enumerate(argv[1:-1], 1):
-                if word.startswith("-") and not word.startswith("--") and "c" in word[1:]:
-                    argvs.extend(_shell_argvs(argv[index + 1]))
+        argv.append(word)
+    for argv in list(argvs):
+        for index, word in enumerate(argv):
+            if os.path.basename(word) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+                continue
+            for flag_index in range(index + 1, len(argv) - 1):
+                flag = argv[flag_index]
+                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                    argvs.extend(_shell_argvs(argv[flag_index + 1]))
                     break
+            break
     return argvs
 
 
