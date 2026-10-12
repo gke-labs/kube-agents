@@ -672,8 +672,6 @@ func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *
 
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	var closeRelease sync.Once
-	defer closeRelease.Do(func() { close(release) })
 
 	conv := &blockingConversations{
 		fakeConversations: fakeConversations{contexts: map[string]string{testConversation: testContext}},
@@ -689,6 +687,7 @@ func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *
 		t.Fatal(err)
 	}
 	defer sub.Stop()
+	defer close(release)
 
 	agent, err := nats.Connect(s.ClientURL())
 	if err != nil {
@@ -724,8 +723,5 @@ func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *
 	case <-time.After(2 * time.Second):
 		t.Fatal("home request was not accepted while ConversationContext was blocked")
 	}
-
-	// Unblock the worker before shutdown so sub.Stop drains cleanly without waiting on grace.
-	closeRelease.Do(func() { close(release) })
 }
 

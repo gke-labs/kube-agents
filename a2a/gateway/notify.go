@@ -346,7 +346,10 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 // validateConversation checks the request's shape before queueing it for
 // the worker. The session record check (ConversationContext) runs in post on
 // the worker goroutine so a slow JetStream KV read does not hold the NATS
-// subscription's delivery goroutine.
+// subscription's delivery goroutine. Note that because the record check is
+// deferred to the worker, invalid or unmatched conversation requests are
+// refused only when the worker processes them, queuing behind earlier jobs
+// and subject to the requester's deadline.
 func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyRequest, *lib.NotifyReply) {
 	refuse := func(reason string) (lib.NotifyRequest, *lib.NotifyReply) {
 		r := n.refuse(reason)
@@ -372,6 +375,12 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 // not. The remaining chunks follow into the same thread; a failure among them
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
+//
+// For conversation requests, the session record lookup (ConversationContext)
+// executes here on the worker rather than on the subscription delivery
+// goroutine. If the JetStream KV read is slow, this worker (and any subsequent
+// queued posts, including home alerts) is held for up to notifyLookupTimeout (5s).
+// However, request acceptance and queue-full refusals remain non-blocking.
 func (n *Notifier) post(job notifyJob) {
 	if job.req.Conversation != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
