@@ -216,8 +216,9 @@ func (s *notifierSub) Stop() {
 	})
 }
 
-// handle runs on the subscription's goroutine. It answers a refusal at once
-// and queues an accepted request for the worker, which answers it once the
+// handle runs on the subscription's goroutine. It answers shape, syntax, and
+// queue-full refusals at once and queues accepted requests for the worker, which
+// validates conversation records and answers either a refusal or success once the
 // first post has landed. Posting here instead would hold every later request
 // behind the relay calls of a long report.
 func (n *Notifier) handle(m *nats.Msg) {
