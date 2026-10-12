@@ -784,7 +784,7 @@ func TestNormalizePhrases(t *testing.T) {
 		"do the thing":      false,
 	} {
 		// These phrases exercise normalization through the exact set.
-		if got := isStatusQuery(phrase); got != want {
+		if got := isStatusQuery(phrase, false); got != want {
 			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
 		}
 	}
@@ -1382,10 +1382,10 @@ func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
 }
 
 // TestDelegatedTaskStatusShapeSteers: the status matcher is the exact
-// phrase set everywhere. During a delegated task a status-shaped but
-// non-exact ask must reach the worker as a steer - only the exact phrases
-// stay status affordances, or a correction is stolen and answered by
-// replay.
+// phrase set wherever the executor runs follow-ups, and a session worker
+// does. During a delegated task a status-shaped but non-exact ask must
+// reach the worker as a steer - only the exact phrases stay status
+// affordances, or a correction is stolen and answered by replay.
 func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-d3"
@@ -3173,6 +3173,49 @@ func TestRelayPostsANoResumeRefusalAtOnce(t *testing.T) {
 	if a, b := postIndex(r, want), postIndex(r, "fleet: green"); a < 0 || a > b {
 		t.Fatalf("first refusal at %d, deliverable at %d: the refusal must post before the terminal", a, b)
 	}
+}
+
+// gh#2723 items 5 and 16: an addressee whose executor refuses follow-ups
+// (the bridge's cli executor, learned from its first no-resume refusal)
+// gets the wide status matcher back: a status-shaped ask is answered by
+// replay, not acked and then refused. A queued notice from the addressee
+// later (its executor now continues sessions) puts it back on the exact
+// phrases, so the same ask steers again.
+func TestNoResumeAddresseeGetsTheWideStatusMatcher(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-noresume-status"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ns-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ns-2", Text: "one"}
+	waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused,
+		EnvelopeID: lastInSubject(t, r, origin).EnvelopeID, Reason: lib.SteerReasonNoResume})
+	waitFor(t, "refusal posted", postedContaining(r, steerNotTakenNotice(lib.SteerReasonNoResume)))
+	acks := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued)
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ns-3", Text: "what is the agent doing"}
+	waitFor(t, "status reply", postedContaining(r, "🔎"))
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 2 {
+		t.Fatalf("%d envelopes on the in subject, want 2: the status ask was sent as a follow-up", n)
+	}
+	if n := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued); n != acks {
+		t.Fatalf("the status ask was acknowledged as a follow-up (%d acks, want %d)", n, acks)
+	}
+
+	// The executor queues one now: the exact phrases only, again.
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ns-4", Text: "also check the memory limits"}
+	waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 3 })
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued,
+		EnvelopeID: lastInSubject(t, r, origin).EnvelopeID})
+	waitFor(t, "queued notice applied", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return !r.g.steersRefusedBy["platform"]
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ns-5", Text: "what is the agent doing"}
+	waitFor(t, "status-shaped ask steers", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 4 })
 }
 
 // Queued follow-ups that never started (refused task-ended at a cancel, or

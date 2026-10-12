@@ -137,6 +137,21 @@ _PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
 
+# The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
+# it is one container of the agent pod, so these are already in agentPod.base and an
+# override moves the pod total by the delta. Its ephemeral request is defaulted to its
+# 2Gi limit, as the proxy's is.
+_AA_MEMORY_REQUEST_BYTES = 384 * 1024**2
+_AA_MEMORY_LIMIT_BYTES = 2 * 1024**3
+_AA_CPU_LIMIT_MILLIS = 1000
+_AA_CPU_REQUEST_MILLIS = 150
+_AA_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_AA_OVERRIDE_MEMORY_LIMIT_BYTES = 4 * 1024**3
+_AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+_AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
+_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
+_AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
+
 
 def _parse_gib_or_mib(quantity: str) -> int:
     """Bytes from the Gi/Mi spellings the patch generator emits."""
@@ -306,6 +321,60 @@ class PreflightDecisionTest(unittest.TestCase):
         nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
         self.assertEqual(nulled, base)
 
+    def test_agent_api_auth_memory_limit_override_moves_only_that_total(self) -> None:
+        """The field's use case (#2648): raising the sidecar's memory limit is counted,
+        so a namespace ResourceQuota sized to the preflight is not passed and then
+        overrun by the Recreate rollout."""
+        base = self._requirements()
+        raised = self._requirements([f"{_AA_VALUE}.limits.memory={_AA_OVERRIDE_MEMORY_LIMIT_BYTES}"])
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _AA_OVERRIDE_MEMORY_LIMIT_BYTES - _AA_MEMORY_LIMIT_BYTES,
+        )
+        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory",
+                    "requestsEphemeral", "limitsEphemeral", "persistentVolumeClaims"):
+            self.assertEqual(raised[key], base[key], key)
+
+    def test_agent_api_auth_request_and_cpu_overrides_are_each_counted(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([
+            f"{_AA_VALUE}.requests.memory={_AA_MEMORY_LIMIT_BYTES}",
+            f"{_AA_VALUE}.limits.cpu={_AA_OVERRIDE_CPU_LIMIT_MILLIS}m",
+            f"{_AA_VALUE}.requests.cpu={_AA_OVERRIDE_CPU_REQUEST_MILLIS}m",
+        ])
+        self.assertEqual(
+            raised["requestsMemory"] - base["requestsMemory"],
+            _AA_MEMORY_LIMIT_BYTES - _AA_MEMORY_REQUEST_BYTES,
+        )
+        self.assertEqual(
+            raised["limitsCpu"] - base["limitsCpu"],
+            _AA_OVERRIDE_CPU_LIMIT_MILLIS - _AA_CPU_LIMIT_MILLIS,
+        )
+        self.assertEqual(
+            raised["requestsCpu"] - base["requestsCpu"],
+            _AA_OVERRIDE_CPU_REQUEST_MILLIS - _AA_CPU_REQUEST_MILLIS,
+        )
+        # A requests.memory override must not leak into the limits total.
+        self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_agent_api_auth_ephemeral_override_moves_both_sides_with_defaulting(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([f"{_AA_VALUE}.limits.ephemeral-storage={_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES}"])
+        moved = _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES - _AA_EPHEMERAL_LIMIT_BYTES
+        self.assertEqual(raised["limitsEphemeral"] - base["limitsEphemeral"], moved)
+        self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], moved)
+        explicit = self._requirements([
+            f"{_AA_VALUE}.limits.ephemeral-storage={_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES}",
+            f"{_AA_VALUE}.requests.ephemeral-storage=4Gi",
+        ])
+        self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"],
+                         4 * 1024**3 - _AA_EPHEMERAL_LIMIT_BYTES)
+
+    def test_agent_api_auth_null_override_key_keeps_the_default(self) -> None:
+        base = self._requirements()
+        nulled = self._requirements([f"{_AA_VALUE}.limits.memory=null"])
+        self.assertEqual(nulled, base)
+
     def test_credential_proxy_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
         # Helm renders quota-preflight.yaml before the CR template, so the preflight's own
         # read of the override is the first to see it. The CR template is removed from this
@@ -324,6 +393,90 @@ class PreflightDecisionTest(unittest.TestCase):
                     self.assertNotIn("cannot parse quantity", res.stderr)
                 res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
                 self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+            finally:
+                self.chart = original
+
+    def test_agent_api_auth_refused_override_counts_defaults(self) -> None:
+        """An override the operator refuses is rendered at defaults, Degraded, so the
+        preflight must count the defaults, not the override's delta. A zero limit, a
+        limit below the default request, and a request above the default limit are the
+        refusals agentAPIAuthResourcesCheck does not catch (they stay the operator's)."""
+        base = self._requirements()
+        for override in (
+            [f"{_AA_VALUE}.limits.memory=0"],
+            [f"{_AA_VALUE}.limits.memory=256Mi"],
+            [f"{_AA_VALUE}.limits.cpu=0"],
+            [f"{_AA_VALUE}.requests.memory=5Gi"],
+            [f"{_AA_VALUE}.requests.cpu=2"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a refused override {override} moved the footprint; it must count defaults")
+
+    def test_agent_api_auth_refused_override_at_rounding_boundary_counts_defaults(self) -> None:
+        """The operator compares the exact resource.Quantity (request.Cmp(limit)); the
+        preflight must decide "would the operator render this?" on the same exact figures,
+        not on parseBytes/parseCpuMillis which ceil an m-suffixed quantity. An override a
+        rounding step under a default crosses the pair for the operator while the rounded
+        value lands back on the default, so a gate on the rounded integers counts it as
+        rendered and moves the footprint under the quota the operator never asks for."""
+        base = self._requirements()
+        # 402653183500m = 402653183.5 bytes, half a byte under the 384Mi default request;
+        # the operator refuses (limit < default request) and renders at 2Gi, Degraded.
+        # 149.5m = 0.1495 cores, under the 150m default request; same refusal.
+        for override in (
+            [f"{_AA_VALUE}.limits.memory=402653183500m"],
+            [f"{_AA_VALUE}.limits.cpu=149.5m"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a boundary refusal {override} moved the footprint; it must count defaults")
+
+    def test_agent_api_auth_oversized_limit_does_not_wrap_the_requirement_negative(self) -> None:
+        """A sidecar limit the validator admits (any byte count under 2^63) must not carry
+        the replica-multiplied pod sum or the base add past int64 and wrap the requirement
+        negative, which would pass every quota. The preflight saturates to the int64
+        ceiling instead, which no real quota satisfies."""
+        # Two replicas, 5 exabytes: 5E is under 2^63 but doubles over it at the multiply.
+        two_rep = {"platformAgent": {"deployment": {
+            "availability": {"replicas": 2},
+            "agentAPIAuth": {"resources": {"limits": {"memory": "5E"}}},
+        }}}
+        got = self._requirements(values=two_rep)
+        self.assertGreater(got["limitsMemory"], 0,
+                           "limitsMemory wrapped negative; the replica multiply overflowed int64")
+        # One replica, ~8.9GB below 2^63: the base add alone carries it past int64.
+        one_rep = {"platformAgent": {"deployment": {
+            "agentAPIAuth": {"resources": {"limits": {"memory": "9.22337203e18"}}},
+        }}}
+        got1 = self._requirements(values=one_rep)
+        self.assertGreater(got1["limitsMemory"], 0,
+                           "limitsMemory wrapped negative at one replica; the base add overflowed int64")
+
+        # The proxy override flows through the same workload-loop add (one replica, no
+        # multiply -- the narrower window the reviewer tied to the same clamp).
+        proxy = {"platformAgent": {"deployment": {
+            "credentialProxy": {"resources": {"limits": {"memory": "9.22337203e18"}}},
+        }}}
+        gotp = self._requirements(values=proxy)
+        self.assertGreater(gotp["limitsMemory"], 0,
+                           "limitsMemory wrapped negative for a proxy override; the workload-loop add overflowed int64")
+
+    def test_agent_api_auth_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # The footprint path reads the override too; with the CR template removed, a bad
+        # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck
+        # in the preflight, naming the key rather than reaching parseBytes as garbage.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(self.chart, chart)
+            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            original, self.chart = self.chart, chart
+            try:
+                for value in ("-1Gi", "abc", "2GB"):
+                    res = self._render({"probe": {"emitRequirements": True}},
+                                       [f"{_AA_VALUE}.limits.memory={value}"])
+                    self.assertNotEqual(res.returncode, 0, res.stdout)
+                    self.assertIn(f"{_AA_VALUE}.limits.memory is", res.stderr)
+                res = self._render({"probe": {"emitRequirements": True}}, [f"{_AA_VALUE}.limits=4Gi"])
+                self.assertIn(f"{_AA_VALUE}.limits is 4Gi, which is not a map", res.stderr)
             finally:
                 self.chart = original
 

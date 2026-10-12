@@ -120,11 +120,11 @@ updates:
         patterns:
           - "*"
 
-  # These two directories hold the literal FROM pins that images.json does not
-  # cover. The gke-app-onboarding one is a `node` tag, and
-  # deploy/docker/Dockerfile copies agents/platform/skills/ wholesale into the
-  # published platform image, so it ships. The other is an `alpine` tag in an
-  # e2e fixture.
+  # This directory holds a literal FROM pin that images.json does not cover:
+  # an alpine base in an e2e fixture. The gke-app-onboarding skill's Dockerfile
+  # also has a literal pin, but it is generated from google/skills plus a patch
+  # (scripts/skill_overlay.py), so a bump there edits that patch; a Dependabot
+  # PR against the generated file would fail `make skills-check`.
   #
   # Every other Dockerfile is either out of reach or excluded on purpose. The
   # images this repository builds interpolate two ARGs each
@@ -133,11 +133,10 @@ updates:
   # agentplugins Dockerfiles are `FROM busybox:musl@sha256:…`, a literal digest
   # the updater could move, and are left out because images.json owns that pin
   # (its `busybox` entry) and `make images-check` holds the three copies in
-  # step; a bump lands in all of them at once, by hand. Naming the two
-  # directories, rather than globbing, is what keeps this from recreating #763.
+  # step; a bump lands in all of them at once, by hand. Naming the
+  # directory, rather than globbing, is what keeps this from recreating #763.
   - package-ecosystem: "docker"
     directories:
-      - "/agents/platform/skills/gke-app-onboarding/assets"
       - "/tests/e2e/operator/templates/plugin_src"
     schedule:
       interval: "weekly"

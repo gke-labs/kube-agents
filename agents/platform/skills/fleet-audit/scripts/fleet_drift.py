@@ -60,7 +60,9 @@ DEFAULT_TIMEOUT_S = 60
 # What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
 # manifest whichever layer cut it off.
 TIMEOUT_RC = 124
-MAX_WORKERS = 8
+# The credential proxy's admitted count at the operator's default limit;
+# collect.py's MAX_WORKERS comment has the reasoning.
+MAX_WORKERS = 4
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300

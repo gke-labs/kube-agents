@@ -16,8 +16,9 @@ JSON object with ``message_id``; ``a2a notify`` adds ``thread_id``, which
 :func:`thread_from_response` prefers over deriving the thread from the message
 name.
 
-The gateway posts to the configured home channel and nowhere else. A target's
-chat id is therefore not forwarded: a thread names its own space, and a post
+The gateway posts these to the configured home channel (it posts into a
+conversation only for a request naming one, which the kanban notifier sends
+for a card's report). A target's chat id is therefore not forwarded: a thread names its own space, and a post
 with no thread goes to the home channel, which is where a bare platform target
 went under ``hermes send`` too.
 """

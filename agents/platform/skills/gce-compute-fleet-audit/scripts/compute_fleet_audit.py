@@ -128,7 +128,16 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 DEFAULT_TIMEOUT_S = 60
 # The return code `timeout(1)` uses, recorded for a read that ran out of time.
 TIMEOUT_RC = 124
-MAX_WORKERS = 8
+# How many projects this audit reads at once. Each is a run of gcloud compute
+# reads through the credential proxy, which admits four requests at once under
+# its child memory budget at the operator's default 1Gi limit
+# (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool only
+# queues the rest at the proxy, where a read still waiting at its 60 s admission
+# bound is refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its
+# project as gate-failed -- the SOP's cue to re-read it by hand through the same
+# proxy. So the pool is the admitted count, as the fleet-audit collectors and
+# stall_watch.py's and cluster_agent_reconcile.py's listing pools are.
+MAX_WORKERS = 4
 # `audit_report.validate_check_command`'s ceiling, restated rather than
 # imported because this script ships standalone. An over-length `command` is
 # not a clipped field: `finish` refuses the whole document, so a project with

@@ -326,6 +326,40 @@ class PreLlmCallTest(unittest.TestCase):
             self.assertTrue(home.get(field), f"{field} is empty")
         self.assertEqual(home["name"], "spaces/AAA")
 
+    # --- the greeting's home-channel sentence ------------------------------
+
+    def test_greeting_says_reports_come_here_when_the_turn_set_the_home_channel(self):
+        self._arm_home_channel()
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_completed_greeting_also_gets_the_sentence(self):
+        self._arm_home_channel()
+        (self.data_dir / "INVENTORY.md").write_text("REPORT", encoding="utf-8")
+        context = self._call()["context"]
+        self.assertIn("SCAN COMPLETED", context)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, context)
+
+    def test_home_channel_sentence_promises_no_later_post(self):
+        # The completed greeting says the summary is already here, so the
+        # sentence must not promise a later post.
+        self.assertNotIn("I'll post", plugin.HOME_CHANNEL_INSTRUCTION)
+
+    def test_greeting_says_nothing_about_reports_when_a_home_channel_was_configured(self):
+        self._arm_home_channel(configured=mock.sentinel.home)
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_greeting_says_nothing_about_reports_when_the_write_failed(self):
+        self._arm_home_channel(persist_error=OSError("read-only"))
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_greeting_says_nothing_about_reports_without_the_home_channel_api(self):
+        # setUp leaves Hermes' home-channel names at None, as on an older Hermes.
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_home_channel_sentence_names_no_command(self):
+        # The command to move the home channel is different on each platform.
+        self.assertNotIn("/", plugin.HOME_CHANNEL_INSTRUCTION)
+
     def test_failed_home_channel_write_still_primes_onboarding(self):
         _, save_env_value = self._arm_home_channel(persist_error=OSError("read-only"))
         self.assertIn("SCAN IN PROGRESS", self._call()["context"])
@@ -335,9 +369,9 @@ class PreLlmCallTest(unittest.TestCase):
 
     # --- the eval seam ----------------------------------------------------
 
-    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running", age=0):
+    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running", age=0, **extra):
         marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
-        request = {"variant": variant, "phrase": phrase, "written_at": time.time() - age}
+        request = {"variant": variant, "phrase": phrase, "written_at": time.time() - age, **extra}
         marker.write_text(json.dumps(request), encoding="utf-8")
         return marker
 
@@ -345,6 +379,25 @@ class PreLlmCallTest(unittest.TestCase):
         kwargs = {"platform": "api_server", "user_message": "hi! priya here, just installed you"}
         kwargs.update(overrides)
         return self._call(**kwargs)
+
+    def test_eval_marker_with_home_channel_set_adds_the_sentence(self):
+        self._plant(home_channel_set=True)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
+    def test_eval_marker_without_home_channel_set_adds_no_sentence(self):
+        self._plant()
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
+    def test_eval_marker_home_channel_set_must_be_true_not_truthy(self):
+        self._plant(home_channel_set="true")
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
+    def test_eval_marker_with_home_channel_set_writes_no_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        self._plant(home_channel_set=True)
+        self._eval_call()
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
 
     def test_eval_marker_greets_on_a_platform_the_allowlist_excludes(self):
         self._plant()

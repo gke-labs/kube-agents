@@ -66,6 +66,12 @@ variable "variant" {
   }
 }
 
+variable "home_channel_set" {
+  type        = bool
+  description = "When true, the plugin greets as if this turn made the chat the home channel. The greeting then says that scheduled reports come to this chat."
+  default     = false
+}
+
 variable "phrase" {
   type        = string
   description = "Substring of the case's prompt and of no other case's; only a turn containing it gets the greeting"

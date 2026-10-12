@@ -97,7 +97,18 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
-MAX_WORKERS = 8
+# How many clusters a sweep reads at once. Every check is a kubectl or gcloud
+# the credential proxy runs, and the proxy admits four requests at once under
+# its child memory budget at the operator's default limit
+# (docs/designs/credential-proxy-child-memory-budget.md §2.2: 704 MiB for
+# children over 176 MiB a request). A wider pool only queues the rest at the
+# proxy, where a check still waiting at its 60 s admission bound is refused
+# busy, or hits DEFAULT_TIMEOUT_S here first and reads its cluster as
+# unreachable -- which is the SOPs' cue to retry that cluster by hand, through
+# the same proxy. So the pool is the admitted count, as stall_watch.py's and
+# cluster_agent_reconcile.py's listing pools are; the procedural collectors
+# beside this file carry the same figure and point here.
+MAX_WORKERS = 4
 
 # What `default_run` reports when *it* gave up, following the shell convention
 # for a command killed by `timeout(1)`. It is this collector's own marker and
@@ -779,7 +790,7 @@ def dump_state(
     only to paths keyed by its own cluster, and it named this file as the
     example of a name no two threads can collide on — but a cluster name is
     unique within a project, not across the fleet, and this collector runs
-    eight projects at once. Two clusters called `prod` in two projects wrote
+    several projects at once. Two clusters called `prod` in two projects wrote
     the same path, and the loser re-read the winner's dump: not a truncated
     file or a crash, but one cluster's workloads published under the other's
     name, with a manifest recording a clean rc=0 read.
@@ -7750,8 +7761,8 @@ AUTOPILOT_ALLOWLIST_KINDS = (
 # That fits inside 60 comfortably, which is why the check looked fine until it
 # ran for real. The collector sweeps `MAX_WORKERS` clusters at once, and the
 # fifteen without Config Connector answer this read in about a tenth of a
-# second, so the hub is the only one that is still working when the other seven
-# in its wave are hammering the same pod -- and on 2026-09-06, the first day
+# second, so the hub is the only one that is still working when the rest of
+# its wave are hammering the same pod -- and on 2026-09-06, the first day
 # the check was live, it went past 60 and was recorded as inapplicable. The
 # check has never once executed against the only cluster it can apply to.
 #

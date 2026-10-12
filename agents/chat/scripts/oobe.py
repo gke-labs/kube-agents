@@ -81,6 +81,7 @@ IN_FLIGHT_STATUSES = (CLAIMED_STATUS, "running")
 SKIPPED_STATUS = "skipped"
 COMPLETED_STATUS = "completed"
 SKIP_REASON_COLUMN = "skip_reason"
+FINISHED_AT_COLUMN = "finished_at"
 SKIP_ALREADY_RUNNING = "already_running_elsewhere"
 PLATFORM_PROFILE = "platform"
 PROFILES_DIR = "profiles"
@@ -336,8 +337,8 @@ def retire() -> None:
         _log(f"could not remove the {OOBE_JOB_ID} job: {e}")
 
 
-def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]] | None:
-    """``(job, status, claimed_at)`` for every run of ``jobs`` in the Platform Agent's cron store.
+def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float, float | None]] | None:
+    """``(job, status, claimed_at, finished_at)`` for every run of ``jobs`` in the Platform Agent's cron store.
 
     None when the store cannot be read; a store not yet created has no runs.
     """
@@ -350,9 +351,11 @@ def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]
             f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
         )
         try:
-            has_reason = any(row[1] == SKIP_REASON_COLUMN for row in conn.execute("PRAGMA table_info(executions)"))
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+            has_reason = SKIP_REASON_COLUMN in columns
+            finished = FINISHED_AT_COLUMN if FINISHED_AT_COLUMN in columns else "NULL"
             rows = conn.execute(
-                f"SELECT job_id, status, claimed_at, {SKIP_REASON_COLUMN if has_reason else 'NULL'} "
+                f"SELECT job_id, status, claimed_at, {SKIP_REASON_COLUMN if has_reason else 'NULL'}, {finished} "
                 f"FROM executions WHERE job_id IN ({placeholders}) AND claimed_at IS NOT NULL ORDER BY claimed_at",
                 jobs,
             ).fetchall()
@@ -362,37 +365,47 @@ def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]
         _log(f"cannot read {ledger}: {e}")
         return None
     runs = []
-    for job_id, status, claimed, skip_reason in rows:
+    for job_id, status, claimed, skip_reason, finished in rows:
         if status == SKIPPED_STATUS and skip_reason != SKIP_ALREADY_RUNNING:
             continue
         try:
-            runs.append((job_id, status, datetime.fromisoformat(claimed).timestamp()))
+            claimed_at = datetime.fromisoformat(claimed).timestamp()
         except (TypeError, ValueError):
             continue
+        try:
+            finished_at = datetime.fromisoformat(finished).timestamp()
+        except (TypeError, ValueError):
+            finished_at = None
+        runs.append((job_id, status, claimed_at, finished_at))
     return runs
 
 
-def run_status(runs: list[tuple[str, str, float]], job_id: str, since: float) -> str | None:
+def run_status(runs: list[tuple[str, str, float, float | None]], job_id: str, since: float) -> str | None:
     """The status of the first run of ``job_id`` claimed at or after ``since``, or None if there is none."""
-    after = [status for job, status, claimed in runs if job == job_id and claimed >= since]
+    after = [status for job, status, claimed, _finished in runs if job == job_id and claimed >= since]
     return after[0] if after else None
 
 
-def audits_in_flight(runs: list[tuple[str, str, float]], now: float) -> set[str]:
+def audits_in_flight(runs: list[tuple[str, str, float, float | None]], now: float) -> set[str]:
     """The first-run audits with a run still going, scheduled or marked, younger than the run limit."""
-    return {job for job, status, claimed in runs if status in IN_FLIGHT_STATUSES and now - claimed < RUN_LIMIT_SECONDS}
+    return {
+        job
+        for job, status, claimed, _finished in runs
+        if status in IN_FLIGHT_STATUSES and now - claimed < RUN_LIMIT_SECONDS
+    }
 
 
-def completed_since(runs: list[tuple[str, str, float]], job_id: str, since: float) -> bool:
+def completed_since(runs: list[tuple[str, str, float, float | None]], job_id: str, since: float) -> bool:
     """Whether ``job_id`` has a completed run that was going at or after ``since``.
 
-    Claimed after it, or up to ``RUN_LIMIT_SECONDS`` before it: a scheduled run already under way
-    when the sweep was filed (the gate files only after the reconcile, which can take half an
-    hour) completes during onboarding as much as one claimed after.
+    Judged by when the run finished: a scheduled run already under way when the sweep was filed
+    (the gate files only after the reconcile, which can take half an hour) completes during
+    onboarding as much as one claimed after, while one that finished before the sweep saw the
+    fleet before onboarding. A row with no finish time is judged by its claim.
     """
     return any(
-        job == job_id and status == COMPLETED_STATUS and claimed >= since - RUN_LIMIT_SECONDS
-        for job, status, claimed in runs
+        job == job_id and status == COMPLETED_STATUS and (claimed if finished is None else finished) >= since
+        for job, status, claimed, finished in runs
     )
 
 

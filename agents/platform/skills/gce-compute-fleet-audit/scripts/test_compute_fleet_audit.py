@@ -3,6 +3,8 @@
 
 import datetime
 import hashlib
+import inspect
+import importlib
 import io
 import json
 import os
@@ -2226,6 +2228,38 @@ class ApiDisabledTest(unittest.TestCase):
         entry = cf.collect_project("real-proj", run=self.refusing("ERROR: SERVICE_DISABLED"))
         self.assertEqual(entry["outcome"], "gate-failed")
         self.assertIn("the refusal does not name 'real-proj'", entry["error"])
+
+
+
+class SweepPoolTest(unittest.TestCase):
+    def test_pool_matches_the_fleet_audit_collectors_admitted_count(self):
+        # This collector sweeps projects through the same credential proxy as the
+        # fleet-audit collectors, so its pool is the same admitted count they pin
+        # (docs/designs/credential-proxy-child-memory-budget.md §2.2). Tied to
+        # collect.MAX_WORKERS rather than a lone literal so the collectors move
+        # together. Discovered by the pool it runs, like the fleet-audit scan, so a
+        # collector added to this skill under any constant name is caught too.
+        import collect  # noqa: E402 -- fleet-audit/scripts is on sys.path above
+
+        here = Path(os.path.dirname(__file__))
+        pooled = sorted(
+            path
+            for path in here.glob("*.py")
+            if not path.name.startswith("test_") and "ThreadPoolExecutor(" in path.read_text()
+        )
+        self.assertIn("compute_fleet_audit.py", [p.name for p in pooled])
+        for path in pooled:
+            with self.subTest(collector=path.name):
+                mod = importlib.import_module(path.stem)
+                self.assertTrue(
+                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
+                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin",
+                )
+                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
+                self.assertEqual(
+                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+                    mod.MAX_WORKERS,
+                )
 
 
 if __name__ == "__main__":

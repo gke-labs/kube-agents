@@ -140,6 +140,79 @@ func TestPodUsageSource_SumsTheBrokersCountedStatuses(t *testing.T) {
 	}
 }
 
+// The watcher's body also carries k8s_event_watcher_cluster_up, one series per
+// cluster the watcher built a client for: the count of series is the clusters
+// registered and the count at 1 the clusters monitored. A broker body yields
+// no cluster reading at all, so the poller can tell "none" from "zero".
+func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE k8s_event_watcher_events_injected_total counter",
+		`k8s_event_watcher_events_injected_total{cluster="a",location="l",namespace="n",project="p",reason="BackOff"} 7`,
+		"# HELP k8s_event_watcher_cluster_up 1 once this cluster's informer has completed its initial list.",
+		"# TYPE k8s_event_watcher_cluster_up gauge",
+		`k8s_event_watcher_cluster_up{cluster="a",location="l",project="p"} 1`,
+		`k8s_event_watcher_cluster_up{cluster="b",location="l",project="p"} 0`,
+		`k8s_event_watcher_cluster_up{cluster="c",location="l2",project="p"} 1`,
+		"# TYPE k8s_event_watcher_cluster_discovery_errors_total counter",
+		`k8s_event_watcher_cluster_discovery_errors_total{profile="broken"} 1`,
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Sample != 7 {
+		t.Errorf("sample = %d, want 7", reading.Sample)
+	}
+	if reading.Clusters == nil || reading.Clusters.Registered != 3 || reading.Clusters.Monitored != 2 {
+		t.Fatalf("clusters = %+v, want 3 registered and 2 monitored", reading.Clusters)
+	}
+
+	empty := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_events_injected_total counter\n")
+	reading, err = newPodUsageSource().Scrape(context.Background(), empty, usageCounterEventsIngested)
+	if err != nil {
+		t.Fatalf("Scrape of a watcher body without the gauge: %v", err)
+	}
+	if reading.Clusters == nil || reading.Clusters.Registered != 0 || reading.Clusters.Monitored != 0 {
+		t.Fatalf("a watcher body without the gauge = %+v, want a zero reading, not none", reading.Clusters)
+	}
+
+	broker := serveBody(t, http.StatusOK, "# TYPE kubeagents_tool_invocations_total counter\nkubeagents_tool_invocations_total{status=\"success\"} 1\n")
+	reading, err = newPodUsageSource().Scrape(context.Background(), broker, usageCounterToolExecutions)
+	if err != nil {
+		t.Fatalf("Scrape of the broker: %v", err)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("the broker's body yielded a cluster reading: %+v", reading.Clusters)
+	}
+
+	bad := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_cluster_up gauge\nk8s_event_watcher_cluster_up{cluster=\"a\"} NaN\n")
+	if _, err := newPodUsageSource().Scrape(context.Background(), bad, usageCounterEventsIngested); scrapeKind(t, err) != usageScrapeKindSample {
+		t.Errorf("a NaN cluster_up sample: %v, want kind %q", err, usageScrapeKindSample)
+	}
+}
+
+// A watcher body with more cluster_up series than any fleet has is refused
+// whole, so a body on the port cannot set the gauges past the ceiling.
+func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("# TYPE k8s_event_watcher_cluster_up gauge\n")
+	for i := int64(0); i <= usageClusterGaugeCeiling; i++ {
+		fmt.Fprintf(&b, "k8s_event_watcher_cluster_up{cluster=\"c%d\",location=\"l\",project=\"p\"} 1\n", i)
+	}
+	addr := serveBody(t, http.StatusOK, b.String())
+	if _, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested); scrapeKind(t, err) != usageScrapeKindSample {
+		t.Errorf("a body past the gauge ceiling: %v, want kind %q", err, usageScrapeKindSample)
+	}
+	at := strings.TrimSuffix(b.String(), fmt.Sprintf("k8s_event_watcher_cluster_up{cluster=\"c%d\",location=\"l\",project=\"p\"} 1\n", usageClusterGaugeCeiling))
+	addr = serveBody(t, http.StatusOK, at)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	if err != nil || reading.Clusters == nil || reading.Clusters.Registered != usageClusterGaugeCeiling {
+		t.Fatalf("a body at the ceiling: %+v, %v; want %d registered", reading.Clusters, err, usageClusterGaugeCeiling)
+	}
+}
+
 // Each scrape that produces no body to count: a connection that failed, a
 // 3xx answer (not followed), a line past its bound, a wanted line expfmt
 // cannot parse, a sample that is negative or not finite.

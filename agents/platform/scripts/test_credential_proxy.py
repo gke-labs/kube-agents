@@ -6493,9 +6493,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         reservations = []
         real_reserve = executor.reserve_child_memory
 
-        def spy_reserve(caller=None, yield_when=None, deadline=None):
-            reservations.append({"yield_when": yield_when, "deadline": deadline})
-            return real_reserve(caller=caller, yield_when=yield_when, deadline=deadline)
+        def spy_reserve(caller=None, yield_when=None, deadline=None, queued_at=None):
+            reservations.append({"yield_when": yield_when, "deadline": deadline, "queued_at": queued_at})
+            return real_reserve(
+                caller=caller, yield_when=yield_when, deadline=deadline, queued_at=queued_at
+            )
 
         yield_deadlines = []
         real_await = executor._await_covered_refreshers
@@ -6516,6 +6518,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(yield_deadlines))
         self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
         self.assertIsNotNone(reservations[1]["yield_when"])
+        # The second leg is handed the first's arrival, so the one admission
+        # is observed from it; the first measures its own.
+        self.assertIsNone(reservations[0]["queued_at"])
+        self.assertIsNotNone(reservations[1]["queued_at"])
+        self.assertLessEqual(reservations[1]["queued_at"], reservations[1]["deadline"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
         # Reworded for the leg it ran on: stepped aside, with the budget's
         # figures, never `_admit`'s text naming the full wait bound.

@@ -130,7 +130,8 @@ it, and the two fail on the activity door's port. Name it `hermes-bridge`. An ex
 opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/2623). The `sidecars` field takes
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
-executor, `API_SERVER_KEY` and `A2A_ACTIVITY_SECRET`. The operator reads `BRIDGE_CONCURRENCY`
+executor, `API_SERVER_KEY`, `A2A_ACTIVITY_SECRET` and `SESSION_KV_API_KEY` (without the last,
+every chat turn ends saying a card's answer cannot be posted back). The operator reads `BRIDGE_CONCURRENCY`
 back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
 `API_SERVER_KEY` and `BRIDGE_ACTIVITY_LISTEN`, to decide whether the `api` executor's
 pod-wide hook is rendered; it writes none of those.
@@ -373,9 +374,19 @@ trace. With `BRIDGE_EXECUTOR` unset and no key, the bridge logs a warning and ru
 executor, so a sidecar declared before `api` existed keeps working; `BRIDGE_EXECUTOR=api` with
 no key is refused at start.
 
-What the `api` executor does not do. A kanban card the persona creates completes after the turn
-has answered, and the API server has no channel to push that completion back, so it never reaches
-the A2A thread; the `cli` executor loses it the same way. A turn the bridge stops waiting
+A kanban card the persona creates completes after the turn has answered, and the API server
+has no channel to push that completion back. So before a task's first turn the bridge records the
+conversation its session answers (the platform, the gateway's conversation key from the task's
+`authority.audience.conversation`, and the `contextId`) in the pod's session-kv, with
+`PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
+`SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
+gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
+turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
+be posted back. A Google Chat conversation is posted back today; a Slack conversation's route is
+recorded the same way and is delivered once the gateway arms the notify route for Slack. A
+conversation on a door with no notify route (inject, the A2A door, Discord) records nothing. The `cli` executor records no route, so its cards still do not report back.
+
+What the `api` executor does not do. A turn the bridge stops waiting
 for, on cancel or the deadline, may keep running in the server, and the next task on the same
 session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
 Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
@@ -444,20 +455,34 @@ gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
 request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
-then the one terminal. A turn's answer the bridge holds between turns, while the next follow-up's
-capability is checked, is not lost to a shutdown: the worker ends the task with it as the `result`,
-and the queue is refused `task-ended`. A failed follow-up turn names itself in the terminal
+then the one terminal. At each turn boundary the bridge asks the verifier once per distinct
+capability among the queued follow-ups, not once per follow-up, so a verifier that does not answer
+holds the previous turn's answer back for one timeout. A turn's answer the bridge holds between
+turns, while the next follow-up's capability is checked, is not lost to a shutdown: the worker ends
+the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
+`turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,
+the deadline or a shutdown lands after the next follow-up was chosen but before its request was
+sent (the terminal that cause calls for carries it as the `result`, best-effort: the answer is
+already on the stream as a `turn`, so a failed publish of that copy leaves the terminal's state as
+it was, and a cancel still ends `canceled`). A failed follow-up turn names itself in the terminal
 (`; turn: N` after the session). A follow-up does not change task state (payload spec assertion
 12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
 not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
 whose turn had started when the bridge crashed counts as run, though its answer never arrives.
 Mid-turn steering through the runs API is gke-labs#2628.
 
-**Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
-image follows the operator, but the sidecar's image is whatever the CR names, so until someone
-edits the CR the two can be a release apart, and a rollback produces the reverse skew. Upgrade the
-operator (and with it the gateway) first, then bump the CR's `hermes-bridge` sidecar tag. On a
-rollback, move the sidecar tag back first, then the operator. The two skews look like this:
+**Upgrade order for steering.** The gateway and the bridge do not always roll together. The
+gateway's image follows the operator; the rendered bridge's image is chosen as
+[Where it runs](#where-it-runs) describes. Two cases can leave the two a release apart. One is the
+release `platform-agent` agent image pinned by tag with `A2A_BRIDGE_IMAGE` unset, where the bridge
+follows the CR's agent tag. The other is `A2A_BRIDGE_IMAGE` set: the operator uses the override
+verbatim, so the bridge runs whatever it names. It moves with the operator only when whoever rolls
+the operator rewrites that env in the same step, as `hack/ci-deploy.sh` does; a value set by hand
+stays where it was. In either case upgrade the operator (and with it the gateway) first, then bump
+the CR's agent tag or the override; on a rollback, move the agent tag or the override back first,
+then the operator. With a custom or digest-pinned agent image and no override, or no image on the
+CR, the bridge follows the operator and there is no skew to order. A CR-declared bridge (above)
+follows its own sidecar tag, in the same order. The two skews look like this:
 
 - **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
   artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take

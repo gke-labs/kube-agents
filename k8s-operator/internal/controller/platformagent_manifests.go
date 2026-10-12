@@ -247,12 +247,15 @@ const (
 	// so one core is roughly 45x the observed use rather than a budget for the watcher alone.
 	//
 	// GOMAXPROCS has been cgroup-aware since Go 1.25 and k8s-operator builds with 1.27
-	// (k8s-operator/go.mod), so dropping this limit from 2 to 1 sets the
+	// (k8s-operator/go.mod), so this 1 CPU limit makes the Go runtime set the
 	// k8s-event-watcher's GOMAXPROCS to 1. Go rounds up, so choosing 1 rather than 500m
-	// keeps GOMAXPROCS=1 while preserving a full core of burst.
+	// keeps GOMAXPROCS=1 while preserving a full core of burst. These are defaults:
+	// spec.deployment.agentAPIAuth.resources overrides any of them per key
+	// (resolveAgentAPIAuthResources), so an override of limits.cpu moves GOMAXPROCS too.
 	//
-	// Memory limit must stay at 2Gi: the event watcher reads this limit via Downward API
-	// (EVENT_WATCHER_MEMORY_LIMIT_BYTES) to set GOMEMLIMIT to half of it.
+	// Memory limit defaults to 2Gi. The event watcher reads whatever limit is rendered,
+	// via the Downward API (EVENT_WATCHER_MEMORY_LIMIT_BYTES), to set GOMEMLIMIT to half
+	// of it, so raising limits.memory raises the soft limit with it.
 	agentAPIAuthCPULimit              = "1"
 	agentAPIAuthMemoryLimit           = "2Gi"
 	agentAPIAuthEphemeralStorageLimit = "2Gi"
@@ -2918,14 +2921,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
-		// A2A_NOTIFY_PLATFORM is dropped on every install, not only while the
-		// A2A surface is up: on a today install a plugin's value would reroute
-		// every Google Chat post from hermes send to a chat.notify route that
-		// does not exist there. The operator renders it only under next, after
-		// this merge.
+		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
+		// every install, not only while the A2A surface is up: on a today
+		// install a plugin's value would reroute Google Chat posts from
+		// hermes send to a chat.notify route that does not exist there. The
+		// operator renders them only under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
 				kept = append(kept, e)
 			}
 		}
@@ -3098,12 +3101,19 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
 	// so the agent-side callers that used to `hermes send` a proactive post
-	// route it to the gateway's chat.notify instead. This names the platform
-	// they reroute; the bus identity above is what sends it. Only when the
-	// home channel is one the gateway will arm the route for: otherwise every
-	// post would go to a subject nobody answers.
+	// route it to the gateway's chat.notify home channel instead. This names
+	// the platform they reroute; the bus identity above is what sends it.
+	// Only with a home channel the route posts to: otherwise every proactive
+	// post would be refused, and on a Chat-and-Slack install the agent would
+	// count Chat as a platform to post to ahead of Slack.
 	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
+	}
+	// A kanban card's report back to the gateway conversation it was filed
+	// in rides the same route whenever the gateway arms it, home channel or
+	// not; only the kanban notifier reads this.
+	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -3838,6 +3848,36 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 	return c
 }
 
+// resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
+// override over the operator's defaults, one key at a time, so a CR that sets
+// only limits.memory keeps every other default. A nil override returns the
+// defaults unchanged, which the goldens and the chart's quota preflight carry.
+// ValidateAgentAPIAuthResources reads the same merged result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	resolved := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
+			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
+			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
+			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
+		},
+	}
+	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
+		return resolved
+	}
+	override := deployment.AgentAPIAuth.Resources
+	for name, quantity := range override.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range override.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
+}
+
 // buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
 // credential runtime moved out: the authenticated front door for the Hermes API,
 // the k8s-event-watcher, and the drift-detector where an install has enabled it.
@@ -3975,23 +4015,14 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			TimeoutSeconds:      3,
 			FailureThreshold:    3,
 		},
-		Resources: corev1.ResourceRequirements{
-			// Memory request covers the watcher's dedup and scale-up memos, which
-			// scale with the number of watched clusters, and the initial list of
-			// each cluster's events, which it holds only until delivered: the
-			// watcher keeps no store of Events (watcher.go, Run).
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-			},
-			// Why these values are what they are: see the agentAPIAuth* constant
-			// declarations at the top of this file.
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-				corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-				corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-			},
-		},
+		// The defaults are the agentAPIAuth* constants at the top of this file;
+		// spec.deployment.agentAPIAuth.resources overrides any key of them
+		// (resolveAgentAPIAuthResources). The memory request covers the watcher's
+		// dedup and scale-up memos and the initial list it holds only until
+		// delivered (watcher.go, Run). The event watcher reads the memory limit
+		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
+		// half of it, so a raised limit raises the soft limit with no other change.
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4621,14 +4652,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_SERVICE_NAME":           {},
 
 		// The findings queue's pacing limits (`findings_queue.pacing_limits`,
-		// read by the `no_agent` script `findings_nudge.py`): how many findings
-		// are added to chat, and from which UTC hour;
-		// FINDINGS_FIRST_REPORT_CRITICALS is parsed but reserved for the
-		// first inventory report's selection, and nothing reads it yet. Each
-		// is parsed as a whole number, and a value that does not parse, is
-		// negative, or is not an hour falls back to its default, so an
-		// arbitrary value bounds a count of chat messages and reaches nothing
-		// else. Kept apart from the block above so gofmt does not realign it.
+		// read by the `no_agent` scripts `findings_nudge.py` and
+		// `bootstrap_handoff.py`, which passes them to the first inventory
+		// report's selection): how many findings are added to chat, and from
+		// which UTC hour. Each is parsed as a whole number, and a value that
+		// does not parse, is negative, or is not an hour falls back to its
+		// default, so an arbitrary value bounds a count of chat messages and
+		// reaches nothing else. Kept apart from the block above so gofmt does not realign it.
 		"FINDINGS_DAILY_CRITICALS":        {},
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},

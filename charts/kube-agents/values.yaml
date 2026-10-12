@@ -808,6 +808,34 @@ platformAgent:
     # does).
     credentialProxy:
       resources: {}
+    # The agent-api-auth sidecar's requests and limits, forwarded to the CR as
+    # spec.deployment.agentAPIAuth.resources when any key is set. Each key merges
+    # over the operator's defaults (150m CPU and 384Mi requests; 1 CPU, 2Gi memory
+    # and 2Gi ephemeral-storage limits), so
+    #
+    #   agentAPIAuth:
+    #     resources:
+    #       limits:
+    #         memory: 4Gi
+    #
+    # raises the memory limit and keeps the rest. The container runs the event
+    # watcher, the drift detector and the API authenticator; the watcher reads the
+    # memory limit through the Downward API and sets its Go soft memory limit to
+    # half of it, so raise this when the watcher is OOM-killed under a large fleet
+    # of watched clusters (#2648).
+    # Overriding limits.cpu also changes the watcher's GOMAXPROCS (the Go runtime
+    # derives it from the container's CPU limit), so leave limits.cpu at the default unless you mean to. The operator refuses a request above its limit,
+    # a negative quantity, a zero limit, claims, and any name other than cpu,
+    # memory and ephemeral-storage, whether or not its webhook is enabled: it
+    # ignores the override, renders the sidecar at its defaults and reports
+    # Degraded with reason InvalidAgentAPIAuthResources, the agent staying Ready.
+    # The webhook, where enabled, refuses the override at apply, and warns on the
+    # Autopilot memory-per-vCPU band and on a limit set without its request. There
+    # is no child-budget floor as there is for the credential proxy. On an existing
+    # install the chart fails the upgrade when the installed CRD predates the field;
+    # apply crds/ first (upgrade.sh does).
+    agentAPIAuth:
+      resources: {}
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator
   # to clear its finalizer, before Helm deletes the operator itself. Without it,
   # `helm uninstall` and `terraform destroy` strand the CR and hang the namespace

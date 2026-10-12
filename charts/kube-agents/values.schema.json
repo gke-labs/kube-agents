@@ -645,6 +645,15 @@
                   "type": "object"
                 }
               }
+            },
+            "agentAPIAuth": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
+              }
             }
           }
         },

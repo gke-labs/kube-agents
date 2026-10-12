@@ -1304,8 +1304,9 @@ them, so a script that writes `/opt/data/x` in the agent pod and reads
 the path itself looking wrong. What crosses sandbox-to-gateway is read by name. A file a finished card names in `artifacts` is copied for the length of its
 delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
-built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once
-its markers say a delivery is due, as the bootstrap onboarding section below describes.
+built for that one caller. The onboarding report, and the three JSON files the prioritization
+worker writes beside it, are read by `bootstrap_delivery.py` once its markers say a delivery is
+due, as the bootstrap onboarding section below describes.
 What crosses the other way is `sandbox_mirror.py`'s work, described above: it copies the
 working directories once on first start, and on every start and each new profile it creates
 the profile's working directories and copies each Cluster Agent's identity file. Nothing
@@ -1791,10 +1792,11 @@ wrong thing for a reviewer to find even though it is inert there. So the image g
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
 `stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import. Only `inventory_findings.py extract` works
-there: `register` and `ranked` call the Session KV server on the agent pod's loopback and
-exit 13 from the sandbox, and the prioritization SOP answers that exit by ranking from its own
-scores and writing the report without the findings queue.
+plus the transitive closure of what they import. `inventory_findings.py extract` and `select`
+work there, and `select` chooses the report's items from the scores file alone. `register` calls
+the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
+prioritization SOP answers that exit by going on to `select` and writing the report.
+`bootstrap_delivery.py` registers the same batch from the agent pod before it delivers the report.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
 earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
@@ -2052,7 +2054,10 @@ sandbox today; what is left to move is the script around them.
 `.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
 first; only once they say a delivery is due does it read `INVENTORY.md` out of the
 sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
-and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as `agent`,
+and rename it to `INVENTORY.delivered.md` in the sandbox. Before the claim it reads the
+worker's `INVENTORY.items.json` and `INVENTORY.scores.json` the same way and registers them in
+the findings queue, which the worker's `register` cannot reach; after it, it reads
+`INVENTORY.shown.json` to mark the report's items shown. The rename connects as `agent`,
 for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
 `agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
 because a failing `no_agent` script posts an alert to the user's chat on every tick it
@@ -2432,8 +2437,9 @@ are questions about this pod that a file in the other one cannot answer.
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
 directory nothing else reads. The one other agent-side reader that crosses is
-`bootstrap_delivery.py`, which reads the single file it posts, `INVENTORY.md`, by
-name once its markers say a delivery is due, and lands nothing on disk. Every other
+`bootstrap_delivery.py`, which reads the file it posts, `INVENTORY.md`, and the three
+JSON files written beside it by name once its markers say a delivery is due, and lands
+nothing on disk. Every other
 agent-side reader still looks on the gateway's volume and still finds nothing, and
 generalising either — a tool the model can call to bring a file across on demand,
 with a landing directory that persists past a single delivery — is a decision about
@@ -3083,8 +3089,8 @@ anyway is in [The Session KV store](#the-session-kv-store).
   `.bashrc` route are covered by `make docker-smoke-sandbox`. When the helper landed, a
   routed `gcloud` or `kubectl`
   stopped at `CREDENTIAL_PROXY_URL is not configured`, so the connection was proven and
-  the command behind it was not; since then `stall-watch`, a shipped roster entry, runs `gcloud container clusters
-get-credentials` and `kubectl` behind it on every tick, and `github_token_refresh.py`'s
+  the command behind it was not; since then `stall-watch`, a shipped roster entry, runs `kubectl` behind it
+  on every tick and `gcloud container clusters get-credentials` when a cluster's credential record is a day old, and `github_token_refresh.py`'s
   forward mints through it. The helper had to land before
   the agent image can drop `credential-proxy-exec`, which makes it the gate on that change.
 - **The MCP server's kubeconfig moved to `/home/hermes/.kubeconfigs`, and the proxy

@@ -1,8 +1,10 @@
 """The credential broker's Prometheus surface.
 
-A metrics-only listener serves three families: brokered tool invocations by
-tool, subcommand and outcome; their wall-clock latency; and the credentialed
-listener's requests by route family and status code. Two properties carry the
+A metrics-only listener serves the brokered tool invocations by tool,
+subcommand and outcome; their wall-clock latency; the credentialed listener's
+requests by route family and status code; the admission queue, as a histogram
+of waits and a counter of refusals by the bound that held the request; and the
+slots and child memory in use beside their caps. Two properties carry the
 security argument and are what these tests hold: nothing a caller sends reaches
 a label value, and the listener serves nothing but the exposition.
 
@@ -90,12 +92,15 @@ class _BrokerFixture(unittest.TestCase):
         policy_path = Path(self.temp_dir.name) / "policy.json"
         policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
         CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.metrics = ProxyMetrics()
         CredentialProxyHandler.executor = CommandExecutor(
             timeout_seconds=5,
             max_output_bytes=4096,
             state_dir=str(Path(self.temp_dir.name) / "state"),
             scoped_pool=None,
+            metrics=CredentialProxyHandler.metrics,
         )
+        CredentialProxyHandler.metrics.set_admission_gauges(CredentialProxyHandler.executor.admission_snapshot)
         stub_dir = Path(self.temp_dir.name) / "bin"
         stub_dir.mkdir()
         stub = stub_dir / "kubectl"
@@ -112,7 +117,6 @@ class _BrokerFixture(unittest.TestCase):
         CredentialProxyHandler.max_request_bytes = 65536
         CredentialProxyHandler.enforce_read_only = True
         CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
-        CredentialProxyHandler.metrics = ProxyMetrics()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -337,6 +341,347 @@ class RequestCountingTest(_BrokerFixture):
         self.assertNotIn("secret-project", exposition)
         self.assertNotIn("timeSeries", exposition)
         self.assertIn('endpoint="/v1/gcp"', exposition)
+
+
+def _hold_a_slot(case, executor, seconds):
+    """Hold a request slot for `seconds` on another thread; return once held."""
+    held = threading.Event()
+
+    def hold():
+        with executor.request_slot():
+            held.set()
+            time.sleep(seconds)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    case.addCleanup(thread.join)
+    case.assertTrue(held.wait(5), "the slot holder never got its slot")
+    return thread
+
+
+def _budgeted_executor(case, admits, metrics, max_output_bytes=1024):
+    """An executor whose child memory budget admits exactly `admits` slot-taking requests."""
+    per_request = (
+        credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+        + credential_proxy.OUTPUT_COPIES_PER_COMMAND * max_output_bytes
+    )
+    limit = (
+        credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+        + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+        + admits * per_request
+    )
+    floor = min(admits, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
+    with mock.patch.object(credential_proxy, "BUDGET_MINIMUM_ADMITTED_REQUESTS", floor):
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=max_output_bytes,
+            state_dir=case.temp_dir.name,
+            scoped_pool=None,
+            max_concurrent_commands=8,
+            memory_limit_bytes=limit,
+            metrics=metrics,
+        )
+    case.assertEqual(admits, executor.requests_the_budget_admits())
+    return executor
+
+
+class AdmissionMetricsTest(unittest.TestCase):
+    """The queue the child memory budget created, made visible: a histogram of
+    admission waits by the bound that held the request, a counter of refusals
+    by bound, and gauges of what is in use against each cap. Observed on the
+    executor, rendered by the registry serve() hands it."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.metrics = ProxyMetrics()
+
+    def executor(self, **kwargs):
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=1024,
+            state_dir=self.temp_dir.name,
+            scoped_pool=None,
+            metrics=self.metrics,
+            **kwargs,
+        )
+        self.metrics.set_admission_gauges(executor.admission_snapshot)
+        return executor
+
+    def families(self):
+        return _parse(self.metrics.render())
+
+    def test_every_admission_is_observed_even_a_short_one(self):
+        # The log line starts at COMMAND_SLOT_WAIT_LOG_MS; the histogram does
+        # not, so an idle broker's p50 is a measured zero, not an absence. An
+        # admission that never waited blames neither bound: `none`.
+        executor = self.executor()
+        with executor.request_slot():
+            pass
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+
+    def test_an_unwaited_admission_is_none_whether_the_budget_is_on_or_off(self):
+        # The label an idle broker shows does not flip with the memory limit:
+        # at the 2Gi default most admissions wait for nothing, and `budget`
+        # there would blame a budget that held nothing.
+        for executor in (self.executor(), _budgeted_executor(self, admits=4, metrics=self.metrics)):
+            with executor.request_slot():
+                pass
+        families = self.families()
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+
+    def test_a_wait_for_a_slot_is_observed_under_the_slot_bound(self):
+        executor = self.executor(max_concurrent_commands=1)
+        _hold_a_slot(self, executor, seconds=1)
+        queued_at = time.monotonic()
+        with executor.request_slot():
+            waited = time.monotonic() - queued_at
+        families = self.families()
+        # Two admissions: the holder's, which waited for nothing and is `none`,
+        # and this one, under the slot cap.
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        total = _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="slot")
+        self.assertGreaterEqual(total, 0.5)
+        self.assertLessEqual(total, waited + 0.1)
+        # Cumulative buckets in bound order: this wait is past the first edge
+        # and inside the last; the holder's zero sits in `none`'s first bucket.
+        buckets = [
+            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le=str(bound))
+            for bound in credential_proxy.ADMISSION_WAIT_BUCKETS
+        ]
+        self.assertEqual(buckets, sorted(buckets))
+        self.assertEqual(0, buckets[0])
+        self.assertEqual(1, buckets[-1])
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
+
+    def test_a_wait_for_the_budget_is_observed_under_the_budget_bound(self):
+        # Eight slots, a budget for one: the second request waits for the
+        # first's reservation, which is the queue #2632 measured.
+        executor = _budgeted_executor(self, admits=1, metrics=self.metrics)
+        self.metrics.set_admission_gauges(executor.admission_snapshot)
+        _hold_a_slot(self, executor, seconds=1)
+        with executor.request_slot():
+            pass
+        families = self.families()
+        # The holder's admission waited for nothing (`none`); this one waited
+        # under the budget: with the budget on and no slot ever full, the
+        # budget is what the queue is for.
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.5)
+
+    def test_the_buckets_put_the_preflight_cap_and_the_refusal_bound_on_an_edge(self):
+        # 15 s is the cap the Cluster Agent preflight puts on one brokered
+        # call; 60 s is COMMAND_SLOT_WAIT_SECONDS, past which the
+        # broker refuses. A dashboard reads "how often did a wait cross
+        # either" off a bucket ratio only if both are bucket bounds.
+        self.assertIn(15.0, credential_proxy.ADMISSION_WAIT_BUCKETS)
+        self.assertIn(float(credential_proxy.COMMAND_SLOT_WAIT_SECONDS), credential_proxy.ADMISSION_WAIT_BUCKETS)
+        self.assertEqual(list(credential_proxy.ADMISSION_WAIT_BUCKETS), sorted(credential_proxy.ADMISSION_WAIT_BUCKETS))
+
+    def test_a_refusal_at_the_slot_cap_carries_its_bound(self):
+        executor = self.executor(max_concurrent_commands=1)
+        _hold_a_slot(self, executor, seconds=1)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with executor.request_slot():
+                    self.fail("a slot was granted while the holder still had it")
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, raised.exception.bound)
+
+    def test_a_refusal_by_the_budget_carries_its_bound(self):
+        executor = _budgeted_executor(self, admits=1, metrics=self.metrics)
+        _hold_a_slot(self, executor, seconds=1)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with executor.request_slot():
+                    self.fail("admitted past the budget")
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, raised.exception.bound)
+
+    def test_with_the_budget_off_a_refusal_behind_the_queue_head_is_the_slot_cap(self):
+        # The request fits and no slot is full at the instant of refusal, so
+        # the queue ahead is what held it. With the budget off that queue can
+        # only be waiting for a slot; `budget` here would send the operator to
+        # raise a limit the broker is not using. The text agrees.
+        executor = self.executor(max_concurrent_commands=2, memory_limit_bytes=None)
+        with executor._slot_condition:
+            executor._slots_in_use = 1
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=False)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, bound)
+            self.assertIn("waiting on its limit of 2 concurrent commands", executor._refusal_text(True, bound))
+            executor._slots_in_use = 0
+
+    def test_with_the_budget_on_a_refusal_behind_the_queue_head_is_the_budget(self):
+        executor = _budgeted_executor(self, admits=2, metrics=self.metrics)
+        with executor._slot_condition:
+            executor._slots_in_use = 1
+            executor._reserved_bytes = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=False)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, bound)
+            self.assertIn("waiting for its child memory budget", executor._refusal_text(True, bound))
+            executor._slots_in_use = 0
+            executor._reserved_bytes = 0
+
+    def test_a_refusal_in_the_wake_of_a_freed_slot_counts_under_the_cap_it_waited_behind_and_says_so(self):
+        # Budget admitting more than the slot cap, so the cap is the binding
+        # bound. At the instant of refusal a slot has just freed (the waiter
+        # woke on that notify) and the request fits, yet it spent its wait
+        # behind the cap: the counter and the 503 text must both say so, as
+        # the histogram would.
+        executor = _budgeted_executor(self, admits=4, metrics=self.metrics)
+        executor.max_concurrent_commands = 2
+        with executor._slot_condition:
+            executor._slots_in_use = 1
+            executor._reserved_bytes = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=True)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, bound)
+            self.assertIn("concurrent commands", executor._refusal_text(True, bound))
+            self.assertNotIn("memory budget", executor._refusal_text(True, bound))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._held_bound(takes_slot=True, saw_slots_full=False))
+            executor._slots_in_use = 0
+            executor._reserved_bytes = 0
+
+    def test_a_budget_sized_to_the_slot_cap_counts_a_convoy_refusal_under_the_cap_like_its_waits(self):
+        # Both bounds bind at once: two slots, a budget for exactly two, both
+        # held. The ninth-of-eight shape on an install whose limit admits the
+        # cap exactly. The waits in that convoy are observed under `slot`
+        # (the cap was full); a refusal must count the same way, not under
+        # `budget` because the budget also happens to be full at the instant.
+        executor = _budgeted_executor(self, admits=2, metrics=self.metrics)
+        executor.max_concurrent_commands = 2
+        with executor._slot_condition:
+            executor._slots_in_use = 2
+            executor._reserved_bytes = 2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            self.assertFalse(executor._fits_budget(True), "the budget is full too")
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=True)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, bound)
+            self.assertIn("without reaching a free slot", executor._refusal_text(True, bound))
+            executor._slots_in_use = 0
+            executor._reserved_bytes = 0
+
+    def test_a_slot_less_reserver_is_held_by_the_budget_whatever_the_cap_did(self):
+        executor = _budgeted_executor(self, admits=2, metrics=self.metrics)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._held_bound(takes_slot=False, saw_slots_full=True))
+
+    def test_a_reservation_that_yielded_is_observed_once_from_its_first_arrival(self):
+        # A route refresher that steps aside for a vcs verb leaves `_admit` by
+        # AdmissionYielded, which carries its arrival, and re-enters with a
+        # deadline on the same thread handing the arrival back: one
+        # admission, observed once, from the first leg's arrival.
+        executor = _budgeted_executor(self, admits=1, metrics=self.metrics)
+        holder = _hold_a_slot(self, executor, 0.4)  # the one admission the budget has
+        with self.assertRaises(credential_proxy.AdmissionYielded) as raised:
+            with executor.reserve_child_memory(yield_when=lambda: True):
+                self.fail("admitted instead of yielding")
+        arrival = raised.exception.queued_at
+        # Only the holder's own (unwaited, `none`) admission is observed so far.
+        self.assertIsNone(_series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        holder.join()
+        with executor.reserve_child_memory(deadline=time.monotonic() + 5, queued_at=arrival):
+            pass
+        families = _parse(self.metrics.render())
+        # The second leg was admitted at once, but it carries the first leg's
+        # arrival, so it is a waited admission under the budget, not `none`.
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.4)
+
+    def test_the_snapshot_is_typed_and_the_render_reads_its_fields(self):
+        snapshot = self.executor(max_concurrent_commands=3).admission_snapshot()
+        self.assertIsInstance(snapshot, credential_proxy.AdmissionSnapshot)
+        self.assertEqual((0, 3, 0, None), tuple(snapshot))
+
+    def test_a_refusal_at_the_refresh_lock_carries_its_bound(self):
+        executor = self.executor()
+        self.assertTrue(executor._refresh_lock.acquire(blocking=False))
+        self.addCleanup(executor._refresh_lock.release)
+        with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+            executor._acquire_refresh_lock("github", time.monotonic() + 0.1, None)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_REFRESH_LOCK, raised.exception.bound)
+
+    def test_a_refusal_by_the_session_limit_carries_its_bound(self):
+        slots = credential_proxy.SessionSlots(1)
+        with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+                    self.fail("a second session command was admitted past the limit")
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_SESSION, raised.exception.bound)
+
+    def test_refusals_are_counted_by_bound_and_nothing_else(self):
+        self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_SLOT)
+        self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_SLOT)
+        self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_BUDGET)
+        families = self.families()
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="budget"))
+        for labels in families["kubeagents_credential_proxy_admission_refusals_total"]:
+            self.assertEqual({"bound"}, {key for key, _ in labels})
+            self.assertRegex(dict(labels)["bound"], _WORD_LABEL)
+
+    def test_a_refusal_bound_outside_the_vocabulary_is_counted_as_other(self):
+        # The label set is closed: a bound the code does not name counts under
+        # `other` rather than opening a series per message.
+        self.metrics.record_refusal("something a caller wrote")
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="other"))
+        self.assertNotIn("something a caller wrote", self.metrics.render())
+
+    def test_the_gauges_read_the_slots_and_bytes_in_use_against_each_cap(self):
+        executor = _budgeted_executor(self, admits=2, metrics=self.metrics)
+        self.metrics.set_admission_gauges(executor.admission_snapshot)
+        idle = self.families()
+        self.assertEqual(0, _series(idle, "kubeagents_credential_proxy_slots_in_use"))
+        self.assertEqual(0, _series(idle, "kubeagents_credential_proxy_child_memory_reserved_bytes"))
+        self.assertEqual(8, _series(idle, "kubeagents_credential_proxy_slot_cap"))
+        self.assertEqual(executor.children_budget_bytes, _series(idle, "kubeagents_credential_proxy_child_memory_budget_bytes"))
+        _hold_a_slot(self, executor, seconds=1)
+        busy = self.families()
+        self.assertEqual(1, _series(busy, "kubeagents_credential_proxy_slots_in_use"))
+        self.assertEqual(
+            credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES,
+            _series(busy, "kubeagents_credential_proxy_child_memory_reserved_bytes"),
+        )
+
+    def test_with_the_budget_off_the_budget_gauge_is_absent_and_the_cap_stands(self):
+        # No limit at all, or one under the floor: the budget is off and the
+        # series is absent, which is the signal #2463 describes, not a zero
+        # that reads as "nothing reserved".
+        self.executor(memory_limit_bytes=None)
+        families = self.families()
+        self.assertNotIn("kubeagents_credential_proxy_child_memory_budget_bytes", families)
+        self.assertEqual(credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS, _series(families, "kubeagents_credential_proxy_slot_cap"))
+
+    def test_a_registry_without_an_executor_renders_no_gauges(self):
+        families = self.families()
+        for name in (
+            "kubeagents_credential_proxy_slots_in_use",
+            "kubeagents_credential_proxy_child_memory_reserved_bytes",
+            "kubeagents_credential_proxy_slot_cap",
+            "kubeagents_credential_proxy_child_memory_budget_bytes",
+        ):
+            self.assertNotIn(name, families)
+
+
+class BusyRouteCountingTest(_BrokerFixture):
+    def test_a_busy_exec_answer_counts_a_refusal_under_its_bound(self):
+        # The one site per route that answers the busy 503 counts the refusal
+        # from the exception's bound, so the counter never parses a message.
+        executor = CredentialProxyHandler.executor
+        executor.max_concurrent_commands = 1
+        _hold_a_slot(self, executor, seconds=2)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            status, body = self.post(["kubectl", "get", "pods"])
+        self.assertEqual((503, "busy", "CREDENTIAL_PROXY_BUSY"), (status, body["status"], body["code"]))
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
 
 
 class MetricsListenerTest(unittest.TestCase):

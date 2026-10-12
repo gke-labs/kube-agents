@@ -459,3 +459,39 @@ func TestCredentialProxyLongResourceNameKeepsTheReason(t *testing.T) {
 		}
 	}
 }
+
+func apiAuthResourcesAgent(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		Spec: agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: override},
+			},
+		}},
+	}
+}
+
+// The webhook refuses a spec.deployment.agentAPIAuth.resources override at apply,
+// on the field the override crossed, so a webhook-on install is told at admission
+// what the reconciler would otherwise only report as Degraded a moment later.
+func TestAgentAPIAuthCrossedPairIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), apiAuthResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.agentAPIAuth.resources.requests.memory")
+	if !strings.Contains(msg, "exceeds the 4Gi memory limit set beside it") {
+		t.Errorf("message %q does not name the crossed limit", msg)
+	}
+}
+
+// An unknown resource name under the sidecar override is refused at admission too,
+// naming the agentAPIAuth field path rather than the credential proxy's.
+func TestAgentAPIAuthUnknownResourceNameIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), apiAuthResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}))
+	assertFieldError(t, err, "spec.deployment.agentAPIAuth.resources.limits.nvidia.com/gpu")
+}

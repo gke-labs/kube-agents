@@ -6,6 +6,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -89,6 +90,32 @@ SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 # sentinel after all — see _gateway_api_token — but the name is resolved rather
 # than read, because which file answers it is the whole of issue #786.
 GATEWAY_AUTH_ENV = "API_SERVER_KEY"
+
+# A route the hermes-bridge records for a gateway conversation's Hermes
+# session (PUT /v1/sessions/{id}/route): only the bridge's session ids, which
+# all start with this, so the route cannot re-address an alert or cron session.
+CONVERSATION_SESSION_PREFIX = "a2a-"
+# How the hermes-bridge names a conversation's session from its context id
+# (a2a/hermes-bridge/api.go, apiSessionID): the context id verbatim when it is
+# path-safe and short enough, else a truncated SHA-256 under "h-". A route is
+# recorded only for the session its own context id names, so one session's
+# cards cannot be re-addressed to another conversation's context.
+CONVERSATION_SAFE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+CONVERSATION_CONTEXT_MAX_CHARS = 128
+CONVERSATION_HASHED_PREFIX = "h-"
+CONVERSATION_HASHED_HEX_CHARS = 32
+# The conversation key's prefix for each platform the A2A gateway can hold, as
+# the gateway spells its session-record keys (gchatConversationID,
+# slackConversationID); a key for another backend is refused.
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:"}
+# The metadata key the route is kept under. Its own key, not the row's
+# platform/chat_id/thread_id: those are a chat thread's address, which other
+# readers (send_notification, the delegation headers) use as one, and a
+# gateway conversation is not addressed that way.
+CONVERSATION_ROUTE_KEY = "conversation_route"
+# Bounds on what a route carries: a gateway conversation key and context id
+# are short, and anything longer is not one.
+CONVERSATION_FIELD_MAX_CHARS = 512
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -3716,6 +3743,77 @@ def inject_message(
     )
 
     return {"status": "injected"}
+
+
+def _conversation_session_id(context_id: str) -> str:
+    """The hermes-bridge's session id for a context id (apiSessionID in a2a/hermes-bridge/api.go)."""
+    if len(context_id) <= CONVERSATION_CONTEXT_MAX_CHARS and CONVERSATION_SAFE_CONTEXT_RE.match(context_id):
+        return CONVERSATION_SESSION_PREFIX + context_id
+    digest = hashlib.sha256(context_id.encode()).hexdigest()[:CONVERSATION_HASHED_HEX_CHARS]
+    return CONVERSATION_SESSION_PREFIX + CONVERSATION_HASHED_PREFIX + digest
+
+
+@app.put("/v1/sessions/{session_id}/route", dependencies=[Depends(verify_api_key)])
+def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record the gateway conversation a bridge session answers, so its cards report back there.
+
+    The hermes-bridge calls this before each turn of an `a2a-*` session (the
+    api executor's Hermes session for one gateway conversation). A kanban card
+    the turn files subscribes to `api_server` and this session id, and
+    `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
+    `conversation_route` (`platform`, `conversation`, the gateway's key, and
+    `context_id`) and addresses the subscription to the conversation. The
+    kanban notifier then posts the card's report with `a2a notify
+    --conversation`, and the gateway posts it only if the conversation's
+    session record carries that context id.
+
+    The row is upserted, keeping any other keys on it; the route stays out of
+    the row's platform/chat_id/thread_id, which address a chat thread.
+    """
+    if not session_id.startswith(CONVERSATION_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail=f"a route is recorded only for {CONVERSATION_SESSION_PREFIX}* sessions")
+    platform = str(request_data.get("platform") or "").strip()
+    conversation = str(request_data.get("conversation") or "").strip()
+    context_id = str(request_data.get("context_id") or "").strip()
+    prefix = CONVERSATION_KEY_PREFIXES.get(platform)
+    if prefix is None:
+        raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
+    if not conversation.startswith(prefix) or len(conversation) == len(prefix):
+        raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    if not context_id:
+        raise HTTPException(status_code=400, detail="context_id is required")
+    if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="conversation or context_id is too long")
+    if session_id != _conversation_session_id(context_id):
+        raise HTTPException(status_code=400, detail="context_id is not this session's")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            meta: Dict[str, Any] = {}
+            if row:
+                try:
+                    loaded = json.loads(row[0])
+                    meta = loaded if isinstance(loaded, dict) else {}
+                except ValueError:
+                    meta = {}
+            meta[CONVERSATION_ROUTE_KEY] = {
+                "platform": platform,
+                "conversation": conversation,
+                "context_id": context_id,
+            }
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",
+                (session_id, json.dumps(meta)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return {"status": "recorded"}
 
 
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])

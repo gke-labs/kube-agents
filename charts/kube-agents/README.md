@@ -406,8 +406,8 @@ terminal and Google Chat pull counters from its metrics-only port 9096 (elsewher
 that one selects no pod). The operator's policies on all three pods admit the
 collector's namespace, `gke-gmp-system`, on those ports either way, and on the
 first two they admit the operator's own pods as well; the value only decides
-whether a scrape is configured, and the operator's own read of the two counters
-into `status.usage` does not depend on it.
+whether a scrape is configured, and the operator's own read of the counters and
+cluster gauges into `status.usage` does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed

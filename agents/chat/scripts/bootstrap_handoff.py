@@ -23,8 +23,10 @@ discovery, which deletes ``.bootstrap_scan_filed`` but may not know this marker,
 still gets its own hand-off.
 """
 
+import dataclasses
 import hashlib
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -39,6 +41,9 @@ PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 ASSIGNEE = "platform"
 RAW_PATH = "/opt/data/INVENTORY.raw.md"
 REPORT_PATH = "/opt/data/INVENTORY.md"
+# inventory_findings.py's DEFAULT_LIMITS_PATH, which its `select` reads;
+# test_bootstrap_handoff.py holds the two copies equal.
+LIMITS_PATH = "/opt/data/INVENTORY.limits.json"
 PRIORITIZE_INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory_prioritize_sop.md",
     "/opt/platform-template/governance/inventory_prioritize_sop.md",
@@ -651,6 +656,19 @@ def write_raw(data_dir: Path, text: str, path: str = RAW_PATH) -> bool:
     return True
 
 
+def limits_text() -> str:
+    """The findings pacing limits as this pod's environment sets them, as JSON.
+
+    The ranking card's terminal is the shell sandbox, which gets none of this
+    pod's environment, so ``inventory_findings.py select`` reads how many
+    criticals the first report lists from this file. Not from the card body:
+    the body is the card's identity, and a changed limit would archive a live card.
+    """
+    import findings_queue  # beside this script in the pod
+
+    return json.dumps(dataclasses.asdict(findings_queue.pacing_limits(os.environ))) + "\n"
+
+
 def _prioritize_body() -> str:
     paths = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     return (
@@ -815,6 +833,8 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         except OSError as e:
             _log(f"wrote {REPORT_PATH} but could not write {marker}: {e}")
         _log(f"no cluster was audited for sweep {sweep_id}; wrote {REPORT_PATH} without ranking")
+        return None
+    if not write_raw(data_dir, limits_text(), LIMITS_PATH):
         return None
     task_id = file_prioritize(parse_task_id, state.get("stale_keys"))
     if not task_id:

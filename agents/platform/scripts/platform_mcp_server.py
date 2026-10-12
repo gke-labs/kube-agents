@@ -1167,7 +1167,8 @@ def mark_finding_surfaced(finding_id: str, chat_id: str = "", thread_id: str = "
     the time the finding was last named. It does not mark the finding shown
     for pacing: naming a finding in answer to someone's request is not an
     addition, so it counts against no daily limit and does not hold back
-    new findings. Only the nudge marks findings shown.
+    new findings. Only the nudge and the first inventory report's delivery
+    mark findings shown.
 
     Args:
         finding_id: The finding's id.
