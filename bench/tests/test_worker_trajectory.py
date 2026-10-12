@@ -325,6 +325,26 @@ def test_parents_maps_each_fanned_out_card_to_the_card_that_filed_it(data_root: 
     assert worker_trajectory.parents({"cards": []}) == {}
 
 
+def test_parents_ignores_a_predecessor_link_when_the_creator_table_is_there(data_root: Path) -> None:
+    # A card gated on another by task_links was not necessarily filed by it:
+    # the walk still follows the link, the lineage does not.
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute("DELETE FROM kanban_worker_children")
+        conn.execute("INSERT INTO task_links VALUES (?, ?)", (FRONT, CHILD))
+    payload = _payload(_run_script(data_root, [FRONT]))
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["children"] == [CHILD] and cards[FRONT]["fanned_out"] == []
+    assert worker_trajectory.parents(payload) == {}
+
+
+def test_parents_falls_back_to_the_links_on_a_capture_without_fanned_out() -> None:
+    # A capture from before the split carried one list; it is read as before.
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"]}]}) == {"t_b": "t_a"}
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": []}]}) == {}
+    # The inject transport's summary lists card ids, not records.
+    assert worker_trajectory.parents({"cards": ["t_a", "t_b"]}) == {}
+
+
 def test_each_call_is_paired_with_its_result_and_tagged(data_root: Path) -> None:
     calls = _payload(_run_script(data_root, [FRONT]))["calls"]
 

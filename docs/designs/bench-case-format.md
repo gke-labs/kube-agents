@@ -226,7 +226,9 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it; with `after_result_pattern` the forbidden set applies only to the commands
+purges it; with `match: segments` each pattern is tried against every simple command inside a
+call as a shell runs it, behind joins, lines and `$(...)`, in `sh -c` strings and executed heredocs,
+wrapper words and assignments stripped, quoted prose, comments and file heredocs left out; with `after_result_pattern` the forbidden set applies only to the commands
 a worker issued after its first call whose result matched and whose command matched
 `after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` calls in the
 trajectory, which carry results as the record stores them, a JSON string with newlines

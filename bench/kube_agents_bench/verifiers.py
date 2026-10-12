@@ -89,6 +89,7 @@ from kube_agents_bench import (
     onboarding,
     transcript,
 )
+from kube_agents_bench.shell_segments import segments as _shell_segments
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -1332,6 +1333,17 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
 
+    ``match`` says what a pattern is tried against. ``command`` (the
+    default) is the call's text as one string. ``segments`` is each simple
+    command inside it as a shell would run it (:mod:`shell_segments`): the
+    command behind every join, line and ``$(...)``, the script in a ``-c``
+    string, an executed heredoc's lines, each from its command word on,
+    with wrapper words and assignments stripped and file heredocs, quoted
+    prose and comments left out. A command matches when any of its segments
+    does, and the reason names the segment. A case grading what a worker
+    RAN, rather than what its call text contains, wants ``segments``, so
+    its patterns can anchor on ``^kubectl`` instead of describing shell.
+
     ``after_result_pattern`` makes the forbidden set order-aware: it applies
     only to the commands a worker issued AFTER its first command whose result
     matched the pattern and whose command matched ``after_command_pattern``,
@@ -1384,6 +1396,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     forbidden_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
     after_command_pattern: str | None = None
+    match: Literal["command", "segments"] = "command"
 
     @field_validator("required_patterns", "forbidden_patterns")
     @classmethod
@@ -1404,6 +1417,19 @@ class WorkerCommandsVerifier(BaseVerifier):
         if self.after_command_pattern is not None and self.after_result_pattern is None:
             raise ValueError("after_command_pattern narrows the window after_result_pattern opens; set both")
         return self
+
+    def _texts(self, command: str) -> list[str]:
+        """What a pattern is tried against for ``command``, per ``match``."""
+        if self.match == "segments":
+            return _shell_segments(command) or []
+        return [command]
+
+    def _hit(self, pattern: str, command: str) -> str | None:
+        """The text of ``command`` that ``pattern`` matched, or ``None``."""
+        for text in self._texts(command):
+            if re.search(pattern, text):
+                return text
+        return None
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1451,7 +1477,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     return False
                 if self.after_command_pattern is None:
                     return failed
-                return re.search(self.after_command_pattern, command) is not None
+                return self._hit(self.after_command_pattern, command) is not None
 
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
             graded = []
@@ -1482,10 +1508,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
         missing = [
             p for p in self.required_patterns
-            if not any(re.search(p, c) for c in commands)
+            if not any(self._hit(p, c) is not None for c in commands)
         ]
         hits = [
-            (p, c) for p in self.forbidden_patterns for c in graded if re.search(p, c)
+            (p, text) for p in self.forbidden_patterns for c in graded for text in [self._hit(p, c)] if text is not None
         ]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the

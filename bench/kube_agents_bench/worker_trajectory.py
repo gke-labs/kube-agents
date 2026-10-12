@@ -582,9 +582,14 @@ while kb is not None and queue:
             "FROM task_runs WHERE task_id = ? ORDER BY id",
             (tid,),
         ).fetchall()
-        children = []
+        # Two kinds of edge, kept apart: ``fanned_out`` is the cards this
+        # card's worker filed (the creator-of table the image adds), the
+        # rest of ``children`` are predecessor links, which also gate cards
+        # nobody here filed. The walk follows both; a lineage follows the
+        # first alone.
+        fanned_out = []
         if has_table(kb, "kanban_worker_children"):
-            children += [
+            fanned_out = [
                 r["child_id"]
                 for r in kb.execute(
                     "SELECT child_id FROM kanban_worker_children WHERE creator_id = ? "
@@ -592,7 +597,7 @@ while kb is not None and queue:
                     (tid,),
                 )
             ]
-        children += [
+        children = list(fanned_out) + [
             r["child_id"]
             for r in kb.execute(
                 "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
@@ -609,6 +614,7 @@ while kb is not None and queue:
         "status": row["status"],
         "runs": len(runs),
         "children": list(dict.fromkeys(children)),
+        "fanned_out": list(dict.fromkeys(fanned_out)),
         "sessions": [],
     }
     cards[tid] = card
@@ -699,16 +705,23 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
     """Child card to parent card, from the capture's card walk.
 
     ``None`` when the read did not run. A card the front agent filed has no
-    entry; a card a worker fanned out (``kanban_worker_children``, or a
-    continuation gated on it) maps to the card whose worker filed it. The
-    ordered checks use it to treat a card and the cards it spawned as one
-    worker's work.
+    entry; a card a worker fanned out (``kanban_worker_children``) maps to
+    the card whose worker filed it. Predecessor links (``task_links``) are
+    not lineage: a card gated on another was not necessarily filed by it, so
+    they are read only from a capture that predates ``fanned_out``, where
+    the two kinds were one list. The ordered checks use the map to treat a
+    card and the cards its worker spawned as one worker's work.
     """
-    if summary is None:
+    if not isinstance(summary, dict):
         return None
     found: dict[str, str] = {}
     for card in summary.get("cards") or []:
-        for child in card.get("children") or []:
+        # A summary that lists card ids rather than card records (the inject
+        # transport's) carries no edges.
+        if not isinstance(card, dict):
+            continue
+        edges = card.get("fanned_out") if "fanned_out" in card else card.get("children")
+        for child in edges or []:
             found.setdefault(str(child), str(card.get("task") or ""))
     return found
 
