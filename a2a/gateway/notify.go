@@ -381,6 +381,9 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 // goroutine. If the JetStream KV read is slow, this worker (and any subsequent
 // queued posts, including home alerts) is held for up to notifyLookupTimeout (5s).
 // However, request acceptance and queue-full refusals remain non-blocking.
+// If the gateway begins stopping while the session record lookup is in flight,
+// post re-checks isStopping() after the lookup and answers with the stopping
+// refusal rather than initiating new relay calls.
 func (n *Notifier) post(job notifyJob) {
 	if job.req.Conversation != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
@@ -394,6 +397,10 @@ func (n *Notifier) post(job notifyJob) {
 		if have == "" || have != job.req.ContextID {
 			n.log.Warn("notify refused: no live conversation with that context", "conversation", job.req.Conversation)
 			n.reply(job, n.refuse(notifyConversationRefused))
+			return
+		}
+		if n.isStopping() {
+			n.reply(job, n.refuse(notifyStoppingRefusal))
 			return
 		}
 	}
