@@ -642,3 +642,90 @@ func TestTheGatewaysConversationsReadTheSessionRecord(t *testing.T) {
 		t.Fatalf("ConversationContext(unknown) = %q, %v; want empty", got, err)
 	}
 }
+
+type blockingConversations struct {
+	fakeConversations
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingConversations) ConversationContext(ctx context.Context, key string) (string, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return b.fakeConversations.ConversationContext(ctx, key)
+}
+
+// A slow session record lookup runs in the worker, not on the NATS subscription's
+// delivery goroutine, so it does not hold the acceptance of subsequent requests.
+func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var closeRelease sync.Once
+	defer closeRelease.Do(func() { close(release) })
+
+	conv := &blockingConversations{
+		fakeConversations: fakeConversations{contexts: map[string]string{testConversation: testContext}},
+		entered:           entered,
+		release:           release,
+	}
+	poster := &fakeNotifyPoster{}
+	n := newTestNotifier(t, poster)
+	n.SetConversations(conv)
+
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+
+	// 1. Send conversation request.
+	convReq, _ := json.Marshal(lib.NotifyRequest{Text: "conv text", Conversation: testConversation, ContextID: testContext})
+	if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"conv", convReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until ConversationContext is entered.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConversationContext was not entered")
+	}
+
+	// 2. While ConversationContext is still blocked, send home request.
+	homeReq, _ := json.Marshal(lib.NotifyRequest{Text: "home text"})
+	if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"home", homeReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert that home request is accepted into n.jobs while release is still unclosed!
+	select {
+	case job := <-n.jobs:
+		if job.req.Text != "home text" {
+			t.Fatalf("queued job text = %q, want %q", job.req.Text, "home text")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("home request was not accepted while ConversationContext was blocked")
+	}
+
+	// Unblock the worker before shutdown so sub.Stop drains cleanly without waiting on grace.
+	closeRelease.Do(func() { close(release) })
+}
+

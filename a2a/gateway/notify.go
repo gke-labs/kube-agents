@@ -343,14 +343,10 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	return req, nil
 }
 
-// validateConversation admits a request aimed at a conversation only when
-// the gateway holds a session record for it whose context id is the one the
-// request carries: a conversation the agent is working in. The bound is the
-// set of live records, not a secret: the agent principal, the one sender, can
-// read every live conversation's context id (its Hermes sessions are named
-// for them), so this refuses a conversation with no record, a made-up key
-// and a stale route, not a post into another conversation the agent holds a
-// session for. Anything else is refused before any post.
+// validateConversation checks the request's shape before queueing it for
+// the worker. The session record check (ConversationContext) runs in post on
+// the worker goroutine so a slow JetStream KV read does not hold the NATS
+// subscription's delivery goroutine.
 func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyRequest, *lib.NotifyReply) {
 	refuse := func(reason string) (lib.NotifyRequest, *lib.NotifyReply) {
 		r := n.refuse(reason)
@@ -368,17 +364,6 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 	if !strings.HasPrefix(req.Conversation, n.convPrefix) || len(req.Conversation) == len(n.convPrefix) {
 		return refuse(fmt.Sprintf("conversation %q is not on this route's backend", req.Conversation))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
-	defer cancel()
-	have, err := n.conv.ConversationContext(ctx, req.Conversation)
-	if err != nil {
-		n.log.Warn("notify: session record unreadable", "conversation", req.Conversation, "err", err)
-		return refuse(notifyConversationRefused)
-	}
-	if have == "" || have != req.ContextID {
-		n.log.Warn("notify refused: no live conversation with that context", "conversation", req.Conversation)
-		return refuse(notifyConversationRefused)
-	}
 	return req, nil
 }
 
@@ -388,6 +373,21 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
 func (n *Notifier) post(job notifyJob) {
+	if job.req.Conversation != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
+		defer cancel()
+		have, err := n.conv.ConversationContext(ctx, job.req.Conversation)
+		if err != nil {
+			n.log.Warn("notify: session record unreadable", "conversation", job.req.Conversation, "err", err)
+			n.reply(job, n.refuse(notifyConversationRefused))
+			return
+		}
+		if have == "" || have != job.req.ContextID {
+			n.log.Warn("notify refused: no live conversation with that context", "conversation", job.req.Conversation)
+			n.reply(job, n.refuse(notifyConversationRefused))
+			return
+		}
+	}
 	thread := job.req.Thread
 	if job.req.Conversation != "" {
 		thread = job.req.Conversation
