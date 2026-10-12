@@ -786,8 +786,9 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 		close(stopped)
 	}()
 
-	// Wait briefly for sub.Stop to set stopping and wait on the worker.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until sub.Stop has marked the notifier stopping; it then waits on
+	// the worker, which is parked in the lookup.
+	waitFor(t, "Stop to mark the notifier stopping", n.isStopping)
 
 	// Release the blocked ConversationContext lookup.
 	releaseOnce.Do(func() { close(release) })
