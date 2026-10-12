@@ -159,6 +159,81 @@ def test_executed_heredocs_are_commands_and_file_heredocs_are_content():
     assert segments("kubectl apply -f - <<EOF\napiVersion: v1\nkind: ConfigMap\nEOF") == ["kubectl apply -f - <<EOF"]
 
 
+def test_the_opener_line_is_read_whole_and_tee_writes_a_script():
+    assert segments("bash <<'EOF' 2>&1 | tee /tmp/out.log\nkubectl scale deploy x --replicas=3\nEOF") == [
+        "kubectl scale deploy x --replicas=3",
+        "bash <<'EOF' 2>&1",
+        "tee /tmp/out.log",
+    ]
+    assert segments("sh <<'EOF' && echo done\nkubectl patch deploy x -p y\nEOF")[0] == "kubectl patch deploy x -p y"
+    assert segments("tee /tmp/run.sh <<'EOF'\nkubectl scale deploy x --replicas=3\nEOF\nbash /tmp/run.sh")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    assert segments("cat <<'EOF' | sudo tee /tmp/run\nkubectl scale deploy x --replicas=3\nEOF\nbash /tmp/run")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    assert segments("cat <<'EOF' | tee /tmp/notes.md\nkubectl scale deploy x --replicas=3 was refused\nEOF") == [
+        "cat <<'EOF'",
+        "tee /tmp/notes.md",
+    ]
+
+
+def test_a_python_body_is_one_segment_of_text():
+    script = "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"kubectl\", \"scale\", \"deploy/x\", \"--replicas=3\"])\nEOF"
+    assert segments(script) == [
+        'import subprocess\nsubprocess.run(["kubectl", "scale", "deploy/x", "--replicas=3"])',
+        "python3 - <<'EOF'",
+    ]
+    assert segments("cat > /tmp/s.py <<'EOF'\nimport os\nos.system(\"kubectl scale deploy x --replicas=3\")\nEOF\npython3 /tmp/s.py")[0] == (
+        'import os\nos.system("kubectl scale deploy x --replicas=3")'
+    )
+    assert segments("cat > /tmp/s.py <<'EOF'\nimport requests\nrequests.patch(\"https://h/apis/apps/v1/x/scale\")\nEOF")[0].startswith("import requests")
+
+
+def test_a_bare_tag_heredoc_body_is_expanded():
+    assert segments("cat > /tmp/note.txt <<EOF\nResult: $(kubectl scale deploy x --replicas=3 2>&1)\nEOF") == [
+        "kubectl scale deploy x --replicas=3 2>&1",
+        "cat > /tmp/note.txt <<EOF",
+    ]
+    assert segments("cat > /tmp/note.txt <<'EOF'\nResult: $(kubectl scale deploy x --replicas=3 2>&1)\nEOF") == [
+        "cat > /tmp/note.txt <<'EOF'",
+    ]
+    assert segments("cat > /tmp/note.txt <<\\EOF\nResult: $(kubectl scale deploy x)\nEOF") == ["cat > /tmp/note.txt <<\\EOF"]
+
+
+def test_the_command_word_is_normalised():
+    for shape in ("\\kubectl scale deploy x --replicas=3", '"kubectl" scale deploy x --replicas=3', "'kubectl' scale deploy x --replicas=3"):
+        assert segments(shape) == ["kubectl scale deploy x --replicas=3"], shape
+    assert segments("\\bash -c 'kubectl scale deploy x --replicas=3'")[1:] == ["kubectl scale deploy x --replicas=3"]
+
+
+def test_valued_options_before_dash_c_and_punctuated_tags():
+    assert segments("bash -eo pipefail -c 'kubectl scale deploy x --replicas=3'")[1:] == ["kubectl scale deploy x --replicas=3"]
+    assert segments("bash -o pipefail -c 'kubectl scale deploy x --replicas=3'")[1:] == ["kubectl scale deploy x --replicas=3"]
+    assert segments('python3 -W ignore -c "import os; os.system(\'kubectl scale deploy x\')"')[1:] == [
+        "import os; os.system('kubectl scale deploy x')"
+    ]
+    assert segments("cat > /tmp/d.yaml <<MANIFEST.yaml\nkind: ConfigMap\nMANIFEST.yaml\nkubectl apply -f /tmp/d.yaml") == [
+        "cat > /tmp/d.yaml <<MANIFEST.yaml",
+        "kubectl apply -f /tmp/d.yaml",
+    ]
+    assert segments("cat > /tmp/d.yaml <<EOF-1\nkind: ConfigMap\nEOF-1\nkubectl apply -f /tmp/d.yaml")[-1] == "kubectl apply -f /tmp/d.yaml"
+
+
+def test_a_pull_request_body_written_and_submitted_in_one_call_is_content():
+    call = (
+        'BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)\ncat > "$BODY" <<\'EOF\'\n'
+        "The policy refused `kubectl scale deployment kube-dns --replicas=3`; proposing it as a PR.\n\n"
+        "```\nkubectl scale deployment kube-dns -n kube-system --replicas=3\n```\nEOF\n"
+        'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit --repo acme/infra --title "Scale kube-dns" --body-file "$BODY"'
+    )
+    assert segments(call) == [
+        "mktemp -p /opt/data/scratch pr_body.XXXXXX.md",
+        'cat > "$BODY" <<\'EOF\'',
+        'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit --repo acme/infra --title "Scale kube-dns" --body-file "$BODY"',
+    ]
+
+
 def test_prose_quotes_and_comments_are_not_commands():
     assert segments("grep -r 'kubectl apply' /opt/defaults/skills") == ["grep -r 'kubectl apply' /opt/defaults/skills"]
     assert segments('git commit -m "kube-dns: set replicas to 3 (kubectl scale was refused)"') == [

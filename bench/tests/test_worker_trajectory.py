@@ -337,10 +337,9 @@ def test_parents_ignores_a_predecessor_link_when_the_creator_table_is_there(data
     assert worker_trajectory.parents(payload) == {}
 
 
-def test_parents_falls_back_to_the_links_on_a_capture_without_fanned_out() -> None:
-    # A capture from before the split carried one list; it is read as before.
-    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"]}]}) == {"t_b": "t_a"}
+def test_parents_reads_only_the_fanned_out_edges() -> None:
     assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": []}]}) == {}
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": ["t_b"]}]}) == {"t_b": "t_a"}
     # The inject transport's summary lists card ids, not records.
     assert worker_trajectory.parents({"cards": ["t_a", "t_b"]}) == {}
 

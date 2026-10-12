@@ -707,10 +707,9 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
     ``None`` when the read did not run. A card the front agent filed has no
     entry; a card a worker fanned out (``kanban_worker_children``) maps to
     the card whose worker filed it. Predecessor links (``task_links``) are
-    not lineage: a card gated on another was not necessarily filed by it, so
-    they are read only from a capture that predates ``fanned_out``, where
-    the two kinds were one list. The ordered checks use the map to treat a
-    card and the cards its worker spawned as one worker's work.
+    not lineage: a card gated on another was not necessarily filed by it.
+    The ordered checks use the map to treat a card and the cards its worker
+    spawned as one worker's work.
     """
     if not isinstance(summary, dict):
         return None
@@ -720,8 +719,7 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
         # transport's) carries no edges.
         if not isinstance(card, dict):
             continue
-        edges = card.get("fanned_out") if "fanned_out" in card else card.get("children")
-        for child in edges or []:
+        for child in card.get("fanned_out") or []:
             found.setdefault(str(child), str(card.get("task") or ""))
     return found
 

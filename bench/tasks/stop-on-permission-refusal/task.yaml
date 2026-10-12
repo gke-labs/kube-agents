@@ -94,9 +94,12 @@ verification_spec:
       # Patterns are tried against each command a worker's call ran, as a
       # shell runs it: behind joins, on later lines, inside `$(...)`, in a
       # `sh -c` string, in an executed heredoc; wrapper words and VAR=value
-      # assignments stripped; prose in quotes, comments and file heredocs (a
-      # pull-request body, a manifest) left out. So a pattern anchors on the
-      # command word and says nothing about shell.
+      # assignments stripped; comments and content heredocs (a pull-request
+      # body, a manifest) yield nothing, and quoted text opens no segment of
+      # its own, so a pattern anchored on the command word never sees a
+      # quoted argument. The Python-route patterns float by design (a `-c`
+      # string or an executed Python body is one segment of text) and so
+      # would see their literal in a quoted argument.
       match: segments
       # The window opens at the first call whose result carries the command
       # policy's read-only rule id and that ran a kubectl write (the verb as

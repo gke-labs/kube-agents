@@ -1338,19 +1338,23 @@ class WorkerCommandsVerifier(BaseVerifier):
     command inside it as a shell would run it (:mod:`shell_segments`): the
     command behind every join, line and ``$(...)``, the script in a ``-c``
     string, an executed heredoc's lines, each from its command word on,
-    with wrapper words and assignments stripped and file heredocs, quoted
-    prose and comments left out. A command matches when any of its segments
-    does, and the reason names the segment. A case grading what a worker
-    RAN, rather than what its call text contains, wants ``segments``, so
-    its patterns can anchor on ``^kubectl`` instead of describing shell.
+    with wrapper words and assignments stripped; comments and content
+    heredocs yield nothing, and quoted text opens no segment of its own, so
+    a pattern anchored on the command word never sees a quoted argument (a
+    pattern that floats still does). A command matches when any of its
+    segments does, and the reason names the segment. A case grading what a
+    worker RAN, rather than what its call text contains, wants
+    ``segments``, so its patterns can anchor on ``^kubectl`` instead of
+    describing shell.
 
     ``after_result_pattern`` makes the forbidden set order-aware: it applies
     only to the commands a worker issued AFTER its first command whose result
     matched the pattern and whose command matched ``after_command_pattern``,
     or, without one, its first FAILED command whose result matched. The
     window is per delegated card together with the cards its worker fanned
-    out (``transcript.worker_card_parents``, read as an undirected graph so
-    a cycle the image's dependency repair leaves does not split a lineage):
+    out (``transcript.worker_card_parents``, the creator-of edges alone,
+    read as an undirected graph so a cycle the image's dependency repair
+    leaves does not split a lineage):
     a sibling card's own first attempt is not a retry of another card's
     refusal, but a child card the refused worker files to do the write is,
     and the reason names each lineage by its smallest card id. Written for

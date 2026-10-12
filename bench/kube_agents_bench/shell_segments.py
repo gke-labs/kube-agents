@@ -11,43 +11,52 @@ What counts as a segment:
 
 - each simple command on a line, split at ``;``, ``&&``, ``||``, ``|``, ``&``
   and parentheses, with a backslash-newline joined to the next line;
-- the command inside ``$(...)`` and backticks, wherever it sits, a double-quoted
-  string included;
+- the command inside ``$(...)`` and backticks, wherever it sits: a double-quoted
+  string, or the body of a heredoc whose tag is unquoted, which the shell
+  expands;
 - the script a shell runs from a ``-c`` string (``sh``, ``bash``, ``zsh``,
-  ``dash``) or ``eval``, segmented in turn; the ``-c`` string of a ``python``
-  command, as one segment of Python text;
+  ``dash``, ``ksh``) or ``eval``, segmented in turn; the ``-c`` string of a
+  ``python`` command, as one segment of Python text;
 - what ``kubectl exec``, ``kubectl run`` and ``kubectl debug`` run after ``--``;
-- the lines of a heredoc that is executed: fed to an interpreter on its opener
-  line, written to a ``.sh``/``.py`` path, or written to a path that a later
-  command in the same call runs. Any other heredoc body is content (a manifest,
-  a pull-request body) and is not a command.
+- the body of a heredoc that is executed: fed to a shell or ``python`` on its
+  opener line (the whole line, pipes included), written to a ``.sh``/``.py``
+  path, or written (by ``>``, ``tee`` or ``dd of=``) to a path that a later
+  command in the same call runs or marks executable. A shell body is segmented
+  in turn; a Python body is one segment of Python text. Any other heredoc body
+  is content (a manifest, a pull-request body) and is not a command.
 
-What is stripped before the command word: wrapper words and their options
-(``env``, ``sudo -u x``, ``time``, ``timeout 30``, ``nice -n 5``, ``nohup``,
-``xargs -n1``, ``command``, ``builtin``, ``exec``, ``if``, ``!``, ``while``,
-``until``, ``then``, ``else``, ``elif``, ``do``, ``{``) and leading ``VAR=value``
-assignments. A command word that is ``$(which x)``, ``$(command -v x)`` or
-``$(type -p x)`` reads as ``x``. Shell keywords that close a block (``fi``,
+A segment starts at its command word, normalised: wrapper words and their
+options (``env``, ``sudo -u x``, ``time``, ``timeout 30``, ``nice -n 5``,
+``nohup``, ``xargs -n1``, ``command``, ``builtin``, ``exec``, ``if``, ``!``,
+``while``, ``until``, ``then``, ``else``, ``elif``, ``do``, ``{``) and leading
+``VAR=value`` assignments are stripped; a quoted or backslashed command word
+(``"kubectl"``, ``\\kubectl``) reads bare; ``$(which x)``, ``$(command -v x)``
+and ``$(type -p x)`` read as ``x``. Shell keywords that close a block (``fi``,
 ``done``, ``esac``, ``}``) are not commands and yield nothing.
+
+Quoted text does not open a segment of its own, so a pattern anchored on the
+command word never sees a quoted argument; a pattern that must float (Python
+text in a ``-c`` string) still does. Comments and content heredocs yield
+nothing at all.
 
 What is not understood, stated so a case is not written against it: a command
 behind a shell variable (``$K scale``), text piped into an interpreter
-(``echo ... | sh``), a here-string, aliases and functions, and anything after a
-quote that never closes. The walk is linear in the call's length.
+(``echo ... | sh``), a here-string, aliases and functions, a script written in
+one call and run in a later one, and anything after a quote that never closes.
+The walk is linear in the call's length.
 """
 
 from __future__ import annotations
 
 import re
 
-# Shell words that precede the command they run, with how many option tokens
-# follow: options are any ``-x`` tokens, and the words below take one more
-# value token after the named options.
+# Shell words that precede the command they run. Options are any ``-x``
+# tokens; the named options take one value token more; ``timeout`` takes a
+# duration after its options.
 _WRAPPERS = frozenset(
     {"env", "sudo", "time", "nohup", "nice", "timeout", "xargs", "command", "builtin", "exec",
      "if", "!", "while", "until", "then", "else", "elif", "do", "{"}
 )
-# Options of a wrapper that take a value token of their own.
 _WRAPPER_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-T", "-U"},
     "nice": {"-n"},
@@ -55,19 +64,30 @@ _WRAPPER_VALUE_OPTIONS = {
     "env": {"-u", "-C", "-S"},
     "timeout": {"-s", "-k"},
 }
-# ``timeout`` takes a duration after its options.
 _WRAPPER_POSITIONAL = {"timeout": 1}
 # Words that end a block; never a command.
-_BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")", "then", "else", "do"})
+_BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 _PYTHONS = re.compile(r"^python[\d.]*$")
-_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
+_SHELL_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
+# Short options of an interpreter that take a value token, read before a ``-c``.
+_INTERPRETER_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "-W", "-X", "-m"})
 _KUBECTL_PASSTHROUGH = frozenset({"exec", "run", "debug"})
-_SCRIPT_SUFFIXES = (".sh", ".py", ".bash")
+_PYTHON_SUFFIX = ".py"
+_SHELL_SUFFIXES = (".sh", ".bash")
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
 _WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-p)\s+(\S+)$")
-_HEREDOC_RE = re.compile(r"<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z0-9_]+))")
+# ``<<`` or ``<<-``, then a tag: quoted, backslashed, or bare; a bare tag is a
+# shell word, and only a bare tag's body is expanded.
+_HEREDOC_RE = re.compile(r"<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|(\\)?([^\s;&|<>()'\"\\]+))")
 _REDIRECT_TARGET_RE = re.compile(r"(?:^|\s)>{1,2}\s*(\S+)")
+_DD_TARGET_RE = re.compile(r"(?:^|\s)of=(\S+)")
+# Nesting beyond this is not shell a worker writes; it bounds a pathological
+# input rather than any real one.
+_MAX_DEPTH = 8
+# How a heredoc body is read once it is known to be executed.
+_KIND_SHELL = "shell"
+_KIND_PYTHON = "python"
 
 
 def segments(command: str) -> list[str]:
@@ -77,11 +97,6 @@ def segments(command: str) -> list[str]:
     return out
 
 
-# Nesting beyond this is not shell a worker writes; it bounds a pathological
-# input rather than any real one.
-_MAX_DEPTH = 8
-
-
 def _walk(text: str, out: list[str], depth: int) -> None:
     if depth > _MAX_DEPTH or not text:
         return
@@ -89,9 +104,17 @@ def _walk(text: str, out: list[str], depth: int) -> None:
     for inner in nested:
         _walk(inner, out, depth + 1)
     executed = _executed_paths(pieces)
-    for opener, target, body in heredocs:
-        if _heredoc_is_code(opener, target, executed):
+    for opener_pieces, body, expands in heredocs:
+        if expands:
+            inner: list[str] = []
+            _collect_nested(body, inner)
+            for sub in inner:
+                _walk(sub, out, depth + 1)
+        kind = _heredoc_kind(opener_pieces, executed)
+        if kind == _KIND_SHELL:
             _walk(body, out, depth + 1)
+        elif kind == _KIND_PYTHON and body.strip():
+            out.append(body.strip())
     for piece in pieces:
         _emit(piece, out, depth)
 
@@ -101,57 +124,64 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
     index = _command_index(tokens)
     if index is None:
         return
-    start, _, word = tokens[index]
+    _, end, word = tokens[index]
     unquoted = _unquote(word)
     inner = _substituted_command(word)
     if inner is not None:
         which = _WHICH_RE.match(inner.strip())
-        if which:
-            unquoted = which.group(1)
-            segment = unquoted + piece[tokens[index][1]:]
-        else:
+        if not which:
             return
-    else:
-        segment = piece[start:]
+        unquoted = which.group(1)
     if unquoted in _BLOCK_CLOSERS:
         return
-    out.append(segment.strip())
+    out.append((unquoted + piece[end:]).strip())
     base = unquoted.rsplit("/", 1)[-1]
     rest = tokens[index + 1 :]
     if base in _SHELLS or base == "eval" or _PYTHONS.match(base):
-        script = _dash_c_script(base, rest, piece)
+        script = _dash_c_script(base, rest)
         if script is not None:
             if base in _SHELLS or base == "eval":
                 _walk(script, out, depth + 1)
-            else:
+            elif script.strip():
                 out.append(script.strip())
     if base == "kubectl" and rest and _unquote(rest[0][2]) in _KUBECTL_PASSTHROUGH:
-        for position, (_, end, token) in enumerate(rest):
+        for _, token_end, token in rest:
             if token == "--":
-                tail = piece[end:].strip()
+                tail = piece[token_end:].strip()
                 if tail:
                     _walk(tail, out, depth + 1)
                 break
 
 
-def _dash_c_script(base: str, rest: list[tuple[int, int, str]], piece: str) -> str | None:
+def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
+    """The string a shell or python runs with ``-c``, or everything after ``eval``."""
     if base == "eval":
         return " ".join(_unquote(t) for _, _, t in rest) if rest else None
-    for position, (_, _, token) in enumerate(rest):
-        if token.startswith("-") and not token.startswith("--") and "c" in token[1:]:
-            if position + 1 < len(rest):
-                return _unquote(rest[position + 1][2])
-            return None
-        if not token.startswith("-"):
-            return None
+    i = 0
+    while i < len(rest):
+        token = rest[i][2]
+        if token.startswith("--"):
+            i += 1
+            continue
+        if token.startswith(("-", "+")) and len(token) > 1:
+            if "c" in token[1:] and token[0] == "-":
+                return _unquote(rest[i + 1][2]) if i + 1 < len(rest) else None
+            # ``-o x`` and a cluster ending in a value letter (``-eo x``).
+            if token in _INTERPRETER_VALUE_OPTIONS or ("-" + token[-1]) in _INTERPRETER_VALUE_OPTIONS:
+                i += 2
+                continue
+            i += 1
+            continue
+        return None
     return None
 
 
 def _command_index(tokens: list[tuple[int, int, str]]) -> int | None:
     i = 0
     while i < len(tokens):
-        word = _unquote(tokens[i][2])
-        if _ASSIGNMENT_RE.match(tokens[i][2]) and not tokens[i][2].startswith(("'", '"')):
+        raw = tokens[i][2]
+        word = _unquote(raw)
+        if _ASSIGNMENT_RE.match(raw) and not raw.startswith(("'", '"')):
             i += 1
             continue
         if word in _WRAPPERS:
@@ -183,6 +213,8 @@ def _substituted_command(word: str) -> str | None:
 
 
 def _unquote(token: str) -> str:
+    if token.startswith("\\") and len(token) > 1:
+        token = token[1:]
     if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
         body = token[1:-1]
         return body.replace('\\"', '"') if token[0] == '"' else body
@@ -265,17 +297,18 @@ def _skip_parens(text: str, i: int) -> int:
     return n
 
 
-def _scan(text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
+def _scan(text: str) -> tuple[list[str], list[str], list[tuple[list[str], str, bool]]]:
     """Split ``text`` into simple-command pieces, nested substitution texts and heredocs.
 
-    Returns ``(pieces, nested, heredocs)``; a heredoc is ``(opener piece,
-    redirect target or "", body)``.
+    Returns ``(pieces, nested, heredocs)``; a heredoc is ``(the pieces of its
+    opener line, body, whether the shell expands the body)``.
     """
     pieces: list[str] = []
     nested: list[str] = []
-    heredocs: list[tuple[str, str, str]] = []
-    pending: list[tuple[str, bool]] = []  # (tag, strip leading tabs)
+    heredocs: list[tuple[list[str], str, bool]] = []
+    pending: list[tuple[str, bool, bool]] = []  # (tag, strip leading tabs, expands)
     buf: list[str] = []
+    line_first = 0  # index in ``pieces`` of the first piece on the current line
     i, n = 0, len(text)
 
     def flush() -> None:
@@ -285,10 +318,11 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
             pieces.append(piece)
 
     def end_of_line(pos: int) -> int:
-        """Consume heredoc bodies that start at ``pos`` (just after a newline)."""
+        """Consume the pending heredoc bodies that start at ``pos`` (just after a newline)."""
         nonlocal pending
-        opener = "".join(buf).strip() or (pieces[-1] if pieces else "")
-        for tag, strip_tabs in pending:
+        current = "".join(buf).strip()
+        opener_pieces = pieces[line_first:] + ([current] if current else [])
+        for tag, strip_tabs, expands in pending:
             body_lines: list[str] = []
             while pos < n:
                 nl = text.find("\n", pos)
@@ -298,8 +332,7 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
                 if candidate.strip() == tag:
                     break
                 body_lines.append(candidate if strip_tabs else line)
-            target = _REDIRECT_TARGET_RE.search(opener)
-            heredocs.append((opener, _unquote(target.group(1)) if target else "", "\n".join(body_lines)))
+            heredocs.append((opener_pieces, "\n".join(body_lines), expands))
         pending = []
         return pos
 
@@ -340,8 +373,13 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
         elif c == "<" and text.startswith("<<", i) and not text.startswith("<<<", i):
             m = _HEREDOC_RE.match(text, i)
             if m:
-                tag = m.group(2) if m.group(2) is not None else m.group(3) if m.group(3) is not None else m.group(4)
-                pending.append((tag, m.group(1) == "-"))
+                if m.group(2) is not None:
+                    tag, expands = m.group(2), False
+                elif m.group(3) is not None:
+                    tag, expands = m.group(3), False
+                else:
+                    tag, expands = m.group(5), m.group(4) is None
+                pending.append((tag, m.group(1) == "-", expands))
                 buf.append(text[i : m.end()])
                 i = m.end()
             else:
@@ -350,10 +388,10 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
         elif c == "\n":
             if pending:
                 i = end_of_line(i + 1)
-                flush()
             else:
-                flush()
                 i += 1
+            flush()
+            line_first = len(pieces)
         elif c == "&" and (text[i - 1 : i] in "<>" or text.startswith("&>", i)):
             # A redirection (``2>&1``, ``&>file``), not a background join.
             buf.append(c)
@@ -378,7 +416,7 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
 
 
 def _collect_nested(inner: str, nested: list[str]) -> None:
-    """Substitutions inside a double-quoted string."""
+    """Substitutions inside text the shell expands: a double-quoted string, a bare-tag heredoc."""
     i, n = 0, len(inner)
     while i < n:
         if inner.startswith("$(", i):
@@ -397,34 +435,76 @@ def _collect_nested(inner: str, nested: list[str]) -> None:
             i += 1
 
 
-def _executed_paths(pieces: list[str]) -> set[str]:
-    """Paths a piece runs: ``bash p``, ``source p``, ``. p``, ``python p``, ``./p``, ``chmod +x p``."""
-    paths: set[str] = set()
+def _command_word(piece: str) -> tuple[str, list[str]] | None:
+    """The normalised command word of ``piece`` and its unquoted arguments."""
+    tokens = _tokens(piece)
+    index = _command_index(tokens)
+    if index is None:
+        return None
+    word = _unquote(tokens[index][2])
+    return word, [_unquote(t) for _, _, t in tokens[index + 1 :]]
+
+
+def _executed_paths(pieces: list[str]) -> dict[str, str]:
+    """Each path a piece runs, to how: ``bash p``, ``. p``, ``python p``, ``./p``, ``chmod +x p``.
+
+    An interpreter runs its first positional argument only; a flag's value
+    (``--body-file p``) is not a script.
+    """
+    paths: dict[str, str] = {}
     for piece in pieces:
-        tokens = _tokens(piece)
-        index = _command_index(tokens)
-        if index is None:
+        found = _command_word(piece)
+        if found is None:
             continue
-        word = _unquote(tokens[index][2])
+        word, args = found
         base = word.rsplit("/", 1)[-1]
-        args = [_unquote(t) for _, _, t in tokens[index + 1 :] if not t.startswith("-")]
-        if base in _INTERPRETERS or _PYTHONS.match(base) or word == "chmod":
-            paths.update(args)
+        positional = [a for a in args if not a.startswith("-")]
+        if base in _SHELL_RUNNERS and positional:
+            paths.setdefault(positional[0], _KIND_SHELL)
+        elif _PYTHONS.match(base) and positional:
+            paths.setdefault(positional[0], _KIND_PYTHON)
+        elif word == "chmod":
+            for path in positional[1:]:
+                paths.setdefault(path, _KIND_SHELL)
         elif word.startswith(("./", "/")):
-            paths.add(word)
-            paths.add(word[2:] if word.startswith("./") else word)
+            paths.setdefault(word, _KIND_SHELL)
+            paths.setdefault(word[2:] if word.startswith("./") else word, _KIND_SHELL)
     return paths
 
 
-def _heredoc_is_code(opener: str, target: str, executed: set[str]) -> bool:
-    if target.endswith(_SCRIPT_SUFFIXES) or target in executed or ("./" + target) in executed:
-        return True
-    for piece in _scan(opener)[0]:
-        tokens = _tokens(piece)
-        index = _command_index(tokens)
-        if index is None:
+def _heredoc_target(opener_pieces: list[str]) -> str:
+    """The file a heredoc's line writes to: a ``>`` redirect, ``tee``, or ``dd of=``."""
+    for piece in opener_pieces:
+        redirect = _REDIRECT_TARGET_RE.search(piece)
+        if redirect:
+            return _unquote(redirect.group(1))
+        dd = _DD_TARGET_RE.search(piece)
+        if dd:
+            return _unquote(dd.group(1))
+        found = _command_word(piece)
+        if found and found[0].rsplit("/", 1)[-1] == "tee":
+            positional = [a for a in found[1] if not a.startswith("-")]
+            if positional:
+                return positional[0]
+    return ""
+
+
+def _heredoc_kind(opener_pieces: list[str], executed: dict[str, str]) -> str | None:
+    """How a heredoc's body runs, or ``None`` when it is content."""
+    for piece in opener_pieces:
+        found = _command_word(piece)
+        if found is None:
             continue
-        base = _unquote(tokens[index][2]).rsplit("/", 1)[-1]
-        if base in _INTERPRETERS or _PYTHONS.match(base):
-            return True
-    return False
+        base = found[0].rsplit("/", 1)[-1]
+        if _PYTHONS.match(base):
+            return _KIND_PYTHON
+        if base in _SHELL_RUNNERS:
+            return _KIND_SHELL
+    target = _heredoc_target(opener_pieces)
+    if not target:
+        return None
+    if target.endswith(_PYTHON_SUFFIX):
+        return _KIND_PYTHON
+    if target.endswith(_SHELL_SUFFIXES):
+        return _KIND_SHELL
+    return executed.get(target) or executed.get("./" + target)

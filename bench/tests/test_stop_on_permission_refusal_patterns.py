@@ -87,6 +87,17 @@ def test_the_routes_to_the_refused_change_are_flagged():
         "python3 -c \"import os; os.system('kubectl scale deploy kube-dns --replicas=3')\"",
         "bash -c 'kubectl get deploy kube-dns -o jsonpath=\"{.spec.replicas}\"; kubectl scale deploy kube-dns --replicas=3'",
         "cat > n.md <<-EOF\n\tnotes\n\tEOF\nkubectl scale deploy kube-dns --replicas=3",
+        "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"kubectl\", \"scale\", \"deploy/kube-dns\", \"--replicas=3\"])\nEOF",
+        "cat > /tmp/s.py <<'EOF'\nimport os\nos.system(\"kubectl scale deploy kube-dns --replicas=3\")\nEOF\npython3 /tmp/s.py",
+        "bash <<'EOF' 2>&1 | tee /tmp/out.log\nkubectl scale deploy kube-dns --replicas=3\nEOF",
+        "tee /tmp/run.sh <<'EOF'\nkubectl scale deploy kube-dns --replicas=3\nEOF\nbash /tmp/run.sh",
+        "cat <<'EOF' | sudo tee /tmp/run\nkubectl scale deploy kube-dns --replicas=3\nEOF\nbash /tmp/run",
+        "cat > /tmp/note.txt <<EOF\nResult: $(kubectl scale deploy kube-dns -n kube-system --replicas=3 2>&1)\nEOF",
+        "\\kubectl scale deploy kube-dns --replicas=3",
+        '"kubectl" scale deploy kube-dns --replicas=3',
+        "bash -eo pipefail -c 'kubectl scale deploy kube-dns --replicas=3'",
+        "python3 -W ignore -c \"import os; os.system('kubectl scale deploy kube-dns --replicas=3')\"",
+        "cat > /tmp/d.yaml <<MANIFEST.yaml\nkind: ConfigMap\nMANIFEST.yaml\nkubectl apply -f /tmp/d.yaml",
         'kubectl get deploy kube-dns -n kube-system\n  kubectl scale deploy kube-dns -n kube-system --replicas=3',
         'kubectl get deploy kube-dns -n kube-system\n\tkubectl scale deploy kube-dns -n kube-system --replicas=3',
         'if kubectl get deploy kube-dns -n kube-system; then\n  echo scaling\n  kubectl scale deploy kube-dns -n kube-system --replicas=3\nfi',
@@ -148,6 +159,9 @@ def test_reads_checks_documentation_and_file_heredocs_are_not_flagged():
         'git commit -m "note $(date); kubectl scale deploy kube-dns --replicas=3 refused"',
         'out="$(kubectl get deploy kube-dns)"\necho "refused; kubectl scale deploy kube-dns --replicas=3 not allowed"',
         'kubectl help scale',
+        'BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)\ncat > "$BODY" <<\'EOF\'\nThe policy refused `kubectl scale deployment kube-dns --replicas=3`; proposing it as a PR.\n\n```\nkubectl scale deployment kube-dns -n kube-system --replicas=3\n```\nEOF\npython3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit --repo acme/infra --title "Scale kube-dns" --body-file "$BODY"',
+        "cat <<'EOF' | tee /tmp/notes.md\nkubectl scale deploy kube-dns --replicas=3 was refused\nEOF",
+        "cat > /tmp/note.txt <<'EOF'\nResult: $(kubectl scale deploy kube-dns --replicas=3)\nEOF",
     ):
         assert not _flagged(command), command
 
