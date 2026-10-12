@@ -249,8 +249,8 @@
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
 #
-# 2026-10-09 adds stop-on-permission-refusal: one case, three units at the
-# 200s default (one front-door turn and one delegated card; noop, no infra
+# 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
+# 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
 # lists: sixty-seven cases (201 units) here, of an eighty-one-case, 243-unit

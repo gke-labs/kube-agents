@@ -17,7 +17,10 @@ What counts as a segment:
 - the script a shell runs from a ``-c`` string (``sh``, ``bash``, ``zsh``,
   ``dash``, ``ksh``) or ``eval``, segmented in turn; the ``-c`` string of a
   ``python`` command, as one segment of Python text;
-- what ``kubectl exec``, ``kubectl run`` and ``kubectl debug`` run after ``--``;
+- what ``kubectl exec``, ``kubectl run`` and ``kubectl debug`` run after ``--``,
+  global flags before the verb included;
+- the quoted arguments of an ``echo``, ``printf`` or ``tee`` that writes a file
+  a later command in the same call runs;
 - the body of a heredoc that is executed: fed to a shell or ``python`` on its
   opener line (the whole line, pipes included), written to a ``.sh``/``.py``
   path, or written (by ``>``, ``tee`` or ``dd of=``) to a path that a later
@@ -73,6 +76,8 @@ _SHELL_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
 # Short options of an interpreter that take a value token, read before a ``-c``.
 _INTERPRETER_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "-W", "-X", "-m"})
 _KUBECTL_PASSTHROUGH = frozenset({"exec", "run", "debug"})
+# Commands whose quoted arguments become a file's content.
+_WRITERS = frozenset({"echo", "printf", "tee"})
 _PYTHON_SUFFIX = ".py"
 _SHELL_SUFFIXES = (".sh", ".bash")
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
@@ -104,6 +109,25 @@ def _walk(text: str, out: list[str], depth: int) -> None:
     for inner in nested:
         _walk(inner, out, depth + 1)
     executed = _executed_paths(pieces)
+    for index, piece in enumerate(pieces):
+        # A script written by ``echo``/``printf`` (``>`` or ``tee``) and run
+        # in the same call: the writer's quoted arguments are the script, or
+        # the piece piped into ``tee``.
+        target = _heredoc_target([piece])
+        kind = executed.get(target) or executed.get("./" + target) if target else None
+        if kind is None:
+            continue
+        found = _command_word(piece)
+        if found is None or found[0].rsplit("/", 1)[-1] not in _WRITERS:
+            continue
+        source = pieces[index - 1] if found[0].rsplit("/", 1)[-1] == "tee" and index else piece
+        for _, _, token in _tokens(source):
+            if token[:1] in "'\"" and len(token) > 2:
+                script = _unquote(token)
+                if kind == _KIND_SHELL:
+                    _walk(script, out, depth + 1)
+                elif script.strip():
+                    out.append(script.strip())
     for opener_pieces, body, expands in heredocs:
         if expands:
             inner: list[str] = []
@@ -144,13 +168,29 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
                 _walk(script, out, depth + 1)
             elif script.strip():
                 out.append(script.strip())
-    if base == "kubectl" and rest and _unquote(rest[0][2]) in _KUBECTL_PASSTHROUGH:
+    if base == "kubectl" and _kubectl_verb(rest) in _KUBECTL_PASSTHROUGH:
         for _, token_end, token in rest:
             if token == "--":
                 tail = piece[token_end:].strip()
                 if tail:
                     _walk(tail, out, depth + 1)
                 break
+
+
+def _kubectl_verb(rest: list[tuple[int, int, str]]) -> str | None:
+    """kubectl's first subcommand: the first argument past the global flags and their values."""
+    i = 0
+    while i < len(rest):
+        token = rest[i][2]
+        if token == "--":
+            return None
+        if token.startswith("-"):
+            i += 1
+            if "=" not in token and i < len(rest) and not rest[i][2].startswith("-"):
+                i += 1
+            continue
+        return _unquote(token)
+    return None
 
 
 def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:

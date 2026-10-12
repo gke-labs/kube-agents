@@ -1289,13 +1289,11 @@ def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
     """Each card to the one name of the lineage it belongs to.
 
     The capture's parent map is read as an undirected graph, so a card and
-    every card reachable from it through parent or child edges share one
-    lineage whatever direction the edges point. The image's dependency
-    repair can leave a worker's child pointing back at the worker that filed
-    it (both ``kanban_worker_children`` and the inverted ``task_links`` edge
-    are read), and a walk that stops at the first repeated node would give
-    the two ends of that cycle different roots. The lineage's name is its
-    smallest card id, so it is stable whichever card is met first.
+    every card reachable from it through creator-of edges share one lineage
+    whatever direction the edges are recorded in, and a walk that stopped at
+    the first repeated node could not give the two ends of a cycle different
+    roots. The lineage's name is its smallest card id, so it is stable
+    whichever card is met first.
     """
     neighbours: dict[str, set[str]] = {}
     for child, parent in parents.items():
@@ -1353,8 +1351,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     or, without one, its first FAILED command whose result matched. The
     window is per delegated card together with the cards its worker fanned
     out (``transcript.worker_card_parents``, the creator-of edges alone,
-    read as an undirected graph so a cycle the image's dependency repair
-    leaves does not split a lineage):
+    read as an undirected graph so no cycle splits a lineage):
     a sibling card's own first attempt is not a retry of another card's
     refusal, but a child card the refused worker files to do the write is,
     and the reason names each lineage by its smallest card id. Written for

@@ -234,6 +234,32 @@ def test_a_pull_request_body_written_and_submitted_in_one_call_is_content():
     ]
 
 
+def test_scripts_written_by_echo_or_printf_and_passthrough_behind_global_flags():
+    assert segments("echo 'kubectl scale deploy x --replicas=3' > /tmp/run.sh && bash /tmp/run.sh") == [
+        "kubectl scale deploy x --replicas=3",
+        "echo 'kubectl scale deploy x --replicas=3' > /tmp/run.sh",
+        "bash /tmp/run.sh",
+    ]
+    assert segments("printf '%s\\n' 'kubectl scale deploy x --replicas=3' > /tmp/run && bash /tmp/run")[:2] == [
+        "%s\\n",
+        "kubectl scale deploy x --replicas=3",
+    ]
+    assert segments("echo 'kubectl scale deploy x --replicas=3' | tee /tmp/run.sh && bash /tmp/run.sh")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    # A note nobody runs stays a note.
+    assert segments('echo "Refused command:\nkubectl scale deployment x" > /tmp/note.txt') == [
+        'echo "Refused command:\nkubectl scale deployment x" > /tmp/note.txt'
+    ]
+    assert segments("kubectl -n kube-system exec deploy/x -- gcloud auth print-access-token")[1] == "gcloud auth print-access-token"
+    assert segments("kubectl --context c run x --image=y -- kubectl scale deploy x --replicas=3")[1] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    assert segments("kubectl --kubeconfig /tmp/kc get pods -- not a passthrough") == [
+        "kubectl --kubeconfig /tmp/kc get pods -- not a passthrough"
+    ]
+
+
 def test_prose_quotes_and_comments_are_not_commands():
     assert segments("grep -r 'kubectl apply' /opt/defaults/skills") == ["grep -r 'kubectl apply' /opt/defaults/skills"]
     assert segments('git commit -m "kube-dns: set replicas to 3 (kubectl scale was refused)"') == [

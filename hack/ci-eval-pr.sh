@@ -2539,6 +2539,10 @@ unit_cost_hint() {
     # One delegation and one forge list call. Measured on `dev-vcs3-20261001b`:
     # 173-237s a repetition over three runs, 225s the middle one.
     vcs-forge-cli-request-uses-the-verbs) echo 240 ;;
+    # Measured 13-28 minutes a repetition on a dev install while main runs
+    # the worker to its retries after the refusal (#1948); priced at the
+    # middle so it is not the last tier a deadline cut truncates.
+    stop-on-permission-refusal) echo 1200 ;;
     *) echo 200 ;;
   esac
 }

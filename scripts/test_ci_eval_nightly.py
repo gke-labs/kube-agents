@@ -291,6 +291,7 @@ class ArrayHygieneTest(unittest.TestCase):
             ("vcs-issue-resolver-triage", 1300),
             ("vcs-review-feedback-read-back", 600),
             ("vcs-spent-branch-reuse", 900),
+            ("stop-on-permission-refusal", 900),
         ):
             with self.subTest(case=case):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {case}")
