@@ -155,7 +155,7 @@ upgrade-retrospective-after-upgrade (daily 05:00 UTC as a sweep, and woken early
        ├─ (D) the stream's one ledger issue, an entry per cluster and object, where a repository is linked
        └─ posts one line per cluster to chat; names the report's path
   └─ upgrade-readiness-watch (daily; reads guards.json once the collector merges)
-       └─ its sandbox hop reads guards.json and prints each live guard in its next report
+       └─ reads guards.json (sandbox_exec.read_bytes as agent, §3.5) and prints each live guard in its next report
   └─ on demand: a question about what an upgrade did, or whether upgrades have problems,
        routed by the chat roster and the platform persona to this report; the SOP answers from
        the saved report when it is newer than the last upgrade operation, else runs the collector
@@ -203,13 +203,19 @@ pod, reads, through the sandbox hop the readiness watch uses (`sandbox_exec.run`
 itself, a `no_agent` script having no `fleet_scope` tool: on a declared install
 `fleet_scope_targets.declared_scope_targets()`, which reads the reconcile's `fleet_scope.json`
 under the agent home (`PLATFORM_AGENT_HOME`, the root the readiness watch already reaches), gives
-it the resolved projects, the same set the tool hands the SOP as `--scope-projects`; on an
-undeclared install (`None` from that call) it declines to enumerate, as the readiness watch does,
-and reads the management project plus the projects the Cluster Agent profiles' `cluster_identity`
-name, so an undeclared install's other projects are reviewed by the 05:00 sweep and the Sunday run
-rather than by the wake, and requirement 1's latency holds for declared installs and for the
-profiles' projects; the job it wakes resolves the fleet through the `fleet_scope` tool as every
-route does (§3.2). When an operation reached `DONE` at least
+it the resolved projects, the same set the tool hands the SOP as `--scope-projects`; an answer
+that carries the `declared-scope=unresolved` row (the render's answer, a carried tick, a failed
+folder, organisation or selector lookup, §3.2), or whose `projects` is empty (a render answer with
+the management project known by number), is read as handed: the watch reads the projects it has,
+logs the row as the reason the wake is partial, and the members the row stands for are reviewed
+by the 05:00 sweep or the Sunday run once the reconcile resolves them; a `ScopeRenderUnreadable`
+from the call is the tick's failure line, as the readiness watch fails closed; on an undeclared
+install (`None` from that call) it declines to enumerate, as the readiness watch does, and reads
+the management project plus the projects the Cluster Agent profiles' `cluster_identity` name, so
+an undeclared install's other projects are reviewed by the 05:00 sweep and the Sunday run rather
+than by the wake, and requirement 1's latency holds for a declared install whose scope the
+reconcile has resolved and for the profiles' projects; the job it wakes resolves the fleet through
+the `fleet_scope` tool as every route does (§3.2). When an operation reached `DONE` at least
 fifteen minutes earlier that it has not seen, marks the after-upgrade job due with the same
 `trigger_job` call the first-run stage uses, which carries a job id and nothing else, behind the
 same guard the stage puts in front of it: `trigger_job` also sets a job's `enabled` back to true,
@@ -843,9 +849,15 @@ runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
 temporary name and renamed, at 0644 whatever the writer's umask (`STORE_FILE_MODE`, set by chmod,
-since `mkstemp` makes 0600 under any umask) in store directories at 0777 (`STORE_DIR_MODE`), the
-fleet-audit report store's rule, so the uid-1000 tick, a root hand run and the watch's `agent`
-reader each read what any of them wrote;
+since `mkstemp` makes 0600 under any umask) in 0755 directories (`STORE_DIR_MODE`), and a run as
+root hands each directory and file it creates to the owner of the nearest directory that already
+existed: the fleet-audit report store's rule (`audit_report.py`'s `REPORT_DIR_MODE`,
+`REPORT_FILE_MODE` and `_adopt_owner`), which the collector carries as the sibling collectors carry
+their copies rather than importing the harness module into the sandbox run, so the uid-1000 tick
+writes after a root hand run and no login but the store's owner can replace its files, where a
+world-writable directory would have let any login on the pod do so. On a repository-linked install
+`finish` also keeps the stream's validated document under the report store; this design's own ring
+stands for what `finish` never sees, an install without a repository and the scoped runs;
 in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
 advance, and a run that dies between the guards and the ledger leaves the guards' review counts
 one ahead, which the next run's review of the same clusters raises again (the ids and first-seen
@@ -856,8 +868,9 @@ releasing its note with the recovery `finish` above; `--reset-ledger`, run by an
 operator on purpose, archives the record and lets the next run start as a first run. A run starts
 from an empty ledger on its own only when neither a ledger nor a crash record exists, and only on a
 route that may: the after-upgrade route with no full run recorded prints its no-baseline line
-instead (§3.2). The readiness watch runs on the gateway pod and reaches the file the same way it reaches
-`gcloud`, through its sandbox hop. The chat line still carries the counts and the top finding, so
+instead (§3.2). The readiness watch runs on the gateway pod and reads the file as §3.5 states,
+`sandbox_exec.read_bytes` as the `agent` principal, not the `hermes` login its `gcloud` hop uses.
+The chat line still carries the counts and the top finding, so
 a reader who never opens the file gets the verdict.
 
 ### 3.7 What the run may not do
@@ -955,7 +968,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
    selection) and `agents/platform/scripts/upgrade_retrospective_watch.py` with its `no_agent`
    entry (`*/15 * * * *`), which wakes it (§3.1); the readiness
-   watch reading `guards.json` through its sandbox hop once the collector merges; the cron README section and
+   watch reading `guards.json` as §3.5 states once the collector merges; the cron README section and
    the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
    report must classify, starting with the entries that have no passing record yet; the catalogue's
@@ -973,7 +986,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
   after the inventory scan, and its repository skip).
 - `agents/platform/scripts/upgrade_readiness_watch.py` and its test: the guards reader (reads
-  `guards.json` through the watch's sandbox hop and prints a line per live guard, §3.5).
+  `guards.json` with `sandbox_exec.read_bytes` as §3.5 states and prints a line per live guard).
 - `docs/site/src/content/docs/reference/cron-jobs.md` (generated), the autonomous-watchdogs and
   security reference pages where they enumerate the roster.
 
@@ -1030,8 +1043,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   reading run emits carrying them; an Error the after-upgrade route reported, filed at `major` by
   the next full run; an unreachable cluster and an upgrading cluster recorded without failing the
   run and without a candidate; the watch marking nothing for a paused, disabled or absent job; the after-upgrade watch's project
-  set, the declared scope's resolved projects from `fleet_scope.json`, the management project plus
-  the profiles' projects on an undeclared install, and no listing in either case; the guards
+  set, the declared scope's resolved projects from `fleet_scope.json`, an answer carrying the
+  unresolved row read as handed and logged as partial, an unreadable render the tick's failure
+  line, the management project plus the profiles' projects on an undeclared install, and no
+  listing in any case; the guards
   reader printing a guard as quoted content and one line for an absent, unreadable, over-cap or
   malformed file;
   two guards on one object re-graded together, a kept guard taking the object's new check, the
