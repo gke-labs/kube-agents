@@ -123,7 +123,7 @@ class TestTheCreateGate(unittest.TestCase):
         finally:
             guard._WAKE_TURN.reset(token)
         self.assertIsNotNone(refusal)
-        self.assertIn("wait for the person", refusal)
+        self.assertIn("when the person next writes", refusal)
 
     def test_an_unmarked_turn_is_not(self):
         self.assertIsNone(guard.refuse_create_on_wake())

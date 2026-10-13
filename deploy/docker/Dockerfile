@@ -1488,7 +1488,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # "stuck" when every slot is busy; the notifier claims `queued` (TERMINAL_KINDS,
 # never _WAKE_KINDS) and delivers it as the first line of the card's rolling
 # progress message. Runs after wake_nudge, whose two dispatcher anchors bracket
-# the stuck counter this edits, and after the four kanban_tools.py appliers
+# the stuck counter this edits, and after the five kanban_tools.py appliers
 # above, whose lines it does not share. The _WAKE_KINDS grep repeats the one in
 # the kanban-progress stage: a queued notice must never cost an LLM turn.
 # See the module docstring in deploy/docker/patches/kanban_priority.py.

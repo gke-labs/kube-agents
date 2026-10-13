@@ -142,17 +142,22 @@ check("the handler is wrapped by the wake guard", found is not None)
 
 COMPRESSED_TIP = "20261013_160000_ab12cd"
 
+# The real session store, with a compressed continuation of a front-door
+# session, read the way the wrapper reads it (through asyncio.to_thread).
+from hermes_state import SessionDB  # noqa: E402
 
-class _DB:
-    rows = {COMPRESSED_TIP: {"parent_session_id": FRONT_DOOR}, FRONT_DOOR: {"parent_session_id": None}}
-
-    def get_session(self, sid):
-        return self.rows.get(sid)
+store = SessionDB(TMP / "state.db")
+store.create_session(FRONT_DOOR, "api_server")
+store.create_session(COMPRESSED_TIP, "api_server", parent_session_id=FRONT_DOOR)
+check(
+    "the API server has the session-store accessor the walk uses",
+    asyncio.iscoroutinefunction(getattr(api.APIServerAdapter, "_ensure_session_db_async", None)),
+)
 
 
 class _Adapter2:
     async def _ensure_session_db_async(self):
-        return _DB()
+        return store
 
 
 class _Request:
@@ -228,7 +233,7 @@ try:
 finally:
     guard._WAKE_TURN.reset(token)
 check("a wake turn's create is refused", not refused.get("ok") and "refused" in json.dumps(refused), json.dumps(refused))
-check("the refusal says to wait for the person", "wait for the person" in json.dumps(refused))
+check("the refusal keeps the suggestion for the person's next message", "when the person next writes" in json.dumps(refused))
 check("a turn in another context, meanwhile, still creates", person.get("ok") is True, json.dumps(person))
 check("only that card was written", cards() == before + 1, f"cards {before} -> {cards()}")
 after = tool_create("Next question")

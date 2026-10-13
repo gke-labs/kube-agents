@@ -57,8 +57,8 @@ HANDLER_ANCHOR = (
     "OpenAICompatRoutesMixin._handle_chat_completions)\n"
 )
 HANDLER_PATCHED = (
-    "    # kube-agents patch: a wake self-post records its session as on a\n"
-    "    # wake turn until the handler returns (#2610). See\n"
+    "    # kube-agents patch: a wake self-post for a front-door session runs\n"
+    "    # as a marked turn until the handler returns (#2610). See\n"
     "    # tools/kanban_wake_guard.py.\n"
     "    _handle_chat_completions = _admit_api_agent_request(\n"
     "        _kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)\n"

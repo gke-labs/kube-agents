@@ -103,15 +103,15 @@ WAKE_REFUSAL = (
     "kanban_create refused: this turn is an automatic notification that a "
     "card finished, not a message from the person, so it can't start new "
     "work. Don't file a card from it. If you'd suggest a follow-up (a fix, a "
-    "pull request, another investigation), say so in your reply and wait for "
-    "the person to ask for it."
+    "pull request, another investigation), keep it for when the person next "
+    "writes, and wait for them to ask for it."
 )
 
 UNBLOCK_REFUSAL = (
     "kanban_unblock refused: this turn is an automatic notification that a "
     "card changed, not a message from the person, so it can't release work. "
     "If the card is waiting on a question, that question is for the person: "
-    "relay it and wait for their answer, which can unblock the card."
+    "wait for their answer, which can unblock the card."
 )
 
 #: Whether the running turn is a wake turn in a front-door session.
@@ -145,8 +145,14 @@ async def _is_front_door(adapter, session_id: str) -> bool:
                 return True
             seen.add(parent)
             current = parent
-    except Exception as exc:  # noqa: BLE001 — fail open
-        logger.debug("kanban_wake_guard: lineage of %s unreadable: %r", session_id, exc)
+    except Exception as exc:  # noqa: BLE001 — fail open, but say so
+        # Not debug: for a compressed front-door session this walk alone
+        # decides the mark, so a store that can't be read lets the wake turn
+        # file work again.
+        logger.warning(
+            "kanban_wake_guard: lineage of %s unreadable, so its wake turn runs "
+            "unguarded: %r", session_id, exc,
+        )
     return False
 
 
