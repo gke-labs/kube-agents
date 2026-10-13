@@ -449,8 +449,9 @@ the checks rest on. A failed operations listing leaves `upgrade-operation-failed
 every cluster of that project, caps every match there at `medium`, and leaves an unchanged
 cluster of that project with only the checks a re-check read backs, so `coverage_gaps` names the
 rest. A cluster whose project listing failed or whose every read failed is `unreachable` or
-`gate-failed` with the error, and a cluster upgrading now or settling (§3.2) is `gate-failed` with
-the operation as its `error`: the run read nothing on it. `candidates[]` carries one candidate per
+`gate-failed` with the error, a cluster upgrading now or settling (§3.2) is `gate-failed` with
+the operation as its `error`, and a cluster the run's read deadline left unread (§3.6) is
+`gate-failed` with the budget as its `error`: the run read nothing on it. `candidates[]` carries one candidate per
 object per run, keyed `(check, cluster, namespace, object)`; the object is the workload's
 `Kind/name` under its namespace or, with an empty namespace, `Node/<name>`, `NodePool/<pool>` or
 `Operation/<name>` (§3.4). An incident the report files this run is the object's candidate, an
@@ -626,14 +627,15 @@ quoted as the object's own text, not stated as the review's finding. A symptom t
 Warning, unclassified, rather than dropped: the report is a record of the upgrade, not only of the
 catalogue's part of it. The entries not in the table (4, 8, 9, 10, 11, 13, 16) have no symptom a
 single read identifies with confidence; they are the ones the readiness checks have to catch before
-the upgrade, and the report says so under (C) when a cluster's symptoms are unclassified. Entries 3
-and 5 joined the table from the catalogue's gap review: entry 3 is a Deployment's `Available=False`
-transition, or a StatefulSet with no ready replica, on a workload with more than one replica,
-inside one `UPGRADE_NODES` span with every pod on that pool (high; medium when the pods were in the
-zone it drained), keyed by the operation like a budget hold; entry 5 is read from the cluster
-describe and the maintenance policy, medium, and only
-once the skew has stood more than a day after the latest window close or exclusion end (while a
-window is open or an exclusion active it is an Info line).
+the upgrade, and the report says so under (C) when a cluster's symptoms are unclassified. The
+catalogue's gap table names each entry's signature in one line, entries 3 and 5 included; this
+section keeps what a cell cannot carry, their discriminators: entry 3 holds on a Deployment's
+`Available=False` transition, or a StatefulSet with no ready replica, on a workload with more than
+one replica, inside one `UPGRADE_NODES` span with every pod on that pool (high; medium when the
+pods were in the zone it drained), keyed by the operation like a budget hold; entry 5 is read
+from the cluster describe and the maintenance policy, medium, and only once the skew has stood
+more than a day after the latest window close or exclusion end (while a window is open or an
+exclusion active it is an Info line).
 
 Three incidents have no workload object, and each has an object of its own in the manifest's
 `(check, cluster, namespace, object)` identity, with an empty namespace. A node that did not come
@@ -732,7 +734,28 @@ root for its duration, and the SOP runs the collector in the foreground with the
 `timeout: 600`, the foreground maximum the fleet-audit SOPs name, never in the background. The
 budget is this design's own figure, not a sibling's precedent: the obtainability SOP runs its
 collector the same way at the same ceiling, and that collector, which reads a comparable set per
-cluster, takes 60–80 seconds on a twelve-cluster fleet. A background run was rejected for the
+cluster, takes 60–80 seconds on a twelve-cluster fleet. The collector holds its own deadline
+under that ceiling, `RUN_DEADLINE_S`, 480 seconds from the process's start with the lock wait
+included, as `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` bounds its project reads. Past the
+deadline it starts no further cluster read, finishes the reads in flight (each bounded by its own
+timeout, which the 120-second margin covers once), and writes what it read as a partial run: the
+ledger entries, guards and report of the clusters it completed; the clusters it did not reach
+held unchanged, listed under "Reads that failed" with the budget as the reason and `gate-failed`
+in the manifest with the same reason, so the run is partial and `finish` holds their findings; an
+unchanged cluster whose re-check the deadline deferred keeps its guards held with their checks
+unevaluated, as after a failed re-check read. Clusters are read in a fixed order, the cluster
+reviewed longest ago first (one never reviewed before any other), then the re-checks in the same
+order, so the tail the deadline cuts is a different one each run and a fleet whose reads do not
+fit one run is read across runs: the first run on such a fleet produces a baseline for the
+clusters it reached and the next run reaches the next, rather than the same clusters being read
+and killed every week. A run the terminal still kills, one whose in-flight reads hang past the
+margin, writes nothing and prints no exit line; the recovery `finish` below then names the saved
+report's clusters or, on a first run, the clusters the SOP lists itself from the tool's
+`collector_args`, and the first run of an undeclared install is then the case the rule cannot
+cover. Per-cluster persistence, the three files rewritten after each cluster, was rejected: the
+prune, the guards merge and the manifest are one computation over the fleet set, and a partial
+state file with a resume protocol would replace a 600-second ceiling with a format to keep. A
+background run was rejected for the
 sibling's reason and one of its own: it outlives the turn, so the SOP would have to poll for its
 end before `finish`, and a wake that starts a second run beside it is two writers past the lock.
 The lock wait is sized to fit under the budget with the run: a second run, scheduled,
@@ -785,7 +808,9 @@ one day never replace each other; each ring is pruned to the newest fourteen, th
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
 temporary name and renamed,
 in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
-advance; a ledger that cannot be parsed is set aside under a dated name and the run stops with that
+advance, and a run that dies between the guards and the ledger leaves the guards' review counts
+one ahead, which the next run's review of the same clusters raises again (the ids and first-seen
+dates are unchanged); a ledger that cannot be parsed is set aside under a dated name and the run stops with that
 as its line. While a dated crash record sits beside no ledger, every run refuses to start from empty
 and repeats that line, so the record is read rather than overwritten, a route that called `start`
 releasing its note with the recovery `finish` above; `--reset-ledger`, run by an
@@ -940,7 +965,12 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   `--cluster` outside it refused the same way, the listing on an undeclared install, and a
   listing that failed, did not name the active project, or had no active project to check it
   against (an empty one the failed case) holding every ledger project outside it;
-  `--after-upgrade` refusing `--since`; a locked-out full run exiting 0 with the lock-held line and
+  `--after-upgrade` refusing `--since`; the read deadline: a run whose clock passes
+  `RUN_DEADLINE_S` after the first review reviews no further cluster, writes the clusters it read,
+  holds the rest as `gate-failed` with the budget reason and no stale Warning, defers the
+  re-checks the same way with their guards held and their checks unevaluated, and orders reviews
+  by the ledger's last review so the next run reads the held clusters first; a locked-out full
+  run exiting 0 with the lock-held line and
   writing nothing; a
   persisting guard's candidate under the check its guard records, moved on a re-grade, with first
   seen and the review count, a cleared
@@ -1004,7 +1034,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   install's maintenance window, are starting values.
 - The 600-second foreground budget and the two-minute lock wait (§3.6) are sized on a fleet of the
   size the sibling collectors are measured on. A fleet whose full run does not fit under the budget
-  with the wait is an open question, to be settled by measurement, not by a background run.
+  is read across runs: the collector's own deadline ends the reads at 480 seconds and writes what
+  it read, the clusters it did not reach are held and read first next run, so such a fleet's
+  baseline completes over several runs rather than never. How many runs a given fleet needs is
+  the figure still to be measured, not whether it gets a report.
 - Audit-log reads (eviction 429s, admission rejections) would sharpen (B); `gcloud logging read` is
   on the allowlist, cost and scope to decide.
 - Whether a live guard should turn the readiness verdict for that cluster to `blocked`, or only
