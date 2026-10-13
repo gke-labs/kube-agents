@@ -70,7 +70,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
@@ -800,6 +800,25 @@ REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 #: How a store directory below a host spells the `/` between path segments.
 #: Kept equal to `report_status.STORE_PATH_SEPARATOR`, which reads it back.
 STORE_PATH_SEPARATOR = "%2F"
+
+# A run on an install that registers no GitOps repository: no ledger to write
+# and no repository to propose a fix to, so the run keeps its report in the
+# store under this key and says so. A GitHub owner cannot contain `_`, and a
+# first segment without a dot is never another forge's host, so the key cannot
+# name a real repository's store.
+NO_FORGE_REPO = "no_forge/local"
+NO_FORGE_STATUS = "NO_FORGE"
+NO_FORGE_MODE = "none"
+NO_FORGE_NOTE = (
+    "No forge is configured (no GitOps repository is registered in "
+    "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
+    "remediation pull request was opened. The findings are in the report store."
+)
+# The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
+NO_FORGE_WORKSPACE_PREFIX = "workspace_"
+# How many findings the chat summary names, most severe first; the store keeps
+# every one.
+NO_FORGE_SUMMARY_FINDINGS = 10
 
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
@@ -2246,10 +2265,11 @@ def declared_intent_repos(repo: str, context: list[str]) -> list[str]:
     it. `get_context_github_repos` returns a slug that is also managed, so
     without the fold the same repository would be required twice, and a
     document naming it once would read as incomplete. Compared case-folded,
-    because GitHub slugs are.
+    because GitHub slugs are. With no forge there is no GitOps repository to
+    search, so the step owes the context repositories alone.
     """
     out: list[str] = []
-    seen: set[str] = set()
+    seen: set[str] = {NO_FORGE_REPO}
     for slug in [repo, *context]:
         text = str(slug).strip()
         key = text.lower()
@@ -11729,6 +11749,37 @@ def resolve_repo(
     return gitops_workspace.resolve_repo()
 
 
+def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
+    """`resolve_repo`, or `NO_FORGE_REPO` on an install that registers no repository.
+
+    Only a managed list read as empty means no forge. A list that cannot be
+    read raises from `get_managed_repos` here as it does inside
+    `resolve_repo`, so a failed ConfigMap read is never taken for an install
+    without a forge, and neither is a `--repo` that did not resolve.
+    """
+    try:
+        return resolve_repo(audit_id=audit_id, repo=repo)
+    except RuntimeError:
+        import gitops_workspace
+
+        if (repo and str(repo).strip()) or gitops_workspace.get_managed_repos():
+            raise
+        return NO_FORGE_REPO
+
+
+def no_forge_workspace(audit_id: str) -> Path:
+    """The empty directory a run with no forge hands the collector, scrubbed by `start`.
+
+    The SOPs pass `start`'s `workspace` to the collector and write fixes into
+    it. There is no repository to clone, and no lease holds this directory, so
+    the collector reads it as the empty tree it is.
+    """
+    path = Path(SCRATCH_DIR) / f"{NO_FORGE_WORKSPACE_PREFIX}{audit_id}"
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def repo_root() -> Path:
     res = run_cmd(["git", "rev-parse", "--show-toplevel"], check=False)
     root = (res.stdout or "").strip()
@@ -14654,6 +14705,42 @@ def unsearched_intent_entries(
     return out
 
 
+def _open_ledger(
+    repo: str, audit_id: str
+) -> tuple[Path, int | None, list[str], list[dict[str, str]]]:
+    """`start`'s forge half: the workspace, the labels, and what the open ledger asks.
+
+    Returns the workspace, the open ledger issue, the pending `/remediate`
+    targets on it, and the findings it carries.
+    """
+    refresh_credentials(repo)
+    # The one place a scrub is correct: the audit has not written anything yet,
+    # so whatever is in the tree is debris from a run that did not finish.
+    root = ensure_workspace(repo, audit_id, reset=True)
+    ensure_labels(repo, audit_id)
+
+    # No branch is created or reset here. The report branch is gone: the ledger
+    # is an issue, and each remediation pull request branches off main on demand.
+    existing_issue, _, existing_body = find_existing_issue(repo, audit_id)
+
+    pending: list[str] = []
+    carried: list[dict[str, str]] = []
+    if existing_issue is not None:
+        pending = pending_remediate_targets(fetch_issue_comments(repo, existing_issue))
+        # What the ledger carries, read off the same stored body `finish` will
+        # join against. A lost memory prints an empty list and says so on
+        # stderr (read_report_memory logs it); `finish` then holds nothing, by
+        # the same rule the delta applies.
+        memory = previous_run_memory(audit_id, existing_issue, repo, existing_body)
+        carried = [
+            {"id": fid, "check": fid.split(".", 1)[0], **where}
+            for fid, where in sorted(
+                parse_finding_locations(str((memory or {}).get("ledger_body") or "")).items()
+            )
+        ]
+    return root, existing_issue, pending, carried
+
+
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     claim_in_flight(audit_id)
@@ -14685,32 +14772,15 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
             stale.unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
-    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
-    refresh_credentials(repo)
-    # The one place a scrub is correct: the audit has not written anything yet,
-    # so whatever is in the tree is debris from a run that did not finish.
-    root = ensure_workspace(repo, audit_id, reset=True)
-    ensure_labels(repo, audit_id)
-
-    # No branch is created or reset here. The report branch is gone: the ledger
-    # is an issue, and each remediation pull request branches off main on demand.
-    existing_issue, _, existing_body = find_existing_issue(repo, audit_id)
-
-    pending: list[str] = []
-    carried: list[dict[str, str]] = []
-    if existing_issue is not None:
-        pending = pending_remediate_targets(fetch_issue_comments(repo, existing_issue))
-        # What the ledger carries, read off the same stored body `finish` will
-        # join against. A lost memory prints an empty list and says so on
-        # stderr (read_report_memory logs it); `finish` then holds nothing, by
-        # the same rule the delta applies.
-        memory = previous_run_memory(audit_id, existing_issue, repo, existing_body)
-        carried = [
-            {"id": fid, "check": fid.split(".", 1)[0], **where}
-            for fid, where in sorted(
-                parse_finding_locations(str((memory or {}).get("ledger_body") or "")).items()
-            )
-        ]
+    repo = resolve_repo_or_no_forge(audit_id, opt_repo)
+    no_forge = repo == NO_FORGE_REPO
+    if no_forge:
+        # The checks still run; only the ledger and the fixes have nowhere to go.
+        log(f"NO FORGE: {NO_FORGE_NOTE}")
+        root = no_forge_workspace(audit_id)
+        existing_issue, pending, carried = None, [], []
+    else:
+        root, existing_issue, pending, carried = _open_ledger(repo, audit_id)
 
     try:
         os.makedirs(SCRATCH_DIR, exist_ok=True)
@@ -14746,7 +14816,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
         json.dumps(
             {
                 "issue": existing_issue,
-                "repo": repo,
+                "repo": None if no_forge else repo,
                 # Which mechanism will publish the fixes. It changes one thing
                 # the agent can see — in `content` mode the workspace is a
                 # scratch directory rather than a checkout, so there is nothing
@@ -14754,8 +14824,10 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                 # does. Reported rather than inferred: the agent cannot see the
                 # broker's configuration, and guessing from the absence of a
                 # `.git` is the kind of inference that reads a failed clone as
-                # a mode switch.
-                "mode": "content" if content_mode() else "directory",
+                # a mode switch. `none` is an install with no forge: nothing
+                # publishes the fixes, and the workspace is empty.
+                "mode": NO_FORGE_MODE if no_forge else ("content" if content_mode() else "directory"),
+                **({"no_forge": NO_FORGE_NOTE} if no_forge else {}),
                 # Where this stream's workspace actually is. The agent does not
                 # start in one and cannot guess this — the path carries a lease
                 # segment, and it is private to this audit, so a manifest
@@ -15823,6 +15895,172 @@ def handle_remediate(args: argparse.Namespace) -> None:
     )
 
 
+def previous_no_forge_ids(audit_id: str) -> list[str] | None:
+    """The finding ids the previous run with no forge stored; None when unknowable.
+
+    `[]` when the store has never held this stream's no-forge reports: the run
+    is first, and everything it finds is new. There is no public ledger to hold
+    the record against, so `latest.json` is trusted on its own when a run with
+    no forge wrote it for this key under this id scheme. A directory without a
+    readable `latest.json` is a write that failed (`write_report` drops the
+    file then), so the delta is unknown rather than empty.
+    """
+    directory = reports_dir_for(audit_id, NO_FORGE_REPO)
+    if not directory.exists():
+        return []
+    try:
+        envelope = json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log(f"WARNING: no readable report store record for {audit_id} ({exc}); {MEMORY_UNKNOWABLE}")
+        return None
+    ids = envelope.get("current_ids") if isinstance(envelope, dict) else None
+    if (
+        not isinstance(ids, list)
+        or envelope.get("status") != NO_FORGE_STATUS
+        or _ledger_key(envelope.get("repo")) != _ledger_key(NO_FORGE_REPO)
+        or envelope.get("id_scheme") != ID_SCHEME
+    ):
+        log(
+            f"WARNING: the report store record for {audit_id} was not written by a "
+            f"run with no forge under id scheme {ID_SCHEME}; {MEMORY_UNKNOWABLE}"
+        )
+        return None
+    return [str(fid) for fid in ids]
+
+
+def render_no_forge_summary(
+    audit_id: str,
+    data: dict,
+    gaps: list[str],
+    new_ids: list[str],
+    resolved_ids: list[str],
+    delta_known: bool,
+) -> str:
+    """The chat summary of a run with no forge, which is the only report its operator gets.
+
+    The headline counts, the most severe findings up to
+    `NO_FORGE_SUMMARY_FINDINGS`, the coverage gaps, and the note that says
+    why nothing was published. Redacted like the ledger body, because it is
+    delivered to a channel the same way.
+    """
+    findings = list(data.get("findings") or [])
+    clusters = len((data.get("scope") or {}).get("clusters") or [])
+    counts = severity_counts(findings)
+    delta = (
+        f"; {len(new_ids)} new, {len(resolved_ids)} resolved since the last run"
+        if delta_known
+        else "; the change since the last run is unknown"
+    )
+    lines = [
+        f"{audit_name(audit_id)}: {findings_phrase(len(findings))} "
+        f"({counts['critical']} critical) across {clusters} cluster(s){delta}."
+    ]
+    rank = {severity: index for index, severity in enumerate(SEVERITIES)}
+    ordered = sorted(findings, key=lambda f: rank.get(str(f.get("severity")), len(SEVERITIES)))
+    for finding in ordered[:NO_FORGE_SUMMARY_FINDINGS]:
+        where = "/".join(
+            part for part in (str(finding.get("cluster") or ""), str(finding.get("namespace") or "")) if part
+        )
+        lines.append(
+            f"- [{finding.get('severity')}] {redact_secrets(str(finding.get('title') or ''))} ({where})"
+        )
+    if len(ordered) > NO_FORGE_SUMMARY_FINDINGS:
+        lines.append(f"- and {len(ordered) - NO_FORGE_SUMMARY_FINDINGS} more in the report store")
+    if gaps:
+        lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
+    lines.append(NO_FORGE_NOTE)
+    return "\n".join(lines)
+
+
+def _finish_without_forge(
+    audit_id: str,
+    data: dict,
+    now: datetime,
+    *,
+    manifest: dict | None,
+    waiver: str,
+    timers: Callable[[], dict],
+) -> None:
+    """Keep a run on an install with no forge in the report store, and print its line.
+
+    Everything `finish` does with a ledger is skipped: the issue, its delta
+    comment, the held set, the remediation sweep and the stale closes all need
+    a repository. The checks still ran, so the delta is taken against the
+    previous no-forge envelope and the JSON line carries a `summary` for the
+    run to deliver to chat. A document `finish` would refuse is refused the
+    same way, since validation runs before this.
+    """
+    findings = list(data["findings"])
+    declared = [entry for entry in data.get("declared") or [] if isinstance(entry, dict)]
+    gaps = coverage_gaps(data) + ([waiver_gap(waiver)] if waiver else [])
+    for gap in gaps:
+        log(f"COVERAGE GAP: {gap}")
+    accounted = findings + postures_withheld(data) + declared
+    unpublished = unpublished_candidates(accounted, manifest)
+    wholly_dropped = wholly_unpublished_checks(accounted, manifest)
+    current_ids = finding_ids(findings)
+    previous_ids = previous_no_forge_ids(audit_id)
+    delta_known = previous_ids is not None
+    new_ids = sorted(set(current_ids) - set(previous_ids or []))
+    # Over a coverage gap an absence means "not checked", not fixed.
+    resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(current_ids))
+    if not delta_known:
+        new_ids, resolved_ids = [], []
+    payload = {
+        "status": NO_FORGE_STATUS,
+        "issue_url": None,
+        "new": len(new_ids),
+        "resolved": len(resolved_ids),
+        "prs_opened": [],
+        "prs_still_open": [],
+        "prs_closed": [],
+        # The findings branch's rule: quiet only when nothing changed and the
+        # run could vouch for what it saw.
+        "silent_ok": not (
+            not delta_known or new_ids or resolved_ids or gaps or unpublished or wholly_dropped
+        ),
+        "partial": bool(gaps),
+        "coverage_gaps": gaps,
+        "declared": len(declared),
+        POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
+        UNACCOUNTED_KEY: [],
+        **(
+            {
+                UNPUBLISHED_CANDIDATES_KEY: unpublished,
+                WHOLLY_UNPUBLISHED_CHECKS_KEY: wholly_dropped,
+                UNCORROBORATED_FINDINGS_KEY: sorted(uncorroborated_findings(findings, manifest)),
+            }
+            if manifest is not None
+            else {}
+        ),
+        "findings": len(findings),
+        "critical": severity_counts(findings)["critical"],
+        "no_forge": NO_FORGE_NOTE,
+        "summary": render_no_forge_summary(
+            audit_id, data, gaps, new_ids, resolved_ids, delta_known
+        ),
+        **timers(),
+    }
+    write_report(
+        audit_id,
+        report_envelope(
+            audit_id,
+            payload,
+            data,
+            now,
+            repo=NO_FORGE_REPO,
+            issue_number=None,
+            ledger_body="",
+            new_ids=new_ids,
+            resolved_ids=resolved_ids,
+            rendered_ids=current_ids,
+            delta_known=delta_known,
+        ),
+        now,
+    )
+    print(json.dumps(payload))
+
+
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     if getattr(args, "dry_run", False):
@@ -15969,7 +16207,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # called from. The real run knows which repository it is finishing and
     # holds the record to it; a dry run resolves nothing and compares only
     # when `--repo` was given.
-    repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    repo_hint = opt_repo if args.dry_run else resolve_repo_or_no_forge(audit_id, opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
     # Before the dry-run split, so that the preview and the real run publish
     # the same words. After `adopt_collector_evidence`, which makes the
@@ -16040,6 +16278,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         return
 
     repo = repo_hint
+    if repo == NO_FORGE_REPO:
+        _finish_without_forge(
+            audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload
+        )
+        return
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)

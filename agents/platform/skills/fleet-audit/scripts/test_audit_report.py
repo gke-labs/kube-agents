@@ -24997,5 +24997,145 @@ class TestManifestRemediationLinks(HarnessTestCase):
             self.assertNotIn("refreshed", out["b"])
 
 
+class TestNoForge(BaseTestCase):
+    """An install that registers no GitOps repository still runs its audits (#2419)."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        # Any git or forge call fails the test: a run with no forge has none to make.
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        for patcher in (
+            patch("gitops_workspace.get_managed_repos", return_value=[]),
+            patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
+            patch.dict(sys.modules, {"github_token_refresh": no_remote}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def store(self):
+        return self.reports_dir / AUDIT / "no_forge" / "local"
+
+    def start(self):
+        code = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def finish(self, doc):
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_start_hands_over_an_empty_workspace_and_says_no_forge(self):
+        workspace = Path(audit_report.SCRATCH_DIR) / f"workspace_{AUDIT}"
+        workspace.mkdir(parents=True)
+        (workspace / "leftover.yaml").write_text("kind: Namespace\n", encoding="utf-8")
+
+        out = self.start()
+
+        self.assertIsNone(out["repo"])
+        self.assertIsNone(out["issue"])
+        self.assertEqual(out["mode"], audit_report.NO_FORGE_MODE)
+        self.assertEqual(out["no_forge"], audit_report.NO_FORGE_NOTE)
+        self.assertEqual(out["workspace"], str(workspace))
+        self.assertEqual(list(workspace.iterdir()), [])
+        self.assertEqual(out[audit_report.DECLARED_INTENT_REPOS_KEY], [])
+        self.assertIn("NO FORGE:", self.err)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_an_unreadable_repository_list_is_not_taken_for_no_forge(self):
+        with patch(
+            "gitops_workspace.get_managed_repos",
+            side_effect=RuntimeError("Failed to read ConfigMap platform-agent-gitops-state"),
+        ):
+            code = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(code, 1)
+        self.assertIn("Failed to read ConfigMap", self.err)
+        self.assertEqual(self.out, "")
+
+    def test_finish_stores_the_findings_and_prints_a_summary(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+
+        out = self.finish(doc)
+
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertIsNone(out["issue_url"])
+        self.assertEqual((out["findings"], out["critical"], out["new"]), (4, 2, 4))
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual(out["prs_opened"], [])
+        summary = out["summary"].splitlines()
+        self.assertTrue(summary[0].startswith(audit_report.audit_name(AUDIT)))
+        self.assertIn("4 findings (2 critical) across 2 cluster(s); 4 new, 0 resolved", summary[0])
+        # Most severe first.
+        self.assertEqual(
+            [line.split("] ", 1)[1].split(" (")[0] for line in summary[1:5]],
+            ["Crit one", "Crit two", "Major one", "Minor one"],
+        )
+        self.assertEqual(summary[-1], audit_report.NO_FORGE_NOTE)
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["status"], audit_report.NO_FORGE_STATUS)
+        self.assertEqual(latest["repo"], audit_report.NO_FORGE_REPO)
+        self.assertIsNone(latest["issue_number"])
+        self.assertEqual(len(latest["current_ids"]), 4)
+        self.assertEqual(len(latest["document"]["findings"]), 4)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_the_delta_runs_against_the_previous_no_forge_report(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.finish(doc)
+
+        unchanged = self.finish(doc)
+        self.assertEqual((unchanged["new"], unchanged["resolved"]), (0, 0))
+        self.assertTrue(unchanged["silent_ok"])
+
+        fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+        self.assertFalse(fixed["silent_ok"])
+
+    def test_an_unreadable_record_makes_the_delta_unknown(self):
+        self.finish(make_doc())
+        (self.store() / "latest.json").write_text("{", encoding="utf-8")
+
+        out = self.finish(make_doc())
+
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertFalse(out["silent_ok"])
+        self.assertIn("unknown", out["summary"].splitlines()[0])
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertFalse(latest["delta_known"])
+
+    def test_a_coverage_gap_claims_nothing_resolved(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+
+        out = self.finish(make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}]))
+
+        self.assertEqual(out["resolved"], 0)
+        self.assertTrue(out["partial"])
+        self.assertIn("Coverage is incomplete", out["summary"])
+
+    def test_postures_are_not_withheld_for_a_repository_that_does_not_exist(self):
+        doc = make_doc()
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+
+        out = self.finish(doc)
+
+        self.assertEqual(out[audit_report.POSTURES_WITHHELD_KEY], [])
+        self.assertEqual(out["findings"], 1)
+        self.assertFalse(out["partial"])
+
+    def test_the_report_readers_find_the_store(self):
+        self.finish(make_doc())
+        import report_status
+
+        dirs, unreadable = report_status.scan_repo_dirs(str(self.reports_dir), AUDIT)
+        self.assertEqual((dirs, unreadable), ([audit_report.NO_FORGE_REPO], []))
+
+
 if __name__ == "__main__":
     unittest.main()

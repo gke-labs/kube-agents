@@ -45,6 +45,17 @@ run whose repository fails that stores nothing. The path is lower-cased, because
 not case-sensitive: an on-demand `--repo Acme/GitOps` and a ConfigMap's `acme/gitops` are one
 ledger, and two directories for it would each trust a memory the other had moved past.
 
+An install that registers no GitOps repository has no ledger to publish to, and the store is then
+the only record of the run. `start` and `finish` take that install from a managed list read as
+empty, never from one that could not be read. `finish` validates the document as usual, skips every
+forge step, and writes the envelope under the reserved directory `no_forge/local` with `status:
+NO_FORGE`, `issue_number: null` and an empty `ledger_body`. No GitHub owner contains `_`, and a
+first segment without a dot is never another forge's host, so the key cannot name a real
+repository's store. With no public body to check it against, the next no-forge run trusts that
+`latest.json` on its own (its `status`, `repo` and `id_scheme`) and takes the delta from its
+`current_ids`. A missing directory is a first run, and a directory without a readable `latest.json`
+is a lost memory, as in §4.
+
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,

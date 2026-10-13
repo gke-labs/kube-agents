@@ -181,7 +181,8 @@ Before inspecting anything, claim the workspace:
 ```
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), makes
+configured repo in `$GITOPS_STATE_CONFIGMAP`, failing if ambiguous across multiple repos, and
+running with no forge when none is registered — see [No forge configured](#no-forge-configured)), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
@@ -239,6 +240,7 @@ manual one, or, for a fix the sweep would open, `finish` refuses until it is the
 
 `mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
 workspace is empty rather than a checkout. Read it rather than guessing from what is on disk.
+`mode: "none"` means no forge is configured; see [No forge configured](#no-forge-configured).
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
@@ -442,6 +444,9 @@ gives its `started_at` and `finished_at`. A timer without its input is absent. T
   comments could not be read, so a `/remediate` may be standing unanswered there (stderr says
   `comments could not be read`). Not a clean result; report it as
   [The clean run](#the-clean-run) says.
+- `{"status":"NO_FORGE","issue_url":null,…,"findings":4,"critical":2,"no_forge":"…","summary":"…"}`
+  — no forge is configured, so nothing was published; see
+  [No forge configured](#no-forge-configured).
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
@@ -517,6 +522,27 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 
 A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
 and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
+
+### No forge configured
+
+An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (and no `--repo`) has
+no forge to write a ledger to. The audit runs anyway:
+
+- `start` prints `"mode": "none"`, `"repo": null`, `"issue": null`, a `no_forge` note, and an empty
+  `workspace`. Pass that `workspace` to the collector as the SOP says. There is no repository, so
+  `declared_intent_repos` lists only `context_repos`, and `fetch`, `list`, `grep` and `remediate`
+  have nothing to act on: do not run them.
+- Run every check as the SOP says and write the findings document as usual. A `manifest`
+  remediation is still a valid way to describe a fix, but nothing opens it as a pull request.
+- `finish` validates the document as usual, then writes it to the report store instead of a ledger
+  and prints `status: "NO_FORGE"`, `issue_url: null`, `new` and `resolved` against the previous
+  no-forge run, `findings`, `critical`, the `no_forge` note, and `summary`.
+
+**Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
+does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
+`[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
+names the findings, the coverage gaps, and that no forge is configured. Do not report the run as
+failed, and do not invent an issue URL.
 
 ## The findings document
 

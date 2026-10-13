@@ -255,6 +255,11 @@ FIXTURE_NOT_READY = {
         "project's id at the case's two sites: the command check's first forbidden "
         "pattern and the ledger check's forbidden phrase"
     ),
+    "fleet-audit-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
         "service account can read, declared in the install's spec.scope.projects (or an "
@@ -396,6 +401,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    # No field: "this run's report is in the store" is the assertion, and
+    # `status` and `required_finding_phrases` only narrow it.
+    "audit_report_stored": (),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
