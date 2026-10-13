@@ -700,15 +700,19 @@ class VcsRequestCountingTest(_BrokerFixture):
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
-    def vcs_count(self, verb, status):
-        """The series' value, waiting briefly: the outcome is recorded after the
-        response is written, so a scrape right behind the answer can precede it."""
+    def assert_vcs_count(self, verb, status, expected=1, msg=None):
+        """Assert the series reaches `expected`, polling first: the outcome is
+        recorded after the response is written, so a scrape right behind the
+        answer can precede the increment, and a series that already exists from
+        an earlier request reads one short. At the deadline the assertion fails
+        with the last value seen, so a miscount still names the real number."""
         deadline = time.monotonic() + 2.0
         while True:
             count = _series(self.families(), "kubeagents_vcs_requests_total", verb=verb, status=status)
-            if count is not None or time.monotonic() > deadline:
-                return count
+            if count == expected or time.monotonic() > deadline:
+                break
             time.sleep(0.02)
+        self.assertEqual(expected, count, msg)
 
     @contextlib.contextmanager
     def vcs_route(self, verb, fn):
@@ -723,18 +727,18 @@ class VcsRequestCountingTest(_BrokerFixture):
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
             status, _ = self.post_vcs("proposal-create", {"repository": "github:example.com/o/r"})
         self.assertEqual(200, status)
-        self.assertEqual(1, self.vcs_count("proposal-create", "success"))
+        self.assert_vcs_count("proposal-create", "success")
 
     def test_an_underscored_verb_counts_under_the_hyphenated_name(self):
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
             self.post_vcs("proposal_create")
-        self.assertEqual(1, self.vcs_count("proposal-create", "success"))
+        self.assert_vcs_count("proposal-create", "success")
 
     def test_an_unknown_verb_counts_as_other_and_blocked_and_is_never_named(self):
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
             status, _ = self.post_vcs("secret-verb-from-caller")
         self.assertEqual(404, status)
-        self.assertEqual(1, self.vcs_count("other", "blocked"))
+        self.assert_vcs_count("other", "blocked")
         self.assertNotIn("secret-verb", CredentialProxyHandler.metrics.render())
 
     def test_a_forge_fault_counts_as_error(self):
@@ -744,7 +748,7 @@ class VcsRequestCountingTest(_BrokerFixture):
         with self.vcs_route("proposal-create", failing):
             status, _ = self.post_vcs("proposal-create")
         self.assertEqual(500, status)
-        self.assertEqual(1, self.vcs_count("proposal-create", "error"))
+        self.assert_vcs_count("proposal-create", "error")
 
     def test_an_unmanaged_repository_counts_as_blocked(self):
         def refused(payload):
@@ -753,7 +757,7 @@ class VcsRequestCountingTest(_BrokerFixture):
         with self.vcs_route("proposal-create", refused):
             status, _ = self.post_vcs("proposal-create")
         self.assertEqual(403, status)
-        self.assertEqual(1, self.vcs_count("proposal-create", "blocked"))
+        self.assert_vcs_count("proposal-create", "blocked")
 
     def test_a_broker_at_its_cap_counts_as_busy(self):
         @contextlib.contextmanager
@@ -767,7 +771,7 @@ class VcsRequestCountingTest(_BrokerFixture):
         ):
             status, _ = self.post_vcs("proposal-list")
         self.assertEqual(503, status)
-        self.assertEqual(1, self.vcs_count("proposal-list", "busy"))
+        self.assert_vcs_count("proposal-list", "busy")
 
     def test_a_repository_field_that_cannot_be_read_counts_as_error_and_an_unserved_host_as_blocked(self):
         # The exceptions `registry.resolve` raises: an unreadable field, an
@@ -789,7 +793,7 @@ class VcsRequestCountingTest(_BrokerFixture):
                 got, _ = self.post_vcs("proposal-list", {"repository": "nonsense"})
             self.assertEqual(status, got)
             counted[want] = counted.get(want, 0) + 1
-            self.assertEqual(counted[want], self.vcs_count("proposal-list", want), (status, want))
+            self.assert_vcs_count("proposal-list", want, counted[want], (status, want))
 
     def test_a_caller_that_leaves_the_queue_counts_as_abandoned(self):
         @contextlib.contextmanager
@@ -804,7 +808,7 @@ class VcsRequestCountingTest(_BrokerFixture):
             # Nothing is written back, so the client sees the connection close.
             with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
                 self.post_vcs("proposal-list")
-        self.assertEqual(1, self.vcs_count("proposal-list", "abandoned"))
+        self.assert_vcs_count("proposal-list", "abandoned")
 
     def test_an_unreadable_managed_list_counts_as_error_not_blocked(self):
         broker = mock.Mock()
@@ -817,7 +821,7 @@ class VcsRequestCountingTest(_BrokerFixture):
             status, body = self.post_vcs("proposal-list", {"repository": "o/r"})
         self.assertEqual(503, status)
         self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", body["code"])
-        self.assertEqual(1, self.vcs_count("proposal-list", "error"))
+        self.assert_vcs_count("proposal-list", "error")
         self.assertIsNone(_series(self.families(), "kubeagents_vcs_requests_total", verb="proposal-list", status="blocked"))
 
     def test_every_label_value_is_from_the_closed_vocabularies(self):
@@ -825,7 +829,7 @@ class VcsRequestCountingTest(_BrokerFixture):
             self.post_vcs("proposal-create")
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
             self.post_vcs("nope")
-        self.vcs_count("other", "blocked")
+        self.assert_vcs_count("other", "blocked")
         for labels in self.families()["kubeagents_vcs_requests_total"]:
             pairs = dict(labels)
             self.assertIn(pairs["verb"], credential_proxy.vcs_broker.VCS_VERBS | {credential_proxy.LABEL_OTHER})
