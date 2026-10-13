@@ -292,6 +292,17 @@ _HALT_SUFFIX = (
     "Write up what you already have and call `kanban_complete`, or call "
     "`kanban_block` if what you have is genuinely unusable.]"
 )
+# The halt hermes_cli/permission_refusal_stop.py raises: the tool is not
+# exhausted, the change is refused, and the card closes with that fact.
+PERMISSION_REFUSAL_HALT_CODE = "permission_refusal_halt"
+_REFUSAL_HALT_SUFFIX = (
+    "\n\n[System: the command policy refused this change — a permission "
+    "boundary, not an error to work around. Do not try another "
+    "route and do not start a pull request. Call "
+    "`kanban_block(kind=\"needs_input\", reason=...)` now with what was refused, "
+    "quoting the policy's message, and a note that the change can be proposed "
+    "as a pull request if the requester wants one.]"
+)
 
 
 def guardrail_halt_nudge(build_nudge, *, messages, attempts, decision):
@@ -314,6 +325,8 @@ def guardrail_halt_nudge(build_nudge, *, messages, attempts, decision):
         return None
     tool = getattr(decision, "tool_name", None) or "that tool"
     code = getattr(decision, "code", None) or "tool guardrail"
+    if code == PERMISSION_REFUSAL_HALT_CODE:
+        return base + _REFUSAL_HALT_SUFFIX
     return base + _HALT_SUFFIX.format(tool=tool, code=code)
 
 

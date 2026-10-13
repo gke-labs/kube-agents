@@ -239,6 +239,17 @@ context_file_max_chars: 100000
 tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
+  # Definitive permission refusals (the command policy's kubernetes.read-only
+  # rule) in one run before the runtime halts it
+  # (deploy/docker/patches/permission_refusal_stop.py).
+  # The policy's notice says the change is refused however it is attempted, so
+  # the first one ends the run with the refusal on the board instead of the
+  # workaround hunt #1943 describes; live runs showed the model reading the
+  # guidance a lower tier appends and going on investigating. A higher value
+  # restores that guidance tier. API 403s are not counted: an audit meets
+  # them on projects it may not read and continues; nor are gcp.read-only
+  # refusals, whose allowlist refuses an unlisted read with the same notice.
+  permission_refusal_halt_after: 1
 
 # Shared memory, read-only.
 #

@@ -1288,6 +1288,24 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # X-Hermes-Failure-Reason. See the module docstring in
 # deploy/docker/patches/apply_api_failure_reason_header.py.
 #
+# permission_refusal_stop rides it too (#1946, #1943): a worker refused a write
+# by the command policy kept trying the change another way until its step
+# budget ran out; the stock loop guardrails count identical retries and reset on
+# any success, so they never fired. One insert at the top of
+# ToolCallGuardrailController.after_call classifies every tool result: a
+# definitive policy refusal (kubernetes.read-only's, which admits every read
+# verb, with the action boundary notice) is counted across the turn and halts
+# on the configured one
+# (tool_loop_guardrails.permission_refusal_halt_after, default 1, read by a
+# second insert in ToolCallGuardrailConfig.from_mapping; below it a refusal
+# only appends guidance). The halt leaves through kanban_guardrail_exit's
+# nudge, which names the refusal and the board call, and a third insert in
+# run_agent.py makes it a chat turn's reply. An API 403, and gcp.read-only's
+# refusal (an allowlist that refuses unlisted reads with the same notice), only
+# warn, so a fleet audit goes on past a project it may not read or a read the
+# list lacks. See
+# the module docstring in deploy/docker/patches/permission_refusal_stop.py.
+#
 # ssh_shared_master rides it too (#2174): every working environment in the pod
 # shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it when a
 # worker process that had run a command exited normally, cutting any sibling's
@@ -1299,6 +1317,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
+     deploy/docker/patches/permission_refusal_stop.py \
      /opt/hermes/hermes_cli/
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
@@ -1315,6 +1334,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/apply_ssh_shared_master.py \
      deploy/docker/patches/verify_ssh_shared_master.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
+     deploy/docker/patches/apply_permission_refusal_stop.py \
+     deploy/docker/patches/verify_permission_refusal_stop.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1324,8 +1345,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_permission_refusal_stop.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
+    grep -q "_kube_observe_refusal(" /opt/hermes/agent/tool_guardrails.py && \
+    grep -q "kube_permission_refusal_halt_after" /opt/hermes/agent/tool_guardrails.py && \
+    grep -q 'decision.code == "permission_refusal_halt"' /opt/hermes/run_agent.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
     grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/turn_api_error.py && \
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
@@ -1344,6 +1369,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_permission_refusal_stop.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
