@@ -84,7 +84,7 @@ class RelayProbeTest(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.shutdown)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
-        self.report = (STACK / "report.md").read_text()
+        self.report = (STACK / "report.txt").read_text()
 
     def probe(self, *args, key=KEY):
         env = {k: v for k, v in os.environ.items() if k != "SESSION_KV_API_KEY"}

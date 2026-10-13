@@ -37,7 +37,7 @@ REPO = Path(__file__).resolve().parents[2]
 TASK = REPO / "bench" / "tasks" / "chat-relay-posts-report-as-written" / "task.yaml"
 STACK = REPO / "bench" / "tf" / "prebuilt" / "relay-report"
 POSTED_AT = datetime(2026, 10, 13, 18, 0, 0, tzinfo=timezone.utc)
-REPORT = (STACK / "report.md").read_text().strip()
+REPORT = (STACK / "report.txt").read_text().strip()
 DAY_SESSION = "cron-platform-bench-relay-probe-20261013"
 DELIVERED = {"status": "delivered", "session_id": DAY_SESSION, "relay": "ok", "relay_detail": ""}
 

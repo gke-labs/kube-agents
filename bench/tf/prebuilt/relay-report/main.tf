@@ -16,14 +16,14 @@
 # one scheduled report to the chat relay, the way every `deliver: "chat"` job's
 # report reaches it, and record what the relay answered.
 #
-# relay_probe.py (beside this file) POSTs report.md to the Session KV server's
+# relay_probe.py (beside this file) POSTs report.txt to the Session KV server's
 # /v1/cron-reports on loopback in the agent container: the call the scheduler's
 # relay plugin makes (deploy/docker/plugins/chat/adapter.py). The route posts to
 # every enabled chat platform and stores what it posted against the thread; the
 # verifier reads that back. The call is synchronous, so the apply returns once
 # the relay has answered.
 #
-# report.md is modelled on the fleet-wide-cost-analysis report that
+# report.txt is modelled on the fleet-wide-cost-analysis report that
 # toshiowang-gkedemos3's relay turn answered with a kanban card and a one-line
 # reply on 2026-10-08 (gke-labs/kube-agents#2742). The workload it names does
 # not exist, so a card an image's relay turn files sends a specialist after
@@ -49,7 +49,7 @@ locals {
   hermes     = "/opt/hermes/.venv/bin/hermes"
   python     = "/opt/hermes/.venv/bin/python3"
   probe_b64  = base64encode(file("${path.module}/relay_probe.py"))
-  report_b64 = base64encode(file("${path.module}/report.md"))
+  report_b64 = base64encode(file("${path.module}/report.txt"))
   # The Session KV server's loopback address in the agent pod
   # (deploy/docker/plugins/chat/adapter.py, DEFAULT_RELAY_URL).
   session_kv_url = "http://127.0.0.1:8699" # sanitizer: allow the agent pod's own loopback, where the Session KV server listens
