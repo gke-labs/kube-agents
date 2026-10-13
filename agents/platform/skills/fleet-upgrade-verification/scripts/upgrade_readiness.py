@@ -43,7 +43,7 @@ import re
 from datetime import datetime, time, timedelta, timezone
 
 import readiness_rules
-from readiness_rules import audit_log, zonal_control_plane
+from readiness_rules import audit_log, capacity, container_runtime, dataplane, intree_volumes, zonal_control_plane
 from readiness_rules import finding as finding_tiers  # the tier vocabulary; `finding` itself names a loop variable below
 
 # Per-member verdicts. `blocked` when any rule blocks; `unknown` when a rule could not be
@@ -391,7 +391,11 @@ RULE_NONE = "no rules"
 # this order, which is the order the table and the JSON list their findings in. One list,
 # grouped by entry number, the entry in the comment.
 EXTRA_RULES = [
+    capacity,  # entry 2
     zonal_control_plane,  # entry 11
+    container_runtime,  # entry 13
+    dataplane,  # entry 16
+    intree_volumes,  # entry 19
 ]
 RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own
