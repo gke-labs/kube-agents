@@ -596,6 +596,7 @@ def test_the_declaration_waives_only_the_trajectory(no_tool_spec, make_run, muta
     )
     assert verdict.rung is Rung.NOT_A_REAL_RUN
     assert needle in verdict.reason
+    assert "trajectory is empty" not in verdict.reason
 
 
 def test_an_undeclared_case_still_blocks_a_reply_with_no_tool_calls(noop_spec, make_run):
