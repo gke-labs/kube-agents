@@ -205,21 +205,32 @@ through the credential proxy, the entrypoint rewrites those two entries in every
 `config.yaml` (and the platform profile's, when it is the front door) to the proxy's relay. An
 earlier release's entrypoint repairs only the User-Agent header in them, so after a rollback across
 that change each Cluster Agent's two servers name a relay address the older operator never sets,
-and every call to them fails. Put the two entries back from the rolled-back image's own template,
-keeping the rest of each file, from the gateway's `platform-agent` container:
+and every call to them fails. Put the two entries back from the rolled-back image's own templates,
+keeping the rest of each file, from the gateway's `platform-agent` container. The command covers
+every cluster profile and, when the platform profile is the front door, that one too:
 
 ```sh
 python3 - <<'PY'
 import glob, os, yaml
-template = yaml.safe_load(open("/opt/cluster-template/config.yaml"))
-for path in glob.glob("/opt/data/profiles/cluster-*/config.yaml"):
+home = os.environ.get("PLATFORM_AGENT_HOME", "/opt/data")
+targets = [(path, "/opt/cluster-template/config.yaml")
+           for path in glob.glob(f"{home}/profiles/cluster-*/config.yaml")]
+if os.environ.get("HERMES_GATEWAY_PROFILE") == "platform":
+    targets.append((f"{home}/profiles/platform/config.yaml", "/opt/platform-template/config.yaml"))
+for path, template_path in targets:
+    template = yaml.safe_load(open(template_path))
     live = yaml.safe_load(open(path))
     for name in ("gke", "developer_knowledge"):
-        live["mcp_servers"][name] = template["mcp_servers"][name]
+        if name in template.get("mcp_servers", {}):
+            live["mcp_servers"][name] = template["mcp_servers"][name]
     yaml.safe_dump(live, open(path + ".tmp", "w"), sort_keys=False)
     os.replace(path + ".tmp", path)
+    print("restored", path)
 PY
 ```
+
+It prints each file it restored; an install with Cluster Agents that prints none is looking in the
+wrong place.
 
 ## Reverting GCP resources too
 

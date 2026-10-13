@@ -8844,10 +8844,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            content_length = -1
+            # The two answers /v1/exec gives: 400 for a length that is not a
+            # number, 413 for one out of range.
+            LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+            return
         if content_length <= 0 or content_length > self.max_request_bytes:
             # Nothing to drain: a body over the cap is one drain_request_body
-            # declines, and an empty or unreadable length announces none.
+            # declines, and an empty length announces none.
             LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
             self._json(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,

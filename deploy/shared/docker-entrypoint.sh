@@ -1542,11 +1542,14 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # this, every cluster onboarded before an image changed the header keeps
         # sending the old one for the life of the volume, while the platform profile
         # and every newly onboarded cluster send the new one — two header shapes from
-        # one build, on a value the API teams key dashboards on. The helper writes
-        # only when the value differs, so a profile already current is not rewritten.
+        # one build, on a value the API teams key dashboards on. For a server the
+        # template routes through the credential proxy's MCP relay it does more: the
+        # whole args list and the proxy token entry become the template's (see the
+        # helper). It writes only when something differs, so a profile already
+        # current is not rewritten.
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             repair_remote_mcp_user_agent "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
-                || echo "WARN: failed to repair the remote MCP User-Agent in $d/config.yaml; this cluster agent keeps sending the header it was scaffolded with" >&2
+                || echo "WARN: failed to repair the remote MCP entries in $d/config.yaml; this cluster agent keeps the header and server URLs it was scaffolded with, and if the back-fill added MCP_REMOTE_BEARER_FILE beside a Google URL its gke and developer_knowledge calls fail until the repair succeeds" >&2
         fi
         # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
         # cron store if one exists on the PVC.
@@ -1600,13 +1603,14 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
         backfill_config_from_template \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
             || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
-        # The fill leaves lists alone, so the one image-owned value inside one — the
-        # remote MCP User-Agent — is repaired in place, exactly as the cluster loop
-        # above does for its profiles. Force-synced, flag off, the file already
+        # The fill leaves lists alone, so the image-owned values inside one — the
+        # remote MCP User-Agent, and a relayed server's whole args and token entry —
+        # are repaired in place, exactly as the cluster loop above does for its
+        # profiles. Force-synced, flag off, the file already
         # carries it; this is the front door taking the same repair.
         repair_remote_mcp_user_agent \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
-            || echo "WARN: could not repair the remote MCP User-Agent in profiles/platform/config.yaml; the front door keeps sending the header it was scaffolded with" >&2
+            || echo "WARN: could not repair the remote MCP entries in profiles/platform/config.yaml; the front door keeps the header and server URLs it was scaffolded with, and its gke and developer_knowledge calls may fail until the repair succeeds" >&2
     else
         echo "[ENTRYPOINT] profiles/platform/config.yaml is missing; seeding it from the image template." >&2
         cp "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
@@ -1858,8 +1862,12 @@ chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
 # Hermes leaves an unset variable as literal text, mcp-remote cannot parse that as
 # a URL, and every call to those tools fails with nothing here saying why. The
 # usual cause is this image running under an operator from before the relay.
-# Primary only: the dashboard sidecar runs no agent, and is not given the variable.
-if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -z "${KUBE_AGENTS_MCP_RELAY_URL:-}" ]; then
+# Primary only: the dashboard sidecar runs no agent, and is not given the
+# variable. And only with HERMES_MANAGED_DIR set, the operator's marker as for the
+# managed-scope check above: an image started any other way has no relay by
+# design, and an alert on every such boot would make the alarm routine.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -n "${HERMES_MANAGED_DIR:-}" ] \
+    && [ -z "${KUBE_AGENTS_MCP_RELAY_URL:-}" ]; then
     echo "[ENTRYPOINT] ALERT KUBE_AGENTS_MCP_RELAY_URL is unset, so the gke and developer_knowledge MCP servers will fail on every call. The operator sets it; upgrade the operator to a build that does." >&2
 fi
 

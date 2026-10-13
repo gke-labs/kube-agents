@@ -239,6 +239,11 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(json.loads(body)["rule"], mcp_policy.RULE_SERVER)
         self.assertEqual(self.upstream_requests, [])
 
+    def test_an_unparseable_content_length_is_400(self):
+        status, _, _ = self._request(body=b"{}", headers={"Content-Length": "abc"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.upstream_requests, [])
+
     def test_get_is_405_and_an_oversized_body_is_413(self):
         status, headers, _ = self._request(method="GET")
         self.assertEqual(status, 405)

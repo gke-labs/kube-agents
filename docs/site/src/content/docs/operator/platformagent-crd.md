@@ -477,8 +477,8 @@ Three things change while it is on:
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
   dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
-  it instead, on the same terms as the `default` profile's own file (with one exception, the
-  remote MCP `User-Agent`), so `/sethome` and `monitoring.install_id` survive a restart — see
+  it instead, on the same terms as the `default` profile's own file (except the remote MCP server
+  entries, which follow the image), so `/sethome` and `monitoring.install_id` survive a restart — see
   [How config reaches each profile](#how-config-reaches-each-profile).
 
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
@@ -556,7 +556,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Handing the file to the agent is the point — that is what lets `/sethome` and
   `monitoring.install_id` survive — but the same change means a key the running agent writes there
   is not reverted at boot. Keys the image adds still arrive through the back-fill; keys already in
-  the file stay as they were last written, except the remote MCP `User-Agent`, which follows the
+  the file stay as they were last written, except the remote MCP server entries, which follow the
   image ([below](#how-config-reaches-each-profile)). Operator-owned settings are unaffected: they
   come from the overlay and the `/etc/hermes` pins, both re-applied every boot.
 - Cluster profiles that already exist are otherwise unaffected — their config, skills and
@@ -1116,12 +1116,16 @@ template declares and the live file has lost are restored at the next start, and
 and every value the file already holds are left alone, except the retired `memory.provider` key,
 which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
 
-One value inside both of these files does follow the image: the `User-Agent` header that the
-remote MCP servers' `args` carry (see [the config reference](/kube-agents/reference/config/)). The
-back-fill recurses only through mappings and that value lives in a list, so it would otherwise stay
-as the image that scaffolded the profile spelled it for the life of the volume. At every start the
-entrypoint sets it to the image template's in each cluster profile's `config.yaml`, and in the
-platform profile's when it is the front door, and the repair changes nothing else in the file.
+The remote MCP server entries inside both of these files do follow the image (see
+[the config reference](/kube-agents/reference/config/)). The back-fill recurses only through
+mappings and a server's `args` is a list, so it would otherwise stay as the image that scaffolded
+the profile spelled it for the life of the volume. At every start the entrypoint repairs it in each
+cluster profile's `config.yaml`, and in the platform profile's when it is the front door: for a
+server the template routes through the credential proxy's MCP relay (`gke` and
+`developer_knowledge`), the whole `args` list and the `MCP_REMOTE_BEARER_FILE` entry in its `env`
+become the template's, so a hand edit to either is reverted at the next start; for any other remote
+server the image ships, only the `User-Agent` header value is set. Nothing else in the file is
+changed.
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
