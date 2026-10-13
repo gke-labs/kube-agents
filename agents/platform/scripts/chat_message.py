@@ -247,8 +247,22 @@ def mark(ask: str = "", settle: str = "") -> dict:
 # --- the plan --------------------------------------------------------------
 
 
+def _open_row(row: Any) -> bool:
+    """Whether a row can still move: running, waiting, or failed and not archived (``slack_ux_status._open``)."""
+    if row.status in (_status.TASK_RUNNING, _status.TASK_PENDING):
+        return True
+    return row.status == _status.TASK_ERROR and not getattr(row, "archived", False)
+
+
 def _plan_rows(rows: Sequence[Any]) -> list[Any]:
-    return list(rows)[-_status.ROWS_MAX:]
+    """The newest ``ROWS_MAX`` rows, the oldest settled ones dropped first, as ``slack_ux_status._prune``
+    drops them, so the window cuts no card that can still move while a settled one stays."""
+    rows = list(rows)
+    extra = len(rows) - _status.ROWS_MAX
+    if extra > 0:
+        settled = {id(row) for row in [row for row in rows if not _open_row(row)][:extra]}
+        rows = [row for row in rows if id(row) not in settled]
+    return rows[-_status.ROWS_MAX:]
 
 
 def _item(row: Any, several: bool) -> dict:

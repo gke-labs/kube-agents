@@ -4,17 +4,12 @@
     {
       "in": "checkout-gateway is crashlooping on an OOM. It hit its 256Mi limit.\n\nRaise it to 512Mi.",
       "headline": "checkout-gateway is crashlooping on an OOM.",
-      "body": [
-        "It hit its 256Mi limit.",
-        "Raise it to 512Mi."
-      ]
+      "body": ["It hit its 256Mi limit.", "Raise it to 512Mi."]
     },
     {
       "in": "## **Yes**, [seeded-a](https://x) is `healthy`\n- one\n- two",
       "headline": "Yes, seeded-a is healthy",
-      "body": [
-        "- one\n- two"
-      ]
+      "body": ["- one\n- two"]
     },
     {
       "in": "",
@@ -29,17 +24,12 @@
     {
       "in": "Here it is.\n\n```\na\n\nb\n```\n\nDone.",
       "headline": "Here it is.",
-      "body": [
-        "```\na\n\nb\n```",
-        "Done."
-      ]
+      "body": ["```\na\n\nb\n```", "Done."]
     },
     {
       "in": "```\nkubectl get pods\n```",
       "headline": "",
-      "body": [
-        "```\nkubectl get pods\n```"
-      ]
+      "body": ["```\nkubectl get pods\n```"]
     },
     {
       "in": "Pods fail readiness, e.g. checkout-gateway in ns. prod.",
@@ -54,37 +44,27 @@
     {
       "in": "Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.",
       "headline": "Deployments, StatefulSets, etc. All fail readiness.",
-      "body": [
-        "Node-a is cordoned."
-      ]
+      "body": ["Node-a is cordoned."]
     },
     {
       "in": "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one",
       "headline": "payments-api keeps crashing: secret payments-db-creds is missing.",
-      "body": [
-        "Since 14:02.\n- one"
-      ]
+      "body": ["Since 14:02.\n- one"]
     },
     {
       "in": "payments-api is crashlooping with:\n```\nOOMKilled. Exit 137\n```\nSince 14:02.",
       "headline": "payments-api is crashlooping with:",
-      "body": [
-        "```\nOOMKilled. Exit 137\n```\nSince 14:02."
-      ]
+      "body": ["```\nOOMKilled. Exit 137\n```\nSince 14:02."]
     },
     {
       "in": "```payments-api``` is crashlooping on OOM.\n\nRaise the limit.",
       "headline": "payments-api is crashlooping on OOM.",
-      "body": [
-        "Raise the limit."
-      ]
+      "body": ["Raise the limit."]
     },
     {
       "in": "The pod logs `connection refused. Retrying` on every start. Since 14:02.",
       "headline": "The pod logs connection refused. Retrying on every start.",
-      "body": [
-        "Since 14:02."
-      ]
+      "body": ["Since 14:02."]
     },
     {
       "in": "`__init__.py` is missing.",
@@ -94,58 +74,42 @@
     {
       "in": "##\tSummary\nCheckout is down. Since 14:02.",
       "headline": "Summary",
-      "body": [
-        "Checkout is down. Since 14:02."
-      ]
+      "body": ["Checkout is down. Since 14:02."]
     },
     {
       "in": "**Checkout is crashlooping on OOM. Raise the limit.**",
       "headline": "Checkout is crashlooping on OOM.",
-      "body": [
-        "**Raise the limit.**"
-      ]
+      "body": ["**Raise the limit.**"]
     },
     {
       "in": "**Checkout is down.** Raise the limit.",
       "headline": "Checkout is down.",
-      "body": [
-        "Raise the limit."
-      ]
+      "body": ["Raise the limit."]
     },
     {
       "in": "*It is down. Restart it.*",
       "headline": "It is down.",
-      "body": [
-        "*Restart it.*"
-      ]
+      "body": ["*Restart it.*"]
     },
     {
       "in": "_It is down. Restart it._",
       "headline": "It is down.",
-      "body": [
-        "_Restart it._"
-      ]
+      "body": ["_Restart it._"]
     },
     {
       "in": "Use *one* of them. Next *two*.",
       "headline": "Use one of them.",
-      "body": [
-        "Next *two*."
-      ]
+      "body": ["Next *two*."]
     },
     {
       "in": "The env var DB__HOST is unset. Pods crashloop.",
       "headline": "The env var DB__HOST is unset.",
-      "body": [
-        "Pods crashloop."
-      ]
+      "body": ["Pods crashloop."]
     },
     {
       "in": "Memory is 2**20 bytes. Raise it.",
       "headline": "Memory is 2**20 bytes.",
-      "body": [
-        "Raise it."
-      ]
+      "body": ["Raise it."]
     },
     {
       "in": "DB__HOST or DB__PORT is unset.",
@@ -155,9 +119,7 @@
     {
       "in": "**Pod**s are down. Restart them.",
       "headline": "Pods are down.",
-      "body": [
-        "Restart them."
-      ]
+      "body": ["Restart them."]
     },
     {
       "in": "Node pool np-1 at rev. 7 is cordoned.",
@@ -172,107 +134,77 @@
     {
       "in": "Several pods fail (e.g. Checkout) in prod. Raise it.",
       "headline": "Several pods fail (e.g. Checkout) in prod.",
-      "body": [
-        "Raise it."
-      ]
+      "body": ["Raise it."]
     },
     {
       "in": "Pods fail (i.e. Checkout). Raise it.",
       "headline": "Pods fail (i.e. Checkout).",
-      "body": [
-        "Raise it."
-      ]
+      "body": ["Raise it."]
     },
     {
       "in": "Ticket No. 3 is open. Second sentence.",
       "headline": "Ticket No. 3 is open.",
-      "body": [
-        "Second sentence."
-      ]
+      "body": ["Second sentence."]
     },
     {
       "in": "payments-api fails readiness since deploy No. 42. Restore the secret.",
       "headline": "payments-api fails readiness since deploy No. 42.",
-      "body": [
-        "Restore the secret."
-      ]
+      "body": ["Restore the secret."]
     },
     {
       "in": "See No. 3. Second sentence.",
       "headline": "See No. 3.",
-      "body": [
-        "Second sentence."
-      ]
+      "body": ["Second sentence."]
     },
     {
       "in": "Filed under #No. 7 on seeded-a. Then wait.",
       "headline": "Filed under #No. 7 on seeded-a.",
-      "body": [
-        "Then wait."
-      ]
+      "body": ["Then wait."]
     },
     {
       "in": "Use the default, ex. Checkout. More.",
       "headline": "Use the default, ex. Checkout.",
-      "body": [
-        "More."
-      ]
+      "body": ["More."]
     },
     {
       "in": "Disk is at 90% (approx. Two hours left). Then it fills.",
       "headline": "Disk is at 90% (approx. Two hours left).",
-      "body": [
-        "Then it fills."
-      ]
+      "body": ["Then it fills."]
     },
     {
       "in": "Latency is high vs. Yesterday. Scale up.",
       "headline": "Latency is high vs. Yesterday.",
-      "body": [
-        "Scale up."
-      ]
+      "body": ["Scale up."]
     },
     {
       "in": "Replicas are at max. Raise the HPA ceiling.",
       "headline": "Replicas are at max.",
-      "body": [
-        "Raise the HPA ceiling."
-      ]
+      "body": ["Raise the HPA ceiling."]
     },
     {
       "in": "Restarted after 5 min. Raise it.",
       "headline": "Restarted after 5 min.",
-      "body": [
-        "Raise it."
-      ]
+      "body": ["Raise it."]
     },
     {
       "in": "The answer is no. Checkout is down.",
       "headline": "The answer is no.",
-      "body": [
-        "Checkout is down."
-      ]
+      "body": ["Checkout is down."]
     },
     {
       "in": "The pool is at its max. 4 pods are pending. Raise it.",
       "headline": "The pool is at its max. 4 pods are pending.",
-      "body": [
-        "Raise it."
-      ]
+      "body": ["Raise it."]
     },
     {
       "in": "Keep min. 2 replicas on seeded-a. Then drain.",
       "headline": "Keep min. 2 replicas on seeded-a.",
-      "body": [
-        "Then drain."
-      ]
+      "body": ["Then drain."]
     },
     {
       "in": "Hello \u00005\u0000 world. More.",
       "headline": "Hello 5 world.",
-      "body": [
-        "More."
-      ]
+      "body": ["More."]
     },
     {
       "in": "The answer is no. 3 pods are down.",
@@ -287,9 +219,7 @@
     {
       "in": "Run ```a` now. Next.",
       "headline": "Run ```a` now.",
-      "body": [
-        "Next."
-      ]
+      "body": ["Next."]
     },
     {
       "in": "Done.) Next.",
@@ -304,23 +234,17 @@
     {
       "in": "Mr. Smith says hi. Next.",
       "headline": "Mr.",
-      "body": [
-        "Smith says hi. Next."
-      ]
+      "body": ["Smith says hi. Next."]
     },
     {
       "in": "1. Checkout is crashlooping on OOM. It hit 256Mi.",
       "headline": "Checkout is crashlooping on OOM.",
-      "body": [
-        "It hit 256Mi."
-      ]
+      "body": ["It hit 256Mi."]
     },
     {
       "in": "~~~\nkubectl get pods\n~~~",
       "headline": "",
-      "body": [
-        "~~~\nkubectl get pods\n~~~"
-      ]
+      "body": ["~~~\nkubectl get pods\n~~~"]
     },
     {
       "in": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
@@ -338,44 +262,32 @@
     {
       "in": "Three clusters have pods restarting right now: seeded-a, seeded-b and seeded-c.\n\n- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)",
       "headline": "Three clusters have pods restarting right now: seeded-a, seeded-b and seeded-c.",
-      "body": [
-        "- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)"
-      ]
+      "body": ["- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)"]
     },
     {
       "in": "Écoute: le pod redémarre. Ensuite rien.",
       "headline": "Écoute: le pod redémarre.",
-      "body": [
-        "Ensuite rien."
-      ]
+      "body": ["Ensuite rien."]
     },
     {
       "in": "# Summary\nThe pod restarted.",
       "headline": "Summary",
-      "body": [
-        "The pod restarted."
-      ]
+      "body": ["The pod restarted."]
     },
     {
       "in": "١. Checkout is down. More follows.",
       "headline": "Checkout is down.",
-      "body": [
-        "More follows."
-      ]
+      "body": ["More follows."]
     },
     {
       "in": "Pods restart. Then\u001cmore.",
       "headline": "Pods restart.",
-      "body": [
-        "Then\u001cmore."
-      ]
+      "body": ["Then\u001cmore."]
     },
     {
       "in": "See [logs](https://x.io/a b) now. Next.",
       "headline": "See [logs](https://x.io/a b) now.",
-      "body": [
-        "Next."
-      ]
+      "body": ["Next."]
     }
   ],
   "plain": [
