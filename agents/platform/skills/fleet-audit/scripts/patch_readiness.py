@@ -281,8 +281,14 @@ READINESS_STATE_SUBDIR = "upgrade-readiness-state"
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
 UNEVALUATED_REASON_FORMAT = "the readiness reporter could not grade this cluster ({why})"
+# The wrapper for a cluster no reporter run was started for: the version
+# checks did not judge it, the fleet budget was spent first, the scratch
+# directory or the per-run file could not be prepared, or the phase crashed
+# before reaching it. The reporter wrapper would blame a run that never was.
+UNEVALUATED_NOT_RUN_FORMAT = "the readiness reporter was not run for this cluster ({why})"
 UNEVALUATED_NO_ROW = "no members[] row for it in the reporter's report"
 UNEVALUATED_SCRATCH_FORMAT = "the collector could not prepare its scratch directory {path} ({error})"
+UNEVALUATED_PENDING_FORMAT = "the collector could not clear the per-run report file {path} left by an earlier run ({error})"
 UNEVALUATED_EMPTY_REPORT = "the readiness reporter's listing did not include this cluster (deleted or renamed since the collector listed it, or in a zone that did not answer)"
 UNEVALUATED_UNRECOGNISED_BLOCK = "graded blocked for a cause this check does not know"
 # The reporter exits 1 when the run had an error -- the cluster's objects it
@@ -1243,6 +1249,7 @@ def attach_fleet_spread(entries: list[dict]) -> None:
     for entry in entries:
         entry.pop("_bare_name", None)
         entry.pop("_in_flight", None)
+        entry.pop("_channel", None)
         entry.pop("_master_version", None)
         entry.pop("_status", None)
 
@@ -1623,10 +1630,11 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     `blocked` by an exclusion alone, or `ready`, is a check that ran and found
     nothing. A cluster with no release channel, and so no target version,
     whose only lag is a pool ahead of its control plane is the second
-    `checks_not_applicable` route: nothing that applies could be graded, so
-    the same answer every week, with the reason, whatever its budget read
-    found; on any other lag its budget half was graded, and a clean `unknown`
-    row there is the check running clean. Any other `unknown` row, a row
+    `checks_not_applicable` route, declared before any reporter runs from the
+    cluster's own channel and lag: nothing that applies could be graded, so
+    the same answer every week, with the reason, and no reporter run spent or
+    lost on it; on any other lag its budget half is graded, and a clean
+    `unknown` row there is the check running clean. Any other `unknown` row, a row
     the reporter did not produce, a reporter that wrote no report, or a
     `blocked` whose cause this join does not know, goes into the entry's
     `checks_unevaluated`: the slug stays out of `commands`, and `finish`
@@ -1652,12 +1660,24 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             # out under a pool-only lag nobody established, and a clean
             # `master-behind` beside a pool nobody could read would declare a
             # cluster current. The SOP's section 3 and 3.11 say unevaluated.
-            _unevaluated(entry, UNEVALUATED_VERSION_NOT_JUDGED)
+            _unevaluated(entry, UNEVALUATED_VERSION_NOT_JUDGED, ran=False)
         elif not due.behind:
             # Judged, and nothing due. A cluster mid-upgrade has no candidate
             # because §3 suppresses them, not because it is current: say which.
             reason = NOT_APPLICABLE_IN_FLIGHT_REASON if entry.get("_in_flight") else NOT_BEHIND_REASON
             entry["checks_not_applicable"] = [{"check": UPGRADE_BLOCKED_CHECK, "reason": reason}]
+        elif not due.budget_applies and not entry.get("_channel"):
+            # A static cluster whose only lag is a pool ahead of its control
+            # plane: the control plane's move is due, which drains no node, so
+            # no budget can hold it, and the ceiling has no target to be graded
+            # against (no channel, so the reporter resolves none). Nothing that
+            # applies could be graded, and that is true of this cluster every
+            # week, so it is declared here, from the cluster's own channel and
+            # lag, before the budget check and before any reporter starts: it
+            # costs no reporter run, and a run skipped, failed or stopped
+            # cannot turn the declaration into a limitation. The version
+            # finding itself stands. SOP 3.11's Not applicable bullet is this.
+            entry["checks_not_applicable"] = [{"check": UPGRADE_BLOCKED_CHECK, "reason": NOT_APPLICABLE_NO_TARGET_REASON}]
         else:
             behind.append(entry)
     if not behind:
@@ -1674,7 +1694,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
         # other ten checks down with it (`crashed_entries`).
         log(f"{project}: cannot prepare {scratch} ({exc}); upgrade-blocked unavailable there")
         for entry in behind:
-            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=scratch, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
+            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=scratch, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]), ran=False)
         return
     # One reporter run per behind cluster, with `--cluster` naming it: the
     # reporter reads nothing else in the project, and the recorded command on
@@ -1706,7 +1726,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
                 # Skipped before anything is touched: last week's report stays
                 # at the path the ledger's open finding and the SOP point at.
                 log(f"{project}/{entry['_bare_name']}: readiness budget spent before the reporter could run; upgrade-blocked unevaluated there")
-                _unevaluated(entry, UNEVALUATED_BUDGET_SPENT.format(budget=READINESS_FLEET_BUDGET_S))
+                _unevaluated(entry, UNEVALUATED_BUDGET_SPENT.format(budget=READINESS_FLEET_BUDGET_S), ran=False)
                 continue
         try:
             # A per-run file a crashed collector left behind would otherwise
@@ -1719,7 +1739,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
                 os.unlink(pending)
         except OSError as exc:
             log(f"{project}/{entry['_bare_name']}: cannot clear {pending} ({exc}); upgrade-blocked unavailable there")
-            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=pending, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
+            _unevaluated(entry, UNEVALUATED_PENDING_FORMAT.format(path=pending, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]), ran=False)
             continue
         # What runs writes the per-run file; what the entry records names the
         # path the report is moved onto, where a reader finds it and where a
@@ -1821,39 +1841,19 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         skew_blocked = due.skew_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("skew") or {}).get("blocking"))
         # A static cluster's row: no channel, so no target for the ceiling to
         # be graded against. Read from the row's channel and target alone, a
-        # fact about the cluster; the two arms below decide from it and from
+        # fact about the cluster; the arm below decides from it and from
         # `_due`, never from what this week's budget read found, so the
-        # disposition is the same every week whatever the budget did.
+        # disposition is the same every week whatever the budget did. The
+        # pool-ahead lag on a static cluster never reaches the reporter: the
+        # gate in `collect_upgrade_blocked` declares it first.
         no_target = not (member or {}).get("target_version") and (member or {}).get("channel") in NO_CHANNEL_SPELLINGS
         why = None
         if not members:
             why = no_report
         elif member is None:
             why = UNEVALUATED_NO_ROW
-        elif no_target and not skew_blocked and not due.budget_applies:
-            # No release channel, no target, and the one cause that can block
-            # the upgrade due is the ceiling: a static cluster whose only lag
-            # is a pool ahead of its control plane. The control plane's move
-            # drains no node, so no budget can hold it, and the ceiling has no
-            # target to be graded against; nothing that applies could be
-            # graded, and that is true of this cluster every week. It is not
-            # applicable here, with the reason, rather than a limitation that
-            # holds the stream partial for good; the version finding itself
-            # stands. The channel test (both spellings GKE uses for a static
-            # cluster) is what makes it a fact about the cluster: the reporter
-            # also resolves no target when its own `get-server-config` failed
-            # or omitted the channel, and that row is on a channel with a
-            # target nobody fetched this run, which the branch below records
-            # as unevaluated with the reporter's note saying so. The gate
-            # already required both version checks to have judged the
-            # cluster, so this declares nothing on a cluster nobody looked
-            # at. A budget on this row, blocking or clean, changes nothing
-            # here: the declaration reads no budget outcome, so it cannot
-            # flip with one and retire a finding it did not grade.
-            entry.setdefault("checks_not_applicable", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": NOT_APPLICABLE_NO_TARGET_REASON})
-            continue
-        elif no_target and not skew_blocked and not readiness.get("read_error") and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY):
-            # The same row on a lag a budget can hold (a behind control plane,
+        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY):
+            # That row on a lag a budget can hold (a behind control plane,
             # or a pool behind its control plane): the target matters only to
             # the ceiling, and the budget half, which applies, was graded on
             # a clean read and found nothing. The check ran on the half that
@@ -1913,14 +1913,16 @@ def _has_disposition(entry: dict) -> bool:
     )
 
 
-def _unevaluated(entry: dict, why: str) -> None:
+def _unevaluated(entry: dict, why: str, *, ran: bool = True) -> None:
     """The manifest's own field for a check whose read failed: `finish` then
     requires a `limitations` line on the cluster and refuses the slug in
     `checks_run` or `checks_not_applicable`, which is what the SOP's prose
-    asks for and nothing else enforces."""
-    entry.setdefault("checks_unevaluated", []).append(
-        {"check": UPGRADE_BLOCKED_CHECK, "reason": UNEVALUATED_REASON_FORMAT.format(why=why)}
-    )
+    asks for and nothing else enforces. `ran` says whether a reporter run was
+    started for the cluster: the reason's opening clause names the reporter's
+    failure when one was, and says no run was made when none was, so the
+    published limitation names the real cause."""
+    wrapper = UNEVALUATED_REASON_FORMAT if ran else UNEVALUATED_NOT_RUN_FORMAT
+    entry.setdefault("checks_unevaluated", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": wrapper.format(why=why)})
 
 
 def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
@@ -2035,6 +2037,10 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             # Consumed by `collect_upgrade_blocked`: a cluster mid-upgrade is
             # declared with the in-flight reason, not the not-behind one.
             "_in_flight": _any_upgrade_in_flight(c),
+            # Consumed by `collect_upgrade_blocked`: a static cluster whose only
+            # lag is a pool ahead of its control plane is declared from this and
+            # `_due` before any reporter run.
+            "_channel": _release_channel(c),
             # Consumed and removed by `attach_incumbent_topic`, for the same
             # reason `_master_version` is: the fact is fleet-wide and this
             # worker only ever sees one project.
@@ -2097,7 +2103,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 # no cluster is left without the check in any field.
                 for entry in results[index]:
                     if entry.get("outcome") == OUTCOME_COLLECTED and not _has_disposition(entry):
-                        _unevaluated(entry, UNEVALUATED_PHASE_CRASHED.format(error=type(exc).__name__))
+                        _unevaluated(entry, UNEVALUATED_PHASE_CRASHED.format(error=type(exc).__name__), ran=False)
 
     entries = [entry for group in results for entry in group]
     attach_fleet_spread(entries)

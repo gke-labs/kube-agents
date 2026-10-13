@@ -264,9 +264,9 @@ each is waiting for whoever schedules it.
   declared and run as budgets come and go. The declaration is for the one lag where nothing
   that applies could be graded: a static cluster whose only lag is a pool ahead of its control
   plane, where the control-plane move drains no node, so no budget can hold it, and the ceiling
-  has no target to be graded against; a budget on that row, blocking or clean, changes nothing.
-  The collector
-  writes `upgrade-blocked` into that entry's `checks_not_applicable` with the reason; copy the
+  has no target to be graded against; a budget there changes nothing. The collector declares it
+  from the cluster's own channel and lag before any reporter run, so it costs no reporter run and
+  no skipped, failed or stopped run can turn it into a limitation; it writes `upgrade-blocked` into that entry's `checks_not_applicable` with the reason; copy the
   entry into the document's `checks_not_applicable` verbatim, or the ledger stays partial on a
   current fleet. It is the one check in this audit the collector ever declares inapplicable, and
   it never declares it on a cluster 3.1 or 3.2 did not judge, nor on a channel cluster whose

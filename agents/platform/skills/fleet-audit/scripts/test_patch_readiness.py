@@ -1770,7 +1770,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         by = {short(e): e for e in self.project(run)}
         entry = by["dark"]
         self.assertNotIn("checks_not_applicable", entry)
-        self.assertIn(pr.UNEVALUATED_VERSION_NOT_JUDGED, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+        self.assertEqual(self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK], pr.UNEVALUATED_NOT_RUN_FORMAT.format(why=pr.UNEVALUATED_VERSION_NOT_JUDGED))
         # pool-skew ran and found nothing, which does not make the cluster
         # current; the reporter is still not called for a cluster with no
         # candidate.
@@ -1841,16 +1841,17 @@ class UpgradeBlockedTest(unittest.TestCase):
         """The one lag the declaration is for: a static cluster whose only lag
         is a pool ahead of its control plane. The control plane's move is due,
         no budget can hold it, and the ceiling has no target to be graded
-        against, so nothing that applies could be graded. The declaration
-        reads no budget outcome: a blocking budget and a clean read dispose
-        the row the same way, in `checks_not_applicable`, never in
-        `commands`."""
+        against, so nothing that applies could be graded. The declaration is
+        made before any reporter runs, from the cluster's own channel and lag:
+        whatever row the reporter would return, it is never asked, and the
+        check is in `checks_not_applicable`, never in `commands`."""
         c = cluster(name="static", master=self.CURRENT, channel=None, node_pools=[pool("default-pool", "1.31.0-gke.1")])
         for row in (self.member("static", status="blocked", pdbs=[self.BUDGET], gap=None), self.member("static", status="unknown", gap=None)):
             row["channel"] = None
             row["target_version"] = None
             with self.subTest(status=row["readiness"]["status"]):
                 entry = self.collect([c], [row])["static"]
+                self.assertEqual(self.calls, [])
                 self.assertIn("pool-skew", {x["check"] for x in entry["candidates"]})
                 self.assertNotIn("master-behind", {x["check"] for x in entry["candidates"]})
                 self.assertEqual([x["check"] for x in entry.get("checks_not_applicable") or []], [pr.UPGRADE_BLOCKED_CHECK])
@@ -1858,6 +1859,44 @@ class UpgradeBlockedTest(unittest.TestCase):
                 self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
                 self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
                 self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+
+    def test_a_static_pool_ahead_cluster_is_declared_whatever_its_reporter_run_would_have_done(self):
+        """The three ways a reporter run is lost: the budget spent before it,
+        a non-zero exit, a stop at its timeout. A static cluster whose only
+        lag is a pool ahead of its control plane is declared before any of
+        them can happen, so no run is spent on it and none of the three turns
+        the declaration into a limitation; the `UNSPECIFIED` spelling of a
+        static cluster is the same cluster."""
+        import time as _time
+
+        for channel in (None, "UNSPECIFIED"):
+            c = cluster(name="static", master=self.CURRENT, channel=channel, node_pools=[pool("default-pool", "1.31.0-gke.1")])
+            for rc in (2, pr.TIMEOUT_RC):
+                with self.subTest(channel=channel, reporter_rc=rc):
+                    entry = self.collect([c], reporter_rc=rc, write_report=False)["static"]
+                    self.assertEqual(self.calls, [])
+                    self.assertEqual([x["check"] for x in entry.get("checks_not_applicable") or []], [pr.UPGRADE_BLOCKED_CHECK])
+                    self.assertEqual(entry["checks_not_applicable"][0]["reason"], pr.NOT_APPLICABLE_NO_TARGET_REASON)
+                    self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+                    self.assertNotIn("checks_unevaluated", entry)
+            with self.subTest(channel=channel, budget="spent"):
+                self.calls = []
+
+                def run(argv, **kwargs):
+                    joined = " ".join(argv)
+                    if "clusters list" in joined:
+                        return run_of(0, json.dumps([c]))
+                    if "get-server-config" in joined:
+                        return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
+                    if REPORTER_NEEDLE in joined:
+                        self.calls.append(argv)
+                        return NO_REPORTER
+                    raise AssertionError(joined)
+
+                entry = {short(e): e for e in self.project(run, deadline=_time.monotonic() + 1)}["static"]
+                self.assertEqual(self.calls, [])
+                self.assertEqual([x["check"] for x in entry.get("checks_not_applicable") or []], [pr.UPGRADE_BLOCKED_CHECK])
+                self.assertNotIn("checks_unevaluated", entry)
 
     def test_a_channel_cluster_whose_target_was_not_fetched_is_unevaluated_not_declared(self):
         # The reporter resolves no target when its own get-server-config
@@ -2496,11 +2535,38 @@ class UpgradeBlockedTest(unittest.TestCase):
         # thirty, so it is not run and the reason says so.
         by = {short(e): e for e in self.project(run, deadline=_time.monotonic() + 20)}
         self.assertEqual(self.calls, [])
-        self.assertIn("readiness budget", self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK])
+        # No run was started, and the published reason says so rather than
+        # blaming a reporter that never ran.
+        self.assertEqual(
+            self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK],
+            pr.UNEVALUATED_NOT_RUN_FORMAT.format(why=pr.UNEVALUATED_BUDGET_SPENT.format(budget=pr.READINESS_FLEET_BUDGET_S)),
+        )
 
     def test_a_reporter_stopped_at_its_budget_says_so(self):
         by = self.collect([cluster(name="lag", master=self.BEHIND)], reporter_rc=pr.TIMEOUT_RC, write_report=False)
-        self.assertIn("ran past its budget", self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK])
+        reason = self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK]
+        # A run was started and stopped: this one is the reporter's.
+        self.assertEqual(reason, pr.UNEVALUATED_REASON_FORMAT.format(why=pr.UNEVALUATED_TIMED_OUT.format(seconds=pr.READINESS_TIMEOUT_S)))
+
+    def test_a_per_run_file_that_cannot_be_cleared_is_a_gap_that_names_the_file_not_a_directory(self):
+        """A leftover per-run file the collector cannot remove (here a
+        directory squatting on its name) stops the run before the reporter
+        starts; the reason names the per-run file and says no run was made,
+        and last week's report at the path is untouched."""
+        pending = self.report_path() + pr.PENDING_SUFFIX
+        os.makedirs(pending)
+        with open(self.report_path(), "w", encoding="utf-8") as handle:
+            handle.write("last week")
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
+        entry = by["lag"]
+        self.assertEqual(self.calls, [])
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        reason = self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK]
+        self.assertTrue(reason.startswith(pr.UNEVALUATED_NOT_RUN_FORMAT.split("{why}")[0] + pr.UNEVALUATED_PENDING_FORMAT.split("{path}")[0] + pending), reason)
+        self.assertNotIn("could not grade", reason)
+        self.assertNotIn("scratch directory", reason)
+        with open(self.report_path(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "last week")
 
     def test_a_report_not_marked_as_narrowed_to_this_cluster_is_not_read(self):
         """The reporter marks a `--cluster` run's report with its specs. A full
@@ -2745,7 +2811,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertEqual([x["check"] for x in by["cur"]["checks_not_applicable"]], [pr.UPGRADE_BLOCKED_CHECK])
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(by["cur"]))
         reasons = [u["reason"] for u in by["lag"].get("checks_unevaluated") or [] if u["check"] == pr.UPGRADE_BLOCKED_CHECK]
-        self.assertEqual(reasons, [pr.UNEVALUATED_REASON_FORMAT.format(why=pr.UNEVALUATED_PHASE_CRASHED.format(error="RuntimeError"))])
+        self.assertEqual(reasons, [pr.UNEVALUATED_NOT_RUN_FORMAT.format(why=pr.UNEVALUATED_PHASE_CRASHED.format(error="RuntimeError"))])
         self.assertNotIn("not in the shape", reasons[0])
 
     def test_an_unknown_row_carries_the_reporters_note(self):
@@ -2784,7 +2850,8 @@ class UpgradeBlockedTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {pr.SCRATCH_DIR_ENV: os.path.join(blocker, "scratch")}):
             by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
         reason = self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK]
-        self.assertIn("scratch directory", reason)
+        self.assertTrue(reason.startswith(pr.UNEVALUATED_NOT_RUN_FORMAT.split("{why}")[0] + pr.UNEVALUATED_SCRATCH_FORMAT.split("{path}")[0]), reason)
+        self.assertNotIn("could not grade", reason)
         self.assertIn(blocker, reason)
         self.assertEqual(self.calls, [])
 
