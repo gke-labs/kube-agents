@@ -1068,7 +1068,7 @@ MITIGATIONS = {
     2: {
         "title": "No spare capacity for the displaced pods",
         "before": "A pool whose upgrade settings let a node go before its replacement exists, with requests near allocatable, the autoscaler at its ceiling or quota exhausted.",
-        "read_today": "the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; `maxSurge` and headroom against allocatable are unread",
+        "read_today": "the readiness mode of `fleet-upgrade-verification` grades a pool whose upgrade settings remove a node before its replacement exists by placing the pods of each of its nodes onto the nodes their selectors, affinity and tolerations admit, `blocked` when the pool cannot grow and a pod has no node to take it, a risk when a pod is stranded but the pool keeps some surge or can grow, a note when every pod is placed; the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; accelerator quota is unread by the readiness rule",
         "mitigate_before": "Keep the pool on maxSurge at least 1 and maxUnavailable 0, with one node of headroom and quota for the extra node.",
         "mitigate_after": "Add a node or raise the ceiling and the Pending pods schedule.",
     },
@@ -1145,7 +1145,7 @@ MITIGATIONS = {
     13: {
         "title": "The container runtime changes",
         "before": "Node agents on the CRI v1alpha2 API, images in the Docker v1 schema, DaemonSets shipping containerd 1.x configuration.",
-        "read_today": "the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant, and the compliance audit's `hostpath-mount` check flags a pod mounting the containerd socket as a security finding; CRI clients, image schemas and containerd configuration are unread as an upgrade risk",
+        "read_today": "the readiness mode of `fleet-upgrade-verification` pairs the containerd major each pool's nodes report with the major the target's node image ships (`upgrade_shape_tables.py`, by minor and image family) and the pods mounting the runtime socket, a risk when the major changes under such a pod; the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant, and the compliance audit's `hostpath-mount` check flags a pod mounting the containerd socket as a security finding; image schemas and containerd configuration are unread as an upgrade risk",
         "mitigate_before": "Move agents to the CRI v1 API, rebuild v1-schema images, drop containerd 1.x overrides.",
         "mitigate_after": "The same changes under pressure; a completed pool can be downgraded in place while GKE still offers the previous version.",
     },
@@ -1166,7 +1166,7 @@ MITIGATIONS = {
     16: {
         "title": "The network dataplane changes",
         "before": "Dataplane and DNS provider, policy count, the known issues for the target version.",
-        "read_today": "the fleet-consistency drift audit reads each cluster's `datapathProvider` and its network-policy settings across the cohort, so a member whose dataplane differs from its peers is reported, and the compliance audit's `netpol-missing` check flags a namespace with no protecting policy without asking whether the cluster enforces any; how a policy behaves, and the DNS provider, are unread",
+        "read_today": "the readiness mode of `fleet-upgrade-verification` flags a legacy-dataplane cluster whose network policy add-on is off and whose namespaces carry NetworkPolicies, naming the namespaces whose policies take effect once enforcement does; the fleet-consistency drift audit reads each cluster's `datapathProvider` and its network-policy settings across the cohort, so a member whose dataplane differs from its peers is reported, and the compliance audit's `netpol-missing` check flags a namespace with no protecting policy without asking whether the cluster enforces any; how a policy behaves, and the DNS provider, are unread",
         "mitigate_before": "Rehearse the target version on a staging cluster with the same dataplane; keep NetworkPolicy explicit.",
         "mitigate_after": "A completed pool can be downgraded in place while GKE still offers the previous version; the control plane cannot go back.",
     },
@@ -1187,7 +1187,7 @@ MITIGATIONS = {
     19: {
         "title": "In-tree volumes lose their CSI path",
         "before": "PersistentVolumes with an in-tree gcePersistentDisk spec while the PD CSI driver add-on is disabled; StorageClasses naming a retired provisioner.",
-        "read_today": "nothing as an upgrade risk; the fleet waste audit reads disks for cost (orphaned volumes, unattached disks), not for how they are attached",
+        "read_today": "the readiness mode of `fleet-upgrade-verification` reads every in-tree `gcePersistentDisk` PersistentVolume against the PD CSI driver add-on, `blocked` for a volume a workload mounts while the add-on is off and a risk otherwise; the fleet waste audit reads disks for cost (orphaned volumes, unattached disks), not for how they are attached; StorageClass provisioners are unread",
         "mitigate_before": "Enable the PD CSI driver add-on and move StorageClasses to pd.csi.storage.gke.io.",
         "mitigate_after": "Enable the add-on; the volumes attach.",
     },

@@ -350,11 +350,60 @@ blocker joins the verdict, a risk never does, and the table prints them under `o
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
 note column does. The rules registered today, with the catalogue entry each reads:
 
+- **Surge capacity** (`surge-capacity`, entry 2). A pool whose upgrade settings take a node away
+  before its replacement exists (`maxUnavailable` above 0 on the surge strategy, or a blue-green
+  upgrade with the autoscaled rollout policy), measured by placing the pods of each of its nodes
+  in turn, largest first, onto the schedulable nodes left that each pod may schedule on (its node
+  selector, its required node affinity and the taints it tolerates decide which; a tainted pool's
+  spare capacity never counts for a pod without the toleration), each onto the eligible node with
+  the most room left by CPU and memory requests (native sidecars and the pod's `overhead` counted
+  as the scheduler counts them), DaemonSet and mirror pods excepted; a pod no eligible node can
+  take is stranded. It blocks when `maxSurge` is 0, `maxUnavailable` above 0, the autoscaler
+  cannot grow the pool (at its ceiling, or not autoscaled) and a pod is stranded; a stranded pod
+  with some surge left, a growable autoscaler or an autoscaled blue-green rollout is a risk; a pool
+  whose every node's pods are placed is a note. The node measured is the one whose stranded pods
+  are the largest in either resource, so a memory-bound node counts as a CPU-bound one does, and
+  the cell names the pool, its settings, that node, the stranded requests, the room on the nodes
+  the pods may schedule on, the largest stranded workloads and any other node of the pool that
+  strands pods. Autopilot members are not graded. A pool at or above the target is not graded; no
+  target, an unparsable pool version or quantity, or Nodes or Pods not read is unknown, and the
+  rule can block, so that unknown moves the verdict. GKE's defaults (`maxSurge` 1,
+  `maxUnavailable` 0) never trigger it.
 - **Zonal control plane** (`zonal-control-plane`, entry 11). A cluster whose `location` is a zone
   is a risk on every report, never a blocker: the Kubernetes API is unreachable for a short window
   while the single control-plane replica is rebuilt, running pods are unaffected, and the cell
   says what to do about it. A location that is neither a zone nor a region is unknown, and since
   the rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+- **Container runtime** (`container-runtime`, entry 13). For each pool below the target, the
+  containerd major its nodes report (`status.nodeInfo.containerRuntimeVersion`, or the table by the
+  pool's minor when the nodes were not read) against the major the target's node image ships
+  (`upgrade_shape_tables.CONTAINERD_MAJOR_BY_GKE_MINOR`: Linux images at 1.33, Windows Server at
+  1.35, GKE's containerd 2 page as the source), paired with every pod or template that mounts a
+  runtime socket (`/run/containerd/containerd.sock`, `/var/run/docker.sock`, either spelling) through
+  a `hostPath` volume. A pool whose major changes under socket clients is a risk naming the pool,
+  both majors and the clients' owners; a change with no client, and clients with no change, are
+  notes; a change on a member whose Pods or DaemonSets were not read is unknown, and since the
+  rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+- **Network dataplane** (`network-dataplane`, entry 16). A cluster on the legacy dataplane
+  (`networkConfig.datapathProvider` absent or `LEGACY_DATAPATH`) whose network policy add-on is off
+  and whose namespaces carry NetworkPolicies is a risk naming the namespaces and their counts:
+  nothing enforces those policies today, and all of them take effect the moment enforcement does,
+  at the node rebuild after the add-on is enabled or on the Dataplane V2 cluster that replaces
+  this one, which is the shape GKE's recommender files as `NETWORK_POLICIES_UNRECONCILED`; the
+  cell names the Dataplane V2 members among the clusters the run listed (the projects' whole
+  listing, even when `--cluster` narrows who is graded), where the same policies would be
+  enforced. Policies the add-on enforces are a note, and so is a legacy member with no policy at
+  all, so every legacy member states its dataplane and enforcement; a Dataplane V2 member is
+  clean; a legacy member whose NetworkPolicies were not read is unknown, which never moves the
+  verdict since the rule cannot block.
+- **In-tree volumes** (`in-tree-volumes`, entry 19). Every PersistentVolume with an in-tree
+  `gcePersistentDisk` source, its claim, and the pods and templates that mount the claim, against
+  `addonsConfig.gcePersistentDiskCsiDriverConfig.enabled`. With the add-on off, a volume a workload
+  mounts blocks (the rescheduled pod cannot attach it), naming the volume and the workload, and an
+  unmounted one is a risk; with the add-on on, every in-tree volume is a risk, since it still
+  depends on the migration shim rather than on the driver. PersistentVolumes not read is unknown
+  and, since the rule can block, moves the verdict; Pods not read is unknown too, with the
+  templates still graded.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read
