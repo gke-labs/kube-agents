@@ -408,6 +408,17 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "upgrades-removed-api-caller-named": (
+        "#2655: needs a removed-api-caller role, a writer that calls an API "
+        "version the cluster's next minor stops serving, which no standing fleet "
+        "role can carry (the catalogue's entry 6 Fixture line says why), so the "
+        "seeded fleet's upgrade-failure shapes merged without it; the "
+        "deprecated-api-caller role is stamped deprecated, not removed, and stands "
+        "in for entry 9, and the readiness report's removed-api-callers rule is "
+        "covered by unit tests on a captured log sample. The case waits for the "
+        "role on a purpose-built cluster, or for the next minor that removes a "
+        "served API; #2275 is the umbrella that tracks the scenario cases to merge"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
