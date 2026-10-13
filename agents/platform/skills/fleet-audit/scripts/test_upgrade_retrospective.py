@@ -2828,10 +2828,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(link.resolve().exists())
         self.assertEqual(len(list(reports.glob("*Z.json"))), ur.REPORTS_KEPT + 1)
 
-    def test_caller_named_output_parents_keep_the_callers_umask(self):
+    def test_caller_named_output_parents_keep_the_callers_umask_and_their_files_are_the_stores_mode(self):
         # `make_store_dir` clears the umask for the store's own directories alone: a parent a caller-named
         # `--output`, `--manifest-file` or `--report` creates outside the store is made under the
-        # caller's umask, never world-writable, while `reports/` under the store stays 0777.
+        # caller's umask, never world-writable, while `reports/` under the store stays 0777. The files
+        # inside are `STORE_FILE_MODE` (0644) as every file the collector writes: `mkstemp` would make
+        # them 0600 under any umask, and a root hand run's manifest must stay readable by the uid-1000
+        # `finish` that reads it.
         with tempfile.TemporaryDirectory() as outside:
             out = Path(outside) / "retro" / "out.json"
             manifest = Path(outside) / "mf" / "m.json"
@@ -2844,7 +2847,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 os.umask(mask)
             for created in (out.parent, manifest.parent, report.parent):
                 self.assertEqual(stat.S_IMODE(created.stat().st_mode), ur.STORE_DIR_MODE & ~0o077, created)
-            self.assertTrue(out.exists() and manifest.exists() and report.exists())
+            for written in (out, manifest, report):
+                self.assertEqual(stat.S_IMODE(written.stat().st_mode), ur.STORE_FILE_MODE, written)
             self.assertEqual(stat.S_IMODE((self.home / ur.REPORTS_SUBDIR).stat().st_mode), ur.STORE_DIR_MODE)
 
     def test_the_declared_scope_is_swept_exactly_and_nothing_is_listed(self):
@@ -4668,6 +4672,7 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(guard, {g["id"] for g in result["guards"]})
         self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == other], [])
         self.assertIn(line, ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
+        self.assertIn(ur.INFO_SCOPE_NOTE.format(note=ur.fleet_scope_args.unread_note([("other-project", "denied")])), ur.render_report(result))
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         entry = next(c for c in manifest["clusters"] if c["name"] == other)
         self.assertEqual((entry["outcome"], entry["project"]), (ur.MANIFEST_OUTCOME_UNREACHABLE, "other-project"))
@@ -4675,9 +4680,118 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(manifest["limitations"], ur.fleet_scope_args.unread_note([("other-project", "denied")]))
         self.assertIn("other-project (denied)", manifest["limitations"])
         self.assertTrue(manifest["partial"])
+        self.assertEqual([c["error"] for c in manifest["clusters"] if c["name"] == ur.UNENUMERATED_PROJECTS_TARGET], [manifest["limitations"]])
+        document = self.document_from(manifest)
+        self.assertEqual([s["cluster"] for s in document["scope"]["skipped"]], [other, ur.UNENUMERATED_PROJECTS_TARGET])
+        self.audit_report.cross_check_manifest(document, manifest)
+
+    def test_a_full_run_handed_the_unresolved_row_prunes_no_project(self):
+        # The fleet_scope tool's `declared-scope=unresolved` row names no project (the render answered, or
+        # a folder, organisation or selector lookup is unresolved), so the handed set is not the fleet
+        # (`sweep_is_declared` is false). A first run with the row still records the project it read, so
+        # its reviews write guards. A later full run with the row prunes no project: a ledger project
+        # outside the handed set is held with its guards, its known clusters "Reads that failed" lines
+        # and `unreachable` manifest entries the document skips, the fleet stays the ledger's set plus
+        # the projects read, and the row's note is the manifest's limitation. The next resolved scope
+        # prunes against the handed set as before.
+        row = f"{ur.fleet_scope_args.UNRESOLVED_SCOPE_ROW}=unresolved"
+        first, fleet = self.collect(scope_projects=PROJECT, scope_unread=row)
+        self.assertFalse(ur.declared_scope.sweep_is_declared())
+        self.assertFalse(any("projects list" in " ".join(c) for c in fleet.calls))
+        self.assertEqual((first["fleet"], first["removed_clusters"], first["scope_unread"], first["outside_fleet"], first["held_clusters"], first["scoped"]), ([PROJECT], [], [], [], {}, False))
+        self.assertTrue(first["guards"] and all(g["cluster"] in (GEMMA, SEEDED) for g in first["guards"]))
+        manifest = json.loads(Path(first["manifest_path"]).read_text())
+        self.assertEqual((manifest["limitations"], manifest["partial"], manifest["fleet"]), (ur.fleet_scope_args.UNRESOLVED_SCOPE_NOTE, True, [PROJECT]))
+        # No known cluster carries the gap, so the siblings' unenumerated-projects target does: a
+        # `gate-failed` entry the document skips, which is what makes `finish` read the run as partial.
+        [gap] = [c for c in manifest["clusters"] if c["name"] == ur.UNENUMERATED_PROJECTS_TARGET]
+        self.assertEqual((gap["outcome"], gap["error"]), (ur.MANIFEST_OUTCOME_GATE_FAILED, ur.fleet_scope_args.UNRESOLVED_SCOPE_NOTE))
+        document = self.document_from(manifest)
+        self.assertIn(ur.UNENUMERATED_PROJECTS_TARGET, [s["cluster"] for s in document["scope"]["skipped"]])
+        self.assertTrue(self.audit_report.coverage_gaps(document))
+        self.audit_report.cross_check_manifest(document, manifest)
+        # The reconcile resolves the scope to two projects; the second gains a cluster and a guard.
+        self.collect(scope_projects=f"{PROJECT},other-project", now=datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc))
+        other = "other-project/us-central1-a/elsewhere"
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        guards = ur.load_json(self.home / ur.GUARDS_FILENAME, {})
+        guard = ur.guard_id(other, 7, "apps/Deployment/x")
+        guards["guards"].append({**guards["guards"][0], "id": guard, "cluster": other, "entry": 7, "object": "apps/Deployment/x"})
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, guards)
+        # A Sunday on which the snapshot does not answer: the tool hands the host project and the row.
+        held, fleet = self.collect(scope_projects=PROJECT, scope_unread=row, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertFalse(any("other-project" in " ".join(c) for c in fleet.calls))
+        self.assertEqual((held["fleet"], held["removed_clusters"], held["scope_unread"], held["scoped"], held["held_clusters"]), ([PROJECT, "other-project"], [], [], False, {other: "other-project"}))
+        line = ur.SCOPE_UNRESOLVED_HOLD_TEXT.format(cluster=other, project="other-project", row=ur.fleet_scope_args.UNRESOLVED_SCOPE_ROW, outcome="unresolved")
+        self.assertIn(line, held["failed_reads"])
+        report = ur.render_report(held)
+        self.assertIn(line, report.split(ur.INFO_FAILED_READS)[1])
+        self.assertNotIn(ur.INFO_REMOVED, report)
+        self.assertIn(ur.INFO_SCOPE_NOTE.format(note=ur.fleet_scope_args.UNRESOLVED_SCOPE_NOTE), report)
+        self.assertIn(other, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})[ur.LEDGER_PROJECTS_KEY], [PROJECT, "other-project"])
+        self.assertIn(guard, {g["id"] for g in held["guards"]})
+        self.assertEqual([i for i in held["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == other], [])
+        manifest = json.loads(Path(held["manifest_path"]).read_text())
+        entry = next(c for c in manifest["clusters"] if c["name"] == other)
+        self.assertEqual((entry["outcome"], entry["project"], "candidates" in entry), (ur.MANIFEST_OUTCOME_UNREACHABLE, "other-project", False))
+        self.assertIn("declared scope is not resolved yet (declared-scope=unresolved)", entry["error"])
+        self.assertEqual((manifest["limitations"], manifest["partial"], manifest["fleet"]), (ur.fleet_scope_args.UNRESOLVED_SCOPE_NOTE, True, [PROJECT, "other-project"]))
         document = self.document_from(manifest)
         self.assertIn(other, [s["cluster"] for s in document["scope"]["skipped"]])
         self.audit_report.cross_check_manifest(document, manifest)
+        # The next full run handed the resolved set prunes against it as before.
+        narrowed, _ = self.collect(scope_projects=PROJECT, now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((narrowed["fleet"], narrowed["removed_clusters"], narrowed["held_clusters"]), ([PROJECT], [other], {}))
+        self.assertNotIn(guard, {g["id"] for g in narrowed["guards"]})
+
+    def test_a_review_that_raises_keeps_the_listing_backed_operation_check_and_guard(self):
+        # `_safe_review`'s fallback keeps what the listing established before any read, as `review_cluster`
+        # records it first: a failed operation on a cluster whose review raised is `collected` on the
+        # operation check with the five kubectl checks unevaluated, its Error the entry's `major`
+        # candidate, the operation guard written, and the raise the limitation, as the credentials path
+        # already is. With the listing failed too, nothing backs the check: gate-failed, no candidate.
+        ops = copy.deepcopy(OPERATIONS)
+        errored = next(o for o in ops if o.get("error"))
+        bad = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/idle-batch-pool" in o["targetLink"])
+        bad["error"], bad["statusMessage"] = errored["error"], errored["statusMessage"]
+        obj = f"Operation/{bad['name']}"
+        guard = ur.guard_id(SEEDED, ur.ENTRY_OPERATION, obj)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("planted")
+
+        with mock.patch.object(ur, "collect_symptoms", boom):
+            result, _ = self.collect(FakeFleet(operations=ops))
+        seeded = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual((seeded["reviewed"], seeded["partial"], seeded["answered"], [c["check"] for c in seeded["commands"]]), (False, list(ur.CORE_READS), [], [ur.CHECK_OPERATION_FAILED]))
+        self.assertEqual([g["id"] for g in seeded["guards"]], [guard])
+        self.assertTrue(any(e.startswith("review failed: RuntimeError('planted')") for e in seeded["read_errors"]))
+        [incident] = [i for i in result["sections"]["errors"] if i["object"] == obj]
+        self.assertEqual((incident["kind"], [g["id"] for g in incident["guards"]]), (ur.INCIDENT_OPERATION, [guard]))
+        report = ur.render_report(result)
+        self.assertNotIn(ur.OPERATION_NO_GUARD_TEXT, report)
+        self.assertIn(f"guard `{guard}` first seen", report)
+        self.assertIn(f"- {SEEDED}: review failed:", report)
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        entry = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual((entry["outcome"], [c["check"] for c in entry["commands"]]), (ur.MANIFEST_OUTCOME_COLLECTED, [ur.CHECK_OPERATION_FAILED]))
+        self.assertEqual([c["check"] for c in entry["checks_unevaluated"]], [check for check, read in ur.CHECK_READS if read != ur.OPERATIONS_READ])
+        self.assertEqual([(c["check"], c["severity"], c["object"]) for c in entry["candidates"]], [(ur.CHECK_OPERATION_FAILED, ur.MANIFEST_SEVERITY_MAJOR, obj)])
+        self.assertTrue(entry["limitations"].startswith("reads that failed: review failed: RuntimeError('planted')"), entry["limitations"])
+        self.assertTrue(manifest["partial"])
+        self.assertIn(guard, {g["id"] for g in result["guards"]})
+        document = self.document_from(manifest)
+        self.assertIn(SEEDED, [c["name"] for c in document["scope"]["clusters"]])
+        self.audit_report.cross_check_manifest(document, manifest)
+        with mock.patch.object(ur, "collect_symptoms", boom):
+            unread, _ = self.collect(FakeFleet(operations=ops, ops_fail={PROJECT}), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(unread["manifest_path"]).read_text())
+        entry = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual((entry["outcome"], "candidates" in entry), (ur.MANIFEST_OUTCOME_GATE_FAILED, False))
+        self.assertEqual([i for i in unread["sections"]["errors"] if i["cluster"] == SEEDED], [])
 
     def test_three_guards_on_one_object_are_one_candidate(self):
         # Two event-only guards on inference-server (a volume attach, a webhook rejection) beside its
@@ -4710,11 +4824,30 @@ class ManifestTest(unittest.TestCase):
         self.audit_report.cross_check_manifest(document, manifest)
 
     def test_api_disabled_project_does_not_make_the_run_partial(self):
+        # A project whose Kubernetes Engine API is off is an empty project, not a failed read, as the
+        # sibling collectors count it: no gap, the run complete, and on a full run its ledger clusters
+        # (from before the API was turned off) leave like any cluster a successful listing no longer names.
         result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), scope_projects=f"{PROJECT},no-gke-project")
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         self.assertFalse(manifest["partial"])
         self.assertEqual([c["name"] for c in manifest["clusters"]], [GEMMA, SEEDED])
         self.assertEqual(manifest["fleet"], [PROJECT, "no-gke-project"])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        old = "no-gke-project/us-central1-a/retired"
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        ledger["clusters"][old] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        guards = ur.load_json(self.home / ur.GUARDS_FILENAME, {})
+        guard = ur.guard_id(old, 7, "apps/Deployment/x")
+        guards["guards"].append({**guards["guards"][0], "id": guard, "cluster": old, "entry": 7, "object": "apps/Deployment/x"})
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, guards)
+        later, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), scope_projects=f"{PROJECT},no-gke-project", now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((later["removed_clusters"], later["failed_reads"], later["fleet"]), ([old], [], [PROJECT, "no-gke-project"]))
+        self.assertNotIn(old, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertNotIn(guard, {g["id"] for g in later["guards"]})
+        self.assertIn(f"- {old}: no longer listed by its project", ur.render_report(later))
+        manifest = json.loads(Path(later["manifest_path"]).read_text())
+        self.assertEqual((manifest["partial"], "limitations" in manifest, old in [c["name"] for c in manifest["clusters"]]), (False, False, False))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_dry_run_and_no_flag_write_no_manifest(self):

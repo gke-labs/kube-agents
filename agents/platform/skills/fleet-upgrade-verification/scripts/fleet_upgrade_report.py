@@ -726,7 +726,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tu
     try:
         prepare_kubeconfig(kubeconfig_dir, path)
     except OSError as e:
-        return None, f"cannot create kubeconfig directory {kubeconfig_dir}: {e}", path
+        return None, f"cannot prepare kubeconfig directory {kubeconfig_dir} for {path}: {e}", path
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
     rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)
