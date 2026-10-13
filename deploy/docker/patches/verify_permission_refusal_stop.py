@@ -2,7 +2,7 @@
 """Build gate for the permission-refusal stop.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_permission_refusal_stop.py``. The applier proves its two anchors
+``apply_permission_refusal_stop.py``. The applier proves its three anchors
 matched; this drives the patched runtime:
 
 1. ``ToolCallGuardrailConfig.from_mapping`` reads
@@ -12,9 +12,10 @@ matched; this drives the patched runtime:
    the guidance decision and the second the halt, with a successful call and
    an unrelated failure in between (the stock counters would have reset); the
    halt is the turn's ``halt_decision``, so ``agent/turn_tool_round.py``'s
-   halt branch sees it; a new turn starts the count again; an API 403 and a
-   ``gcp.read-only`` refusal warn and never halt; a flag refusal and a plain
-   failure take the stock path.
+   halt branch sees it; a new turn starts the count again; an API 403, a
+   ``gcp.read-only`` refusal and a ``kubernetes.read-only`` refusal of a read
+   spelling warn and never halt; a flag refusal and a plain failure take the
+   stock path.
 3. ``append_toolguard_guidance`` renders the guidance into the tool result.
 4. ``hermes_cli.kanban_guardrail_exit.guardrail_halt_nudge`` gives the halt its
    refusal-specific instruction, driven against the real
@@ -104,11 +105,22 @@ def main() -> int:
     if (api.action, api.code) != ("warn", stop.API_WARN_CODE) or controller.halt_decision is not None:
         return fail(f"an API 403 decided {api!r}")
     gcloud = controller.after_call("terminal", {"command": "gcloud artifacts docker tags list x"}, GCLOUD_REFUSAL)
-    if (gcloud.action, gcloud.code) != ("warn", stop.GCLOUD_WARN_CODE) or controller.halt_decision is not None:
+    if (gcloud.action, gcloud.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
         return fail(f"a gcp.read-only refusal decided {gcloud!r}")
+    read = controller.after_call("terminal", {"command": "kubectl config view"}, REFUSAL)
+    if (read.action, read.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
+        return fail(f"a refused read spelling decided {read!r}")
+    joined = controller.after_call("terminal", {"command": "kubectl \\\n  -n kube-system \\\n  scale deploy x --replicas=3"}, REFUSAL)
+    if joined.code not in (stop.WARN_CODE, stop.HALT_CODE):
+        return fail(f"a line-continued write decided {joined!r}")
+    code126 = controller.after_call("terminal", {"command": "kubectl scale deploy x --replicas=3"}, REFUSAL.replace('"exit_code": 77', '"exit_code": 126'))
+    if code126.code not in (stop.WARN_CODE, stop.HALT_CODE):
+        return fail(f"a refusal returned with exit 126 decided {code126!r}")
+    if not hasattr(controller, "_kube_stock_after_call"):
+        return fail("the stock after_call was not kept under its new name")
     for result in (FLAG_REFUSAL, PLAIN_FAILURE, OK):
         decision = controller.after_call("terminal", {"command": "kubectl get x"}, result)
-        if decision.code in (stop.WARN_CODE, stop.GCLOUD_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):
+        if decision.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):
             return fail(f"{result[:40]!r} took the refusal path: {decision!r}")
 
     # 3. The guidance reaches the tool result.

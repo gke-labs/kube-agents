@@ -2,11 +2,12 @@
 
 Three anchored edits, two in ``agent/tool_guardrails.py`` and one in ``run_agent.py``:
 
-1. ``ToolCallGuardrailController.after_call`` — ask
-   ``hermes_cli.permission_refusal_stop.observe_refusal`` first; a refusal
-   returns its own decision (guidance, or the halt the halt branch in
-   ``agent/turn_tool_round.py`` already routes through the kanban-aware exit)
-   and anything else falls through to the stock counters untouched.
+1. ``ToolCallGuardrailController.after_call`` — the stock method is renamed
+   ``_kube_stock_after_call`` and a new ``after_call`` runs it first, then asks
+   ``hermes_cli.permission_refusal_stop.observe_refusal`` whether a refusal
+   replaces its decision (guidance, or the halt the halt branch in
+   ``agent/turn_tool_round.py`` already routes through the kanban-aware exit).
+   The stock counters therefore see every call.
 2. ``ToolCallGuardrailConfig.from_mapping`` — read
    ``tool_loop_guardrails.permission_refusal_halt_after`` onto the config, so
    the threshold sits beside the other guardrail thresholds in a profile's
@@ -18,7 +19,7 @@ Three anchored edits, two in ``agent/tool_guardrails.py`` and one in ``run_agent
    "stopped retrying after N non-progressing attempts" text, which is about
    loops and tells the user to change strategy.
 
-No insert consumes its anchor, so a marker check refuses the second run.
+Each edit leaves a marker the applier refuses on a second run.
 See the module docstring in permission_refusal_stop.py for the defect.
 """
 
@@ -30,29 +31,33 @@ from pathlib import Path
 GUARDRAILS_RELATIVE = "agent/tool_guardrails.py"
 RUN_AGENT_RELATIVE = "run_agent.py"
 
-# The first five statements of after_call: unique in the file through the
-# ``if failed is None`` test, which before_call does not make.
+# The signature of after_call, unique in the file.
 AFTER_CALL_ANCHOR = (
-    "        args = _coerce_args(args)\n"
-    "        signature = ToolCallSignature.from_call(tool_name, args)\n"
-    "        if failed is None:\n"
-    "            failed, _ = classify_tool_failure(tool_name, result)\n"
-    "        warnings = self.config.warnings_enabled\n"
+    "    def after_call(\n"
+    "        self, tool_name: str, args: Mapping[str, Any] | None, result: str | None,\n"
+    "        *, failed: bool | None = None,\n"
+    "    ) -> ToolGuardrailDecision:\n"
 )
-AFTER_CALL_INSERT = """        # kube-agents patch: a definitive permission refusal is terminal for the
-        # action. Count it across the turn, whatever succeeded in between, and
-        # halt after the configured number. See hermes_cli/permission_refusal_stop.py.
+AFTER_CALL_WRAPPER = """    def after_call(
+        self, tool_name: str, args: Mapping[str, Any] | None, result: str | None,
+        *, failed: bool | None = None,
+    ) -> ToolGuardrailDecision:
+        # kube-agents patch: the stock counters run first; a definitive
+        # permission refusal then overrides their decision (counted across
+        # the turn, halting at the configured number), and a refusal that is
+        # only guidance replaces an allow/warn. See hermes_cli/permission_refusal_stop.py.
+        decision = self._kube_stock_after_call(tool_name, args, result, failed=failed)
         try:
             from hermes_cli.permission_refusal_stop import observe_refusal as _kube_observe_refusal
 
             _kube_refusal = _kube_observe_refusal(
-                self, tool_name, result, signature,
-                decide=self._decide, decision_cls=ToolGuardrailDecision,
+                self, tool_name, _coerce_args(args), result, decision.signature,
+                stock=decision, decide=self._decide, decision_cls=ToolGuardrailDecision,
             )
         except Exception:
             _kube_refusal = None
-        if _kube_refusal is not None:
-            return _kube_refusal
+        return decision if _kube_refusal is None else _kube_refusal
+
 """
 AFTER_CALL_MARKER = "_kube_observe_refusal("
 
@@ -85,7 +90,8 @@ HALT_RESPONSE_MARKER = 'decision.code == "permission_refusal_halt"'
 
 # (file, label, anchor, replacement, marker)
 EDITS = (
-    (GUARDRAILS_RELATIVE, "after_call", AFTER_CALL_ANCHOR, AFTER_CALL_ANCHOR + AFTER_CALL_INSERT, AFTER_CALL_MARKER),
+    (GUARDRAILS_RELATIVE, "after_call", AFTER_CALL_ANCHOR,
+     AFTER_CALL_WRAPPER + AFTER_CALL_ANCHOR.replace("def after_call(", "def _kube_stock_after_call("), AFTER_CALL_MARKER),
     (GUARDRAILS_RELATIVE, "from_mapping", FROM_MAPPING_ANCHOR, FROM_MAPPING_PATCHED, FROM_MAPPING_MARKER),
     (RUN_AGENT_RELATIVE, "halt_response", HALT_RESPONSE_ANCHOR, HALT_RESPONSE_PATCHED, HALT_RESPONSE_MARKER),
 )

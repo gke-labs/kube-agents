@@ -73,8 +73,14 @@ _BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 _PYTHONS = re.compile(r"^python[\d.]*$")
 _SHELL_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
-# Short options of an interpreter that take a value token, read before a ``-c``.
+# Short options of an interpreter that take a value token, read before a ``-c``;
+# the value may also be attached (``-Werror``, ``-Xdev``).
 _INTERPRETER_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "-W", "-X", "-m"})
+_INTERPRETER_LONG_VALUE_OPTIONS = frozenset({"--rcfile", "--init-file"})
+# ``echo``/``printf`` options that precede the text they print.
+_WRITER_OPTIONS = frozenset({"-e", "-E", "-n", "-v", "-ne", "-en"})
+# A chmod mode that adds execute: ``+x``, ``u+x``, ``a=rx``, ``755``, ``0700``.
+_CHMOD_EXEC_RE = re.compile(r"[+=][^,]*[xX]|^[0-7]{0,3}[1357]$|^[0-7]*[1357][0-7]{2}$")
 _KUBECTL_PASSTHROUGH = frozenset({"exec", "run", "debug"})
 # Commands whose quoted arguments become a file's content.
 _WRITERS = frozenset({"echo", "printf", "tee"})
@@ -121,13 +127,20 @@ def _walk(text: str, out: list[str], depth: int) -> None:
         if found is None or found[0].rsplit("/", 1)[-1] not in _WRITERS:
             continue
         source = pieces[index - 1] if found[0].rsplit("/", 1)[-1] == "tee" and index else piece
-        for _, _, token in _tokens(source):
-            if token[:1] in "'\"" and len(token) > 2:
-                script = _unquote(token)
-                if kind == _KIND_SHELL:
-                    _walk(script, out, depth + 1)
-                elif script.strip():
-                    out.append(script.strip())
+        _emit_written(source, kind, out, depth)
+    for piece in pieces:
+        # ``bash <(echo cmd)``: the interpreter runs what the substituted command prints.
+        found = _command_word(piece)
+        if found is None:
+            continue
+        base = found[0].rsplit("/", 1)[-1]
+        kind = _KIND_SHELL if base in _SHELL_RUNNERS else _KIND_PYTHON if _PYTHONS.match(base) else None
+        if kind is None:
+            continue
+        for arg in found[1]:
+            if arg.startswith("<(") and arg.endswith(")"):
+                for inner_piece in _scan(arg[2:-1])[0]:
+                    _emit_written(inner_piece, kind, out, depth)
     for opener_pieces, body, expands in heredocs:
         if expands:
             inner: list[str] = []
@@ -193,21 +206,74 @@ def _kubectl_verb(rest: list[tuple[int, int, str]]) -> str | None:
     return None
 
 
+def _emit_written(piece: str, kind: str, out: list[str], depth: int) -> None:
+    """Walk, or keep as text, what a writer piece prints when something runs it."""
+    for script in _writer_scripts(piece):
+        if kind == _KIND_SHELL:
+            _walk(script, out, depth + 1)
+        elif script.strip():
+            out.append(script.strip())
+
+
+def _writer_scripts(piece: str) -> list[str]:
+    """The text ``echo``/``printf``/``tee`` in ``piece`` writes: each quoted argument,
+    or the arguments joined as the shell hands them over when any is bare."""
+    found = _command_word(piece)
+    if found is None:
+        return []
+    base = found[0].rsplit("/", 1)[-1]
+    if base not in _WRITERS or base == "tee":
+        return []
+    words: list[str] = []
+    for _, _, token in _tokens(piece):
+        if token.startswith((">", "1>", "2>", "&>")):
+            break
+        words.append(token)
+    # Everything after the writer's word and its options; printf's first word is the format.
+    while words and words[0].rsplit("/", 1)[-1] != base:
+        words.pop(0)
+    words = words[1:]
+    while words and words[0] in _WRITER_OPTIONS:
+        words.pop(0)
+    if base == "printf":
+        words = words[1:]
+    if any(w[:1] not in "'\"" for w in words):
+        return [" ".join(_unquote(w) for w in words)]
+    return [_unquote(w) for w in words if len(w) > 2]
+
+
 def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
-    """The string a shell or python runs with ``-c``, or everything after ``eval``."""
+    """The string a shell or python runs with ``-c``, or everything after ``eval``.
+
+    Options are read as the interpreter reads them: ``--`` ends them (after a
+    ``-c`` the next token is the script; before one there is no script), long
+    options that take a value consume it, a short value option consumes the
+    next token or carries it attached, and only then does a cluster holding
+    ``c`` name the script."""
     if base == "eval":
         return " ".join(_unquote(t) for _, _, t in rest) if rest else None
     i = 0
     while i < len(rest):
         token = rest[i][2]
+        if token == "--":
+            return None
         if token.startswith("--"):
-            i += 1
+            i += 2 if token in _INTERPRETER_LONG_VALUE_OPTIONS else 1
             continue
         if token.startswith(("-", "+")) and len(token) > 1:
+            if token in _INTERPRETER_VALUE_OPTIONS:
+                i += 2
+                continue
+            if token[:2] in _INTERPRETER_VALUE_OPTIONS and len(token) > 2:
+                i += 1
+                continue
             if "c" in token[1:] and token[0] == "-":
-                return _unquote(rest[i + 1][2]) if i + 1 < len(rest) else None
-            # ``-o x`` and a cluster ending in a value letter (``-eo x``).
-            if token in _INTERPRETER_VALUE_OPTIONS or ("-" + token[-1]) in _INTERPRETER_VALUE_OPTIONS:
+                k = i + 1
+                if k < len(rest) and rest[k][2] == "--":
+                    k += 1
+                return _unquote(rest[k][2]) if k < len(rest) else None
+            # A cluster ending in a value letter (``-eo x``).
+            if ("-" + token[-1]) in _INTERPRETER_VALUE_OPTIONS:
                 i += 2
                 continue
             i += 1
@@ -279,6 +345,8 @@ def _tokens(piece: str) -> list[tuple[int, int, str]]:
             elif c == '"':
                 i = _skip_double(piece, i)
             elif c == "$" and piece.startswith("$(", i):
+                i = _skip_parens(piece, i + 1)
+            elif c in "<>" and piece.startswith(c + "(", i):
                 i = _skip_parens(piece, i + 1)
             elif c == "`":
                 j = piece.find("`", i + 1)
@@ -398,6 +466,12 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[list[str], str, b
             nested.append(text[i + 2 : j - 1] if text[j - 1 : j] == ")" else text[i + 2 : j])
             buf.append(text[i:j])
             i = j
+        elif c in "<>" and text.startswith(c + "(", i):
+            # Process substitution: ``bash <(echo cmd)`` runs what ``echo`` prints.
+            j = _skip_parens(text, i + 1)
+            nested.append(text[i + 2 : j - 1] if text[j - 1 : j] == ")" else text[i + 2 : j])
+            buf.append(text[i:j])
+            i = j
         elif c == "`":
             j = text.find("`", i + 1)
             if j < 0:
@@ -503,7 +577,7 @@ def _executed_paths(pieces: list[str]) -> dict[str, str]:
             paths.setdefault(positional[0], _KIND_SHELL)
         elif _PYTHONS.match(base) and positional:
             paths.setdefault(positional[0], _KIND_PYTHON)
-        elif word == "chmod":
+        elif word == "chmod" and positional and _CHMOD_EXEC_RE.search(positional[0]):
             for path in positional[1:]:
                 paths.setdefault(path, _KIND_SHELL)
         elif word.startswith(("./", "/")):

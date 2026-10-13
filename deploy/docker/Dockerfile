@@ -1291,19 +1291,21 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # permission_refusal_stop rides it too (#1946, #1943): a worker refused a write
 # by the command policy kept trying the change another way until its step
 # budget ran out; the stock loop guardrails count identical retries and reset on
-# any success, so they never fired. One insert at the top of
-# ToolCallGuardrailController.after_call classifies every tool result: a
-# definitive policy refusal (kubernetes.read-only's, which admits every read
-# verb, with the action boundary notice) is counted across the turn and halts
-# on the configured one
+# any success, so they never fired. ToolCallGuardrailController.after_call is
+# wrapped (the stock method keeps running first, under a new name) and the
+# wrapper classifies every tool result: a
+# definitive policy refusal (kubernetes.read-only's, of a command naming a
+# mutating kubectl verb, with the action boundary notice) is counted across
+# the turn and halts on the configured one
 # (tool_loop_guardrails.permission_refusal_halt_after, default 1, read by a
 # second insert in ToolCallGuardrailConfig.from_mapping; below it a refusal
 # only appends guidance). The halt leaves through kanban_guardrail_exit's
 # nudge, which names the refusal and the board call, and a third insert in
-# run_agent.py makes it a chat turn's reply. An API 403, and gcp.read-only's
-# refusal (an allowlist that refuses unlisted reads with the same notice), only
-# warn, so a fleet audit goes on past a project it may not read or a read the
-# list lacks. See
+# run_agent.py makes it a chat turn's reply. An API 403, gcp.read-only's
+# refusal and kubernetes.read-only's refusal of a read spelling (both rules
+# are allowlists that refuse unlisted reads with the same notice) only warn,
+# so an investigation goes on past a project it may not read or a spelling
+# the list lacks. See
 # the module docstring in deploy/docker/patches/permission_refusal_stop.py.
 #
 # ssh_shared_master rides it too (#2174): every working environment in the pod

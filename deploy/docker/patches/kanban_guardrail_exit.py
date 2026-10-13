@@ -297,11 +297,12 @@ _HALT_SUFFIX = (
 PERMISSION_REFUSAL_HALT_CODE = "permission_refusal_halt"
 _REFUSAL_HALT_SUFFIX = (
     "\n\n[System: the command policy refused this change — a permission "
-    "boundary, not an error to work around. Do not try another "
-    "route and do not start a pull request. Call "
-    "`kanban_block(kind=\"needs_input\", reason=...)` now with what was refused, "
-    "quoting the policy's message, and a note that the change can be proposed "
-    "as a pull request if the requester wants one.]"
+    "boundary, not an error to work around. Do not try another route. "
+    "If the card asked for a pull request, propose the change through "
+    "`submit-suggestion` and `kanban_complete` with the refusal quoted; "
+    "otherwise call `kanban_block(kind=\"needs_input\", reason=...)` now with "
+    "what was refused, quoting the policy's message, and a note that the "
+    "change can be proposed as a pull request if the requester wants one.]"
 )
 
 

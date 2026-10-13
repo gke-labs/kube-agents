@@ -240,10 +240,9 @@ def test_scripts_written_by_echo_or_printf_and_passthrough_behind_global_flags()
         "echo 'kubectl scale deploy x --replicas=3' > /tmp/run.sh",
         "bash /tmp/run.sh",
     ]
-    assert segments("printf '%s\\n' 'kubectl scale deploy x --replicas=3' > /tmp/run && bash /tmp/run")[:2] == [
-        "%s\\n",
-        "kubectl scale deploy x --replicas=3",
-    ]
+    assert segments("printf '%s\\n' 'kubectl scale deploy x --replicas=3' > /tmp/run && bash /tmp/run")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
     assert segments("echo 'kubectl scale deploy x --replicas=3' | tee /tmp/run.sh && bash /tmp/run.sh")[0] == (
         "kubectl scale deploy x --replicas=3"
     )
@@ -258,6 +257,39 @@ def test_scripts_written_by_echo_or_printf_and_passthrough_behind_global_flags()
     assert segments("kubectl --kubeconfig /tmp/kc get pods -- not a passthrough") == [
         "kubectl --kubeconfig /tmp/kc get pods -- not a passthrough"
     ]
+
+
+def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_read():
+    # A script written by a bare ``echo`` and run in the same call.
+    assert segments("echo kubectl scale deploy x --replicas=3 > /tmp/run.sh && bash /tmp/run.sh")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    assert segments("echo -e kubectl scale deploy x --replicas=3 >run.sh; bash run.sh")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    # Process substitution runs what the inner command prints.
+    assert segments("bash <(echo 'kubectl scale deploy x --replicas=3')")[0] == (
+        "echo 'kubectl scale deploy x --replicas=3'"
+    )
+    assert segments("diff <(kubectl get deploy a -o yaml) <(kubectl get deploy b -o yaml)")[:2] == [
+        "kubectl get deploy a -o yaml",
+        "kubectl get deploy b -o yaml",
+    ]
+    # ``--`` after ``-c``, a long valued option, an attached ``-W`` value.
+    assert "kubectl scale deploy x --replicas=3" in segments("bash -c -- 'kubectl scale deploy x --replicas=3'")
+    assert segments("bash -- script.sh") == ["bash -- script.sh"]
+    assert "kubectl scale deploy x --replicas=3" in segments(
+        "bash --rcfile /dev/null -c 'kubectl scale deploy x --replicas=3'"
+    )
+    assert segments("python3 -Werror::DeprecationWarning -c 'import kubernetes'")[1] == "import kubernetes"
+    # A chmod that does not add execute does not make the file a script.
+    assert segments("echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes && chmod 600 /tmp/notes") == [
+        "echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes",
+        "chmod 600 /tmp/notes",
+    ]
+    assert segments("echo 'kubectl scale deploy x --replicas=3' > /tmp/r && chmod +x /tmp/r")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
 
 
 def test_prose_quotes_and_comments_are_not_commands():

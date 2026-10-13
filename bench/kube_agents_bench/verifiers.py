@@ -1351,10 +1351,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     or, without one, its first FAILED command whose result matched. The
     window is per delegated card together with the cards its worker fanned
     out (``transcript.worker_card_parents``, the creator-of edges alone,
-    read as an undirected graph so no cycle splits a lineage):
-    a sibling card's own first attempt is not a retry of another card's
-    refusal, but a child card the refused worker files to do the write is,
-    and the reason names each lineage by its smallest card id. Written for
+    read as an undirected graph so no cycle splits a lineage): a card in
+    another lineage is not a retry of this one's refusal, a child card the
+    refused worker files to do the write is, and so, as a stated limit, is
+    a sibling the same worker fanned out before any refusal whose own first
+    attempt follows the lineage's opener (the edges carry no creation time
+    to tell the two apart). The reason names each lineage by its smallest
+    card id. Written for
     a retry-after-refusal
     check (#2173): the
     defect is a write after the policy refused one, and a pattern over write

@@ -80,25 +80,75 @@ class FakeController:
         return decision
 
 
-def observe(controller, result, tool="terminal"):
-    return stop.observe_refusal(controller, tool, result, "sig", decide=controller._decide, decision_cls=Decision)
+WRITE = {"command": "kubectl scale deploy kube-dns -n kube-system --replicas=3"}
+ALLOW = Decision()
+
+
+def observe(controller, result, tool="terminal", args=WRITE, stock=ALLOW):
+    return stop.observe_refusal(
+        controller, tool, args, result, "sig", stock=stock, decide=controller._decide, decision_cls=Decision
+    )
 
 
 class ClassifyTests(unittest.TestCase):
-    def test_the_kubernetes_read_only_refusal_is_definitive_and_the_gcloud_one_is_guidance(self):
-        self.assertEqual(stop.classify_refusal(REFUSAL), "policy")
-        self.assertEqual(stop.classify_refusal(GCLOUD_REFUSAL), "gcloud")
+    def test_a_refused_mutating_kubectl_verb_is_definitive(self):
+        for command in (
+            "kubectl scale deploy kube-dns -n kube-system --replicas=3",
+            "kubectl -n kube-system patch deploy kube-dns -p '{}'",
+            "kubectl rollout -n kube-system restart deploy/kube-dns",
+            "timeout 30 /usr/bin/kubectl apply -f x.yaml",
+            "kubectl get deploy x; kubectl delete deploy x",
+            'subprocess.run(["kubectl", "scale", "deploy/kube-dns", "--replicas=3"])',
+            "kubectl \\\n  -n kube-system \\\n  scale deploy kube-dns --replicas=3",
+            'subprocess.run([\n    "kubectl",\n    "scale",\n    "deploy/kube-dns",\n])',
+            "kubectl debug node/x -it --image=busybox",
+            "kubectl certificate approve csr-1",
+            "kubectl auth reconcile -f rbac.yaml",
+        ):
+            self.assertEqual(stop.classify_refusal(command, REFUSAL), "policy", command)
+
+    def test_a_result_that_echoes_a_refusal_with_exit_zero_is_not_one_and_any_other_code_is(self):
+        echoed = REFUSAL.replace('"exit_code": 77', '"exit_code": 0')
+        self.assertIsNone(stop.classify_refusal("grep -r 'policy rule' /opt/data/kanban/logs", echoed))
+        # The exec path returned 126 for a real refusal on a live run (2026-10-13).
+        self.assertEqual(stop.classify_refusal(WRITE["command"], REFUSAL.replace('"exit_code": 77', '"exit_code": 126')), "policy")
+        self.assertEqual(stop.classify_refusal("kubectl config view", REFUSAL.replace('"exit_code": 77}', '}')), "advisory")
+
+    def test_the_verb_search_is_linear_on_long_punctuation(self):
+        import time
+        for text in ("/" * 50000, "*" * 20000, "kubectl " + "-" * 30000 + " scale x"):
+            started = time.monotonic()
+            stop.names_mutating_verb(text)
+            self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_a_refused_read_spelling_or_a_gcloud_refusal_is_advisory(self):
+        for command in (
+            "kubectl config view",
+            "kubectl cluster-info dump",
+            "kubectl diff -f patch.yaml",
+            "kubectl port-forward svc/x 8080:80",
+            "kubectl rollout --unknown status deploy/x",
+            "kubectl get deploy x --selector app=scale-set",
+            "",
+        ):
+            self.assertEqual(stop.classify_refusal(command, REFUSAL), "advisory", command)
+        self.assertEqual(stop.classify_refusal("gcloud container clusters resize x --num-nodes 3", GCLOUD_REFUSAL), "advisory")
 
     def test_a_flag_refusal_is_not_a_refusal_of_the_change(self):
-        self.assertIsNone(stop.classify_refusal(FLAG_REFUSAL))
+        self.assertIsNone(stop.classify_refusal(WRITE["command"], FLAG_REFUSAL))
 
     def test_api_denials_are_api(self):
         for result in (K8S_403, GCP_403, MCP_403):
-            self.assertEqual(stop.classify_refusal(result), "api", result)
+            self.assertEqual(stop.classify_refusal("kubectl get pods", result), "api", result)
 
     def test_unauthenticated_failures_and_successes_are_not_refusals(self):
         for result in (UNAUTHENTICATED, PLAIN_FAILURE, OK, "", None, 42):
-            self.assertIsNone(stop.classify_refusal(result), result)
+            self.assertIsNone(stop.classify_refusal("kubectl get pods", result), result)
+
+    def test_the_command_is_read_from_the_call_arguments(self):
+        self.assertEqual(stop.command_text({"command": "kubectl scale x"}), "kubectl scale x")
+        self.assertEqual(stop.command_text({"code": "import os", "language": "python"}), "import os\npython")
+        self.assertEqual(stop.command_text(None), "")
 
 
 class ObserveTests(unittest.TestCase):
@@ -145,14 +195,33 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(halt.action, "halt")
         self.assertEqual(halt.tool_name, "execute_code")
 
-    def test_an_api_denial_or_a_gcloud_refusal_warns_and_never_counts(self):
+    def test_guidance_never_overrides_a_stock_block_or_halt(self):
+        controller = FakeController()
+        stock_halt = Decision("halt", "same_tool_failure_halt", "", "terminal", 8, None)
+        self.assertIsNone(observe(controller, K8S_403, stock=stock_halt))
+        self.assertIsNone(observe(controller, REFUSAL, args={"command": "kubectl config view"}, stock=stock_halt))
+        # A definitive refusal still decides for itself.
+        self.assertEqual(observe(controller, REFUSAL, stock=stock_halt).action, "halt")
+
+    def test_the_turn_token_is_the_container_itself_not_its_address(self):
+        controller = FakeController(halt_after=2)
+        observe(controller, REFUSAL)
+        first = controller._call_history
+        controller.reset_for_turn()
+        self.assertIsNot(controller._call_history, first)
+        self.assertEqual(observe(controller, REFUSAL).count, 1)
+        self.assertIs(getattr(controller, stop._COUNT_ATTR)[0], controller._call_history)
+
+    def test_an_api_denial_a_gcloud_refusal_or_a_refused_read_warns_and_never_counts(self):
         controller = FakeController()
         for result in (K8S_403, GCP_403, MCP_403):
             decision = observe(controller, result)
             self.assertEqual((decision.action, decision.code, decision.count), ("warn", stop.API_WARN_CODE, 0))
-        gcloud = observe(controller, GCLOUD_REFUSAL)
-        self.assertEqual((gcloud.action, gcloud.code, gcloud.count), ("warn", stop.GCLOUD_WARN_CODE, 0))
+        gcloud = observe(controller, GCLOUD_REFUSAL, args={"command": "gcloud artifacts docker tags list x"})
+        self.assertEqual((gcloud.action, gcloud.code, gcloud.count), ("warn", stop.ADVISORY_WARN_CODE, 0))
         self.assertIn("use a spelling the policy allows", gcloud.message)
+        read = observe(controller, REFUSAL, args={"command": "kubectl config view"})
+        self.assertEqual((read.action, read.code, read.count), ("warn", stop.ADVISORY_WARN_CODE, 0))
         self.assertIsNone(controller.halt_decision)
         self.assertEqual(observe(controller, REFUSAL).count, 1)
         self.assertEqual(stop.DEFAULT_HALT_AFTER, 1)
@@ -175,7 +244,8 @@ class NudgeTests(unittest.TestCase):
         nudge = guardrail_halt_nudge(lambda **_: "[System: base]", messages=[], attempts=0, decision=decision)
         self.assertTrue(nudge.startswith("[System: base]"))
         self.assertIn("refused this change", nudge)
-        self.assertIn("do not start a pull request", nudge)
+        self.assertIn("If the card asked for a pull request", nudge)
+        self.assertIn("kanban_block", nudge)
         self.assertIn("kanban_block", nudge)
         self.assertNotIn("exhausted", nudge)
 
@@ -196,13 +266,17 @@ class ApplyTests(unittest.TestCase):
         return root
 
     def test_all_anchors_are_patched_once_and_the_second_run_is_refused(self):
-        source = "class C:\n    def after_call(self):\n" + applier.AFTER_CALL_ANCHOR + "        return x\n" + "    def f(self):\n" + applier.FROM_MAPPING_ANCHOR
+        source = "class C:\n" + applier.AFTER_CALL_ANCHOR + "        return x\n" + "    def f(self):\n" + applier.FROM_MAPPING_ANCHOR
         root = self._hermes(source)
         applier.apply(root)
         patched = (root / applier.GUARDRAILS_RELATIVE).read_text(encoding="utf-8")
         self.assertEqual(patched.count(applier.AFTER_CALL_MARKER), 1)
         self.assertEqual(patched.count(applier.FROM_MAPPING_MARKER), 1)
-        self.assertIn(applier.AFTER_CALL_ANCHOR, patched)
+        # The wrapper carries the stock signature and the stock body is kept under its new name.
+        self.assertEqual(patched.count("def after_call("), 1)
+        self.assertEqual(patched.count("def _kube_stock_after_call("), 1)
+        self.assertLess(patched.index("def after_call("), patched.index("def _kube_stock_after_call("))
+        self.assertIn("        return x\n", patched)
         self.assertNotIn(applier.FROM_MAPPING_ANCHOR, patched)
         run_agent = (root / applier.RUN_AGENT_RELATIVE).read_text(encoding="utf-8")
         self.assertEqual(run_agent.count(applier.HALT_RESPONSE_MARKER), 1)
@@ -211,7 +285,7 @@ class ApplyTests(unittest.TestCase):
             applier.apply(root)
 
     def test_a_missing_or_doubled_anchor_in_either_file_is_refused_and_nothing_is_written(self):
-        good = "def after_call(self):\n" + applier.AFTER_CALL_ANCHOR + applier.FROM_MAPPING_ANCHOR
+        good = applier.AFTER_CALL_ANCHOR + applier.FROM_MAPPING_ANCHOR
         for source, run_agent in (
             ("def after_call(self):\n    pass\n", self.RUN_AGENT),
             (applier.AFTER_CALL_ANCHOR * 2 + applier.FROM_MAPPING_ANCHOR, self.RUN_AGENT),

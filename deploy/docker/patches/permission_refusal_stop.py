@@ -12,15 +12,23 @@ module is the backstop for a model that does not.
 
 What it does
 ------------
-Installed into ``ToolCallGuardrailController.after_call`` by
-``apply_permission_refusal_stop.py``, ahead of the stock counters. For every
-tool result it asks :func:`classify_refusal`:
+Installed around ``ToolCallGuardrailController.after_call`` by
+``apply_permission_refusal_stop.py``: the stock method runs first, so its
+failure counters and loop caps see every call, and :func:`observe_refusal`
+then decides whether a refusal overrides its decision. For every tool result
+it asks :func:`classify_refusal`:
 
-* ``policy``: the command policy's ``kubernetes.read-only`` rule refused the
-  command and said it is final (the action boundary notice ``command_policy.py``
-  prints: "refused however it is attempted"). That rule admits every kubectl
-  read verb, so what it refuses is a write or an action. Counted per turn,
-  across every tool and whatever succeeded in between. The ``permission_refusal_halt_after``-th
+* ``policy``: the command policy's ``kubernetes.read-only`` rule refused a
+  command that names a mutating kubectl verb (:data:`_MUTATING_VERBS`), with
+  the action boundary notice ``command_policy.py`` prints ("refused however it
+  is attempted"). The rule is an allowlist of read verbs and refuses an
+  unlisted read spelling (``config view``, ``cluster-info dump``, ``diff``,
+  ``port-forward``, ``cp``, ``exec``) with the same words, so the verb is what
+  tells a refused write from a refused read: a write is counted, per turn,
+  across every tool and whatever succeeded in between. A result that carries
+  an exit code of 0 is not a refusal (a read that echoed a logged refusal);
+  the shim's own code is 77, but the exec path has been seen to return 126
+  for the same refusal, so no other value is required. The ``permission_refusal_halt_after``-th
   (``tool_loop_guardrails`` in the profile config, default
   :data:`DEFAULT_HALT_AFTER`, the first) halts the turn through the controller's
   own halt decision, which ``agent/turn_tool_round.py`` already routes through
@@ -31,11 +39,15 @@ tool result it asks :func:`classify_refusal`:
   investigating, which is why the default halts on the first. A flag refusal
   (``retried without the flag``) is not counted: the policy itself says the
   command may be retried.
-* ``gcloud``: the ``gcp.read-only`` rule's refusal, which carries the same
-  notice. Guidance only, never counted: that rule is an allowlist of known
-  reads and refuses an unlisted read with the same words, telling the agent to
-  use an allowed spelling or report the gap, and a halt there ended a live
-  Cluster Agent investigation on ``gcloud artifacts docker tags list``.
+* ``advisory``: the notice on anything else: a kubectl command with no
+  mutating verb in it, or ``gcp.read-only``'s refusal (also an allowlist, which
+  refuses unlisted reads the same way; a halt there ended a live Cluster Agent
+  investigation on ``gcloud artifacts docker tags list``). Guidance only,
+  never counted: the policy's own text tells the agent to use an allowed
+  spelling or report the gap, and a write it did not recognise is still
+  refused by the policy on the next try. The guidance replaces the stock
+  decision only when that decision was ``allow`` or ``warn``; a stock halt
+  (eight varied failures of one tool, say) still ends the run.
 * ``api``: a 403 from the Kubernetes or Google Cloud API. Guidance only, never
   counted: a fleet audit meets these on projects it may not read and goes on
   to the next one, and halting it would be the wrong fix (#1946's own caveat).
@@ -43,8 +55,9 @@ tool result it asks :func:`classify_refusal`:
   owns them.
 
 The counter lives on the controller and keys on the turn: Hermes rebuilds
-``_call_history`` in ``reset_for_turn``, so its identity names the turn without
-a second anchor in that method. A kanban worker is one turn for the whole card,
+``_call_history`` in ``reset_for_turn``, so the deque object names the turn
+(held by reference, so a freed deque's address cannot be mistaken for it)
+without a second anchor in that method. A kanban worker is one turn for the whole card,
 which is the scope the count should have.
 
 Why not the stock detector
@@ -66,13 +79,42 @@ DEFAULT_HALT_AFTER = 1
 HALT_AFTER_ATTR = "kube_permission_refusal_halt_after"
 #: Decision codes, in the shape of upstream's.
 WARN_CODE = "permission_refusal"
-GCLOUD_WARN_CODE = "gcloud_policy_refusal"
+ADVISORY_WARN_CODE = "policy_refusal_advisory"
 API_WARN_CODE = "permission_denied"
 HALT_CODE = "permission_refusal_halt"
 #: The phrase only the command policy's action boundary notice carries.
 _POLICY_ACTION_RE = re.compile(r"refused however it is attempted")
-#: The rule whose refusals are definitive: it allows every kubectl read.
+#: The rule whose refusal of a mutating verb is definitive.
 _DEFINITIVE_RULE_RE = re.compile(r"policy rule: kubernetes\.read-only\b")
+#: kubectl verbs that change state (``debug`` starts a pod or container,
+#: ``certificate`` approves or denies, ``reconcile`` is ``auth reconcile``);
+#: ``rollout`` only with a mutating sub-verb.
+_MUTATING_VERBS = (
+    "scale|patch|edit|apply|replace|autoscale|annotate|label|create|delete|set|run|expose"
+    "|cordon|uncordon|drain|taint|debug|certificate|reconcile"
+)
+#: Line continuations, and newlines after a comma or an opening bracket (a
+#: formatted Python list), read as one line before the verb is looked for.
+_JOIN_RE = re.compile(r"\\\n\s*|(?<=[,(\[])\s*\n\s*")
+#: A command that succeeded only echoed the notice; the shim itself exits 77,
+#: and the exec path has returned 126 for the same refusal.
+_SUCCESS_EXIT_CODE = "0"
+_EXIT_CODE_RE = re.compile(r'"exit_code":\s*(-?\d+)')
+#: A kubectl word, then within the same simple command one of the verbs above, as
+#: a word of its own (``patch.yaml`` and ``--replicas=3`` are not verbs). The
+#: separator class admits the quoted, comma-separated form a Python list uses.
+_WORD_EDGE = r"(?<![\w./=:@-])"
+_WORD_END = r"(?![\w./=:@-])"
+#: ``kubectl`` as a word (a directory in front of it ends in ``/``, which the
+#: lookbehind admits; a prefix group here was quadratic on long punctuation).
+_KUBECTL_WORD = r"(?<![\w=:@-])kubectl" + _WORD_END
+_MUTATING_CALL_RE = re.compile(
+    rf"{_KUBECTL_WORD}[^;|&\n]{{0,400}}?{_WORD_EDGE}(?:{_MUTATING_VERBS}){_WORD_END}"
+)
+_ROLLOUT_CALL_RE = re.compile(
+    rf"{_KUBECTL_WORD}[^;|&\n]{{0,400}}?{_WORD_EDGE}rollout{_WORD_END}"
+    rf"[^;|&\n]{{0,200}}?{_WORD_EDGE}(?:restart|undo|pause|resume){_WORD_END}"
+)
 #: Kubernetes and Google Cloud API denials, in the shapes kubectl, gcloud and the
 #: MCP tools print them. ``401``/``Unauthenticated`` deliberately absent.
 _API_DENIED_RE = re.compile(
@@ -86,11 +128,11 @@ WARN_MESSAGE = (
     "refused however it is attempted, so do not retry it through another command, tool, "
     "flag, identity or API. Stop working on this change now and report what was refused, "
     "quoting the message, with a note that it can be proposed as a pull request; open one "
-    "only if the request asked for a pull request. Another refused change in this run "
-    "ends the run."
+    "only if the request asked for a pull request. Further refused changes in this run "
+    "end the run."
 )
-GCLOUD_WARN_MESSAGE = (
-    "The command policy refused this gcloud command. If it would change cloud state, that "
+ADVISORY_WARN_MESSAGE = (
+    "The command policy refused this command. If it would change cluster or cloud state, that "
     "change is refused however it is attempted: do not retry it through another command, tool, "
     "flag or identity; report it, and propose it as a pull request only if one was asked for. "
     "If it only reads, use a spelling the policy allows or report the gap; do not work around it."
@@ -109,12 +151,32 @@ HALT_MESSAGE = (
 )
 
 
-def classify_refusal(result) -> str | None:
-    """``"policy"`` for a definitive refusal, ``"gcloud"`` or ``"api"`` for guidance, else ``None``."""
+def command_text(args) -> str:
+    """The command a tool call ran, as far as its arguments say: ``command`` first, else every string."""
+    if not isinstance(args, dict):
+        return ""
+    command = args.get("command")
+    if isinstance(command, str):
+        return command
+    return "\n".join(v for v in args.values() if isinstance(v, str))
+
+
+def names_mutating_verb(command: str) -> bool:
+    """Whether ``command`` runs kubectl with a verb that changes state."""
+    joined = _JOIN_RE.sub(" ", command)
+    return bool(_MUTATING_CALL_RE.search(joined) or _ROLLOUT_CALL_RE.search(joined))
+
+
+def classify_refusal(command, result) -> str | None:
+    """``"policy"`` for a definitive refusal, ``"advisory"`` or ``"api"`` for guidance, else ``None``."""
     if not isinstance(result, str) or not result:
         return None
     if _POLICY_ACTION_RE.search(result):
-        return "policy" if _DEFINITIVE_RULE_RE.search(result) else "gcloud"
+        exit_code = _EXIT_CODE_RE.search(result)
+        if exit_code and exit_code.group(1) == _SUCCESS_EXIT_CODE:
+            return None
+        definitive = _DEFINITIVE_RULE_RE.search(result) and names_mutating_verb(command or "")
+        return "policy" if definitive else "advisory"
     if _API_DENIED_RE.search(result):
         return "api"
     return None
@@ -127,32 +189,36 @@ def halt_after(config) -> int:
 
 
 def turn_token(controller):
-    """Something that changes when ``reset_for_turn`` runs: the identity of a per-turn container."""
-    history = getattr(controller, "_call_history", None)
-    return id(history) if history is not None else None
+    """Something that changes when ``reset_for_turn`` runs: the per-turn container itself."""
+    return getattr(controller, "_call_history", None)
 
 
 def count_refusal(controller) -> int:
     """Count one definitive refusal for the current turn and return the turn's total."""
     token = turn_token(controller)
     previous = getattr(controller, _COUNT_ATTR, None)
-    count = previous[1] + 1 if isinstance(previous, tuple) and previous[0] == token else 1
+    count = previous[1] + 1 if isinstance(previous, tuple) and previous[0] is token else 1
     setattr(controller, _COUNT_ATTR, (token, count))
     return count
 
 
-def observe_refusal(controller, tool_name, result, signature, *, decide, decision_cls):
-    """The decision for ``result`` when it is a refusal, else ``None`` so the stock path runs.
+def observe_refusal(controller, tool_name, args, result, signature, *, stock, decide, decision_cls):
+    """The decision that replaces ``stock`` when ``result`` is a refusal, else ``None``.
 
-    ``decide`` is the controller's ``_decide`` (which records a halt as the
-    turn's halt decision); ``decision_cls`` is ``ToolGuardrailDecision``. Both
-    are injected so this module never imports Hermes.
+    ``args`` are the call's arguments (the command is read from them);
+    ``stock`` is what the unpatched ``after_call`` decided, which guidance
+    never overrides when it is a block or a halt; ``decide`` is the
+    controller's ``_decide`` (which records a halt as the turn's halt
+    decision); ``decision_cls`` is ``ToolGuardrailDecision``. The last two are
+    injected so this module never imports Hermes.
     """
-    kind = classify_refusal(result)
+    kind = classify_refusal(command_text(args), result)
     if kind is None:
         return None
     if kind != "policy":
-        code, message = (API_WARN_CODE, API_WARN_MESSAGE) if kind == "api" else (GCLOUD_WARN_CODE, GCLOUD_WARN_MESSAGE)
+        if getattr(stock, "action", "allow") not in ("allow", "warn"):
+            return None
+        code, message = (API_WARN_CODE, API_WARN_MESSAGE) if kind == "api" else (ADVISORY_WARN_CODE, ADVISORY_WARN_MESSAGE)
         return decision_cls(
             action="warn", code=code, message=message,
             tool_name=tool_name, count=0, signature=signature,
