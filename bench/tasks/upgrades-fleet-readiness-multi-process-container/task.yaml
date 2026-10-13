@@ -1,0 +1,165 @@
+# The readiness report names a multi-process container and says the group OOM kill already applies to it
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 15: the OOM killer starts killing the whole container).
+# It grades the readiness report's `group-oom-kill` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/group_oom_kill.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule is a heuristic on the command and the image, and says so in every
+# finding: a supervisor program, a shell script that forks a background job
+# (`readiness_rules.shell_forks` reads the script), or an image whose
+# entrypoint is a supervisor. The shape is a risk when the target turns the
+# group OOM kill on for the pool: a move to cgroup v2 at 1.28 or later, or a
+# cgroup v2 pool's kubelet crossing 1.28. The seeded fleet's pools run cgroup
+# v2 with a kubelet past 1.28, so the rule reports the shape in its note:
+# already group-killed, not an upgrade risk. The declared line therefore reads
+# `blocks the upgrade: no`, and the case grades that the agent names the
+# Deployment from the report and does not call it a blocker. The cell pattern
+# stops at the shape, so a fleet whose pool the target moves to cgroup v2 (a
+# risk) is still graded on the rule's own text.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per object the report names, and the
+# checks read two slots from any line naming the planted object: the verdict,
+# `blocks the upgrade: <yes|no>`, and the cell, the entry the report printed
+# for the object, copied as printed. Nothing else on the line is graded, not
+# the cluster prefix and not the kind field: the declared-line form's earlier
+# cases found that anchoring on the rendering graded the agent's formatting
+# rather than its judgement. The verdict token is one word from a closed set,
+# so there is no room for a hedge on the graded part. The cell slot is what
+# proves the report ran: its pattern is wording only the rule's own text
+# produces (`group-oom-kill: Deployment seeded-shapes/multi-process-worker
+# container <name> runs a shell script that forks a background job`), which
+# the skill paraphrases and a hand kubectl survey cannot supply; a report
+# whose rule is missing prints no such entry, so the slot reads `none` or
+# another rule's text and the line fails there whatever the verdict says. The
+# cell carries a `;`, which keeps the verifier's value-wrap fold from removing
+# a quote or angle bracket the agent kept around it, so the patterns admit any
+# prefix before the rule's text, a note column's other entries included. A pod
+# of the workload may stand in for it on the line (the name plus one or two
+# hash suffixes), as the agent sometimes renders it. Each accept is `<name>
+# ... blocks the upgrade: no` on one line, read after the harness's trail fold
+# (`fold_decoration`); the forbid is the same name with any other value, so a
+# second line about the object that contradicts the first fails whatever the
+# right line says. The prose, the reason the rule gives, and the recommended
+# remedy are the judge's, against `expected_output`.
+#
+# Planted defect required: on slot a, the Deployment multi-process-worker in
+# seeded-shapes, one replica, whose shell supervisor forks two workers under
+# one memory limit (role `multi-process-container` in
+# bench/tf/fleet/fixtures.json). The safeguard reads that the Deployment still
+# has its one replica after the run, so an agent that changed the planted
+# object fails the case whatever its answer says. No `worker_commands`
+# objective: it reads delegated workers' terminals only and errors on a run
+# the router answered itself, so the report's own output is graded through the
+# cell slot instead, as upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+id: upgrades-fleet-readiness-multi-process-container
+name: Fleet upgrade readiness names the container running several processes
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per object that the readiness report
+  names as a blocker, as a risk, or as a shape it checked and cleared, in
+  exactly this form and with no other words on the line: "<cluster>/<object
+  name>: kind <deployment|statefulset|daemonset|cronjob|pdb|exclusion>; blocks
+  the upgrade: <yes|no>; cell: <the entry the report prints for that object in
+  its other blockers, risks or note column, copied as printed|none>". Write
+  each name exactly as the API shows it, with no brackets, quotes or
+  parentheses around it. When a column holds several entries separated by ";
+  ", copy the one naming the object. Put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the Deployment multi-process-worker in seeded-shapes: its container runs a
+  shell script that forks two workers under one memory limit, a heuristic the
+  report marks as one. It says the pool already runs cgroup v2 with a kubelet
+  at 1.28 or later, so an OOM kill already takes the whole container and the
+  upgrade changes nothing; the report carries it in its note column, not as a
+  risk or a blocker. It recommends one process per container or
+  singleProcessOOMKill in the pool's node system config. Other clusters'
+  blockers and risks come from the same run. It ends with one declared line
+  per object; the line for multi-process-worker reads "blocks the upgrade: no"
+  and its cell is the report's entry for it, beginning "group-oom-kill:
+  Deployment seeded-shapes/multi-process-worker container <name> runs a shell
+  script that forks a background job". It cites no CVE identifiers and changes
+  nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - multi-process-container
+
+verification_spec:
+  # The verdict this case exists for: a line naming multi-process-worker whose verdict
+  # is no; the forbid is the same name with any other verdict.
+  - name: multi-process-worker-line-does-not-block
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - multi-process-container
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: no(?:\s*;|\s*$)'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!no(?:\s*;|\s*$))'
+
+  # The report's own wording: the entry the note column carries for the object is the
+  # rule's text, which the skill paraphrases and a cluster listing cannot
+  # supply. A report whose rule is missing prints no such entry, so the slot
+  # reads `none` or something else and the line fails here, whatever the
+  # verdict says. Any prefix is admitted before the rule's text: a quote or
+  # angle bracket the agent kept around the cell (the `;` inside it keeps the
+  # value-wrap fold from removing one), or a note column's other entries.
+  - name: multi-process-worker-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - multi-process-container
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?group-oom-kill: deployment seeded-shapes/multi-process-worker:? container [a-z0-9-]+ runs a shell script that forks a background job[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?group-oom-kill: deployment seeded-shapes/multi-process-worker:? container [a-z0-9-]+ runs a shell script that forks a background job)[^\n]*$'
+
+  # The prompt's "read only", grounded: the planted object is as the fixture
+  # declares it after the run.
+  - name: the-planted-deployment-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: multi-process-container
+      kind: deployment
+      resource_name: multi-process-worker
+      namespace: seeded-shapes
+      path: spec.replicas
+      op: eq
+      value: 1
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

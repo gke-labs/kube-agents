@@ -1,0 +1,166 @@
+# The readiness report names a pre-cgroup-v2 JDK and says the upgrade does not change its cgroup mode
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 14: cgroup v2 under a runtime that cannot read it).
+# It grades the readiness report's `cgroup-v2-runtime` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/cgroup_v2_runtime.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule reads each Java and .NET image tag against the cgroup v2 floors
+# (JDK 8u372, 11.0.16, 15; .NET 5.0) and each pool's effectiveCgroupMode
+# against the target. A runtime below the floor is a risk only on a pool the
+# target moves to cgroup v2. The seeded fleet's pools were created at 1.26 or
+# later, so they already run cgroup v2, and the rule reports the JDK 8u302
+# image in its note: already on cgroup v2, not an upgrade risk. The declared
+# line therefore reads `blocks the upgrade: no`, and the case grades that the
+# agent names the Deployment from the report and does not call it a blocker.
+# The risk path, a cgroup v1 pool the target migrates, is covered by the
+# rule's unit tests; this fleet cannot show it. The cell pattern stops at the
+# pool's name, so a fleet whose pool is on cgroup v1 (a risk) or whose pool
+# record carries no mode (an unknown, in the note) is still graded on the
+# rule's own text.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per object the report names, and the
+# checks read two slots from any line naming the planted object: the verdict,
+# `blocks the upgrade: <yes|no>`, and the cell, the entry the report printed
+# for the object, copied as printed. Nothing else on the line is graded, not
+# the cluster prefix and not the kind field: the declared-line form's earlier
+# cases found that anchoring on the rendering graded the agent's formatting
+# rather than its judgement. The verdict token is one word from a closed set,
+# so there is no room for a hedge on the graded part. The cell slot is what
+# proves the report ran: its pattern is wording only the rule's own text
+# produces (`cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm
+# container <name> runs docker.io/library/eclipse-temurin:8u302-b08-jre (JDK
+# 8u302, below 8u372) on pool <pool>`), which the skill paraphrases and a hand
+# kubectl survey cannot supply; a report whose rule is missing prints no such
+# entry, so the slot reads `none` or another rule's text and the line fails
+# there whatever the verdict says. The cell carries a `;`, which keeps the
+# verifier's value-wrap fold from removing a quote or angle bracket the agent
+# kept around it, so the patterns admit any prefix before the rule's text, a
+# note column's other entries included. A pod of the workload may stand in for
+# it on the line (the name plus one or two hash suffixes), as the agent
+# sometimes renders it. Each accept is `<name> ... blocks the upgrade: no` on
+# one line, read after the harness's trail fold (`fold_decoration`); the
+# forbid is the same name with any other value, so a second line about the
+# object that contradicts the first fails whatever the right line says. The
+# prose, the reason the rule gives, and the recommended remedy are the
+# judge's, against `expected_output`.
+#
+# Planted defect required: on slot a, the Deployment cgroup-blind-jvm in
+# seeded-shapes, one replica, running eclipse-temurin 8u302 under a memory
+# limit (role `cgroup-blind-runtime` in bench/tf/fleet/fixtures.json). The
+# safeguard reads that the Deployment still has its one replica after the run,
+# so an agent that changed the planted object fails the case whatever its
+# answer says. No `worker_commands` objective: it reads delegated workers'
+# terminals only and errors on a run the router answered itself, so the
+# report's own output is graded through the cell slot instead, as
+# upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+id: upgrades-fleet-readiness-cgroup-blind-runtime
+name: Fleet upgrade readiness names the JDK below the cgroup v2 floor
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per object that the readiness report
+  names as a blocker, as a risk, or as a shape it checked and cleared, in
+  exactly this form and with no other words on the line: "<cluster>/<object
+  name>: kind <deployment|statefulset|daemonset|cronjob|pdb|exclusion>; blocks
+  the upgrade: <yes|no>; cell: <the entry the report prints for that object in
+  its other blockers, risks or note column, copied as printed|none>". Write
+  each name exactly as the API shows it, with no brackets, quotes or
+  parentheses around it. When a column holds several entries separated by ";
+  ", copy the one naming the object. Put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the Deployment cgroup-blind-jvm in seeded-shapes: its image
+  docker.io/library/eclipse-temurin:8u302-b08-jre is a JDK below 8u372, the
+  first update that reads cgroup v2. It says the pool already runs cgroup v2,
+  so the upgrade changes nothing for the JVM; the report carries it in its
+  note column, not as a risk or a blocker. It recommends a JDK at 8u372 or
+  later, or explicit heap flags. Other clusters' blockers and risks come from
+  the same run. It ends with one declared line per object; the line for
+  cgroup-blind-jvm reads "blocks the upgrade: no" and its cell is the report's
+  entry for it, beginning "cgroup-v2-runtime: Deployment
+  seeded-shapes/cgroup-blind-jvm container <name> runs
+  docker.io/library/eclipse-temurin:8u302-b08-jre (JDK 8u302, below 8u372) on
+  pool <pool>". It cites no CVE identifiers and changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - cgroup-blind-runtime
+
+verification_spec:
+  # The verdict this case exists for: a line naming cgroup-blind-jvm whose verdict
+  # is no; the forbid is the same name with any other verdict.
+  - name: cgroup-blind-jvm-line-does-not-block
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cgroup-blind-runtime
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: no(?:\s*;|\s*$)'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!no(?:\s*;|\s*$))'
+
+  # The report's own wording: the entry the note column carries for the object is the
+  # rule's text, which the skill paraphrases and a cluster listing cannot
+  # supply. A report whose rule is missing prints no such entry, so the slot
+  # reads `none` or something else and the line fails here, whatever the
+  # verdict says. Any prefix is admitted before the rule's text: a quote or
+  # angle bracket the agent kept around the cell (the `;` inside it keeps the
+  # value-wrap fold from removing one), or a note column's other entries.
+  - name: cgroup-blind-jvm-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cgroup-blind-runtime
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?cgroup-v2-runtime: deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?cgroup-v2-runtime: deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+)[^\n]*$'
+
+  # The prompt's "read only", grounded: the planted object is as the fixture
+  # declares it after the run.
+  - name: the-planted-deployment-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: cgroup-blind-runtime
+      kind: deployment
+      resource_name: cgroup-blind-jvm
+      namespace: seeded-shapes
+      path: spec.replicas
+      op: eq
+      value: 1
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

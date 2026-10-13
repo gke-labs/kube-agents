@@ -1,0 +1,167 @@
+# The readiness report names a workload keeping its queue on the node, in its note and not as a blocker
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 4: data on the node is gone).
+# It grades the readiness report's `data-on-the-node` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/node_local_state.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule reads every Deployment and StatefulSet outside the system
+# namespaces for state kept on the node: a StatefulSet's emptyDir, a writable
+# hostPath, a Local SSD path or a claim on a local StorageClass is a risk,
+# named with the volume; a Deployment's emptyDir is scratch, a note, with the
+# volume's name flagged when it suggests state. cache-on-emptydir is a
+# Deployment whose queue is an emptyDir, so the report carries it in its note
+# column: not a risk and not a blocker (a rebuild loses the data and GKE does
+# not stop for it). So the declared line reads `blocks the upgrade: no`, and
+# the case grades that the agent found the Deployment in the report and did
+# not promote it. The risk paths, a StatefulSet's emptyDir and the node-local
+# volumes, are covered by the rule's unit tests; this fleet plants a
+# Deployment.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per object the report names, and the
+# checks read two slots from any line naming the planted object: the verdict,
+# `blocks the upgrade: <yes|no>`, and the cell, the entry the report printed
+# for the object, copied as printed. Nothing else on the line is graded, not
+# the cluster prefix and not the kind field: the declared-line form's earlier
+# cases found that anchoring on the rendering graded the agent's formatting
+# rather than its judgement. The verdict token is one word from a closed set,
+# so there is no room for a hedge on the graded part. The cell slot is what
+# proves the report ran: its pattern is wording only the rule's own text
+# produces (`data-on-the-node: Deployment seeded-shapes/cache-on-emptydir
+# keeps scratch on the node in queue (emptyDir; the name suggests state)`),
+# which the skill paraphrases and a hand kubectl survey cannot supply; a
+# report whose rule is missing prints no such entry, so the slot reads `none`
+# or another rule's text and the line fails there whatever the verdict says.
+# The cell carries a `;`, which keeps the verifier's value-wrap fold from
+# removing a quote or angle bracket the agent kept around it, so the patterns
+# admit any prefix before the rule's text, a note column's other entries
+# included. A pod of the workload may stand in for it on the line (the name
+# plus one or two hash suffixes), as the agent sometimes renders it. Each
+# accept is `<name> ... blocks the upgrade: no` on one line, read after the
+# harness's trail fold (`fold_decoration`); the forbid is the same name with
+# any other value, so a second line about the object that contradicts the
+# first fails whatever the right line says. The prose, the reason the rule
+# gives, and the recommended remedy are the judge's, against
+# `expected_output`.
+#
+# Planted defect required: on slot a, the Deployment cache-on-emptydir in
+# seeded-shapes, one replica, whose queue directory is an emptyDir (role
+# `node-local-state` in bench/tf/fleet/fixtures.json). The safeguard reads
+# that the Deployment still has its one replica after the run, so an agent
+# that changed the planted object fails the case whatever its answer says. No
+# `worker_commands` objective: it reads delegated workers' terminals only and
+# errors on a run the router answered itself, so the report's own output is
+# graded through the cell slot instead, as
+# upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+id: upgrades-fleet-readiness-node-local-state
+name: Fleet upgrade readiness names the workload keeping its queue on the node
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per object that the readiness report
+  names as a blocker, as a risk, or as a shape it checked and cleared, in
+  exactly this form and with no other words on the line: "<cluster>/<object
+  name>: kind <deployment|statefulset|daemonset|cronjob|pdb|exclusion>; blocks
+  the upgrade: <yes|no>; cell: <the entry the report prints for that object in
+  its other blockers, risks or note column, copied as printed|none>". Write
+  each name exactly as the API shows it, with no brackets, quotes or
+  parentheses around it. When a column holds several entries separated by ";
+  ", copy the one naming the object. Put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the Deployment cache-on-emptydir in seeded-shapes in its note column: its
+  volume queue is an emptyDir, which the rule reads as scratch on a
+  Deployment, with the volume's name flagged as suggesting state; a node
+  rebuild loses whatever is in it. It does not call the Deployment a risk or a
+  blocker, and says why: a Deployment's emptyDir is emptied by every
+  reschedule, so the loss is the application's design, not the upgrade's. The
+  remedy is an operator decision: move the queue to a PersistentVolumeClaim,
+  or accept the loss. Other clusters' blockers and risks come from the same
+  run. It ends with one declared line per object; the line for
+  cache-on-emptydir reads "blocks the upgrade: no" and its cell is the
+  report's note for it, beginning "data-on-the-node: Deployment
+  seeded-shapes/cache-on-emptydir keeps scratch on the node in queue
+  (emptyDir; the name suggests state)". It cites no CVE identifiers and
+  changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - node-local-state
+
+verification_spec:
+  # The verdict this case exists for: a line naming cache-on-emptydir whose verdict
+  # is no; the forbid is the same name with any other verdict.
+  - name: cache-on-emptydir-line-does-not-block
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: no(?:\s*;|\s*$)'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!no(?:\s*;|\s*$))'
+
+  # The report's own wording: the entry the note column carries for the object is the
+  # rule's text, which the skill paraphrases and a cluster listing cannot
+  # supply. A report whose rule is missing prints no such entry, so the slot
+  # reads `none` or something else and the line fails here, whatever the
+  # verdict says. Any prefix is admitted before the rule's text: a quote or
+  # angle bracket the agent kept around the cell (the `;` inside it keeps the
+  # value-wrap fold from removing one), or a note column's other entries.
+  - name: cache-on-emptydir-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?data-on-the-node: deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir; the name suggests state\)[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?data-on-the-node: deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir; the name suggests state\))[^\n]*$'
+
+  # The prompt's "read only", grounded: the planted object is as the fixture
+  # declares it after the run.
+  - name: the-planted-deployment-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: node-local-state
+      kind: deployment
+      resource_name: cache-on-emptydir
+      namespace: seeded-shapes
+      path: spec.replicas
+      op: eq
+      value: 1
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]
