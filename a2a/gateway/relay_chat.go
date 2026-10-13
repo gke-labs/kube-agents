@@ -27,6 +27,16 @@ const chatProblemMax = 200
 // NUL, which no status line carries.
 const lineKeySeparator = "\x00"
 
+// layoutOf is the chat message a reading hands an adapter to lay out: nil
+// for one that carries only a mark, which lays nothing out and whose mark
+// is applied, not drawn.
+func layoutOf(r chatmsg.Reading) *chatmsg.Message {
+	if r.Message == nil || r.Message.MarkOnly() {
+		return nil
+	}
+	return r.Message
+}
+
 // readChat reads carrier c's chat message out of parts, logging and counting
 // what it dropped.
 func (g *Gateway) readChat(conversation, taskID string, c chatmsg.Carrier, parts []lib.Part) chatmsg.Reading {
@@ -112,6 +122,11 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 			rs.lineTextOnly = true
 		}
 		if !rs.lineLaidOut {
+			if rs.lineTextOnly && lineKeyText(rs.lastLine) == line {
+				// The line already shows this text; only the chat
+				// message changed, and this backend shows none.
+				return true
+			}
 			return g.editLine(conversation, messageID, line)
 		}
 	}
@@ -146,11 +161,17 @@ func lineKey(line string, rs *relayState) string {
 func (g *Gateway) resultChat(conversation, taskID string, rs *relayState, replayed []lib.Part) *chatmsg.Message {
 	switch {
 	case replayed != nil:
-		return g.readChat(conversation, taskID, chatmsg.Result, replayed).Message
+		return layoutOf(g.readChat(conversation, taskID, chatmsg.Result, replayed))
 	case len(rs.resultChunks) > 0:
-		return g.readChatArtifact(conversation, taskID, chatmsg.Result, rs.resultChunks).Message
+		return layoutOf(g.readChatArtifact(conversation, taskID, chatmsg.Result, rs.resultChunks))
 	}
 	return nil
+}
+
+// lineKeyText is the text half of a lineKey.
+func lineKeyText(key string) string {
+	text, _, _ := strings.Cut(key, lineKeySeparator)
+	return text
 }
 
 // relayMark hands a terminal's mark to an adapter that applies marks.

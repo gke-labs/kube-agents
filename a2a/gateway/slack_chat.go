@@ -214,7 +214,8 @@ func slackMrkdwnTexts(v any, out []any) []any {
 }
 
 // slackChatHead is the headline, bold, with the note after it on the same
-// line (blocks_report's head). It is the one block above the side bar.
+// line (blocks_report's head). It stays above the side bar, alone unless the
+// message has a fold (renderSlackChat).
 func slackChatHead(m *chatmsg.Message) map[string]any {
 	var head []map[string]any
 	if m.Headline != "" {

@@ -140,6 +140,20 @@ func TestNotifyUpdateKeysAreBounded(t *testing.T) {
 	}
 }
 
+// Eviction is least recently used: a key edited all along (a plan) outlives
+// the keys created after it.
+func TestNotifyUpdateKeyInUseIsNotEvicted(t *testing.T) {
+	n, conv := newChatNotifier(t, false)
+	serveJSON(t, n, lib.NotifyRequest{Text: "plan", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	for i := 0; i < notifyUpdateKeysMax; i++ {
+		serveJSON(t, n, lib.NotifyRequest{Text: "q", Update: fmt.Sprintf("q%d", i), Conversation: testConversation, ContextID: testContext})
+		serveJSON(t, n, lib.NotifyRequest{Text: "plan, later", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	}
+	if len(conv.posts) != notifyUpdateKeysMax+1 || len(conv.edits) != notifyUpdateKeysMax {
+		t.Fatalf("posts = %d, edits = %d; want the plan edited every time", len(conv.posts), len(conv.edits))
+	}
+}
+
 // An update key edits only what it posted in the same conversation.
 func TestNotifyUpdateKeyIsPerConversation(t *testing.T) {
 	const other = "gchat:spaces/OTHER/threads/T8"

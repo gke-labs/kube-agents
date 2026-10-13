@@ -558,7 +558,7 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 				"conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
 		}
 	}
-	m := OutMessage{Text: job.req.Text, Chat: reading.Message}
+	m := OutMessage{Text: job.req.Text, Chat: layoutOf(reading)}
 	key := job.req.Update
 	if key == "" {
 		if m.Chat == nil {
@@ -635,7 +635,9 @@ func (n *Notifier) chatOutcome(conversation string, err error) bool {
 
 // notifyUpdates remembers, per conversation, the message each update key
 // last posted: at most notifyUpdateKeysMax keys a conversation and
-// notifyUpdateConversationsMax conversations, the oldest forgotten first.
+// notifyUpdateConversationsMax conversations, the least recently used
+// forgotten first, so a plan edited all along outlives the questions filed
+// after it.
 // Process memory, so a restart forgets every key and the next request with
 // one posts anew, as the spec allows. Only the notifier's one worker uses
 // it, so it takes no lock.
@@ -655,7 +657,21 @@ func (u *notifyUpdates) get(conversation, key string) (string, bool) {
 		return "", false
 	}
 	message, ok := keys.messages[key]
+	if ok {
+		u.order = moveToEnd(u.order, conversation)
+		keys.order = moveToEnd(keys.order, key)
+	}
 	return message, ok
+}
+
+// moveToEnd moves item to the end of order, the most recently used place.
+func moveToEnd(order []string, item string) []string {
+	for i, v := range order {
+		if v == item {
+			return append(append(order[:i:i], order[i+1:]...), item)
+		}
+	}
+	return order
 }
 
 func (u *notifyUpdates) put(conversation, key, message string) {
@@ -672,7 +688,10 @@ func (u *notifyUpdates) put(conversation, key, message string) {
 			u.order = u.order[1:]
 		}
 	}
-	if _, ok := keys.messages[key]; !ok {
+	u.order = moveToEnd(u.order, conversation)
+	if _, ok := keys.messages[key]; ok {
+		keys.order = moveToEnd(keys.order, key)
+	} else {
 		keys.order = append(keys.order, key)
 		if len(keys.order) > notifyUpdateKeysMax {
 			delete(keys.messages, keys.order[0])

@@ -1671,7 +1671,8 @@ chunk, a progress artifact, a `notice` artifact (one message of its own, posted 
 message of an `input-required` status, and a terminal status, whose chat message is its `mark`
 alone. A chat message that breaks a rule is dropped whole, logged with the rule it broke and
 counted (`chat_messages_total{outcome="invalid"}`, under Metrics), and its text posts as it
-would have; a bad `mark` drops alone. What survives reaches the adapter as a message value,
+would have; a bad `mark` drops alone, and a chat message that carries only a `mark` lays
+nothing out. What survives reaches the adapter as a message value,
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, Google Chat, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
@@ -1721,8 +1722,9 @@ the text elsewhere. The first request with an `update` key posts one message, it
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or an edit that fails posts anew.
-A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the oldest forgotten
-first. A notify's `mark` is not applied yet.
+A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
+forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
+`mark` is not applied yet.
 
 ## The console adapter (added 9/23)
 

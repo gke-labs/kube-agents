@@ -280,7 +280,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		if ask == "" {
 			ask = "the task needs input to continue"
 		}
-		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: question.Message})
+		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
 		g.updateRollingLine(rec, taskID, rs)
 	default:
 		// A steer notice is the executor's word on one follow-up and is
@@ -309,7 +309,7 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		// A chat message here is the live message's whole state, so one
 		// without it returns the line to text.
-		rs.lineChat = g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts).Message
+		rs.lineChat = layoutOf(g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts))
 		if render {
 			g.updateRollingLine(rec, taskID, rs)
 		}
@@ -339,7 +339,7 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		// message and its answer: to every backend, the console included,
 		// since it is not the deliverable the console reads off TASKS.
 		notice := g.readChat(rec.Key, taskID, chatmsg.Notice, a.Artifact.Parts)
-		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: notice.Message})
+		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: layoutOf(notice)})
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
 		rs.sawDelegate = true
@@ -669,7 +669,7 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState, taskID string) {
 	rs.turnAnswers = append(rs.turnAnswers, text)
 	if text != "" && !isConsoleConversation(rec.Key) {
 		turn := g.readChatArtifact(rec.Key, taskID, chatmsg.Turn, chunks)
-		g.postMessage(rec.Key, OutMessage{Text: text, Chat: turn.Message})
+		g.postMessage(rec.Key, OutMessage{Text: text, Chat: layoutOf(turn)})
 	}
 }
 

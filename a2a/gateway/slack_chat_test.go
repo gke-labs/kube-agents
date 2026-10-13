@@ -119,8 +119,8 @@ func TestSlackRichMarkdownSpans(t *testing.T) {
 		{"[https://good.example](https://evil.example/x)", `[{"text":"https://good.example","type":"text"}]`},
 		// In-word markers are text.
 		{"2*3*4 and DB_HOST_NAME", `[{"text":"2*3*4 and DB_HOST_NAME","type":"text"}]`},
-		// rich_text is literal, so a mention token is plain text here (and
-		// refuseSlackChat refuses the message that carries one).
+		// rich_text is literal, so a mention token is plain text here, and
+		// Slack shows it as written.
 		{"ping <!here>", `[{"text":"ping \u003c!here\u003e","type":"text"}]`},
 	} {
 		got, _ := json.Marshal(slackRichMarkdown(tc.md))
@@ -148,9 +148,24 @@ func TestSlackChatRendersNoMention(t *testing.T) {
 			continue
 		}
 		raw, _ := json.Marshal(layout)
-		if strings.Contains(string(raw), `"<!`) || strings.Contains(string(raw), `"text":"write <!`) {
-			t.Errorf("a token reached mrkdwn unescaped: %s", raw)
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
 		}
+		for _, text := range slackMrkdwnTexts(decoded, nil) {
+			if s, _ := text.(string); strings.Contains(s, "<!") || strings.Contains(s, "<@") {
+				t.Errorf("a token reached mrkdwn unescaped: %q", s)
+			}
+		}
+	}
+	fold := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "write <!channel> to ping"}}
+	layout, err := renderSlackChat(&fold, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := layout.Blocks[0]["child_blocks"].([]map[string]any)[0]["text"].(map[string]any)
+	if section["text"] != "write &lt;!channel&gt; to ping" || section["verbatim"] != true {
+		t.Fatalf("fold section = %v, want the token escaped and sent verbatim", section)
 	}
 	bare := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "hey @here, look"}}
 	if _, err := renderSlackChat(&bare, "x"); err == nil || !strings.Contains(err.Error(), "mention") {
@@ -158,8 +173,8 @@ func TestSlackChatRendersNoMention(t *testing.T) {
 	}
 }
 
-// A fold's text is cut into sections under Slack's cap; one that needs more
-// children than a container holds is too large, and posts as text.
+// A fold's text is cut into sections under Slack's cap; a chunk that escaping
+// pushes past the section cap is too large, and posts as text.
 func TestSlackChatFoldTooLarge(t *testing.T) {
 	m := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: strings.Repeat("&", 12000)}}
 	if _, err := renderSlackChat(&m, "x"); !errors.Is(err, errSlackChatTooLarge) {

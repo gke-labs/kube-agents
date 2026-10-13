@@ -292,19 +292,37 @@ func TestChatProgressOnATextOnlyBackendEditsText(t *testing.T) {
 func TestChatProgressChangeAloneEditsNothingOnATextOnlyBackend(t *testing.T) {
 	r := startRigWith(t, func(c *Config) { c.DisplayMode = displayModeDefault })
 	origin := startChatTask(t, r, "discord:g1/text-plan-change", false)
-	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "a"}, chatPart(t, testPlan)}, false, false)
 	waitFor(t, "the working line", func() bool {
 		texts := r.adapter.editTexts()
 		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "working")
 	})
 	time.Sleep(200 * time.Millisecond)
 	before := len(r.adapter.editTexts())
+	// The first plan, then a changed one: under default display mode the
+	// line's text is "working" throughout, so neither costs an edit.
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "a"}, chatPart(t, testPlan)}, false, false)
 	changed := testPlan
 	changed.Plan = &chatmsg.Plan{Title: "Upgrade readiness", Items: []chatmsg.PlanItem{{ID: "t-1", Title: "Read cluster versions", Status: chatmsg.StatusComplete}}}
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "b"}, chatPart(t, changed)}, false, false)
 	time.Sleep(500 * time.Millisecond)
 	if after := len(r.adapter.editTexts()); after != before {
 		t.Fatalf("edits went from %d to %d for a line whose text did not change", before, after)
+	}
+}
+
+// A chat message that carries only a mark lays nothing out: the line stays
+// the text edit, and nothing is counted rendered.
+func TestMarkOnlyProgressLaysNothingOut(t *testing.T) {
+	r := startRig(t)
+	origin := startChatTask(t, r, "discord:g1/mark-only-progress", true)
+	markOnly := chatmsg.Message{Schema: chatmsg.Schema, Mark: &chatmsg.Mark{Ask: "investigate"}}
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "looking"}, chatPart(t, markOnly)}, false, false)
+	waitFor(t, "the progress edit", func() bool {
+		texts := r.adapter.editTexts()
+		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "looking")
+	})
+	if len(r.adapter.chatEditsCopy()) != 0 || chatCount(t, r, chatRendered) != 0 {
+		t.Fatalf("chat edits %d, rendered %v; want none for a mark-only message", len(r.adapter.chatEditsCopy()), chatCount(t, r, chatRendered))
 	}
 }
 
