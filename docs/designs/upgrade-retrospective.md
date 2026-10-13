@@ -129,8 +129,8 @@ beside the [readiness checks](upgrade-readiness-checks.md) and is on `main`
 (`agents/platform/scripts/upgrade_readiness_watch.py`, the `upgrade-readiness-watch` roster entry):
 it produces the before-the-upgrade report and keeps its own state on the gateway's profile volume,
 and it does not yet read `guards.json`; this design's (D) lands its guards on the shell's volume
-(§3.6), and the guards reader this design adds to the watch reads them through its sandbox hop
-once the collector merges.
+(§3.6), and the guards reader this design adds to the watch reads them as §3.5 states, once the
+collector merges.
 
 ## 2. Target model
 
@@ -198,8 +198,18 @@ lines and files no ledger issue. Both bounds matter: the floor keeps a run off p
 settled, and the window's start, which Sunday's full run advances, keeps Monday's sweep from
 re-selecting the operations Sunday reviewed once they leave the reviewed list. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
 `no_agent` script, `upgrade_retrospective_watch.py`, which runs every fifteen minutes on the gateway
-pod, reads the operations of the projects in the install's scope (§3.2) through the sandbox hop the readiness watch uses
-(`sandbox_exec` as its default principal, read only) and, when an operation reached `DONE` at least
+pod, reads, through the sandbox hop the readiness watch uses (`sandbox_exec.run` as its default
+`hermes` principal, read only), the operations of the projects it resolves on the gateway pod
+itself, a `no_agent` script having no `fleet_scope` tool: on a declared install
+`fleet_scope_targets.declared_scope_targets()`, which reads the reconcile's `fleet_scope.json`
+under the agent home (`PLATFORM_AGENT_HOME`, the root the readiness watch already reaches), gives
+it the resolved projects, the same set the tool hands the SOP as `--scope-projects`; on an
+undeclared install (`None` from that call) it declines to enumerate, as the readiness watch does,
+and reads the management project plus the projects the Cluster Agent profiles' `cluster_identity`
+name, so an undeclared install's other projects are reviewed by the 05:00 sweep and the Sunday run
+rather than by the wake, and requirement 1's latency holds for declared installs and for the
+profiles' projects; the job it wakes resolves the fleet through the `fleet_scope` tool as every
+route does (§3.2). When an operation reached `DONE` at least
 fifteen minutes earlier that it has not seen, marks the after-upgrade job due with the same
 `trigger_job` call the first-run stage uses, which carries a job id and nothing else, behind the
 same guard the stage puts in front of it: `trigger_job` also sets a job's `enabled` back to true,
@@ -704,7 +714,15 @@ automatic and both reversible:
   states for every gap. The collector merges the file on
   every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
   shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
-  the collector merges, reads the file through its own sandbox hop and adds a line per live guard to its next
+  the collector merges, reads the file with `sandbox_exec.read_bytes` on the store's path
+  (`/opt/data/upgrade-retrospective/guards.json`), as the `agent` principal that helper defaults
+  to, the route `bootstrap_delivery.py` takes for a report the sandbox wrote, under a byte cap of
+  its own; the hop's `hermes` login never carries the file. The file is one the model's shell
+  account can write, collector or no collector, so the watch prints each live guard as quoted
+  content from the file, never as a finding of its own, and a file that is absent, unreadable
+  (`SandboxReadFailed`), over the cap or malformed is one line in the watch's report saying so,
+  never a report with no guards and no reason; a guard therefore never turns a cluster's verdict
+  (§8). It adds a line per live guard to its next
   report for that cluster, so the operator planning the next upgrade sees "the last upgrade held
   the drain on `seeded-upgrade/pinned-batch-runner`'s budget; it still allows no disruption".
 - **The stream's ledger issue.** Where the install has a repository, the retrospective is a
@@ -821,7 +839,10 @@ dry run reads without the lock. Reports are named by their finish time in UTC, f
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
-temporary name and renamed,
+temporary name and renamed, at 0644 whatever the writer's umask (`STORE_FILE_MODE`, set by chmod,
+since `mkstemp` makes 0600 under any umask) in store directories at 0777 (`STORE_DIR_MODE`), the
+fleet-audit report store's rule, so the uid-1000 tick, a root hand run and the watch's `agent`
+reader each read what any of them wrote;
 in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
 advance, and a run that dies between the guards and the ledger leaves the guards' review counts
 one ahead, which the next run's review of the same clusters raises again (the ids and first-seen
@@ -1005,7 +1026,11 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   review count unchanged across a run that did not read its cluster, and the candidate the next
   reading run emits carrying them; an Error the after-upgrade route reported, filed at `major` by
   the next full run; an unreachable cluster and an upgrading cluster recorded without failing the
-  run and without a candidate; the watch marking nothing for a paused, disabled or absent job;
+  run and without a candidate; the watch marking nothing for a paused, disabled or absent job; the after-upgrade watch's project
+  set, the declared scope's resolved projects from `fleet_scope.json`, the management project plus
+  the profiles' projects on an undeclared install, and no listing in either case; the guards
+  reader printing a guard as quoted content and one line for an absent, unreadable, over-cap or
+  malformed file;
   one candidate per object on a reviewed cluster whose incident covers a guard (the incident's,
   under this run's check, with the guard's first-seen date and review count), the guard's check
   moved on a re-grade and the old id absent from `collector_flagged_ids`; row 12's node predicate
@@ -1060,5 +1085,6 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   the figure still to be measured, not whether it gets a report.
 - Audit-log reads (eviction 429s, admission rejections) would sharpen (B); `gcloud logging read` is
   on the allowlist, cost and scope to decide.
-- Whether a live guard should turn the readiness verdict for that cluster to `blocked`, or only
-  annotate it, is the readiness watch's decision once it reads the file.
+- A live guard never turns the readiness verdict to `blocked`: `guards.json` is a file the model's
+  shell account can write, so the watch prints each guard as quoted content from it (§3.5) and the
+  verdict stays with the watch's own rules.
