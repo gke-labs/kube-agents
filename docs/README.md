@@ -33,6 +33,7 @@ kube-agents/
 │   AGENTS.md, CLAUDE.md                           guide, contributor/agent rules
 ├── a2a/                                           A2A bus: the persona README +
 │                                                  the mode-gated a2a-topics skill
+│                                                  and the session agent's persona
 ├── agents/                                        agent blueprints (runtime docs)
 │   ├── chat/                                      Planning Agent front door: persona
 │   │                                              docs, onboarding templates,

@@ -41,6 +41,13 @@ on:
       # lib/chatmsg validates every shared chat case, so a case-only change
       # has to run it.
       - "tests/conformance/chat/**"
+      # cmd/session-persona's tests read these from outside the module: the
+      # cluster skills the worker image ships a session copy of, and the
+      # broker policy the session's read tables must stay a subset of. An
+      # edit to either alone has to run those tests.
+      - "agents/cluster/skills/**"
+      - "agents/platform/scripts/command_policy.py"
+      - "agents/platform/scripts/credential_proxy.py"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -75,6 +82,9 @@ jobs:
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
               - "tests/conformance/chat/**"
+              - "agents/cluster/skills/**"
+              - "agents/platform/scripts/command_policy.py"
+              - "agents/platform/scripts/credential_proxy.py"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'
