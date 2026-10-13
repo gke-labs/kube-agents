@@ -736,20 +736,30 @@ budget is this design's own figure, not a sibling's precedent: the obtainability
 collector the same way at the same ceiling, and that collector, which reads a comparable set per
 cluster, takes 60–80 seconds on a twelve-cluster fleet. The collector holds its own deadline
 under that ceiling, `RUN_DEADLINE_S`, 480 seconds from the process's start with the lock wait
-included, as `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` bounds its project reads. Past the
-deadline it starts no further cluster read, finishes the reads in flight (each bounded by its own
-timeout, which the 120-second margin covers once), and writes what it read as a partial run: the
-ledger entries, guards and report of the clusters it completed; the clusters it did not reach
-held unchanged, listed under "Reads that failed" with the budget as the reason and `gate-failed`
-in the manifest with the same reason, so the run is partial and `finish` holds their findings; an
-unchanged cluster whose re-check the deadline deferred keeps its guards held with their checks
-unevaluated, as after a failed re-check read. Clusters are read in a fixed order, the cluster
+included, as `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` bounds its project reads, and tighter
+than that precedent, which bounds only when a project's reads start: every subprocess this run
+starts gets the smaller of its own timeout and the time left under the deadline, and one
+attempted past it fails at once with the budget as its error, so the reads end by the 480th
+second (worst case, a read started at 479 s runs one second) and the 120-second margin to the
+terminal's 600 covers the merge and the writes, not a read; a cluster whose endpoint drops
+packets costs the run at most the time left, never a timeout per read. Past the deadline the run
+starts no further cluster and writes what it read as a partial run: the ledger entries, guards
+and report of the clusters it completed; the clusters it did not reach held unchanged, listed
+under "Reads that failed" with the budget as the reason and `gate-failed` in the manifest with
+the same reason, so the run is partial and `finish` holds their findings; a cluster the deadline
+cut mid-review kept as a partial review under §3.3's failed-read rule (the reads that answered
+filed, the checks the refused reads decide unevaluated, the budget named in `limitations`, its
+guards held, `partial_read` recorded so it is re-selected and, its last review unchanged, read
+early next run), and one whose credentials the deadline refused the credentials-failed shape,
+`collected` on the operation check alone; an unchanged cluster whose re-check the deadline
+deferred keeps its guards held with their checks unevaluated, as after a failed re-check read.
+Clusters are read in a fixed order, the cluster
 reviewed longest ago first (one never reviewed before any other), then the re-checks in the same
 order, so the tail the deadline cuts is a different one each run and a fleet whose reads do not
 fit one run is read across runs: the first run on such a fleet produces a baseline for the
 clusters it reached and the next run reaches the next, rather than the same clusters being read
-and killed every week. A run the terminal still kills, one whose in-flight reads hang past the
-margin, writes nothing and prints no exit line; the recovery `finish` below then names the saved
+and killed every week. A run the terminal still kills, which the bounded reads leave to a stall
+in the merge or the writes, writes nothing and prints no exit line; the recovery `finish` below then names the saved
 report's clusters or, on a first run, the clusters the SOP lists itself from the tool's
 `collector_args`, and the first run of an undeclared install is then the case the rule cannot
 cover. Per-cluster persistence, the three files rewritten after each cluster, was rejected: the
@@ -969,7 +979,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   `RUN_DEADLINE_S` after the first review reviews no further cluster, writes the clusters it read,
   holds the rest as `gate-failed` with the budget reason and no stale Warning, defers the
   re-checks the same way with their guards held and their checks unevaluated, and orders reviews
-  by the ledger's last review so the next run reads the held clusters first; a locked-out full
+  by the ledger's last review so the next run reads the held clusters first; a read that stalls
+  past the deadline cut at the time left, the reads after it refused at once with the budget as
+  their error, the cluster kept as a partial review, and the run ending under the terminal's
+  limit with the manifest written; a locked-out full
   run exiting 0 with the lock-held line and
   writing nothing; a
   persisting guard's candidate under the check its guard records, moved on a re-grade, with first
