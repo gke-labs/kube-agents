@@ -166,7 +166,7 @@ removes both. The first-run stage skips every audit when no GitOps repository is
 the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
 streams it serves exist to file a ledger. This stream does not: the collector needs no repository
 and the report on the volume is the record. Where a repository is configured and the run is full,
-the SOP calls `start`, then runs the collector, then `finish` with the collector's manifest (`finish`
+the SOP probes the collector's lock (§3.6), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
 refuses a manifest older than the run); without a repository it runs the collector alone, manifest
 included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
@@ -218,7 +218,9 @@ answer from it and say when it was produced; otherwise run the collector for tho
 A question that names a cluster the last run did not review forces that cluster (`--cluster`). A
 question asked inside the floor, within fifteen minutes of an operation's `DONE`, gets that
 cluster's settling line (§3.2): the answer says the review runs once the pods have settled, on the
-after-upgrade route's next wake.
+after-upgrade route's next wake. A fleet-wide question asked while the stream's in-flight note
+stands, after a Sunday run lost the lock, is refused by `start`; the SOP answers from the latest
+saved report and names the time the stream frees (§3.6).
 
 ### 3.2 Scope: new or upgraded since the last run
 
@@ -671,13 +673,21 @@ The lock wait is sized to fit under the budget with the run: a second run, sched
 after-upgrade or on demand, waits up to two minutes, long enough for a scoped run of a few clusters
 to finish, which is the collision that matters, the Sunday run or a question landing while an
 after-upgrade run holds the lock. Past the wait the collector prints the lock-held line, naming
-the holder and the time, exits 0 and writes nothing, on every route. The SOP's Sunday run has
-called `start` by then and has no manifest: it does not call `finish` (there is nothing to pass,
-and `finish` refuses last week's manifest), ends the stream run with the lock as its one
-limitation in the chat line, files nothing, and lets the in-flight note `start` left expire on
-its own (two hours); the fleet-wide review, the `last_run` advance, the guard re-checks and the
-ledger rewrite wait for the next tick, or for a fleet-wide question asked meanwhile, which is a
-full run (§3.1a); the after-upgrade route keeps reviewing upgrades in between. The reverse costs
+the holder and the time, exits 0 and writes nothing, on every route. The routes that file the
+ledger call `start` before the collector (§3.1), and the in-flight note `start` leaves is what a
+lost lock would cost: the harness releases the note only through `finish`, `finish` refuses a
+document that audited nothing (`scope.clusters` must be non-empty) and keeps the note on a
+refusal, and a standing note makes `start` refuse every run of the stream for two hours, the
+fleet-wide question included. So the Sunday route and the fleet-wide on-demand route probe the
+lock before `start`: the collector's `--probe-lock` tries the lock without blocking, holds it for
+no time and writes nothing, and the SOP spends the two-minute wait on the probe, before any note
+exists, then calls `start` and runs the collector. A run that still loses the lock, taken between
+the probe and the run, ends as the collector did: the SOP calls no `finish`, reports the lock as
+the run's one limitation in its chat line and files nothing, and the note's two-hour TTL is the
+wait; a fleet-wide question inside it is refused by `start`, and the SOP answers from the latest
+saved report and names the time the stream frees; the fleet-wide review, the `last_run` advance,
+the guard re-checks and the ledger rewrite wait for the next tick or for a question after that; the
+after-upgrade route, which calls no `start`, keeps reviewing upgrades in between. The reverse costs
 nothing: an after-upgrade wake locked out by the Sunday run exits the same way, the Sunday run
 reviews the same operation, and the route's next wake or sweep finds it in the reviewed list and
 prints nothing; an on-demand run locked out answers from the latest saved report and says a run
@@ -781,7 +791,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    ledger, selection, (A), (B), the signature table, the catalogue table for (C), the guards merge,
    JSON and Markdown output, the collector manifest (`--manifest-file`, §3.3) with the stream's
    check ids and its `COLLECTOR_AUDITS` entry, `--dry-run`, `--full`, `--cluster`, `--since` and
-   `--reset-ledger` as §3.2 and §3.6 define them; unit tests on fixtures captured from the test
+   `--reset-ledger` and `--probe-lock` as §3.2 and §3.6 define them; unit tests on fixtures captured from the test
    fleet, including the manifest against `cross_check_manifest`.
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
@@ -853,8 +863,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   moved on a re-grade and the old id absent from `collector_flagged_ids`; row 12's node predicate
   per operator: a pod kept off spot nodes by `cloud.google.com/gke-spot DoesNotExist` or
   `gke-preemptible NotIn [true]` and refused for `Insufficient cpu` is row 2, and `Exists` on a key
-  no node carries is row 12; the report rendering, including an empty section and the severity of
-  each fixture incident.
+  no node carries is row 12; `--probe-lock` exiting 0 when the lock is free and 1 with the holder
+  line when it is held, holding it for no time and writing nothing; the report rendering,
+  including an empty section and the severity of each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
