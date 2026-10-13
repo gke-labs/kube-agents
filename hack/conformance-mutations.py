@@ -57,7 +57,8 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Two today, B1-denylist-rule and A3-fastpath-redundant.
+    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
+    #: and B1-gke-mcp-overlay-copy-redundant.
     must_survive: bool = False
 
 
@@ -473,6 +474,48 @@ Mutation(
         "collapse two adjacent entries onto their common prefix while tidying "
         "the list -- _gcloud_is_read_only matches on prefix, so the group entry "
         "allows every verb beneath it, `delete` included",
+    ),
+    Mutation(
+        "B1-gke-mcp-allowlist-inverted",
+        "agents/cluster/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "turn the Cluster Agent's allowlist into a denylist, the way a denylist "
+        "author would spell it -- the reads are now hidden and the eight write "
+        "tools, create_cluster among them, are offered to every cluster profile",
+    ),
+    Mutation(
+        "B1-gke-mcp-write-tool-in-shared-defaults",
+        "deploy/shared/defaults/config.yaml",
+        ("        - check_k8s_auth\n", "        - check_k8s_auth\n        - create_cluster\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "re-offer create_cluster in the shared defaults alone. The platform "
+        "overlay is untouched, so only an assertion against the merged config "
+        "the image builds sees the union carry it to the Platform Agent",
+    ),
+    Mutation(
+        "B1-gke-mcp-unmodelled-profile",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "give the Chat Agent the gke server by copying the entry without its "
+        "filter -- a profile the test does not build is a profile it would "
+        "otherwise never read",
+    ),
+    Mutation(
+        # The platform overlay's copy of the allowlist is redundant with the
+        # shared defaults' one once the two are merged, and Hermes lets
+        # `include` win over `exclude`. Pinned as deliberate: a suite that went
+        # red here would be asserting the source file, not the profile.
+        "B1-gke-mcp-overlay-copy-redundant",
+        "agents/platform/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "invert the platform overlay's copy alone; the merged config still "
+        "carries the shared defaults' allowlist, and include wins",
+        must_survive=True,
     ),
     Mutation(
         "B1-slack-remove-allowlist-widened",

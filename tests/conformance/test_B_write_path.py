@@ -16,6 +16,7 @@ argv.
 
 from __future__ import annotations
 
+import copy
 import re
 import sys
 import unittest
@@ -30,6 +31,71 @@ _WORKFLOWS = sorted(
     # as .yaml would otherwise escape every assertion over this set silently.
     (h.REPO_ROOT / ".github" / "workflows").glob("*.y*ml")
 )
+
+
+# The hosted GKE MCP server. Matched by URL rather than by the `gke` key, so a
+# copy of the entry under another name is still found.
+_GKE_MCP_URL = "https://container.googleapis.com/mcp"
+
+# The server's tools that it annotates `readOnlyHint: true`, from its
+# `tools/list` on 2026-10-13: 15 of 23. The other eight are create_cluster,
+# create_node_pool, update_cluster, update_node_pool, apply_k8s_manifest,
+# patch_k8s_resource, delete_k8s_resource and cancel_operation.
+_GKE_MCP_READ_TOOLS = frozenset(
+    {
+        "check_k8s_auth",
+        "describe_k8s_resource",
+        "get_cluster",
+        "get_k8s_cluster_info",
+        "get_k8s_logs",
+        "get_k8s_resource",
+        "get_k8s_rollout_status",
+        "get_k8s_version",
+        "get_node_pool",
+        "get_operation",
+        "list_clusters",
+        "list_k8s_api_resources",
+        "list_k8s_events",
+        "list_node_pools",
+        "list_operations",
+    }
+)
+
+# A registered MCP tool name whose verb changes something. Hermes registers a
+# server's tool as `mcp__<server>__<tool>` (tools/mcp_tool_schema.py
+# `mcp_prefixed_tool_name`, at the pinned tag). The read set above is the
+# assertion; this is the backstop for a verb the server has not shipped yet.
+_WRITE_SHAPED_MCP_TOOL = re.compile(
+    r"^mcp__.+?__(?:create|update|delete|patch|apply|cancel|scale|set|remove|add"
+    r"|restart|rollback|drain|cordon|upgrade|resize|start|stop|enable|disable)_"
+)
+
+
+def _profile_configs():
+    """The config each profile that declares the GKE server runs with.
+
+    The Platform Agent's is not a file in the repository: the image build
+    merges the shared defaults with agents/platform/config.yaml, and the merge
+    unions lists, so a write tool in either copy's allowlist reaches the
+    profile. It is rebuilt here with the build's own merge. The Cluster Agent's
+    template is copied into the image as it is.
+    """
+    merge = h.merge_configs_module().merge
+    shared = yaml.safe_load(h.text("shared_defaults_config"))
+    platform = yaml.safe_load(h.text("platform_config"))
+    return {
+        "platform": merge(copy.deepcopy(shared), platform),
+        "cluster": yaml.safe_load(h.text("cluster_config")),
+    }
+
+
+def _servers_reaching(config, url):
+    """The `mcp_servers` entries in one parsed config whose argv names `url`."""
+    return {
+        name: server
+        for name, server in (config.get("mcp_servers") or {}).items()
+        if isinstance(server, dict) and url in (server.get("args") or [])
+    }
 
 
 def _workflows():
@@ -172,6 +238,63 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             with self.subTest(argv=argv):
                 decision = command_policy.evaluate(argv)
                 self.assertFalse(decision.allowed, f"{argv} reached the project")
+
+    def test_B1_the_gke_mcp_server_offers_no_write_tool(self) -> None:
+        """The one cloud write path the broker never sees.
+
+        The `gke` MCP server runs in the agent container on the pod's Workload
+        Identity credential, so the gcloud allowlist above does not apply to
+        it. With a `custom` permission set that grants a write role, an
+        unfiltered server hands the model create_cluster and
+        patch_k8s_resource, and both have been used.
+
+        The filter is a declaration rather than enforcement: the credential is
+        unchanged, and only the tool list stands between the model and the
+        write. So this reads the list from the config each profile actually
+        runs with, not from the source files. It requires a `tools.include`
+        allowlist, since `exclude` offers a tool the day the server ships it,
+        and requires every name on it to be one the server marks read-only.
+        A config anywhere in the tree that declares the server but is not
+        modelled here fails too, because a profile this test does not read is
+        a profile it cannot protect.
+        """
+        declaring = {
+            path.relative_to(h.REPO_ROOT).as_posix()
+            for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
+            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_URL)
+        }
+        modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
+        self.assertEqual(
+            set(),
+            declaring - modelled,
+            f"these configs declare {_GKE_MCP_URL} and no profile here is built from them",
+        )
+
+        for profile, config in _profile_configs().items():
+            servers = _servers_reaching(config, _GKE_MCP_URL)
+            with self.subTest(profile=profile):
+                self.assertTrue(servers, f"the {profile} profile declares no {_GKE_MCP_URL} server")
+            for name, server in servers.items():
+                with self.subTest(profile=profile, server=name):
+                    include = (server.get("tools") or {}).get("include")
+                    self.assertIsInstance(
+                        include,
+                        list,
+                        f"{profile}: mcp_servers.{name} has no tools.include allowlist, "
+                        "so every tool the server offers is registered, create_cluster included",
+                    )
+                    offered = [f"mcp__{name}__{tool}" for tool in include]
+                    self.assertEqual(
+                        [],
+                        [tool for tool in offered if _WRITE_SHAPED_MCP_TOOL.search(tool)],
+                        f"{profile}: write tools offered on mcp_servers.{name}",
+                    )
+                    self.assertEqual(
+                        [],
+                        sorted(str(tool) for tool in include if tool not in _GKE_MCP_READ_TOOLS),
+                        f"{profile}: mcp_servers.{name} names tools the server does not mark "
+                        "read-only (a glob counts: it matches whatever the server names next)",
+                    )
 
     def test_B1_the_sandbox_image_ships_no_credentialed_cli(self) -> None:
         """The build gate, asserted against the stage graph rather than a grep.
