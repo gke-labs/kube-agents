@@ -9879,3 +9879,154 @@ def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_chang
 )
 def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
     assert not _case_grades(case, objective, text)
+
+
+
+
+# The workload-rule cases for catalogue entries 4, 12, 14, 15, 17, 18 and 20
+# grade the planted object's declared line on two slots: its verdict and the
+# cell the report printed for it, wording only the rule produces. The cell
+# carries a `;`, so a wrap the agent kept around it survives `_VALUE_WRAP`, and
+# a note's entry may come with the note column's other entries before it; the
+# cases' patterns admit any prefix before the rule's text, and these tests hold
+# each case to that through the shipped entry and the real fold. The cell texts
+# are the rules' own, as their unit tests assert them
+# (agents/platform/skills/fleet-upgrade-verification/scripts/test_readiness_rules_workloads.py).
+_WORKLOAD_RULE_CASES = {
+    "upgrades-fleet-readiness-node-local-state": (
+        "cache-on-emptydir",
+        "deployment",
+        "data-on-the-node",
+        "data-on-the-node: Deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue (emptyDir; the name suggests state); "
+        "not a risk: a Deployment's emptyDir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload's",
+    ),
+    "upgrades-fleet-readiness-deprecated-node-label": (
+        "arch-pinned-worker",
+        "deployment",
+        "removed-node-label",
+        "removed-node-label: Deployment seeded-shapes/arch-pinned-worker: selects on beta.kubernetes.io/arch=amd64 (nodeSelector), deprecated since 1.14 "
+        "in favour of kubernetes.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods",
+    ),
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "cgroup-blind-jvm",
+        "deployment",
+        "cgroup-v2-runtime",
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, already on cgroup v2; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "multi-process-worker",
+        "deployment",
+        "group-oom-kill",
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job "
+        "on pool default-pool, on cgroup v2 with a kubelet at 1.33.4-gke.1000, which already group-kills; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-node-image-coupled-agent": (
+        "cni-shaped-agent",
+        "daemonset",
+        "node-image-coupled-agent",
+        "node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the node's network and coupled to the node image: "
+        "mounts /etc/cni/net.d from the node; pool(s) default-pool are below the target and get a new node image in this upgrade",
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "cuda-pinned-trainer",
+        "cronjob",
+        "gpu-driver",
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries "
+        "that accelerator; the target driver cannot be read, and the pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked",
+    ),
+    "upgrades-fleet-readiness-retired-registry-image": (
+        "legacy-registry-pull",
+        "deployment",
+        "retired-registry",
+        "retired-registry: Deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io "
+        "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
+        "pool(s) default-pool are below the target and are rebuilt in this upgrade",
+    ),
+}
+# The other grades the same rules print for the same objects on another fleet
+# (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
+# the patterns stop before the pool-dependent tail, so these pass the cell slot too.
+_WORKLOAD_RULE_OTHER_CELLS = {
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm: container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 at the target; "
+        "the heap is then sized from the node and the container is OOM-killed"
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker: container supervisor runs a shell script that forks a background job "
+        "(heuristic: the process count is not readable from the API) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 "
+        "at the target; a kubelet at 1.34 then sets memory.oom.group and an OOM kill takes every process in the container"
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer requests nvidia.com/gpu with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 "
+        "on pool gpu-pool; the target 1.33 node image ships driver R535 (gpuDriverVersion DEFAULT), which serves CUDA 12.2; "
+        "forward-compatibility packages inside the image are not readable from the tag"
+    ),
+}
+_WORKLOAD_CELL_WRAPS = [
+    "{cell}",
+    '"{cell}"',
+    "'{cell}'",
+    "“{cell}”",
+    "<{cell}>",
+    "`{cell}`",
+    # The note column's other entries ahead of the rule's.
+    "cluster read failed; PDBs not graded; {cell}",
+]
+
+
+def _workload_case_spec(case: str) -> dict:
+    return yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+
+
+def _workload_case_grades(case: str, objective: str, text: str) -> bool:
+    spec = _workload_case_spec(case)
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="workload-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _workload_line(name: str, kind: str, cell: str, verdict: str = "no") -> str:
+    return f"seeded-a/{name}: kind {kind}; blocks the upgrade: {verdict}; cell: {cell}"
+
+
+@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
+@pytest.mark.parametrize("wrap", _WORKLOAD_CELL_WRAPS)
+def test_workload_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
+    name, kind, _rule, cell = _WORKLOAD_RULE_CASES[case]
+    text = _workload_line(name, kind, wrap.format(cell=cell))
+    assert _workload_case_grades(case, f"{name}-line-does-not-block", text)
+    assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", text)
+
+
+@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_OTHER_CELLS))
+def test_workload_rule_case_accepts_the_rules_other_grade_on_another_fleet(case):
+    name, kind, _rule, _cell = _WORKLOAD_RULE_CASES[case]
+    text = _workload_line(name, kind, _WORKLOAD_RULE_OTHER_CELLS[case])
+    assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", text)
+
+
+@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
+def test_workload_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
+    name, kind, rule, cell = _WORKLOAD_RULE_CASES[case]
+    verdict_objective = f"{name}-line-does-not-block"
+    cell_objective = f"{name}-line-quotes-the-reports-cell"
+    # A report whose rule is missing prints no cell: `none`, or another rule's text, wrapped or not.
+    assert not _workload_case_grades(case, cell_objective, _workload_line(name, kind, "none"))
+    assert not _workload_case_grades(case, cell_objective, _workload_line(name, kind, f"{rule}: something else"))
+    assert not _workload_case_grades(case, cell_objective, _workload_line(name, kind, f'"{rule}: something else"'))
+    # The earlier frame, without the cell slot, still carries its verdict and fails the cell slot.
+    old_frame = _workload_line(name, kind, cell).rsplit("; cell:", 1)[0]
+    assert _workload_case_grades(case, verdict_objective, old_frame)
+    assert not _workload_case_grades(case, cell_objective, old_frame)
+    # A promoted verdict fails whatever the cell says, and so does a second line that contradicts the first.
+    assert not _workload_case_grades(case, verdict_objective, _workload_line(name, kind, cell, verdict="yes"))
+    assert not _workload_case_grades(case, verdict_objective, "\n".join([_workload_line(name, kind, cell), _workload_line(name, kind, cell, verdict="yes")]))
+    # A pod of the workload may stand in for it; another object's line never does.
+    assert _workload_case_grades(case, cell_objective, _workload_line(f"{name}-7d9f8c6b5-x2k9q", kind, cell))
+    assert not _workload_case_grades(case, cell_objective, _workload_line("other-workload", kind, cell))
