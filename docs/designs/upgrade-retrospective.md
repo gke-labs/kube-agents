@@ -313,7 +313,8 @@ resolved project set and `--scope-unread` with the declared projects the install
 each with its outcome. The collector imports the shared `fleet_scope_args` module as `collect.py`,
 `patch_readiness.py` and `fleet_drift.py` do, so the resolution is theirs: `--project` names one
 project and is a hand run's override, free on an install that declares no scope and otherwise
-admitted only beside the scope flags and for a project inside the readable set; else the declared
+admitted only beside the scope flags and for a project inside the readable set, and `--cluster`
+names its project under the same rule; else the declared
 scope is swept exactly as handed, nothing listed, and a declared scope with no readable project is
 an error rather than a listing; else, on an install that declares no scope (the tool answers
 `declared: false`), the active `gcloud` project plus every project `gcloud projects list` returns.
@@ -330,9 +331,11 @@ the render's answer when no snapshot answers, and the row a carried tick or a fa
 organisation or selector lookup appends, under which the members are exactly what is unknown
 (`DeclaredScope.sweep_is_declared` in `fleet_scope_args.py` is the tree's predicate, false while
 the row is present). A full run handed that row, or any `--scope-unread` entry that is not a
-project id, is handed a set that is not the fleet: it prunes no project, holds every ledger entry
-and guard of a project outside the handed set the way it holds an unread project's below, lists
-those clusters under "Reads that failed" with the row's note as `unreachable` manifest entries,
+project id, or one on an undeclared install whose `gcloud projects list` failed or did not name
+the active project (an incomplete listing, as `collect.py` reads it), is handed a set that is not
+the fleet: it prunes no project, holds every ledger entry and guard of a project outside the
+handed set the way it holds an unread project's below, lists those clusters under "Reads that
+failed" with the row's note, or the listing's, as `unreachable` manifest entries,
 and records the fleet as the ledger's set plus the projects it read, so a first run with the row
 still records the project it read; a cluster a successful listing no longer names still leaves.
 The manifest carries the row's note as it carries an unread project's (below), so the run is
@@ -911,8 +914,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   unread note, the unresolved row on a full run pruning no project, holding every ledger entry
   and guard outside the handed set as `unreachable` with the row's note, and recording the fleet
   as the ledger's set plus the projects read, an API-disabled project counted empty with its
-  ledger clusters leaving on a full run, `--project` refused outside a declared scope, the
-  listing on an undeclared install; a locked-out full run exiting 0 with the lock-held line and
+  ledger clusters leaving on a full run, `--project` refused outside a declared scope and a
+  `--cluster` outside it refused the same way, the listing on an undeclared install, and a
+  listing that failed or did not name the active project holding every ledger project outside
+  it; a locked-out full run exiting 0 with the lock-held line and
   writing nothing; a
   persisting guard's candidate under the check its guard records, moved on a re-grade, with first
   seen and the review count, a cleared
