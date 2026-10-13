@@ -371,6 +371,23 @@ An eval run can drive the agent against a GitLab repository instead ([#2394](htt
 - **The deploy.** `EVAL_FORGE=gitlab` in `hack/ci-deploy.sh` turns the GitHub integration and the minter off, declares one GitLab forge and its gitops repository through `platformAgent.integration.forges` and `repositories`, and before the chart reads `gitlab-agent-token` from `kube-agents-prow`'s Secret Manager, once before the image build to fail fast and once straight into the Kubernetes Secret the forge's `credentialsRef` names (`gitlab-forge-token`, under the key `token`, this deploy's choice until the operator's GitLab provider fixes the key it reads). The deploy refuses in seconds, before the image build, while the chart in the checkout does not register `provider: gitlab` in both of its hand-mirrored lists, the PlatformAgent CRD's enum and `$registered` in `charts/kube-agents/templates/_helpers.tpl`. The GitLab provider is the operator half of #1154, and nothing here can run live before it.
 - **Grading and cleanup.** `hack/ci-eval-pr.sh` under `EVAL_FORGE=gitlab` reads the pair once at preflight and proves both authenticate (`ci_gitlab_forge.py whoami`, the token in its environment; a token that reads but is dead stops the run there, as a mint that fails does), hands the agent token to the two resets and exports the ledger token as `BENCH_GITLAB_TOKEN` with `BENCH_FORGE=gitlab`, the host and the bot's login, the names the bench's forge-graded checks and the inject lane's write safeguard read, and unsets the GitHub token so nothing can read the GitHub twin repository by mistake. The ledger reset and the pull-request reset take `--forge gitlab` and close the project's issues and merge requests through `hack/ci_gitlab_forge.py`: the same rules as 5.5 with the bot's login for the `[bot]` suffix and the merge request's source project for the fork test, the same closing note and marker, the same record. On a pull request the lane runs `hack/eval/gitlab-cases.txt`, the registered cases that grade the forge ([`docs/eval-gate-roster.md`](eval-gate-roster.md), "The GitLab lane"); the GitLab nightly (`ci-kube-agents-eval-nightly-gitlab`, #2832) runs the same list and never appends to the evidence store. The sweep's GitLab pass, `hack/ci_sweep_agent_pulls.py --forge gitlab`, does the same closes across the free pool projects with the shared agent token and writes `pull-sweep-gitlab.json`; it also reads both tokens' expiry into the report's `gitlab_tokens`: a token due within 30 days (7 marks it urgent) is a warning line and an entry, not a failure, so a yearly step does not read as a month of failed sweeps, and a token that is dead or could not be checked fails the run naming it. The CI health bot reads that report ([`docs/ci-health.md`](ci-health.md)). It never rotates. Nothing is minted per unit: the pair lasts the year.
 
+**Onboarding a project.** Before section 8 registers it in Boskos: once a project is leasable, the sweep's GitLab pass fails every run with `404 Project Not Found` on it and a GitLab lease of it dies at the reset. Two calls as a group Owner, with a personal access token of scope `api` and a short expiry, kept on one line in a file of mode 600 as `PRIVATE-TOKEN: <token>` so it reaches neither the shell nor `ps`:
+
+```bash
+HDR=~/.config/gitlab/eval-admin-header   # the one-line header file above
+API=https://gitlab.com/api/v4
+NAME="${PROJECT_ID}-infra"
+GROUP_ID=$(curl -sS -H @"$HDR" "$API/groups/gke-agentic" | jq .id)
+curl -sS -H @"$HDR" -H 'Content-Type: application/json' -X POST "$API/projects" \
+  -d "{\"name\":\"$NAME\",\"path\":\"$NAME\",\"namespace_id\":$GROUP_ID,\"visibility\":\"private\",\"initialize_with_readme\":true}" \
+  | jq '{path_with_namespace, visibility, default_branch}'
+BOT_ID=$(curl -sS -H @"$HDR" "$API/users?username=kube-agents-eval-bot" | jq '.[0].id')
+curl -sS -H @"$HDR" -X POST "$API/projects/gke-agentic%2F$NAME/members" \
+  --data-urlencode "user_id=$BOT_ID" --data-urlencode access_level=30 | jq '{username, access_level}'
+```
+
+Done when the first call reports `private` with a `default_branch`, the second reports `kube-agents-eval-bot` at access level 30, and the next sweep run names the project in `pull-sweep-gitlab.json` with no error. Nothing else: the token pair is the pool's, and the runners' Secret Manager grants are on the secrets, not on the project. Delete the Owner token when done.
+
 The Prow job and the sweep's GitLab pass in `oss-test-infra` are the rest of #2394.
 
 ### 5.7 The Compute plant sweep
@@ -452,7 +469,7 @@ A run that can answer every question needs project-level read on the pool projec
 
 ## 8. Boskos pool registration
 
-Once the GCP project is provisioned with the prerequisites above, register the project ID under the `kube-agents-evals-project` resource type in the Prow Boskos deployment configuration:
+Once the GCP project is provisioned with the prerequisites above, and its GitLab project exists with the bot on it (5.6, "Onboarding a project"), register the project ID under the `kube-agents-evals-project` resource type in the Prow Boskos deployment configuration:
 
 ```yaml
 - type: kube-agents-evals-project
