@@ -1393,6 +1393,11 @@ resource "kubernetes_deployment_v1" "intree_pd_reader" {
   }
   spec {
     replicas = 1
+    # Single-writer volume: a surge pod cannot attach the RWO disk while the
+    # old one holds it, so replace in place, as the stack's StatefulSet does.
+    strategy {
+      type = "Recreate"
+    }
     selector {
       match_labels = { app = "intree-pd-reader" }
     }
