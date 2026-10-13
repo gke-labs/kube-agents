@@ -125,10 +125,12 @@ reads, and what one cluster's upgrade broke never reaches the next cluster's rea
 One thing on the roster and one design shape this one. The fleet audits pair a deterministic
 collector (`collect.py`, `patch_readiness.py`) with a governance SOP the Platform Agent follows,
 which is the split used here. The daily readiness watch, `upgrade-readiness-watch`, is specified
-beside the [readiness checks](upgrade-readiness-checks.md) and is in review rather than on `main`:
-it produces the before-the-upgrade report and keeps its own state on the gateway's profile volume;
-this design's (D) lands its guards on the shell's volume (§3.6), which the watch reads through its
-sandbox hop once it ships.
+beside the [readiness checks](upgrade-readiness-checks.md) and is on `main`
+(`agents/platform/scripts/upgrade_readiness_watch.py`, the `upgrade-readiness-watch` roster entry):
+it produces the before-the-upgrade report and keeps its own state on the gateway's profile volume,
+and it does not yet read `guards.json`; this design's (D) lands its guards on the shell's volume
+(§3.6), and the guards reader this design adds to the watch reads them through its sandbox hop
+once the collector merges.
 
 ## 2. Target model
 
@@ -152,7 +154,7 @@ upgrade-retrospective-after-upgrade (daily 05:00 UTC as a sweep, and woken early
        ├─ reads the collector's output, tailors (C) to the cluster's objects
        ├─ (D) the stream's one ledger issue, an entry per cluster and object, where a repository is linked
        └─ posts one line per cluster to chat; names the report's path
-  └─ upgrade-readiness-watch (daily, once it ships)
+  └─ upgrade-readiness-watch (daily; reads guards.json once the collector merges)
        └─ its sandbox hop reads guards.json and prints each live guard in its next report
   └─ on demand: a question about what an upgrade did, or whether upgrades have problems,
        routed by the chat roster and the platform persona to this report; the SOP answers from
@@ -537,7 +539,7 @@ signatures:
 | `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API                  | 6     |
 | every replica of a multi-replica workload unavailable inside one `UPGRADE_NODES` span, all on its pool | 3     |
 | a pool two minors from its control plane, or one pool on two kubelet versions, standing                | 5     |
-| more than a day after the last window close or exclusion end                                           |       |
+| more than a day after the last window close or exclusion end; never on a cluster with no policy        |       |
 
 Rows overlap, and a symptom carries exactly one entry, so the rows are tried in a fixed order and
 the first that holds wins; the order is the most specific discriminator first, so a finding id (the
@@ -635,7 +637,10 @@ one replica, inside one `UPGRADE_NODES` span with every pod on that pool (high; 
 pods were in the zone it drained), keyed by the operation like a budget hold; entry 5 is read
 from the cluster describe and the maintenance policy, medium, and only once the skew has stood
 more than a day after the latest window close or exclusion end (while a window is open or an
-exclusion active it is an Info line).
+exclusion active it is an Info line). On a cluster with no maintenance policy the row does not
+hold: there is no window to be too short, and the skew is the pool-skew reading the readiness
+watch's shipped rule makes under entry 10; the report lists it as an Info line naming that rule,
+the stored set carries it, and nothing is filed or re-filed for it.
 
 Three incidents have no workload object, and each has an object of its own in the manifest's
 `(check, cluster, namespace, object)` identity, with an empty namespace. A node that did not come
@@ -699,7 +704,7 @@ automatic and both reversible:
   states for every gap. The collector merges the file on
   every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
   shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
-  it ships, reads the file through its own sandbox hop and adds a line per live guard to its next
+  the collector merges, reads the file through its own sandbox hop and adds a line per live guard to its next
   report for that cluster, so the operator planning the next upgrade sees "the last upgrade held
   the drain on `seeded-upgrade/pinned-batch-runner`'s budget; it still allows no disruption".
 - **The stream's ledger issue.** Where the install has a repository, the retrospective is a
@@ -926,7 +931,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
    selection) and `agents/platform/scripts/upgrade_retrospective_watch.py` with its `no_agent`
    entry (`*/15 * * * *`), which wakes it (§3.1); the readiness
-   watch reading `guards.json` through its sandbox hop once it ships; the cron README section and
+   watch reading `guards.json` through its sandbox hop once the collector merges; the cron README section and
    the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
    report must classify, starting with the entries that have no passing record yet; the catalogue's
@@ -943,7 +948,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   and the collector's `--after-upgrade` selection.
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
   after the inventory scan, and its repository skip).
-- The readiness watch's script, once it is on `main` (reads `guards.json` through its sandbox hop).
+- `agents/platform/scripts/upgrade_readiness_watch.py` and its test: the guards reader (reads
+  `guards.json` through the watch's sandbox hop and prints a line per live guard, §3.5).
 - `docs/site/src/content/docs/reference/cron-jobs.md` (generated), the autonomous-watchdogs and
   security reference pages where they enumerate the roster.
 
@@ -975,7 +981,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   `--cluster` outside it refused the same way, the listing on an undeclared install, and a
   listing that failed, did not name the active project, or had no active project to check it
   against (an empty one the failed case) holding every ledger project outside it;
-  `--after-upgrade` refusing `--since`; the read deadline: a run whose clock passes
+  `--after-upgrade` refusing `--since`; a two-minor skew on a cluster with no maintenance policy
+  an Info line and never row 5, on a first run and on the next; the read deadline: a run whose clock passes
   `RUN_DEADLINE_S` after the first review reviews no further cluster, writes the clusters it read,
   holds the rest as `gate-failed` with the budget reason and no stale Warning, defers the
   re-checks the same way with their guards held and their checks unevaluated, and orders reviews
@@ -1023,7 +1030,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   alone, no model) is a test, not an eval.
 - **Live.** The first run on a dev install: the first-run stage producing the baseline report; a
   weekend tick after an upgrade producing an incident with all four parts; a guard appearing in the
-  next readiness report once the watch ships; the ledger issue where a repository is linked.
+  next readiness report once the collector merges; the ledger issue where a repository is linked.
 
 ## 8. Accepted risks and open questions
 
