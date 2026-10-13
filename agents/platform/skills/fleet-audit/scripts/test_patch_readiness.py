@@ -2822,23 +2822,31 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn(pr.UNEVALUATED_UNRECOGNISED_BLOCK, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
 
     def test_a_stale_report_is_never_read_back(self):
-        """The report path is the same every run. A reporter that dies before
-        writing must not have last run's budget republished from the file
-        still there: the collector reads only the per-run file it handed the
-        reporter, and leaves that file where the ledger points."""
-        os.makedirs(os.path.dirname(self.report_path()), exist_ok=True)
+        """The per-run file has a fixed name, so a collector killed between the
+        reporter's write and the clean-up (the terminal's 600-second kill, an
+        evicted pod) leaves a complete, graded report at it. Next week a
+        reporter that dies before writing must not have that file read back
+        as its report and last week's budget republished: the collector
+        clears the per-run file before the run. The report at the path the
+        ledger points at is the second seed: it is not read either, and it
+        stays, neither removed nor replaced by the leftover."""
+        pending = self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX
+        os.makedirs(os.path.dirname(pending), exist_ok=True)
+        with open(pending, "w", encoding="utf-8") as handle:
+            json.dump({"members": [self.member("lag", pdbs=[self.BUDGET])], "errors": [], "narrowed_to": ["us-central1/lag"]}, handle)
+        last_week = json.dumps({"members": [], "errors": [], "narrowed_to": ["us-central1/lag"], "week": "last"})
         with open(self.report_path(), "w", encoding="utf-8") as handle:
-            json.dump({"members": [self.member("lag", pdbs=[self.BUDGET])], "narrowed_to": ["us-central1/lag"]}, handle)
+            handle.write(last_week)
         by = self.collect([cluster(name="lag", master=self.BEHIND)], reporter_rc=pr.READINESS_EXIT_PARTIAL, write_report=False)
         entry = by["lag"]
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
         self.assertIn("no readable report", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
-        # Not read, and not removed: it stays where the open finding points
-        # until a graded row replaces it, and the per-run file is not there.
+        # The leftover is gone, and last week's report at the path the finding
+        # points at was neither read nor replaced by it.
+        self.assertFalse(os.path.exists(pending))
         with open(self.report_path(), encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["members"][0]["cluster"], "lag")
-        self.assertFalse(os.path.exists(self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX))
+            self.assertEqual(handle.read(), last_week)
 
     def test_a_reporter_that_times_out_or_fails_leaves_last_weeks_report_where_the_command_points(self):
         """The ledger's open finding carries the recorded command and, past
