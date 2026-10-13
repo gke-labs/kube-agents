@@ -34,6 +34,7 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "hack" / "rollback-roundtrip.sh"
 _CI_EVAL = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
+_CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _OPERATOR = _REPO_ROOT / "k8s-operator"
 _A2A_MANIFESTS = _OPERATOR / "internal" / "controller" / "platformagent_a2a_manifests.go"
 _CONTROLLER = _OPERATOR / "internal" / "controller" / "platformagent_controller.go"
@@ -80,6 +81,7 @@ _FAST_ENV = {
     "ROLLBACK_BUS_UP_TIMEOUT": "30",
     "ROLLBACK_BRIDGE_TIMEOUT": "30",
     "ROLLBACK_SETTLE_TIMEOUT": "30",
+    "ROLLBACK_UNSCHEDULABLE_TIMEOUT": "30",
     "ROLLBACK_TURN_TIMEOUT": "5",
     "ROLLBACK_TURN_ATTEMPTS": "2",
     "ROLLBACK_BUS_TASK_TIMEOUT": "10",
@@ -194,6 +196,9 @@ FAKE_KUBECTL = textwrap.dedent(
         if u is not None and s["tick"] >= u:
             s["unschedulable_until"] = None
             set_ready(s)
+            for pod in s["pods"]:
+                if pod["metadata"]["name"] == AGENT_POD and s.get("unbound_node"):
+                    pod["spec"]["nodeName"] = s.pop("unbound_node")
 
     def set_ready(s, phase="Ready", reason="Reconciled", status="True"):
         cr = s["cr"]
@@ -276,6 +281,44 @@ FAKE_KUBECTL = textwrap.dedent(
 
     PVC = "data-platform-agent-a2a-nats-0"
     CREDS = "platform-agent-a2a-nats-creds"
+    AGENT_POD = "platform-agent-gateway-abc"
+    CAPACITY_MSG = ("Pod %s cannot be scheduled onto any available node: 0/3 nodes are available: "
+                    "1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 Insufficient memory. "
+                    "no new claims to deallocate, preemption: 0/3 nodes are available: "
+                    "1 Preemption is not helpful for scheduling, 2 No preemption victims found for incoming pod." % AGENT_POD)
+
+    def late_unschedulable(s):
+        # Periodic 2109267671341076480 (#2414 class): the operator's last
+        # pass before the settle check saw the agent pod Pending on capacity
+        # and wrote Degraded/PodUnschedulable. The pod was scheduled seconds
+        # later; the operator watches no Pods, so the status kept the message
+        # until the pass the pod's readiness started (through the owned
+        # Deployment) rewrote it. Fired on the first pod list the settle check
+        # makes once the leg's mode has reconciled, so the settle check itself
+        # passes and the not-degraded check is the first to read it.
+        # late_unschedulable says what follows: "clears" (the pod is not yet
+        # bound; a few calls later it is, and the next pass writes Ready),
+        # "stale" (the pod is already bound and rolled out, and no pass ever
+        # rewrites the status), "persistent" (the pod is not bound and never
+        # is).
+        sc = s["scenario"]
+        leg = sc.get("late_unschedulable_on")
+        if not leg or s["cr"]["spec"].get("mode", "today") != leg or s.get("pending") or s.get("late_fired"):
+            return
+        if leg == "next" and {"spec": {"mode": "next"}} not in s["patches"]:
+            return
+        s["late_fired"] = True
+        reason = sc.get("late_reason", "PodUnschedulable")
+        message = sc.get("late_message", CAPACITY_MSG)
+        set_ready(s, phase="Degraded", reason=reason, status="False")
+        s["cr"]["status"]["conditions"][0]["message"] = message
+        how = sc.get("late_unschedulable", "clears")
+        if how in ("clears", "persistent"):
+            for pod in s["pods"]:
+                if pod["metadata"]["name"] == AGENT_POD:
+                    s["unbound_node"] = pod["spec"].pop("nodeName")
+        if how == "clears":
+            s["unschedulable_until"] = s["tick"] + 6
 
     def job(name, cond):
         conds = [] if cond == "Running" else [{"type": cond, "status": "True"}]
@@ -381,6 +424,7 @@ FAKE_KUBECTL = textwrap.dedent(
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
+                late_unschedulable(s)
             elif kind == "jobs":
                 # A Job that turns Failed after leg 2's provisioning read it
                 # Complete: the second such read under next sees it Failed.
@@ -427,6 +471,14 @@ FAKE_KUBECTL = textwrap.dedent(
 ).lstrip()
 
 
+def capacity_message(pod: str) -> str:
+    """The operator's PodUnschedulable message for a pod short of CPU and memory."""
+    return (
+        f"Pod {pod} cannot be scheduled onto any available node: 0/3 nodes are available: "
+        "1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 Insufficient memory."
+    )
+
+
 def b64(value: str) -> str:
     return base64.b64encode(value.encode()).decode()
 
@@ -466,7 +518,11 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
     if scenario.get("degraded_baseline"):
         cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": scenario["degraded_baseline"], "message": "m"})
     pods = [
-        {"metadata": {"name": "platform-agent-gateway-abc", "labels": {}}, "status": {"phase": "Running", "containerStatuses": [{"name": "platform-agent", "state": {"running": {}}}]}},
+        {
+            "metadata": {"name": "platform-agent-gateway-abc", "labels": {}},
+            "spec": {"nodeName": "gk3-pool-1-node-a"},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "platform-agent", "state": {"running": {}}}]},
+        },
         {"metadata": {"name": "platform-agent-a2a-nats-0", "labels": {"app.kubernetes.io/part-of": "a2a-next"}}, "status": {"phase": "Running"}},
     ]
     jobs = [
@@ -738,6 +794,79 @@ class KeptRoundTripTest(RoundTripTest):
         result, _, _ = self.run_sim(healthy_next_state(unschedulable_on="next"))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("PodUnschedulable", result.stdout)
+
+    def test_a_capacity_unschedulable_that_clears_is_forgiven_at_not_degraded(self) -> None:
+        # Periodic 2109267671341076480: every other leg-2 check passed, and
+        # leg2.not-degraded read a PodUnschedulable on capacity the operator
+        # wrote while an Autopilot node was coming up. Here the next pass
+        # clears it inside the window; the run passes and says what it forgave.
+        for leg in ("today", "next"):
+            with self.subTest(leg=leg):
+                result, _, _ = self.run_sim(healthy_next_state(late_unschedulable_on=leg, late_unschedulable="clears"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(passed(result), _PASSING_ORDER)
+                check = "leg1.not-degraded" if leg == "today" else "leg2.not-degraded"
+                self.assertIn(f"{check}: Degraded on a pod waiting for CPU or memory", result.stdout)
+                line = next(x for x in result.stdout.splitlines() if x.startswith(f"PASS {check}:"))
+                self.assertIn("forgave a transient PodUnschedulable", line)
+                self.assertIn("cleared after", line)
+
+    def test_a_stale_capacity_unschedulable_on_a_bound_rolled_out_pod_fails_at_the_window(self) -> None:
+        # The pod the condition names is bound and the agent Deployment is
+        # rolled out, but no operator pass rewrites the status. The wait ends
+        # only on the CR's own verdict, so this fails at the bound rather than
+        # passing on pod state while the CR still reads Degraded (a fault on a
+        # pod the operator scans later would hide behind it). The same for a
+        # message about a pod that is not the agent's.
+        for pod in ("platform-agent-gateway-abc", "platform-agent-a2a-gateway-x"):
+            with self.subTest(pod=pod):
+                result, _, _ = self.run_sim(
+                    healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_message=capacity_message(pod)),
+                    ROLLBACK_UNSCHEDULABLE_TIMEOUT="2",
+                )
+                self.assert_fails_at(result, "leg2.not-degraded", "still Degraded after 2s on a pod waiting for CPU or memory")
+                self.assert_fails_at(result, "leg2.not-degraded", f"Pod {pod} cannot be scheduled")
+                self.assertNotIn("PASS leg2.not-degraded", result.stdout)
+
+    def test_a_capacity_unschedulable_that_persists_fails_at_the_window(self) -> None:
+        started = time.monotonic()
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="persistent"), ROLLBACK_UNSCHEDULABLE_TIMEOUT="2"
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/PodUnschedulable")
+        self.assert_fails_at(result, "leg2.not-degraded", "still Degraded after 2s")
+        self.assertIn("leg2.not-degraded: Degraded on a pod waiting for CPU or memory", result.stdout)
+        self.assertLess(time.monotonic() - started, 60)
+
+    def test_an_unschedulable_that_is_not_capacity_fails_at_once(self) -> None:
+        # A taint or a selector only: no scale-up places the pod.
+        result, _, _ = self.run_sim(
+            healthy_next_state(
+                late_unschedulable_on="next",
+                late_unschedulable="stale",
+                late_message="Pod platform-agent-gateway-abc cannot be scheduled onto any available node: 0/3 nodes are available: 3 node(s) had untolerated taint(s).",
+            )
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/PodUnschedulable")
+        self.assertNotIn("waiting for CPU or memory", result.stdout)
+
+    def test_a_degraded_phase_for_another_reason_fails_at_once(self) -> None:
+        # The message is the capacity one, so only the reason tells them apart.
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_reason="CrashLoopBackOff")
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/CrashLoopBackOff")
+        self.assertNotIn("waiting for CPU or memory", result.stdout)
+
+    def test_a_capacity_unschedulable_on_another_pod_that_clears_is_forgiven(self) -> None:
+        # The operator scans the A2A pods too; the deploy's gate waits on a
+        # capacity message about any of them, and so does this.
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="clears", late_message=capacity_message("platform-agent-a2a-gateway-x"))
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(x for x in result.stdout.splitlines() if x.startswith("PASS leg2.not-degraded:"))
+        self.assertIn("cleared after", line)
 
     def test_provisioning_slower_than_the_ready_bound_gets_the_bus_up_budget(self) -> None:
         # Under next the CR is not Ready until the provisioning Job is done.
@@ -1244,6 +1373,24 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         sts = text[text.index("func buildA2ANATSStatefulSet(") :]
         sts = sts[: sts.index("\nfunc ")]
         self.assertNotIn("PersistentVolumeClaimRetentionPolicy", sts)
+
+    def test_the_capacity_wait_is_the_deploy_gates(self) -> None:
+        # #2427's gate after the sidecar patch and the not-degraded checks
+        # forgive the same Degraded for the same time: one reason, one
+        # scheduler-message match, and a window of its attempts times its poll.
+        c = self.constants()
+        deploy = {}
+        for line in _CI_DEPLOY.read_text().splitlines():
+            match = re.match(r"""readonly ([A-Z0-9_]+)=["']?([^"']*)["']?$""", line)
+            if match:
+                deploy[match.group(1)] = match.group(2)
+        script = _SCRIPT.read_text()
+        self.assertEqual(c["CR_READY_REASON_POD_UNSCHEDULABLE"], deploy["CR_READY_REASON_POD_UNSCHEDULABLE"])
+        self.assertIn(f"readonly SCHEDULER_CAPACITY_SHORTFALL_RE='{deploy['SCHEDULER_CAPACITY_SHORTFALL_RE']}'", script)
+        window = int(deploy["MODE_NEXT_UNSCHEDULABLE_ATTEMPTS"]) * int(deploy["MODE_NEXT_POLL_SECONDS"])
+        self.assertEqual(int(c["DEFAULT_UNSCHEDULABLE_TIMEOUT"]), window)
+        self.assertIn('reason = "PodUnschedulable"', _CONTROLLER.read_text())
+        self.assertIn("cannot be scheduled onto any available node", _CONTROLLER.read_text())
 
     def test_the_status_words_are_the_operators(self) -> None:
         c = self.constants()

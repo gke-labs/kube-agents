@@ -147,3 +147,81 @@ func TestTheNotifyRouteWorksForTheAgentAndNobodyElse(t *testing.T) {
 		}
 	}
 }
+
+// TestTheSlackNotifyRouteWorksForTheAgentAndNobodyElse is the same
+// measurement for chat.notify.slack: the agent asks and the gateway's Slack
+// notifier answers on the shared reply namespace, and no other principal can
+// send a Slack notify or read the requests.
+func TestTheSlackNotifyRouteWorksForTheAgentAndNobodyElse(t *testing.T) {
+	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	gwClient, err := lib.Connect(ctx, h.url, lib.WithName("notify-gateway-slack"),
+		lib.WithUserPassword("gateway", renderedGatewayPassword))
+	if err != nil {
+		t.Fatalf("connect as gateway: %v", err)
+	}
+	defer gwClient.Close()
+	poster := &recordingPoster{}
+	notifier, err := gateway.NewSlackNotifier(poster, "C0HOME", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := notifier.Start(gwClient)
+	if err != nil {
+		t.Fatalf("the gateway could not subscribe chat.notify.slack under its rendered grant: %v", err)
+	}
+	defer sub.Stop()
+
+	agent, agentViolations := h.connectAs(t, "agent", agentToken)
+	reply := lib.NotifyReplyPrefix + "slack-1"
+	in, err := agent.SubscribeSync(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "a cron finding"})
+	if err := agent.PublishRequest(lib.NotifySubjectSlack, reply, body); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := in.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatalf("the agent got no answer on chat.notify.slack under the rendered grants: %v", err)
+	}
+	var answer lib.NotifyReply
+	if err := json.Unmarshal(msg.Data, &answer); err != nil || answer.Error != "" || answer.MessageID == "" {
+		t.Fatalf("answer = %s (%v)", msg.Data, err)
+	}
+	if poster.count() != 1 {
+		t.Fatalf("posted %d times, want 1", poster.count())
+	}
+	if !subscribeRefused(t, agent, agentViolations, lib.NotifySubjectSlack) {
+		t.Error("the agent could subscribe to chat.notify.slack; it would read every other notify")
+	}
+
+	type principal struct {
+		name string
+		nc   *nats.Conn
+		v    chan error
+	}
+	bridge, bv := connectStatic(t, h, "bridge", "pw-bridge")
+	web, wv := connectStatic(t, h, "web", "pw-web")
+	session, sv := h.connectAs(t, podA, tokenPodA)
+	provision, pv := h.connectAs(t, "provision", tokenProvision)
+	verifier, vv := h.connectAs(t, "verifier", tokenVerifier)
+	for _, o := range []principal{{"bridge", bridge, bv}, {"web", web, wv}, {"session", session, sv}, {"provision", provision, pv}, {"verifier", verifier, vv}} {
+		checkPublish(t, o.nc, o.v, map[string]bool{lib.NotifySubjectSlack: true})
+		if !subscribeRefused(t, o.nc, o.v, lib.NotifySubjectSlack) {
+			t.Errorf("%s could subscribe to chat.notify.slack", o.name)
+		}
+		before := poster.count()
+		if err := o.nc.PublishRequest(lib.NotifySubjectSlack, lib.NotifyReplyPrefix+o.name, body); err != nil {
+			t.Fatal(err)
+		}
+		_ = o.nc.Flush()
+		time.Sleep(200 * time.Millisecond)
+		if poster.count() != before {
+			t.Errorf("%s's Slack notify reached the gateway and was posted", o.name)
+		}
+	}
+}

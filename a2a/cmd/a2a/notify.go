@@ -57,7 +57,7 @@ const notifyExitRouteUnavailable = 4
 // notifyExitRouteUnavailable.
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--timeout <d>] [--] [text]
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
@@ -79,6 +79,7 @@ func runNotify(args []string) error {
 	conversation := fs.String("conversation", "", "the gateway conversation to post into, instead of the home channel")
 	contextID := fs.String("context", "", "the conversation's context id (with --conversation)")
 	timeout := fs.Duration("timeout", notifyDefaultTimeout, "how long to wait for the gateway's answer")
+	blocksFile := fs.String("blocks-file", "", "a JSON array of Slack Block Kit blocks to post as one message, with the text as its fallback (Slack only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -98,8 +99,19 @@ func runNotify(args []string) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(lib.NotifyRequest{Text: text, Thread: *thread, WaitMillis: timeout.Milliseconds(),
-		Conversation: *conversation, ContextID: *contextID})
+	req := lib.NotifyRequest{Text: text, Thread: *thread, WaitMillis: timeout.Milliseconds(),
+		Conversation: *conversation, ContextID: *contextID}
+	if *blocksFile != "" {
+		raw, err := os.ReadFile(*blocksFile)
+		if err != nil {
+			return fmt.Errorf("notify: --blocks-file: %w", err)
+		}
+		if !json.Valid(raw) {
+			return fmt.Errorf("notify: --blocks-file %s is not JSON", *blocksFile)
+		}
+		req.Blocks = raw
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}

@@ -580,7 +580,12 @@ def local(session: dict, args: list[str], verb: str) -> dict:
 
 
 def capabilities(repository: str | None = None) -> dict:
-    """What this install can do with a repository, before anything is spent."""
+    """What this install can do with a repository, before anything is spent.
+
+    `fileUrl`, when present, is the web address of a file on this forge, with
+    `{ref}` and `{path}` to fill. Use it for a link to a file, because this
+    client builds no forge URL.
+    """
     spec = repository or resolve_session(None)["spec"]
     return call("capabilities", {"repository": spec})
 

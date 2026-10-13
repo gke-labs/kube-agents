@@ -756,6 +756,11 @@ gitops_repo_for_project() {
     kube-agents-evals-33) echo "gke-agentic/kube-agents-evals-33-infra" ;;
     kube-agents-evals-34) echo "gke-agentic/kube-agents-evals-34-infra" ;;
     kube-agents-evals-35) echo "gke-agentic/kube-agents-evals-35-infra" ;;
+    kube-agents-evals-36) echo "gke-agentic/kube-agents-evals-36-infra" ;;
+    kube-agents-evals-37) echo "gke-agentic/kube-agents-evals-37-infra" ;;
+    kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
+    kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
+    kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -802,6 +807,11 @@ gitlab_project_for_project() {
     kube-agents-evals-33) echo "gke-agentic/kube-agents-evals-33-infra" ;;
     kube-agents-evals-34) echo "gke-agentic/kube-agents-evals-34-infra" ;;
     kube-agents-evals-35) echo "gke-agentic/kube-agents-evals-35-infra" ;;
+    kube-agents-evals-36) echo "gke-agentic/kube-agents-evals-36-infra" ;;
+    kube-agents-evals-37) echo "gke-agentic/kube-agents-evals-37-infra" ;;
+    kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
+    kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
+    kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
     *) return 1 ;;
   esac
 }

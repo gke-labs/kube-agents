@@ -13,7 +13,7 @@ those scores. Your job between those commands is judgement — scoring, and writ
 nothing else.
 
 This is the last stage before delivery. The file you write is posted to the user **verbatim** by the
-`bootstrap-inventory-delivery` job — no agent edits or reformats it afterward.
+onboarding delivery (the `oobe` job's delivery stage) — no agent edits or reformats it afterward.
 
 The report lists only the most urgent critical findings, up to a limit the install sets, and the
 queue holds all of them, so a finding that does not reach the report is deferred rather than
@@ -461,5 +461,5 @@ Write clean Markdown that reads well in a chat client. Structure:
 ## Step 7: Silent Exit
 
 Once `/opt/data/INVENTORY.md` is confirmed on disk, return strictly `[SILENT]` without running any
-further commands. Delivery is handled by the `bootstrap-inventory-delivery` job — do not message the
+further commands. Delivery is handled by the `oobe` job's delivery stage — do not message the
 user yourself.

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Deterministic (no-LLM) delivery for first-time onboarding.
 
-This script backs the ``bootstrap-inventory-delivery`` cron job, which runs
+This is the delivery stage of the ``oobe`` cron job (``oobe.py``), which runs
 with ``no_agent: true``. Its stdout is delivered verbatim by the cron
 scheduler to the job's configured target (``deliver: origin`` — the chat the
-user first spoke in, bound by the ``bootstrap_onboarding`` plugin).
+user first spoke in, bound by the ``bootstrap_onboarding`` plugin). It backed
+the ``bootstrap-inventory-delivery`` job before ``oobe`` took it over; that
+entry ships disabled.
 
 Delivery is claimed exactly once, and only when discovery has finished AND a
 human has connected:
@@ -79,8 +81,11 @@ from pathlib import Path
 
 import sandbox_exec
 
+# The two jobs oobe took over, removed once onboarding is done.
 SCAN_JOB_ID = "bootstrap-inventory-scan"
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# The job that runs this stage, and so the one the plugin links to the chat.
+OOBE_JOB_ID = "oobe"
 
 # The delivered report is renamed here rather than deleted. It is the only copy
 # of a sweep that can take many minutes over a whole fleet, and a chat message
@@ -454,14 +459,14 @@ def _cleanup(data_dir: Path, in_sandbox: bool, shown: bool = False) -> None:
 
 
 def _retire_jobs() -> None:
-    """Remove both onboarding cron jobs, in-process.
+    """Remove the two disabled onboarding cron jobs, in-process.
 
-    Only a run with nothing to deliver may call this. Removing a job while it
-    runs drops the run's fire claim, and the scheduler then discards that run's
-    output instead of posting it. So the run that delivers the report leaves
-    both jobs in place, and a later run, which finds ``.bootstrap_completed``
-    and has nothing to post, removes them and loses nothing. The delivery job
-    goes last because removing it ends this run.
+    Only a run with nothing to deliver may call this, and ``oobe`` removes
+    itself only after it. Removing a job while it runs drops the run's fire
+    claim, and the scheduler then discards that run's output instead of posting
+    it. So the run that delivers the report leaves every job in place, and a
+    later run, which finds ``.bootstrap_completed`` and has nothing to post,
+    removes them and loses nothing.
     """
     try:
         from cron.jobs import remove_job  # type: ignore import-not-found
@@ -484,8 +489,12 @@ def _origin() -> dict:
     try:
         from cron.jobs import get_job  # type: ignore import-not-found
 
-        job = get_job(DELIVERY_JOB_ID) or {}
-        return job.get(ORIGIN_KEY) or {}
+        # oobe's when it runs this stage; the old job's on an install still delivering through it.
+        for job_id in (OOBE_JOB_ID, DELIVERY_JOB_ID):
+            origin = (get_job(job_id) or {}).get(ORIGIN_KEY)
+            if origin:
+                return origin
+        return {}
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: could not read the delivery origin: {e}\n")
         return {}

@@ -16,14 +16,20 @@ name: A2A Module Tests
 # things this job arms that a test quietly does without.
 #
 # The trigger arrangement is k8s-operator-test.yml's, for the reasons its
-# header comment gives: on a pull request the job always starts and the
-# `Detect changes` step decides whether to test, so the check can be required
-# without blocking unrelated changes; on a push to main the `paths:` filter
-# decides instead, so a run that tested nothing is never recorded as a green
-# run. Keep the `paths:` list and the `a2a:` filter below identical.
+# header comment gives: `Run A2A Module Tests` is a required check, so on a
+# pull request the job always starts and the `Detect changes` step decides
+# whether to test, which lets the check be required without blocking unrelated
+# changes; on a push to main the `paths:` filter decides instead, so a run that
+# tested nothing is never recorded as a green run, which is what lets
+# main-broken-notify.yml read the push history. A merge-queue run takes the
+# pull request's shape: the check is required there too, so it has to start
+# every time and filter in the step. Keep the `paths:` list and the `a2a:`
+# filter below identical.
 on:
   pull_request:
     branches: [main, "release/**"]
+  merge_group:
+    branches: [main]
   push:
     branches: [main]
     paths:

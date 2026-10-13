@@ -201,8 +201,20 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
             self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 672Mi floor", err)
 
     def test_a_memory_limit_exactly_at_the_floor_in_millibytes_renders(self):
-        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=704643072000m"])
+        # With the request lowered to meet it: a limit alone under the 1Gi default
+        # request is the crossed pair the test below pins.
+        cr = self._render_cr([
+            f"{_VALUE_PATH}.requests.memory=704643072000m",
+            f"{_VALUE_PATH}.limits.memory=704643072000m",
+        ])
         self.assertEqual(_cr_resources(cr)["limits"]["memory"], "704643072000m")
+
+    def test_a_memory_limit_alone_under_the_default_request_fails_naming_the_pair(self):
+        # 672Mi clears the floor but sits under the operator's 1Gi default request, which
+        # the override does not lower, so the pair is crossed and the render names it.
+        err = self._render_error([f"{_VALUE_PATH}.limits.memory=672Mi"])
+        self.assertIn(f"{_VALUE_PATH}.limits.memory (672Mi) is below the operator's default requests.memory (1Gi)", err)
+        self.assertIn("set requests.memory as well", err)
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=3Gi"])
@@ -341,8 +353,8 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "2Gi"}})
 
     def test_a_limit_at_the_floor_renders(self):
-        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=672Mi"])
-        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "672Mi"}})
+        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=672Mi", f"{_VALUE_PATH}.limits.memory=672Mi"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "672Mi"}, "limits": {"memory": "672Mi"}})
 
     # The CRD's grammar admits `.5Gi`, `1.Gi` and `500n`, and resource.ParseQuantity
     # reads them, so the render has to read them too: a form it dropped instead would

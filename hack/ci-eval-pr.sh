@@ -628,7 +628,9 @@ report_partial_verdict() {
 # was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
 # follows it: a pod replaced mid-run starts a fresh gateway log, and the
 # pod and event watch it stops, the previous containers and the restart
-# record are what say why.
+# record are what say why. collect_litellm_log follows those: the
+# thinking-replay hook's per-request line is in the LiteLLM log alone, so a
+# green run without it cannot say whether the hook touched its traffic.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -649,6 +651,7 @@ profile_and_dump_on_exit() {
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
+  collect_litellm_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -2470,6 +2473,9 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
+    # Tofu too: a plant of a few kubectl execs and one drift collector run,
+    # then the same full drift audit as consistency-drift-outlier. Unmeasured.
+    fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
@@ -2575,6 +2581,7 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
+    fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
@@ -2652,8 +2659,9 @@ STATE_DIR="$(mktemp -d)"
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
 #   per stream -- units that grade ONE audit stream never overlap, across
-#                 tasks: consistency-drift-outlier and
-#                 consistency-no-environment-label both write the
+#                 tasks: consistency-drift-outlier,
+#                 consistency-no-environment-label, and
+#                 fleet-audit-unchanged-finding-keeps-wording write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
 #                 whichever unit opened it. Without this, one lane's ledger
@@ -2962,8 +2970,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     return 0
   fi
   # A ledger-writing unit also holds the stream lock from here until its
-  # state files are written, released with the task lock below: two cases on
-  # one stream (the consistency pair, the patch pair, the obtainability pair)
+  # state files are written, released with the task lock below: cases on
+  # one stream (the consistency trio, the patch pair, the obtainability pair)
   # must not reset and rewrite each other's ledger mid-run. A unit holds every
   # stream task_streams names, in its sorted order, the declared ones too,
   # and then waits out a run the install started on one of them.
@@ -3455,7 +3463,11 @@ job_started_epoch() {
 # round trip, and the diagnostics collector is re-armed under a prefix
 # before it starts: whatever ends the run after that (a pass, a failure, the
 # deadline's TERM), the EXIT trap stops the watch, whose tails then cover
-# the flip, and writes a rollback-* snapshot beside the eval's.
+# the flip, and writes a rollback-* snapshot beside the eval's. The LiteLLM
+# log is not taken here: the flip patches spec.mode, which leaves
+# deployment/litellm alone (the operator only reads it), so the trap's
+# capture still holds the eval's lines, with the round trip's single-turn
+# requests after them.
 #
 # The round trip runs in the background and is waited on, so a SIGTERM (the
 # job's deadline) reaches this script's trap during the wait rather than

@@ -1792,7 +1792,7 @@ wrong thing for a reviewer to find even though it is inert there. So the image g
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
 `stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import. `inventory_findings.py extract` and `select`
+plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
 prioritization SOP answers that exit by going on to `select` and writing the report.
@@ -1814,9 +1814,13 @@ database and is named by its SOP for a hand run. Each gets a stub at its path in
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod. `platform_mcp_server.py` carries the two reads, `list_cluster_profiles` and
-`get_cluster_profile_name`, which is how the agent finds a kanban assignee; creating and
-deleting a profile still has no tool.
+pod. `platform_mcp_server.py` carries the reads of that volume, `list_cluster_profiles` and
+`get_cluster_profile_name`, which is how the agent finds a kanban assignee, and `fleet_scope`, which
+hands the fleet audits the reconcile's scope snapshot they cannot read from here; creating and
+deleting a profile still has no tool. What this pod does know about the scope is one bit the operator
+sets on its container, `KUBEAGENTS_SCOPE_DECLARED`: whether the CR carries a block at all, so that a
+collector run here without the tool's flags refuses to enumerate projects rather than sweep past the
+boundary it cannot see.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)

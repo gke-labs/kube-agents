@@ -119,22 +119,19 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
 # list is how a real finding gets silenced.
 #
-# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
-# copies of google/skills, regenerated either by scripts/sync-upstream-skills.py
-# (deleted and re-copied wholesale; its substitution hooks rewrite only the
-# files registered with them) or by scripts/skill_overlay.py from the copy in third_party/google-skills/
-# (AGENTS.md, Skills Guidelines). A directive written into one of their .sh
-# files by hand lasts until the next sync, and the target goes red on a tree
-# nobody edited. A warning in one of them is fixed upstream, or registered in
-# SKILL_FILE_SUBSTITUTIONS, not here.
+# The scripts under agents/platform/skills/gke-*/ are linted like the rest. They
+# are generated from google/skills plus a patch overlay (scripts/skill_overlay.py;
+# AGENTS.md, Skills Guidelines), so a fix, or for a false positive a
+# `# shellcheck disable=SCnnnn # reason`, is recorded as a patch and survives
+# every sync.
 SHELLCHECK_PATHSPEC := *.sh
-# third_party/google-skills/ holds byte-identical copies of the same upstream skills
-# (scripts/skill_overlay.py), so it is left out for the same reason.
-SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-* :!third_party/google-skills/*
+# third_party/google-skills/ holds byte-identical copies of upstream's skills, which
+# are never edited; the generated skills in agents/platform/skills/gke-*/ carry any fix.
+SHELLCHECK_SKIP_PATHSPEC := :!third_party/google-skills/*
 SHELLCHECK_SEVERITY := warning
 SHELLCHECK_EXCLUDE := SC1090,SC1091
 
-shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
+shellcheck: ## Run shellcheck over every tracked .sh file (the upstream copies in third_party/ excepted) at warning severity.
 	@command -v shellcheck >/dev/null 2>&1 || { \
 		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
 		exit 1; \

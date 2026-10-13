@@ -77,6 +77,13 @@ const (
 		"commands, one per call, with no pipes or other programs; read the output yourself. A refused command prints " +
 		"`policy rule: <rule>` on stderr; report the refusal instead of retrying or working around it."
 
+	// noClusterPrompt is appended when a session pod has no cluster view. A
+	// turn that can't reach the cluster used to search the pod's filesystem
+	// and environment for credentials or tools, narrating each step, before
+	// answering; there is nothing there to find. Not for an AgentProfile's
+	// pod (lib.EnvProfileExecutor), which reaches clusters its own way.
+	noClusterPrompt = "You have no access to any cluster or the fleet on this turn, and this pod's files and environment hold no cluster credentials or tools, so don't search them for any. When an ask needs a cluster, delegate it if you can; otherwise say plainly that you can't reach it from here."
+
 	// delegateToolID is the MCP-qualified tool name the harness's
 	// --allowedTools expects: "mcp__" + server name + "__" + tool name
 	// (worker-adapter/mcp.go names both halves so this can't drift from the
@@ -230,6 +237,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		TaskID:       taskID,
 		Profile:      profile,
 		Session:      os.Getenv("A2A_SESSION"),
+		Primer:       readPrimer(log),
 		// Literal "true" only, like EnvClusterView.
 		ProfileExecutor: os.Getenv(lib.EnvProfileExecutor) == "true",
 		Namespace:       namespace,
@@ -304,8 +312,13 @@ func harnessCommand() []string {
 	// harness in tests or an older image.
 	delegateTool := delegateToolEnabled()
 	var prompts []string
+	// The no-cluster line keys on the view, not on Bash: a view pod whose
+	// override leaves Bash out still holds the broker's URL, token file and
+	// shims, so telling it they aren't there would be false. It gets neither.
 	if bashView {
 		prompts = append(prompts, clusterViewPrompt)
+	} else if !clusterView && os.Getenv(lib.EnvProfileExecutor) != "true" {
+		prompts = append(prompts, noClusterPrompt)
 	}
 	if delegateTool {
 		allowed += "," + delegateToolID
@@ -477,4 +490,24 @@ func envDuration(key string, defSeconds int) time.Duration {
 		fmt.Fprintf(os.Stderr, "ignoring bad %s=%q\n", key, v)
 	}
 	return time.Duration(defSeconds) * time.Second
+}
+
+// readPrimer reads the conversation so far from the file the spawner mounts
+// (lib.EnvPrimerFile). Unset or missing is a first turn, not an error: a pod
+// from a spawner older than the mount, or one started by hand. A read error
+// is logged and the turn runs without it, since a turn with no context
+// beats no turn.
+func readPrimer(log *slog.Logger) string {
+	path := os.Getenv(lib.EnvPrimerFile)
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- the spawner's own mount path
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn("could not read the transcript primer; this turn runs without the conversation so far", "path", path, "error", err)
+		}
+		return ""
+	}
+	return string(b)
 }
