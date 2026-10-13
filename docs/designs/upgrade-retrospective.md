@@ -229,7 +229,8 @@ route that reviewed each, kept while the end time is inside the cluster's select
 selection window is defined once, here, for every route: per cluster, from its last full review to
 the run, or the first-run window of fourteen days back when the ledger has no `last_run` for it;
 `--since` widens a scoped run's window by hand and never moves `last_run`. Only an operation that
-reached `DONE` inside the window is considered on any route, and the window's near end is the same
+reached `DONE` inside the window is considered on any route, for selection and (A) (an operation
+guard's re-check lists back to its operation's start, §3.5), and the window's near end is the same
 on every route: fifteen minutes before the run, the settle floor, so an operation younger than
 that makes its cluster settling rather than reviewed (below); the reviewed list is pruned at the
 earlier of `last_run` and the fourteen-day floor, so an operation leaves the list only once it can
@@ -238,8 +239,11 @@ after it.
 The after-upgrade route also needs a baseline to diff against: when the ledger records no full run
 it prints one line, "no baseline yet; the first full run establishes it", and writes nothing, so an
 install that predates the job gets its first report from the first-run stage or the first Sunday
-tick (§3.1), never from a scoped sweep over a fortnight of operations. A scoped run writes, for the clusters it reviewed, its report, the reviewed
-operations and the guards (so the readiness check learns a failure the same day, requirement 3);
+tick (§3.1), never from a scoped sweep over a fortnight of operations. A scoped run writes, for every cluster it reviewed, its report and the operations it
+reviewed, route bookkeeping a cluster outside the fleet set gets too, so a sweep never reviews one
+operation twice; for a cluster inside the fleet set it writes the guards (so the readiness check
+learns a failure the same day, requirement 3), and for one outside it writes no guard and marks it
+"outside the fleet; not recorded beyond the operations reviewed";
 versions, last-run time and the symptom set stay the full run's, so the next Sunday still selects
 the cluster on the operation's end time, reviews it in full against the stored set the last full
 run wrote, and grades each incident from its own reads: an Error the after-upgrade run reported
@@ -292,7 +296,12 @@ which it is: a full run is one invoked with `--full`, which the SOP passes with 
 `--project` set (the management project and every project a Cluster Agent profile names) on the
 scheduled route and on the fleet-wide on-demand route, and which refuses `--cluster`. A full run may
 change the fleet set: a project that left the roster is pruned with its clusters, a project that
-joined is added. A project the roster still names whose listing failed (a deleted project, a
+joined is added. Between two full runs a roster project the fleet set lacks is reviewed by the
+after-upgrade sweep only for a settled operation it has not reviewed, once: the sweep selects by
+unreviewed operations alone and records the ones it reviewed, inside or outside the fleet set, so
+the project's clusters without an operation are never selected, and the next full run adds the
+project with its clusters' versions and reviews them in full; the bookkeeping a hand run leaves
+for a project outside the roster goes with the next full run's pruning. A project the roster still names whose listing failed (a deleted project, a
 removed binding, the Container API disabled) does not demote the run: its ledger entries and guards
 are held unchanged, its clusters are listed under "Reads that failed", and the run stays full and
 moves the latest link, the way `fleet_drift.py` and `patch_readiness.py` keep a failed project as
@@ -304,8 +313,8 @@ finding's id, first-seen date and review count until a run reads the project aga
 the issue body shows meanwhile. Every run without `--full` is _scoped_, whatever its
 `--project` set: a run narrowed by `--cluster`, by the question that invoked it, or any hand run,
 with or without `--project`. A scoped run reviews only its targets, never
-prunes a ledger entry or a guard outside them, never adds a project to the fleet set (a cluster it
-reviews outside the fleet is reported and marked "outside the fleet; not recorded"), writes its
+prunes a ledger entry or a guard outside them, never adds a project to the fleet set (what it
+writes for a cluster outside the fleet set is stated above, once), writes its
 report under a `-scoped` name, does not move the latest link, and never calls the fleet-audit
 `start` or `finish`, so a question about one clean cluster cannot close the fleet's ledger issue.
 `--since` is a hand-run flag that widens the window a scoped run reviews; it never replaces the
@@ -387,8 +396,9 @@ object per run, keyed `(check, cluster, namespace, object)`; the object is the w
 Error at `major` and a Warning at `minor`, under the check this run's grading gives it, with the
 excerpt and the mitigation text and, where the object carried a guard, that guard's first-seen
 date and review count in its detail. A `failure` guard whose object has no incident this run, one
-the re-check observed again or a keep rule kept (§3.5), emits its own candidate under the check id
-its finding was first filed with, graded the Warning requirement 3 makes it and carrying the same
+the re-check observed again or a keep rule kept (§3.5), emits its own candidate under the check
+its guard records, that of its latest filing (§3.5), graded the Warning requirement 3 makes it and
+carrying the same
 persistence. An incident therefore supersedes the guard's candidate for the run: a Tuesday Error
 that Sunday reviews again, or a budget that holds the next upgrade's drain, yields one candidate,
 the incident's, never two under one id, which `validate_findings` would refuse. The guard follows
@@ -407,7 +417,8 @@ The hold follows the rule the harness implements and no other. A previous findin
 resolved only on a complete run, and only when no candidate carries its `(check, cluster,
 namespace, object)` id (`still_flagged_ids` is that set of candidate ids). A guard the re-check
 observes again therefore emits its candidate, the unclassified Warning's guard among them (§3.5),
-under its original check id, and a guard the re-check clears emits nothing, so the harness resolves
+under the check its guard records, that of its latest filing (§3.5), and a guard the re-check
+clears emits nothing, so the harness resolves
 the finding. A persisting finding has no check id of its own: a held candidate under a new id
 would file a new finding and let the harness announce the old one fixed, the resolved-plus-new
 pair the fixed row order (§3.4) exists to prevent on unchanged evidence; only an incident this run
@@ -583,12 +594,18 @@ automatic and both reversible:
   namespace), evidence, source (pod or node state, events alone, or the operations listing), the
   check id its incident was last filed under (a re-grade moves it, §3.3), first and last seen, and
   the number of reviews that have seen it; the last three are what its re-emitted candidate
-  carries (§3.3). An operation's guard
-  is re-checked through the operations listing every run already makes for its project, so it
-  costs no read: it stands while the listing returns the operation `DONE` with `error` and no
-  later operation of the same type on the same target that reached `DONE` without `error`; that
-  later operation, the retry that succeeded, clears it, as does a listing that answers without the
-  operation, with an Info line saying so; a listing that failed holds it (§3.3). An unclassified
+  carries (§3.3). An operation's guard is re-checked through the operations listing every run
+  already makes for its project, so it costs no read. The listing's earliest bound reaches the
+  start of every operation a guard records, so the selection window (§3.2) never hides a guarded
+  operation from its re-check. The guard stands while the listing returns the operation `DONE`
+  with `error` and no later operation of the same type on the same target that reached `DONE`
+  without `error`. Three things clear it: that later operation, the retry that succeeded; the
+  operation itself listed without an error; and, for a node-pool operation, a cluster describe
+  that no longer lists the target pool. A listing that answers without the operation does not:
+  GKE retains operation records for a limited time the design does not assume, so an operation
+  the API no longer lists holds its guard, with an Info line saying so, until a later clean
+  operation clears it or an operator runs `--reset-ledger` (§3.6); a listing that failed holds it
+  too (§3.3). An unclassified
   Warning carries
   a `failure` guard like a classified one, because the guard is what makes the next run re-check
   the cluster for it (§3.2) and re-emit its candidate while a run observes it (§3.3); without one the
@@ -653,10 +670,18 @@ end before `finish`, and a wake that starts a second run beside it is two writer
 The lock wait is sized to fit under the budget with the run: a second run, scheduled,
 after-upgrade or on demand, waits up to two minutes, long enough for a scoped run of a few clusters
 to finish, which is the collision that matters, the Sunday run or a question landing while an
-after-upgrade run holds the lock. The reverse costs nothing: an after-upgrade wake locked out by the
-Sunday run exits after the wait with one line and writes nothing, the Sunday run reviews the same
-operation, and the route's next wake or sweep finds it in the reviewed list and prints nothing; an
-on-demand run locked out answers from the latest saved report and says a run is in progress. A
+after-upgrade run holds the lock. Past the wait the collector prints the lock-held line, naming
+the holder and the time, exits 0 and writes nothing, on every route. The SOP's Sunday run has
+called `start` by then and has no manifest: it does not call `finish` (there is nothing to pass,
+and `finish` refuses last week's manifest), ends the stream run with the lock as its one
+limitation in the chat line, files nothing, and lets the in-flight note `start` left expire on
+its own (two hours); the fleet-wide review, the `last_run` advance, the guard re-checks and the
+ledger rewrite wait for the next tick, or for a fleet-wide question asked meanwhile, which is a
+full run (§3.1a); the after-upgrade route keeps reviewing upgrades in between. The reverse costs
+nothing: an after-upgrade wake locked out by the Sunday run exits the same way, the Sunday run
+reviews the same operation, and the route's next wake or sweep finds it in the reviewed list and
+prints nothing; an on-demand run locked out answers from the latest saved report and says a run
+is in progress. A
 dry run reads without the lock. Reports are named by their finish time in UTC, full
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
@@ -804,8 +829,13 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   pruned at the window, and the no-baseline line when no full run is recorded); the ledger and
   guards round trips, an unclassified symptom's guard among them, an event-only guard refreshed by
   a re-check whose events read still names the object and cleared by one that does not, and an
-  operation guard held while the listing shows no clean retry and cleared by one; a persisting
-  guard's candidate under its original check id with first seen and the review count, a cleared
+  operation guard held while the listing shows no clean retry, held too when a listing that
+  reaches its operation's start no longer returns it, and cleared by a clean retry or by a target
+  pool the describe no longer lists; a scoped sweep reviewing a new roster project's settled
+  operation once, recording it outside the fleet set with no guard, and selecting nothing the
+  next day; a locked-out full run exiting 0 with the lock-held line and writing nothing; a
+  persisting guard's candidate under the check its guard records, moved on a re-grade, with first
+  seen and the review count, a cleared
   guard emitting nothing, and a guard whose re-check read failed emitting nothing with its check
   in `checks_unevaluated[]` (the manifest against `still_flagged_ids` and `cross_check_manifest`);
   a failed budgets, events, owners or workloads read on a review naming the read in `limitations`,
