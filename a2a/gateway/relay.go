@@ -281,6 +281,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 			ask = "the task needs input to continue"
 		}
 		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: question.Message})
+		g.markFrom(rec, taskID, question)
 		g.updateRollingLine(rec, taskID, rs)
 	default:
 		// A steer notice is the executor's word on one follow-up and is
@@ -309,7 +310,10 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		// A chat message here is the live message's whole state, so one
 		// without it returns the line to text.
-		rs.lineChat = g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts).Message
+		progress := g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts)
+		rs.lineChat = progress.Message
+		// The mark is state whatever the batch renders.
+		g.markFrom(rec, taskID, progress)
 		if render {
 			g.updateRollingLine(rec, taskID, rs)
 		}
@@ -340,6 +344,7 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		// since it is not the deliverable the console reads off TASKS.
 		notice := g.readChat(rec.Key, taskID, chatmsg.Notice, a.Artifact.Parts)
 		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: notice.Message})
+		g.markFrom(rec, taskID, notice)
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
 		rs.sawDelegate = true
@@ -447,10 +452,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// A chat message needs its text fallback, so a non-text result
 		// posts the notice alone.
 		answer := OutMessage{Text: result}
+		var answerChat chatmsg.Reading
 		if result == "" {
 			answer.Text = completedNonTextResult
 		} else if !isConsoleConversation(rec.Key) {
-			answer.Chat = g.resultChat(rec.Key, taskID, rs, replayedResult)
+			answerChat = g.resultChat(rec.Key, taskID, rs, replayedResult)
+			answer.Chat = answerChat.Message
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
@@ -464,6 +471,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if !isConsoleConversation(rec.Key) {
 			g.postMessage(rec.Key, answer)
 		}
+		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed:
 		reason := ""
 		if s.Status.Message != nil {
@@ -496,10 +504,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	}
 	g.postSteerShortfall(rec, rs, taskID)
 	g.flushNotices(rec.Key, rs)
-	// The terminal's chat message is its mark alone, with no fallback.
+	// The terminal's chat message is its mark alone, with no fallback; a
+	// terminal without one takes the default (applyTerminalMark). After the
+	// answer, so the ask's reaction comes off once the answer is posted.
+	var terminal chatmsg.Reading
 	if s.Status.Message != nil {
-		g.relayMark(rec.Key, taskID, g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts))
+		terminal = g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts)
 	}
+	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
@@ -670,6 +682,7 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState, taskID string) {
 	if text != "" && !isConsoleConversation(rec.Key) {
 		turn := g.readChatArtifact(rec.Key, taskID, chatmsg.Turn, chunks)
 		g.postMessage(rec.Key, OutMessage{Text: text, Chat: turn.Message})
+		g.markFrom(rec, taskID, turn)
 	}
 }
 

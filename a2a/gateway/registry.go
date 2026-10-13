@@ -305,6 +305,15 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// AskMessageID is the backend id of the human message that started the
+	// chain, on its root entry only: the message the chain's mark is drawn
+	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
+	// drawn there, so the next mark draws only the difference, across a
+	// restart too. Both empty on a child, a wake, an entry written before
+	// they existed, and a chain whose root was evicted from the history cap
+	// (whose marks then draw nothing).
+	AskMessageID string     `json:"askMessageId,omitempty"`
+	Mark         *MarkState `json:"mark,omitempty"`
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to

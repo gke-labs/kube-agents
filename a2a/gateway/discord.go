@@ -318,3 +318,8 @@ func (d *DiscordAdapter) OpenDirect(userID string) (string, error) {
 	}
 	return conversationID("", ch.ID), nil
 }
+
+// React and RemoveReaction draw no mark on Discord yet: a nil no-op, as the
+// Adapter contract allows a backend that does not react.
+func (d *DiscordAdapter) React(string, string, string) error          { return nil }
+func (d *DiscordAdapter) RemoveReaction(string, string, string) error { return nil }

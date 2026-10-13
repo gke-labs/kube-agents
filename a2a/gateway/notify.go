@@ -547,7 +547,8 @@ func (n *Notifier) post(job notifyJob) {
 // chunk, since an edit reaches one message only. An unkeyed request whose
 // chat message the adapter lays out is one message; otherwise it is not
 // answered here, and post sends its text in chunks as it always has. The
-// mark a chat message carries is not applied on this route yet.
+// mark a chat message carries is drawn on the conversation's latest chain
+// message once the request is handled (MarkConversation).
 func (n *Notifier) postConversation(job notifyJob) bool {
 	conversation := job.req.Conversation
 	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
@@ -556,6 +557,14 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 		for _, p := range reading.Problems {
 			n.log.Warn("notify: chat message dropped; its text fallback stands",
 				"conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
+		}
+	}
+	if reading.Mark != nil {
+		// Drawn once the request is answered, after its post, so the ask's
+		// reaction comes off when the answer is in the thread.
+		if marker, ok := n.conv.(notifyMarker); ok {
+			mark := MarkState{Ask: reading.Mark.Ask, Settle: reading.Mark.Settle}
+			defer marker.MarkConversation(conversation, mark)
 		}
 	}
 	m := OutMessage{Text: job.req.Text, Chat: reading.Message}
@@ -822,6 +831,35 @@ func (c gatewayConversations) PostMessage(conversation string, m OutMessage) (st
 
 func (c gatewayConversations) EditMessage(conversation, messageID string, m OutMessage) error {
 	return c.poster.EditMessage(conversation, messageID, m)
+}
+
+// notifyMarker is the optional half of NotifyConversations that draws the
+// mark a conversation notify carried; gatewayConversations implements it.
+type notifyMarker interface {
+	MarkConversation(conversation string, mark MarkState)
+}
+
+// MarkConversation draws a conversation notify's mark under the
+// conversation's session lock, as the relay draws a task's (mark.go,
+// applyNotifyMark), and writes the record when the drawn state changed.
+func (c gatewayConversations) MarkConversation(conversation string, mark MarkState) {
+	g := c.g
+	l := g.lockSession(conversation)
+	l.Lock()
+	defer l.Unlock()
+	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+	defer cancel()
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil || rec == nil {
+		g.log.Warn("notify: mark not drawn; no session record", "conversation", conversation, "err", err)
+		return
+	}
+	if !g.applyNotifyMark(rec, mark) {
+		return
+	}
+	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+		g.log.Error("notify: session record write failed after a mark", "conversation", conversation, "err", err)
+	}
 }
 
 // Conversations is what Notifier.SetConversations takes: the gateway's

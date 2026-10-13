@@ -565,6 +565,12 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 	return ids, out.NextPageToken == "", nil
 }
 
+// React and RemoveReaction draw no mark on Google Chat: its relay holds app
+// credentials, and Chat's reaction API takes user credentials only, so a nil
+// no-op (Adapter).
+func (a *GoogleChatAdapter) React(string, string, string) error          { return nil }
+func (a *GoogleChatAdapter) RemoveReaction(string, string, string) error { return nil }
+
 // OpenDirect returns the DM conversation for a user (Adapter.OpenDirect).
 // userID is the Google-asserted email; the Chat API accepts the email alias
 // in user resource names.

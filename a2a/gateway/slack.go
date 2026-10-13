@@ -143,6 +143,10 @@ type slackAPI interface {
 	UpdateMessage(channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
 	GetUsersInConversation(params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
+	AddReaction(name string, item slack.ItemRef) error
+	RemoveReaction(name string, item slack.ItemRef) error
+	GetUserInfo(user string) (*slack.User, error)
+	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -208,6 +212,20 @@ type SlackAdapter struct {
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
 	seen      map[string]bool
 	seenOrder []string
+
+	// sessionsAPI drives Agent Sessions (slack_sessions.go); nil in a test
+	// that does not fake it, which then sends no status. sessionStates holds
+	// each thread's session state, made on first use, sessionOrder its
+	// eviction ring. syncSessions runs the session and prompt sends inline,
+	// for tests.
+	sessionsAPI   slackSessionsAPI
+	sessionStates map[string]*slackSession
+	sessionOrder  []string
+	syncSessions  bool
+
+	// ux is the click and question state (slack_interactive.go), made on
+	// first use.
+	ux *slackUX
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -288,6 +306,8 @@ var (
 	_ Adapter           = (*SlackAdapter)(nil)
 	_ TaskObserver      = (*SlackAdapter)(nil)
 	_ SessionLookupSink = (*SlackAdapter)(nil)
+	_ MarkObserver      = (*SlackAdapter)(nil)
+	_ VerifiedObserver  = (*SlackAdapter)(nil)
 )
 
 // SetSessionLookup receives the gateway's session registry as a read, and
@@ -314,7 +334,12 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // record, threaded or not: a DM carries every message, so its threads never
 // consult the cache. Called on the conversation's inbox worker under the
 // session lock (TaskObserver): record and return.
+//
+// It also opens the thread's Agent Session, a DM thread's included:
+// processing from here until the chain ends and its card work settles
+// (slack_sessions.go).
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
+	s.updateSession(conversation, func(st *slackSession) { st.running = true })
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -333,8 +358,12 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 	return s.now().Add(s.sessionTTL)
 }
 
-// TaskTerminal, TaskAccepted and CancelPublished are not the Slack adapter's
-// business: a human reads the thread. A thread stays a session thread past
+// TaskTerminal ends the running half of the thread's Agent Session: it is
+// called for the chain's end only (observedAs), and the session then holds
+// processing while the chain's mark says card work is still open, suspended
+// while it waits on the user, and closes otherwise (slackSession.wanted).
+// TaskAccepted holds processing like TaskStarted; CancelPublished is not the
+// Slack adapter's business: a human reads the thread. A thread stays a session thread past
 // its task's end for as long as the session has been active within the idle
 // TTL, and the relay stamps the task's end as activity, so that window
 // starts at the answer. What TaskTerminal does here is expire the cached
@@ -346,6 +375,7 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // re-ask decides. Called on the relay queue under the session lock: record
 // and return.
 func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
+	s.updateSession(conversation, func(st *slackSession) { st.running = false })
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -371,7 +401,10 @@ func (s *SlackAdapter) expireMark(key string) {
 	}
 }
 
-func (s *SlackAdapter) TaskAccepted(string, string)    {}
+func (s *SlackAdapter) TaskAccepted(conversation, _ string) {
+	s.updateSession(conversation, func(st *slackSession) { st.running = true })
+}
+
 func (s *SlackAdapter) CancelPublished(string, string) {}
 
 // NewSlackAdapter builds the Socket Mode client pair. The bot token drives
@@ -402,6 +435,7 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 		sessionExpiresAt: map[string]time.Time{},
 		seen:             map[string]bool{},
 		now:              time.Now,
+		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackHTTPClient()},
 	}
 }
 
@@ -473,26 +507,25 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			if ctx.Err() != nil {
 				return
 			}
-			if evt.Type != socketmode.EventTypeEventsAPI {
-				// Everything that is not an EventsAPI envelope is dropped
-				// here, unacked. socketmode's parseEvent attaches a Request
-				// to all five request types it knows
+			if evt.Type != socketmode.EventTypeEventsAPI && evt.Type != socketmode.EventTypeInteractive {
+				// Everything that is neither an EventsAPI nor an interactive
+				// envelope is dropped here, unacked. socketmode's parseEvent
+				// attaches a Request to all five request types it knows
 				// (socketmode/socket_mode_managed_conn.go): hello and
 				// disconnect carry one whose EnvelopeID is empty — acking
 				// those would write a junk frame back up the socket — while
-				// slash_commands and interactive carry a real, non-empty one
-				// that this continue throws away.
+				// slash_commands carry a real, non-empty one that this
+				// continue throws away: the gateway answers no slash command.
 				//
-				// The same app serves the legacy consumer under today, which
-				// does answer interactions, so an install may well have
-				// interactivity on and these envelopes do arrive: clicks on
-				// messages posted under today, and on the buttons a chat
-				// message's layout carries (renderSlackChat), which nothing
-				// answers yet. The notify route's raw blocks still carry none
-				// (the agent sends the audit card with its buttons removed).
-				// Answering interactions means acking them here first: Slack
-				// wants the envelope acked inside three seconds, and an
-				// unacked one redelivers and shows the user a timeout.
+				// Interactive envelopes are acked below like an event, inside
+				// the three seconds Slack allows before it redelivers and
+				// shows the clicker a timeout, and a click on one of the
+				// choice buttons a chat message's layout carries
+				// (renderSlackChat) becomes a turn (slack_interactive.go). A
+				// click on any other button (one on a message posted under
+				// today, a link) is acked and changes nothing. The notify
+				// route's raw blocks still carry none (the agent sends the
+				// audit card with its buttons removed).
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -580,6 +613,14 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					return
 				}
 			}
+			if evt.Type == socketmode.EventTypeInteractive {
+				if evt.Request != nil {
+					if msg, ok := s.interactive(evt.Request.Payload); ok {
+						handler(msg)
+					}
+				}
+				continue
+			}
 			e, ok := evt.Data.(slackevents.EventsAPIEvent)
 			if !ok {
 				continue
@@ -587,12 +628,16 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			if e.Type != slackevents.CallbackEvent {
 				continue
 			}
-			m, ok := e.InnerEvent.Data.(*slackevents.MessageEvent)
-			if !ok {
-				continue
-			}
-			if msg, ok := s.inbound(ctx, m); ok {
-				handler(msg)
+			switch inner := e.InnerEvent.Data.(type) {
+			case *slackevents.MessageEvent:
+				if msg, ok := s.inbound(ctx, inner); ok {
+					// Recorded before the handoff, so the gateway's word on
+					// the sender always finds it (InboundVerified).
+					s.notePending(msg)
+					handler(msg)
+				}
+			case *slackevents.AssistantThreadStartedEvent, *slackevents.AppHomeOpenedEvent:
+				s.suggestPrompts(inner)
 			}
 		}
 	}()
@@ -735,6 +780,9 @@ func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, e
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err == nil {
+		s.trackQuestion(conversation, ts, m)
+	}
 	return ts, err
 }
 
@@ -747,10 +795,19 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
 	opts, err := slackMessageOptions(m)
+	if line := s.answeredLine(channel, messageID); line != "" && m.Chat != nil && len(m.Chat.Choices) == 0 {
+		// An answered question edited again without its choices (the card
+		// settling it on the notify route) keeps the line that names who
+		// answered.
+		opts, err = slackAnsweredOptions(m, line)
+	}
 	if err != nil {
 		return err
 	}
 	_, _, _, err = s.api.UpdateMessage(channel, messageID, opts...)
+	if err == nil {
+		s.trackQuestion(conversation, messageID, m)
+	}
 	return err
 }
 
