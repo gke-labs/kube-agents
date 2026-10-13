@@ -16,10 +16,12 @@
 
 For variant from_report, `bench/tf/prebuilt/first-install-hello/main.tf`
 plants INVENTORY.md on the shell sandbox. Pinned here: the refusals (a person
-waiting on an undelivered report, a report the stack did not plant, other than
-one sandbox pod) stopping the apply before anything is written; a file holding
-the stack's own text being planted over; and the destroy removing the report
-only while it holds that text, and failing when it cannot check. As in
+waiting on an undelivered report, a ranking card filed and not delivered, other
+than one sandbox pod) stopping the apply before anything is written; a report
+the stack did not plant being left as it is; a file holding the stack's own
+text being kept; a report appearing during the write failing the apply; and the
+destroy removing the report only while it holds that text, and failing when it
+cannot check. As in
 `test_bootstrap_ranking_plant.py`, the provisioners are rendered the way
 Terraform renders them and run against a stub `kubectl` and `gcloud`; the stub
 runs each in-pod script locally, over one directory per pod.
@@ -141,6 +143,8 @@ class PlantTest(unittest.TestCase):
             (bin_dir / "gcloud", "#!/bin/sh\nexit 0\n"),
             (fakebin / "chown", "#!/bin/sh\nexit 0\n"),
             (fakebin / "stat", "#!/bin/sh\necho 0:0\n"),
+            # A report that lands between the check and the link.
+            (fakebin / "ln", '#!/bin/sh\nif [ "$RACE" = 1 ]; then echo raced > "$2"; exit 1; fi\nexec /bin/ln "$@"\n'),
         ):
             path.write_text(body)
             path.chmod(0o755)
@@ -192,30 +196,59 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.report.exists())
 
+    def test_refuses_while_a_ranking_card_is_filed_and_undelivered(self):
+        (self.agent / ".bootstrap_handoff_filed").write_text("sweep=t_sweep\ntask_id=t_rank\nfiled_at=1\n")
+        result = self._run(_CREATE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ranking card", result.stderr)
+        self.assertFalse(self.report.exists())
+
+    def test_plants_when_the_hand_off_filed_no_ranking_card(self):
+        (self.agent / ".bootstrap_handoff_filed").write_text("sweep=t_sweep\ntask_id=none\nfiled_at=1\n")
+        result = self._run(_CREATE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.report.read_text(), _PLANTED)
+
+    def test_plants_after_delivery_whatever_the_hand_off_filed(self):
+        (self.agent / ".bootstrap_handoff_filed").write_text("task_id=t_rank\n")
+        (self.agent / ".bootstrap_completed").touch()
+        result = self._run(_CREATE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.report.exists())
+
+    def test_fails_when_a_report_lands_during_the_write(self):
+        result = self._run(_CREATE, RACE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not plant", result.stderr)
+        self.assertEqual(self.report.read_text(), "raced\n")
+        self.assertEqual([p.name for p in self.sandbox.iterdir()], ["INVENTORY.md"])
+
     def test_refuses_when_the_agent_pod_cannot_be_read(self):
         result = self._run(_CREATE, EXEC_FAIL="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.report.exists())
 
-    def test_refuses_a_report_it_did_not_plant_and_leaves_it(self):
+    def test_leaves_a_report_it_did_not_plant(self):
         self.report.write_text("A REAL RANKED REPORT\n")
         result = self._run(_CREATE)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("not planted by this stack", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("plants and removes nothing", result.stdout)
         self.assertEqual(self.report.read_text(), "A REAL RANKED REPORT\n")
 
-    def test_refuses_a_symlink_at_the_path(self):
+    def test_leaves_a_symlink_at_the_path(self):
         target = self.sandbox / "elsewhere"
         target.write_text(_PLANTED)
         self.report.symlink_to(target)
         result = self._run(_CREATE)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.report.is_symlink())
+        self.assertEqual(target.read_text(), _PLANTED)
 
-    def test_plants_over_a_report_an_earlier_run_left(self):
+    def test_keeps_a_report_an_earlier_run_left(self):
         self.report.write_text(_PLANTED)
         result = self._run(_CREATE)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kept", result.stdout)
         self.assertEqual(self.report.read_text(), _PLANTED)
 
     def test_refuses_without_exactly_one_sandbox_pod(self):

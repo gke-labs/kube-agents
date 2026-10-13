@@ -18,10 +18,10 @@ name: The first-install hello says the first look is done when the report is rea
 # it is.
 #
 # Isolation class: read-only on the cluster. It plants INVENTORY.md on the
-# shell sandbox and the seam's request in the agent pod, and refuses an install
-# whose sandbox already holds a report it did not plant or where a person is
-# waiting on one. The destroy removes the request, and the report while it
-# still holds the planted text.
+# shell sandbox, unless a report is already there, and the seam's request in
+# the agent pod. Until onboarding has delivered, it refuses an install where a
+# person is waiting on the report or a ranking card is filed. The destroy
+# removes the request, and the report while it still holds the planted text.
 
 fixtures: []
 

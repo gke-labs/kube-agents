@@ -39,11 +39,12 @@
 # With variant from_report the plugin picks the greeting with the opening
 # turn's own check for the ranked report, so this stack also plants
 # INVENTORY.md on the shell sandbox's data volume, where the ranking worker
-# writes it, before it writes the request. The apply refuses when the sandbox
-# already holds a report, which is not this case's to plant over or remove, and
-# when a person has connected and onboarding has not delivered, since the
-# delivery stage would then post the planted file to them. Destroy removes the
-# file only while it still holds what this stack planted. A person's first chat
+# writes it, before it writes the request. Until onboarding has delivered, the
+# apply refuses an install where a person has connected, since the delivery
+# stage would post the planted file to them, and one whose hand-off has filed a
+# ranking card, whose worker would take the planted file for its own report. A
+# report already there is left as it is and read by the plugin. Destroy removes
+# the file only while it still holds what this stack planted. A person's first chat
 # on the install during the case would also find the planted report, so run it
 # on an eval install nobody chats with. The other variants plant nothing else.
 
@@ -127,34 +128,45 @@ resource "null_resource" "planted_report" {
       in_sandbox=(kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" --)
 
       # One read that has to answer `clear`, so a failed exec refuses rather
-      # than reading as "no marker".
+      # than reading as "no marker". Until onboarding has delivered, a person
+      # who has connected would be sent the planted report, and a ranking card
+      # the hand-off filed would find it, take it for its own and write none.
       state="$(kubectl exec -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" -c "${var.agent_container}" -- sh -c \
-        'home="$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}"; if [ -e "$home/.user_aligned" ] && [ ! -e "$home/.bootstrap_completed" ]; then echo waiting; else echo clear; fi' </dev/null || true)"
-      if [ "$state" != clear ]; then
-        echo "ERROR: a person has connected and onboarding has not delivered its report (read: $${state:-nothing}). The delivery stage would post the planted report to them." >&2
-        exit 1
-      fi
-
-      # A file holding this stack's own text is one an earlier run left, by a
-      # destroy that did not finish or an apply killed after the rename; it is
-      # planted over and removed with this run's.
-      present="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
-        'planted="$(base64 -d)"; if ${local.report_absent}; then echo absent; elif ${local.report_ours}; then echo ours; else echo other; fi' \
-        sh "$REPORT_PATH")"
-      case "$present" in
-        absent | ours) ;;
+        'home="$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}"; if [ -e "$home/.bootstrap_completed" ]; then echo clear; elif [ -e "$home/.user_aligned" ]; then echo waiting; else card="$(sed -n -E "s/(^|.*[[:space:]])task_id[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\2/p" "$home/.bootstrap_handoff_filed" 2>/dev/null | head -n 1)"; if [ -n "$card" ] && [ "$card" != none ]; then echo ranking; else echo clear; fi; fi' </dev/null || true)"
+      case "$state" in
+        clear) ;;
+        waiting)
+          echo "ERROR: a person has connected and onboarding has not delivered its report. The delivery stage would post the planted report to them." >&2
+          exit 1
+          ;;
+        ranking)
+          echo "ERROR: the onboarding hand-off has filed a ranking card and onboarding has not delivered. Its worker would find the planted report, take it for its own and write none." >&2
+          exit 1
+          ;;
         *)
-          echo "ERROR: $REPORT_PATH is already on $sandbox_pod and was not planted by this stack (read: $${present:-nothing}). It is not this case's to replace or remove." >&2
+          echo "ERROR: could not read the onboarding state in ${var.agent_container} (read: $${state:-nothing})." >&2
           exit 1
           ;;
       esac
 
-      # Owned as the data volume is, so the plugin's read as the terminal's
-      # login can open it.
-      printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
-        'base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$(dirname "$1")")" "$1.tmp" && chmod 0644 "$1.tmp" && mv -f "$1.tmp" "$1"' \
-        sh "$REPORT_PATH"
-      echo "Planted $REPORT_PATH on $sandbox_pod."
+      # One remote step, so nothing lands between the check and the write: the
+      # link fails rather than replace a report that appeared meanwhile. A file
+      # holding this stack's own text is one an earlier run left and is kept. A
+      # report the stack did not plant is read by the plugin as it is, and this
+      # run plants and removes nothing. The copy is owned as the data volume is,
+      # so the plugin's read as the terminal's login can open it.
+      result="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
+        'b64="$(cat)"; planted="$(printf "%s" "$b64" | base64 -d)"; if ${local.report_ours}; then echo ours; elif ! { ${local.report_absent}; }; then echo other; elif printf "%s" "$b64" | base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$(dirname "$1")")" "$1.tmp" && chmod 0644 "$1.tmp" && ln "$1.tmp" "$1"; then rm -f "$1.tmp"; echo planted; else rm -f "$1.tmp"; echo raced; fi' \
+        sh "$REPORT_PATH")"
+      case "$result" in
+        planted) echo "Planted $REPORT_PATH on $sandbox_pod." ;;
+        ours) echo "$REPORT_PATH on $sandbox_pod already holds this stack's text; kept, and the destroy removes it." ;;
+        other) echo "$REPORT_PATH is already on $sandbox_pod; the plugin reads it, and this run plants and removes nothing." ;;
+        *)
+          echo "ERROR: could not plant $REPORT_PATH on $sandbox_pod (read: $${result:-nothing}); a report may have appeared during the write." >&2
+          exit 1
+          ;;
+      esac
     EOT
   }
 
