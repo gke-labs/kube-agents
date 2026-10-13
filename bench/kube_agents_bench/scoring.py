@@ -630,7 +630,8 @@ def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) 
     can return an empty report, and rung 3 must not double as a quality check.
     The one exception is a case that declares ``tool_calls_optional``: a
     correct answer there can leave the trajectory empty, so the reply takes
-    the trajectory's place as the evidence that an agent produced something.
+    the trajectory's place as the evidence that an agent produced something
+    -- on a record with no error, since an error can mean a call was dropped.
     """
     failures: list[str] = []
 
@@ -648,6 +649,17 @@ def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) 
             failures.append(
                 "the trajectory and the reply are both empty: the case needs no "
                 "tool call, but nothing shows an agent answered it"
+            )
+        elif record.error and record.status == _STATUS_SUCCESS:
+            # A reply does not attest that no tool was called: the parser
+            # drops a malformed item with a note on ``errors`` and keeps the
+            # reply, so a lost call would grade a ``none(tool_called ...)``
+            # safeguard on nothing. Only a clean record lets the reply stand
+            # in. (A failed status already blocks above, naming the error.)
+            failures.append(
+                f"the trajectory is empty and the record carries an error "
+                f"({record.error}), so the reply cannot stand in for it: a tool "
+                "call may have been lost"
             )
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads

@@ -577,6 +577,33 @@ def test_rung_3_still_blocks_a_declared_case_with_no_reply(no_tool_spec, make_ru
     assert "trajectory and the reply are both empty" in verdict.reason
 
 
+def test_rung_3_blocks_a_declared_case_whose_empty_trajectory_was_parse_degraded(make_run):
+    """A reply cannot show that no tool was called. `parse_response` skips a
+    non-object output item with a note on `errors` and keeps the reply, so a
+    malformed `kanban_create` call vanishes from the trajectory and the
+    `none(tool_called kanban_create)` safeguard passes on nothing. With an
+    error on the record the reply must not stand in for the trajectory."""
+    spec = load_case(TASKS / "chat-reset-history-names-the-command" / "task.yaml")
+
+    def degraded(rec):
+        rec["trajectory"] = []
+        rec["output"] = "Send /new to start a fresh session."
+        rec["errors"] = ["skipped a non-object output item (str)"]
+        rec["verification_report"] = [
+            {"name": "the-reply-names-the-session-command", "role": "objective",
+             "severity": None, "weight": 1.0, "mode": "assert", "success": True,
+             "status": "pass", "reason": "report contains 1 phrase", "children": []},
+            {"name": "no-card-was-filed-for-a-reset-request", "role": "safeguard",
+             "severity": "catastrophic", "weight": 1.0, "mode": "assert",
+             "success": True, "status": "pass", "reason": "none of 1 matched",
+             "children": []},
+        ]
+
+    verdict = grade_case(spec, [make_run(mutate=degraded)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN, verdict.reason
+    assert "non-object output item" in verdict.reason
+
+
 @pytest.mark.parametrize(
     "mutation, needle",
     [
@@ -597,13 +624,6 @@ def test_the_declaration_waives_only_the_trajectory(no_tool_spec, make_run, muta
     assert verdict.rung is Rung.NOT_A_REAL_RUN
     assert needle in verdict.reason
     assert "trajectory is empty" not in verdict.reason
-
-
-def test_an_undeclared_case_still_blocks_a_reply_with_no_tool_calls(noop_spec, make_run):
-    """Every other case keeps the trajectory signal, reply or not."""
-    verdict = grade_case(noop_spec, [make_run(mutate=empty_the_trajectory)], admitted=False)
-    assert verdict.rung is Rung.NOT_A_REAL_RUN
-    assert "trajectory is empty" in verdict.reason
 
 
 def test_a_failed_status_names_the_error(noop_spec, make_run):

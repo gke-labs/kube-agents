@@ -117,8 +117,8 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
 first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
-trajectory as no agent having run; with the key set, a non-empty reply stands in for the
-trajectory, and the token, latency and status signals still apply
+trajectory as no agent having run; with the key set, a non-empty reply on a record with no error
+stands in for the trajectory, and the token, latency and status signals still apply
 ([`eval-scorer.md`](eval-scorer.md)). It does not forbid tool calls. It defaults to `false`, must be
 a bare YAML boolean, and devops-bench ignores it.
 
