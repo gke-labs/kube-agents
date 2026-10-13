@@ -138,6 +138,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     ],
     "Manifests and remediation": [
         "gcp-config-connector",
+        "gitops-helm-chart",
         "gke-manifest-generation",
         "submit-suggestion",
     ],

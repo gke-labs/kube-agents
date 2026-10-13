@@ -24,6 +24,11 @@ gitops-repo/
   targeted files (never `git add .`) → Conventional Commit → PR.
 - **Apply:** on merge, the **customer's CI/CD** applies changed paths — `kubectl apply` for K8s/KCC
   YAML, `terraform apply` for HCL. kube-agents never calls cluster/cloud APIs directly.
+- **Third-party Helm charts** are declared, never installed: the Platform Agent's
+  [`gitops-helm-chart` skill](../../agents/platform/skills/gitops-helm-chart/SKILL.md) writes an Argo CD
+  `Application`, a Flux `HelmRelease`, a Config Sync `RootSync` or kustomize `helmCharts`, whichever
+  already syncs the target cluster. A pipeline that only runs `kubectl apply`, like the one sketched
+  here, renders no chart, so on it the agent stops and says so instead of opening a pull request.
 - **Review gate:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/namespaces/**`,
   `**/policy/**`, `knowledge/**` and `.kube-agents/**` require human review (see `CODEOWNERS.example` —
   copy to `CODEOWNERS` and fill in real teams when forking) + the security review gate (06 §7).
