@@ -19,7 +19,9 @@
 # channel posts the turn's words, which is the red.
 #
 # It needs a chat platform: on an install with none the route posts nothing and
-# the verifier fails naming the route's 502.
+# the verifier fails naming the route's 502. No CI install has one, so the case
+# is a reviewed KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py and
+# runs by hand against a chat install.
 #
 # The conversation is not what is graded. Its prompt asks for one roster read
 # (a tool call, so the run has a trajectory) and nothing that touches the board,

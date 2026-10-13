@@ -2844,11 +2844,12 @@ def _send_to_chat(
     return chat_notify.thread_from_response(active_platform, resp) or None
 
 
-# Tokens that end a turn or open a role in a chat template. None of them has a
-# legitimate place in a Kubernetes report, so neutralising them costs nothing --
-# unlike the markdown-shaped patterns platform_mcp_server.py's _neutralize_tokens
-# also rewrites (`### System:`, `[INST]`), which a report about system components
-# can plausibly contain and which would be mangled in the user's own channel.
+# Tokens that end a turn or open a role in a chat template, neutralised in the
+# caller-supplied fields of a drift card (:func:`_defang_drift_field`). None of
+# them has a legitimate place in a Kubernetes object, unlike the markdown-shaped
+# patterns platform_mcp_server.py's _neutralize_tokens also rewrites
+# (`### System:`, `[INST]`). incident_context lists the same tokens for the
+# replay of a stored report.
 _CONTROL_TOKEN_RE = re.compile(r"<\|(?:im_start|im_end|endoftext|system|user|assistant)\|>", re.IGNORECASE)
 
 
@@ -3121,7 +3122,7 @@ def relay_cron_report(
     report: str,
     truncation_notice: str = "",
     also_delivered_to: Sequence[str] = (),
-) -> tuple[str | None, str, list[str]]:
+) -> tuple[str | None, list[str]]:
     """Post a specialist's finished report to chat, as the specialist wrote it.
 
     The report goes to every platform :func:`enabled_chat_platforms` names, each
@@ -3153,7 +3154,7 @@ def relay_cron_report(
     process's environment, would subtract a leg the scheduler never sent and
     leave that channel with nothing at all.
 
-    Returns `(error, degraded, undelivered)`. `error` is None when the report
+    Returns `(error, undelivered)`. `error` is None when the report
     reached at least one chat platform, else a short description of what went
     wrong; the caller turns that into a non-2xx and the string ends up in the
     job's `last_delivery_error` — see :func:`submit_cron_report`.
@@ -3167,11 +3168,6 @@ def relay_cron_report(
     writes it to `last_delivery_error`. Platforms subtracted by
     `also_delivered_to` are not in it: the scheduler is posting there itself, so
     they are skipped rather than missed.
-
-    `degraded` is always empty. It named why a report went out raw when the Chat
-    Agent's turn over it failed, and there is no turn any more; the field stays
-    in the return and in the route's `relay_detail` so the relay plugin,
-    `platform_mcp_server` and `chat_delivery_watch` read it unchanged.
 
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line
@@ -3215,7 +3211,6 @@ def relay_cron_report(
 
     _ensure_session_row(session_id, profile, job_id, title)
 
-    degraded = ""
     # The headline reads the report without the notice, which is not the
     # report's line.
     message = truncation_notice + report
@@ -3293,9 +3288,9 @@ def relay_cron_report(
     undelivered = [p for p in platforms if p not in threads and p not in unthreaded]
     if not threads:
         if unthreaded:
-            return None, degraded, undelivered
-        # chat_delivery_watch and feedback_prompt match on this wording.
-        return f"composed but not delivered to {', '.join(platforms)}", degraded, undelivered
+            return None, undelivered
+        # chat_delivery_watch's HARD_UNDELIVERED_RE matches on this wording.
+        return f"composed but not delivered to {', '.join(platforms)}", undelivered
 
     # Register every leg that landed, so each keeps its own thread for the rest
     # of the day. Order matters: the owner goes last, because the top-level
@@ -3337,7 +3332,7 @@ def relay_cron_report(
             f"Relay for {profile}/{job_id}: delivered to {', '.join(threads)} but not to "
             f"{', '.join(undelivered)}"
         )
-    return None, degraded, undelivered
+    return None, undelivered
 
 
 @app.post("/v1/cron-reports", dependencies=[Depends(verify_api_key)])
@@ -3393,7 +3388,7 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     session_id = _cron_report_session_id(profile, job_id, day)
 
     try:
-        error, degraded, undelivered = relay_cron_report(
+        error, undelivered = relay_cron_report(
             session_id, profile, job_id, title, report, truncation_notice, also_delivered_to
         )
     except Exception as exc:  # never leak a stack trace into last_delivery_error
@@ -3402,11 +3397,9 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
     # 200, because the report is in the channel and the run did its job. `relay`
-    # is what tells the scheduler which of the two deliveries it got, so a job
-    # whose front door has been down all week is visible without reading logs.
-    # `relay_detail` says *why* it degraded, so no consumer has to hardcode a
-    # sentence about a cause it cannot see; `relay` stays a two-value verdict so
-    # the callers that only branch on it need no change at all.
+    # and `relay_detail` reported a degraded delivery, which only a failed Chat
+    # Agent turn produced; no turn runs now, so they always read ok, and they
+    # stay because the relay plugin and platform_mcp_server read them.
     # `undelivered` is a separate idea one platform down: a fan-out that reached
     # one audience and missed another is a delivery, and still something the run
     # record has to carry. It is a list of names and `relay_detail` never repeats
@@ -3417,8 +3410,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     return {
         "status": "delivered",
         "session_id": session_id,
-        "relay": "degraded" if degraded else "ok",
-        "relay_detail": degraded,
+        "relay": "ok",
+        "relay_detail": "",
         "undelivered": ",".join(undelivered),
         "truncated": "true" if truncation_notice else "",
     }

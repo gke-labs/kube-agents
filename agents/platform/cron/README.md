@@ -323,8 +323,9 @@ agent handing out both when asked. `feedback_prompt.py` is the one place the
 product asks, and it does so once per install: a fixed message in the home
 chat channel carrying the form's short link, the form's disclosure that a
 submission becomes a public issue, and a line saying a reply in the thread
-reaches the agent. `deliver: "chat"` is what makes that last line true; the
-Chat Agent posts the message and owns the thread.
+reaches the agent. `deliver: "chat"` is what makes that last line true: the
+relay stores the message against its thread, so a reply there reaches the Chat
+Agent with it attached.
 
 It is a daily cron entry that fires once, not a Hermes one-shot, and the
 reason is this roster's merge. A shipped entry cannot carry an absolute
@@ -422,7 +423,7 @@ with the run still recording `ok`. `check_cron_delivery` in
 `CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
 the typo fails the pull request instead.
 
-## `deliver: "chat"` — reporting through the Chat Agent
+## `deliver: "chat"` — reports the Chat Agent can answer for
 
 `"all"` gets the words into a channel. It does not make them answerable: the
 process that produced them has exited, and the Chat Agent — which is who the
@@ -433,8 +434,9 @@ where that leaves it another platform to post to; on an install where the cron
 child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
-`deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
-it and thereby owns the thread the user replies in. It is a delivery mode, not a
+`deliver: "chat"` hands the run's report to the relay instead, which posts it as
+written and stores it against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.

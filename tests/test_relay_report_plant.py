@@ -85,9 +85,11 @@ class RelayProbeTest(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         self.report = (STACK / "report.txt").read_text()
+        self.kv_db = root / "session_kv.db"
 
     def probe(self, *args, key=KEY):
         env = {k: v for k, v in os.environ.items() if k != "SESSION_KV_API_KEY"}
+        env["SESSION_KV_DB_PATH"] = str(self.kv_db)
         if key:
             env["SESSION_KV_API_KEY"] = key
         return subprocess.run(
@@ -145,6 +147,28 @@ class RelayProbeTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse((self.home / ".bench-relay-probe.json").exists())
         self.assertEqual(self.archived.read_text().split(), ["kanban", "archive", "t_mine"])
+
+    def test_clean_drops_the_probe_from_the_report_index_and_nothing_else(self):
+        """A probe row left behind is listed beside every unthreaded message for a day."""
+        mine = {"platform_threads": {"google_chat": {"chat_id": "spaces/A", "thread_id": "spaces/A/threads/P"}}}
+        other = {"platform_threads": {"google_chat": {"chat_id": "spaces/A", "thread_id": "spaces/A/threads/O"}}}
+        with sqlite3.connect(self.kv_db) as con:
+            con.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+            con.execute("CREATE TABLE incidents (chat_id TEXT, thread_id TEXT, report TEXT)")
+            con.execute("INSERT INTO session_metadata VALUES (?, ?)", ("cron-platform-bench-relay-probe-20261013", json.dumps(mine)))
+            con.execute("INSERT INTO session_metadata VALUES (?, ?)", ("cron-platform-stall-watch-20261013", json.dumps(other)))
+            con.execute("INSERT INTO incidents VALUES ('spaces/A', 'spaces/A/threads/P', 'probe report')")
+            con.execute("INSERT INTO incidents VALUES ('spaces/A', 'spaces/A/threads/O', 'real report')")
+
+        done = self.probe("clean")
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with sqlite3.connect(self.kv_db) as con:
+            self.assertEqual(
+                [r[0] for r in con.execute("SELECT session_id FROM session_metadata")],
+                ["cron-platform-stall-watch-20261013"],
+            )
+            self.assertEqual([r[0] for r in con.execute("SELECT report FROM incidents")], ["real report"])
 
     def test_a_clean_with_nothing_posted_succeeds(self):
         done = self.probe("clean")

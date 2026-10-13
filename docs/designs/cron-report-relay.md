@@ -166,8 +166,9 @@ in practice and for what it did not provide:
 - **Its work went nowhere.** A card filed from the turn is subscribed to the
   turn's own API session. `kanban_event_routing` re-addresses a subscription to a
   chat thread only when the session's routing row names one, and the turn ran
-  before the post that registers it, so all three cards' results were delivered
-  back into a session no one reads.
+  before the post that registers it, so the results of the three cards the
+  2026-10-08 cost report's turns filed were delivered back into a session no one
+  reads.
 - **The report was its input.** The report quotes third-party text (see
   [The report is untrusted input](#the-report-is-untrusted-input)), and the turn
   read it with the `kanban` toolset in reach. The gateway API has no per-request
@@ -180,7 +181,7 @@ in practice and for what it did not provide:
 Platform formatting was never the turn's either: the instructions told it to keep
 the report's markdown, and the adapters render it for each platform on the send.
 
-### Which key the loopback call presents
+## Which key the loopback call presents
 
 The relay no longer calls the gateway; the event-triage path
 (`trigger_agent_troubleshooter`) still does, and this is why it presents the key
@@ -483,20 +484,20 @@ audience and the operator cannot tell which; a report going somewhere unintended
 is visible and correctable, and a report going nowhere was not. An install that
 wants one destination should enable one platform.
 
-Each leg keeps its own thread. A thread id is platform-local, so the session row
+Each leg keeps its own thread. A thread id is platform-local, so the routing row
 carries `platform_threads` — one `(chat_id, thread_id)` per platform — and every
 leg replays only its own. Keeping a single address instead is how a leg that
 failed once stayed unthreaded for the rest of the day: the next report found the
 row naming another platform, posted a fresh top-level message, and did it again
 on every run. The top-level `platform`/`chat_id`/`thread_id` triple still holds
 one address, because the event-triage card has one destination; it goes to the
-leg the session was already routed to, or to the first that landed.
+leg the row was already routed to, or to the first that landed.
 
 An incident row is stored for every leg that landed **on that run**, so a reply
 in any channel the report reached replays it. Storing only one left a reply in
 the other channel answered by an agent that had never seen the report. The
 qualifier is load-bearing in the other direction: `platform_threads` is additive
-and never pruned, and the session id is per job per UTC day, so the map also
+and never pruned, and the routing id is per job per UTC day, so the map also
 holds legs that landed earlier today and failed just now. Writing a row for one
 of those would overwrite that channel's stored context with a report it never
 received, and the store is `INSERT OR REPLACE` on `(chat_id, thread_id)`, so the
@@ -695,8 +696,9 @@ and a silent run, recognised from the job's newest file under `cron/output/`,
 moves the high-water mark and changes nothing else. Failures are graded from the
 strings this design produces: `hard` when the report reached no platform (a 502,
 an unreachable relay, no key), `partial` when it landed somewhere but not on the
-platforms the `undelivered` field names, `degraded` when it posted but the Chat
-Agent's turn failed. The scheduler's own two failures, a platform named in
+platforms the `undelivered` field names, `degraded` when it posted but the relay
+said the delivery degraded (only a route that still ran a Chat Agent turn over
+the report did; the grade stays for a cause the route may name later). The scheduler's own two failures, a platform named in
 `deliver` that is not enabled and a `deliver` that resolved to no target, also
 grade `hard`: nothing was delivered either way. A run the scheduler recorded as
 anything but `ok` and that saved no document (interrupted by a gateway shutdown,

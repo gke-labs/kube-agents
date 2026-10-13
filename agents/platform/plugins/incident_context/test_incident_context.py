@@ -202,6 +202,18 @@ class UntrustedReportFramingTest(unittest.TestCase):
         # Exactly one notice reaches the model, and it is the one this hook wrote.
         self.assertEqual(text.count("[SECURITY NOTICE:"), 1)
 
+    def test_every_chat_template_token_a_relayed_report_can_carry_is_scrubbed(self):
+        """A relayed report is stored as the job wrote it, so this hop is its only scrub.
+
+        Audit evidence quotes annotations and event text verbatim; a template that
+        parses special tokens in text would read these as turn boundaries.
+        """
+        tokens = ("<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|system|>", "<|user|>", "<|assistant|>")
+        text = self.frame("annotation: " + " ".join(t.upper() if i % 2 else t for i, t in enumerate(tokens)))
+        body = text.split("<untrusted_report>\n", 1)[1].split("\n</untrusted_report>", 1)[0]
+        for token in tokens:
+            self.assertNotIn(token, body.lower(), f"{token!r} survived into the fenced body")
+
     def test_one_changed_letter_does_not_get_a_token_through(self):
         """The scrub is case-insensitive, and that is what makes it a scrub.
 

@@ -174,7 +174,7 @@ class SessionKVCallersTest(unittest.TestCase):
                 mock.patch.object(skv, "_send_to_chat", return_value=skv.ALERT_SENT_WITHOUT_THREAD), \
                 self.assertLogs(skv.logger, level="WARNING") as logs:
             result = skv.relay_cron_report("sess", "audit", "job", "Audit", "report")
-        self.assertEqual(result, (None, "", []))
+        self.assertEqual(result, (None, []))
         self.assertFalse([line for line in logs.output if "not delivered" in line], logs.output)
         self.assertTrue([line for line in logs.output if "treated as delivered" in line], logs.output)
 

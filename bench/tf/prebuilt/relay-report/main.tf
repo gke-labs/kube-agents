@@ -32,7 +32,8 @@
 # On an install with a chat platform the report is posted to the home channel.
 #
 # The teardown, and the exit trap on a failed apply, archive any card filed from
-# the probe's relay sessions and remove the state file.
+# the probe's relay sessions, delete the probe's routing rows and stored posts,
+# and remove the state file.
 
 terraform {
   required_version = ">= 1.5.0"

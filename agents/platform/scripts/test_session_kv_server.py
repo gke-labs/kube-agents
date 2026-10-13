@@ -3162,13 +3162,13 @@ class TestRelayReachesEveryEnabledPlatform(unittest.TestCase):
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0], 1)
 
-    def test_a_failed_leg_says_which_leg_and_does_not_claim_a_failed_turn(self):
+    def test_a_failed_leg_says_which_leg_and_does_not_claim_a_degraded_relay(self):
         """A bare `degraded` sent the reader looking for the wrong thing.
 
-        Both consumers of the verdict printed one hardcoded sentence — "the Chat
-        Agent turn failed, so the channel has the raw text marked [unrelayed]".
-        Here the turn succeeded and Slack has a properly composed report; what is
-        wrong is that Google Chat has nothing. An operator handed that sentence
+        Both consumers of the verdict once printed one hardcoded sentence — "the
+        Chat Agent turn failed, so the channel has the raw text marked
+        [unrelayed]". Here Slack has the report; what is wrong is that Google
+        Chat has nothing. An operator handed that sentence
         greps two channels for a marker neither of them contains and never learns
         which one is missing the report.
 
@@ -3433,7 +3433,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
     The channel message is the headline, built from the ledger issue the report
     ends with and linking it; nothing follows it in its thread, and the full
     report is what the incident row stores. Flag off, every leg posts the
-    composed message exactly as before.
+    report exactly as before.
     """
 
     SLACK_THREAD = "1712345678.000100"
@@ -3510,7 +3510,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         with sqlite3.connect(temp_db_path) as conn:
             return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
 
-    def test_flag_off_posts_the_composed_message_unchanged(self):
+    def test_flag_off_posts_the_report_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "false"
         response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
@@ -3801,7 +3801,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(session_kv_server.CRON_RELAY_CALLER_TIMEOUT_S, caller_timeout)
         self.assertLessEqual(session_kv_server.CRON_RELAY_POSTS_BUDGET_S, caller_timeout / 2)
 
-    def test_a_turn_that_spent_the_posts_budget_posts_the_composed_message_once(self):
+    def test_a_spent_posts_budget_posts_the_report_once(self):
         # Past the budget nothing waits on the ledger, Block Kit or a thread post.
         self._blocks_on()
         response, calls = self._post_at(session_kv_server.CRON_RELAY_POSTS_BUDGET_S + 1, lambda *a, **k: self.BLOCKS_TS)
@@ -3825,7 +3825,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(len(self.posts), 1)
         self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
 
-    def test_too_little_time_for_the_ledger_posts_the_composed_message(self):
+    def test_too_little_time_for_the_ledger_posts_the_report(self):
         self._blocks_on()
         left = session_kv_server.AUDIT_HEADLINE_MIN_LEFT_S - 1
         response, calls = self._post_at(session_kv_server.CRON_RELAY_POSTS_BUDGET_S - left, lambda *a, **k: self.BLOCKS_TS)
@@ -3878,8 +3878,7 @@ class TestCronReportLabelSanitisation(unittest.TestCase):
     """`job_id`, `profile` and `title` are caller-supplied, not server-written.
 
     They come off the specialist model's `report_to_chat` arguments, and they
-    reach two places this design treats as trusted: the relay turn's ephemeral
-    system prompt, above the SECURITY NOTICE, and `_index_text`, which replays
+    reach a place this design treats as trusted: `_index_text`, which replays
     them unfenced into every unthreaded message for 24 hours.
     """
 

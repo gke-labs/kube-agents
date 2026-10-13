@@ -24,8 +24,10 @@ carries the SESSION_KV_API_KEY the route requires. Exits 0 whatever the route
 answered: the answer is the verifier's to grade.
 
 clean: archives every card filed from the probe's relay sessions (an image that runs
-an agent turn over the report can file one) and removes the state file. Safe to run
-with nothing posted. The post itself stays in the channel.
+an agent turn over the report can file one), deletes the probe's routing rows and the
+text stored for their threads, so the probe drops out of the 24-hour report index that
+incident_context shows beside unthreaded messages, and removes the state file. Safe to
+run with nothing posted. The post itself stays in the channel.
 """
 
 import base64
@@ -44,6 +46,8 @@ JOB_ID = "bench-relay-probe"
 PROFILE = "platform"
 TITLE = "Bench relay probe"
 KANBAN_DB = os.path.join(home, "kanban.db")
+# session_kv_server.py: SESSION_KV_DB_PATH, which the container's environment carries.
+SESSION_KV_DB = os.environ.get("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 # session_kv_server._cron_report_session_id, for this profile and job.
 SESSION_PREFIX = f"cron-{PROFILE}-{JOB_ID}-"
 # The relay plugin's RELAY_TIMEOUT_SECONDS, plus room for the connect.
@@ -94,11 +98,24 @@ def clean():
         con.close()
     for card in cards:
         subprocess.run([hermes, "kanban", "archive", card], capture_output=True, text=True, check=False)
+    rows = 0
+    if os.path.exists(SESSION_KV_DB):
+        with sqlite3.connect(SESSION_KV_DB, timeout=SQLITE_BUSY_TIMEOUT) as con:
+            routed = con.execute(
+                "SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ?", (SESSION_PREFIX + "%",)
+            ).fetchall()
+            for session_id, blob in routed:
+                for entry in (json.loads(blob or "{}").get("platform_threads") or {}).values():
+                    rows += con.execute(
+                        "DELETE FROM incidents WHERE chat_id = ? AND thread_id = ?",
+                        (entry.get("chat_id"), entry.get("thread_id")),
+                    ).rowcount
+                con.execute("DELETE FROM session_metadata WHERE session_id = ?", (session_id,))
     try:
         os.remove(STATE)
     except FileNotFoundError:
         pass
-    print(f"cleaned: {len(cards)} card(s) archived")
+    print(f"cleaned: {len(cards)} card(s) archived, {rows} stored post(s) removed")
 
 
 if mode == "post":

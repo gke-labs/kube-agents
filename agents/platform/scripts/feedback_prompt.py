@@ -2,8 +2,8 @@
 """One feedback request per install, a week after the job first runs.
 
 Backs the ``feedback-prompt`` cron job, which runs with ``no_agent: true`` and
-``deliver: "chat"``: whatever this prints is handed to the Chat Agent to post in
-the install's home channel, and printing nothing relays nothing. Every feedback
+``deliver: "chat"``: whatever this prints is posted in the install's home
+channel by the relay, and printing nothing relays nothing. Every feedback
 channel kube-agents has is reporter-initiated; this is the one place the product
 asks.
 
@@ -37,9 +37,9 @@ channel nothing takes it back; a post the scheduler recorded as undelivered
 bound yet) is a lost request, which the ledger ``chat-delivery-watch`` keeps
 names like any other failed delivery, and which an operator sends again by
 removing ``.feedback_prompt_sent`` from the profile home: the next tick claims
-afresh. At most once is the direction the job fails in. One Chat Agent
-composition is all it ever costs, on the one tick that prints; every other
-tick prints nothing and relays nothing.
+afresh. At most once is the direction the job fails in. One post is all it
+ever costs, on the one tick that prints; every other tick prints nothing and
+relays nothing.
 
 Both markers live on the data volume, which survives pod restarts and image
 rolls and is deleted only by an uninstall. That is what makes an upgrade not

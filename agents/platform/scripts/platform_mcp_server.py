@@ -1060,15 +1060,15 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # fan-out that reached some platforms and not others, and says which in
     # `relay` and `undelivered`. Reading both here is the difference between the
     # agent knowing what actually happened to its report and it believing the
-    # Chat Agent framed it for everyone. The relay adapter — the other caller of
+    # report reached everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
     #
     # `relay_detail` is the route's own wording for the degradation, so this
-    # end stops hard-coding it: `degraded` has one cause today (the Chat Agent
-    # turn did not compose the report; a leg that never landed keeps `relay:
-    # ok` and shows up in `undelivered` instead). Older routes do not send it;
-    # the sentence they used to get is the fallback.
+    # end does not hard-code it. A current route never sends `degraded`; an
+    # older one did when its Chat Agent turn over the report failed, and its
+    # sentence is the fallback for a route too old to send a detail. A leg that
+    # never landed keeps `relay: ok` and shows up in `undelivered` instead.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":

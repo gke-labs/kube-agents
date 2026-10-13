@@ -1,4 +1,4 @@
-"""``deliver: "chat"`` — hand a cron job's report to the Chat Agent.
+"""``deliver: "chat"`` — hand a cron job's report to the chat relay.
 
 Installed at ``/opt/hermes/plugins/platforms/chat/`` so Hermes discovers it as a
 bundled platform plugin. Nothing in the Hermes tree is edited: the scheduler
@@ -188,7 +188,7 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
     ``deliver`` takes a list, and the relay is one entry in it. ``deliver:
     "chat"`` is relay-only and this returns nothing; ``deliver: "all"`` also
     posts the raw report to every home channel, so unless the relay is told, its
-    fan-out puts a second, composed copy in each of those channels. The route
+    fan-out puts a second copy in each of those channels. The route
     subtracts what this names — see ``relay_cron_report``.
 
     Answered here rather than on the server because this process is the one that
@@ -286,7 +286,7 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
         # does not address cannot get a duplicate from it, so such a part is
         # not a sibling. Reading the part whole was wrong the other way:
         # `slack:D…` matched no platform, and a job delivering to the home
-        # channel by its id got the composed copy on top of the raw one.
+        # channel by its id got the relay's copy on top of the scheduler's.
         if has_id and rest.split(":", 1)[0].strip() != home_channel:
             continue
         handled.add(name)
@@ -375,11 +375,11 @@ def _relay_receipt(response) -> dict:
     The whole body comes back rather than one field off it because the caller
     reads three, and a tuple carrying some of them is one the two ends have to
     keep in step. ``relay_detail`` is the route's own wording for why ``relay``
-    is ``degraded`` -- one cause today, a Chat Agent turn that did not compose
-    the report -- carried so that this end stops hard-coding that sentence and
-    a second cause can land in the route without a client change. A route too
-    old to send it leaves the field absent, and the caller falls back to the
-    sentence it used to print unconditionally.
+    is ``degraded``, carried so that a cause can land in the route without a
+    client change. The only cause there was, a Chat Agent turn over the report
+    that failed, went with the turn; a current route always answers ``ok``. A
+    route too old to send the field leaves it absent, and the caller falls back
+    to the sentence that older route meant.
     """
     try:
         body = json.loads(response.read().decode("utf-8", "replace"))
@@ -431,7 +431,7 @@ async def standalone_send(
     media_files: Optional[list] = None,
     force_document: bool = False,
 ) -> dict:
-    """POST one finished report to the Chat Agent relay.
+    """POST one finished report to the chat relay.
 
     Called by ``tools/send_message_tool._send_via_adapter`` — the cron child has
     no in-process gateway adapter, which is precisely the case this hook exists
@@ -439,8 +439,7 @@ async def standalone_send(
 
     ``chat_id``, ``thread_id``, ``media_files`` and ``force_document`` are
     accepted for signature parity and ignored: this sender names no destination
-    at all. The route resolves them itself — one per enabled chat platform — and
-    the Chat Agent decides what its own message says.
+    at all. The route resolves them itself — one per enabled chat platform.
 
     The error strings become ``last_delivery_error``, so they name the condition
     and never the key.
@@ -468,9 +467,8 @@ async def standalone_send(
     # same error-every-ten-minutes by another name.
     #
     # :func:`is_silent_report` also covers the marker upstream lets through
-    # because a model emphasised it. Relaying that would be worse than posting
-    # it raw: the route runs a Chat Agent turn over the text, and the Chat Agent
-    # asked to relay "[SILENT]" writes a sentence about it.
+    # because a model emphasised it. The route posts what it is given, so
+    # relaying that would put a bare "**[SILENT]**" in the channel.
     if is_silent_report(report):
         logger.info(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
@@ -497,7 +495,7 @@ async def standalone_send(
         "profile": profile_name(),
         "title": title,
         "report": report,
-        # Without this the route fans the composed report out to every enabled
+        # Without this the route fans the report out to every enabled
         # platform, and `deliver: "all"` -- which posts the raw report to those
         # same platforms itself -- lands twice in each of them.
         "also_delivered_to": sibling_delivery_targets(job_id),
@@ -521,13 +519,12 @@ async def standalone_send(
     notes = []
 
     if receipt.get("relay") == "degraded":
-        # The wording comes from the route. `degraded` has one cause today --
-        # the Chat Agent turn did not compose the report and the raw text was
-        # posted instead -- and a leg that never landed is not this case: the
-        # route keeps `relay: ok` and names the platform in `undelivered`. The
-        # fallback is the sentence this end used to print unconditionally,
-        # which is right for the one cause a route too old to send a detail
-        # could have.
+        # The wording comes from the route. A current route never sends
+        # `degraded`; an older one did when its Chat Agent turn over the report
+        # failed and the raw text was posted instead, and the fallback is that
+        # route's sentence, for one too old to send a detail. A leg that never
+        # landed is not this case: the route keeps `relay: ok` and names the
+        # platform in `undelivered`.
         #
         # Bounded at `_DETAIL_MAX_CHARS`, the same ceiling as :func:`_http_error_detail`, and
         # for the same reason: this ends up inside the `error` string the
@@ -560,7 +557,7 @@ async def standalone_send(
         return {"error": message}
 
     logger.info(
-        "chat relay: report handed to the Chat Agent (job_id=%s)", job_id or "?"
+        "chat relay: report handed to the relay (job_id=%s)", job_id or "?"
     )
     return {
         "success": True,
@@ -609,10 +606,9 @@ def register(ctx) -> None:
         cron_deliver_env_var=HOME_CHANNEL_ENV,
         # Out-of-process delivery: the cron child is not the gateway.
         standalone_sender_fn=standalone_send,
-        # No chunking. The Chat Agent is composing a message from this text, not
-        # posting it; the length bound that matters is CRON_REPORT_MAX_CHARS on
+        # No chunking. The length bound that matters is CRON_REPORT_MAX_CHARS on
         # the relay route, which truncates to a single marked report rather than
-        # splitting it into pieces that each start a separate turn.
+        # splitting it into pieces that each post to the thread separately.
         max_message_length=0,
         emoji="🗣️",
         # Never offer /update from a channel that has no inbound side.

@@ -200,6 +200,14 @@ KNOWN_UNREGISTERED = {
         "#2755: stack case held out of the nightly until the infra-lock "
         "chain has room"
     ),
+    # It grades what a chat channel received, and every CI install deploys with
+    # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
+    # relay posts nowhere there and the case can only fail. Run by hand against
+    # an install with a chat platform, as for a relay change's eval loop. The
+    # entry goes when an eval lane has a chat platform.
+    "chat-relay-posts-report-as-written": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants

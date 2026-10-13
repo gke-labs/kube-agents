@@ -20,10 +20,10 @@ it hands over a model's final turn, so `deliver` behaves here as it does on the 
 
 The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
 bar the two on `"all"`. That routes the report through the
-Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
+relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
-one, so a job left on `"all"` reports twice — once flat and once through the Chat Agent. `"local"`
+one, so a job left on `"all"` reports twice — once from the scheduler and once through the relay. `"local"`
 resolves to no target and drops the report. The script still emits a bullet list rather than a
 Markdown table, which wraps badly in chat viewports.
 
