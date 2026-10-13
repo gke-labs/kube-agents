@@ -145,7 +145,11 @@ func read(c Carrier, chat []lib.Part, fallback string) Reading {
 		r.Problems = append(r.Problems, broke("parts", "%d chat messages, at most one per chunk or status message", len(chat)))
 		return r
 	}
-	m, err := Parse(chat[0].Data)
+	parse := Parse
+	if c == Terminal {
+		parse = ParseMark
+	}
+	m, err := parse(chat[0].Data)
 	if err != nil {
 		r.Problems = append(r.Problems, err)
 		return r

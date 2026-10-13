@@ -38,9 +38,6 @@ on:
       # This job runs `make -C k8s-operator envtest-path`, so it depends on
       # that Makefile as surely as on its own sources.
       - "k8s-operator/Makefile"
-      # lib/chatmsg validates every shared chat case, so a case-only change
-      # has to run it.
-      - "tests/conformance/chat/**"
       # cmd/session-persona's tests read these from outside the module: the
       # cluster skills the worker image ships a session copy of, and the
       # broker policy the session's read tables must stay a subset of. An
@@ -48,6 +45,9 @@ on:
       - "agents/cluster/skills/**"
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
+      # lib/chatmsg validates every shared chat case, so a case-only change
+      # has to run it.
+      - "tests/conformance/chat/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -81,10 +81,10 @@ jobs:
               - "a2a/**"
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
-              - "tests/conformance/chat/**"
               - "agents/cluster/skills/**"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
+              - "tests/conformance/chat/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'
