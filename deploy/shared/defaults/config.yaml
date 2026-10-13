@@ -142,6 +142,11 @@ mcp_servers:
     #   - deploy/docker/merge_configs.py unions this list with the platform
     #     overlay's, so a write tool added to either copy reaches the Platform
     #     Agent.
+    #   - A cluster profile already on the volume gets this key at the next pod
+    #     start if it has none (the entrypoint's fill-only back-fill), but keeps
+    #     the list it holds when a later image changes it, the way it keeps
+    #     `args`. Narrowing the list needs an in-place repair like the
+    #     User-Agent one in deploy/shared/docker-entrypoint.sh.
     tools:
       include:
         - check_k8s_auth

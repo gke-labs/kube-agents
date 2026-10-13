@@ -33,8 +33,9 @@ _WORKFLOWS = sorted(
 )
 
 
-# The hosted GKE MCP server. Matched by URL rather than by the `gke` key, so a
-# copy of the entry under another name is still found.
+# The hosted GKE MCP server. Matched by URL, in the mcp-remote argv or as a
+# native `url:` transport, rather than by the `gke` key, so a copy of the entry
+# under another name is still found.
 _GKE_MCP_URL = "https://container.googleapis.com/mcp"
 
 # The server's tools that it annotates `readOnlyHint: true`, from its
@@ -63,8 +64,9 @@ _GKE_MCP_READ_TOOLS = frozenset(
 
 # A registered MCP tool name whose verb changes something. Hermes registers a
 # server's tool as `mcp__<server>__<tool>` (tools/mcp_tool_schema.py
-# `mcp_prefixed_tool_name`, at the pinned tag). The read set above is the
-# assertion; this is the backstop for a verb the server has not shipped yet.
+# `mcp_prefixed_tool_name`, at the pinned tag). Any name it matches is also
+# outside the read set, so it never fails a profile the read-set check passes;
+# it is there so the failure names the write rather than an unknown tool.
 _WRITE_SHAPED_MCP_TOOL = re.compile(
     r"^mcp__.+?__(?:create|update|delete|patch|apply|cancel|scale|set|remove|add"
     r"|restart|rollback|drain|cordon|upgrade|resize|start|stop|enable|disable)_"
@@ -90,11 +92,16 @@ def _profile_configs():
 
 
 def _servers_reaching(config, url):
-    """The `mcp_servers` entries in one parsed config whose argv names `url`."""
+    """The `mcp_servers` entries in one parsed config that reach `url`.
+
+    Either through mcp-remote, where the URL is an argv entry, or through
+    Hermes' native HTTP transport, where it is the `url` key
+    (tools/mcp_tool_server_run.py at the pinned tag).
+    """
     return {
         name: server
         for name, server in (config.get("mcp_servers") or {}).items()
-        if isinstance(server, dict) and url in (server.get("args") or [])
+        if isinstance(server, dict) and (url in (server.get("args") or []) or server.get("url") == url)
     }
 
 
