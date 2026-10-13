@@ -30,7 +30,10 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
    line that says so. Exception: a cluster that still has a finding from an earlier review is
    checked again for that finding each time. This includes a finding that matches none of the
    twenty failures. A fix made between two upgrades then clears the finding before the next
-   upgrade.
+   upgrade. A finding whose only evidence was events is checked again the same way. The next
+   weekend review reads the events and the pods of the object again. It clears the finding when it
+   finds no live symptom on the object. A read that fails keeps the finding, and the report names
+   the failed read.
 3. **Write the `upgrade-retro-report`** with three sections, **Errors**, **Warnings** and **Info**.
    A section can be empty. An entry under Errors or Warnings is one incident: one workload object
    on one cluster, with four parts:
@@ -47,7 +50,7 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
      learns the failure, so the next pre-upgrade report says that the last upgrade damaged this
      object, for as long as the damage is present. If the install has a GitHub repository, the
      review's one tracked issue carries the checklist of fixes, one entry per cluster and object.
-     The next review rewrites the checklist. A failure that is still present keeps its entry. The
+     The next fleet-wide review rewrites the checklist. A failure that is still present keeps its entry. The
      entry says when the review first saw the failure and how many reviews have seen it. The
      review removes the entry when the failure is gone. The review closes the issue when it finds
      nothing.
@@ -56,9 +59,13 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
    GKE reported the upgrade as failed, or when a node did not become ready after its recreation. An
    incident is a **Warning** when the match is tentative, when the object belongs to the cluster's
    system components, when the symptom matches none of the twenty failures, or when a failure from
-   an earlier review is still present with no new evidence. **Info** lists each cluster that was
-   upgraded or found with no failure, each cluster with no change, and each item the review could
-   not read.
+   an earlier review is still present with no new evidence. An earlier review here is an earlier
+   review of the whole fleet, at install or at a weekend. The after-upgrade review reports a failure
+   at once, at its grade, and does not write the checklist. The next weekend review grades the
+   failure again from its own reads and writes it to the checklist at that grade. The first
+   checklist entry for a failure carries its own grade, whatever review found the failure first.
+   **Info** lists each cluster that was upgraded or found with no failure, each cluster with no
+   change, and each item the review could not read.
 
    A cluster with no failure is not an empty entry. For such a cluster, part (C) is a pre-flight for
    its next upgrade: the version its release channel moves it to and when, and the known failure
@@ -221,12 +228,17 @@ install that predates the job gets its first report from the first-run stage or 
 tick (§3.1), never from a scoped sweep over a fortnight of operations. A scoped run writes, for the clusters it reviewed, its report, the reviewed
 operations and the guards (so the readiness check learns a failure the same day, requirement 3);
 versions, last-run time and the symptom set stay the full run's, so the next Sunday still selects
-the cluster on the operation's end time, refreshes its baseline, and reports an incident the
-after-upgrade run already filed as already reviewed, carrying its guard forward rather than grading
-it again; a second wake for an operation already in the list prints nothing. This is the one
-statement of what a scoped run writes; §3.5 and §3.6 defer to it. The before side of the catalogue's diff is established two ways, and the stronger one
+the cluster on the operation's end time, reviews it in full against the stored set the last full
+run wrote, and grades each incident from its own reads: an Error the after-upgrade run reported
+and still present on Sunday is an Error on Sunday too and files at `major`, since Sunday is the
+first run that files it, and one that is gone clears its guard and is filed nowhere. What Sunday
+marks as already reviewed is the operation, in (A), with the route and time that reviewed it; the
+guard the scoped run wrote keeps its first-seen date and gains a review. A second wake for an
+operation already in the list prints nothing. This is the one statement of what a scoped run
+writes; §3.5 and §3.6 defer to it. The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
-each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
+each; events too on a cluster holding an event-only guard, §3.5), so the stored set is at most a
+week old rather than as old as the previous upgrade. And each
 symptom carries its own onset. The default is the pod's own evidence: a Pending pod's start, a
 crash-looping or not-ready pod's `Ready=False` transition (falling back to its start when the pod
 has restarted; a container's last termination is the latest crash, not the first, and is never the
@@ -254,8 +266,9 @@ and grades by onset only, which it says. A cluster is _new_ when absent, _upgrad
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
 it that reached `DONE`, with or without an `error` (a failed or cancelled operation finishes as
 `DONE` with `error` set; `ABORTING` is still in progress), with an end time after the last run, and _re-checked_ when it is unchanged but holds a live guard:
-only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared (a guard
-whose only source was events cannot be re-observed and is held; §3.5). A
+only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared; a guard
+whose only source was events adds the events read, and a guard whose read failed is held, not
+cleared, and emits no candidate (§3.5). A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
 says so, but only on a _full_ run. The ledger records the fleet's project set, written by the last
 full run. The collector cannot tell the roster from a hand-picked project list, so the SOP says
@@ -322,17 +335,24 @@ manifest vouch for an observation nobody made. Then `candidates[]` for every
 incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
 excerpt and the mitigation text. The hold follows the rule the harness implements and no other: a
 previous finding is held, rather than announced resolved, only while a candidate carries the same
-`(check, cluster, namespace, object)` id (`still_flagged_ids` is that set of candidate ids). So a
-`failure` guard the run still observes, or cannot re-observe (event-only, or a re-check whose reads
-failed), emits a candidate under the check id its finding was first filed with, the unclassified
-Warning's guard among them (§3.5), graded the Warning requirement 3 makes it and carrying the
-persistence in its detail: first seen, and the number of reviews that have seen it. A guard the
-re-check clears emits nothing, and the harness resolves the finding. A persisting finding has no
-check id of its own: a candidate under a new id would file a new finding and let the harness
-announce the old one fixed, the resolved-plus-new pair the fixed row order (§3.4) exists to
-prevent. A `risk` guard is Info, filed nowhere, and is no candidate,
-so a clean Sunday discloses nothing and runs silent; `checks_unevaluated[]` and `limitations` on a
-cluster whose read failed; and, in the carried keys the manifest reserves for
+`(check, cluster, namespace, object)` id (`still_flagged_ids` is that set of candidate ids), or
+while the run is partial, when `finish` announces nothing fixed at all (below). So a `failure`
+guard the run observes again, an event-only guard through its events read (§3.5), emits a
+candidate under the check id its finding was first filed with, the unclassified Warning's guard
+among them (§3.5), graded the Warning requirement 3 makes it and carrying the persistence in its
+detail: first seen, and the number of reviews that have seen it. A guard the re-check clears emits
+nothing, and the harness resolves the finding. A guard whose re-check read failed emits nothing
+either, and is held as it stands: a candidate with no read behind it would vouch for an
+observation nobody made, the shape rejected above for an upgrading cluster. Instead the check its
+finding was filed under goes in the cluster's `checks_unevaluated[]`, the failed read in its
+`limitations`, and that check leaves the cluster's `checks_run`, which `finish` reads as a partial
+run: it announces nothing fixed and keeps the ledger issue open naming the gap, as for an upgrading
+cluster, so the finding is neither resolved nor filed again; the guard's review count does not
+move. A persisting finding has no check id of its own: a candidate under a new id would file a new
+finding and let the harness announce the old one fixed, the resolved-plus-new pair the fixed row
+order (§3.4) exists to prevent. A `risk` guard is Info, filed nowhere, and is no candidate, so a
+clean Sunday discloses nothing and runs silent; `checks_unevaluated[]` and `limitations` on a
+cluster whose read failed, in a review or in a re-check; and, in the carried keys the manifest reserves for
 collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
 stream is in `COLLECTOR_AUDITS`, the SOP passes the manifest to `finish`, and `cross_check_manifest`
 enforces what this design would otherwise state as prose: an unreachable cluster must be in
@@ -384,13 +404,22 @@ floor, a workload with more than one replica: a single replica displaced by a dr
 Pending replacement) or entry 1 (the budget that held its drain), never 3, so
 `seeded-upgrade/pinned-batch-runner` files entry 1 on its budget (§4) and, while its replacement is
 still Pending, a second incident on the Deployment graded by the replacement's scheduling message
-(row 2, or row 12 when every clause is a selector miss). Row 12 is the generic one: the scheduler
-writes a `didn't match Pod's node affinity/selector` clause for every node group a pinned pod does
-not target, beside the clause that says why its own pool refused it, so row 12 holds only when every
-clause is a selector or affinity miss. That alone does not say the pool lost the label: an
-autoscaled pool at zero nodes, a label a pool never carried or a deleted pool write the same
-message, and the collector holds no before-state of node labels. Row 12 is therefore `medium`
-unless the selector names a label a kubelet stopped setting at or before the pool's minor, and then
+(row 2 when a clause reads `Insufficient cpu` or `memory`, the shape the seeded fleet's pinned
+replicas write; else row 12). Row 12 is the generic one, and the scheduler's clause set is its
+discriminator. The clauses are the comma-separated reasons the scheduler writes after `nodes are
+available:` up to the first period; the `preemption:` sentence that follows is not part of the
+set. The scheduler writes a `didn't match Pod's node affinity/selector` clause for every node group
+a pinned pod does not target, beside the clause that says why its own pool refused it
+(`Insufficient cpu`, `were unschedulable`, an untolerated taint). Row 12 holds when a clause is a
+selector or affinity miss and no earlier row holds, and it is `high` only when every clause is a
+miss. A mixed message is `medium`, and the repository's entry-12 reproduction is one:
+`bench/upgrade-scenarios/evidence/12/label.txt`, captured during the drain, reads `1 node(s) were
+unschedulable, 2 node(s) didn't match Pod's node affinity/selector`, so it files entry 12 at
+`medium`; once the drain ends the same pod's message carries misses alone. Misses alone still do
+not say the pool lost the label: an autoscaled pool at zero nodes, a label a pool never carried or
+a deleted pool write the same message, and the collector holds no before-state of node labels. Row
+12 is therefore `medium` unless every clause is a miss and the selector names a label a kubelet
+stopped setting at or before the pool's minor, and then
 it is `high`. The list is the collector's `DROPPED_NODE_LABELS` table, label to the minor that
 dropped it, each entry with its source the way `removed_apis.json` beside `api_deprecation_scan.py`
 cites one; it is not in the catalogue, whose entry 12 names no dropped label and records that no
@@ -404,9 +433,11 @@ entry 14, with entry 15 named in the evidence as a second cause.
 
 A match is _sure_ (`high`) when the signature names the entry's own mechanism and the pool the
 object sits on had an operation in the window: a webhook named in the rejection, a selector that
-names a dropped label, a runtime image below the catalogue's floor on a pool migrated to cgroup v2,
-an image that pulls on untouched nodes and fails on rebuilt ones, a volume attach error naming a
-PersistentVolume, a driver error text, a budget with no allowance on a drained node. On a first run a match whose only onset is a recreated pod's is capped at `medium` (§3.2). Anything less,
+names a dropped label in a message of misses alone, a runtime image below the catalogue's floor on
+a pool migrated to cgroup v2, an image that pulls on untouched nodes and fails on rebuilt ones, a
+volume attach error naming a PersistentVolume, a driver error text, a budget with no allowance on a
+drained node. On a first run a match whose only onset is a recreated pod's is capped at `medium`
+(§3.2). Anything less,
 a generic `OOMKilled`, an image pull failure with no untouched node to compare, a Pending pod with
 no pool operation, is _tentative_ (`medium`). Text a namespace user can write is never enough for
 `high` on its own: an Event's `reason` and `message` and a container's termination message are
@@ -439,14 +470,23 @@ automatic and both reversible:
   last seen, and the number of reviews that have seen it; the last three are what its re-emitted
   candidate carries (§3.3). An unclassified Warning carries
   a `failure` guard like a classified one, because the guard is what makes the next run re-check
-  the cluster for it (§3.2) and re-emit its candidate while it stands (§3.3); without one the
+  the cluster for it (§3.2) and re-emit its candidate while a run observes it (§3.3); without one the
   finding is filed once and announced fixed by the first run that does not re-read the cluster. The
   re-check reads what the symptom came from: a symptom read from pod or node state is looked for
   again with those reads and, when absent, cleared, which emits no candidate and lets the harness
-  resolve the finding; one whose only source was events, such as §4's probe failures, cannot be
-  re-observed after the API server's hour, so its guard is held and its candidate re-emitted,
-  marked not re-checkable, until the cluster's next full review clears it with the symptom absent.
-  The collector merges the file on
+  resolve the finding. One whose only source was events, such as §4's probe failures, is looked for
+  again through events. The upgrade window's events are gone after the API server's hour, but the
+  symptom is not: a probe that still fails writes `Unhealthy` with a fresh `lastTimestamp`, which is
+  how §4 counts 31, and a fixed one writes none. So the re-check of a cluster holding such a guard
+  adds the events read (one list call), refreshes the guard when an event in the API server's hour
+  still names the object or its pods, or the pods read shows the object failing, and clears it when
+  both reads answer and neither does. The Sunday run re-checks every cluster that holds a guard, so
+  a fix made in the week clears the guard by the next Sunday, before the next upgrade, as
+  requirement 2 says; the event hour is the limit, and a symptom that recurs less often than hourly
+  can be absent at the read, clear, and be filed again when a review sees it (§8). A re-check read
+  that fails holds the guard as it stands: no candidate, no review counted, the check in the
+  cluster's `checks_unevaluated[]` and the failed read in its `limitations` (§3.3), so the ledger
+  neither resolves nor re-files the finding. The collector merges the file on
   every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
   shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
   it ships, reads the file through its own sandbox hop and adds a line per live guard to its next
@@ -550,8 +590,8 @@ Mitigation set up: guard ...
 ### Unclassified on <cluster>: <namespace>/Deployment/<name>
 What failed: Unhealthy probe events, 31 in the window, matching none of the twenty.
 Mitigation set up: guard <cluster> / unclassified / <namespace>/Deployment/<name> (first seen
-  <date>), event-only: held until the cluster's next full review; entry in the stream's ledger
-  issue where a repository is linked.
+  <date>), event-only: re-checked through events, cleared by the next Sunday run that finds no live
+  symptom on the object; entry in the stream's ledger issue where a repository is linked.
 
 ## Info
 
@@ -627,16 +667,20 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 ## 7. Testing
 
 - **Unit.** Each classifier signature against one captured fixture, row 3's against a workload of
-  one replica (entry 2 or 1, never 3) and of two; selection (new, upgraded by version, upgraded by
-  operation, unchanged, forced; `--after-upgrade` against the window's two bounds, the reviewed
-  list pruned at the window, and the no-baseline line when no full run is recorded); the ledger
-  and guards round trips, an unclassified symptom's guard among them, held when event-only and
-  cleared by a review; a persisting guard's candidate under its original check id with first seen
-  and the review count, and a cleared guard emitting nothing (the manifest against
-  `still_flagged_ids`); an unreachable cluster and an upgrading cluster recorded without failing
-  the run and without a candidate; the watch marking nothing for a paused, disabled or absent
-  job; the report rendering, including an empty section and the severity of each fixture
-  incident.
+  one replica (entry 2 or 1, never 3) and of two, row 12's against the entry-12 reproduction's
+  mixed message (`medium`) and against misses alone with a dropped label (`high`); selection (new,
+  upgraded by version, upgraded by operation, unchanged, forced; `--after-upgrade` against the
+  window's two bounds, the reviewed list pruned at the window, and the no-baseline line when no
+  full run is recorded); the ledger and guards round trips, an unclassified symptom's guard among
+  them, an event-only guard refreshed by a re-check whose events read still names the object and
+  cleared by one that does not; a persisting guard's candidate under its original check id with
+  first seen and the review count, a cleared guard emitting nothing, and a guard whose re-check
+  read failed emitting nothing with its check in `checks_unevaluated[]` (the manifest against
+  `still_flagged_ids` and `cross_check_manifest`); an Error the after-upgrade route reported,
+  filed at `major` by the next full run; an unreachable cluster and an upgrading cluster recorded
+  without failing the run and without a candidate; the watch marking nothing for a paused,
+  disabled or absent job; the report rendering, including an empty section and the severity of
+  each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
@@ -652,10 +696,12 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 - Events expire; a Sunday-evening run sees the week's pod and node state but may miss transient
   events.
   The ledger's version diff still finds the upgrade; (B) says when its evidence is state rather than
-  an event.
+  an event. An event-only guard is re-checked through the same hour (§3.5): a symptom that recurs
+  less often than hourly can clear, and is filed again when a review sees it.
 - Classification is by signature and can be wrong; every finding carries its evidence and a
   confidence, and the SOP may downgrade one. A wrong guard costs one extra line in a readiness
-  report until the next run re-checks the cluster and drops it.
+  report until the next run re-checks the cluster and drops it, the next Sunday run for a guard
+  whose only source was events.
 - Fourteen days for the first run, and a fixed Sunday evening for the fleet-wide run (the
   after-upgrade watch covers the slot after each window) rather than a slot after each
   install's maintenance window, are starting values.
