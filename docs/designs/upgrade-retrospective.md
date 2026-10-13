@@ -19,8 +19,9 @@ The next cluster meets the same failure.
 This design adds a scheduled review, the **upgrade retrospective**. The requirements are:
 
 1. **Run without a request, and answer a request.** The review runs once when the agent is
-   installed, over every cluster it finds, then at the end of each weekend, and within half an hour
-   of an upgrade for the cluster the upgrade changed. A user can also ask
+   installed, over every cluster it finds. It runs again at the end of each weekend. It also runs
+   for the cluster an upgrade changed, fifteen to thirty minutes after the upgrade ends, plus the
+   job's start time. A user can also ask
    for it in their own words, for example "how did the last upgrades go" or "is there anything to
    fix before the next one". The question does not have to name the feature, a cluster or a
    version. If no cluster was upgraded since the last report, the agent answers from that report.
@@ -125,7 +126,7 @@ sandbox hop once it ships.
 upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; once, from the Chat Agent's
                        first-run stage after the inventory scan settles)
 upgrade-retrospective-after-upgrade (daily 05:00 UTC as a sweep, and woken early by
-                       upgrade_retrospective_watch.py within fifteen minutes of an upgrade;
+                       upgrade_retrospective_watch.py after an upgrade, at the latency requirement 1 states;
                        a scoped run over the clusters whose operations are not yet reviewed)
   └─ collector  upgrade_retrospective.py                          deterministic, no model
        ├─ ledger: versions per cluster, last run                   /opt/data/upgrade-retrospective/ledger.json (the shell's volume)
@@ -166,7 +167,7 @@ removes both. The first-run stage skips every audit when no GitOps repository is
 the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
 streams it serves exist to file a ledger. This stream does not: the collector needs no repository
 and the report on the volume is the record. Where a repository is configured and the run is full,
-the SOP probes the collector's lock (§3.6), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
+the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
 refuses a manifest older than the run); without a repository it runs the collector alone, manifest
 included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
@@ -185,7 +186,7 @@ lines and files no ledger issue. Both bounds matter: the floor keeps a run off p
 settled, and the window's start, which Sunday's full run advances, keeps Monday's sweep from
 re-selecting the operations Sunday reviewed once they leave the reviewed list. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
 `no_agent` script, `upgrade_retrospective_watch.py`, which runs every fifteen minutes on the gateway
-pod, reads the roster projects' operations through the sandbox hop the readiness watch uses
+pod, reads the operations of the projects in the install's scope (§3.2) through the sandbox hop the readiness watch uses
 (`sandbox_exec` as its default principal, read only) and, when an operation reached `DONE` at least
 fifteen minutes earlier that it has not seen, marks the after-upgrade job due with the same
 `trigger_job` call the first-run stage uses, which carries a job id and nothing else, behind the
@@ -198,8 +199,9 @@ its own scope from GKE and the collector's ledger, so nothing has to cross from 
 agent. The job runs as the agent, in the agent's shell, the only principal that may write the
 store (§3.6); the hop writes nothing, so a `hermes` caller never touches `/opt/data`, and a model
 turn is spent only when an upgrade completed (or once a day for the sweep). A second wake for the
-same operation finds it reviewed and prints nothing. The review lands fifteen to twenty-nine minutes
-after `DONE` plus the job's start: the replacement pods have had time to settle, and the events of
+same operation finds it reviewed and prints nothing. The review lands between fifteen and thirty
+minutes after `DONE`, plus the job's start, the one figure requirement 1 states (the watch's
+quarter-hour tick behind its fifteen-minute floor): the replacement pods have had time to settle, and the events of
 the operation's last half hour are still inside the API server's hour; events emitted earlier in a
 long drain are already gone, which is why (B) reads pod and node state first and treats events as
 corroboration. The Sunday run stays the fleet-wide baseline and the only scheduled run that files
@@ -218,9 +220,9 @@ answer from it and say when it was produced; otherwise run the collector for tho
 A question that names a cluster the last run did not review forces that cluster (`--cluster`). A
 question asked inside the floor, within fifteen minutes of an operation's `DONE`, gets that
 cluster's settling line (§3.2): the answer says the review runs once the pods have settled, on the
-after-upgrade route's next wake. A fleet-wide question asked while the stream's in-flight note
-stands, after a Sunday run lost the lock, is refused by `start`; the SOP answers from the latest
-saved report and names the time the stream frees (§3.6).
+after-upgrade route's next wake. A fleet-wide question that finds the collector's lock held past
+the probe's wait is answered from the latest saved report, with the line that a run is in progress
+(§3.6); a lost lock leaves no in-flight note behind, so `start` never refuses the question.
 
 ### 3.2 Scope: new or upgraded since the last run
 
@@ -242,8 +244,9 @@ The after-upgrade route also needs a baseline to diff against: when the ledger r
 it prints one line, "no baseline yet; the first full run establishes it", and writes nothing, so an
 install that predates the job gets its first report from the first-run stage or the first Sunday
 tick (§3.1), never from a scoped sweep over a fortnight of operations. A scoped run writes, for every cluster it reviewed, its report and the operations it
-reviewed, route bookkeeping a cluster outside the fleet set gets too, so a sweep never reviews one
-operation twice; for a cluster inside the fleet set it writes the guards (so the readiness check
+reviewed, route bookkeeping a cluster outside the scope the run was handed gets too, so a sweep
+never reviews one operation twice; for a cluster inside the scope it writes the guards (so the
+readiness check
 learns a failure the same day, requirement 3), and for one outside it writes no guard and marks it
 "outside the fleet; not recorded beyond the operations reviewed";
 versions, last-run time and the symptom set stay the full run's, so the next Sunday still selects
@@ -292,33 +295,46 @@ only the reads that guard needs run, and a guard whose symptom or shape is gone 
 whose only source was events adds the events read, and a guard whose read failed is held, not
 cleared, and emits no candidate (§3.5). A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
-says so, but only on a _full_ run. The ledger records the fleet's project set, written by the last
-full run. The collector cannot tell the roster from a hand-picked project list, so the SOP says
-which it is: a full run is one invoked with `--full`, which the SOP passes with the roster's
-`--project` set (the management project and every project a Cluster Agent profile names) on the
-scheduled route and on the fleet-wide on-demand route, and which refuses `--cluster`. A full run may
-change the fleet set: a project that left the roster is pruned with its clusters, a project that
-joined is added. Between two full runs a roster project the fleet set lacks is reviewed by the
-after-upgrade sweep only for a settled operation it has not reviewed, once: the sweep selects by
-unreviewed operations alone and records the ones it reviewed, inside or outside the fleet set, so
-the project's clusters without an operation are never selected, and the next full run adds the
-project with its clusters' versions and reviews them in full; the bookkeeping a hand run leaves
-for a project outside the roster goes with the next full run's pruning. A project the roster still names whose listing failed (a deleted project, a
-removed binding, the Container API disabled) does not demote the run: its ledger entries and guards
-are held unchanged, its clusters are listed under "Reads that failed", and the run stays full and
-moves the latest link, the way `fleet_drift.py` and `patch_readiness.py` keep a failed project as
-that project's gap rather than the sweep's. In the collector manifest (§3.3) those clusters are
-entries with `outcome: unreachable` and the listing error, which the harness's cross-check turns
-into the `scope.skipped` requirement on the findings document: no finding on those clusters is
-announced resolved, the ledger issue stays open with the gap named, and the guards keep each
-finding's id, first-seen date and review count until a run reads the project again; §3.3 says what
-the issue body shows meanwhile. Every run without `--full` is _scoped_, whatever its
-`--project` set: a run narrowed by `--cluster`, by the question that invoked it, or any hand run,
-with or without `--project`. A scoped run reviews only its targets, never
-prunes a ledger entry or a guard outside them, never adds a project to the fleet set (what it
-writes for a cluster outside the fleet set is stated above, once), writes its
-report under a `-scoped` name, does not move the latest link, and never calls the fleet-audit
-`start` or `finish`, so a question about one clean cluster cannot close the fleet's ledger issue.
+says so, but only on a _full_ run. The fleet is the install's declared scope, read the way every
+fleet-audit stream reads it: the SOP calls the platform_control `fleet_scope` tool first on every
+route and passes its `collector_args` to the collector verbatim, `--scope-projects` with the
+resolved project set and `--scope-unread` with the declared projects the install could not read,
+each with its outcome. The collector imports the shared `fleet_scope_args` module as `collect.py`,
+`patch_readiness.py` and `fleet_drift.py` do, so the resolution is theirs: `--project` names one
+project and is a hand run's override, free on an install that declares no scope and otherwise
+admitted only beside the scope flags and for a project inside the readable set; else the declared
+scope is swept exactly as handed, nothing listed, and a declared scope with no readable project is
+an error rather than a listing; else, on an install that declares no scope (the tool answers
+`declared: false`), the active `gcloud` project plus every project `gcloud projects list` returns.
+A collector run on the shell sandbox without the tool's flags, on an install that declares a scope
+(`KUBEAGENTS_SCOPE_DECLARED`), reports that and lists nothing. The collector cannot tell a
+fleet-wide run from a narrowed one by its flags alone, so the SOP says which it is: a full run is
+one invoked with `--full`, which the SOP passes with the tool's `collector_args` on the scheduled
+route and on the fleet-wide on-demand route, and which refuses `--cluster` and `--project`; the
+scope the run was handed is the fleet it records, so a full run prunes the ledger entries and
+guards of a project the scope no longer names (the snapshot's `retiring` rows are not in the
+sweep) with their clusters, and adds the clusters of a project that joined, with their versions.
+Between two full runs a project newly in scope is reviewed by the after-upgrade sweep only for a
+settled operation it has not reviewed, once: the sweep selects by unreviewed operations alone and
+records the ones it reviewed, so the project's clusters without an operation are never selected,
+and the next full run reviews them in full. A declared project the install could not read
+(`--scope-unread`), and a project in scope whose `clusters list` failed inside the run (a deleted
+project, a removed binding, the Container API disabled), do not demote the run: their ledger
+entries and guards are held unchanged, their clusters are listed under "Reads that failed", the
+manifest carries the unread note, and the run stays full and moves the latest link, the way
+`fleet_drift.py` and `patch_readiness.py` keep a failed project as that project's gap rather than
+the sweep's. In the collector manifest (§3.3) those clusters are entries with
+`outcome: unreachable` and the listing error, which the harness's cross-check turns into the
+`scope.skipped` requirement on the findings document: no finding on those clusters is announced
+resolved, the ledger issue stays open with the gap named, and the guards keep each finding's id,
+first-seen date and review count until a run reads the project again; §3.3 says what the issue
+body shows meanwhile. Every run without `--full` is _scoped_: a run narrowed by `--cluster`, by
+`--project`, by the question that invoked it, or any hand run. A scoped run reviews only its
+targets, never prunes a ledger entry or a guard outside them, never changes the recorded fleet
+(what it writes for a cluster outside the scope is stated above, once; a declared scope's override
+cannot name one, so the case is an undeclared install's), writes its report under a `-scoped`
+name, does not move the latest link, and never calls the fleet-audit `start` or `finish`, so a
+question about one clean cluster cannot close the fleet's ledger issue.
 `--since` is a hand-run flag that widens the window a scoped run reviews; it never replaces the
 ledger's last-run time. A cluster with an operation still `PENDING`, `RUNNING` or `ABORTING`, or
 with an operation that reached `DONE` inside the floor, less than fifteen minutes before the run,
@@ -330,13 +346,9 @@ second as settling, each with its operation; the cluster's older operations wait
 reviewed on the next run (the after-upgrade route's wake, fifteen minutes after `DONE`, or the next
 full run); §3.3 says what the manifest and the SOP write for it; and the on-demand route says the
 same when asked mid-upgrade or inside the floor. The collector runs where the fleet-audit collectors run, in the agent's terminal.
-Projects are `--project` when given, else the active `gcloud` project plus every project
-`gcloud projects list` returns: the order `collect.py`, `patch_readiness.py` and `fleet_drift.py`
-share, so this collector reads the same fleet as the three beside it. The SOP passes `--project` for
-the management project and every project a Cluster Agent profile names, so a scheduled run reads the
-reconciler's roster and agrees with the readiness watch design on what "the fleet" is; a run by hand
-without the flag reads what the credential can list, and with or without it is a scoped run unless
-it passes `--full`.
+The scope is the tool's, carried to the collector by the SOP; a run by hand without the flags, on
+an install that declares no scope, reads what the credential can list, and with or without them is
+a scoped run unless it passes `--full`.
 
 ### 3.3 A collector for the facts, an SOP for the judgement
 
@@ -675,19 +687,24 @@ to finish, which is the collision that matters, the Sunday run or a question lan
 after-upgrade run holds the lock. Past the wait the collector prints the lock-held line, naming
 the holder and the time, exits 0 and writes nothing, on every route. The routes that file the
 ledger call `start` before the collector (§3.1), and the in-flight note `start` leaves is what a
-lost lock would cost: the harness releases the note only through `finish`, `finish` refuses a
-document that audited nothing (`scope.clusters` must be non-empty) and keeps the note on a
-refusal, and a standing note makes `start` refuse every run of the stream for two hours, the
-fleet-wide question included. So the Sunday route and the fleet-wide on-demand route probe the
-lock before `start`: the collector's `--probe-lock` tries the lock without blocking, holds it for
-no time and writes nothing, and the SOP spends the two-minute wait on the probe, before any note
-exists, then calls `start` and runs the collector. A run that still loses the lock, taken between
-the probe and the run, ends as the collector did: the SOP calls no `finish`, reports the lock as
-the run's one limitation in its chat line and files nothing, and the note's two-hour TTL is the
-wait; a fleet-wide question inside it is refused by `start`, and the SOP answers from the latest
-saved report and names the time the stream frees; the fleet-wide review, the `last_run` advance,
-the guard re-checks and the ledger rewrite wait for the next tick or for a question after that; the
-after-upgrade route, which calls no `start`, keeps reviewing upgrades in between. The reverse costs
+lost lock costs if nothing releases it: `start` refuses every run of the stream while the note
+stands, two hours, the fleet-wide question included. The harness releases the note only through
+`finish`, and `finish` admits a run that read nothing when the document says so: a cluster entry
+with no `checks_run` is valid when its `limitations` says why, and a collector stream may publish
+without a manifest through `--no-collector-manifest "<why>"`, refused only when the collector
+wrote a manifest this run, which a collector that lost the lock did not. So the Sunday route and
+the fleet-wide on-demand route probe the lock before `start`: the collector's `--probe-lock`
+tries the lock without blocking, holds it for no time and writes nothing, and the SOP spends the
+two-minute wait on the probe, before any note exists, then calls `start` and runs the collector. A
+run that still loses the lock, taken between the probe and the run, releases the note at once with
+a limitations-only `finish`: `findings: []`, every cluster the latest saved report names under
+`scope.clusters` with `checks_run: []` and `limitations` naming the lock, its holder and the time,
+and `--no-collector-manifest` with the same reason. `finish` takes the clean branch over a gap: it
+posts a partial all-clear comment naming the gap on the open ledger issue, or opens the coverage
+issue when none is open, rewrites no body, announces nothing resolved, closes nothing, returns
+`partial: true`, and removes the note, so a fleet-wide question is admitted at once and the next
+tick, or that question, takes the baseline. Leaving the note to its two-hour TTL was rejected: it
+would refuse every fleet-wide question for two hours to save one comment on the ledger. The reverse costs
 nothing: an after-upgrade wake locked out by the Sunday run exits the same way, the Sunday run
 reviews the same operation, and the route's next wake or sweep finds it in the reviewed list and
 prints nothing; an on-demand run locked out answers from the latest saved report and says a run
@@ -791,13 +808,13 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    ledger, selection, (A), (B), the signature table, the catalogue table for (C), the guards merge,
    JSON and Markdown output, the collector manifest (`--manifest-file`, §3.3) with the stream's
    check ids and its `COLLECTOR_AUDITS` entry, `--dry-run`, `--full`, `--cluster`, `--since` and
-   `--reset-ledger` and `--probe-lock` as §3.2 and §3.6 define them; unit tests on fixtures captured from the test
+   `--reset-ledger`, `--probe-lock` and the shared `fleet_scope_args` flags (`--scope-projects`, `--scope-unread`) as §3.2 and §3.6 define them; unit tests on fixtures captured from the test
    fleet, including the manifest against `cross_check_manifest`.
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` entry with the six check ids §3.3 lists, so findings file, with check
-   ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (`start`, the collector and `finish` with its
+   ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (the `fleet_scope` call, the lock probe, `start`, the collector and `finish` with its
    manifest where a repository is linked; the collector alone without one) and the first-run stage
    marking this job due without a repository; the `upgrade-retrospective-after-upgrade` roster
    entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
@@ -841,9 +858,12 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   a re-check whose events read still names the object and cleared by one that does not, and an
   operation guard held while the listing shows no clean retry, held too when a listing that
   reaches its operation's start no longer returns it, and cleared by a clean retry or by a target
-  pool the describe no longer lists; a scoped sweep reviewing a new roster project's settled
-  operation once, recording it outside the fleet set with no guard, and selecting nothing the
-  next day; a locked-out full run exiting 0 with the lock-held line and writing nothing; a
+  pool the describe no longer lists; a scoped sweep reviewing a project newly in scope for its
+  settled operation once, recording the operation, and selecting nothing the next day; a hand
+  run's cluster outside the scope on an undeclared install recorded with its operations and no
+  guard; the scope flags: `--scope-projects` swept exactly, `--scope-unread` as the manifest's
+  unread note, `--project` refused outside a declared scope, the listing on an undeclared
+  install; a locked-out full run exiting 0 with the lock-held line and writing nothing; a
   persisting guard's candidate under the check its guard records, moved on a re-grade, with first
   seen and the review count, a cleared
   guard emitting nothing, and a guard whose re-check read failed emitting nothing with its check
@@ -884,8 +904,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   an event. An event-only guard is re-checked through the same hour (§3.5): a symptom that recurs
   less often than hourly can clear, and is filed again when a review sees it.
 - Classification is by signature and can be wrong; every finding carries its evidence and a
-  confidence, and the SOP may downgrade one. A wrong guard costs one extra line in a readiness
-  report until the next run re-checks the cluster and drops it, the next Sunday run for a guard
+  confidence, the SOP copies the grade (§3.5) and tailors the text, and a wrong signature is
+  corrected in the collector's table, not by the SOP. A wrong guard costs one extra line in a
+  readiness report until the next run re-checks the cluster and drops it, the next Sunday run for a guard
   whose only source was events.
 - A cluster a Sunday run cannot read, upgrading at the tick or with a failed read, keeps the ledger
   issue open and takes its entries out of the issue body for that week; `guards.json` keeps their

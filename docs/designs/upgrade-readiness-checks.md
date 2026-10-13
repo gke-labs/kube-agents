@@ -276,7 +276,8 @@ Rollout tracking against one target version already runs (see Scope). The additi
   The [upgrade retrospective](upgrade-retrospective.md) does the pod and node part of that diff on
   a schedule (new `CrashLoopBackOff`, `ImagePullBackOff` and Pending pods; not webhook latency or
   deprecation warnings): a review of every new or upgraded cluster at the end of each weekend, and
-  of one cluster within half an hour of its upgrade, with the failures it finds classified against
+  of one cluster soon after its upgrade (the retrospective's requirement 1 states the latency), with
+  the failures it finds classified against
   the catalogue and fed back to the readiness report as guards.
 
 ## How it is delivered
