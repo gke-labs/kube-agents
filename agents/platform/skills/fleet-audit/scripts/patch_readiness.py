@@ -1829,13 +1829,18 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
     for entry in behind:
         member = members.get((entry["_bare_name"], entry["location"]))
         readiness = (member or {}).get("readiness") or {}
-        # A skew block is definite whatever the PDB read did, when the ceiling
-        # can block the upgrade due: the reporter grades `blocked` on skew
-        # with `read_error` set beside it, and a blocker it positively
-        # identified is a finding, not a gap. On a pool-only lag the ceiling
-        # blocks nothing that is due, so the one cause that could (a budget
-        # on the pool drain) was never read, and the row is the gap it would
-        # be without the skew. `_due` is the one reading of the lag and what
+        # Each cause counts only on the lag it can block, for a block and for
+        # a gap alike. A skew block is definite whatever the PDB read did,
+        # when the ceiling can block the upgrade due: the reporter grades
+        # `blocked` on skew with `read_error` set beside it, and a blocker it
+        # positively identified is a finding, not a gap. A failed budget read
+        # is a gap only where a budget could hold the upgrade due: on a
+        # pool-only lag the ceiling blocks nothing that is due, so the one
+        # cause that could (a budget on the pool drain) was never read and
+        # the row is a gap, skew or no skew; on a pool-ahead lag the
+        # control-plane move drains no node, so the budget's answer would be
+        # discarded and its missing read costs nothing, and the ceiling's
+        # grade decides. `_due` is the one reading of the lag and what
         # applies to it that the gate, this join and the hit all take.
         due = _due(entry)
         skew_blocked = due.skew_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("skew") or {}).get("blocking"))
@@ -1861,6 +1866,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         # skew block is whatever the budget read did: blocked beats unknown.
         ceiling_ungraded = due.skew_applies and (not (member or {}).get("target_version") or bool((readiness.get("skew") or {}).get("unknown")))
         budget_blocked = due.budget_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("pdbs") or {}).get("blocking"))
+        budget_ungraded = due.budget_applies and bool(readiness.get("read_error"))
         why = None
         if not members:
             why = no_report
@@ -1877,7 +1883,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # declared and run as budgets come and go, and last week's
             # finding retires only against a clean read this week.
             pass
-        elif not skew_blocked and not budget_blocked and (readiness.get("read_error") or ceiling_ungraded):
+        elif not skew_blocked and not budget_blocked and (budget_ungraded or ceiling_ungraded):
             # The reporter's own notes say why a row is `unknown`: the grade's
             # note (no target, so skew and exclusion scope ungraded) and the
             # row's (why there is no target: no channel, or a get-server-config
@@ -1885,7 +1891,10 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # transient read failure from a standing shape.
             notes = [str(n) for n in (readiness.get("note"), member.get("note")) if n]
             note = "; ".join(dict.fromkeys(notes))
-            why = str(readiness.get("read_error") or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
+            # The read error is the reason only where the budget read was the
+            # gap; a pool-ahead row with a failed read and an ungraded ceiling
+            # names the ceiling's note, not a read whose answer is discarded.
+            why = str((readiness.get("read_error") if budget_ungraded else None) or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
         elif readiness.get("status") == READINESS_BLOCKED and _readiness_cause(readiness) is None and not (readiness.get("maintenance") or {}).get("blocking_exclusions"):
             # `blocked` for something that is neither a budget, skew, nor an
             # exclusion: a cause the reporter learned after this join was

@@ -2962,6 +2962,32 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
         self.assertIn("kubectl: forbidden", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
 
+    def test_a_failed_budget_read_on_a_pool_ahead_channel_cluster_is_no_gap_where_the_budget_does_not_apply(self):
+        """On a pool-ahead lag the control-plane move drains no node, so the
+        budget's answer is discarded whatever it is (a blocking budget is the
+        check running clean there); a budget read the reporter could not make
+        costs nothing either, and the ceiling's grade decides. The sibling,
+        where the budget applies and the read fails, stays a gap."""
+        ahead = cluster(name="ahead", master=self.CURRENT, channel="REGULAR", node_pools=[pool("default-pool", "1.31.0-gke.1")])
+        row = self.member("ahead", status="unknown", read_error="kubectl: forbidden", gap=0)
+        entry = self.collect([ahead], [row])["ahead"]
+        self.assertEqual({x["check"] for x in entry["candidates"]} & {"master-behind", "pool-skew"}, {"pool-skew"})
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+        # The same failed read with the ceiling ungraded: a gap, and the reason
+        # names the ceiling's note, not the read whose answer would be discarded.
+        row = self.member("ahead", status="unknown", read_error="kubectl: forbidden", gap=0)
+        row["readiness"]["skew"]["unknown"] = ["default-pool"]
+        row["readiness"]["note"] = "skew not graded for default-pool"
+        reason = self.unevaluated(self.collect([ahead], [row])["ahead"])[pr.UPGRADE_BLOCKED_CHECK]
+        self.assertIn("skew not graded for default-pool", reason)
+        self.assertNotIn("kubectl: forbidden", reason)
+        # Where the budget applies (a behind control plane), the failed read is the gap it was.
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", status="unknown", read_error="kubectl: forbidden")])["lag"]
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertIn("kubectl: forbidden", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+
     def test_a_pool_only_lag_blocked_by_a_budget_and_skew_names_the_held_pool_drain_only(self):
         pools = [pool("default-pool", "1.27.0-gke.1")]
         by = self.collect([cluster(name="skewed", master=self.CURRENT, node_pools=pools)], [self.member("skewed", pdbs=[self.BUDGET], skew=["default-pool"], gap=0)])
