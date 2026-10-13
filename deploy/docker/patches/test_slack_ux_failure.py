@@ -289,6 +289,20 @@ class MarkTest(FlagOn):
         self.assertIn("Check it there?", blocks[0]["text"]["text"])
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
+    def test_under_next_a_marked_reply_is_laid_out_as_a_chat_message(self):
+        # The chat.notify stand-in asks chat_for under the same mark, and gets
+        # the reply's first sentence as the headline and Try again as a choice.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        token = runtime.begin(_turn())
+        try:
+            chat = runtime.chat_for(REPLY)
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["headline"], "I couldn't find seeded-z.")
+        self.assertEqual(chat["choices"], [{"text": "Try again"}])
+        self.assertIn("Check it there?", chat["detail"])
+        self.assertIsNone(runtime.chat_for(REPLY), "an unmarked reply is not laid out")
+
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         self.assertEqual(self.draw(_event()), _render(REPLY))

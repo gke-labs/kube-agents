@@ -228,6 +228,19 @@ class TestSessionKvServerApi(unittest.TestCase):
         self.assertEqual(meta["conversation_route"]["conversation"], "slack:C1/1712.0001")
         self.assertTrue(meta["kept"])
 
+    def test_a_route_keeps_the_asks_kind_when_it_is_a_token(self):
+        # The bridge sends the kind of the turn's ask, which the kanban
+        # notifier's chat messages keep marked while the cards run; anything
+        # but a mark token is dropped, and the route is still recorded.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "slack", "conversation": "slack:dm/D123", "context_id": "ctx-0123abcd", "ask": "fleet"}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]["ask"], "fleet")
+        for bad in ("Fleet", "x" * 17, "a b"):
+            body["ask"] = bad
+            self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
+            self.assertNotIn("ask", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
+
     def test_a_hashed_session_takes_its_own_context(self):
         # The bridge hashes a context id that is not path-safe
         # (a2a/hermes-bridge/api.go, apiSessionID); the route is accepted for

@@ -165,6 +165,22 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual(adapter.teams, ["T1"])
         self.assertIn("PR #412", post["text"])
 
+    def test_under_next_the_pr_card_is_a_chat_message_posted_once(self):
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((chat_id, content, chat, update, metadata))
+                return SimpleNamespace(success=True)
+
+        self.assertTrue(_run(runtime.pr_opened(StandIn(), SUB, f"Opened {PR}")))
+        self.assertFalse(_run(runtime.pr_opened(StandIn(), SUB, f"Report: opened {PR}")))
+        (chat_id, text, chat, update, metadata), = sent
+        self.assertEqual((chat_id, update, metadata), ("C0KAGE", "", {"thread_id": "1700000000.000100"}))
+        self.assertEqual(chat["tone"], "success")
+        self.assertEqual(chat["links"][0], {"text": "Open PR ↗", "url": PR, "primary": True})
+        self.assertIn(PR, text)
+
     def test_the_pr_sits_beside_a_green_bar_under_its_headline(self):
         adapter = _Adapter()
         _run(runtime.pr_opened(adapter, SUB, f"Opened {PR}"))

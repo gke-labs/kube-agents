@@ -56,6 +56,12 @@ NOTIFY_WAIT_SECONDS = 60
 NOTIFY_CONNECT_SECONDS = 30
 NOTIFY_MARGIN_SECONDS = 15
 NOTIFY_SUBPROCESS_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MARGIN_SECONDS
+# The `a2a notify --update` key an event alert is posted under: the gateway
+# edits the message it posted with that key in the same conversation, which is
+# how the alert's triage replaces the alert in place under next
+# (slack_ux_incident's chat route, chat_message.ALERT_UPDATE). Hermes's send
+# has no such key, so the today path posts as before.
+ALERT_UPDATE_KEY = "alert"
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
 GCHAT_PLATFORM = "google_chat"
@@ -88,13 +94,16 @@ def subprocess_timeout(target: str, default: float | None) -> float | None:
 
 
 def command(target: str, message: str, json_output: bool = True, hermes_bin: str = HERMES_CLI,
-            wait_seconds: float | None = None) -> list[str]:
+            wait_seconds: float | None = None, update: str = "") -> list[str]:
     """The argv that posts ``message`` to ``target``.
 
     ``target`` is a ``hermes send --to`` target. ``json_output`` asks the
     Hermes path for ``--json``; the gateway path always answers in JSON.
     ``wait_seconds`` bounds how long `a2a notify` waits for the gateway, for a
-    caller with a deadline shorter than the CLI's default.
+    caller with a deadline shorter than the CLI's default. ``update`` names the
+    message on the gateway path (``a2a notify --update``), so a later notify
+    with the same key in the same conversation edits it; the Hermes path has
+    no such key and ignores it.
     """
     platform, _, rest = target.partition(":")
     if not routes(platform):
@@ -106,6 +115,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     argv = [A2A_CLI, "notify", "--platform", platform]
     if wait_seconds is not None:
         argv += ["--timeout", f"{max(1, int(wait_seconds))}s"]
+    if update:
+        argv += ["--update", update]
     if thread:
         # A Slack thread is a bare ts, which names no channel: it goes out
         # qualified by the target's own channel, and the gateway posts it only

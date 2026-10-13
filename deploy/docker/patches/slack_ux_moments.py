@@ -65,6 +65,15 @@ legacy attachment holding every block below the headline. A settle sends the
 attachment again, since ``chat.update`` would otherwise keep the old one, buttons
 and all; a question settled down to its headline alone loses the bar.
 
+Under ``spec.mode: next`` a card reaches the thread through the kanban
+notifier's chat.notify stand-in (``kanban_chat_notify``), which has no Slack
+client. The same moments go out as ``kube-agents.chat/v1`` messages
+(``agents/platform/scripts/chat_message.py``): the PR card once per thread and
+url, and the question with the ``update`` key ``question-<card>``, whose choices
+reply with the option and the card, as a click does here. Its settle is the
+same key with the choices gone; reading a typed answer back from the thread
+needs a Slack client, so the question settles without the answered line.
+
 Fail-soft: a moment that cannot be posted is logged, and the caller falls back
 to what it did before.
 """
@@ -86,6 +95,10 @@ try:
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _moments = None
     _presenter = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
 
 #: The flag, read here only to word the warning when the renderer is missing.
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -225,12 +238,40 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: s
         return ""
 
 
+def _chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is the chat.notify stand-in and the chat message composer is importable."""
+    return _chat is not None and callable(getattr(adapter, "send_chat", None))
+
+
+async def _send_chat(adapter: Any, sub: dict, text: str, chat: dict, update: str = "") -> bool:
+    """Send ``chat`` in the card's thread over chat.notify; True when it went out."""
+    chat_id = str(sub.get("chat_id") or "")
+    try:
+        result = await adapter.send_chat(
+            chat_id, text, chat, update, metadata={"thread_id": str(sub.get("thread_id") or "")},
+        )
+    except Exception as exc:  # noqa: BLE001 — the caller falls back
+        logger.warning("slack_ux_moments: posting over chat.notify in %s failed: %s", chat_id, exc)
+        return False
+    if getattr(result, "success", False) is not True:
+        logger.warning("slack_ux_moments: chat.notify refused the post in %s: %s", chat_id, getattr(result, "error", None))
+        return False
+    return True
+
+
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
     """Post each PR ``text`` says was opened, once per thread; True when any posted."""
     posted = False
     for url, repo, number, line in _moments.opened_prs(text):
         key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
         if key in _announced:
+            continue
+        if _chat_route(adapter):
+            chat = _chat.pr_message(url, repo, number, line)
+            if not await _send_chat(adapter, sub, _chat.pr_text(url, repo, number, line), chat):
+                continue
+            _remember(_announced, key, None)
+            posted = True
             continue
         blocks, fallback = _moments.pr_opened(url, repo, number, line)
         if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
@@ -249,6 +290,8 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
     """
     if not isinstance(payload, dict) or payload.get("kind") != NEEDS_INPUT:
         return False
+    if _chat_route(adapter):
+        return await _needs_you_chat(adapter, sub, str(payload.get("reason") or ""), event_id)
     moment = _moments.needs_you(
         str(payload.get("reason") or ""), buttons=bool(sub.get("thread_id"))
     )
@@ -270,6 +313,30 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
         _remember(_unsettled, (key, earlier[2]), earlier)
     entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
     _remember(_questions, key, entry)
+    return True
+
+
+async def _needs_you_chat(adapter: Any, sub: dict, reason: str, event_id: int) -> bool:
+    """:func:`needs_you` over chat.notify: the question as a chat message keyed by its card.
+
+    Kept in ``_questions`` with its chat message where the blocks would be and
+    its update key where the ts would be, so :func:`settle_question` and
+    :func:`wake_text` read it as they read a posted one.
+    """
+    key = _sub_key(sub)
+    chat = _chat.needs_you_message(reason, key[0], buttons=bool(sub.get("thread_id")))
+    if chat is None:
+        return False
+    if asked(sub, event_id):
+        return True
+    earlier = _questions.get(key)
+    update = _chat.QUESTION_UPDATE.format(card=key[0])
+    text = f"{reason.strip()}\n{QUESTION_CARD_NOTE.format(card=key[0])}" if key[0] else reason.strip()
+    if not await _send_chat(adapter, sub, text, chat, update):
+        return False
+    if earlier is not None:
+        _remember(_unsettled, (key, earlier[2]), earlier)
+    _remember(_questions, key, (int(event_id or 0), str(sub.get("chat_id") or ""), update, chat, text))
     return True
 
 
@@ -462,6 +529,11 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
     ``until`` is the ts of the card's next question, if it asked again: a reply after it answers that one.
     """
     _event_id, channel, ts, blocks, text = entry
+    if isinstance(blocks, dict):
+        # Posted over chat.notify: the same key without the choices. No typed
+        # answer is read back (there is no Slack client); the renderer owns
+        # the answered line.
+        return not ts or await _send_chat(adapter, sub, text, _chat.needs_you_settled(blocks), ts)
     if not ts or _clicked(channel, ts):
         return True
     note, credit, shown = "", None, False

@@ -55,6 +55,20 @@ class CommandTest(unittest.TestCase):
             for text in ("- pod crashlooping", "--- Daily report", "-1 nodes down", "--thread=spaces/X/threads/Y", "-"):
                 self.assertEqual(chat_notify.command("google_chat", text)[-2:], ["--", text])
 
+    def test_an_update_key_rides_the_gateway_path_only(self):
+        # The event alert's key, which lets its triage edit it in place under
+        # next; hermes send has no such key.
+        with mock.patch.dict(os.environ, ROUTED):
+            self.assertEqual(
+                chat_notify.command("google_chat", "alert", update=chat_notify.ALERT_UPDATE_KEY),
+                ["a2a", "notify", "--platform", "google_chat", "--update", "alert", "--", "alert"],
+            )
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: ""}):
+            self.assertEqual(
+                chat_notify.command("google_chat", "alert", update=chat_notify.ALERT_UPDATE_KEY),
+                ["hermes", "send", "--json", "--to", "google_chat", "alert"],
+            )
+
     def test_a_caller_deadline_becomes_the_cli_wait(self):
         with mock.patch.dict(os.environ, ROUTED):
             argv = chat_notify.command("google_chat", "x", wait_seconds=12.7)
@@ -132,6 +146,9 @@ class SessionKVCallersTest(unittest.TestCase):
             thread = self.skv._post_initial_alert("google_chat", "Warning: pod crashlooping")
         self.assertEqual(run.call_args.args[0][:4], ["a2a", "notify", "--platform", "google_chat"])
         self.assertEqual(thread, "spaces/H/threads/REAL")
+        # Its update key, so the triage can edit the alert in place.
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--update") + 1], chat_notify.ALERT_UPDATE_KEY)
 
     def test_the_relay_replies_on_a_known_thread_through_the_gateway(self):
         with mock.patch.dict(os.environ, ROUTED), \
