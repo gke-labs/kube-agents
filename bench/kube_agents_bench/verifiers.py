@@ -4587,9 +4587,9 @@ def report_store_command(audit: str) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
-    the envelope's ``status``, ``repo``, ``finished_at`` and ``current_ids``,
-    or the ``error`` that kept it unread. The document and ledger body stay in
-    the pod.
+    the envelope's ``status``, ``repo`` and ``finished_at``, and the ids of the
+    findings in its ``document`` (this run's own, never ids it only carried),
+    or the ``error`` that kept it unread. The rest stays in the pod.
     """
     script = f"""
 import glob, json, os
@@ -4598,7 +4598,10 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
     try:
         with open(path, encoding="utf-8") as handle:
             envelope = json.load(handle)
-        out.append({{key: envelope.get(key) for key in ("status", "repo", "finished_at", "current_ids")}})
+        entry = {{key: envelope.get(key) for key in ("status", "repo", "finished_at")}}
+        findings = (envelope.get("document") or {{}}).get("findings") or []
+        entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
+        out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
 print({_REPORT_STORE_READ!r} + json.dumps(out))
@@ -4630,8 +4633,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     store is on whichever pod ran the audit's shell. Passes when one envelope
     finished at or after the run started (``TranscriptSnapshot.started_at``
     less ``max_clock_skew_sec``), has ``status`` when the check names one, and
-    has, for each ``required_finding_phrases`` entry, an id in ``current_ids``
-    containing it.
+    has, for each ``required_finding_phrases`` entry, a finding in its
+    ``document`` whose id contains it. ``current_ids`` is not read: it also
+    carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
     store's readers look. A pod that cannot be read, or a run with no start
@@ -4682,12 +4686,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             )
         failures = []
         for envelope in fresh:
-            ids = [str(fid) for fid in envelope.get("current_ids") or []]
+            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
             elif missing:
-                failures.append(f"{envelope.get('repo')}: no finding id contains {missing}")
+                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw

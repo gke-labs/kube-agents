@@ -63,7 +63,7 @@ The agent's only output is a validated `findings.json` — one entry per deviati
 ./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <path>
 ```
 
-What it publishes has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff. On an install with no GitOps repository, neither tier exists: the run keeps its findings in the report store and reports them in chat.
+What it publishes to the GitOps repository has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff. An install with no GitOps repository gets neither tier: the run keeps its findings in the report store and reports them in chat.
 
 ### Tier 1 — the ledger issue
 

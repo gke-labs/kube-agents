@@ -426,7 +426,7 @@ What `finish` validates, publishes and prints, its exit codes, partial coverage,
 - `status == "CLEAN"` with `partial: true` → the clean result and `coverage_gaps`.
 - `status == "HELD"` → the clean result, the held ids (`unaccounted`) and the issue URL. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
 - `status == "OPENED"`, or `"UPDATED"` with a non-zero `new` or `resolved` → `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <issue_url>`
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
 
 ## Red Lines
 

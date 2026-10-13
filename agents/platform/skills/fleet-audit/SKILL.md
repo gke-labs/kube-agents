@@ -168,8 +168,9 @@ What that workspace contains depends on the install, and `start` tells you which
   harness runs `checkout`, `add`, `commit` and `push` inside it.
 - **`none`** — no forge is configured; see [No forge configured](#no-forge-configured).
 
-Everything else is identical, including where you write manifests and what `finish` publishes. Where
-the two differ, this file says which mode it is talking about.
+Between `content` and `directory` everything else is identical, including where you write manifests
+and what `finish` publishes. Where the two differ, this file says which mode it is talking about.
+`none` differs throughout, and its own section says how.
 
 ### Step 1 — `start`
 
@@ -537,12 +538,15 @@ no forge to write a ledger to. The audit runs anyway:
   remediation is still a valid way to describe a fix, but nothing opens it as a pull request.
 - `finish` validates the document as usual, then writes it to the report store instead of a ledger
   and prints `status: "NO_FORGE"`, `issue_url: null`, `new` and `resolved` against the previous
-  no-forge run, `findings`, `critical`, the `no_forge` note, and `summary`.
+  no-forge run, `findings`, `critical`, the `no_forge` note, and `summary`. A previous finding the
+  collector still flags is held, as on a ledger: it stays in the store and is not resolved. If the
+  store write fails, the note and the summary say so.
 
 **Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
 `[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
-names the findings, the coverage gaps, and that no forge is configured. Do not report the run as
+names the most severe findings with the object each one is about, the ids held for the collector,
+the coverage gaps, and that no forge is configured. Do not report the run as
 failed, and do not invent an issue URL.
 
 ## The findings document

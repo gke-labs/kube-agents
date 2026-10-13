@@ -184,8 +184,8 @@ With none, it writes the marker with the reason and starts nothing.
 
 It does not exit non-zero. No repository is a configuration the installer offers, not a fault, and
 a failing per-minute job repeats until something changes. The operator is told instead: the
-interactive installer's "GitOps repository connection skipped" line says the scheduled audits fail
-without one,
+interactive installer's "GitOps repository connection skipped" line says the scheduled audits run
+without one but write no ledger issue or pull request,
 and once delivery is a stage of `oobe` (§5) the delivered report is to carry one line saying the
 first-run audits did not run and why.
 

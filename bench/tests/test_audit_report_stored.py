@@ -67,7 +67,7 @@ def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BIN
         "status": status,
         "finished_at": finished.isoformat(),
         "current_ids": list(ids),
-        "document": {"findings": []},
+        "document": {"findings": [{"id": fid} for fid in ids]},
     }
     (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
 
@@ -107,6 +107,15 @@ def test_the_finding_has_to_be_in_the_report(root):
     result = _verify()
     assert result.status == "fail"
     assert "debug-binding" in result.reason
+
+
+def test_an_id_the_run_only_held_does_not_count(root):
+    _store(root, finished=STARTED + timedelta(minutes=12), ids=())
+    envelope_path = root / AUDIT / "no_forge" / "local" / "latest.json"
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    envelope["current_ids"] = [BINDING_ID]
+    envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+    assert _verify().status == "fail"
 
 
 def test_unreadable_pods_are_an_error(root, monkeypatch):

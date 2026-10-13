@@ -266,7 +266,8 @@ Session KV server in the agent pod and passes when every row in `finding_ids`, u
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
-the run started, with `status` and the ids `required_finding_phrases` name when it gives them. `oobe_audits_started`, in its own module
+the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
+finding in its `document` whose id contains it. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it

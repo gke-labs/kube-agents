@@ -817,8 +817,8 @@ NO_FORGE_NOTE = (
 NO_FORGE_UNSTORED_NOTE = (
     "No forge is configured (no GitOps repository is registered in "
     "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
-    "remediation pull request was opened. The report store could not be "
-    "written either, so this message is the only record of the findings."
+    "remediation pull request was opened. The report store write failed, so "
+    "the store may not hold this run: keep this message."
 )
 # The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
@@ -11774,8 +11774,15 @@ def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
     except RuntimeError:
         import gitops_workspace
 
-        if (repo and str(repo).strip()) or gitops_workspace.managed_repos_registered():
+        if repo and str(repo).strip():
             raise
+        if gitops_workspace.managed_repos_registered():
+            raise RuntimeError(
+                "managed_repos in $GITOPS_STATE_CONFIGMAP holds a value this image cannot "
+                "use (it does not parse as a list of {type, url} entries, or names a forge "
+                "type this image does not serve); fix the entry, or empty it to run the "
+                "audits with no forge"
+            ) from None
         return NO_FORGE_REPO
 
 
@@ -15989,8 +15996,12 @@ def render_no_forge_summary(
     if len(ordered) > NO_FORGE_SUMMARY_FINDINGS:
         lines.append(f"- and {len(ordered) - NO_FORGE_SUMMARY_FINDINGS} more in the report store")
     if held:
+        shown = ", ".join(held[:NO_FORGE_SUMMARY_FINDINGS])
+        more = len(held) - NO_FORGE_SUMMARY_FINDINGS
         lines.append(
-            f"Still flagged by the collector but not in this run's document: {', '.join(held)}"
+            "Still flagged by the collector but not in this run's document: "
+            + shown
+            + (f", and {more} more in the report store" if more > 0 else "")
         )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
@@ -16029,8 +16040,12 @@ def _finish_without_forge(
     current_ids = finding_ids(findings)
     previous_ids = previous_no_forge_ids(audit_id)
     delta_known = previous_ids is not None
+    # A posture `finish` withheld is in the document, only not published,
+    # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
-        (set(previous_ids or []) & still_flagged_ids(manifest, data)) - set(current_ids)
+        (set(previous_ids or []) & still_flagged_ids(manifest, data))
+        - set(current_ids)
+        - set(finding_ids(postures_withheld(data)))
     )
     stored_ids = sorted(set(current_ids) | set(held))
     new_ids = sorted(set(current_ids) - set(previous_ids or []))

@@ -25070,13 +25070,13 @@ class TestNoForge(BaseTestCase):
         for text in (
             '{"type": "github", "url": "https://github.com/acme/gitops"}',
             '[{"url": "https://github.com/acme/gitops"}]',
-            '[{"type": "gitea", "url": "https://gitea.example.com/acme/gitops"}]',
+            '[{"type": "subversion", "url": "https://svn.example.com/acme/gitops"}]',
             "[not json",
         ):
             with self.subTest(text=text):
                 self.managed_text = text
                 self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
-                self.assertIn("Could not resolve the target repository", self.err)
+                self.assertIn("holds a value this image cannot use", self.err)
                 self.assertEqual(self.out, "")
 
     def test_finish_stores_the_findings_and_prints_a_summary(self):
@@ -25117,6 +25117,20 @@ class TestNoForge(BaseTestCase):
         fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
         self.assertFalse(fixed["silent_ok"])
+
+    def test_a_withheld_posture_is_not_reported_as_held(self):
+        self.finish(make_doc())
+        (fid,) = json.loads((self.store() / "latest.json").read_text())["current_ids"]
+        self.patch_attr("still_flagged_ids", lambda manifest, data: {fid})
+        doc = make_doc()
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        self.record_run(repo=audit_report.NO_FORGE_REPO, context=["acme/context"], audit=AUDIT)
+        self.patch_attr("context_repo_entries", lambda: [{"repo": "acme/context", "ref": None, audit_report.REFUSED_REF_KEY: None}])
+
+        out = self.finish(doc)
+
+        self.assertEqual(out[audit_report.POSTURES_WITHHELD_KEY], [fid])
+        self.assertNotIn("Still flagged", out["summary"])
 
     def test_a_finding_the_collector_still_flags_is_held_not_resolved(self):
         self.finish(make_doc(findings=THREE_SEVERITIES))
