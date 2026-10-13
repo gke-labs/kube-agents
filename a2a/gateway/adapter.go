@@ -64,6 +64,12 @@ type InboundMessage struct {
 	// where to send it instead of being read as an ask. False is every
 	// other message, and every other backend's case.
 	TopLevel bool
+	// Click marks a message that is a click on a choice button rather than a
+	// message of its own: MessageID then names the click (the audit chain's
+	// join), not a message anything can be drawn on. A chain a click starts
+	// carries its mark on the conversation's previous ask instead (mark.go).
+	// False for a typed message, and for every backend but Slack.
+	Click bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running

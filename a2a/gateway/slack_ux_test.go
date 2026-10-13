@@ -120,7 +120,7 @@ func TestSlackClickIsATurnFromTheClicker(t *testing.T) {
 	if !ok {
 		t.Fatal("a choice click must be a turn")
 	}
-	want := InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.1", Text: "Option A: restart"}
+	want := InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.1", Text: "Option A: restart", Click: true}
 	if msg != want {
 		t.Errorf("turn = %+v, want %+v", msg, want)
 	}

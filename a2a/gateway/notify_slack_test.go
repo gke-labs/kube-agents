@@ -301,8 +301,8 @@ func TestNotifyRefusesBlocksOnAConversation(t *testing.T) {
 	}
 }
 
-// TestSlackNotifyRefusesInteractiveBlocks: the gateway acks no click, so a
-// button, a select or an actions block is refused at the gateway, whatever
+// TestSlackNotifyRefusesInteractiveBlocks: the gateway answers clicks only on
+// the buttons it draws, so a raw button, select or actions block is refused at the gateway, whatever
 // the sender stripped; a link in text is not interactive.
 func TestSlackNotifyRefusesInteractiveBlocks(t *testing.T) {
 	adapter, stub := startSlackStubAdapter(t)

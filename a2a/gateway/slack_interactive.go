@@ -312,6 +312,7 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		AuthorID:     p.User.ID,
 		MessageID:    p.ActionTS,
 		Text:         text,
+		Click:        true,
 	}, true
 }
 

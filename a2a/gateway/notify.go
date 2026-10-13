@@ -238,6 +238,10 @@ type notifyJob struct {
 	// deadline is when the requester stops waiting for the answer; zero
 	// when the request did not say.
 	deadline time.Time
+	// mark is the mark a conversation request's chat message carried, nil
+	// when it carried none; reply draws it once the request is answered
+	// with a post, and never for a request that posted nothing.
+	mark *MarkState
 }
 
 // reply answers the job. When the answer says nothing was posted and the
@@ -251,6 +255,14 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 			"text", firstLine(job.req.Text, notifyLostLineMax))
 	}
 	job.answer(r)
+	// After the answer, so the requester does not wait on the session lock,
+	// and only for a post that landed, so the ask's reaction comes off when
+	// the answer is in the thread and not when it failed to be.
+	if r.Error == "" && job.mark != nil {
+		if marker, ok := n.conv.(notifyMarker); ok {
+			marker.MarkConversation(job.req.Conversation, *job.mark)
+		}
+	}
 }
 
 // firstLine is text's first line, cut to max runes.
@@ -433,7 +445,7 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 			return refuse("blocks carry a mention (" + why + "); the notify route posts no mentions, send them as text")
 		}
 		if kind := blocksInteractive(blocks); kind != "" {
-			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers no clicks, so strip it")
+			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers clicks only on the buttons it draws, so strip it")
 		}
 	}
 	return req, nil
@@ -499,6 +511,12 @@ func (n *Notifier) post(job notifyJob) {
 		n.postBlocks(job)
 		return
 	}
+	if job.req.Conversation != "" && len(job.req.Chat) > 0 {
+		// A bad mark drops alone (postConversation logs the rules broken).
+		if mark := chatmsg.ReadNotify(job.req.Text, job.req.Chat).Mark; mark != nil {
+			job.mark = &MarkState{Ask: mark.Ask, Settle: mark.Settle}
+		}
+	}
 	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "") && n.postConversation(job) {
 		return
 	}
@@ -548,7 +566,7 @@ func (n *Notifier) post(job notifyJob) {
 // chat message the adapter lays out is one message; otherwise it is not
 // answered here, and post sends its text in chunks as it always has. The
 // mark a chat message carries is drawn on the conversation's latest chain
-// message once the request is handled (MarkConversation).
+// message once a post answers the request (reply, MarkConversation).
 func (n *Notifier) postConversation(job notifyJob) bool {
 	conversation := job.req.Conversation
 	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
@@ -557,14 +575,6 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 		for _, p := range reading.Problems {
 			n.log.Warn("notify: chat message dropped; its text fallback stands",
 				"conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
-		}
-	}
-	if reading.Mark != nil {
-		// Drawn once the request is answered, after its post, so the ask's
-		// reaction comes off when the answer is in the thread.
-		if marker, ok := n.conv.(notifyMarker); ok {
-			mark := MarkState{Ask: reading.Mark.Ask, Settle: reading.Mark.Settle}
-			defer marker.MarkConversation(conversation, mark)
 		}
 	}
 	m := OutMessage{Text: job.req.Text, Chat: reading.Message}
@@ -724,9 +734,10 @@ func blocksMention(v any) string {
 }
 
 // notifyInteractiveTypes are the block and element types a click or an
-// entry arrives from. The gateway acks no interactive envelope, so a click
-// on one would time out for the user; validate refuses them rather than
-// trusting the sender to strip them.
+// entry arrives from. The gateway answers clicks only on the choice buttons
+// it draws itself from a chat message, so a click on one of these would do
+// nothing for the user; validate refuses them rather than trusting the
+// sender to strip them.
 var notifyInteractiveTypes = []string{
 	"actions", "input", "button", "overflow", "checkboxes", "radio_buttons",
 	"datepicker", "timepicker", "datetimepicker", "plain_text_input",

@@ -357,6 +357,75 @@ func TestTerminalMarkIsDrawnOnTheAsk(t *testing.T) {
 	})
 }
 
+// A delegated child's end is not the chain's: its terminal default waits for
+// the wake, so a failed child leaves no ❌ over a wake that then answers, and
+// the ask's reaction stays on until the wake's answer.
+func TestAChildsEndLeavesTheMarkToTheWake(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-mark"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how is the fleet?")
+	ask := conv + "-0"
+	mark := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &chatmsg.Mark{Ask: "fleet"}})
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-p", Name: lib.ArtifactProgress,
+		Parts: []lib.Part{{Kind: "text", Text: "looking"}, mark}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the ask's mark", func() bool { return len(r.adapter.reactionCalls()) == 1 })
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	child := awaitSubmission(t, r, targetPlatform, 0)
+	waitFor(t, "chain on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return len(pref.Children) == 1
+	})
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	publishFinal(t, r, child, targetPlatform, lib.StateFailed, "reason: quota - exceeded")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint([]string{conv + " +fleet@" + ask}) {
+		t.Fatalf("reactions before the wake answered = %v; the child's end must not settle the chain", got)
+	}
+	completeTask(t, r.execFor(t, wake, wakeSession), "the quota ran out; the fleet itself is fine")
+	want := []string{conv + " +fleet@" + ask, conv + " -fleet@" + ask}
+	waitFor(t, "the wake's settle", func() bool { return len(r.adapter.reactionCalls()) == len(want) })
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reactions = %v, want %v (no ❌ over a wake that answered)", got, want)
+	}
+}
+
+// A click that starts a chain marks the ask whose question it answered, not
+// the click (which is no message).
+func TestAClickChainMarksThePreviousAsk(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/click-chain"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "which cluster first?"}
+	origin := r.awaitTask(t, "platform")
+	question, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "question", Settle: "blocked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: "prod-eu or prod-us?"}}, false, true)
+	publishStatusMessage(t, r, origin, lib.StateCompleted, true, []lib.Part{question})
+	waitFor(t, "the question's mark", func() bool { return len(r.adapter.reactionCalls()) == 2 })
+	waitFor(t, "the chain to end", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "click-ts", Text: "prod-eu", Click: true}
+	second := awaitSubmission(t, r, "platform", 1)
+	completeTask(t, r.execFor(t, second, "platform"), "prod-eu is done")
+	want := []string{conv + " +question@d-5", conv + " +blocked@d-5", conv + " -question@d-5", conv + " -blocked@d-5"}
+	waitFor(t, "the click chain's settle", func() bool { return len(r.adapter.reactionCalls()) == len(want) })
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reactions = %v, want %v", got, want)
+	}
+}
+
 // A conversation notify's mark lands on the latest chain's ask once its task
 // has ended, and is written to the record; while a task runs it is dropped.
 func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {

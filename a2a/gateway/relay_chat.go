@@ -164,10 +164,18 @@ func (g *Gateway) markFrom(rec *SessionRecord, taskID string, r chatmsg.Reading)
 }
 
 // terminalMark draws a terminal's mark: the one its mark-only chat message
-// carried, or the default for a terminal with none.
+// carried, or the default for a terminal with none. A delegated child's end
+// takes no default here: its terminal is relayed before the wake that
+// digests it is minted, so the child still reads as the chain's newest task,
+// and the default would take the ask off (or leave ❌ over a wake that then
+// succeeds) before the chain's answer. The wake's own terminal settles the
+// chain, or observeChildEnd when no wake starts.
 func (g *Gateway) terminalMark(rec *SessionRecord, taskID string, state lib.TaskState, r chatmsg.Reading) {
 	if r.Mark != nil {
 		g.markFrom(rec, taskID, r)
+		return
+	}
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
 		return
 	}
 	g.applyTerminalMark(rec, taskID, state)

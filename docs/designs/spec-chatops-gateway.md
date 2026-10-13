@@ -1639,7 +1639,11 @@ as `slack:<user_id>`, the principal they get as a requester.
 `blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the chain's newest
 task's mark, the terminal default, a conversation notify's mark) and records what it drew on
 the chain's root history entry, so a mark draws only its difference, across a restart too; the
-adapter owns which emoji a token shows, and removes only its own reactions. Interactive
+adapter owns which emoji a token shows, and removes only its own reactions. A delegated child's
+terminal takes no default, since it is relayed before the wake that digests it exists: the
+wake's terminal settles the chain, or the child's end does when no wake starts. A click is no
+message of its own, so a chain a click starts marks the ask of the conversation's previous
+chain, from what is already drawn there. Interactive
 envelopes are acked like events. A click on a choice button the renderer drew is a message from
 the clicker whose text is the choice's reply, handed to the gateway like a typed one, so the
 allowlist and the map judge it the same way and it carries no intent. The gateway tells the
@@ -1734,12 +1738,12 @@ reach, makes the message one the adapter will not send (`blocksMention`, the not
 check). The blocks go on the wire as the renderer wrote them, not through slack-go's types.
 The live message shows the newest progress chat message under every display mode, and keeps it
 when the task ends, its text turning to the terminal line; a progress artifact without one turns
-the message back to text. Nothing answers a click yet: a choice button opens nothing, and Slack
-marks a click on any button, a link's included, as failed until the gateway acks interactions.
-That is the exception to the notify route's refusal of interactive blocks below: a raw `blocks`
-request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat
-message's buttons are the gateway's own, built from validated choices whose click text the
-gateway will read as an ordinary message once it answers clicks. The fold's text goes through
+the message back to text. A click on a choice button is a message from the clicker whose text
+is the button's `value` (Reactions, clicks and Agent Sessions, above); a link button opens its
+url and its click is only acked. That is the exception to the notify route's refusal of
+interactive blocks: a raw `blocks` request is the sender's layout and the gateway cannot vouch
+for what a click sends, while a chat message's buttons are the gateway's own, built from
+validated choices whose click text the gateway reads as an ordinary message. The fold's text goes through
 `toMrkdwn`, the translation the text path uses, so markdown the text path leaves raw (a heading,
 a bullet) shows raw there too. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
 message the shared cases in `tests/conformance/chat/` expect, checked on every run.

@@ -94,6 +94,24 @@ func (rec *SessionRecord) latestChainIndex() int {
 	return -1
 }
 
+// clickAskMessage is the ask message, and the mark drawn on it, that a chain
+// a click starts takes over: the conversation's latest chain's. A click is
+// no message of its own, so its chain marks the ask whose question it
+// answered, starting from what is already drawn there so the next mark draws
+// only its difference. Empty when the conversation has no such chain.
+func (rec *SessionRecord) clickAskMessage() (string, *MarkState) {
+	i := rec.latestChainIndex()
+	if i < 0 {
+		return "", nil
+	}
+	var mark *MarkState
+	if m := rec.Tasks[i].Mark; m != nil {
+		copied := *m
+		mark = &copied
+	}
+	return rec.Tasks[i].AskMessageID, mark
+}
+
 // applyTaskMark draws a mark a task's own chat message carried. Only the
 // chain's newest task's mark counts. The caller holds the session lock and
 // writes the record after.
