@@ -246,7 +246,8 @@ run wrote, and grades each incident from its own reads: an Error the after-upgra
 and still present on Sunday is an Error on Sunday too and files at `major`, since Sunday is the
 first run that files it, and one that is gone clears its guard and is filed nowhere. What Sunday
 marks as already reviewed is the operation, in (A), with the route and time that reviewed it; the
-guard the scoped run wrote keeps its first-seen date and gains a review. A second wake for an
+guard the scoped run wrote keeps its first-seen date and gains a review, and the incident's
+candidate is the object's only one that run, carrying both (§3.3). A second wake for an
 operation already in the list prints nothing. This is the one statement of what a scoped run
 writes; §3.5 and §3.6 defer to it. The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
@@ -380,12 +381,20 @@ cluster of that project with only the checks a re-check read backs, so `coverage
 rest. A cluster whose project listing failed or whose every read failed is `unreachable` or
 `gate-failed` with the error, and a cluster upgrading now or settling (§3.2) is `gate-failed` with
 the operation as its `error`: the run read nothing on it. `candidates[]` carries one candidate per
-incident the report files, an Error at `major` and a Warning at `minor`, with the check id, the
-object, the excerpt and the mitigation text; the object is the workload's `Kind/name` under its
-namespace or, with an empty namespace, `Node/<name>`, `NodePool/<pool>` or `Operation/<name>`
-(§3.4); and one candidate per `failure` guard the run observed again (§3.5), under the check id
-its finding was first filed with, graded the Warning requirement 3 makes it and carrying the
-persistence in its detail: first seen, and the number of reviews that have seen it. A `risk`
+object per run, keyed `(check, cluster, namespace, object)`; the object is the workload's
+`Kind/name` under its namespace or, with an empty namespace, `Node/<name>`, `NodePool/<pool>` or
+`Operation/<name>` (§3.4). An incident the report files this run is the object's candidate, an
+Error at `major` and a Warning at `minor`, under the check this run's grading gives it, with the
+excerpt and the mitigation text and, where the object carried a guard, that guard's first-seen
+date and review count in its detail. A `failure` guard whose object has no incident this run, one
+the re-check observed again or a keep rule kept (§3.5), emits its own candidate under the check id
+its finding was first filed with, graded the Warning requirement 3 makes it and carrying the same
+persistence. An incident therefore supersedes the guard's candidate for the run: a Tuesday Error
+that Sunday reviews again, or a budget that holds the next upgrade's drain, yields one candidate,
+the incident's, never two under one id, which `validate_findings` would refuse. The guard follows
+the incident: it keeps its first-seen date, gains a review, and takes the incident's check when
+the grading moved (§3.5), so when the check changed the old id is resolved by the absence of a
+candidate under it and the new id is filed, one finding per object. A `risk`
 guard is Info, filed nowhere, and is no candidate. The carried keys the manifest reserves for
 collector-resolved fleet facts hold the versions, operations and incident kinds the SOP copies.
 The SOP's `draft` builds `scope.clusters` from the `collected` entries, with `checks_run` equal to
@@ -399,9 +408,10 @@ resolved only on a complete run, and only when no candidate carries its `(check,
 namespace, object)` id (`still_flagged_ids` is that set of candidate ids). A guard the re-check
 observes again therefore emits its candidate, the unclassified Warning's guard among them (§3.5),
 under its original check id, and a guard the re-check clears emits nothing, so the harness resolves
-the finding. A persisting finding has no check id of its own: a candidate under a new id would
-file a new finding and let the harness announce the old one fixed, the resolved-plus-new pair the
-fixed row order (§3.4) exists to prevent. A cluster the run did not read, upgrading now,
+the finding. A persisting finding has no check id of its own: a held candidate under a new id
+would file a new finding and let the harness announce the old one fixed, the resolved-plus-new
+pair the fixed row order (§3.4) exists to prevent on unchanged evidence; only an incident this run
+grades anew moves a finding to another check, as above. A cluster the run did not read, upgrading now,
 unreachable, or with a re-check read that failed, emits no candidate: a candidate with no read
 behind it would make the manifest vouch for an observation nobody made, and
 `checks_not_applicable` is for a check that cannot apply to a cluster (Autopilot, no such resource
@@ -471,17 +481,25 @@ floor, a workload with more than one replica: a single replica displaced by a dr
 Pending replacement) or entry 1 (the budget that held its drain), never 3, so
 `seeded-upgrade/pinned-batch-runner` files entry 1 on its budget (§4) and, while its replacement is
 still Pending, a second incident on the Deployment graded by the replacement's scheduling message
-(row 2: its selector names a label its pool's nodes carry, and that pool's clause reads
+(row 2: a node of its pool satisfies its selector, and that pool's clause reads
 `Insufficient cpu`). Row 12 is the generic one, and its discriminator is the nodes read, not the
 message. The scheduler writes a `didn't match Pod's node affinity/selector` clause for every node
 group a pinned pod does not target, beside the clause that says why its own pool refused it
 (`Insufficient cpu`, `Too many pods`, `were unschedulable`, an untolerated taint), so on a cluster
 with more than one pool every pinned Pending pod carries a miss clause and the clause proves
-nothing. The collector reads the pod's pins, its `nodeSelector` and required node affinity, against
-the labels the nodes carry. When a node carries the labels of one of the pod's terms, the pod's own
-pool evaluated it and refused it for the reason in that pool's clause: row 2 when the clause reads
-`Insufficient cpu` or `memory`, row 18 for `nvidia.com/gpu`, else unclassified, never 12. Row 12
-holds only when no node carries the pinned labels. That still does not say the pool lost the label:
+nothing. The collector reads the pod's pins, its `nodeSelector` and its required node-affinity
+terms, against the nodes read, with the API's own predicate: a node satisfies the pins when it
+carries every `nodeSelector` label with its value and satisfies any one
+`requiredDuringSchedulingIgnoredDuringExecution` term, every expression of the term by its
+operator: `In` by a listed value, `Exists` by the key's presence, `NotIn` and `DoesNotExist` by
+absence (no such key, or a value not listed), `Gt` and `Lt` by an integer compare, and a
+`matchFields` expression on the node's name. When a node satisfies the pins, the pod's own pool
+evaluated it and refused it for the reason in that pool's clause: row 2 when the clause reads
+`Insufficient cpu` or `memory`, row 18 for `nvidia.com/gpu`, else unclassified, never 12; so a pod
+kept off spot nodes by `cloud.google.com/gke-spot DoesNotExist` or `gke-preemptible NotIn [true]`
+and refused by its standard pool for `Insufficient cpu` is row 2, the standard node satisfying the
+term by absence. Row 12 holds only when no node satisfies the pins. That still does not say the
+pool lost the label:
 a label the pool never carried, a deleted pool or an autoscaled pool at zero nodes read the same,
 and the collector holds no before-state of node labels, so row 12 is `medium`. The repository's
 entry-12 reproduction, `bench/upgrade-scenarios/evidence/12/label.txt`, is this case once the pool
@@ -563,8 +581,9 @@ automatic and both reversible:
   entry (`unclassified` for a symptom no row holds for, `operation` for a failed operation), object
   (`namespace/kind/name`, or `Node/<name>`, `NodePool/<pool>` or `Operation/<name>` with no
   namespace), evidence, source (pod or node state, events alone, or the operations listing), the
-  check id its incident was filed under, first and last seen, and the number of reviews that have
-  seen it; the last three are what its re-emitted candidate carries (§3.3). An operation's guard
+  check id its incident was last filed under (a re-grade moves it, §3.3), first and last seen, and
+  the number of reviews that have seen it; the last three are what its re-emitted candidate
+  carries (§3.3). An operation's guard
   is re-checked through the operations listing every run already makes for its project, so it
   costs no read: it stands while the listing returns the operation `DONE` with `error` and no
   later operation of the same type on the same target that reached `DONE` without `error`; that
@@ -799,7 +818,13 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   reading run emits carrying them; an Error the after-upgrade route reported, filed at `major` by
   the next full run; an unreachable cluster and an upgrading cluster recorded without failing the
   run and without a candidate; the watch marking nothing for a paused, disabled or absent job;
-  the report rendering, including an empty section and the severity of each fixture incident.
+  one candidate per object on a reviewed cluster whose incident covers a guard (the incident's,
+  under this run's check, with the guard's first-seen date and review count), the guard's check
+  moved on a re-grade and the old id absent from `collector_flagged_ids`; row 12's node predicate
+  per operator: a pod kept off spot nodes by `cloud.google.com/gke-spot DoesNotExist` or
+  `gke-preemptible NotIn [true]` and refused for `Insufficient cpu` is row 2, and `Exists` on a key
+  no node carries is row 12; the report rendering, including an empty section and the severity of
+  each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
