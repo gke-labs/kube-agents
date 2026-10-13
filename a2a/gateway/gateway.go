@@ -612,6 +612,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	defer g.observeTurnFinished(msg.Conversation)
 
 	backend, principal, ok := g.verifySender(msg)
+	g.observeInboundVerified(msg, ok)
 	if !ok {
 		return
 	}
@@ -1907,6 +1908,14 @@ func (g *Gateway) observeMessageDropped(conversation, authorID string) {
 	}
 }
 
+// observeInboundVerified tells a VerifiedObserver whether a message passed
+// sender verification. See VerifiedObserver.
+func (g *Gateway) observeInboundVerified(msg InboundMessage, verified bool) {
+	if observer, ok := g.adapter.(VerifiedObserver); ok {
+		observer.InboundVerified(msg.Conversation, msg.MessageID, verified)
+	}
+}
+
 // observeTurnFinished tells an InboundObserver that a turn on a conversation
 // has ended. Deferred in handleInbound, so an early return announces it too.
 func (g *Gateway) observeTurnFinished(conversation string) {
@@ -2156,6 +2165,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
+		// The message the chain's mark is drawn on (mark.go).
+		ref.AskMessageID = ts.MessageID
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)

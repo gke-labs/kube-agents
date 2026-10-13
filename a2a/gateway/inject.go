@@ -815,6 +815,11 @@ func (a *InjectAdapter) Roster(conversation string) ([]string, bool, error) {
 	return []string{conv.requester}, true, nil
 }
 
+// React and RemoveReaction: a program reads no reactions, so the door draws
+// no mark (Adapter).
+func (a *InjectAdapter) React(string, string, string) error          { return nil }
+func (a *InjectAdapter) RemoveReaction(string, string, string) error { return nil }
+
 // OpenDirect is the DM-switch primitive, and on this door it returns the
 // conversation the user is already in. Every synthetic conversation has one
 // participant, so the direct conversation with that participant is the

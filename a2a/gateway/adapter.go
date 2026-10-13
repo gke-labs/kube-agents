@@ -103,6 +103,46 @@ type Adapter interface {
 	// that decides to use it comes later. Until then everything posts to the
 	// room it came from.
 	OpenDirect(userID string) (conversation string, err error)
+
+	// React puts the reaction for a mark token on a message the conversation
+	// received, and RemoveReaction takes it off: the `mark` of a chat
+	// message (spec-a2a-payloads.md, "mark"), an ask kind (question,
+	// investigate, ...) or a settle (blocked, failed). The gateway decides
+	// which tokens a message carries; the adapter only owns which emoji, if
+	// any, a token shows, and a token it has none for is a nil no-op.
+	//
+	// Both are best effort, and the rule is the adapter's own: the gateway
+	// holds the bot token, so no credential-proxy rule applies here. An
+	// adapter removes only a reaction the bot itself put on, never anyone
+	// else's, and a backend that cannot react returns nil from both, as
+	// does a reaction that is already there or already gone. A failure is
+	// returned for the caller to log; it never holds up the answer.
+	React(conversation, messageID, token string) error
+	RemoveReaction(conversation, messageID, token string) error
+}
+
+// MarkObserver is the optional extension an Adapter implements to learn the
+// whole mark state of a conversation's latest ask whenever the gateway
+// changes it, beside the React and RemoveReaction calls that draw it. The
+// Slack adapter uses it to hold the thread's Agent Sessions status: an ask
+// whose chain has ended but still carries its kind is card work still open,
+// and a blocked settle is work waiting on the user. Called where the mark is
+// applied, on the conversation's worker under its session lock: record and
+// return.
+type MarkObserver interface {
+	MarkChanged(conversation string, ask, settle string)
+}
+
+// VerifiedObserver is the optional extension an Adapter implements to learn
+// whether a message it handed over passed sender verification (verified:
+// it goes on as a turn) or was dropped. A backend that has to act on the
+// message itself -- the Slack adapter rewriting a clicked question to say
+// who answered, or titling the thread -- must not act for a sender the
+// gateway drops, and only the gateway holds the principal map. Called once
+// per message, on the conversation's inbox worker before the session lock
+// is taken: record and return.
+type VerifiedObserver interface {
+	InboundVerified(conversation, messageID string, verified bool)
 }
 
 // TaskObserver is the optional extension an Adapter implements when it has to

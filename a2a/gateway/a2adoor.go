@@ -1277,6 +1277,11 @@ func (d *A2ADoor) Roster(conversation string) ([]string, bool, error) {
 	return []string{conv.caller}, true, nil
 }
 
+// React and RemoveReaction: a program reads no reactions, so the door draws
+// no mark (Adapter).
+func (d *A2ADoor) React(string, string, string) error          { return nil }
+func (d *A2ADoor) RemoveReaction(string, string, string) error { return nil }
+
 // OpenDirect returns the conversation the caller last spoke on, for the
 // reason the inject door's does: there is no second surface to move to.
 func (d *A2ADoor) OpenDirect(userID string) (string, error) {

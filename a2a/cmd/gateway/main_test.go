@@ -239,6 +239,9 @@ func (f *fakePrimary) OpenDirect(userID string) (string, error) {
 	return "", nil
 }
 
+func (f *fakePrimary) React(string, string, string) error          { return nil }
+func (f *fakePrimary) RemoveReaction(string, string, string) error { return nil }
+
 // TestBuildAdaptersIncludesTheConsole proves buildAdapters wires both the
 // configured chat backend and the console adapter behind one mux: a post to
 // either backend's prefix must reach it (spec-chatops-gateway.md, "The

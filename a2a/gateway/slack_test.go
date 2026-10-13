@@ -35,6 +35,50 @@ type fakeSlackAPI struct {
 	members  []string
 	cursor   string
 	openedIM string
+	// updatedBlocks and updatedAttachments are each update's blocks and
+	// attachments fields as sent, beside updated.
+	updatedBlocks      []string
+	updatedAttachments []string
+	// reactions records reactions.add and .remove as "+name channel/ts" and
+	// "-name channel/ts"; reactErr, when set, is every reaction call's error.
+	reactions []string
+	reactErr  error
+	// users answers users.info; userInfoCalls counts the calls.
+	users         map[string]*slack.User
+	userInfoCalls int
+	// prompts records setSuggestedPrompts calls.
+	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+}
+
+func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "+"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) RemoveReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "-"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) GetUserInfo(user string) (*slack.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userInfoCalls++
+	if u, ok := f.users[user]; ok {
+		return u, nil
+	}
+	return nil, errors.New("user_not_found")
+}
+
+func (f *fakeSlackAPI) SetAssistantThreadsSuggestedPrompts(p slack.AssistantThreadsSetSuggestedPromptsParameters) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prompts = append(f.prompts, p)
+	return nil
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
@@ -64,6 +108,11 @@ func (f *fakeSlackAPI) UpdateMessage(channelID, timestamp string, options ...sla
 	f.updated = append(f.updated, struct{ channel, ts, text string }{
 		values.Get("channel"), timestamp, values.Get("text"),
 	})
+	// Blocks and attachments live outside the values UnsafeApplyMsgOptions
+	// returns, so they are read off the wire form a real client sends.
+	sent := sentUpdateForm(channelID, timestamp, options...)
+	f.updatedBlocks = append(f.updatedBlocks, sent.Get("blocks"))
+	f.updatedAttachments = append(f.updatedAttachments, sent.Get("attachments"))
 	return channelID, timestamp, "", nil
 }
 
@@ -2628,6 +2677,21 @@ func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
 	if got := len(inSubjectEnvelopes(t, r.url, "platform")); got != 0 {
 		t.Errorf("%d task envelopes published for a disallowed sender", got)
 	}
+}
+
+// TestSlackVerificationIsToldToTheAdapter: the adapter learns the gateway's
+// word on every sender (VerifiedObserver), so a click from a sender the
+// gateway drops rewrites nothing, and an admitted one's does. A click is a
+// message like any other here: same path, same allowlist.
+func TestSlackVerificationIsToldToTheAdapter(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U2", MessageID: "60.1", Text: "Option A: restart"}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.2", Text: "Option A: restart"}
+	waitFor(t, "both verdicts", func() bool { return len(r.adapter.verifiedCalls()) == 2 })
+	if got, want := r.adapter.verifiedCalls(), []string{"60.1:false", "60.2:true"}; !slices.Equal(got, want) {
+		t.Errorf("verdicts = %v, want %v", got, want)
+	}
+	slackAuthorityOf(t, r)
 }
 
 // TestSlackListedUnmappedSenderIsAttributedByMemberID: the map is an

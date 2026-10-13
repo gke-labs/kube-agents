@@ -408,3 +408,7 @@ func (a *ConsoleAdapter) Roster(conversation string) ([]string, bool, error) {
 func (a *ConsoleAdapter) OpenDirect(string) (string, error) {
 	return "", errors.New("console adapter: no direct channel beyond the conversation")
 }
+
+// React and RemoveReaction: the console has no reactions (Adapter).
+func (a *ConsoleAdapter) React(string, string, string) error          { return nil }
+func (a *ConsoleAdapter) RemoveReaction(string, string, string) error { return nil }

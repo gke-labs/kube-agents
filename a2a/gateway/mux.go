@@ -180,6 +180,40 @@ func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
 	return m.byPrefix[m.primary].OpenDirect(userID)
 }
 
+func (m *MultiAdapter) React(conversation, messageID, token string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.React(conversation, messageID, token)
+}
+
+func (m *MultiAdapter) RemoveReaction(conversation, messageID, token string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.RemoveReaction(conversation, messageID, token)
+}
+
+// MarkChanged and InboundVerified route like the observer calls below: to
+// the backend that owns the conversation, when it implements the interface.
+func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
+	if a, err := m.pick(conversation); err == nil {
+		if observer, ok := a.(MarkObserver); ok {
+			observer.MarkChanged(conversation, ask, settle)
+		}
+	}
+}
+
+func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
+	if a, err := m.pick(conversation); err == nil {
+		if observer, ok := a.(VerifiedObserver); ok {
+			observer.InboundVerified(conversation, messageID, verified)
+		}
+	}
+}
+
 // The gateway finds TaskObserver and SessionLookupSink by type assertion on
 // the top of the adapter stack, and with a real chat backend the mux is that
 // top (or the primary under the inject door, which asserts on it in turn).

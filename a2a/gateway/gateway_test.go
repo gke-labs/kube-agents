@@ -183,6 +183,10 @@ type fakeAdapter struct {
 	// stopDelay is how long Run takes to return once told to stop, for
 	// pinning that a caller waits for it rather than exiting on its own.
 	stopDelay time.Duration
+	// reactions records React and RemoveReaction calls (reactionCalls).
+	reactions []string
+	// verified records InboundVerified calls (verifiedCalls).
+	verified []string
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -235,6 +239,42 @@ func (a *fakeAdapter) Roster(string) ([]string, bool, error) {
 
 func (a *fakeAdapter) OpenDirect(userID string) (string, error) {
 	return "discord:dm/du-" + userID, nil
+}
+
+// React and RemoveReaction record each call as "+token@messageID" or
+// "-token@messageID", per conversation, in call order.
+func (a *fakeAdapter) React(conversation, messageID, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reactions = append(a.reactions, conversation+" +"+token+"@"+messageID)
+	return nil
+}
+
+func (a *fakeAdapter) RemoveReaction(conversation, messageID, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reactions = append(a.reactions, conversation+" -"+token+"@"+messageID)
+	return nil
+}
+
+// InboundVerified records the gateway's word on each sender as
+// "messageID:true" or "messageID:false" (VerifiedObserver).
+func (a *fakeAdapter) InboundVerified(_, messageID string, verified bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.verified = append(a.verified, fmt.Sprintf("%s:%t", messageID, verified))
+}
+
+func (a *fakeAdapter) verifiedCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.verified...)
+}
+
+func (a *fakeAdapter) reactionCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.reactions...)
 }
 
 func (a *fakeAdapter) postTexts() []string {
