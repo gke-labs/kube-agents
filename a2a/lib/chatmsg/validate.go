@@ -2,7 +2,6 @@ package chatmsg
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 	"unicode"
@@ -47,6 +46,10 @@ const (
 	authorityStart = "://"
 	authorityEnds  = "/?#"
 	backslash      = `\`
+	userinfoMark   = "@"
+	portMark       = ":"
+	ipv6Open       = "["
+	ipv6Close      = "]"
 	lineBreaks     = "\r\n"
 )
 
@@ -320,7 +323,9 @@ func validateMark(m Mark) error {
 // SafeURL reports why raw may not back a link, or nil: http or https with a
 // host, no userinfo, no whitespace or unprintable character, no backslash
 // in the host part (a browser reads one as a slash), at most urlMax
-// characters. The today presenter's _safe_link_url, which this mirrors.
+// characters. It reads the url as the today presenter's _safe_link_url does
+// (Python's urlsplit), splitting rather than parsing it, so a path escape
+// or a port that does not parse refuses nothing the presenter accepts.
 func SafeURL(raw string) error {
 	if n := utf8.RuneCountInString(raw); n > urlMax {
 		return fmt.Errorf("%d characters, at most %d", n, urlMax)
@@ -330,29 +335,42 @@ func SafeURL(raw string) error {
 			return fmt.Errorf("carries whitespace or an unprintable character %U", r)
 		}
 	}
-	if start := strings.Index(raw, authorityStart); start >= 0 {
-		authority := raw[start+len(authorityStart):]
-		if end := strings.IndexAny(authority, authorityEnds); end >= 0 {
-			authority = authority[:end]
-		}
-		if strings.Contains(authority, backslash) {
-			return fmt.Errorf("a backslash in the host part")
-		}
+	scheme, rest, ok := strings.Cut(raw, authorityStart)
+	if !ok {
+		return fmt.Errorf("no %s after a scheme", authorityStart)
 	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("does not parse: %v", err)
+	if scheme = strings.ToLower(scheme); scheme != urlSchemeHTTP && scheme != urlSchemeHTTPS {
+		return fmt.Errorf("scheme %q is not http or https", scheme)
 	}
-	if u.Scheme != urlSchemeHTTP && u.Scheme != urlSchemeHTTPS {
-		return fmt.Errorf("scheme %q is not http or https", u.Scheme)
+	authority := rest
+	if end := strings.IndexAny(authority, authorityEnds); end >= 0 {
+		authority = authority[:end]
 	}
-	if u.User != nil {
+	if strings.Contains(authority, backslash) {
+		return fmt.Errorf("a backslash in the host part")
+	}
+	if strings.Contains(authority, userinfoMark) {
 		return fmt.Errorf("carries userinfo")
 	}
-	if u.Hostname() == "" {
+	if host(authority) == "" {
 		return fmt.Errorf("has no host")
 	}
 	return nil
+}
+
+// host is authority without its port: a bracketed IPv6 literal's inside,
+// else everything before the last colon.
+func host(authority string) string {
+	if strings.HasPrefix(authority, ipv6Open) {
+		if end := strings.Index(authority, ipv6Close); end >= 0 {
+			return authority[len(ipv6Open):end]
+		}
+		return ""
+	}
+	if colon := strings.LastIndex(authority, portMark); colon >= 0 {
+		return authority[:colon]
+	}
+	return authority
 }
 
 // capped checks a field of any number of lines against its cap.

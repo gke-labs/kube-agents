@@ -1,0 +1,91 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "payments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "text": {
+              "text": "## What's wrong\n\npayments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02. Nothing else changed.\n\n## Why\n\n- The container exits reading `payments-db-creds`, which *no longer exists*.\n\n## What to do\n\n- *Option A (Roll back to 14:02):* Revert the Deployment to revision 7.\n- *Option B (Restore the secret):* Recreate payments-db-creds from the GitOps repo.\n- ✅ *Recommended: Option B* — it fixes the cause rather than hiding it.\n- *To authorize:* reply *'apply'* to open a GitOps Pull Request with the recommended fix, or name one directly with *'apply Option A'* / *'apply Option B'*.\n\n🔗 <https://console.cloud.google.com/kubernetes/workload/overview|GKE Workloads> | <https://console.cloud.google.com/logs/query;query=x|Cloud Logs>",
+              "type": "mrkdwn",
+              "verbatim": true
+            },
+            "type": "section"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why · what each option does",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "text": {
+              "emoji": true,
+              "text": "Roll back to 14:02",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Roll back to 14:02 — apply Option A"
+          },
+          {
+            "action_id": "kage.choice.1",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Restore the secret",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Restore the secret — apply Option B"
+          },
+          {
+            "action_id": "kage.link.0",
+            "text": {
+              "emoji": true,
+              "text": "GKE Workloads ↗",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "url": "https://console.cloud.google.com/kubernetes/workload/overview"
+          },
+          {
+            "action_id": "kage.link.1",
+            "text": {
+              "emoji": true,
+              "text": "Cloud Logs ↗",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "url": "https://console.cloud.google.com/logs/query;query=x"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

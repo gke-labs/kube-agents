@@ -797,6 +797,17 @@ func (a *InjectAdapter) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+// PostMessage and EditMessage record text only: a chat message falls back
+// to its text (ErrTextOnly), so a transcript reads as it did before chat
+// messages existed.
+func (a *InjectAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *InjectAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
 // Roster is the requester alone, complete. A synthetic conversation has
 // exactly one participant -- the author who injected into it -- and
 // reporting it complete is the truth rather than a degradation: there is no

@@ -1,0 +1,61 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "The quota for n2 CPUs in us-central1 is exhausted.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "text": {
+              "text": "## What's wrong\n\nThe quota for n2 CPUs in us-central1 is exhausted.\n\n## Why\n\n- Scale-up fails with QUOTA_EXCEEDED.\n\n## What to do\n\n- *Proposed fix (Lower the node pool max):* Set max nodes to 4 in the GitOps repo.\n- *To authorize:* reply *'apply'* to open a GitOps Pull Request with this fix.",
+              "type": "mrkdwn",
+              "verbatim": true
+            },
+            "type": "section"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why · what the fix does",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Lower the node pool max",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Lower the node pool max — apply"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]
