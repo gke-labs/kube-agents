@@ -514,6 +514,16 @@ Mutation(
         "of mcp-remote, under a new name -- no argv for a URL match to find",
     ),
     Mutation(
+        "B1-gke-mcp-respelt-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp/"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "copy the entry with a trailing slash on the URL -- the same endpoint, "
+        "and not byte-equal to the canonical spelling",
+    ),
+    Mutation(
         # The platform overlay's copy of the allowlist is redundant with the
         # shared defaults' one once the two are merged, and Hermes lets
         # `include` win over `exclude`. Pinned as deliberate: a suite that went

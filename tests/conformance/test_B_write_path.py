@@ -32,10 +32,11 @@ _WORKFLOWS = sorted(
 )
 
 
-# The hosted GKE MCP server. Matched by URL, in the mcp-remote argv or as a
-# native `url:` transport, rather than by the `gke` key, so a copy of the entry
-# under another name is still found.
-_GKE_MCP_URL = "https://container.googleapis.com/mcp"
+# The hosted GKE MCP server. Matched by host anywhere in the mcp-remote argv or
+# in a native `url:` transport, rather than by the `gke` key or the exact URL,
+# so a copy under another name, with a trailing slash, another scheme or a
+# `--url=` spelling is still found.
+_GKE_MCP_HOST = "container.googleapis.com"
 
 # The server's tools that it annotates `readOnlyHint: true`, from its
 # `tools/list` on 2026-10-13: 15 of 23. The other eight are create_cluster,
@@ -90,17 +91,19 @@ def _profile_configs():
     }
 
 
-def _servers_reaching(config, url):
-    """The `mcp_servers` entries in one parsed config that reach `url`.
+def _servers_reaching(config, host):
+    """The `mcp_servers` entries in one parsed config that name `host`.
 
     Either through mcp-remote, where the URL is an argv entry, or through
     Hermes' native HTTP transport, where it is the `url` key
-    (tools/mcp_tool_server_run.py at the pinned tag).
+    (tools/mcp_tool_server_run.py at the pinned tag). Any string naming the
+    host counts, so a respelt URL cannot step around the match.
     """
     return {
         name: server
         for name, server in (config.get("mcp_servers") or {}).items()
-        if isinstance(server, dict) and (url in (server.get("args") or []) or server.get("url") == url)
+        if isinstance(server, dict)
+        and any(isinstance(value, str) and host in value for value in [*(server.get("args") or []), server.get("url")])
     }
 
 
@@ -267,19 +270,19 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         declaring = {
             path.relative_to(h.REPO_ROOT).as_posix()
             for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
-            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_URL)
+            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_HOST)
         }
         modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
         self.assertEqual(
             set(),
             declaring - modelled,
-            f"these configs declare {_GKE_MCP_URL} and no profile here is built from them",
+            f"these configs declare {_GKE_MCP_HOST} and no profile here is built from them",
         )
 
         for profile, config in _profile_configs().items():
-            servers = _servers_reaching(config, _GKE_MCP_URL)
+            servers = _servers_reaching(config, _GKE_MCP_HOST)
             with self.subTest(profile=profile):
-                self.assertTrue(servers, f"the {profile} profile declares no {_GKE_MCP_URL} server")
+                self.assertTrue(servers, f"the {profile} profile declares no {_GKE_MCP_HOST} server")
             for name, server in servers.items():
                 with self.subTest(profile=profile, server=name):
                     include = (server.get("tools") or {}).get("include")
