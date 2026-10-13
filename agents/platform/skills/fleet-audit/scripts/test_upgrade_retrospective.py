@@ -98,14 +98,16 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT, api_off_names=None):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
         self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
         # Projects whose `operations list` fails (a quota error, say).
         self.ops_fail = set(ops_fail)
-        # Projects with the Kubernetes Engine API off: both listings refuse with gcloud's words for it.
+        # Projects with the Kubernetes Engine API off: both listings refuse with gcloud's words for it,
+        # naming the listed project, or `api_off_names` (a quota project with the API off names itself).
         self.api_off = set(api_off)
+        self.api_off_names = api_off_names
         # An undeclared install's `gcloud projects list`: its exit code, and the projects it names
         # (the active project alone by default; a list without it is a filtered listing).
         self.projects_list_rc, self.projects_listed = projects_list_rc, projects_listed
@@ -119,13 +121,13 @@ class FakeFleet:
         if "clusters list" in joined:
             project = argv[argv.index("--project") + 1]
             if project in self.api_off:
-                return run_of(1, "", API_OFF_STDERR.format(project=project, api="clusters"))
+                return run_of(1, "", API_OFF_STDERR.format(project=self.api_off_names or project, api="clusters"))
             if self.list_rc or project in self.list_fail:
                 return run_of(self.list_rc or 1, "", "PERMISSION_DENIED")
             return run_of(0, json.dumps([{k: v for k, v in c.items() if k != "project"} for c in self.clusters if c.get("project", PROJECT) == project]))
         if "operations list" in joined:
             if argv[argv.index("--project") + 1] in self.api_off:
-                return run_of(1, "", API_OFF_STDERR.format(project=argv[argv.index("--project") + 1], api="operations"))
+                return run_of(1, "", API_OFF_STDERR.format(project=self.api_off_names or argv[argv.index("--project") + 1], api="operations"))
             if argv[argv.index("--project") + 1] in self.ops_fail:
                 return run_of(1, "", "RESOURCE_EXHAUSTED: quota exceeded")
             return run_of(0, json.dumps(self.operations))
@@ -141,6 +143,8 @@ class FakeFleet:
             if cluster is None or (cluster, key) in self.kubectl_fail:
                 return run_of(1, "", "Unable to connect to the server")
             return run_of(0, json.dumps({"items": READS[cluster][key]}))
+        if "projects describe" in joined:
+            return run_of(0, "123456789\n")
         if "config get-value" in joined:
             return run_of(0, self.active_project + "\n") if self.active_project else run_of(0, "")
         if "projects list" in joined:
@@ -1680,6 +1684,13 @@ class ShapeTest(unittest.TestCase):
         shapes = ur.budget_shapes([pdb], READS["seeded-a"]["workloads"])
         self.assertEqual([(s["object"], s["entry"], s["confidence"]) for s in shapes], [("seeded-debug/Deployment/payments-api", 1, ur.HIGH)])
         self.assertIn("one replica behind budget payments", shapes[0]["evidence"])
+        # A budget that permits the eviction is no entry-1 risk, whatever the replica count: a chart's
+        # `maxUnavailable: 1`, or `minAvailable: 0`. A percentage above zero demands the one pod.
+        selector = pdb["spec"]["selector"]
+        for permissive in ({"maxUnavailable": 1}, {"minAvailable": 0}):
+            self.assertEqual(ur.budget_shapes([{**pdb, "spec": {**permissive, "selector": selector}}], READS["seeded-a"]["workloads"]), [], permissive)
+        percent = {**pdb, "spec": {"minAvailable": "50%", "selector": selector}}
+        self.assertEqual([(s["object"], s["entry"], s["confidence"]) for s in ur.budget_shapes([percent], READS["seeded-a"]["workloads"])], [("seeded-debug/Deployment/payments-api", 1, ur.HIGH)])
 
     def test_entry_19_in_tree_volume_and_class(self):
         pv = self.shape("PersistentVolume/intree-pd", 19)
@@ -3225,6 +3236,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertIn("archived 1 crash record(s)", out.getvalue())
             self.assertEqual(list(self.home.glob(ur.CRASH_RECORD_GLOB)), [])
             self.assertTrue(list((self.home / ur.ARCHIVE_SUBDIR).rglob("ledger.json.unreadable-*")))
+            # The archive root and its stamp are the store's: made at the store's mode by chmod, not
+            # left under the caller's umask, so a root hand reset does not refuse the next uid's.
+            [stamped] = [d for d in (self.home / ur.ARCHIVE_SUBDIR).iterdir() if d.is_dir()]
+            self.assertEqual((stat.S_IMODE((self.home / ur.ARCHIVE_SUBDIR).stat().st_mode), stat.S_IMODE(stamped.stat().st_mode)), (ur.STORE_DIR_MODE, ur.STORE_DIR_MODE))
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
             self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
@@ -4981,6 +4996,79 @@ class ManifestTest(unittest.TestCase):
         ids = [self.audit_report.derive_finding_id(f) for f in document["findings"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.audit_report.cross_check_manifest(document, manifest)
+
+    def test_an_api_refusal_naming_another_project_is_a_failed_read_not_an_empty_project(self):
+        # With a quota project whose Kubernetes Engine API is off, every `--project X` call fails with
+        # a refusal naming the quota project; read as X's own, every project listed empty and a full
+        # run pruned the fleet. The refusal is "no cluster here" only when it names this project
+        # (`collect.refusal_owner`, the rule fleet_waste and fleet_stockout carry); otherwise it is a
+        # failed read, held, for both listings.
+        self.collect()
+        quota, _ = self.collect(FakeFleet(api_off=[PROJECT], api_off_names="quota-proj"), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((quota["removed_clusters"], quota["projects"], quota["fleet"], quota["operations_unread"]), ([], [PROJECT], [PROJECT], [PROJECT]))
+        self.assertTrue(any(line.startswith(f"{PROJECT}: clusters list refused and the refusal names another project ('quota-proj')") for line in quota["failed_reads"]), quota["failed_reads"])
+        self.assertTrue(any(line.startswith(f"{PROJECT}: operations list refused and the refusal names another project ('quota-proj')") for line in quota["failed_reads"]), quota["failed_reads"])
+        self.assertTrue({GEMMA, SEEDED} <= {g["cluster"] for g in quota["guards"]})
+        self.assertEqual(sorted(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]), [GEMMA, SEEDED])
+        manifest = json.loads(Path(quota["manifest_path"]).read_text())
+        self.assertEqual({c["name"]: c["outcome"] for c in manifest["clusters"]}, {GEMMA: ur.MANIFEST_OUTCOME_GATE_FAILED, SEEDED: ur.MANIFEST_OUTCOME_GATE_FAILED})
+        self.assertTrue(manifest["partial"])
+        self.assertNotIn(ur.INFO_REMOVED, ur.render_report(quota))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # A refusal naming this project is the empty project it always was: its clusters leave.
+        own, _ = self.collect(FakeFleet(api_off=[PROJECT]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((own["removed_clusters"], own["failed_reads"]), ([GEMMA, SEEDED], []))
+
+    def test_the_read_budget_ends_the_reads_and_holds_the_rest_for_the_next_run(self):
+        # The run's own deadline under the SOP's 600 s, checked as each review and re-check starts:
+        # past it no further cluster is read. What was read is written; a cluster not reached is held
+        # (ledger and guards untouched, `gate-failed` with the budget reason, no stale Warning) and,
+        # since reviews run in last-reviewed order, read first next run; a re-check the deadline defers
+        # holds its guards with their checks unevaluated. With the budget never spent nothing changes.
+        calls = {"n": 0}
+
+        def clock():
+            calls["n"] += 1
+            return 0.0 if calls["n"] <= 2 else float(ur.RUN_DEADLINE_S)
+
+        manifest_file = str(self.home / "manifest.json")
+        with redirect_stderr(io.StringIO()):
+            first = ur.collect(args(manifest_file=manifest_file), run=FakeFleet(), now=NOW, max_workers=1, clock=clock)
+        self.assertEqual(([r["cluster"] for r in first["reviews"]], first["deferred"], first["budget_spent"], first["deferred_rechecks"]), ([GEMMA], [SEEDED], True, 0))
+        self.assertEqual(sorted(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]), [GEMMA])
+        self.assertEqual({g["cluster"] for g in first["guards"]}, {GEMMA})
+        self.assertIn(ur.BUDGET_SPENT_TEXT.format(cluster=SEEDED, seconds=ur.RUN_DEADLINE_S, count=1), first["failed_reads"])
+        self.assertEqual([w for w in first["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD], [])
+        report = ur.render_report(first)
+        self.assertIn(ur.INFO_BUDGET_SPENT.format(seconds=ur.RUN_DEADLINE_S, reviewed=1, rechecked=0, deferred=1, deferred_rechecks=0), report)
+        manifest = json.loads(Path(first["manifest_path"]).read_text())
+        entry = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
+        self.assertEqual((entry["outcome"], entry["error"], manifest["partial"]), (ur.MANIFEST_OUTCOME_GATE_FAILED, ur.BUDGET_SPENT_REASON.format(seconds=ur.RUN_DEADLINE_S), True))
+        document = self.document_from(manifest)
+        self.assertIn(SEEDED, [s["cluster"] for s in document["scope"]["skipped"]])
+        self.audit_report.cross_check_manifest(document, manifest)
+        # The next run reads the held cluster first (never reviewed sorts before GEMMA's last run) and
+        # defers GEMMA's re-check: its guards held, their checks unevaluated, the reason on the report.
+        calls["n"] = 0
+        with redirect_stderr(io.StringIO()):
+            second = ur.collect(args(manifest_file=manifest_file), run=FakeFleet(), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), max_workers=1, clock=clock)
+        self.assertEqual(([r["cluster"] for r in second["reviews"]], second["deferred"], second["deferred_rechecks"]), ([SEEDED], [], 1))
+        self.assertEqual(sorted(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]), [GEMMA, SEEDED])
+        self.assertTrue({GEMMA, SEEDED} <= {g["cluster"] for g in second["guards"]})
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        gemma = next(c for c in manifest["clusters"] if c["name"] == GEMMA)
+        self.assertEqual(gemma["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
+        self.assertTrue(gemma.get("checks_unevaluated"))
+        self.assertIn(ur.RECHECK_DEFERRED_TEXT.format(seconds=ur.RUN_DEADLINE_S), gemma["limitations"])
+        report = ur.render_report(second)
+        self.assertIn(ur.STALE_UNREAD_TEXT.format(errors=ur.RECHECK_DEFERRED_TEXT.format(seconds=ur.RUN_DEADLINE_S)), report)
+        held = len([g for g in first["guards"] if g["cluster"] == GEMMA and g.get("entry") != ur.ENTRY_OPERATION])
+        self.assertIn(ur.RECHECK_DEFERRED_LINE.format(guards=held), report)
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        with redirect_stderr(io.StringIO()):
+            third = ur.collect(args(manifest_file=manifest_file), run=FakeFleet(), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), max_workers=1)
+        self.assertEqual((third["deferred"], third["deferred_rechecks"], third["budget_spent"]), ([], 0, False))
+        self.assertNotIn("Read budget spent", ur.render_report(third))
 
     def test_api_disabled_project_does_not_make_the_run_partial(self):
         # A project whose Kubernetes Engine API is off is an empty project, not a failed read, as the

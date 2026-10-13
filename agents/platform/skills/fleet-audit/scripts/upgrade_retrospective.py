@@ -165,7 +165,14 @@ lock line and writes nothing, and the SOP releases the in-flight note at
 once with a limitations-only `finish` (its step: `--no-collector-manifest`,
 since the collector wrote none this run), not the note's two-hour TTL; the
 lock line and the crash-record line end with the projects the run resolved
-for its route (`this run's projects: ...`), which that `finish` lists. A run
+for its route (`this run's projects: ...`), which that `finish` lists. The
+run holds its own deadline under the SOP's 600-second budget
+(`RUN_DEADLINE_S`, from the process's start): past it no further cluster is
+read, what was read is written as a partial run, and the clusters not reached
+are held, `gate-failed` with the budget as the reason, and read first next
+run (reviews run in last-reviewed order), so a fleet whose reads do not fit
+one run is read across runs rather than killed every week with nothing
+written. A run
 writes its report, then the JSON, then the guards, then the ledger last, each
 atomically, so a crash leaves at most a report with no ledger advance. A
 ledger or guards file that exists but cannot be read, or carries another
@@ -268,6 +275,21 @@ PROBE_LOCK_EXCLUSIVE = ("full", "after_upgrade", "cluster", "since", "dry_run", 
 # run; a scoped run of a few clusters, the collision that matters, finishes
 # inside it.
 LOCK_WAIT = timedelta(minutes=2)
+# The run's own deadline for starting a cluster's reads, under the SOP's
+# foreground `timeout: 600` and measured from the process's start, the lock
+# wait included: past it no further cluster is read, the reads in flight
+# finish (each bounded by its own timeout, which the margin covers once), and
+# what was read is written as a partial run; the clusters not reached are
+# held and read first next run, in last-reviewed order, so a fleet whose
+# reads do not fit one run is read across runs rather than killed every week
+# with nothing written. `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` is the
+# same kind of deadline.
+RUN_DEADLINE_S = 480
+BUDGET_SPENT_TEXT = "{cluster}: not read this run; the read budget ({seconds} s) was spent after {count} cluster(s); ledger entry and guards kept unchanged, read first next run"
+BUDGET_SPENT_REASON = "not read this run: the read budget ({seconds} s) was spent; held, read first next run"
+RECHECK_DEFERRED_TEXT = "the read budget ({seconds} s) was spent before its re-check started"
+RECHECK_DEFERRED_LINE = "re-check not started, the read budget spent; {guards} guard(s) held"
+INFO_BUDGET_SPENT = "Read budget spent: {seconds} s after {reviewed} review(s) and {rechecked} re-check(s); {deferred} cluster(s) held for the next run, {deferred_rechecks} re-check(s) not started."
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
@@ -343,6 +365,12 @@ STORE_DIR_MODE_TEXT = "{path}: not at the store's mode and could not be changed 
 # gcloud's words for a project whose Kubernetes Engine API is off: it cannot
 # hold a cluster, so its failed listing is an empty project, not a lost one.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# Only a refusal naming this project is that answer: a quota project with the
+# API off names itself in every `--project X` refusal, and read as X's own it
+# would list every project empty and let a full run prune the fleet. The rule
+# is `collect.refusal_owner`, which `fleet_waste.py` and `fleet_stockout.py`
+# read too; a refusal that is not this project's is a failed read, held.
+API_REFUSED_OTHER_FORMAT = "{listing} refused and {why}: {error}"
 
 OP_UPGRADE_MASTER, OP_UPGRADE_NODES = "UPGRADE_MASTER", "UPGRADE_NODES"
 UPGRADE_OPERATION_TYPES = (OP_UPGRADE_MASTER, OP_UPGRADE_NODES)
@@ -1304,7 +1332,12 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | N
     result = run(["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"])
     if result.rc != 0:
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
-            return [], None
+            from collect import refusal_owner  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+            ours, why_not = refusal_owner(project, result.stderr, run=run)
+            if ours:
+                return [], None
+            return [], API_REFUSED_OTHER_FORMAT.format(listing="clusters list", why=why_not, error=f"rc={result.rc}: {_excerpt(result)}")
         return [], f"clusters list rc={result.rc}: {_excerpt(result)}"
     try:
         clusters = json.loads(result.stdout or "[]")
@@ -1331,9 +1364,15 @@ def list_operations(project: str, since: datetime, *, run: RunFn) -> tuple[list[
     parsed, error = run_json(operations_argv(project, since), run=run)
     if error:
         # The same API that made `clusters list` an empty project refuses this
-        # listing with the same words: empty, not a failed read.
+        # listing with the same words: empty, not a failed read, when the
+        # refusal is this project's own.
         if any(marker in error for marker in API_DISABLED_MARKERS):
-            return [], None
+            from collect import refusal_owner  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+            ours, why_not = refusal_owner(project, error, run=run)
+            if ours:
+                return [], None
+            return [], API_REFUSED_OTHER_FORMAT.format(listing="operations list", why=why_not, error=error)
         return [], error
     if not isinstance(parsed, list):
         return [], "operations list returned JSON that is not a list"
@@ -3634,10 +3673,24 @@ def _budget_allows_no_disruption(spec: dict, replicas: int | None) -> bool:
     return False
 
 
+def _budget_demands_the_only_pod(spec: dict) -> bool:
+    """The catalogue's third entry-1 before-signal: a budget whose spec
+    forbids evicting a single-replica workload's only pod, `maxUnavailable`
+    0, an integer `minAvailable` of one or more, or a percentage
+    `minAvailable` above zero, which rounds up to that one pod. A budget that
+    permits the eviction (`maxUnavailable` 1, `minAvailable` 0) is not entry
+    1's blocked drain, whatever the replica count."""
+    if _budget_allows_no_disruption(spec, SINGLE_REPLICA):
+        return True
+    min_available = spec.get("minAvailable")
+    return isinstance(min_available, str) and min_available.endswith("%") and min_available.rstrip("%").isdigit() and int(min_available.rstrip("%")) > 0
+
+
 def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
-    """Entry 1: a budget whose spec allows no disruption (high), one at
-    `disruptionsAllowed` 0 for a reason that will clear (medium), and a
-    one-replica Deployment or StatefulSet a budget selects."""
+    """Entry 1, the catalogue's three before-signals: a budget whose spec
+    allows no disruption (high), one at `disruptionsAllowed` 0 for a reason
+    that will clear (medium), and a single-replica Deployment or StatefulSet
+    behind a budget whose spec demands its only pod (high)."""
     out = []
     for pdb in pdbs:
         meta, status = pdb.get("metadata") or {}, pdb.get("status") or {}
@@ -3655,7 +3708,7 @@ def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
                 out.append(_shape(obj, ENTRY_BUDGET, MEDIUM, f"disruptionsAllowed=0 now, spec {json.dumps(spec, sort_keys=True)} allows disruption once its pods are ready", f"budget {name}"))
         for workload in covered:
             wmeta = workload.get("metadata") or {}
-            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA:
+            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA and _budget_demands_the_only_pod(spec):
                 wobj = _object_of(namespace, workload["kind"], wmeta.get("name", ""))
                 out.append(_shape(wobj, ENTRY_BUDGET, HIGH, f"one replica behind budget {name} ({json.dumps(spec, sort_keys=True)})", f"budget {name}"))
     return out
@@ -4079,6 +4132,17 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     return result
 
 
+def deferred_recheck(key: str, cluster_guards: list[dict]) -> dict | None:
+    """The record of a re-check the run's deadline left unstarted: with
+    guards, a failed read of every kind the guards need, so their checks are
+    unevaluated, the guards held and the run partial, as after a re-check
+    that raised; with none, nothing to record (the stored symptom set keeps
+    its age)."""
+    if not cluster_guards:
+        return None
+    return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "held": {g["id"]: sorted(recheck_reads_for(g)) for g in cluster_guards}, "failed_reads": sorted(recheck_reads_needed(cluster_guards, False)), "errors": [RECHECK_DEFERRED_TEXT.format(seconds=RUN_DEADLINE_S)], "symptom_baseline": None, "commands": {}, "deferred": True}
+
+
 def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False, now: datetime | None = None) -> dict:
     try:
         return recheck_cluster(key, cluster, cluster_guards, run=run, refresh=refresh, now=now)
@@ -4416,6 +4480,9 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     # review raised after the reads answered. Its error is the reason the
     # guards were kept, not the five read names `partial` lists for it.
     unread_errors = {r["cluster"]: list(r.get("read_errors") or []) for r in reviews if r.get("partial") and not r["reviewed"] and not r["answered"]}
+    for r in rechecks or []:
+        if r.get("deferred"):
+            unread_errors[r["cluster"]] = list(r.get("errors") or [])
     stale: dict[str, list[dict]] = {}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
@@ -4892,6 +4959,13 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
         entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_UNREACHABLE, "error": reason[:ERROR_EXCERPT_CHARS]})
+    # Clusters the run's deadline left unread: held, with the budget as the reason.
+    for key in result.get("deferred") or []:
+        if key in seen:
+            continue
+        seen.add(key)
+        project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
+        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": BUDGET_SPENT_REASON.format(seconds=RUN_DEADLINE_S)})
     for line in result["failed_reads"]:
         key, _, reason = line.partition(": ")
         if key in seen or key.count(CLUSTER_KEY_SEPARATOR) != 2 or not reason.startswith("its project's listing failed"):
@@ -4952,6 +5026,9 @@ def render_report(result: dict) -> str:
         lines += [INFO_SCOPED.format(reason=_cell(info["scoped"])), ""]
     if result.get("scope_note"):
         lines += [INFO_SCOPE_NOTE.format(note=_cell(result["scope_note"])), ""]
+    if result.get("budget_spent"):
+        budget = result["budget"]
+        lines += [INFO_BUDGET_SPENT.format(seconds=budget["seconds"], reviewed=budget["reviewed"], rechecked=budget["rechecked"], deferred=budget["deferred"], deferred_rechecks=budget["deferred_rechecks"]), ""]
     if not (info["clean"] or info["unchanged"] or info["failed_reads"] or info.get("removed") or info.get("rechecked") or info.get("upgrading")):
         lines += [NONE_LINE, ""]
     # Severity sections keep `_none_`; Info is never empty after a review.
@@ -4971,6 +5048,9 @@ def render_report(result: dict) -> str:
     if info.get("rechecked"):
         lines += [INFO_RECHECKED, ""]
         for r in info["rechecked"]:
+            if r.get("deferred"):
+                lines.append(f"- {_cell(r['cluster'])}: " + RECHECK_DEFERRED_LINE.format(guards=r["guards"]))
+                continue
             errors = f"; reads that failed: {_cell('; '.join(r['errors']))}" if r["errors"] else ""
             held = f"; {RECHECK_HELD_FORMAT.format(count=len(r['held']))}" if r.get("held") else ""
             refreshed = "; symptom set refreshed" if r.get("symptom_baseline") is not None else ""
@@ -5186,18 +5266,26 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             entries[key].pop("partial_read", None)
     return {"version": LEDGER_VERSION, "updated_at": seen_at, LEDGER_PROJECTS_KEY: ledger.get(LEDGER_PROJECTS_KEY) or [], "clusters": entries}
 
-def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None) -> dict:
+def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
     configs, the reviews, the re-checks); the default is the figure the
     sibling collectors pin to the credential proxy's admitted count.
     `discovery` is `discover_fleet`'s answer when the caller resolved it
     already (`main` does, before the lock, so an exit line can name the
-    projects); without it the run resolves the projects itself."""
+    projects); without it the run resolves the projects itself. `clock`
+    and `started` bound the run: `RUN_DEADLINE_S` after `started` (the
+    process's start when `main` calls, this call's otherwise) no further
+    cluster is read and the rest are held for the next run."""
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish
     now = now or now_utc()
     seen_at = fmt_ts(now)
+    run_started = clock() if started is None else started
+
+    def budget_left() -> bool:
+        return clock() - run_started < RUN_DEADLINE_S
+
     # Refused before any state file is read; `main` refused it before the lock.
     validate_args(args, now)
     since = parse_since(args.since, now)
@@ -5278,6 +5366,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             failed_reads.append(f"{key}: named by --cluster but not listed in its project")
 
     selected, unchanged, upgrading = select_clusters(clusters, ledger, operations, since=since, forced=forced, widen=bool(args.since), after_upgrade=after_upgrade, now=now)
+    # Reviews in a fixed order, the cluster reviewed longest ago first (one
+    # never reviewed before any other), so the tail the deadline cuts rotates.
+    selected.sort(key=lambda s: ((((ledger.get("clusters") or {}).get(s.key) or {}).get("last_run")) or "", s.key))
     if after_upgrade:
         # The route reads only the clusters its operations name: nothing else
         # is listed or re-checked, and with nothing to review it prints
@@ -5301,9 +5392,21 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             server_configs[(project, location)] = config
             if error:
                 failed_reads.append(f"{project}/{location}: {error}")
+    def review_or_defer(s: Selection) -> dict | None:
+        # Checked as each review starts: past the deadline the cluster is
+        # held, untouched in the ledger and the guards, for the next run.
+        if not budget_left():
+            return None
+        return _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now, operations_command=operations_commands.get(s.cluster["project"]))
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        reviews = list(pool.map(lambda s: _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now, operations_command=operations_commands.get(s.cluster["project"])), selected))
+        outcomes = list(pool.map(review_or_defer, selected))
+    deferred = sorted(s.key for s, outcome in zip(selected, outcomes) if outcome is None)
+    read = [s for s, outcome in zip(selected, outcomes) if outcome is not None]
+    reviews = [outcome for outcome in outcomes if outcome is not None]
     reviews.sort(key=lambda r: r["cluster"])
+    for key in deferred:
+        failed_reads.append(BUDGET_SPENT_TEXT.format(cluster=key, seconds=RUN_DEADLINE_S, count=len(reviews)))
     # Only a run invoked with --full is full: it records the fleet's project
     # set and may change it, prunes, writes the dated report and moves the
     # link. Every other run is scoped, whatever its --project set. A roster
@@ -5418,8 +5521,19 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         for row in unchanged
         if row["cluster"] in by_key and (row["cluster"] in held or (not scoped and row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0] in new_fleet))
     ]
+    # The reviews' order again: the cluster refreshed longest ago first.
+    to_recheck.sort(key=lambda item: ((((ledger.get("clusters") or {}).get(item[0]) or {}).get("symptoms_refreshed")) or (((ledger.get("clusters") or {}).get(item[0]) or {}).get("last_run")) or "", item[0]))
+
+    def recheck_or_defer(item: tuple) -> dict | None:
+        key, cluster, cluster_guards, refresh = item
+        if budget_left():
+            return _safe_recheck(key, cluster, cluster_guards, run=run, refresh=refresh, now=now)
+        return deferred_recheck(key, cluster_guards)
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        rechecks = list(pool.map(lambda item: _safe_recheck(item[0], item[1], item[2], run=run, refresh=item[3], now=now), to_recheck))
+        recheck_outcomes = list(pool.map(recheck_or_defer, to_recheck))
+    deferred_rechecks = sum(1 for r in recheck_outcomes if r is None or r.get("deferred"))
+    rechecks = [r for r in recheck_outcomes if r is not None]
     refreshed_baselines = {r["cluster"]: r["symptom_baseline"] for r in rechecks if r.get("symptom_baseline") is not None}
     cleared_ids = {gid for r in rechecks for gid in r["cleared"]}
     refreshed_ids = {gid for r in rechecks for gid in r["refreshed"]}
@@ -5468,7 +5582,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             errors.append(listing_errors.get(project) or f"{OPERATIONS_READ} list failed")
         if errors:
             row["limitations"] = "reads that failed: " + "; ".join(errors)
-    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading}, refreshed_baselines, advance=not scoped, attempted={s.key for s in selected}, route=route, since=since, outside=outside)
+    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in read}, removed, {row["cluster"] for row in upgrading} | set(deferred), refreshed_baselines, advance=not scoped, attempted={s.key for s in read}, route=route, since=since, outside=outside)
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
 
     # Read failures from inside a review join the top-level list so Info
@@ -5490,10 +5604,14 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         "scope_reason": "; ".join(scope_reasons),
         "fleet": sorted(new_fleet),
         "outside_fleet": sorted(outside),
-        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters | set(unread_clusters) | set(held_clusters), operation_guards=operation_guards, listing_unread=operations_unread),
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters | set(unread_clusters) | set(held_clusters) | set(deferred), operation_guards=operation_guards, listing_unread=operations_unread),
         "operation_guards": operation_guards,
         "unread_clusters": unread_clusters,
         "held_clusters": held_clusters,
+        "deferred": deferred,
+        "deferred_rechecks": deferred_rechecks,
+        "budget_spent": bool(deferred or deferred_rechecks),
+        "budget": {"seconds": RUN_DEADLINE_S, "reviewed": len(reviews), "rechecked": len(to_recheck) - deferred_rechecks, "deferred": len(deferred), "deferred_rechecks": deferred_rechecks},
         "scope_unread": sorted(unread_outcomes.items()),
         "scope_unresolved": unresolved_outcome,
         "scope_note": scope_note,
@@ -5690,6 +5808,9 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
     archive = store / ARCHIVE_SUBDIR / now.strftime(REPORT_TS_FORMAT)
     if not move:
         return RESET_LEDGER_DRY_RUN_TEXT.format(count=len(records), archive=archive, names=", ".join(r.name for r in records))
+    # The archive root is the store's too: made as one, not as a caller-umask
+    # ancestor, or a root hand reset would refuse the next uid's.
+    make_store_dir(store / ARCHIVE_SUBDIR)
     make_store_dir(archive)
     for record in records:
         shutil.move(str(record), str(archive / record.name))  # across filesystems too
@@ -5697,6 +5818,7 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 
 
 def main(argv: list[str] | None = None) -> int:
+    run_started = time.monotonic()  # the deadline counts the lock wait too
     args = build_parser().parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)
     try:
@@ -5724,7 +5846,7 @@ def main(argv: list[str] | None = None) -> int:
             print(lock_held_line(lock_path, LOCK_WAIT) + exit_tail)
             return 0
     try:
-        result = collect(args, discovery=discovery)
+        result = collect(args, discovery=discovery, started=run_started)
     except argparse.ArgumentTypeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE

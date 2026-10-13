@@ -169,25 +169,11 @@ DETAIL_EXCERPT_CHARS = 200
 # rather than a read that failed; otherwise every non-GKE project a credential
 # can see is a permanent `gate-failed` target. Copied from `collect.py`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
-# The project an API refusal names, which gcloud gives by number ("has not been
-# used in project 123456789", "consumer: projects/123456789"). The refusal is
-# the consumer project's, and with a quota project set (`billing/quota_project`)
-# that is not the project being listed.
-REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
-# The project *id* a refusal names, when it names one rather than a number,
-# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
-# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
-# lowercase letters, digits and hyphens, starting with a letter and not ending
-# in a hyphen. Used only to say which project a refusal was about.
-REFUSED_PROJECT_ID_RE = re.compile(
-    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
-    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
-)
-# English words of id shape that gcloud's prose puts where an id could sit
-# ("... on this project either."): never read as the project a refusal names.
-REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
-# The read `refusal_names_project` makes to turn a project id into the number
-# a refusal names. `collect_fleet` answers a repeat of it from the first answer.
+# Which project a refusal names, and whether it is the listed project's own:
+# `collect.refusal_owner`, the one rule the collectors share (the regexes and
+# the reasoning live beside it); `refusal_owner` below reads it from there.
+# The read it makes to turn a project id into the number a refusal names;
+# `collect_fleet` answers a repeat of it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # The zone or region and name in a PV's disk handle
 # (`projects/p/zones/us-central1-a/disks/data-1`, `.../regions/r/disks/n`).
@@ -1176,42 +1162,19 @@ class IncompleteEnumeration(RuntimeError):
 
 
 def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
-    """Whether an API-disabled refusal is `project`'s own. Only then is it the
-    answer "no cluster can exist here": a refusal from a quota project with the
-    API off names that project instead, and read as this one's it marked every
-    project cluster-free, so `finish` closed an audit that read no cluster. A
-    refusal naming no project, or one this project's number cannot be read
-    for, is a failed read."""
-    return refusal_owner(project, stderr, run=run)[0]
+    """Whether an API-disabled refusal is `project`'s own; the one rule is
+    `collect.refusal_names_project`, which carries the reasoning."""
+    from collect import refusal_names_project as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
-    """`refusal_names_project`'s answer, with why when it is no: which project
-    the refusal named, or that this project's number could not be read. The
-    two call for different fixes -- a quota-project setting, or the describe
-    permission -- and collapsing them sent the operator after the wrong one."""
-    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
-    if not numbers:
-        # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
-        # `Project acme` names acme as surely as `project acme` does.
-        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
-            return True, ""
-        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
-        if others:
-            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
-        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
-    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
-    if described.rc != 0:
-        return False, (
-            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
-            f"number could not be compared with this project's: "
-            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
-        )
-    if numbers == {described.stdout.strip()}:
-        return True, ""
-    return False, (
-        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
-    )
+    """`refusal_names_project`'s answer with why when it is no; the one rule
+    is `collect.refusal_owner`."""
+    from collect import refusal_owner as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def _describing_once(run: RunFn) -> RunFn:

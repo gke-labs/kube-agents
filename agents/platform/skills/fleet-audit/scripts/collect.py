@@ -231,6 +231,24 @@ SCOPED_RUN_NOTE = (
 # this credential may not list may well hold clusters. Same markers as
 # `fleet_drift.API_DISABLED_MARKERS`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# The project an API refusal names, which gcloud gives by number ("has not been
+# used in project 123456789", "consumer: projects/123456789"). The refusal is
+# the consumer project's, and with a quota project set (`billing/quota_project`)
+# that is not the project being listed. `refusal_owner` below is the one rule
+# for whether a refusal is the listed project's own; `fleet_waste.py`,
+# `fleet_stockout.py` and `upgrade_retrospective.py` read it from here.
+REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
+# The project *id* a refusal names, when it names one rather than a number,
+# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
+# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
+# lowercase letters, digits and hyphens, starting with a letter and not ending
+# in a hyphen. Used only to say which project a refusal was about.
+REFUSED_PROJECT_ID_RE = re.compile(
+    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
+    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
+)
+REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
+PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # gcloud's words for a `clusters list` some zones answered and others did not.
 # It still exits 0 with a JSON array, so the silent zones' clusters would read
 # as clusters that do not exist. See `fleet_drift.ZONE_TIMEOUT_MARKER`.
@@ -662,6 +680,45 @@ def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Dis
         log(f"WARNING: {error}; no project to audit")
         return Discovery([], error)
     return Discovery(projects, None)
+
+
+def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
+    """Whether an API-disabled refusal is `project`'s own. Only then is it the
+    answer "no cluster can exist here": a refusal from a quota project with the
+    API off names that project instead, and read as this one's it marked every
+    project cluster-free, so `finish` closed an audit that read no cluster. A
+    refusal naming no project, or one this project's number cannot be read
+    for, is a failed read."""
+    return refusal_owner(project, stderr, run=run)[0]
+
+
+def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
+    """`refusal_names_project`'s answer, with why when it is no: which project
+    the refusal named, or that this project's number could not be read. The
+    two call for different fixes -- a quota-project setting, or the describe
+    permission -- and collapsing them sent the operator after the wrong one."""
+    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
+    if not numbers:
+        # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
+        # `Project acme` names acme as surely as `project acme` does.
+        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
+            return True, ""
+        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
+        if others:
+            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
+        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
+    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
+    if described.rc != 0:
+        return False, (
+            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
+            f"number could not be compared with this project's: "
+            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
+        )
+    if numbers == {described.stdout.strip()}:
+        return True, ""
+    return False, (
+        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
+    )
 
 
 def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[dict], list[dict], str | None]:
