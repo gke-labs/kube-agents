@@ -11,6 +11,7 @@ from command_policy import (
     _IMPERSONATION_FLAGS,
     _KUBECTL_FILE_WRITE_FLAGS,
     _KUBECTL_IDENTITY_FLAGS,
+    _GOVERNED_TOOLS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -28,6 +29,15 @@ GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # Fewer fenced commands than this means the parser or the path went stale
 # and the allowed-commands test would pass by finding nothing.
 MIN_FENCED_COMMANDS = 8
+# The gcp-terraform skill writes HCL for a pull request and checks it with
+# `tofu fmt`, the one OpenTofu command that needs no provider plugins, state
+# or credentials. The sandbox image carries tofu for that alone.
+TERRAFORM_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gcp-terraform"
+SHIPPED_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+MIN_TERRAFORM_FENCED_COMMANDS = 3
+# A tofu or terraform invocation at a command position: the start of the
+# line, or after a separator or a common wrapper.
+IAC_INVOCATION = re.compile(r"(?:^|[;&|(]\s*|\b(?:sudo|env|timeout\s+\d+|xargs)\s+)(tofu|terraform)(?:\s+(\S+))?")
 
 
 def _gcloud_words(argv):
@@ -1836,6 +1846,81 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
               "--cluster=c", "--location=us-central1"], "node-pools update"),
             (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
               "--project=p"], "firewall-rules update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class TheTerraformSkillStaysInsideThePolicy(unittest.TestCase):
+    """agents/platform/skills/gcp-terraform edits Terraform for a pull request
+    and validates it with `tofu fmt` alone. Every kubectl and gcloud command
+    its fenced blocks spell must be one the policy allows; every tofu command
+    must be `tofu fmt`, and no shipped skill may run `terraform` or any other
+    tofu subcommand, which is the condition the sandbox's tofu binary ships on;
+    and the writes it leaves to the customer's CI must be refused.
+    """
+
+    @staticmethod
+    def _fenced_lines(skill_dir):
+        for path in sorted(skill_dir.rglob("*.md")):
+            for block in FENCED_SHELL_BLOCK.findall(path.read_text(encoding="utf-8")):
+                for line in block.replace("\\\n", " ").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        yield path, line
+
+    def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
+        commands = []
+        for path, line in self._fenced_lines(TERRAFORM_SKILL_DIR):
+            argv = shlex.split(line)
+            if argv and argv[0] in GOVERNED_TOOLS:
+                commands.append((path.name, argv))
+        self.assertGreaterEqual(
+            len(commands), MIN_TERRAFORM_FENCED_COMMANDS,
+            f"found {len(commands)} governed commands under "
+            f"{TERRAFORM_SKILL_DIR}; the skill moved or the fence parser is stale",
+        )
+        for name, argv in commands:
+            with self.subTest(file=name, command=" ".join(argv)):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+
+    def test_the_skill_runs_tofu_fmt_and_nothing_else(self):
+        found = [
+            (path.name, match.group(1), match.group(2))
+            for path, line in self._fenced_lines(TERRAFORM_SKILL_DIR)
+            for match in IAC_INVOCATION.finditer(line)
+        ]
+        self.assertTrue(
+            any(tool == "tofu" and sub == "fmt" for _, tool, sub in found),
+            "the skill no longer spells its tofu fmt check; the fence parser or the step moved",
+        )
+        for name, tool, sub in found:
+            with self.subTest(file=name, command=f"{tool} {sub}"):
+                self.assertEqual(("tofu", "fmt"), (tool, sub))
+
+    def test_no_shipped_skill_runs_terraform_or_another_tofu_command(self):
+        self.assertNotIn("tofu", _GOVERNED_TOOLS)
+        self.assertNotIn("terraform", _GOVERNED_TOOLS)
+        for skill_dir in sorted(SHIPPED_SKILLS_ROOT.glob("*/skills/*/")):
+            for path, line in self._fenced_lines(skill_dir):
+                for match in IAC_INVOCATION.finditer(line):
+                    with self.subTest(skill=skill_dir.name, file=path.name, line=line):
+                        self.assertEqual(("tofu", "fmt"), (match.group(1), match.group(2)))
+
+    def test_what_the_skill_leaves_to_ci_is_refused(self):
+        for argv, desc in (
+            (["gcloud", "container", "node-pools", "update", "default-pool",
+              "--cluster=c", "--location=us-central1", "--project=p"], "node-pools update"),
+            (["gcloud", "container", "node-pools", "create", "batch",
+              "--cluster=c", "--location=us-central1", "--project=p"], "node-pools create"),
+            (["gcloud", "container", "clusters", "create", "c",
+              "--location=us-central1", "--project=p"], "clusters create"),
+            (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
+              "--project=p"], "firewall-rules update"),
+            (["gcloud", "sql", "instances", "describe", "orders-db", "--project=p"],
+             "the sql read the skill says it lacks"),
+            (["gcloud", "auth", "print-access-token"], "access token"),
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
