@@ -8,6 +8,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // Clicks and answered questions (#2149 build item 7, #2192, #2346).
@@ -286,7 +288,9 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 			delete(ux.questions, conversation)
 		}
 		q, label = p.question, p.label
-	case verified && !slackGatewayCommand(p.text):
+	case verified && !chattext.IsCommand(p.text):
+		// A stop, a status ask, /session or a delegate is the gateway's,
+		// not an answer.
 		open, ok := ux.questions[conversation]
 		if ok && !ux.answered[open.channel+"/"+open.ts] {
 			delete(ux.questions, conversation)
@@ -311,19 +315,6 @@ func (s *SlackAdapter) answerLocked(claim string) {
 		ux.answered[claim] = true
 		remember(&ux.answeredOrder, claim, func(k string) { delete(ux.answered, k) })
 	}
-}
-
-// slackGatewayCommand reports a typed message the gateway acts on rather
-// than an answer: a stop, a status ask, the /session command, a delegate.
-func slackGatewayCommand(text string) bool {
-	if isStop(text) || isStatusQuery(text, true) {
-		return true
-	}
-	if _, ok := isSessionCommand(text); ok {
-		return true
-	}
-	_, ok := isDelegate(text)
-	return ok
 }
 
 // slackTypedWords is a typed answer's words for its line: whitespace
