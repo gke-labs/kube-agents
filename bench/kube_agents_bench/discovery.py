@@ -14,7 +14,7 @@
 
 """Read the onboarding discovery sweep's fan-out off the agent's disk.
 
-The sweep card is filed by the ``bootstrap-inventory-scan`` cron job, not by
+The sweep card is filed by the ``oobe`` cron job's scan stage, not by
 the conversation a case drives, so nothing in the transcript names it. What
 it did is on the agent's data volume: the card id in
 ``.bootstrap_scan_filed``, the cluster cards the gate filed for it (keyed

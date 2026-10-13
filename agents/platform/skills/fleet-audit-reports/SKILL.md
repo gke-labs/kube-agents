@@ -94,8 +94,8 @@ object per call.
   `not_applicable_matched`, `not_applicable_returned` and `not_applicable_truncated`; `diff` caps
   `added` and `resolved` independently and reports `added_total`, `resolved_total`, `unchanged` and
   `truncated` — quote `added_total`, not the length of `added`. Findings sort severity-first, so a
-  cap drops only the least severe; `checks` keeps the document's order, so a capped answer lines up
-  with the issue's table.
+  cap drops only the least severe; `checks` keeps the document's order, one row per cluster and
+  check, while the issue's table groups clusters that ran the same command into one row.
 - `--root` overrides the store root. In the pod, leave it alone.
 
 ## The four questions this gets asked

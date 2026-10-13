@@ -40,8 +40,10 @@ shape rules any of the ten checks out -- Autopilot node pools carry every
 field the node-pool checks read -- so this collector never writes
 `checks_not_applicable`; see the comment above `collect_one_cluster`.
 
-Discovery follows `fleet_drift.py`'s: every project the credential can list
-is in scope, a project whose Kubernetes Engine API is off reads as empty, and
+Discovery follows `fleet_drift.py`'s: the declared scope the agent passes
+(`--scope-projects`) when it does, is in scope; a sandbox whose operator says a
+scope is declared refuses a run without it; else every project the credential
+can list is in scope, a project whose Kubernetes Engine API is off reads as empty, and
 a scope that is short for any reason -- `projects list` failed or filtered,
 or `--project` narrowed it on purpose -- is a `gate-failed`
 `project/UNENUMERATED_PROJECTS` row rather than a quiet fleet of fewer
@@ -111,6 +113,37 @@ PROJECT_TARGET_PREFIX = "project/"
 # The target standing for the projects discovery never named. Uppercase
 # because a GCP project id cannot be, so no real project collides with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 # `--project` skips discovery, so a scoped run names no other project. Without
 # a row saying so the manifest reads as a fleet of one project, and `finish`
 # resolves every ledger finding on a cluster the run never looked at.
@@ -282,8 +315,9 @@ def _stderr_excerpt(result: Run) -> str:
 
 
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
-    """§1.1's project scope: the active project plus every project
-    `gcloud projects list` returns, or the one `--project` names.
+    """§1.1's project scope: the one `--project` names, else the declared
+    scope the SOP passed from the fleet_scope tool (`--scope-projects`), else
+    the active project plus every project `gcloud projects list` returns.
 
     Discovery names projects and lists none of them. It used to list each
     candidate and keep the ones holding a cluster, which listed every project
@@ -291,7 +325,20 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     clusters contributes no manifest entry either way. Mirrors
     `fleet_drift.discover_fleet`."""
     if base_project:
+        override_error = declared_scope.override_error(base_project)
+        if override_error:
+            return Discovery([], override_error, None)
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
+
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is a run that read no project,
+        # reported as such rather than widened to the listing.
+        if not declared_scope.projects:
+            return Discovery([], declared_scope.empty_error(), None)
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return Discovery(list(declared_scope.projects), None, declared_scope.note())
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -1275,8 +1322,10 @@ def candidate_summary(manifest: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
+    fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):

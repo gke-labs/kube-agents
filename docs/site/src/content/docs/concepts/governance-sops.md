@@ -57,7 +57,7 @@ It deliberately does **not** evaluate the model. Prompt-injection resistance, ja
 
 ### `gcp_networking_fabric_sop.md`
 
-GCP Networking Fabric & VPC IPAM, daily. Checks VPC subnet IP exhaustion risks, Cloud NAT port exhaustion, PSC routing deadlocks, MTU packet fragmentation, and Cloud Armor false-positive rates.
+GCP Networking Fabric & VPC IPAM, daily. Checks VPC subnet IP exhaustion risks, Cloud NAT port exhaustion, PSC routing deadlocks, MTU mismatches across VPC peerings, Cloud Armor policy anomalies, and management ports open to the whole internet.
 
 Invoked by the `gcp-networking-fabric-audit` watchdog.
 

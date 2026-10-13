@@ -105,8 +105,9 @@ state = {
     "audits_marker": read(AUDITS_MARKER),
     "handoff_marker": read(HANDOFF_MARKER),
     "job_added": False,
-    # A job already in the store at arm time: the stage will remove it once it has fired, and the
-    # disarm puts this record back.
+    # A job already in the store at arm time: the stage removes it once its chain is done and the
+    # report was claimed a few minutes ago (never, on an install nobody has spoken to), and the
+    # disarm puts this record back if it did.
     "job_present": None,
     "cards": [],
 }

@@ -6,8 +6,9 @@
 > `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`,
 > `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
 > `fleet_waste.py` one for `fleet-wide-cost-analysis`, `fleet_stockout.py` one for
-> `stockout-prevention`, and `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
-> `gce-compute-fleet-audit`;
+> `stockout-prevention`, `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
+> `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
+> `gcp-networking-fabric-audit`;
 > each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
@@ -184,6 +185,18 @@ A candidate with `impact_authoritative: true` also replaces the finding's `impac
 checks are the only ones a collector should mark: there the sentence reports which arm fired, which
 the model infers from an excerpt and gets wrong. Every other check's `impact` stays the model's,
 whose rewrite is usually the better sentence.
+
+Between the two adoptions, `carry_unchanged_findings` compares each finding with the same id in the
+previous run's stored report (`ledger_document` when the previous run held the open ledger, or
+`document` otherwise; [`fleet-audit-report-store.md`](fleet-audit-report-store.md) §4). When the
+`evidence` object and the `severity` are the same, the finding keeps the previous run's `title` and
+`impact`. It also keeps the previous `recommendation` and `remediation` together, but not when
+either side is `manifest` or names a path, not when the previous one is `manual` and this run's is
+not, and not when `finish` wrote part of either note. The evidence adoption comes first because it
+makes the evidence of an unchanged finding the same on each run. The arm-specific `impact` comes
+after, because it is an observation, and it must replace carried words. The carry runs before the
+dry-run split, so a dry run shows the words the real run publishes. Changed evidence or a changed
+severity gives the model's new words.
 
 A `no-pdb` candidate also carries `namespace_pdbs`, the names of the budgets already in its
 namespace, and `pod_selector`, the workload's `spec.selector`, but only where that selector reaches
@@ -460,7 +473,8 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 `AuditSpec.scopes`; an empty `scopes` measures every target against the whole roster, and a kind
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
 and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
-are all projects, declares `project` alone. A fleet that holds no cluster is not
+are all projects, declares `project` alone; the networking stream declares a `subnet` kind for
+`subnet-ip-exhaustion` and a `project` kind for its other five checks. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs

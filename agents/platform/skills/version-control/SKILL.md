@@ -242,9 +242,9 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   that with `--advance` and the proposal's base as `--target`.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
-  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
-  the same way however many times you repeat the call — report or fix the
-  argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
+  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN`, `FORGE_REJECTED` and
+  `FORGE_TLS_UNTRUSTED` will answer the same way however many times you repeat
+  the call — report or fix the argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
   `FORGE_NOT_FOUND` does not prove the thing is missing: a private repository
   this install cannot see answers the same way.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
@@ -257,6 +257,12 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 - **`capabilities` before assuming a non-GitHub forge works.** Bitbucket, and
   GitLab on an install that has not configured it, parse their specs and then
   tell you exactly what this install is missing. That is the answer, not a bug to work around.
+- **Link to a file with `capabilities`' `fileUrl`.** It is the file's web address
+  on this forge, with `{ref}` and `{path}` to fill. Percent-encode each of them
+  and keep the `/` (in Python, `quote(value, safe="/")`): a branch name can hold
+  `#` or `%`, which break a link. Use a commit SHA as `{ref}` for a link that
+  must outlive the branch. Do not build a forge URL
+  yourself, and do not use a bare relative path: in an issue it opens nothing.
 
 ## Reference
 

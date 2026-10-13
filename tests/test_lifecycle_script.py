@@ -1082,7 +1082,8 @@ class DeleteAgentCrEndpointTest(unittest.TestCase):
     """
 
     def _run_delete(self, dns_endpoint="gke-abc.us-central1.gke.goog",
-                    allow_external="True", supports_flag=True, wedged=False):
+                    allow_external="True", supports_flag=True, wedged=False,
+                    agent_name="agent"):
         """Run delete_agent_cr against stubbed gcloud, kubectl and terraform.
 
         Returns (completed process, recorded get-credentials invocation).
@@ -1109,12 +1110,12 @@ exit 0
             # command that ran before it, not the deletion itself.
             kubectl = bin_dir / "kubectl"
             # wedged: one PlatformAgent whose delete times out, which walks the
-            # finalizer patch and both RBAC deletes as well.
+            # finalizer patch, RBAC deletes, and JetStream PVC delete as well.
             kubectl.write_text(f"""#!/usr/bin/env bash
 printf '%s\\n' "$*" >> '{kubectl_record}'
 if [[ "{wedged}" == True ]]; then
   case "$*" in
-    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/agent ;;
+    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/{agent_name} ;;
     *"delete platformagent"*) exit 1 ;;
   esac
 fi
@@ -1155,9 +1156,72 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        self.assertEqual(len(calls), 5, self.kubectl_args)
+        self.assertEqual(len(calls), 7, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
+
+    def test_wedged_finalizer_cleans_tokenreview_callout_rbac_and_jetstream_pvc(self):
+        # When the operator's finalizer fails to clear in time, the script strips
+        # the finalizer and manually cleans cluster-scoped RBAC (minimal,
+        # tokenreview, callout tokenreview) and the next-mode JetStream PVC (#2795).
+        # PVC deletion uses --wait=false to avoid blocking teardown, and both the
+        # A2A callout ClusterRoleBinding and JetStream PVC filter on the instance
+        # label to mirror the controller's ownership checks.
+        proc, _ = self._run_delete(wedged=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            "delete clusterrolebinding kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete clusterrolebinding -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=kubeagents:a2a-callout-tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete clusterrole kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-0 --ignore-not-found --wait=false",
+            self.kubectl_args,
+        )
+
+    def test_wedged_finalizer_truncates_long_instance_label_for_pvc(self):
+        # Ensure that instanceLabel (>63 chars) is properly truncated to 63 chars
+        # and trailing dashes/dots/underscores are trimmed as instanceLabel does.
+        cases = [
+            (
+                "alphanumeric_cut_only",
+                "a" * 60 + "-xyz",
+                "kubeagents-system-" + ("a" * 45),
+                63,
+            ),
+            (
+                "trailing_dash_trimmed",
+                "a" * 44 + "-" + "b" * 20,
+                "kubeagents-system-" + ("a" * 44),
+                62,
+            ),
+            (
+                "multiple_trailing_punctuation_trimmed",
+                "a" * 42 + "-.-" + "b" * 20,
+                "kubeagents-system-" + ("a" * 42),
+                60,
+            ),
+        ]
+        for name, long_agent, expected_label, expected_len in cases:
+            with self.subTest(name=name):
+                proc, _ = self._run_delete(wedged=True, agent_name=long_agent)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(len(expected_label), expected_len)
+                self.assertIn(
+                    f"delete clusterrolebinding -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=kubeagents:a2a-callout-tokenreview:kubeagents-system:{long_agent} --ignore-not-found",
+                    self.kubectl_args,
+                )
+                self.assertIn(
+                    f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=data-{long_agent}-a2a-nats-0 --ignore-not-found --wait=false",
+                    self.kubectl_args,
+                )
 
     def test_it_uses_the_dns_endpoint_when_one_accepts_external_traffic(self):
         proc, args = self._run_delete()

@@ -381,15 +381,14 @@ fi
 echo "==> Provisioning the environment at the candidate commit via canonical install.sh..."
 ./install.sh "${INSTALL_ARGS[@]}"
 
-# spec.mode: next, set on the CR the install just created, then the gate that
-# waits for what the operator renders for it. install.sh on this tree takes no
-# mode, so the switch is the same merge patch the next-mode dev clusters were
-# installed with. The install's --mode flag (#2524) replaces the patch once it
-# merges: that installer takes PLATFORM_AGENT_MODE from the environment this
-# script leaves it exported in under `next` (only rc and nightly get here
-# with it; the long-lived environments are refused above), so the
-# platform_agent_mode_patch_next call below is then the one line to delete
-# (with this paragraph's patch sentences). The wait stays either way.
+# spec.mode: next, then the gate that waits for what the operator renders for
+# it. install.sh reads PLATFORM_AGENT_MODE from the environment this script
+# leaves it exported in under `next` (only rc and nightly get here with it;
+# the long-lived environments are refused above), so the install already
+# renders spec.mode: next and the merge patch below applies a value the CR
+# already holds. The patch is redundant and stays only because removing it
+# moves the tests that pin it; that removal is its own change. The wait
+# stays either way.
 #
 # install.sh has already pointed kubectl at the cluster and checked the
 # context; the context is still named on each call, so nothing here can reach
