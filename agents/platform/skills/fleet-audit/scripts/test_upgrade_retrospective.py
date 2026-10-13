@@ -522,6 +522,19 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(pods=[pod("on-master", scheduled_message=miss, node_selector={"node-role.kubernetes.io/master": ""})])
         self.assertEqual(entries(row), {(12, ur.HIGH)})
         self.assertEqual(row["classifications"][0]["detail"], "selector node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24")
+        # A mixed message, the dropped label named: the pod's own pool refused it for another reason,
+        # so medium, with the other clauses named.
+        mixed = "0/4 nodes are available: 1 node(s) were unschedulable, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("on-master", scheduled_message=mixed, node_selector={"node-role.kubernetes.io/master": ""})])
+        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], "selector node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24; " + ur.MIXED_CLAUSES_FORMAT.format(clauses="1 node(s) were unschedulable"))
+        # The repository's entry-12 reproduction (bench/upgrade-scenarios/evidence/12/label.txt), read
+        # during the drain: the clause set ends at the first period, the preemption sentence's own
+        # `0/3 nodes are available` is not the total, and the row files at medium.
+        reproduction = "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("label-pinned-5746f57c68-ghnpj", scheduled_message=reproduction, node_selector={"beta.kubernetes.io/arch": "amd64"})])
+        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        self.assertIn(ur.MIXED_CLAUSES_FORMAT.format(clauses="1 node(s) were unschedulable"), row["classifications"][0]["detail"])
         # On a cluster below that minor the label is not yet dropped.
         old = cluster_doc("seeded-a")
         old["currentMasterVersion"] = "1.23.17-gke.1700"
@@ -2020,30 +2033,55 @@ class LedgerAndGuardsTest(unittest.TestCase):
         remaining = {g["id"] for g in third["guards"] if g["cluster"] == SEEDED}
         self.assertEqual(len(remaining), len(seeded_guards) - 3)
         self.assertIn(ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server"), remaining)
-        # A re-check whose read fails clears nothing and says so.
+        # A re-check whose read fails clears nothing, holds every guard that needed the read, and
+        # says so; the held guards keep their review count.
         fourth, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc))
         [recheck] = [r for r in fourth["rechecks"] if r["cluster"] == SEEDED]
-        self.assertEqual(recheck["cleared"], [])
+        self.assertEqual((recheck["cleared"], recheck["failed_reads"]), ([], ["pods"]))
         self.assertTrue(recheck["errors"])
+        self.assertEqual(recheck["held"].get(ur.guard_id(SEEDED, 2, INFERENCE)), ["pods"])
+        # The budget's keep rule reads pdbs, which answered: still at zero, refreshed.
+        self.assertIn(ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server"), recheck["refreshed"])
+        self.assertEqual(next(g for g in fourth["guards"] if g["id"] == ur.guard_id(SEEDED, 2, INFERENCE))["reviews"], 3)
+        self.assertIn(ur.RECHECK_HELD_FORMAT.format(count=len(recheck["held"])), ur.render_report(fourth))
 
-    def test_event_only_guard_is_not_recheckable(self):
-        reads = {**READS["seeded-a"], "events": READS["seeded-a"]["events"] + [event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1", name="inference-server-778b78fdb8-zzzzz", namespace="seeded-capacity")]}
-        with mock.patch.dict(READS, {"seeded-a": reads}):
+    def test_event_only_guard_is_rechecked_through_events(self):
+        # An attach failure on a pod of the healthy checkout-gateway: an event-only guard. The
+        # re-check adds the events read: refreshed while an event still names the object, held when
+        # that read fails, cleared when the events read is empty and the pods read shows it healthy.
+        checkout = "seeded-reliability/Deployment/checkout-gateway"
+        attach = event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1", name="checkout-gateway-568bd768b4-zzzzz", namespace="seeded-reliability")
+        with_event = {**READS["seeded-a"], "events": READS["seeded-a"]["events"] + [attach]}
+        with mock.patch.dict(READS, {"seeded-a": with_event}):
             first, _ = self.collect()
-        gid = ur.guard_id(SEEDED, 19, INFERENCE)
+        gid = ur.guard_id(SEEDED, 19, checkout)
         guard = next(g for g in first["guards"] if g["id"] == gid)
-        self.assertEqual(guard["source"], ur.GUARD_SOURCE_EVENT)
+        self.assertEqual((guard["source"], guard["check"], guard["reviews"]), (ur.GUARD_SOURCE_EVENT, ur.CHECK_SYMPTOM_TENTATIVE, 1))
         # A guard a pod also showed is not event-only.
         self.assertEqual(next(g for g in first["guards"] if g["id"] == ur.guard_id(SEEDED, 2, INFERENCE))["source"], ur.CATEGORY_PENDING)
-        # Unchanged, no events read: the event-only guard is neither cleared nor refreshed.
-        second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        # Unchanged, the event still in the API server's hour: the re-check reads events and refreshes.
+        with mock.patch.dict(READS, {"seeded-a": with_event}):
+            second, fleet = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
         [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
-        self.assertEqual((recheck["cleared"], recheck["not_recheckable"]), ([], [gid]))
-        self.assertIn(gid, {g["id"] for g in second["guards"]})
-        self.assertIn(f"- {SEEDED}: re-checked for {recheck['guards']} guard(s): 0 cleared; {ur.RECHECK_NOT_RECHECKABLE_TEXT.format(count=1)}", ur.render_report(second))
-        # The next full review of the cluster, with the event gone, clears it.
-        third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
-        self.assertNotIn(gid, {g["id"] for g in third["guards"]})
+        self.assertIn("events", {c[2] for c in fleet.calls if c[0] == "kubectl"})
+        self.assertIn(gid, recheck["refreshed"])
+        self.assertEqual((recheck["cleared"], recheck["held"]), ([], {}))
+        self.assertEqual(next(g for g in second["guards"] if g["id"] == gid)["reviews"], 2)
+        self.assertEqual([i for i in second["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD], [])
+        # The events read fails: held as it stands, no review counted, the read a limitation.
+        with mock.patch.dict(READS, {"seeded-a": with_event}):
+            third, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "events")]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        [recheck] = [r for r in third["rechecks"] if r["cluster"] == SEEDED]
+        self.assertEqual((recheck["held"].get(gid), recheck["failed_reads"]), (["events"], ["events"]))
+        self.assertNotIn(gid, recheck["cleared"] + recheck["refreshed"])
+        self.assertEqual(next(g for g in third["guards"] if g["id"] == gid)["reviews"], 2)
+        self.assertIn(f"- {SEEDED}: re-checked for {recheck['guards']} guard(s): 0 cleared; {ur.RECHECK_HELD_FORMAT.format(count=1)}", ur.render_report(third))
+        self.assertIn("cluster re-checked this run but the read failed (events:", ur.render_report(third))
+        # The event gone and the pods healthy: both reads answer, neither names it, cleared.
+        fourth, _ = self.collect(now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc))
+        [recheck] = [r for r in fourth["rechecks"] if r["cluster"] == SEEDED]
+        self.assertIn(gid, recheck["cleared"])
+        self.assertNotIn(gid, {g["id"] for g in fourth["guards"]})
 
     def test_stale_guard_on_a_partially_read_cluster_says_so(self):
         self.collect()
@@ -2138,9 +2176,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
         with mock.patch.dict(READS, {"seeded-a": reads}):
             self.collect()
         later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        # The event is gone but inference-server's pods still fail: the event guard is refreshed
+        # through its object, so nothing is stale on a re-checked cluster whose reads answered.
         second, _ = self.collect(now=later)
         report = ur.render_report(second)
-        self.assertIn(ur.STALE_EVENT_ONLY_TEXT, report)
+        self.assertEqual([i for i in second["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD], [])
         self.assertNotIn("cluster not reviewed this run", report)
         third, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         report = ur.render_report(third)
@@ -3318,6 +3358,18 @@ class ChecksRunTest(unittest.TestCase):
             self.assertIn(" kubectl get pods -A -o json", by_check[ur.CHECK_SYMPTOM_TENTATIVE])
             self.assertIn(" kubectl get nodes -o json", by_check[ur.CHECK_NODE_BROKEN])
 
+    def test_an_unchanged_cluster_whose_recheck_read_failed_drops_the_checks_it_backs(self):
+        self.collect()
+        second, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        row = next(u for u in second["unchanged"] if u["cluster"] == SEEDED)
+        # The listing backs a check whose read did not run, never one whose read ran and failed.
+        self.assertEqual([c["check"] for c in row["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
+        self.assertEqual([c["check"] for c in row["checks_unevaluated"]], [ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES])
+        self.assertTrue(all(c["reason"] == "pods read failed" for c in row["checks_unevaluated"]))
+        self.assertTrue(row["limitations"].startswith("reads that failed: pods:"))
+        other = next(u for u in second["unchanged"] if u["cluster"] == GEMMA)
+        self.assertEqual((other["checks_unevaluated"], "limitations" in other), ([], False))
+
     def test_a_scoped_unchanged_cluster_without_guards_is_backed_by_the_listing_alone(self):
         # A scoped run re-reads an unchanged cluster only for the guards it holds; with
         # none, the listing that found no upgrade is the one command behind every check.
@@ -3398,7 +3450,10 @@ class ManifestTest(unittest.TestCase):
         clusters, skipped, findings = [], [], []
         for entry in manifest["clusters"]:
             if entry["outcome"] == ur.MANIFEST_OUTCOME_COLLECTED:
-                clusters.append({"name": entry["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]})
+                cluster = {"name": entry["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]}
+                if entry.get("limitations"):
+                    cluster["limitations"] = entry["limitations"]
+                clusters.append(cluster)
                 findings.extend({"check": c["check"], "cluster": c["cluster"], "namespace": c["namespace"], "object": c["object"]} for c in entry["candidates"])
             elif entry["outcome"] != ur.MANIFEST_OUTCOME_OUT_OF_SCOPE:
                 skipped.append({"cluster": entry["name"], "reason": entry["error"]})
@@ -3467,11 +3522,31 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual({c["check"] for c in seeded["checks_unevaluated"]}, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
         self.assertTrue(seeded["limitations"].startswith("reads that failed: pods:"))
         self.assertTrue(manifest["partial"])
-        document = self.document_from(manifest)
-        for cluster in document["scope"]["clusters"]:
-            if cluster["name"] == SEEDED:
-                cluster["limitations"] = seeded["limitations"]
-        self.audit_report.cross_check_manifest(document, manifest)
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # The same on a re-checked cluster: a full run, then a week on the pods read fails in the
+        # re-check. Every failure guard needed it: held, no candidate, the pods-backed checks
+        # unevaluated and out of `checks_run` (the listing does not back them), the run partial.
+        self.collect(now=datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc))
+        later, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(later["manifest_path"]).read_text())
+        seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
+        self.assertEqual((seeded["outcome"], seeded["facts"]["status"]), (ur.MANIFEST_OUTCOME_COLLECTED, "unchanged"))
+        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
+        self.assertEqual({c["check"] for c in seeded["checks_unevaluated"]}, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
+        self.assertTrue(seeded["limitations"].startswith("reads that failed: pods:"))
+        self.assertEqual(seeded["candidates"], [])
+        self.assertEqual([h for h in manifest["still_flagged"] if h["cluster"] == SEEDED], [])
+        self.assertTrue(manifest["partial"])
+        held = [g for g in later["guards"] if g["cluster"] == SEEDED and g["kind"] == ur.GUARD_KIND_FAILURE and g["entry"] != 1]
+        self.assertTrue(held)
+        # Held as they stood: last seen by the full run, no review counted.
+        self.assertTrue(all(g["last_seen"] == "2026-10-09T18:00:00Z" for g in held))
+        # The budget guard's keep rule read pdbs, which answered: refreshed, but its check's own
+        # read (pods) failed, so it emits no candidate either.
+        [budget] = [g for g in later["guards"] if g["cluster"] == SEEDED and g["entry"] == 1 and g["kind"] == ur.GUARD_KIND_FAILURE]
+        self.assertEqual(budget["last_seen"], "2026-10-15T18:00:00Z")
+        self.assertTrue(any(w["kind"] == ur.INCIDENT_STALE_GUARD and w["cluster"] == SEEDED for w in later["sections"]["warnings"]))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_failed_listing_and_upgrading_clusters_are_gate_failed(self):
         self.collect(project=[PROJECT, "other-project"])
@@ -3513,8 +3588,9 @@ class ManifestTest(unittest.TestCase):
             self.collect()
         # The first run filed inference-server as an Error (`upgrade-broke-workload`); its guards,
         # the event-only attach one among them, carry that check. The second run re-observes the
-        # pod guard and cannot re-check the event one: one candidate under the original check, a
-        # Warning, with each guard's persistence, so the harness holds the finding by its own id.
+        # pod guard, and the event guard through its object still failing: one candidate under the
+        # original check, a Warning, with each guard's persistence, so the harness holds the
+        # finding by its own id.
         second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         [held] = [h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"]
@@ -3523,8 +3599,8 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
         [candidate] = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
         self.assertEqual((candidate["check"], candidate["severity"], candidate["entries"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MINOR, "2, 19"))
-        self.assertEqual(candidate["persistence"], ["persists since 2026-10-08T18:00:00Z, 2 review(s)", "persists since 2026-10-08T18:00:00Z, 1 review(s)"])
-        self.assertEqual(candidate["not_recheckable"], [ur.guard_id(SEEDED, 19, INFERENCE)])
+        self.assertEqual(candidate["persistence"], ["persists since 2026-10-08T18:00:00Z, 2 review(s)", "persists since 2026-10-08T18:00:00Z, 2 review(s)"])
+        self.assertNotIn("not_recheckable", candidate)
         self.assertTrue(candidate["excerpt"].startswith(f"guard {ur.guard_id(SEEDED, 2, INFERENCE)} persists since 2026-10-08T18:00:00Z, 2 review(s): "))
         self.assertTrue(candidate["command"].endswith(" kubectl get pods -A -o json"))
         # `finish` spells the set the way the ledger spells ids: derived, then clipped; the id is the
@@ -3533,6 +3609,43 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(held_id, self.audit_report.collector_flagged_ids(manifest))
         self.assertIn(held_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertEqual(held_id, self.audit_report.published_id({"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-capacity", "object": "Deployment/inference-server"}))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_error_from_the_after_upgrade_route_is_filed_major_by_the_next_full_run(self):
+        # Sunday's full run, then a pool upgrade on Tuesday that displaces a new replica: the
+        # after-upgrade wake files it as an Error (`major`) and writes its guard. The next Sunday
+        # reviews the cluster on the operation's end time, grades the row against the stored set
+        # (not recorded, created inside the window: new), files the same identity at `major`, and
+        # the guard carries Tuesday's first_seen with two reviews; the operation line says the
+        # after-upgrade route reviewed it already.
+        self.collect()
+        tuesday_op = copy.deepcopy(next(o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]))
+        tuesday_op.update(name="operation-tuesday", startTime="2026-10-13T16:30:00Z", endTime="2026-10-13T17:00:00Z")
+        displaced = pod("web-5d8f9c7b6-abcde", namespace="seeded-capacity", scheduled_message="0/4 nodes are available: 1 Insufficient cpu, 3 node(s) didn't match Pod's node affinity/selector.", node_selector={"cloud.google.com/gke-nodepool": "pinned-inference-pool"})
+        displaced["metadata"]["creationTimestamp"] = "2026-10-13T16:40:00Z"
+        web = "seeded-capacity/Pod/web-5d8f9c7b6-abcde"
+        identity = {"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-capacity", "object": "Pod/web-5d8f9c7b6-abcde"}
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [displaced]}}):
+            tuesday, _ = self.collect(FakeFleet(operations=OPERATIONS + [tuesday_op]), now=datetime(2026, 10, 13, 17, 30, tzinfo=timezone.utc), full=False, after_upgrade=True)
+            self.assertTrue(tuesday["scoped"])
+            manifest = json.loads(Path(tuesday["manifest_path"]).read_text())
+            [filed] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
+            self.assertEqual((filed["check"], filed["severity"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR))
+            self.assertEqual(self.audit_report.published_id(filed), self.audit_report.published_id(identity))
+            guard = ur.guard_id(SEEDED, 2, web)
+            self.assertEqual([(g["check"], g["reviews"], g["first_seen"]) for g in tuesday["guards"] if g["id"] == guard], [(ur.CHECK_BROKE_WORKLOAD, 1, "2026-10-13T17:30:00Z")])
+            sunday, _ = self.collect(FakeFleet(operations=OPERATIONS + [tuesday_op]), now=datetime(2026, 10, 18, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in sunday["reviews"] if r["cluster"] == SEEDED)
+        [op] = review["what_happened"]["operations"]
+        self.assertEqual(op["already_reviewed"]["route"], ur.ROUTE_AFTER_UPGRADE)
+        self.assertIn(ur.ALREADY_REVIEWED_FORMAT.format(route=ur.ROUTE_AFTER_UPGRADE, at="2026-10-13T17:30:00Z"), ur.render_report(sunday))
+        manifest = json.loads(Path(sunday["manifest_path"]).read_text())
+        [again] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
+        self.assertEqual((again["check"], again["severity"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR))
+        self.assertNotIn("persistence", again)
+        self.assertEqual(self.audit_report.published_id(again), self.audit_report.published_id(identity))
+        self.assertIn(web, [i["object"] for i in sunday["sections"]["errors"]])
+        self.assertEqual([(g["check"], g["reviews"], g["first_seen"]) for g in sunday["guards"] if g["id"] == guard], [(ur.CHECK_BROKE_WORKLOAD, 2, "2026-10-13T17:30:00Z")])
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_persisting_guard_keeps_its_check_id_and_a_cleared_guard_emits_nothing(self):
@@ -3564,10 +3677,10 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertNotIn(filed_id, self.audit_report.collector_flagged_ids(manifest))
 
-    def test_two_stale_guards_on_one_object_are_one_candidate(self):
+    def test_three_guards_on_one_object_are_one_candidate(self):
         # Two event-only guards on inference-server (a volume attach, a webhook rejection) beside its
-        # pod-sourced entry-2 guard. The next run re-observes the pod guard; the event-only ones cannot
-        # be re-checked and go stale together: one Warning, one candidate, one still-flagged identity.
+        # pod-sourced entry-2 guard. The next run re-observes the pod guard, and the event guards
+        # through the object still failing: no stale Warning, one candidate, one identity.
         events = READS["seeded-a"]["events"] + [
             event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1", name="inference-server-778b78fdb8-zzzzz", namespace="seeded-capacity"),
             event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet", name="inference-server-778b78fdb8", namespace="seeded-capacity"),
@@ -3576,18 +3689,17 @@ class ManifestTest(unittest.TestCase):
             first, _ = self.collect()
         self.assertEqual({g["entry"] for g in first["guards"] if g["object"] == INFERENCE and g["kind"] == ur.GUARD_KIND_FAILURE}, {2, 7, 19})
         second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
-        stale = [w for w in second["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["object"] == INFERENCE]
-        self.assertEqual([(w["entries"], sorted(g["entry"] for g in w["guards"]), w["event_only"]) for w in stale], [("7, 19", [7, 19], True)])
-        report = ur.render_report(second)
-        self.assertEqual(report.count(f"### 7, 19 — {SEEDED} — `{INFERENCE}`"), 1)
-        self.assertIn(f"guard `{INFERENCE}` entry 7, first seen 2026-10-08T18:00:00Z, still live; guard `{INFERENCE}` entry 19, first seen 2026-10-08T18:00:00Z, still live.", report)
+        self.assertEqual([w for w in second["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD], [])
+        [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
+        self.assertTrue({ur.guard_id(SEEDED, e, INFERENCE) for e in (2, 7, 19)} <= set(recheck["refreshed"]))
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         # All three guards were filed with the object's Error (`upgrade-broke-workload`): one
         # candidate under that check, the re-observed pod guard and the two held event guards in it.
         [candidate] = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
         self.assertEqual((candidate["check"], candidate["namespace"], candidate["entries"], candidate["severity"]), (ur.CHECK_BROKE_WORKLOAD, "seeded-capacity", "2, 7, 19", ur.MANIFEST_SEVERITY_MINOR))
-        self.assertEqual((len(candidate["persistence"]), candidate["not_recheckable"]), (3, [ur.guard_id(SEEDED, 7, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)]))
+        self.assertEqual(candidate["persistence"], ["persists since 2026-10-08T18:00:00Z, 2 review(s)"] * 3)
+        self.assertNotIn("not_recheckable", candidate)
         [held] = [h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"]
         self.assertEqual((held["check"], held["guards"]), (ur.CHECK_BROKE_WORKLOAD, [ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 7, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)]))
         document = self.document_from(manifest)

@@ -124,8 +124,10 @@ its guards need -- so a guard clears when an operator's fix lands between
 upgrades, without waiting for the next one. The weekly run therefore
 re-reads every cluster that holds a guard, and with risk guards present
 that is most of the fleet; the SOP sizes the schedule for that. A failure
-guard whose only source was an event is not re-checkable (a re-check reads
-no events) and waits for the cluster's next full review.
+guard whose only source was an event is re-checked through the events read:
+refreshed while an event in the API server's hour still names the object, or
+the pods read shows the object failing, cleared when both answer and neither
+does; a guard whose re-check read failed is held as it stands.
 
 Every subprocess goes through `default_run`; tests inject a fake in its place.
 Nothing here writes to a cluster: `gcloud ... list`, `get-credentials` into a
@@ -503,7 +505,6 @@ MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # finding was filed under, and a held guard the run still observes, or cannot
 # re-observe, emits a candidate under that check with its persistence.
 HELD_PERSISTS_FORMAT = "persists since {since}, {reviews} review(s)"
-NOT_RECHECKABLE_SUFFIX = ", not re-checkable"
 # The SOP files an Error at `major` and a Warning at `minor`, never `critical`.
 MANIFEST_SEVERITY_MAJOR, MANIFEST_SEVERITY_MINOR = "major", "minor"
 # A failed operation's candidate names the operation.
@@ -532,6 +533,12 @@ DEPRECATED_NODE_LABEL_PREFIXES = ("beta.kubernetes.io/", "failure-domain.beta.ku
 DROPPED_NODE_LABELS = {"node-role.kubernetes.io/master": (1, 24)}
 LABEL_DROPPED_FORMAT = "{label} dropped in {major}.{minor}"
 LABEL_NOT_DROPPED_TEXT = "selector names no label the catalogue lists as dropped by the pool's minor"
+# Row 12 on a scheduler message whose clause set (the sentence up to the
+# first period) mixes selector misses with other reasons: medium, the other
+# clauses named; the pod's own pool refused it for one of them.
+MIXED_CLAUSES_FORMAT = "clauses beside the selector miss: {clauses}"
+CLAUSE_LIST_MARKER = "available: "
+CLAUSE_SEPARATOR = ", "
 RETIRED_IMAGE_HOSTS = ("k8s.gcr.io/", "gcr.io/google-containers/", "gcr.io/google_containers/", "gcr.io/kubernetes-helm/")
 IN_TREE_PD_PROVISIONER = "kubernetes.io/gce-pd"
 IN_TREE_PD_VOLUME_KEY = "gcePersistentDisk"
@@ -607,12 +614,13 @@ GUARD_KIND_FAILURE, GUARD_KIND_RISK = "failure", "risk"
 # every one of them answered on the review that did not see it; a slow
 # `kubectl get pods` must not erase a cluster's memory.
 FAILURE_GUARD_READS = ("pods", "nodes", "events", "pdbs", "owners")
-# A failure guard whose only source was an event cannot be re-observed by a
-# re-check, which reads no events; it is kept until the next full review.
+# A failure guard whose only source was an event adds the events read to its
+# re-check: refreshed while an event in the API server's hour still names the
+# object (or the pods read shows it failing), cleared when neither does.
 GUARD_SOURCE_EVENT = CATEGORY_EVENT
-RECHECK_NOT_RECHECKABLE_TEXT = "{count} event-only guard(s) not re-checkable; cleared by the next review of the cluster"
+RECHECK_EVENT_READS = ("events",)
+RECHECK_HELD_FORMAT = "{count} guard(s) held, a needed read failed"
 STALE_PARTIAL_TEXT = "cluster read partially this run ({failed}); the guard below could not be re-observed and was kept."
-STALE_EVENT_ONLY_TEXT = "cluster re-checked this run; the guard below came from an event alone and a re-check reads no events, so it is kept until the cluster's next full review."
 STALE_RECHECK_FAILED_TEXT = "cluster re-checked this run but the read failed ({errors}); the guard below was kept."
 SPEC_SHAPE_READS = ("pods", "owners", "workloads")
 SHAPE_READS_BY_ENTRY = {
@@ -1356,12 +1364,15 @@ def command_text(argv: list[str], kubeconfig: Path | None = None) -> str:
     return f"{KUBECONFIG_ENV}={shlex.quote(str(kubeconfig))} {text}" if kubeconfig else text
 
 
-def checks_run(commands_by_read: dict[str, str], fallback: str | None = None) -> list[dict]:
+def checks_run(commands_by_read: dict[str, str], fallback: str | None = None, failed: set[str] | frozenset[str] = frozenset()) -> list[dict]:
     """The SOP's `checks_run` entries for one cluster: each check whose read
     answered, with that read's command; `fallback` (the operations listing
-    that decided an unchanged cluster) backs a check whose read did not run."""
+    that decided an unchanged cluster) backs a check whose read did not run,
+    never one whose read ran and failed (`failed`): that check is unevaluated."""
     out = []
     for check, read in CHECK_READS:
+        if read in failed:
+            continue
         command = commands_by_read.get(read) or fallback
         if command:
             out.append({"check": check, "command": command})
@@ -2206,18 +2217,23 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
         m = pattern.search(text)
         detail = ""
         if entry == ENTRY_NODE_LABEL:
-            # The scheduler writes a selector-miss clause for every node group
-            # a pinned pod does not target, beside the clause that says why
-            # its own pool refused it: the row holds only when every clause
-            # is a selector or affinity miss.
-            total, missed = SCHEDULING_TOTAL_RE.search(text), SELECTOR_MISS_COUNT_RE.search(text)
-            if total and missed and int(missed.group(1)) < int(total.group(1)):
-                return None
+            # The clause set is the sentence up to the first period; the
+            # `preemption:` sentence after it has its own `0/N nodes are
+            # available`. The scheduler writes a selector-miss clause for
+            # every node group a pinned pod does not target, beside the clause
+            # that says why its own pool refused it: a mixed set is medium,
+            # and only misses alone that name a dropped label are high.
+            clauses = text.split(".", 1)[0]
+            total, missed = SCHEDULING_TOTAL_RE.search(clauses), SELECTOR_MISS_COUNT_RE.search(clauses)
             detail = _selector_detail(symptom)
             dropped = _dropped_label(symptom, ctx)
             if dropped:
                 detail += f"; {dropped}"
-            else:
+            if total and missed and int(missed.group(1)) < int(total.group(1)):
+                confidence = MEDIUM
+                others = [clause.strip() for clause in clauses.split(CLAUSE_LIST_MARKER, 1)[-1].split(CLAUSE_SEPARATOR) if clause.strip() and not SELECTOR_MISS_COUNT_RE.search(clause)]
+                detail += f"; {MIXED_CLAUSES_FORMAT.format(clauses=', '.join(others) or '?')}"
+            elif not dropped:
                 # The clause alone does not say the pool lost the label.
                 confidence = MEDIUM
                 detail += f"; {LABEL_NOT_DROPPED_TEXT}"
@@ -3457,22 +3473,32 @@ def parse_version(v: str) -> tuple[int, int, int, int] | None:
 
 def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False, now: datetime | None = None) -> dict:
     """Re-read an unchanged cluster for the guards it holds: the symptom or
-    shape behind each is looked for again with only the reads it needs. A
-    guard whose finding is gone, and whose reads all answered, is cleared."""
+    shape behind each is looked for again with only the reads it needs (an
+    event-source guard adds the events read). A guard whose finding is gone,
+    and whose reads all answered, is cleared; one a needed read failed for is
+    held as it stands, named in `held` with the reads that did not answer."""
+
+    def reads_for(guard: dict) -> set[str]:
+        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_RISK:
+            return set(guard.get("reads") or SPEC_SHAPE_READS)
+        reads = set(RECHECK_FAILURE_READS)
+        if guard.get("entry") == ENTRY_BUDGET:
+            reads |= set(RECHECK_BUDGET_READS)
+        if guard.get("entry") == ENTRY_SPREAD:
+            reads |= set(RECHECK_SPREAD_READS)
+        if guard.get("source") == GUARD_SOURCE_EVENT:
+            reads |= set(RECHECK_EVENT_READS)
+        return reads
+
     needed: set[str] = set(REFRESH_READS) if refresh else set()
     for guard in cluster_guards:
-        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_RISK:
-            needed |= set(guard.get("reads") or SPEC_SHAPE_READS)
-        else:
-            needed |= set(RECHECK_FAILURE_READS)
-            if guard.get("entry") == ENTRY_BUDGET:
-                needed |= set(RECHECK_BUDGET_READS)
-            if guard.get("entry") == ENTRY_SPREAD:
-                needed |= set(RECHECK_SPREAD_READS)
-    result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [], "symptom_baseline": None, "commands": {}}
+        needed |= reads_for(guard)
+    result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "held": {}, "failed_reads": [], "errors": [], "symptom_baseline": None, "commands": {}}
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
         result["errors"].append(error)
+        result["failed_reads"] = sorted(needed)
+        result["held"] = {guard["id"]: sorted(reads_for(guard)) for guard in cluster_guards}
         return result
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     reads: dict[str, list] = {}
@@ -3482,6 +3508,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
         parsed, read_error = run_json(argv, run=run, timeout=KUBECTL_TIMEOUT_S, env=env)
         if read_error:
             result["errors"].append(f"{name}: {read_error}")
+            result["failed_reads"].append(name)
             continue
         reads[name] = (parsed.get("items") or []) if isinstance(parsed, dict) else []
         result["commands"][name] = command_text(argv, kubeconfig)
@@ -3499,19 +3526,25 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     symptoms = collect_symptoms(cluster, reads, [], EPOCH, now=now)
     if refresh and set(REFRESH_READS) <= answered:
         result["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms} | set(skew["keys"]))
-    fresh = {g["id"] for g in guards_for(key, symptoms, "")}
+    fresh_failure = guards_for(key, symptoms, "")
+    fresh = {g["id"] for g in fresh_failure}
     fresh |= {g["id"] for g in risk_guards_for(key, collect_risks(cluster, reads)[0], "")}
+    # An event-source guard is also present while the pods read shows its
+    # object failing: the event may have left the API server's hour, the
+    # symptom has not.
+    failing_objects = {g["object"] for g in fresh_failure}
     for guard in cluster_guards:
         kind = guard.get("kind", GUARD_KIND_FAILURE)
-        if kind == GUARD_KIND_FAILURE and guard.get("source") == GUARD_SOURCE_EVENT:
-            result["not_recheckable"].append(guard["id"])
-            continue
-        reads_needed = set(guard.get("reads") or SPEC_SHAPE_READS) if kind == GUARD_KIND_RISK else set(RECHECK_FAILURE_READS) | (set(RECHECK_BUDGET_READS) if guard.get("entry") == ENTRY_BUDGET else set()) | (set(RECHECK_SPREAD_READS) if guard.get("entry") == ENTRY_SPREAD else set())
-        present = guard["id"] in fresh or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero) or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_SPREAD and guard.get("object") in unavailable) or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_WINDOW and guard.get("object") in skewed)
+        reads_needed = reads_for(guard)
+        present = guard["id"] in fresh
+        if kind == GUARD_KIND_FAILURE:
+            present = present or (guard.get("source") == GUARD_SOURCE_EVENT and guard.get("object") in failing_objects) or (guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero) or (guard.get("entry") == ENTRY_SPREAD and guard.get("object") in unavailable) or (guard.get("entry") == ENTRY_WINDOW and guard.get("object") in skewed)
         if present:
             result["refreshed"].append(guard["id"])
         elif reads_needed <= answered:
             result["cleared"].append(guard["id"])
+        else:
+            result["held"][guard["id"]] = sorted(reads_needed - answered)
     return result
 
 
@@ -3520,7 +3553,7 @@ def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: R
         return recheck_cluster(key, cluster, cluster_guards, run=run, refresh=refresh, now=now)
     except Exception as exc:  # noqa: BLE001 -- the boundary is the point
         log(f"{key}: re-check failed: {exc!r}")
-        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None, "commands": {}}
+        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "held": {g["id"]: [] for g in cluster_guards}, "failed_reads": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None, "commands": {}}
 
 
 def _bare_what_happened(selection: Selection) -> dict:
@@ -3825,7 +3858,6 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
             if failed:
                 partial_reads[r["cluster"]] = failed
     upgrading_keys = {row["cluster"] for row in upgrading or []}
-    not_recheckable = {gid for r in rechecks or [] for gid in r.get("not_recheckable") or []}
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
     stale: dict[str, list[dict]] = {}
     for guard in guards:
@@ -3845,7 +3877,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             stale.setdefault(guard["cluster"], []).append(guard)
     for cluster, held in stale.items():
-        warnings.extend(fold_held_guards(cluster, held, not_recheckable, partial_reads.get(cluster) or [], recheck_errors.get(cluster) or []))
+        warnings.extend(fold_held_guards(cluster, held, partial_reads.get(cluster) or [], recheck_errors.get(cluster) or []))
     errors.sort(key=_incident_key)
     warnings.sort(key=_incident_key)
     return {
@@ -3855,7 +3887,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     }
 
 
-def fold_held_guards(cluster: str, held: list[dict], not_recheckable: set[str] | None = None, partial: list[str] | None = None, recheck_errors: list[str] | None = None) -> list[dict]:
+def fold_held_guards(cluster: str, held: list[dict], partial: list[str] | None = None, recheck_errors: list[str] | None = None) -> list[dict]:
     """Failure guards held on a cluster this run did not re-observe, as one
     stale-guard incident per object whatever the number of entries its
     guards carry: a finding is identified by check, cluster, namespace and
@@ -3866,7 +3898,6 @@ def fold_held_guards(cluster: str, held: list[dict], not_recheckable: set[str] |
         if incident is None:
             by_object[guard["object"]] = incident = {
                 "partial": list(partial or []),
-                "event_only": True,
                 "recheck_errors": list(recheck_errors or []),
                 "kind": INCIDENT_STALE_GUARD,
                 "severity": SEVERITY_WARNING,
@@ -3880,7 +3911,6 @@ def fold_held_guards(cluster: str, held: list[dict], not_recheckable: set[str] |
                 "guards": [],
             }
         incident["guards"].append(guard)
-        incident["event_only"] = incident["event_only"] and guard["id"] in (not_recheckable or set())
     for incident in by_object.values():
         incident["guards"].sort(key=lambda g: (g.get("entry") or 0, g["id"]))
         incident["entries"] = _guard_entries_label(incident["guards"])
@@ -3924,8 +3954,6 @@ def _incident_lines(incident: dict) -> list[str]:
     if incident["kind"] == INCIDENT_STALE_GUARD:
         if incident.get("partial"):
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_PARTIAL_TEXT.format(failed=', '.join(incident['partial']))}")
-        elif incident.get("event_only"):
-            lines.append(f"{PART_WHAT_HAPPENED} {STALE_EVENT_ONLY_TEXT}")
         elif incident.get("recheck_errors"):
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_RECHECK_FAILED_TEXT.format(errors=_cell('; '.join(incident['recheck_errors'])))}")
         else:
@@ -4100,15 +4128,24 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
     return candidate
 
 
-def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, str, str]], not_recheckable: set[str], commands: dict[str, str]) -> tuple[list[dict], list[dict]]:
-    """One candidate per (check, object) for the failure guards a run still
-    holds on a cluster and no incident filed this run -- re-observed by the
-    re-check, kept by a keep rule, or held as not re-checkable -- under the
-    check its finding was filed under, with its persistence; and the
-    still-flagged identities beside them."""
+def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, str, str]], commands: dict[str, str], seen_at: str, unevaluated: set[str] | frozenset[str] = frozenset()) -> tuple[list[dict], list[dict]]:
+    """One candidate per (check, object) for the failure guards this run
+    observed again on a cluster (`last_seen` is this run: re-observed by the
+    re-check or kept by a keep rule) and no incident filed, under the check
+    its finding was filed under, with its persistence; and the still-flagged
+    identities beside them. A guard a failed read held emits nothing: a
+    candidate with no read behind it would vouch for an observation nobody
+    made; its check is unevaluated and the run partial instead."""
     groups: dict[tuple[str, str], list[dict]] = {}
     for guard in guards:
+        if guard.get("last_seen") != seen_at:
+            continue
         check = _guard_check(guard)
+        if check in unevaluated:
+            # The check's own read failed this run (a budget kept at zero
+            # through the pdbs read while pods failed): no candidate under
+            # a check the manifest calls unevaluated.
+            continue
         namespace, obj = _split_object(guard["object"])
         if (check, namespace, obj) in covered:
             continue
@@ -4117,10 +4154,7 @@ def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, s
     for (check, full_object), held in sorted(groups.items()):
         held.sort(key=lambda g: (g.get("entry") or 0, g["id"]))
         namespace, obj = _split_object(full_object)
-        excerpt = "; ".join(
-            f"guard {g['id']} {HELD_PERSISTS_FORMAT.format(since=g['first_seen'], reviews=int(g.get('reviews') or 1))}{NOT_RECHECKABLE_SUFFIX if g['id'] in not_recheckable else ''}: {g['evidence']}"
-            for g in held
-        )
+        excerpt = "; ".join(f"guard {g['id']} {HELD_PERSISTS_FORMAT.format(since=g['first_seen'], reviews=int(g.get('reviews') or 1))}: {g['evidence']}" for g in held)
         impact = " ".join(MITIGATIONS[g["entry"]]["mitigate_after"] for g in held if g.get("entry") in MITIGATIONS) or UNCLASSIFIED_MITIGATION_TEXT
         candidate = {
             "check": check,
@@ -4136,7 +4170,6 @@ def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, s
             "needs_triage": None,
             "entries": _guard_entries_label(held),
             "persistence": [HELD_PERSISTS_FORMAT.format(since=g["first_seen"], reviews=int(g.get("reviews") or 1)) for g in held],
-            "not_recheckable": [g["id"] for g in held if g["id"] in not_recheckable],
         }
         if commands.get(check):
             candidate["command"] = commands[check]
@@ -4160,21 +4193,21 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
     def commands_of(rows: list[dict]) -> list[dict]:
         return [{"check": c["check"], "command": c["command"], "rc": 0} for c in rows]
 
-    not_recheckable = {gid for r in result.get("rechecks") or [] for gid in r.get("not_recheckable") or []}
     guards_by_cluster: dict[str, list[dict]] = {}
     for guard in result.get("guards") or []:
         if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             guards_by_cluster.setdefault(guard["cluster"], []).append(guard)
     still_flagged: list[dict] = []
 
-    def candidates_of(key: str, commands: list[dict]) -> list[dict]:
+    def candidates_of(key: str, commands: list[dict], unevaluated: list[dict] | None = None) -> list[dict]:
         # The incidents this run filed, then every failure guard the run
-        # still holds on the cluster under its own finding's check (one per
-        # check and object), so the harness holds rather than resolves it.
+        # observed again on the cluster under its own finding's check (one
+        # per check and object), so the harness holds rather than resolves
+        # it; none under a check whose read failed this run.
         by_check = {c["check"]: c["command"] for c in commands}
         fresh = [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents_by_cluster.get(key, []) if i["kind"] != INCIDENT_STALE_GUARD]
         covered = {(c["check"], c["namespace"], c["object"]) for c in fresh}
-        held, flagged = _held_candidates(key, guards_by_cluster.get(key, []), covered, not_recheckable, by_check)
+        held, flagged = _held_candidates(key, guards_by_cluster.get(key, []), covered, by_check, result["generated_at"], {u["check"] for u in unevaluated or []})
         still_flagged.extend(flagged)
         return fresh + held
 
@@ -4189,9 +4222,9 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             credentials_failed = any(e.startswith("get-credentials") for e in review["read_errors"])
             entry.update(outcome=MANIFEST_OUTCOME_UNREACHABLE if credentials_failed else MANIFEST_OUTCOME_GATE_FAILED, error="; ".join(review["read_errors"])[:ERROR_EXCERPT_CHARS])
         else:
-            entry.update(outcome=MANIFEST_OUTCOME_COLLECTED, commands=commands, candidates=candidates_of(key, commands))
             failed = {e.split(":")[0] for e in review["read_errors"]}
             unevaluated = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed or (read == OPERATIONS_READ and review["project"] in set(result.get("operations_unread") or []))]
+            entry.update(outcome=MANIFEST_OUTCOME_COLLECTED, commands=commands, candidates=candidates_of(key, commands, unevaluated))
             if unevaluated:
                 entry["checks_unevaluated"] = unevaluated
             if review["read_errors"]:
@@ -4213,11 +4246,18 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
         commands = commands_of(row.get("commands") or [])
-        entries.append({
+        entry = {
             "name": key, "project": project, "location": location,
-            "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands),
+            "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands, row.get("checks_unevaluated")),
             "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run")},
-        })
+        }
+        # A re-check whose read failed: the checks it backs are unevaluated
+        # and the read is a limitation, as on a review.
+        if row.get("checks_unevaluated"):
+            entry["checks_unevaluated"] = row["checks_unevaluated"]
+        if row.get("limitations"):
+            entry["limitations"] = row["limitations"]
+        entries.append(entry)
     for row in result["upgrading"]:
         key = row["cluster"]
         seen.add(key)
@@ -4296,9 +4336,9 @@ def render_report(result: dict) -> str:
         lines += [INFO_RECHECKED, ""]
         for r in info["rechecked"]:
             errors = f"; reads that failed: {_cell('; '.join(r['errors']))}" if r["errors"] else ""
-            not_recheckable = f"; {RECHECK_NOT_RECHECKABLE_TEXT.format(count=len(r['not_recheckable']))}" if r.get("not_recheckable") else ""
+            held = f"; {RECHECK_HELD_FORMAT.format(count=len(r['held']))}" if r.get("held") else ""
             refreshed = "; symptom set refreshed" if r.get("symptom_baseline") is not None else ""
-            lines.append(f"- {_cell(r['cluster'])}: re-checked for {r['guards']} guard(s): {len(r['cleared'])} cleared{not_recheckable}{refreshed}{errors}")
+            lines.append(f"- {_cell(r['cluster'])}: re-checked for {r['guards']} guard(s): {len(r['cleared'])} cleared{held}{refreshed}{errors}")
         lines.append("")
     if info.get("removed"):
         lines += [INFO_REMOVED, ""]
@@ -4625,9 +4665,17 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         failed_reads.extend(f"{r['cluster']}: re-check: {e}" for e in r["errors"])
     # An unchanged cluster's checks ran as the operations listing that found no
     # upgrade; a re-check that read pods or nodes backs those checks with that read.
-    recheck_commands = {r["cluster"]: r.get("commands") or {} for r in rechecks}
+    recheck_by_cluster = {r["cluster"]: r for r in rechecks}
     for row in unchanged:
-        row["commands"] = checks_run(recheck_commands.get(row["cluster"], {}), fallback=operations_commands.get(row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]))
+        recheck = recheck_by_cluster.get(row["cluster"]) or {}
+        failed = set(recheck.get("failed_reads") or [])
+        # A check whose read ran and failed in the re-check is unevaluated,
+        # not backed by the listing: the harness then holds the cluster's
+        # findings as a partial run rather than resolving or re-filing them.
+        row["commands"] = checks_run(recheck.get("commands") or {}, fallback=operations_commands.get(row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]), failed=failed)
+        row["checks_unevaluated"] = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed]
+        if recheck.get("errors"):
+            row["limitations"] = "reads that failed: " + "; ".join(recheck["errors"])
     new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading}, refreshed_baselines, advance=not scoped, attempted={s.key for s in selected}, route=route, since=since, outside=outside)
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
 
