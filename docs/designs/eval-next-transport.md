@@ -463,14 +463,16 @@ session store rather than from the trajectory (Completion signals), so a case wh
 delegated worker's report is graded on that report, as on the api lane. Two differences from the
 api lane remain, and both are the transport's rather than the agent's. A router-scope
 `tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
-calls. And the GitHub-write safeguard dates a
-write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
-time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
-the card's worker opens lands in its own case's window. What the wait does not follow is a
-worker's own fan-out, the child cards a worker files, nor a card still running when the case
-reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
-the next unit's window and charge the next unit for it. Attributing each write to its case is
-[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
+calls. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
+call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
+lane what names a write is the reply and the workers' calls the harness reads back from the pod
+once the delegation wait has found the cards; a write neither names is recorded as unattributed
+and charged to nobody. The wait holds a case until the cards it filed are terminal, so a pull
+request the card's worker opens lands in its own case's window. What the wait does not follow is
+a worker's own fan-out, the child cards a worker files, nor a card still running when the case
+reaches the delegation ceiling or when the wait falls back. A write from one of those that lands
+in a later first-phase unit's window is unattributed there; one that lands in a requesting
+case's window, which runs alone and is marked exclusive, is charged to that case, so read a block
 on a requesting case's later repetitions as transport when the earlier case fanned out or ended
 at the ceiling. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on

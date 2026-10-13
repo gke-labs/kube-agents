@@ -52,12 +52,17 @@ readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
 # second (burst 429s at the model quota). A unit of a case that requests a
 # pull request -- the fan-out's second phase -- waits the settle instead:
 # the GitHub-write safeguard opens its window max_clock_skew_sec
-# before the repetition starts (GitHubWritesVerifier in
-# bench/kube_agents_bench/verifiers.py, whose default this equals; a test
-# pins the two), so a write in the last seconds of the unit before must be
-# older than that before the next window can open.
+# before the repetition starts (the lane entry in
+# EVAL_INJECT_LANE_SAFEGUARDS_FILE sets it, and says how 30 s was measured;
+# scripts/test_ci_eval_lane_safeguards.py pins the two equal), so a write in
+# the last seconds of the unit before must be older than that before the next
+# window can open. On the 2026-10-08 presubmit each requesting unit also ran
+# 90-140 s past its last write (the delegation wait, the card's completion,
+# the checks), so the settle is not the only margin. Every second
+# here is paid once per second-phase unit: three on a presubmit, eighteen on
+# the nightly.
 readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=5
-readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
+readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=30
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -1889,7 +1894,7 @@ fi
 # entry reaches it through the record's report, which is what rung 1 grades.
 # Applied on every transport, the api lane as well as the inject lane
 # (#2611), so `today` and `next` are graded against the same bar. A write
-# the safeguard charges is one the repetition's own reply or calls name, or
+# the safeguard charges is one the repetition's reply or creating calls name, or
 # any write in the window of a case that runs alone in the second phase
 # (GitHubWritesVerifier in bench/kube_agents_bench/verifiers.py), so a case
 # is not redded by a concurrent case's write.
@@ -3140,7 +3145,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # still running at the delegation ceiling, and the wait's fallback paths
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
-# grades"; per-case attribution is #2611).
+# grades"): unattributed there in the first phase, and charged to the unit
+# in the second, whose window is exclusive.
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-}," in
     *",$1,"*) echo 1 ;;

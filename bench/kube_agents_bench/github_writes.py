@@ -178,14 +178,53 @@ DEFAULT_CALL_TIMEOUT_SECONDS = 30.0
 #: refuses and which would otherwise read as seconds since 1970.
 YEAR_DIGITS = 4
 
-#: Where a branch name is found in a text: not after a character that would
-#: make it the tail of a longer name (a ``/`` may precede it, as in
-#: ``refs/heads/<branch>`` or a ``/tree/<branch>`` URL), and not before one
-#: that would continue it (a ``.`` only when a name character follows, so a
-#: sentence may end on it). ``platform-agent/fix`` is not found inside
-#: ``platform-agent/fix-oom``.
-BRANCH_NAME_BEFORE = r"(?<![A-Za-z0-9._-])"
+#: Where a branch name is found in a text: not before a character that would
+#: continue it (a ``.`` only when a name character follows, so a sentence may
+#: end on it), and not after one that would make it the tail of a longer
+#: name. ``platform-agent/fix`` is not found inside ``platform-agent/fix-oom``,
+#: nor ``fix-oom`` inside ``platform-agent/fix-oom``.
 BRANCH_NAME_AFTER = r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_/-])"
+BRANCH_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-")
+#: The ``/``-ended forms git and the forges print a branch after, which a
+#: ``/`` before the name may close: ``refs/heads/<branch>``,
+#: ``origin/<branch>``, and a web URL's ``/tree/``, ``/commits/`` or
+#: ``/compare/`` path (GitLab's ``/-/tree/`` ends in the same). A ``/`` after
+#: anything else continues a longer name. The bare-word ones must start a
+#: name themselves, so ``myorigin/`` is not ``origin/``.
+BRANCH_PATH_PREFIXES = ("refs/heads/", "origin/", "/tree/", "/commits/", "/compare/")
+#: What closes a range or a compare link, ``main..<branch>`` and
+#: ``main...<branch>``: git refuses ``..`` inside a ref name, so a branch
+#: after it is whole.
+BRANCH_RANGE_SEPARATOR = ".."
+#: The commands that create a branch or a pull request, matched against one
+#: shell segment of a call (:func:`writing_segments`): ``submit-suggestion``'s
+#: ``prepare`` and ``submit``, ``version-control``'s ``branch``, ``publish``
+#: and ``proposal create``, and the raw ``git``/``gh``/``glab`` forms. What a
+#: repetition charges itself with by its calls is what these name, never a
+#: read that takes a branch or URL as its argument (``vcs.py clone
+#: --branch``, ``proposal list --source``, ``gh pr view <url>``, ``git fetch
+#: origin <branch>``): a read names another case's pull request as easily as
+#: a listing's result does.
+WRITING_COMMANDS = tuple(
+    re.compile(p)
+    for p in (
+        r"\bsubmit_suggestion(?:\.py)?[\"']?\s+(?:prepare|submit)\b",
+        r"\bvcs(?:\.py)?[\"']?\s+(?:branch|publish|push)\b",
+        r"\bvcs(?:\.py)?[\"']?\s+(?:proposal|pr|mr)\s+(?:create|open)\b",
+        r"\bgit(?:\s+-[Cc]\s+\S+)*\s+(?:push|branch|checkout\s+(?:-[bB]|--orphan)|switch\s+(?:-[cC]|--create))\b",
+        r"\bgh\b.*\bpr\s+create\b",
+        r"\bglab\b.*\bmr\s+create\b",
+    )
+)
+#: A tool whose name says it creates a branch or a pull request (a forge MCP
+#: server's ``create_pull_request``, ``create_branch``, ``push_files``): every
+#: argument it was handed is what it wrote.
+WRITING_TOOL_NAME = re.compile(r"(?i)(?:create|open)_?(?:pull|merge|branch|proposal)|push")
+#: What separates one command from the next in a shell line, after a
+#: backslash-newline continuation is joined: a heredoc's body, a ``cd`` and a
+#: read chained before the write each fall in a segment of their own.
+SHELL_CONTINUATION = "\\\n"
+SHELL_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n]")
 #: A branch whose name holds none of these is a bare word (``fix``,
 #: ``main``) that a reply's prose carries by accident, so it is attributed
 #: by its pull request's URL alone, never by its name.
@@ -675,14 +714,47 @@ def named_in(
     What charges a write to the repetition that made it rather than to every
     repetition whose window it falls in (#2611): the agent links the pull
     request it opened in its own reply, and its own push or
-    ``submit-suggestion`` call carries the branch.
+    ``submit-suggestion`` call carries the branch. The caller decides what
+    ``text`` holds; the verifier hands it the reply and the writing calls
+    alone (:func:`writing_segments`).
     """
     if write.number is not None and write.number in proposal_numbers_named(text, repo, forge, environ):
         return True
     branch = write.branch
     if not branch or not any(sep in branch for sep in BRANCH_NAME_SEPARATORS):
         return False
-    return re.search(BRANCH_NAME_BEFORE + re.escape(branch) + BRANCH_NAME_AFTER, text) is not None
+    return any(
+        _starts_a_name(text[: m.start()])
+        for m in re.finditer(re.escape(branch) + BRANCH_NAME_AFTER, text)
+    )
+
+
+def writing_segments(command: str) -> list[str]:
+    """The segments of a shell line that create a branch or a pull request
+    (:data:`WRITING_COMMANDS`), so a write is charged by the call that made
+    it and not by a read chained beside it."""
+    joined = command.replace(SHELL_CONTINUATION, " ")
+    return [s for s in SHELL_SEGMENT_SPLIT.split(joined) if any(p.search(s) for p in WRITING_COMMANDS)]
+
+
+def is_writing_tool(name: str) -> bool:
+    """Whether a tool's name says it creates a branch or a pull request."""
+    return bool(WRITING_TOOL_NAME.search(name or ""))
+
+
+def _starts_a_name(before: str) -> bool:
+    """Whether a branch name that begins right after ``before`` is whole,
+    rather than the tail of a longer name (:data:`BRANCH_PATH_PREFIXES`,
+    :data:`BRANCH_RANGE_SEPARATOR`)."""
+    if not before or before[-1] not in BRANCH_NAME_CHARS:
+        return True
+    if before.endswith(BRANCH_RANGE_SEPARATOR):
+        return True
+    for prefix in BRANCH_PATH_PREFIXES:
+        if before.endswith(prefix):
+            head = before[: -len(prefix)]
+            return prefix.startswith("/") or not head or head[-1] not in BRANCH_NAME_CHARS
+    return False
 
 
 def parse_github_time(value: Any) -> datetime | None:

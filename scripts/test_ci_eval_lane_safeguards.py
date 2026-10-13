@@ -158,7 +158,7 @@ class InjectLaneTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
         # The writer units wait the safeguard's settle, not the stagger.
-        self.assertEqual(value(result, "PAUSE"), "120")
+        self.assertEqual(value(result, "PAUSE"), "30")
         scratch = pathlib.Path(value(result, "DIR"))
         self.assertTrue(scratch.is_dir())
         paths = dict(line.split(" ", 1) for line in tagged(result, "PATH"))
@@ -330,16 +330,16 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertFalse(any("every other unit is done" in line for line in lines))
         self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 8)
 
-    def test_the_settle_equals_the_safeguards_clock_skew_default(self):
+    def test_the_settle_equals_the_lane_safeguards_clock_skew(self):
         """The settle exists so a write in the last seconds of the unit before
-        is outside the next window, whose lower edge is the check's default
-        skew; the two numbers have to agree."""
+        is outside the next window, whose lower edge is the lane entry's
+        max_clock_skew_sec; the two numbers have to agree, and the entry has
+        to set one rather than fall back to the check's default."""
         script = SCRIPT.read_text(encoding="utf-8")
         settle = re.search(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", script, re.MULTILINE).group(1)
-        verifiers = (REPO_ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text(encoding="utf-8")
-        body = verifiers[verifiers.index("class GitHubWritesVerifier") :]
-        default = re.search(r"max_clock_skew_sec: float = Field\(default=(\d+)\.0", body).group(1)
-        self.assertEqual(settle, default)
+        lane_file = eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8")
+        skews = re.findall(r"^\s+max_clock_skew_sec: (\d+)$", lane_file, re.MULTILINE)
+        self.assertEqual(skews, [settle])
         self.assertIsNotNone(re.search(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=\d+$", script, re.MULTILINE))
 
 

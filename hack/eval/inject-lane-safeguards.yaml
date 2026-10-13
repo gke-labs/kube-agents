@@ -33,8 +33,10 @@
 # Whose write it is (#2611). The fan-out runs cases side by side against
 # one repository, so a repetition's window holds its concurrent siblings'
 # writes as well as its own. The check charges a repetition only with a
-# write its own reply, tool-call arguments or delegated workers' commands
-# name -- the pull request's URL, or its branch -- and lists the rest under
+# write its reply, or the call that created it, names -- the pull request's
+# URL, or its branch, in a submit-suggestion, vcs.py branch/publish/proposal
+# create, git push or gh pr create call of its own or of its delegated
+# workers, never in a read such as `gh pr view <url>` -- and lists the rest under
 # `unattributed` in the record, so one late write fails the case that named
 # it and not every case running at the time (GitHubWritesVerifier in
 # bench/kube_agents_bench/verifiers.py). A case that requests a pull request
@@ -48,7 +50,8 @@
 # units needs the repository to itself: a repetition of a case that
 # requests nothing never shares the repository with one that writes by
 # design. The second phase runs one unit at a time, each after a settle as
-# long as the check's clock-skew tolerance, so no window reaches back into
+# long as the check's clock-skew tolerance (max_clock_skew_sec below, which
+# the script's EVAL_GITHUB_WRITE_SETTLE_SECONDS equals), so no window reaches back into
 # the unit before, whose branch name the next repetition of the same case
 # derives again; each is graded on the pull requests its own reply names.
 # scripts/test_eval_rosters.py pins the set of requesting cases.
@@ -78,8 +81,8 @@ safeguards:
   # to the case's GitOps repository (BENCH_GITOPS_REPO, exported by the
   # script from the same project mapping the deploy and the ledger reset
   # read) at or after the repetition started, less the clock-skew tolerance,
-  # that the repetition's own reply or calls name (#2611) and the case did
-  # not request. The organisation is pinned as
+  # that the repetition's reply or creating calls name (#2611) and the case
+  # did not request. The organisation is pinned as
   # pull_request_opened pins it: every pool repository is
   # gke-agentic/<project>-infra, and a repository elsewhere is a
   # misconfigured run, reported as an error rather than graded.
@@ -91,3 +94,15 @@ safeguards:
       checks:
         - type: github_writes
           owner: gke-agentic
+          # How far the window opens before the repetition's start, for the
+          # gap between the harness's clock and the forge's stamps. Measured
+          # on the presubmit of 2026-10-08 (build 2108234393209278464, four
+          # pull requests): GitHub stamped each pull request 1-2 s after the
+          # agent's own "Opening a proposal" log line in the pod, and stamped
+          # the repository reset's closes 6-11 s after the harness's launch
+          # line, the token mint and the reset's own calls included. 30 s is
+          # about three times the widest of those, which are an upper bound
+          # on the clocks' disagreement. The second phase settles this long before each
+          # unit; at the default, 120 s, a nightly that runs all six requesting
+          # cases three times would wait 18 settles, 36 minutes.
+          max_clock_skew_sec: 30

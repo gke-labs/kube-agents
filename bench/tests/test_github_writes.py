@@ -481,6 +481,144 @@ def test_a_bare_word_branch_is_named_by_its_url_alone():
     assert github_writes.named_in(write, PR39_URL, REPO, "github")
 
 
+PDB_BRANCH = "platform-agent/checkout-gateway-pdb-new"
+
+
+def _pdb_write(branch: str = PDB_BRANCH) -> github_writes.GitHubWrite:
+    return github_writes.GitHubWrite(
+        kind=github_writes.KIND_PULL_REQUEST, branch=branch, when=RUN_START, how=github_writes.HOW_OPENED, number=39
+    )
+
+
+@pytest.mark.parametrize(
+    "text, named",
+    [
+        # A longer name that ends in this one is another branch.
+        ("git push origin platform-agent/fix-oom", False),
+        (f"https://github.com/{REPO}/tree/platform-agent/fix-oom", False),
+        ("refs/heads/platform-agent/fix-oom", False),
+        ("myorigin/fix-oom", False),
+        # The forms a `/` before the name closes.
+        ("git push origin fix-oom", True),
+        ("git push origin HEAD:refs/heads/fix-oom", True),
+        ("git log origin/fix-oom", True),
+        (f"https://github.com/{REPO}/tree/fix-oom", True),
+        (f"https://github.com/{REPO}/commits/fix-oom", True),
+    ],
+)
+def test_a_branch_is_not_named_by_a_longer_name_that_ends_in_it(text, named):
+    assert github_writes.named_in(_pdb_write("fix-oom"), text, REPO, "github") is named
+
+
+@pytest.mark.parametrize(
+    "text, named",
+    [
+        (f"git diff main...{PDB_BRANCH}", True),
+        (f"git log origin/main..{PDB_BRANCH}", True),
+        (f"https://github.com/{REPO}/compare/main...{PDB_BRANCH}?expand=1", True),
+        (f"https://github.com/{REPO}/compare/{PDB_BRANCH}?expand=1", True),
+        # One dot is still a longer name.
+        (f"v1.{PDB_BRANCH}", False),
+    ],
+)
+def test_a_branch_after_a_range_or_compare_separator_is_named(text, named):
+    assert github_writes.named_in(_pdb_write(), text, REPO, "github") is named
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"name": "terminal", "args": {"command": f"python3 vcs.py clone --repo {REPO} --branch {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"python3 vcs.py proposal list --source {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"python3 vcs.py remote-branch view {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"python3 inspect_repository.py --ref {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"gh pr view {PR39_URL}"}},
+        {"name": "terminal", "args": {"command": f"gh pr diff {PR39_URL}"}},
+        {"name": "terminal", "args": {"command": f"git fetch origin {PDB_BRANCH}"}},
+        # A read chained beside a write names nothing: the push is of another branch.
+        {"name": "terminal", "args": {"command": f"git fetch origin {PDB_BRANCH} && git push origin HEAD:platform-agent/mine"}},
+        {"name": "execute_code", "args": {"code": f"print(open('/tmp/x').read())  # {PDB_BRANCH}"}},
+    ],
+)
+def test_a_branch_or_url_in_a_reads_arguments_does_not_charge_the_write(env, github, call):
+    """A sibling's pull request named in the argument of a read (#2611): the
+    repetition looked at it, it did not make it. Only a creating call, or the
+    reply, charges a write."""
+    route_listing(github, "pulls-requested-only.json")
+    stash(calls=[call])
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert res.raw["unattributed"] == ["#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18+00:00"]
+
+
+def test_a_read_in_a_workers_command_does_not_charge_the_write(env, github):
+    route_listing(github, "pulls-requested-only.json")
+    stash(calls=[], worker_commands=[{"task": "t1", "command": f"gh pr view {PR39_URL} --json files"}])
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert res.raw["unattributed"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"name": "terminal", "args": {"command": f'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \\\n  --repo "{REPO}" --branch "{PDB_BRANCH}"'}},
+        {
+            "name": "terminal",
+            "args": {
+                "command": "BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)\n"
+                "cat > \"$BODY\" <<'EOF'\nAdds a PodDisruptionBudget.\nEOF\n"
+                f'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit --branch "{PDB_BRANCH}" --body-file "$BODY"'
+            },
+        },
+        {"name": "terminal", "args": {"command": f"python3 vcs.py branch {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"python3 vcs.py proposal create --title t --source {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"cd /tmp/repo && git checkout -b {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"git -C /tmp/repo push -u origin {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"gh pr create --head {PDB_BRANCH} --title t --body b"}},
+        {"name": "create_pull_request", "args": {"owner": "gke-agentic", "repo": "x", "head": PDB_BRANCH}},
+    ],
+)
+def test_the_call_that_created_the_branch_charges_the_write(env, github, call):
+    route_listing(github, "pulls-requested-only.json")
+    stash(calls=[call])
+    res = check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["unattributed"] == []
+
+
+def test_on_the_inject_lane_the_workers_submit_call_charges_the_write(env, github):
+    """The door's trace shapes every string argument of the front agent's
+    calls (a2a/hermes-bridge/activity.go, shapeOf), so they name nothing; the
+    delegated worker's calls are read back from the pod raw and join the
+    trajectory tagged with its profile (worker_trajectory), and the worker's
+    submit-suggestion call names the branch it wrote."""
+    route_listing(github, "pulls-requested-only.json")
+    front = {"name": "kanban_create", "args": {"title": "<string, 40 chars>", "body": "<string, 900 chars>"}, "status": "completed"}
+    worker = {
+        "name": "terminal",
+        "args": {"command": f"python3 submit_suggestion.py submit --branch {PDB_BRANCH} --title t"},
+        "agent": "platform",
+        "task": "t_b999714f",
+    }
+    stash(final_message="Opened a pull request with the fix.", calls=[front, worker])
+    res = check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["unrequested"] == ["#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18+00:00"]
+
+
+def test_on_the_inject_lane_a_write_no_captured_call_or_reply_names_stays_unattributed(env, github):
+    """Without the worker's calls (a door with no session store, the cli
+    executor) and with a reply that does not link it, nothing ties the write
+    to this repetition: it is recorded as unattributed, not charged, because
+    a concurrent repetition's write looks the same."""
+    route_listing(github, "pulls-requested-only.json")
+    front = {"name": "terminal", "args": {"command": "<string, 92 chars>"}, "status": "completed"}
+    stash(final_message="Opened a pull request with the fix.", calls=[front])
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert res.raw["unattributed"] == ["#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18+00:00"]
+
 # --- branches ----------------------------------------------------------------
 
 

@@ -3235,17 +3235,26 @@ def _strings_in(value: Any) -> list[str]:
 
 
 def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
-    """What one repetition said and sent, for charging a write to it: its
-    reply, its tool calls' arguments and its delegated workers' commands.
-    Not the tool results, which carry what the agent read -- another case's
-    pull request in a listing -- as well as what it wrote."""
+    """What one repetition said and wrote with, for charging a write to it:
+    its reply, and the calls that create a branch or a pull request -- the
+    front agent's and its delegated workers' tool calls (the worker
+    trajectory joins ``trajectory`` tagged with its ``agent``) and the
+    workers' terminal commands. Not a read's arguments and not any tool
+    result: ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a
+    listing name another case's pull request as easily as this one's
+    (:func:`kube_agents_bench.github_writes.writing_segments`)."""
     parts = [snap.final_message, snap.output]
     for call in snap.trajectory:
-        if isinstance(call, dict):
-            parts.extend(_strings_in(call.get("args")))
+        if not isinstance(call, dict):
+            continue
+        strings = _strings_in(call.get("args"))
+        if github_writes.is_writing_tool(str(call.get("name") or "")):
+            parts.extend(strings)
+        else:
+            parts.extend(seg for s in strings for seg in github_writes.writing_segments(s))
     for row in snap.worker_commands or []:
         if isinstance(row, dict):
-            parts.append(str(row.get("command") or ""))
+            parts.extend(github_writes.writing_segments(str(row.get("command") or "")))
     return "\n".join(parts)
 
 
@@ -3305,22 +3314,34 @@ class GitHubWritesVerifier(BaseVerifier):
 
     WHOSE WRITE IT IS (#2611). The fan-out runs cases side by side against
     one repository, so a window holds every concurrent repetition's writes.
-    A write is charged to this repetition only when what it said or sent
-    names it (:func:`kube_agents_bench.github_writes.named_in`): the pull
-    request's web URL or the write's branch, in its reply (``final_message``
-    or ``output``), its own tool calls' arguments, or its delegated workers'
-    commands. Tool results are not read: a listing the
-    agent fetched names pull requests it did not open. A write in the window
+    A write is charged to this repetition only when its reply or the call
+    that created it names it (:func:`kube_agents_bench.github_writes.named_in`):
+    the pull request's web URL or the write's branch, in its reply
+    (``final_message``, which carries the delegated cards' results, or
+    ``output``), or in a call that creates a branch or a pull request --
+    ``submit-suggestion``, ``vcs.py branch``/``publish``/``proposal create``,
+    ``git push``, ``gh pr create``
+    (:func:`kube_agents_bench.github_writes.writing_segments`) -- among its
+    own tool calls, its delegated workers' tool calls, and their terminal
+    commands. A read's arguments and every tool result are left out:
+    ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a listing
+    name another case's pull request as easily as this one's. On the inject
+    lane the front agent's arguments arrive as shapes (the bridge sends no
+    string value off the pod), so what names a write there is the reply and
+    the workers' calls, which the harness reads back from the pod's session
+    store when its delegation wait found the cards. A write in the window
     that nothing of this repetition names is not charged to it and is
     listed under ``unattributed`` in ``raw`` and in the reason, so one late
     write fails the repetition that named it rather than every repetition
     running at the time. With ``exclusive_window`` -- set by the lane on a
     case that requests a pull request, which runs alone -- a write nothing
     names is charged all the same, since no other repetition was writing.
-    Otherwise a write no repetition names is graded by none (a trace the
-    door dropped or truncated, a delegated worker's call the transport
-    does not carry); the run's leftovers listing (``hack/ci-eval-pr.sh``)
-    still names it.
+    Otherwise a write no repetition names is graded by none (a reply that
+    does not link it from a run whose workers' calls were not read back --
+    the bridge's ``cli`` executor, a wait that fell back, a card the read
+    could not reach); the run's leftovers listing (``hack/ci-eval-pr.sh``)
+    still names it. Charging it to every repetition whose window holds it
+    would charge the concurrent ones that did not make it.
 
     HOW A CASE THAT WRITES BY DESIGN IS KEPT AWAY. The script runs the
     cases that request a pull request in a second phase, after every other
@@ -3331,7 +3352,12 @@ class GitHubWritesVerifier(BaseVerifier):
     ``EVAL_GITHUB_WRITE_SETTLE_SECONDS``, pinned equal by a test), so no
     window reaches back into the unit before, whose branch name the next
     repetition of the same case derives again; each is graded on the pull
-    requests its own reply names.
+    requests its own reply names. That ordering holds while a unit's writes
+    land before it ends: a write from a card the harness's delegation wait
+    did not follow (a worker's fan-out child, a card at the delegation
+    ceiling) can land in the next unit's window, unattributed there in the
+    first phase and charged to it in the second, whose window is exclusive
+    (#2619).
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.
@@ -3470,8 +3496,9 @@ class GitHubWritesVerifier(BaseVerifier):
             left_out.append(f"requested and left out: {'; '.join(excused)}")
         if unattributed:
             left_out.append(
-                "in the window but named nowhere in this repetition's reply, tool-call "
-                "arguments or worker commands, so not charged to it (a concurrent "
+                "in the window but named nowhere in this repetition's reply or in a "
+                "call of its that creates a branch or a pull request, so not charged "
+                "to it (a concurrent "
                 f"repetition's, or one the eval cannot attribute): "
                 f"{'; '.join(w.describe() for w in unattributed)}"
             )
