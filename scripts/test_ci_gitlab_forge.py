@@ -104,6 +104,8 @@ class FakeGitLab:
         self.state_on_create = "opened"  # what GET answers for a created issue's state before any close
         self.stale_stamp = False  # the description comes back with a stamp from 2000, as a replayed body would
         self.unmarked_notes = False  # notes come back without the reset marker, as a human's close would read
+        self.naive_stamp = False  # the description comes back with a stamp that carries no UTC offset
+        self.empty_issue_read = False  # GET /issues/<iid> answers an empty body (None) instead of the issue
 
     def __call__(self, method, path, token, body=None, host=gitlab.DEFAULT_HOST):
         self.calls.append((method, path, body))
@@ -125,7 +127,7 @@ class FakeGitLab:
                 found = self.detail.get(int(bare.rsplit("/", 1)[1]))
                 if found is None:
                     raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
-                return dict(found)
+                return None if self.empty_issue_read else dict(found)
             if bare == f"/projects/{ENC}/merge_requests":
                 return [m for m in self.mrs if m.get("state", "opened") == "opened"] if page == 1 else []
             if bare == f"/projects/{ENC}/repository/branches":
@@ -161,6 +163,8 @@ class FakeGitLab:
             description = str(body.get("description") or "")
             if self.stale_stamp:
                 description = re.sub(r"watchdog at \S+?\. ", "watchdog at 2000-01-01T00:00:00+00:00. ", description)
+            if self.naive_stamp:
+                description = re.sub(r"\+00:00\. ", ". ", description, count=1)
             created = {
                 "iid": iid, "title": body.get("title", ""), "author": {"username": self.author_on_create or self.login},
                 "labels": str(body.get("labels") or "").split(","), "state": self.state_on_create,
@@ -304,13 +308,14 @@ class LedgerProbeTest(unittest.TestCase):
         self.assertEqual(iid, 1)
         steps = list(zip([m for m, _, _ in fake.calls], [p.split("?")[0].replace(f"/projects/{ENC}", "") for _, p, _ in fake.calls], fake.tokens))
         # The agent writes; the grader's token reads the issue and its notes, nothing else.
-        self.assertEqual(steps[0], ("POST", "/issues", "agent-tok"))
-        self.assertEqual(steps[1], ("GET", "/issues/1", "ledger-tok"))
+        self.assertEqual(steps[0], ("GET", "/user", "agent-tok"))
+        self.assertEqual(steps[1], ("POST", "/issues", "agent-tok"))
+        self.assertEqual(steps[2], ("GET", "/issues/1", "ledger-tok"))
         self.assertIn(("POST", "/issues/1/notes", "agent-tok"), steps)
         self.assertIn(("PUT", "/issues/1", "agent-tok"), steps)
         self.assertEqual(steps[-2:], [("GET", "/issues/1", "ledger-tok"), ("GET", "/issues/1/notes", "ledger-tok")])
         self.assertEqual({t for (m, _, t) in steps if m in ("POST", "PUT")}, {"agent-tok"})
-        created = fake.calls[0][2]
+        created = fake.calls[1][2]
         self.assertEqual(created["title"], "[audit] eval ledger-path probe")
         self.assertEqual(created["labels"], "agent:audit,audit:eval-ledger-probe")
         # The body is the footer the bench's ledger check parses, under the probe's own stream.
@@ -328,7 +333,37 @@ class LedgerProbeTest(unittest.TestCase):
         self.assertIsNone(iid)
         self.assertEqual(len(faults), 1)
         self.assertTrue(faults[0].startswith("publish: the agent token could not open an issue in gke-agentic/kube-agents-evals-2-infra"), faults)
-        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual([m for m, _, _ in fake.calls], ["GET", "POST"])
+
+    def test_a_login_the_agent_token_cannot_read_creates_nothing(self):
+        # The lookup comes before the create, so a fault there leaves no issue to retire.
+        fake = FakeGitLab(fail={("GET", "/user")})
+        iid, faults, _ = self._probe(fake)
+        self.assertIsNone(iid)
+        self.assertEqual(len(faults), 1)
+        self.assertTrue(faults[0].startswith("publish: the agent token could not read its own login at gitlab.com"), faults)
+        self.assertEqual([m for m, _, _ in fake.calls], ["GET"])
+        self.assertEqual(fake.detail, {})
+
+    def test_a_naive_footer_stamp_reads_as_utc_rather_than_crashing(self):
+        # The bench's parser reads a stamp without an offset as UTC; so does the probe, and the
+        # round-trip check then runs instead of a TypeError leaving the issue open.
+        fake = FakeGitLab()
+        fake.naive_stamp = True
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertEqual(faults, [])
+        self.assertEqual(fake.detail[1]["state"], "closed")
+
+    def test_an_empty_read_back_is_the_read_back_fault(self):
+        fake = FakeGitLab()
+        fake.empty_issue_read = True
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertIn("read-back: GitLab answered the read of issue #1 with an empty body", faults)
+        # The issue is still retired; the post-close read fails the same way and says so.
+        self.assertEqual(fake.detail[1]["state"], "closed")
+        self.assertIn("reset read-back: issue #1 is not closed after the reset", faults)
 
     def test_a_body_that_does_not_come_back_as_written_is_the_read_back_fault(self):
         fake = FakeGitLab()
@@ -1144,8 +1179,12 @@ class EvalScriptGitLabTest(unittest.TestCase):
         proc = self._run(self._probe_body())
         self.assertIn("RC=0", proc.stdout)
         self.assertIn("Ledger probe (lease): issue #7 opened as the agent, read back with the grader's token, closed by the reset in gke-agentic/kube-agents-evals-2-infra", proc.stdout)
-        probes = [line for line in (self.dir / "whoami.log").read_text().splitlines() if line.startswith("PROBE ")]
-        self.assertEqual(probes, ['PROBE argv=["--path", "gke-agentic/kube-agents-evals-2-infra", "--project", "kube-agents-evals-2", "--build", "1", "--host", "gitlab.com"] ledger=glpat-ledger'])
+        log = (self.dir / "whoami.log").read_text().splitlines()
+        probe_argv = '["--path", "gke-agentic/kube-agents-evals-2-infra", "--project", "kube-agents-evals-2", "--build", "1", "--host", "gitlab.com"]'
+        # Both tokens ride in the helper's environment: the stub logs the agent token on its WHOAMI line
+        # for every invocation and the ledger token on the PROBE line.
+        self.assertIn(f"WHOAMI argv={probe_argv} token=glpat-agent", log)
+        self.assertEqual([line for line in log if line.startswith("PROBE ")], [f"PROBE argv={probe_argv} ledger=glpat-ledger"])
         self.assertNotIn("WARNING", proc.stderr)
 
     def test_a_broken_ledger_path_stops_the_run_naming_the_step(self):

@@ -329,6 +329,9 @@ def _probe_issue_view(issue: dict) -> tuple[set[str], str | None, datetime.datet
         stamp = datetime.datetime.fromisoformat(match.group("stamp"))
     except ValueError:
         return labels_of(issue), match.group("audit").strip(), None
+    if stamp.tzinfo is None:
+        # The bench's parser reads a naive stamp as UTC rather than dropping it.
+        stamp = stamp.replace(tzinfo=datetime.timezone.utc)
     return labels_of(issue), match.group("audit").strip(), stamp
 
 
@@ -346,6 +349,13 @@ def probe_ledger_path(path: str, project: str, build: str, agent_token: str, led
     faults: list[str] = []
     labels = f"{AUDIT_LABEL},{STREAM_LABEL_PREFIX}{PROBE_AUDIT_ID}"
     body = PROBE_FOOTER.format(audit=PROBE_AUDIT_ID, stamp=now.isoformat())
+    # The bot's login first, so a lookup fault creates nothing to retire.
+    try:
+        bot_login = current_login(agent_token, host)
+    except RateLimited:
+        raise
+    except CALL_FAULTS + (ResetError,) as exc:
+        return None, [f"publish: the agent token could not read its own login at {host} ({exc})"]
     try:
         created = _write("POST", f"/projects/{encoded(path)}/issues", agent_token, {"title": PROBE_TITLE, "description": body, "labels": labels}, host)
     except RateLimited:
@@ -363,8 +373,13 @@ def probe_ledger_path(path: str, project: str, build: str, agent_token: str, led
     except CALL_FAULTS as exc:
         faults.append(f"read-back: the ledger token could not read issue #{iid} ({exc})")
         seen = None
+    if seen is not None and not isinstance(seen, dict):
+        faults.append(f"read-back: GitLab answered the read of issue #{iid} with no object ({str(seen)[:PROBE_REPLY_EXCERPT_CHARS]})")
+        seen = None
+    elif seen is None and not faults:
+        faults.append(f"read-back: GitLab answered the read of issue #{iid} with an empty body")
     if isinstance(seen, dict):
-        why = not_a_ledger_because(seen, PROBE_AUDIT_ID, current_login(agent_token, host))
+        why = not_a_ledger_because(seen, PROBE_AUDIT_ID, bot_login)
         if why:
             faults.append(f"read-back: issue #{iid} does not read as a ledger: {why}")
         _, audit, stamp = _probe_issue_view(seen)
