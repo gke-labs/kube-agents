@@ -16,7 +16,6 @@ argv.
 
 from __future__ import annotations
 
-import copy
 import re
 import sys
 import unittest
@@ -86,7 +85,7 @@ def _profile_configs():
     shared = yaml.safe_load(h.text("shared_defaults_config"))
     platform = yaml.safe_load(h.text("platform_config"))
     return {
-        "platform": merge(copy.deepcopy(shared), platform),
+        "platform": merge(shared, platform),
         "cluster": yaml.safe_load(h.text("cluster_config")),
     }
 
