@@ -203,3 +203,75 @@ func TestTheForgeConfigurationRollsTheBrokerNotTheGateway(t *testing.T) {
 		t.Error("declaring a GitLab forge does not change the broker's policy hash")
 	}
 }
+
+// A forge's CA bundle is the Secret key caBundleRef names, mounted into the
+// broker's pod only, at the path its configuration entry names. It comes from
+// a Secret so that changing it needs the same rights as changing the token
+// beside it; a ConfigMap of the same name is never read. Optional, so a missing
+// Secret does not stop the broker, and not a SubPath, so kubelet's refresh of
+// the Secret reaches the broker with no restart.
+func TestAForgeCABundleIsMountedIntoTheBrokerOnly(t *testing.T) {
+	agent := gitlabAgent("gitlab-forge-token")
+	// A self-managed host: gitlab.com refuses caBundleRef.
+	agent.Spec.Integration.Forges[1].Host = "gitlab.internal.example"
+	agent.Spec.Integration.Forges[1].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca", Key: "root.pem"}
+
+	var document struct {
+		Forges []map[string]any `json:"forges"`
+	}
+	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	if err := json.Unmarshal([]byte(raw), &document); err != nil {
+		t.Fatalf("the forge configuration is not JSON: %v\n%s", err, raw)
+	}
+	caFile := forgeCADir + "/gitlab/" + agentv1alpha1.ForgeCABundleFileName
+	if got := document.Forges[1]["caFile"]; got != caFile {
+		t.Errorf("caFile = %v, expected %s", got, caFile)
+	}
+	if _, found := document.Forges[0]["caFile"]; found {
+		t.Error("GitHub's entry carries a caFile")
+	}
+
+	dep := buildCredentialProxyDeployment(agent, "hash")
+	container := dep.Spec.Template.Spec.Containers[0]
+	mount := mountCovering(&container, caFile)
+	if mount == nil {
+		t.Fatalf("%s is supplied by no mount in the broker container", caFile)
+	}
+	if mount.SubPath != "" || !mount.ReadOnly {
+		t.Errorf("the CA mount is %+v; expected a read-only directory mount", mount)
+	}
+	var source *corev1.SecretVolumeSource
+	for _, volume := range dep.Spec.Template.Spec.Volumes {
+		if volume.Name == mount.Name {
+			source = volume.Secret
+		}
+		// A ConfigMap of the same name is not the CA: a ConfigMap write must
+		// not choose the broker's trust anchor.
+		if volume.ConfigMap != nil && volume.ConfigMap.Name == "gitlab-forge-ca" {
+			t.Errorf("the broker pod reads a ConfigMap named like the CA Secret, as %q", volume.Name)
+		}
+	}
+	if source == nil || source.SecretName != "gitlab-forge-ca" {
+		t.Fatalf("the CA mount %q is not the Secret gitlab-forge-ca: %+v", mount.Name, source)
+	}
+	if len(source.Items) != 1 || source.Items[0].Key != "root.pem" || source.Items[0].Path != agentv1alpha1.ForgeCABundleFileName {
+		t.Errorf("the Secret projection is %+v; expected only root.pem, as ca.crt", source.Items)
+	}
+	if source.Optional == nil || !*source.Optional {
+		t.Error("the CA Secret projection is not optional, so a missing Secret would stop the broker")
+	}
+
+	gateway := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
+	sandbox := buildShellSandboxStatefulSet(agent, "keys", credentialProxyURL(agent), "s")
+	for name, podVolumes := range map[string][]corev1.Volume{
+		"gateway": gateway.Spec.Volumes,
+		"sandbox": sandbox.Spec.Template.Spec.Volumes,
+	} {
+		for _, volume := range podVolumes {
+			if (volume.Secret != nil && volume.Secret.SecretName == "gitlab-forge-ca") ||
+				(volume.ConfigMap != nil && volume.ConfigMap.Name == "gitlab-forge-ca") {
+				t.Errorf("the %s pod mounts the forge's CA as %q", name, volume.Name)
+			}
+		}
+	}
+}

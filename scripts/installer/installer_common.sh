@@ -904,7 +904,7 @@ load_install_env() {
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub. --gitops-forge is the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -3562,6 +3562,11 @@ write_tfvars_from_state() {
       echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
       echo "gitlab_repo               = $(hcl_str "${GITOPS_REPO:-}")"
       echo "gitlab_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}")"
+      # Only when a CA was given, so an install without one renders the lines
+      # it always has.
+      if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+        echo "gitlab_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
     fi

@@ -645,11 +645,21 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             "GKE_PROJECT_ID",
             "GKE_CLUSTER_NAME",
             "GKE_LOCATION",
+            # The collectors' scope guard reads it in the session; set on the
+            # container alone it never reaches them (#2840's strict pass).
+            "KUBEAGENTS_SCOPE_DECLARED",
         }
         self.assertTrue(
             required.issubset(names),
             f"expected {required} to be subset of {names}",
         )
+
+    def test_the_scope_answer_is_also_written_as_a_root_owned_file(self) -> None:
+        """A session can unset the forwarded variable; the collectors read this file first."""
+        content = _ENTRYPOINT.read_text()
+        self.assertIn('SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"', content)
+        self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_SCOPE_DECLARED:-false\}" >"\$SANDBOX_SCOPE_DECLARED_FILE"')
+        self.assertIn('chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"', content)
 
 
 if __name__ == "__main__":

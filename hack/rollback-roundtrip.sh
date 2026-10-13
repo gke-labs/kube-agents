@@ -94,6 +94,19 @@ readonly CR_REFUSAL_REASONS="A2AProvisionFailed ModeNotRecognized"
 readonly JOB_CONDITION_COMPLETE="Complete"
 readonly JOB_CONDITION_FAILED="Failed"
 
+# The one Degraded phase the not-degraded checks wait out rather than fail on
+# at once, the same one hack/ci-deploy.sh's gate after the sidecar patch
+# forgives (#2414, #2427), with the same reason and the same match: the
+# operator gives the Ready condition this reason for any pod it scans that
+# the scheduler marked Unschedulable, copying the scheduler's words in after
+# "cannot be scheduled onto any available node:" behind "Pod <name>", and a
+# count of nodes short of CPU or memory there is a pod an Autopilot scale-up
+# places. A message with no such count (a taint, a selector or affinity
+# only, or the RuntimeClass sentence) fails on the first read as before.
+# tests/test_rollback_roundtrip.py holds these to hack/ci-deploy.sh.
+readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
+readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
+
 # A container waiting for one of these is not coming up on its own, and a pod
 # holding one is stuck rather than starting.
 readonly STUCK_WAITING_REASONS="CrashLoopBackOff ImagePullBackOff ErrImagePull CreateContainerConfigError CreateContainerError InvalidImageName RunContainerError"
@@ -156,6 +169,17 @@ readonly DEFAULT_BRIDGE_TIMEOUT=300
 # Pods and Jobs settling after Ready: nothing pending, terminating or backing
 # off, and under today nothing of the A2A stack left.
 readonly DEFAULT_SETTLE_TIMEOUT=300
+# How long a not-degraded check waits out that one Degraded: hack/ci-deploy.sh's
+# window (MODE_NEXT_UNSCHEDULABLE_ATTEMPTS reads, MODE_NEXT_POLL_SECONDS
+# apart). Only the CR ending the Degraded ends the wait early. The operator
+# watches no Pods, so the scheduler placing a pod starts no pass, and the
+# status keeps the scheduler's message while the pod starts. But it owns
+# the agent Deployment (Owns, no predicate), so the agent pod going Ready
+# changes that Deployment's status and starts a pass that scans the pods
+# again. In periodic 2109267671341076480 the agent pod was bound at
+# 15:14:12Z, the pass its readiness started ran at 15:15:19Z, and the check
+# read the old message at about 15:15:20Z, while that pass was running.
+readonly DEFAULT_UNSCHEDULABLE_TIMEOUT=300
 # One today turn's request, and how many fresh tunnels it gets.
 readonly DEFAULT_TURN_TIMEOUT=120
 readonly DEFAULT_TURN_ATTEMPTS=5
@@ -192,6 +216,7 @@ TEARDOWN_TIMEOUT="${ROLLBACK_TEARDOWN_TIMEOUT:-${DEFAULT_TEARDOWN_TIMEOUT}}"
 BUS_UP_TIMEOUT="${ROLLBACK_BUS_UP_TIMEOUT:-${DEFAULT_BUS_UP_TIMEOUT}}"
 BRIDGE_TIMEOUT="${ROLLBACK_BRIDGE_TIMEOUT:-${DEFAULT_BRIDGE_TIMEOUT}}"
 SETTLE_TIMEOUT="${ROLLBACK_SETTLE_TIMEOUT:-${DEFAULT_SETTLE_TIMEOUT}}"
+UNSCHEDULABLE_TIMEOUT="${ROLLBACK_UNSCHEDULABLE_TIMEOUT:-${DEFAULT_UNSCHEDULABLE_TIMEOUT}}"
 TURN_TIMEOUT="${ROLLBACK_TURN_TIMEOUT:-${DEFAULT_TURN_TIMEOUT}}"
 TURN_ATTEMPTS="${ROLLBACK_TURN_ATTEMPTS:-${DEFAULT_TURN_ATTEMPTS}}"
 BUS_TASK_TIMEOUT="${ROLLBACK_BUS_TASK_TIMEOUT:-${DEFAULT_BUS_TASK_TIMEOUT}}"
@@ -666,22 +691,53 @@ degraded_baseline_summary() {
   fi
 }
 
+# Whether the CR's last read is the one Degraded the window forgives: phase
+# Degraded, Ready reason PodUnschedulable, and a capacity count in the
+# scheduler's words.
+capacity_unschedulable() {
+  [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ] \
+    && [ "${CR_READY_REASON}" = "${CR_READY_REASON_POD_UNSCHEDULABLE}" ] \
+    && [[ "${CR_READY_MSG}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]
+}
+
 # Fails on a Degraded phase, or on a Degraded condition the baseline did not
-# carry with the same reason.
+# carry with the same reason. One Degraded phase is waited out instead of
+# failed on at once: a pod waiting for CPU or memory
+# (capacity_unschedulable), up to UNSCHEDULABLE_TIMEOUT, with a line per
+# change. The wait ends only when the CR stops saying Degraded, so the PASS
+# is the operator's own verdict after the pod came up, and a fault on a pod
+# its scan reaches later is read rather than hidden behind this one. Still
+# there at the bound, or turned into any other Degraded, it fails as before.
+# A forgiven Degraded is named in the PASS line.
 assert_not_degraded() {
-  local name="$1"
-  read_cr_state || fail "${name}" "the CR could not be read"
-  if [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ]; then
-    fail "${name}" "$(cr_state_summary) ($(degraded_baseline_summary))"
+  local name="$1" start=$SECONDS deadline forgiven="" waited="" last=""
+  deadline=$((SECONDS + UNSCHEDULABLE_TIMEOUT))
+  while :; do
+    read_cr_state || fail "${name}" "the CR could not be read"
+    [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ] || break
+    capacity_unschedulable || fail "${name}" "$(cr_state_summary) ($(degraded_baseline_summary))"
+    waited="$(cr_state_summary)"
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      fail "${name}" "still Degraded after ${UNSCHEDULABLE_TIMEOUT}s on a pod waiting for CPU or memory: $(cr_state_summary) ($(degraded_baseline_summary))"
+    fi
+    if [ "${CR_READY_MSG}" != "${last}" ]; then
+      note "${name}: Degraded on a pod waiting for CPU or memory (#2414), $((SECONDS - start))s in; waiting up to ${UNSCHEDULABLE_TIMEOUT}s for the operator to clear it: $(cr_state_summary)"
+      last="${CR_READY_MSG}"
+    fi
+    sleep "${POLL_SECONDS}"
+  done
+  if [ -n "${waited}" ]; then
+    note "${name}: the PodUnschedulable on capacity cleared after $((SECONDS - start))s"
+    forgiven="forgave a transient PodUnschedulable on capacity, cleared after $((SECONDS - start))s (was: ${waited}); "
   fi
   if [ "${CR_DEGRADED}" = "${CR_CONDITION_TRUE}" ]; then
     if [ "${CR_DEGRADED_REASON:-unspecified}" != "${PRE_DEGRADED_REASON}" ]; then
       fail "${name}" "a Degraded condition new since the flip: $(cr_state_summary) ($(degraded_baseline_summary))"
     fi
-    pass "${name}" "phase ${CR_PHASE}; Degraded=True/${CR_DEGRADED_REASON:-unspecified} is the one the install carried before the flip, not new"
+    pass "${name}" "${forgiven}phase ${CR_PHASE}; Degraded=True/${CR_DEGRADED_REASON:-unspecified} is the one the install carried before the flip, not new"
     return 0
   fi
-  pass "${name}" "phase ${CR_PHASE}, no Degraded condition set ($(degraded_baseline_summary))"
+  pass "${name}" "${forgiven}phase ${CR_PHASE}, no Degraded condition set ($(degraded_baseline_summary))"
 }
 
 # The NATS pod mounts the kept claim, by name, now that the bus is back.
@@ -1007,8 +1063,10 @@ CURRENT_LEG="leg2"
 # GENERATION_TIMEOUT + BUS_UP_TIMEOUT = 300 + 1500 = 1800s, whatever the
 # split between the five. That leaves 1800s of the 3600s ci-eval-pr.sh gives
 # the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1 and the rest of
-# leg 2, which take minutes on a healthy install; a run that needs more is
-# stopped there and reports itself interrupted at the leg it was in. The
+# leg 2, which take minutes on a healthy install (each not-degraded check's
+# capacity wait, UNSCHEDULABLE_TIMEOUT, adds at most 300s, 600s for both);
+# a run that needs more is stopped there and reports itself interrupted at
+# the leg it was in. The
 # job-level bound is ci-eval-pr.sh's, beside EVAL_ROLLBACK_START_BY_SECONDS:
 # the run starts by 15600s of job age, deploy included, and with the 3600s
 # bound and its 60s kill grace ends by 19260s, inside the 21600s deadline. The

@@ -144,6 +144,10 @@ type GitProvider struct {
 	// A forge of this provider without credentialsRef is refused: the broker
 	// has nothing to call it with.
 	NeedsCredentials bool
+	// AcceptsCABundle is a forge whose broker client reads a CA bundle the
+	// administrator names in caBundleRef. A provider without it refuses the
+	// field: a CA that nothing reads would hide a certificate problem.
+	AcceptsCABundle bool
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -179,7 +183,8 @@ var gitProviders = map[string]*GitProvider{
 		Egress:                  []string{"gitlab.com", "*.gitlab.com"},
 		SelfManaged:             true,
 		ReservedSegmentSuffixes: []string{".git", ".atom"},
-		NeedsCredentials: true,
+		NeedsCredentials:        true,
+		AcceptsCABundle:         true,
 	},
 }
 

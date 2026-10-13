@@ -22,7 +22,7 @@ exclusion in effect whose scope covers the upgrade, the maintenance window's sta
 `upgrade_readiness.py`; this file reads and renders.
 
 Read-only against GCP: the gcloud commands it runs are `container clusters list`,
-`container get-server-config`, `projects list`, `config get-value project`, `projects
+`container get-server-config`, `projects list` (when neither `--project` nor a declared scope is passed), `config get-value project`, `projects
 describe` (to tie an API-disabled refusal to its project or resolve a numeric project
 number to its projectId) and, with
 `--readiness`, `container clusters get-credentials`. The only things it writes are its
@@ -36,12 +36,15 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
 
 import upgrade_readiness as readiness
 
-# Project resolution: explicit --project flags are the whole scope. Otherwise the
+# Project resolution: explicit --project flags are the whole scope, and so is the
+# declared scope the agent passes (--scope-projects, from the platform_control
+# fleet_scope tool). Otherwise the
 # per-profile project variables are unioned with the fleet's monitored-project list
 # when it is set, or with gcloud's configured project and every project
 # `gcloud projects list` returns when it is unset or blank.
@@ -53,7 +56,40 @@ PROJECT_ID_FORMAT = "--format=value(projectId)"
 PROJECTS_LIST_CMD = (GCLOUD, "projects", "list", PROJECT_ID_FORMAT)
 # The `project` a failed or filtered `gcloud projects list` is reported under.
 PROJECTS_LIST_ERROR_SCOPE = "(all projects: gcloud projects list)"
+# The same slot when the scope came from the fleet_scope tool and nothing was listed.
+DECLARED_SCOPE_ERROR_SCOPE = "(declared scope: fleet_scope)"
 PROJECTS_LIST_ERROR_CHARS = 300
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 CONFIG_PROJECT_CMD = (GCLOUD, "config", "get-value", "project")
 API_DISABLED_MARKERS = (
     "SERVICE_DISABLED",
@@ -314,7 +350,13 @@ def _normalise_project_id(project: str, listing_errors: list[str] | None = None)
 
 
 def get_target_projects(cli_projects: list[str] | None = None, listing_errors: list[str] | None = None) -> list[str]:
-    """Resolves the projects to enumerate; --project wins, else env unioned with discovery.
+    """Resolves the projects to enumerate: --project wins, else the declared
+    scope the SOP passed from the fleet_scope tool (--scope-projects, swept as
+    given with nothing listed), else env unioned with discovery.
+
+    Under a declared scope the only entry appended to `listing_errors` is the
+    note naming the declared projects the install could not read
+    (--scope-unread), so the run reads as partial for them.
 
     A failed `gcloud projects list` is appended to `listing_errors` when the
     caller passes one, so the narrowed scope reads as a failed read rather than
@@ -322,7 +364,48 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
     configured project: it is filtered, not complete, as fleet_drift.py treats it.
     """
     if cli_projects:
-        return sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
+        # Refused before anything is read: a scoped sandbox without the flags
+        # must not describe a project the worker named.
+        if declared_scope.args_missing:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        resolved: set[str] = set()
+        if not any(p.strip() for p in cli_projects):
+            # `--project "$VAR"` with the variable unset. Under a declared scope
+            # say so, with the remedy; without one the "no project" usage line
+            # main prints is the right answer, and this remedy would name a
+            # scope the install does not have.
+            if listing_errors is not None and declared_scope.declared:
+                listing_errors.append(fleet_scope_args.EMPTY_PROJECT_OVERRIDE_ERROR)
+            return []
+        for raw in (p.strip() for p in cli_projects if p.strip()):
+            project = _normalise_project_id(raw, listing_errors)
+            # Checked on the resolved id, so a number that names a listed project
+            # passes; a number the describe could not resolve reaches the holder
+            # as digits, which it refuses under a declared scope with the remedy
+            # and lets through without one, as before, with the failure recorded.
+            resolved.add(project or raw)
+        # On the resolved ids: a project number given here names the same
+        # project the tool lists by id.
+        override_errors = [declared_scope.override_error(p) for p in sorted(resolved)]
+        if any(override_errors):
+            if listing_errors is not None:
+                listing_errors.extend(e for e in override_errors if e)
+            return []
+        return sorted(resolved)
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable enumerates nothing and says so,
+        # rather than widening to the listing.
+        if not declared_scope.projects:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        if listing_errors is not None and declared_scope.note():
+            listing_errors.append(declared_scope.note())
+        return sorted(declared_scope.projects)
 
     # Parsed before it is tested, so a blank or separator-only value reads as
     # unset rather than as an override that names nothing and skips discovery.
@@ -334,6 +417,7 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
             raw_projects.add(val)
     if monitored:
         return sorted({_normalise_project_id(p) or p for p in raw_projects})
+
     # The host project is always in a discovered scope, whether or not a
     # `GCP_PROJECT_ID`-style variable also names one.
     rc, stdout, _ = run_cmd(list(CONFIG_PROJECT_CMD))
@@ -1028,7 +1112,8 @@ def render_progress(report: dict, previous: dict | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
-    parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
+    parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. On an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args; omit to sweep --scope-projects when given, else the fleet's configured projects")
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
@@ -1037,6 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")
@@ -1057,15 +1143,17 @@ def main(argv: list[str] | None = None) -> int:
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)
+    scope_label = DECLARED_SCOPE_ERROR_SCOPE if declared_scope.declared else PROJECTS_LIST_ERROR_SCOPE
     if not projects:
         for error in listing_errors:
-            sys.stderr.write(f"gcloud projects list: {error}\n")
-        sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
+            sys.stderr.write(f"{scope_label}: {error}\n")
+        if not declared_scope.declared:
+            sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
     report = build_report(projects, args.target_version, readiness_options)
     report["errors"][:0] = [
-        {"project": PROJECTS_LIST_ERROR_SCOPE, "location": None, "message": error} for error in listing_errors
+        {"project": scope_label, "location": None, "message": error} for error in listing_errors
     ]
     path = state_path(args.state_dir, args.target_version)
     previous, state_error = load_state(path)

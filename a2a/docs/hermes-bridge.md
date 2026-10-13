@@ -382,8 +382,7 @@ conversation its session answers (the platform, the gateway's conversation key f
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A Google Chat conversation is posted back today; a Slack conversation's route is
-recorded the same way and is delivered once the gateway arms the notify route for Slack. A
+be posted back. A Google Chat or Slack conversation is posted back. A
 conversation on a door with no notify route (inject, the A2A door, Discord) records nothing. The `cli` executor records no route, so its cards still do not report back.
 
 What the `api` executor does not do. A turn the bridge stops waiting

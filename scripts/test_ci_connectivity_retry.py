@@ -84,20 +84,24 @@ def dump_function() -> str:
 
 
 def gateway_collector() -> str:
-    """collect_gateway_log() and the log-tail constants, lifted from ci-env.sh.
+    """collect_gateway_log(), collect_litellm_log() and the log constants,
+    lifted from ci-env.sh.
 
-    The dumper calls it for the running pod's log, so the dump under test
-    carries the real collector rather than a stub: its `|| true` guard is
-    one of the ones the survival test below is about. Every `*_LOG_*`
-    readonly comes along, since the dumper reads the litellm and envoy tail
-    sizes too and `set -u` would end the script at the first unbound one.
+    The dumper calls both, so the dump under test carries the real
+    collectors rather than stubs: their `|| true` guards are among the ones
+    the survival test below is about. Every `*_LOG_*` readonly comes along,
+    since the dumper reads the envoy tail size too and `set -u` would end the
+    script at the first unbound one.
     """
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly [A-Z_]*_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
-    match = re.search(r"^collect_gateway_log\(\) \{\n.*?^\}$", src, re.DOTALL | re.MULTILINE)
-    if match is None or not constants:  # pragma: no cover
-        raise AssertionError(f"collect_gateway_log() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in ("collect_gateway_log", "collect_litellm_log"):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None or not constants:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def write_stub(directory: pathlib.Path, name: str, body: str) -> None:

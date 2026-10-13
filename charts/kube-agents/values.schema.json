@@ -858,6 +858,18 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "caBundleRef": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "key": {
+                        "type": "string"
+                      }
+                    }
                   }
                 }
               }

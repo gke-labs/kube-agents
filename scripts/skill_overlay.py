@@ -130,11 +130,18 @@ GIT_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
     # No user ignore file either: a scratch repository must record every file it is given.
     # and paths printed verbatim, so the diff text the tool parses names a non-ASCII file as is.
-    "GIT_CONFIG_COUNT": "2",
+    # Do not let auto gc or maintenance detach into the background: ensure any housekeeping
+    # triggered by porcelain commands runs synchronously in the foreground before subprocess.run
+    # returns, while allowing the persistent upstream cache to still be compacted.
+    "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.excludesFile",
     "GIT_CONFIG_VALUE_0": os.devnull,
     "GIT_CONFIG_KEY_1": "core.quotePath",
     "GIT_CONFIG_VALUE_1": "false",
+    "GIT_CONFIG_KEY_2": "gc.autoDetach",
+    "GIT_CONFIG_VALUE_2": "false",
+    "GIT_CONFIG_KEY_3": "maintenance.autoDetach",
+    "GIT_CONFIG_VALUE_3": "false",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_AUTHOR_NAME": "skill-overlay",
     "GIT_AUTHOR_EMAIL": "skill-overlay@example.invalid",
