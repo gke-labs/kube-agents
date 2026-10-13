@@ -119,6 +119,16 @@ class ClassifyTests(unittest.TestCase):
             "kubectl certificate approve csr-1",
             "kubectl auth reconcile -f rbac.yaml",
             "kubectl --context foo rollout restart deploy/kube-dns -n kube-system",
+            "if ! kubectl scale deploy kube-dns -n kube-system --replicas=3; then echo refused; fi",
+            "{ kubectl scale deploy kube-dns --replicas=3; }",
+            "for d in kube-dns kube-dns-autoscaler; do kubectl scale deploy $d -n kube-system --replicas=3; done",
+            "(kubectl scale deploy kube-dns --replicas=3)",
+            "echo deploy/kube-dns | xargs kubectl scale --replicas=3",
+            "echo deploy/kube-dns | xargs -I {} kubectl scale {} --replicas=3",
+            "python3 -c 'import subprocess; subprocess.run([\"kubectl\", \"scale\", \"deploy/x\", \"--replicas=3\"])'",
+            "kubectl get deploy kube-dns -n kube-system  # current state\nkubectl scale deploy kube-dns -n kube-system --replicas=3",
+            "# bump kube-dns\nkubectl scale deploy kube-dns -n kube-system --replicas=3",
+            "exec kubectl scale deploy kube-dns --replicas=3",
         ):
             self.assertEqual(stop.classify_refusal(command, REFUSAL), "policy", command)
 
@@ -127,6 +137,7 @@ class ClassifyTests(unittest.TestCase):
             'subprocess.run(["kubectl", "scale", "deploy/kube-dns", "--replicas=3"])',
             'subprocess.run([\n    "kubectl",\n    "scale",\n    "deploy/kube-dns",\n])',
             'os.system("kubectl patch deploy x -p y")',
+            '# scale it\nsubprocess.run(["kubectl", "scale", "deploy/kube-dns", "--replicas=3"])',
         ):
             self.assertEqual(stop.classify_refusal(text, REFUSAL, loose=True), "policy", text)
         self.assertEqual(stop.classify_refusal('subprocess.run(["kubectl", "get", "pods"])', REFUSAL, loose=True), "advisory")
@@ -283,7 +294,6 @@ class NudgeTests(unittest.TestCase):
         self.assertTrue(nudge.startswith("[System: base]"))
         self.assertIn("refused this change", nudge)
         self.assertIn("If the card asked for a pull request", nudge)
-        self.assertIn("kanban_block", nudge)
         self.assertIn("kanban_block", nudge)
         self.assertNotIn("exhausted", nudge)
 

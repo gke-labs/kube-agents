@@ -119,6 +119,8 @@ def main() -> int:
         return fail(f"a successful read quoting a denial decided {events!r}")
     for command, result in (
         ("kubectl \\\n  -n kube-system \\\n  scale deploy x --replicas=3", REFUSAL),
+        ("kubectl get deploy x  # current state\nkubectl scale deploy x --replicas=3", REFUSAL),
+        ("if ! kubectl scale deploy x --replicas=3; then echo refused; fi", REFUSAL),
         ("kubectl scale deploy x --replicas=3; kubectl get deploy x", REFUSAL.replace('"exit_code": 77', '"exit_code": 0')),
         ("kubectl scale deploy x --replicas=3", REFUSAL.replace('"exit_code": 77', '"exit_code": 126')),
     ):

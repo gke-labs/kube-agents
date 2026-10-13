@@ -19,8 +19,9 @@ What counts as a segment:
   ``python`` command, as one segment of Python text;
 - what ``kubectl exec``, ``kubectl run`` and ``kubectl debug`` run after ``--``,
   global flags before the verb included;
-- the quoted arguments of an ``echo``, ``printf`` or ``tee`` that writes a file
-  a later command in the same call runs;
+- the text an ``echo`` or ``printf`` writes to a file a later command in the
+  same call runs (quoted or bare arguments; a ``printf`` format with no
+  further argument is the text), or that is piped into such a ``tee``;
 - the body of a heredoc that is executed: fed to a shell or ``python`` on its
   opener line (the whole line, pipes included), written to a ``.sh``/``.py``
   path, or written (by ``>``, ``tee`` or ``dd of=``) to a path that a later
@@ -44,9 +45,12 @@ nothing at all.
 
 What is not understood, stated so a case is not written against it: a command
 behind a shell variable (``$K scale``), text piped into an interpreter
-(``echo ... | sh``), a here-string, aliases and functions, a script written in
-one call and run in a later one, and anything after a quote that never closes.
-The walk is linear in the call's length.
+(``echo ... | sh``), a here-string's content, a ``printf`` format whose
+directives are filled from later arguments, aliases and functions, a script
+written in one call and run in a later one, and anything after a quote that
+never closes. A content heredoc whose opener line also carries an interpreter
+joined by ``&&`` or ``;`` is read as that interpreter's body. The walk is
+linear in the call's length.
 """
 
 from __future__ import annotations
@@ -235,8 +239,8 @@ def _writer_scripts(piece: str) -> list[str]:
     words = words[1:]
     while words and words[0] in _WRITER_OPTIONS:
         words.pop(0)
-    if base == "printf":
-        words = words[1:]
+    if base == "printf" and len(words) > 1:
+        words = words[1:]  # the format; with no further argument the format is the text
     if any(w[:1] not in "'\"" for w in words):
         return [" ".join(_unquote(w) for w in words)]
     return [_unquote(w) for w in words if len(w) > 2]
@@ -484,7 +488,11 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[list[str], str, b
         elif c == "#" and (i == 0 or text[i - 1] in " \t\n;&|("):
             j = text.find("\n", i)
             i = n if j < 0 else j
-        elif c == "<" and text.startswith("<<", i) and not text.startswith("<<<", i):
+        elif c == "<" and text.startswith("<<<", i):
+            # A here-string: an operand, not a heredoc opener.
+            buf.append("<<<")
+            i += 3
+        elif c == "<" and text.startswith("<<", i):
             m = _HEREDOC_RE.match(text, i)
             if m:
                 if m.group(2) is not None:

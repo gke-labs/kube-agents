@@ -26,11 +26,14 @@ it asks :func:`classify_refusal`:
   ``port-forward``, ``cp``, ``exec``, and ``<verb> --help``) with the same
   words, so the verb is what tells a refused write from a refused read. The
   verb is resolved the way kubectl reads it (:func:`names_mutating_verb`):
-  the command is split into simple commands at ``;``, ``&&``, ``||``, ``|``
-  and newlines, a ``kubectl`` in command position (after assignments and
-  wrappers, inside a ``sh -c`` string, after an ``exec … --`` passthrough,
-  or inside a ``$(…)``) has its global flags walked, and the first operand is
-  the verb; ``-h``/``--help`` anywhere before ``--`` makes it a help read.
+  the command is split into simple commands at ``;``, ``&&``, ``||``, ``|``,
+  parentheses and newlines (comments do not end a line early), a ``kubectl``
+  in command position (after assignments, wrappers such as ``sudo``,
+  ``timeout``, ``xargs``, and the shell's own keywords ``if``, ``!``, ``do``,
+  ``{``; inside a ``sh -c`` or ``python -c`` string; after an ``exec … --``
+  passthrough; inside a ``$(…)``) has its global flags walked, and the first
+  operand is the verb; ``-h``/``--help`` anywhere before ``--`` makes it a
+  help read.
   A verb word elsewhere in the line (an argument, a passthrough, a quoted
   string) is not a verb. A write is counted, per turn, across every tool and
   whatever succeeded in between; the call's exit code is not consulted,
@@ -113,10 +116,19 @@ _KUBECTL_VALUE_FLAGS = frozenset({
     "--profile", "--profile-output", "--password", "--username", "--vmodule",
 })
 _HELP_FLAGS = frozenset({"-h", "--help"})
-#: Words a shell command may carry before the command word.
-_WRAPPERS = frozenset({"sudo", "env", "time", "nice", "ionice", "nohup", "command", "stdbuf", "timeout"})
+#: Words a shell command may carry before the command word, and the shell's
+#: own keywords and group openers that may stand in command position.
+_WRAPPERS = frozenset({
+    "sudo", "env", "time", "nice", "ionice", "nohup", "command", "builtin", "exec", "stdbuf",
+    "timeout", "watch", "xargs",
+})
 _WRAPPERS_WITH_OPERAND = frozenset({"timeout"})
+_XARGS_PLACEHOLDER = "{}"
+_KEYWORDS = frozenset({"if", "!", "then", "else", "elif", "do", "while", "until", "{", "}", "(", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_PYTHON_RE = re.compile(r"^python[\d.]*$")
+#: Shell punctuation the lexer splits off: command separators and group parentheses.
+_PUNCTUATION = ";|&()"
 _PASSTHROUGH = "--"
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _CONTINUATION_RE = re.compile(r"\\\n")
@@ -128,18 +140,6 @@ _MAX_DEPTH = 6
 #: A kubectl word, then within the same simple command one of the verbs above, as
 #: a word of its own (``patch.yaml`` and ``--replicas=3`` are not verbs). The
 #: separator class admits the quoted, comma-separated form a Python list uses.
-_WORD_EDGE = r"(?<![\w./=:@-])"
-_WORD_END = r"(?![\w./=:@-])"
-#: ``kubectl`` as a word (a directory in front of it ends in ``/``, which the
-#: lookbehind admits; a prefix group here was quadratic on long punctuation).
-_KUBECTL_WORD = r"(?<![\w=:@-])kubectl" + _WORD_END
-_MUTATING_CALL_RE = re.compile(
-    rf"{_KUBECTL_WORD}[^;|&\n]{{0,400}}?{_WORD_EDGE}(?:{_MUTATING_VERBS}){_WORD_END}"
-)
-_ROLLOUT_CALL_RE = re.compile(
-    rf"{_KUBECTL_WORD}[^;|&\n]{{0,400}}?{_WORD_EDGE}rollout{_WORD_END}"
-    rf"[^;|&\n]{{0,200}}?{_WORD_EDGE}(?:restart|undo|pause|resume){_WORD_END}"
-)
 #: Kubernetes and Google Cloud API denials, in the shapes kubectl, gcloud and the
 #: MCP tools print them. ``401``/``Unauthenticated`` deliberately absent.
 _API_DENIED_RE = re.compile(
@@ -190,8 +190,9 @@ def _tokens(text: str, *, loose: bool) -> list[str]:
     """Shell words with ``;``, ``&&``, ``||``, ``|``, ``&`` and newlines as separators
     (in program text a newline separates nothing)."""
     text = _CONTINUATION_RE.sub(" ", text).replace("\n", " " if loose else " ; ")
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=";|&")
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=_PUNCTUATION)
     lexer.whitespace_split = True
+    lexer.commenters = ""  # a ``#`` would swallow every later line of the joined text
     try:
         return list(lexer)
     except ValueError:
@@ -201,7 +202,7 @@ def _tokens(text: str, *, loose: bool) -> list[str]:
 def _simple_commands(tokens: list[str]) -> list[list[str]]:
     out: list[list[str]] = [[]]
     for token in tokens:
-        if token and set(token) <= set(";|&"):
+        if token and set(token) <= set(_PUNCTUATION):
             out.append([])
         else:
             out[-1].append(token)
@@ -249,20 +250,26 @@ def _command_is_mutating(words: list[str], depth: int) -> bool:
     if depth > _MAX_DEPTH:
         return False
     i = 0
-    while i < len(words) and (_ASSIGNMENT_RE.match(words[i]) or words[i] in _WRAPPERS or (i and words[i - 1] in _WRAPPERS and words[i].startswith("-"))):
-        if words[i] in _WRAPPERS_WITH_OPERAND:
+    in_wrapper_options = False
+    while i < len(words):
+        token = words[i]
+        if token in _KEYWORDS or _ASSIGNMENT_RE.match(token) or token in _WRAPPERS:
+            in_wrapper_options = token in _WRAPPERS
+            i += 2 if token in _WRAPPERS_WITH_OPERAND else 1
+        elif in_wrapper_options and (token.startswith("-") or token == _XARGS_PLACEHOLDER):
             i += 1
-        i += 1
+        else:
+            break
     if i >= len(words):
         return False
     word, args = words[i].rsplit("/", 1)[-1], words[i + 1 :]
     if word == "kubectl":
         return _kubectl_is_mutating(args, depth)
-    if word in _SHELLS and "-c" in args:
+    if (word in _SHELLS or _PYTHON_RE.match(word)) and "-c" in args:
         script = args[args.index("-c") + 1 :]
         if script and script[0] == _PASSTHROUGH:
             script = script[1:]
-        return bool(script) and _text_is_mutating(script[0], depth + 1, loose=False)
+        return bool(script) and _text_is_mutating(script[0], depth + 1, loose=word not in _SHELLS)
     if word == "eval":
         return _text_is_mutating(" ".join(args), depth + 1, loose=False)
     return False
@@ -271,6 +278,8 @@ def _command_is_mutating(words: list[str], depth: int) -> bool:
 def _text_is_mutating(text: str, depth: int, *, loose: bool) -> bool:
     if depth > _MAX_DEPTH or not text:
         return False
+    if loose:
+        text = _PYTHON_PUNCTUATION_RE.sub(" ", text)
     for inner in _SUBSTITUTION_RE.findall(text):
         if _text_is_mutating(inner[0] or inner[1], depth + 1, loose=False):
             return True
@@ -295,8 +304,6 @@ def names_mutating_verb(command: str, *, loose: bool = False) -> bool:
     ``loose`` is for program text rather than a shell command: list punctuation is
     dropped and ``kubectl`` may appear at any word position.
     """
-    if loose:
-        command = _PYTHON_PUNCTUATION_RE.sub(" ", command)
     return _text_is_mutating(command, 0, loose=loose)
 
 

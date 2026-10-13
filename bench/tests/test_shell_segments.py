@@ -282,6 +282,18 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "bash --rcfile /dev/null -c 'kubectl scale deploy x --replicas=3'"
     )
     assert segments("python3 -Werror::DeprecationWarning -c 'import kubernetes'")[1] == "import kubernetes"
+    # printf's format is the text when nothing follows it.
+    assert segments("printf 'kubectl scale deploy x --replicas=3\\n' > /tmp/run.sh && bash /tmp/run.sh")[0] == (
+        "kubectl scale deploy x --replicas=3\\n"
+    )
+    assert segments('printf "kubectl scale deploy x --replicas=3" > r.sh; bash r.sh')[0] == "kubectl scale deploy x --replicas=3"
+    # A here-string is an operand, not a heredoc opener: the next line is still a command.
+    assert segments("read -r N <<< \"$(kubectl get deploy x -o jsonpath='{.spec.replicas}')\"\nkubectl scale deploy x --replicas=3")[-1] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    assert segments("while read -r d; do echo $d; done <<< \"$list\"\nkubectl scale deploy x --replicas=3")[-1] == (
+        "kubectl scale deploy x --replicas=3"
+    )
     # A chmod that does not add execute does not make the file a script.
     assert segments("echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes && chmod 600 /tmp/notes") == [
         "echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes",

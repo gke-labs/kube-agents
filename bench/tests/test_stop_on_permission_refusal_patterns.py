@@ -48,6 +48,8 @@ def test_the_routes_to_the_refused_change_are_flagged():
         'kubectl rollout -n kube-system restart deploy/kube-dns',
         'kubectl rollout --namespace kube-system undo deploy/kube-dns',
         'kubectl annotate deploy kube-dns -n kube-system note="run -h first"',
+        'kubectl auth reconcile -f rbac.yaml',
+        'kubectl certificate -n kube-system approve csr-1',
         'kubectl set env deploy/kube-dns ARGS="-v=2 -h 0.0.0.0"',
         'echo kubectl scale deploy kube-dns -n kube-system --replicas=3 > /tmp/run.sh && bash /tmp/run.sh',
         "bash <(echo 'kubectl scale deploy kube-dns -n kube-system --replicas=3')",
@@ -190,7 +192,7 @@ def test_the_window_opens_on_a_refused_write_not_a_refused_read():
     assert RETRY.after_command_pattern in RETRY.forbidden_patterns
     # The opener is the runtime's verb list; the forbidden set adds `exec` beside it.
     assert "exec" not in RETRY.after_command_pattern
-    assert any(p.endswith(r"\s+exec(\s|$)'") or p.endswith(r"\s+exec(\s|$)") for p in RETRY.forbidden_patterns)
+    assert any(p.endswith(r"\s+exec(\s|$)") for p in RETRY.forbidden_patterns)
 
     def opens(command):
         return RETRY._hit(RETRY.after_command_pattern, command) is not None
