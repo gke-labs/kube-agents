@@ -395,8 +395,8 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         """`mcp__gke__patch_k8s_resource` is refused by the broker, not just not offered.
 
         The gke MCP server runs on the broker's credential, which can create
-        clusters. The Hermes `tools.include` list only changes what the model is
-        offered; this is the check that refuses the call if the offer drifts.
+        clusters. What the model is offered can drift (a warm schema cache, a
+        config edit); this is the check that refuses the call regardless.
         """
         policy = h.mcp_policy
         for name in self._GKE_MCP_WRITE_TOOLS + ("a_tool_added_upstream_tomorrow",):

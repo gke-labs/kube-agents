@@ -40,6 +40,11 @@ async function getGcloudProjectId() {
 async function runProxy() {
   log('Discovering OAuth server configuration...')
   const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
+
+  const authInitializer = async () => {
+    const authState = await authCoordinator.initializeAuth()
+    return authState
+  }
 }
 """
 
@@ -76,6 +81,14 @@ class ApplyTest(unittest.TestCase):
         self.assertLess(project_fn.index("return null"), project_fn.index("auth.getProjectId()"))
         self.assertIn("? { authorizationServerUrl: serverUrl }", patched)
         self.assertIn(": await discoverOAuthServerInfo(serverUrl, headers)", patched)
+
+    def test_the_token_never_goes_to_an_https_url_and_a_401_starts_no_oauth(self):
+        patched = self.patched()
+        run = patched.split("async function runProxy() {")[1]
+        # The https guard runs before discovery, so before any request is made.
+        self.assertLess(run.index("protocol === 'https:'"), run.index("discoverOAuthServerInfo"))
+        init = run.split("const authInitializer = async () => {")[1]
+        self.assertLess(init.index("if (BEARER_FILE)"), init.index("authCoordinator.initializeAuth()"))
 
     def test_every_anchor_is_consumed_once(self):
         patched = self.patched()

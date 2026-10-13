@@ -10,10 +10,12 @@ request.
 
 **The table is the enforcement.** The token the broker forwards carries the
 `cloud-platform` scope, and the GKE server offers tools that create clusters
-and patch workloads on it. The Hermes `tools.include` list on the agent's side
-decides what the model is offered; this decides what reaches Google. A name
-missing here is refused whatever the model was offered, so a tool added
-upstream is refused until someone adds it by pull request.
+and patch workloads on it. This table decides what reaches Google, and,
+through `filter_tools_list`, what the model is offered. A Hermes
+`tools.include` list in an agent config can narrow that offer further, but
+nothing here depends on one. A name missing here is refused whatever the model
+was offered, so a tool added upstream is refused until someone adds it by pull
+request.
 
 Standard library only, like `api_policy`: the process holding the credential
 imports it, and so do its tests. `Decision` is reused from `command_policy` so
@@ -65,8 +67,9 @@ JSONRPC_VERSION = "2.0"
 
 # The gke server's read tools: the 15 of its 23 that the server annotates
 # `readOnlyHint: true`. Read from a live `tools/list` on 2026-10-13. This set
-# is the one source; the Hermes `tools.include` lists in the agent configs are
-# held to it by tests/conformance. Every name left out mutates something:
+# is the one source: a Hermes `tools.include` list added to an agent config
+# should be held to it by test, not kept by hand. Every name left out mutates
+# something:
 # create_cluster, update_cluster, cancel_operation, create_node_pool,
 # update_node_pool, apply_k8s_manifest, delete_k8s_resource, patch_k8s_resource.
 #

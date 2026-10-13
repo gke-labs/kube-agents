@@ -200,10 +200,10 @@ func a2aSessionBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
 // the broker. Audience-bound and one hour long, so a copy that escapes the Pod
 // is worth an hour of broker access and nothing else.
 //
-// credentialProxyChatAudience, not credentialProxyAudience: the chat relays are
-// the only thing in this Pod that calls the broker, and minting for the chat
-// audience is what stops this token opening the shell's routes if it does
-// escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
+// credentialProxyChatAudience, not credentialProxyAudience: the chat relays and
+// the remote MCP servers' mcp-remote children are the only things in this Pod
+// that call the broker, and minting for the chat audience is what stops this
+// token opening the shell's routes if it does escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
 func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	return corev1.Volume{
 		Name: agentCredentialProxyTokenVolume,

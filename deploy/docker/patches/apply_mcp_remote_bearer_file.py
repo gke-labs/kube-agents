@@ -25,7 +25,11 @@ With ``MCP_REMOTE_BEARER_FILE`` set, this patch makes ``proxy.ts``:
 - skip the project lookup, because the proxy sets ``X-Goog-User-Project`` from
   its own credential (and ``gcloud`` is not in this image to fall back to);
 - skip OAuth discovery, whose probes would reach the proxy unauthenticated and
-  be logged there as rejected callers.
+  be logged there as rejected callers, and fail a connect the proxy answers 401
+  instead of starting an OAuth callback server and waiting on it;
+- refuse to start when the server URL is https. The proxy is plain HTTP on a
+  cluster Service, so an https URL is a config still pointed at Google, and the
+  projected token must never be sent there.
 
 Unset, the fork behaves exactly as before. The variable is a path, not a
 secret: the configs pass ``${CREDENTIAL_PROXY_TOKEN_FILE}``.
@@ -94,10 +98,30 @@ async function getGcloudProjectId() {
 
 DISCOVERY_ANCHOR = "  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)\n"
 DISCOVERY_PATCHED = """\
+  // kube-agents patch: the token is for the in-cluster credential proxy, which is
+  // plain HTTP on a cluster Service. An https URL means a config that still points at
+  // Google, and the token must not go there.
+  if (BEARER_FILE && new URL(serverUrl).protocol === 'https:') {
+    throw new Error('MCP_REMOTE_BEARER_FILE is set but the server URL is https; refusing to send the credential proxy token outside the cluster')
+  }
   // kube-agents patch: the credential proxy is not an OAuth resource server.
   const discoveryResult: Awaited<ReturnType<typeof discoverOAuthServerInfo>> = BEARER_FILE
     ? { authorizationServerUrl: serverUrl }
     : await discoverOAuthServerInfo(serverUrl, headers)
+"""
+
+AUTH_INIT_ANCHOR = """\
+  const authInitializer = async () => {
+    const authState = await authCoordinator.initializeAuth()
+"""
+AUTH_INIT_PATCHED = """\
+  const authInitializer = async () => {
+    // kube-agents patch: a 401 from the credential proxy is a refused token, not a
+    // prompt to log in. Fail the connect now rather than wait out an OAuth callback.
+    if (BEARER_FILE) {
+      throw new Error('the credential proxy refused the bearer token; MCP_REMOTE_BEARER_FILE disables the OAuth flow')
+    }
+    const authState = await authCoordinator.initializeAuth()
 """
 
 SUBSTITUTIONS = (
@@ -105,6 +129,7 @@ SUBSTITUTIONS = (
     ("token", TOKEN_ANCHOR, TOKEN_PATCHED),
     ("project", PROJECT_ANCHOR, PROJECT_PATCHED),
     ("discovery", DISCOVERY_ANCHOR, DISCOVERY_PATCHED),
+    ("auth initializer", AUTH_INIT_ANCHOR, AUTH_INIT_PATCHED),
 )
 
 

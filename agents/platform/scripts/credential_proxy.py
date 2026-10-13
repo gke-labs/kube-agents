@@ -8914,6 +8914,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "UPSTREAM_REDIRECTED",
                 "the upstream answered with a redirect, which the relay does not follow",
             )
+        elif upstream.status == HTTPStatus.UNAUTHORIZED:
+            # Google refusing the broker's own credential. Passed through, it would
+            # read to mcp-remote as its own token refused and send it after an
+            # OAuth login; the caller's token is the broker's to judge, and it did.
+            refused = (
+                "UPSTREAM_UNAUTHORIZED",
+                "the upstream refused the credential proxy's own credential",
+            )
         elif upstream.body and not upstream.content_type.lower().startswith(
             MCP_RELAY_CONTENT_TYPE
         ):

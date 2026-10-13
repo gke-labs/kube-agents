@@ -40,8 +40,10 @@ class EvaluateTest(unittest.TestCase):
                 self.assertEqual(decision.rule_id, mcp_policy.RULE_READ_ONLY)
 
     def test_the_read_set_and_the_write_set_are_the_whole_server(self):
+        # 23 tools in the live list: 15 read, 8 write, none in both.
         self.assertEqual(len(mcp_policy.GKE_READ_TOOLS), 15)
         self.assertFalse(mcp_policy.GKE_READ_TOOLS & set(GKE_WRITE_TOOLS))
+        self.assertEqual(len(mcp_policy.GKE_READ_TOOLS | set(GKE_WRITE_TOOLS)), 23)
 
     def test_an_unknown_tool_is_refused_the_same_way(self):
         decision = mcp_policy.evaluate("gke", call("get_cluster_and_also_delete_it"))

@@ -210,6 +210,12 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(json.loads(body)["code"], "UPSTREAM_NOT_JSON")
 
+    def test_an_upstream_401_is_the_brokers_fault_not_the_callers(self):
+        self.reply.update(status=401, body=b'{"error":{"code":401}}')
+        status, _, body = self._request(message=tools_call("get_cluster"))
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAUTHORIZED")
+
     def test_an_upstream_error_status_is_passed_through(self):
         self.reply.update(status=403, body=b'{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}')
         status, _, _ = self._request(message=tools_call("get_cluster"))

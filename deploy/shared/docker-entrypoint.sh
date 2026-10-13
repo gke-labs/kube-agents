@@ -686,6 +686,14 @@ PYEOF
 # gets the template's inserted where the template carries it, so the proxy invocation
 # keeps the same shape. Identity, overlays, timeouts, every other arg: untouched.
 #
+# One wider repair rides in the same pass. A server whose template args name the
+# credential proxy's MCP relay (`${KUBE_AGENTS_MCP_RELAY_URL}`) has image-owned args
+# end to end: the URL, its flags and the header all move together with the `env`
+# entry that names the proxy token. The fill above adds that `env` key to a profile
+# scaffolded before the relay existed while leaving its Google URL in place, and that
+# pairing would send the gateway's ServiceAccount token to Google. So for those
+# servers the whole `args` list, and the token entry in `env`, become the template's.
+#
 # A caller reports its own failure, as with the fill: only it knows which profile.
 repair_remote_mcp_user_agent() {
     "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" <<'UAEOF'
@@ -697,6 +705,10 @@ import yaml
 HEADER_FLAG = "--header"
 HEADER_NAME = "user-agent"
 TMP_SUFFIX = ".user-agent.tmp"
+# A template arg starting with this marks a server reached through the credential
+# proxy's MCP relay, whose args and token entry are image-owned whole.
+RELAY_URL_MARKER = "${KUBE_AGENTS_MCP_RELAY_URL}"
+BEARER_FILE_ENV = "MCP_REMOTE_BEARER_FILE"
 
 template_path, live_path = sys.argv[1], sys.argv[2]
 
@@ -732,7 +744,22 @@ for name, template_server in template_servers.items():
     if not isinstance(template_server, dict) or not isinstance(live_server, dict):
         continue
     template_args, live_args = template_server.get("args"), live_server.get("args")
-    if not isinstance(template_args, list) or not isinstance(live_args, list):
+    if not isinstance(template_args, list):
+        continue
+    if any(isinstance(arg, str) and arg.startswith(RELAY_URL_MARKER) for arg in template_args):
+        template_env = template_server.get("env") or {}
+        live_env = live_server.get("env")
+        if not isinstance(live_env, dict):
+            live_env = {}
+        wanted_env = dict(live_env)
+        if BEARER_FILE_ENV in template_env:
+            wanted_env[BEARER_FILE_ENV] = template_env[BEARER_FILE_ENV]
+        if live_args != template_args or live_env != wanted_env:
+            live_server["args"] = list(template_args)
+            live_server["env"] = wanted_env
+            repaired.append(name)
+        continue
+    if not isinstance(live_args, list):
         continue
     template_slot = header_slot(template_args)
     if template_slot is None:
@@ -1820,6 +1847,17 @@ fi
 # peer uid may refuse the chmod, and that is fine.
 mkdir -p "$TARGET_DIR/scratch"
 chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
+
+# 4.5 Say so loudly when the remote MCP servers cannot start. Every profile's
+# `gke` and `developer_knowledge` entries interpolate KUBE_AGENTS_MCP_RELAY_URL,
+# the credential proxy's MCP relay, which the operator sets on this container.
+# Hermes leaves an unset variable as literal text, mcp-remote cannot parse that as
+# a URL, and every call to those tools fails with nothing here saying why. The
+# usual cause is this image running under an operator from before the relay.
+# Primary only: the dashboard sidecar runs no agent, and is not given the variable.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -z "${KUBE_AGENTS_MCP_RELAY_URL:-}" ]; then
+    echo "[ENTRYPOINT] ALERT KUBE_AGENTS_MCP_RELAY_URL is unset, so the gke and developer_knowledge MCP servers will fail on every call. The operator sets it; upgrade the operator to a build that does." >&2
+fi
 
 # 5. Start background microservices (FastAPI proxy)
 #
