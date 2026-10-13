@@ -502,20 +502,23 @@ what one _did_ break, so the same surprise waited for the next cluster. This
 entry is the fleet-audit stream that fills that gap: at 18:00 UTC on Sunday,
 after the maintenance windows most fleets set at night or at the weekend and
 before Monday's audits, the Platform Agent follows
-`governance/upgrade_retrospective_sop.md`. The SOP runs the deterministic
-collector, `skills/fleet-audit/scripts/upgrade_retrospective.py`, with `--full`
-and one `--project` per roster project (the management project and every
-project a Cluster Agent profile names, read with `list_cluster_profiles`), so
-the scheduled run reads the reconciler's roster rather than every project the
-credential can list, and with `--manifest-file`, so `finish` holds the findings
-document to what the collector read. The collector keeps a ledger of versions per cluster,
+`governance/upgrade_retrospective_sop.md`. The SOP resolves the fleet with the
+platform_control `fleet_scope` tool first, as every fleet-audit stream does,
+probes the collector's lock (`--probe-lock`) before it opens the audit run, and
+runs the deterministic collector,
+`skills/fleet-audit/scripts/upgrade_retrospective.py`, with `--full`, the
+tool's `collector_args` verbatim (`--scope-projects`, `--scope-unread`; nothing
+on an install that declares no scope) and `--manifest-file`, so `finish` holds
+the findings document to what the collector read, in the foreground under the
+terminal tool's `timeout: 600`. The collector keeps a ledger of versions per cluster,
 reviews every cluster that is new or was upgraded since the last run, reads
 pods, nodes, events and budgets, classifies what it finds against the upgrade
 failure catalogue, and writes the three-section report (Errors, Warnings, Info)
 to `/opt/data/upgrade-retrospective/` on the shell sandbox's volume, with
 `upgrade-retro-report.md` pointing at the newest full run. The SOP's half is
-the judgement: it grades every incident by the seven checks in its section 3,
-tailors the catalogue's mitigation text to the cluster's own objects, files the
+the judgement: it confirms every candidate against the six checks in its
+section 3 and copies the collector's grade, tailors the catalogue's mitigation
+text to the cluster's own objects, files the
 stream's one ledger issue where a repository is configured, and posts one chat
 line per reviewed cluster with its counts and top finding. A quiet weekend, with
 no cluster new or upgraded, posts nothing.
@@ -540,18 +543,23 @@ persona's delegation list route "how did the upgrades go", "did anything break",
 from the saved report when it is newer than the last upgrade operation on the
 clusters the question covers and runs the collector first when it is not: a
 fleet-wide question as a full run, a question about named clusters as a scoped
-one (`--cluster`), which writes a `-scoped` report, moves no link and touches no
-ledger. A second run while one holds the store's lock prints one line and writes
-nothing.
+one (`--cluster`, beside the tool's `collector_args`; the collector refuses a
+cluster outside the declared scope), which writes a `-scoped` report, moves no
+link and touches no ledger. A second run while one holds the store's lock prints
+one line and writes nothing; a question that meets it is answered from the saved
+report, naming the run that holds the lock. A collector exit without a manifest
+after `start` (the lock lost, a crash record) takes the SOP's recovery `finish`,
+which releases the in-flight note at once instead of leaving it to its TTL.
 
 `risk: low`, as every audit: the run's only writes are the collector's files on
 the volume, the ledger issue through `audit_report.py`, and the chat message,
 and the `high` tier's command allowlist would refuse the collector itself, a
 Python script. `deliver: chat`, so the Chat Agent owns the thread a reply lands
 in. The collector also keeps a guard per classified failure and per risk shape
-in `guards.json` beside its ledger, for the readiness watch to read once it
-ships ([the readiness design](../../../docs/designs/upgrade-readiness-checks.md));
-nothing reads the file today.
+in `guards.json` beside its ledger, for the readiness watch to read once its
+reader ships ([the readiness design](../../../docs/designs/upgrade-readiness-checks.md));
+nothing scheduled reads the file today, and the SOP's on-demand section reads its
+risk entries for a cluster the latest report lists as unchanged.
 
 ## Never put an id on both rosters
 

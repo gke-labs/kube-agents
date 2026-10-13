@@ -4,9 +4,13 @@
 # budget that forbids the eviction. The retrospective names it on every run, under one of
 # three readings: as a failure under Errors (`upgrade-broke-workload`) when an UPGRADE_NODES
 # on the pool the workload pins to drained the node inside the window and the budget held
-# the drain; as a failure still present under Warnings (`upgrade-failure-persists`) while
-# the guard from that run is live; and otherwise as a risk shape in the cluster's Info block,
-# since the budget is present whether or not an upgrade ran that week. The question asks for
+# the drain; as a failure still present under Warnings (re-filed under its original check,
+# `upgrade-broke-workload`, with `persists since <date>, <n> review(s)`) while the guard from
+# that run is live; and otherwise as a risk shape, in the cluster's Info block when the run
+# reviewed it or, when the latest report lists the cluster as unchanged, in the report of the
+# review its row names or in its `kind: risk` guard in `guards.json`, which the SOP's section 7
+# reads for an unchanged cluster, since the budget is present whether or not an upgrade ran
+# that week. The question asks for
 # one line per failure and per risk the report names, so the budget's line is owed under all
 # three readings, and nothing here asserts which one applied: the planted noun is the object
 # and its entry number, and those are what the deterministic check reads.
