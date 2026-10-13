@@ -688,6 +688,8 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
     token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
     headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+    shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+    defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.
@@ -702,6 +704,20 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     pod_selector {}
     policy_types = ["Ingress", "Egress"]
   }
+}
+
+# The shape namespaces' policies were first declared as two standalone
+# resources, and a project applied from that branch holds them under those
+# addresses. Without these blocks the rename plans as a delete and a create,
+# which the reconciler refuses (reconcile-allow.json); with them it is a no-op.
+moved {
+  from = kubernetes_network_policy_v1.seeded_shapes_default_deny
+  to   = kubernetes_network_policy_v1.default_deny["shapes"]
+}
+
+moved {
+  from = kubernetes_network_policy_v1.seeded_defaults_default_deny
+  to   = kubernetes_network_policy_v1.default_deny["defaults"]
 }
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
@@ -1159,18 +1175,6 @@ resource "kubernetes_namespace_v1" "seeded_shapes" {
   depends_on = [google_container_node_pool.seeded_a_default]
 }
 
-resource "kubernetes_network_policy_v1" "seeded_shapes_default_deny" {
-  metadata {
-    name      = "default-deny"
-    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
-  }
-
-  spec {
-    pod_selector {}
-    policy_types = ["Ingress", "Egress"]
-  }
-}
-
 # Defect (entry 4, role node-local-state): state that lives on the node. The
 # queue directory is an emptyDir, so a rebuilt node starts the pod with an
 # empty queue; the stamp the container writes at start is what a rebuild
@@ -1481,18 +1485,6 @@ resource "kubernetes_namespace_v1" "seeded_defaults" {
   depends_on = [google_container_node_pool.seeded_a_default]
 }
 
-resource "kubernetes_network_policy_v1" "seeded_defaults_default_deny" {
-  metadata {
-    name      = "default-deny"
-    namespace = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
-  }
-
-  spec {
-    pod_selector {}
-    policy_types = ["Ingress", "Egress"]
-  }
-}
-
 resource "kubernetes_deployment_v1" "baseline_edge_worker" {
   metadata {
     name      = "baseline-edge-worker"
@@ -1622,10 +1614,11 @@ resource "kubernetes_cron_job_v1" "stale_kubectl_client" {
 
 # Defect (entry 14, role cgroup-blind-runtime): a Java runtime from before
 # cgroup v2 support (JDK 8 reads it from 8u372; this is 8u302) under a memory
-# limit. On a cgroup v1 node the JVM sizes its heap from the limit; on a
+# limit. On a cgroup v1 node such a JVM sizes its heap from the limit; on a
 # cgroup v2 node it reads the machine's memory instead and is OOM-killed once
-# it grows. The image tag is the before-signal; the JVM here only sleeps, so
-# the pod runs on either cgroup mode.
+# it grows. The image's JDK version is the dependency and the before-signal:
+# the container prints `java -version` at start and then runs `sleep`, so no
+# JVM is resident and the pod runs on either cgroup mode.
 resource "kubernetes_deployment_v1" "cgroup_blind_jvm" {
   metadata {
     name      = "cgroup-blind-jvm"
