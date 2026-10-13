@@ -653,6 +653,31 @@ func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	}
 }
 
+// The collectors cannot see the scope snapshot from this pod, so the operator
+// tells them whether a boundary exists at all: with one, a run without the
+// fleet_scope tool's flags refuses to list rather than sweeping every project
+// the identity can see.
+func TestShellSandboxScopeDeclaredEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) string {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envScopeDeclared {
+				return env.Value
+			}
+		}
+		t.Fatalf("%s is not set on the sandbox container; the collectors read it", envScopeDeclared)
+		return ""
+	}
+	if got := read(shellSandboxTestAgent()); got != "false" {
+		t.Errorf("%s = %q without a scope block, want false", envScopeDeclared, got)
+	}
+	declared := shellSandboxTestAgent()
+	declared.Spec.Scope = &agentv1alpha1.ScopeSpec{}
+	if got := read(declared); got != "true" {
+		t.Errorf("%s = %q with a present, empty scope block (the host-only boundary), want true", envScopeDeclared, got)
+	}
+}
+
 func TestShellSandboxHostContextAndGKEEnv(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{

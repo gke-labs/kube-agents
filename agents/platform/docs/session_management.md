@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, and the `stall-watch` cron script. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -33,7 +33,7 @@ Delivery is the card itself. Hermes subscribes every card to the session it was 
 
 Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel.
 
-The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged.
+The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
 The session id is therefore the thread key, and `session_metadata` records the `platform` alongside the `thread_id`: a thread belongs to exactly one chat platform, and a report addressed to the other is not degraded to the home channel but refused outright.
 
@@ -318,7 +318,7 @@ separate ⚠️ total for each above the body. No metric counts the delivery-fai
 that line and this column are together the only record that a delivery failed anywhere in the
 system. The SOP's "What this recap does not report" owns the naming-versus-counting line and says
 what to query for the detail. Like `cluster`, it postdates the first draft of this table, and the recap selects it only
-when `PRAGMA table_info` says it is there — see "A pre-release table, and no migration" below for
+when `PRAGMA table_info` says it is there — see "Which columns are migrated, and which are not" below for
 why that tolerance is in the reader and not in `init_db`, and why `cluster` does not get it.
 
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
@@ -336,7 +336,7 @@ two clusters apart, and it is what lets the recap's header say which clusters a 
 postdates the other columns, and unlike `delivery_error` the reader gets no tolerance for its
 absence: `record_intercepted_event` names it in every INSERT, so a table without it records nothing
 at all, and the recap reports that as an unreadable ledger rather than a quiet day — see
-"A pre-release table, and no migration" below.
+"Which columns are migrated, and which are not" below.
 
 `object_uid` is recorded, and named in the same INSERT under the same terms, because `workload`
 cannot substitute for it: `clean_workload_name` strips the replica suffix before the row is written,
@@ -363,11 +363,14 @@ CREATE TABLE intercepted_events(
   message     TEXT NOT NULL DEFAULT '',
   severity    TEXT NOT NULL DEFAULT '',
   occurrences INTEGER NOT NULL DEFAULT 1,
-  notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back
+  notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back; 1 when posted to chat; 2 when dispatched on a headless install with no chat platform enabled
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
+  session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
 
 ##### Two bounds, not one
 
@@ -385,16 +388,20 @@ order of a hundred megabytes. The recap's own 120-character cut is a display cho
 time and bounds nothing on disk; 512 keeps more than it shows, which leaves room for a
 `FailedScheduling` message that names a predicate per node.
 
-##### A pre-release table, and no migration
+##### Which columns are migrated, and which are not
 
-`init_db` runs `CREATE TABLE IF NOT EXISTS` and nothing else: there is no `ALTER TABLE` for
-`cluster`, `object_uid` or `delivery_error` anywhere in the tree. The table has never been in a release, so the
-only databases carrying an earlier shape are dev installs that ran an intermediate commit of the
-change that introduced it, and a migration maintained for a shape no user has is machinery that
-outlives its reason.
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
+for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
+startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
+before the table ever shipped in a release, so the only databases carrying an earlier shape
+without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
+introduced the table (#426), and a migration maintained for a pre-release shape no released
+install has is machinery that outlives its reason.
 
-**If you have such an install, you must drop the table before rolling the image.** `CREATE TABLE IF
-NOT EXISTS` is a no-op against it, so the columns never appear, and how badly that ends depends on
+**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
+NOT EXISTS` is a no-op against a pre-0.2.0 table missing those three columns, so they never appear, and how badly that ends depends on
 which column is missing:
 
 - **No `cluster`** — the ledger stops recording anything. `record_intercepted_event` names the

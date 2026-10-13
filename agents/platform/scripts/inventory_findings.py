@@ -5,8 +5,8 @@ The onboarding hand-off (bootstrap_handoff.py) writes a ```findings block into
 the raw file; this script
 reads it and owns every deterministic step of the prioritization stage:
 `extract` produces the authoritative item list, `register` refuses to send
-anything until every one of those items carries a score, and `ranked` reads
-back the queue's order and the total the report's roll-up line counts from.
+anything until every one of those items carries a score, and `select` chooses
+the items the first report lists.
 
 The stage used to ask the worker to enumerate the findings from prose and call
 `register_findings` itself, and it lost findings three ways at once. It decided
@@ -33,6 +33,17 @@ import findings_queue as fq
 
 DEFAULT_RAW_PATH = "/opt/data/INVENTORY.raw.md"
 DEFAULT_ITEMS_PATH = "/opt/data/INVENTORY.items.json"
+DEFAULT_SCORES_PATH = "/opt/data/INVENTORY.scores.json"
+# The pacing limits as the gateway's environment sets them, which this terminal
+# cannot read: bootstrap_handoff.py writes them beside the raw file.
+DEFAULT_LIMITS_PATH = "/opt/data/INVENTORY.limits.json"
+# What `select` chose, for bootstrap_delivery.py to mark shown once the report
+# is delivered: {"items": [{"class": <item class>, "ids": [<queue id>, ...]}]}.
+DEFAULT_SHOWN_PATH = "/opt/data/INVENTORY.shown.json"
+SHOWN_ITEMS = "items"
+SHOWN_CLASS = "class"
+SHOWN_IDS = "ids"
+TMP_SUFFIX = ".tmp"
 DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
 POST_TIMEOUT_SECONDS = 30
 
@@ -300,10 +311,6 @@ def post_batch(endpoint: str, findings: list[dict], scope: dict | None) -> dict:
     return _request(endpoint, "/v1/findings", body)
 
 
-def fetch_ranked(endpoint: str) -> list[dict]:
-    return _request(endpoint, "/v1/findings/ranked").get("findings") or []
-
-
 def _read_json(path: str, what: str) -> dict:
     """The scores file is hand-written each run, so a trailing comma is likely."""
     try:
@@ -317,34 +324,67 @@ def _read_json(path: str, what: str) -> dict:
         ) from None
 
 
-def cmd_register(args: argparse.Namespace) -> int:
-    items = _read_json(args.items, "items").get("items")
+def _read_items(items_path: str) -> list:
+    """`extract`'s items, checked for their shape."""
+    items = _read_json(items_path, "items").get("items")
     if not isinstance(items, list):
         raise Failure(
             EXIT_INCOMPLETE,
-            [f"{args.items} has no `items` list -- run `extract` first, or point --items at its output"],
+            [f"{items_path} has no `items` list -- run `extract` first, or point --items at its output"],
         )
-    raw_scores = _read_json(args.scores, "scores")
+    return items
+
+
+def _read_scores(scores_path: str) -> dict:
+    """The scores file, checked for its shape."""
+    raw_scores = _read_json(scores_path, "scores")
     if not isinstance(raw_scores, dict) or not isinstance(raw_scores.get("scores"), dict):
         raise Failure(
             EXIT_INCOMPLETE,
             ["the scores file must be an object with a `scores` map keyed by finding id"],
         )
-    complete = {str(name) for name in raw_scores.get("complete_clusters") or []}
+    return raw_scores
+
+
+def _read_batch(items_path: str, scores_path: str) -> tuple[list, dict]:
+    """`extract`'s items and the scores file, each checked for its shape."""
+    return _read_items(items_path), _read_scores(scores_path)
+
+
+def complete_clusters(raw_scores: dict) -> set[str]:
+    """The scores file's `complete_clusters`, as '<project>/<cluster>' strings."""
+    return {str(name) for name in raw_scores.get("complete_clusters") or []}
+
+
+def cluster_batches(payloads: list[dict], complete: set[str]) -> list[tuple[str, list[dict], dict | None]]:
+    """The payloads as one `(where, batch, scope)` per cluster, in sorted order.
+
+    `where` is '<project>/<cluster>'; `scope` marks that cluster's sweep
+    complete when `complete` names it, and is None otherwise.
+    """
+    by_cluster: dict[tuple[str, str], list[dict]] = {}
+    for payload in payloads:
+        by_cluster.setdefault((payload["project"], payload["cluster"]), []).append(payload)
+    batches = []
+    for (project, cluster), batch in sorted(by_cluster.items()):
+        where = f"{project}/{cluster}"
+        scope = {"project": project, "cluster": cluster, "complete": True} if where in complete else None
+        batches.append((where, batch, scope))
+    return batches
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    items, raw_scores = _read_batch(args.items, args.scores)
+    complete = complete_clusters(raw_scores)
     payloads = build_payloads(items, raw_scores["scores"])
     if not payloads:
         print("nothing to register: the sweep extracted no findings")
         return 0
 
-    by_cluster: dict[tuple[str, str], list[dict]] = {}
-    for payload in payloads:
-        by_cluster.setdefault((payload["project"], payload["cluster"]), []).append(payload)
-
+    batches = cluster_batches(payloads, complete)
     sent = 0
     failures: list[str] = []
-    for (project, cluster), batch in sorted(by_cluster.items()):
-        where = f"{project}/{cluster}"
-        scope = {"project": project, "cluster": cluster, "complete": True} if where in complete else None
+    for where, batch, scope in batches:
         if args.dry_run:
             print(f"{where}: {len(batch)} finding(s), scope={'complete' if scope else 'omitted'} (dry run)")
             sent += len(batch)
@@ -369,7 +409,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # An unmatched entry is a silent no-op with a real cost: the absence rule
     # never runs, so a fixed critical keeps its floor severity and the nudge
     # nags about it every morning with no exit.
-    for entry in sorted(complete - {f"{p}/{c}" for p, c in by_cluster}):
+    for entry in sorted(complete - {where for where, _, _ in batches}):
         print(
             f"warning: complete_clusters entry {entry!r} matched no registered batch; "
             "entries are '<project>/<cluster>' and the absence rule did not run for it"
@@ -380,46 +420,153 @@ def cmd_register(args: argparse.Namespace) -> int:
         raise Failure(
             EXIT_POST_FAILED,
             failures,
-            f"The other {sent} did register and are in the queue. Write the report from the "
-            "scores you computed, and name the clusters above in the card summary as missing "
-            "from the queue.",
+            f"The other {sent} did register and are in the queue. The delivery job registers "
+            "this whole batch again from the agent pod when it delivers the report. Go on to "
+            "`select`, and name the clusters above in the card summary as not yet in the queue.",
         )
     return 0
 
 
 # --------------------------------------------------------------------------
-# ranked
+# select
 # --------------------------------------------------------------------------
 
 
-def cmd_ranked(args: argparse.Namespace) -> int:
+def read_limits(path: str) -> fq.PacingLimits:
+    """The limits the hand-off wrote, or the defaults when the file is missing or unusable."""
     try:
-        ranked = fetch_ranked(args.endpoint)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise Failure(
-            EXIT_POST_FAILED,
-            [str(exc)],
-            "Rank by the scores you computed instead, and say so in the card summary.",
-        ) from None
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        sys.stderr.write(f"select: no {path}; using the default limits\n")
+        return fq.PacingLimits()
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"select: cannot read {path} ({exc}); using the default limits\n")
+        return fq.PacingLimits()
+    if not isinstance(raw, dict):
+        sys.stderr.write(f"select: {path} is not a JSON object; using the default limits\n")
+        return fq.PacingLimits()
+    # Through the parser the environment goes through, so a bad value here
+    # falls back to its default the same way.
+    return fq.pacing_limits({fq.PACING_ENV[name]: str(value) for name, value in raw.items() if name in fq.PACING_ENV})
 
-    for index, finding in enumerate(ranked, 1):
-        where = "/".join(
-            x
-            for x in (finding.get("project"), finding.get("cluster"), finding.get("namespace"), finding.get("object"))
-            if x
+
+def select_items(
+    items: list[dict], scores: dict, limit: int, exclude: frozenset[str] = frozenset()
+) -> tuple[list[list[dict]], int, int]:
+    """The first report's items, the critical items it leaves out, and every other item.
+
+    Scored here from the vectors, as the queue would score them, so the
+    choice does not depend on the queue being reachable and sees only this
+    batch. Rows are gathered into items by `fq.item_key` and ordered by their
+    best row in the queue's order; an item is critical when any of its rows
+    is. The report lists the top `limit` critical items and nothing else.
+    Provider-managed observations (`fq.rolled_up`) are never items and count
+    once per line (`fq.item_key`) among the others; a line that also has an
+    ordinary row is already counted as that item. The nudge's open count
+    still counts such a line twice, once as the item and once as managed.
+    Ids in `exclude` are rows the user dismissed, which are neither listed nor
+    counted.
+    """
+    payloads = build_payloads(items, scores)
+    by_ref = {item["id"]: item for item in items}
+    rows: dict[str, dict] = {}
+    # `build_payloads` returns one payload per extracted id, in this order, or raises.
+    for item, payload in zip(by_ref.values(), payloads):
+        row = fq.validate_finding(payload)
+        row["ref"] = item["id"]
+        # Two lines naming one object are one row in the queue, the later
+        # line's, as registering them would leave it.
+        rows[row["id"]] = row
+
+    managed: set[tuple] = set()
+    lines: dict[tuple, list[dict]] = {}
+    for row in sorted(rows.values(), key=fq.ranked_sort_key):
+        if row["id"] in exclude:
+            continue
+        if fq.rolled_up(row):
+            managed.add(fq.item_key(row))
+            continue
+        lines.setdefault(fq.item_key(row), []).append(row)
+    critical = [members for members in lines.values() if any(r["severity"] == fq.SEVERITIES[0] for r in members)]
+    shown = critical[:limit]
+    return shown, len(critical) - len(shown), len(lines) - len(critical) + len(managed - lines.keys())
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def describe_selection(
+    shown: list[list[dict]], deferred: int, others: int, limits: fq.PacingLimits
+) -> str:
+    if shown:
+        out = [f"first report: list exactly {_plural(len(shown), 'critical item', 'critical items')}, in this order"]
+    elif deferred:
+        out = [f"first report: list no item; the limit is {limits.first_report_criticals}"]
+    else:
+        out = ["first report: list no item; there are no critical findings"]
+    for index, members in enumerate(shown, 1):
+        best = members[0]
+        objects = _plural(len(members), "object", "objects")
+        out.append(f"{index:>3}. critical  {best['check_slug']}  {best['project']}/{best['cluster']}  ({objects})")
+        for row in members:
+            where = "/".join(x for x in (row["namespace"], row["object"]) if x)
+            out.append(f"       {row['ref']}  {row['severity']:<8} {where}  {row['title']}")
+
+    remaining = deferred + others
+    if remaining:
+        critical_part = f", {deferred} of them critical" if deferred else ", none of them critical"
+        out.append(f"\nroll-up: {_plural(remaining, 'more item', 'more items')}{critical_part}")
+    else:
+        out.append("\nroll-up: none; the report has no roll-up line")
+    # The listed items count against the delivery day's critical allowance
+    # (bootstrap_delivery.py marks them), so when they fill it the rest start
+    # the next day. A limit of 0 adds none of that kind at all.
+    if deferred:
+        if not limits.daily_criticals:
+            out.append("pace: the critical items not listed are not added in chat; the daily limit is 0")
+        else:
+            start = " the day after the report arrives" if len(shown) >= limits.daily_criticals else ""
+            out.append(
+                f"pace: the critical items not listed are added in chat from {fq.REMIND_HOUR}:00 UTC{start}, "
+                f"at most {limits.daily_criticals} a day"
+            )
+    elif not shown and others:
+        if not limits.noncritical_max:
+            out.append("pace: non-critical items are not added in chat; the daily limit is 0")
+        else:
+            out.append(
+                f"pace: non-critical items are added in chat from {limits.noncritical_after_hour}:00 UTC, "
+                f"at most {limits.noncritical_max} a day"
+            )
+    return "\n".join(out)
+
+
+def cmd_select(args: argparse.Namespace) -> int:
+    items = _read_items(args.items)
+    # A clean fleet has nothing to score, so the SOP writes no scores file for it.
+    scores = _read_scores(args.scores)["scores"] if items else {}
+    limits = read_limits(args.limits)
+    try:
+        shown, deferred, others = select_items(
+            items, scores, limits.first_report_criticals, frozenset(args.exclude or ())
         )
-        flags = []
-        if finding.get("provider_managed"):
-            flags.append("provider_managed")
-        if not finding.get("actionable", True):
-            flags.append("not_actionable")
-        suffix = f"  [{','.join(flags)}]" if flags else ""
-        print(
-            f"{index:>3}. {finding.get('rank_score'):>4} {finding.get('severity'):<8} "
-            f"{finding.get('check')}  {where}{suffix}\n     {finding.get('title')}"
-        )
-    print(f"\ntotal: {len(ranked)}")
-    print("The roll-up count is this total minus the rows you show or gather into a shown line.")
+    except Failure as failure:
+        failure.hint = "Nothing was selected. Fix all of these, then re-run."
+        raise
+
+    record = {
+        SHOWN_ITEMS: [
+            {SHOWN_CLASS: fq.ITEM_CLASSES[0], SHOWN_IDS: [row["id"] for row in members]} for members in shown
+        ]
+    }
+    out = Path(args.out)
+    tmp = out.with_name(out.name + TMP_SUFFIX)
+    tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(out)
+
+    print(describe_selection(shown, deferred, others, limits))
+    print(f"\nthe listed items are written to {out}")
     return 0
 
 
@@ -442,9 +589,13 @@ def main(argv: list[str] | None = None) -> int:
     register.add_argument("--dry-run", action="store_true")
     register.set_defaults(func=cmd_register)
 
-    ranked = sub.add_parser("ranked", help="the queue's order, and the authoritative total")
-    ranked.add_argument("--endpoint", default=os.environ.get("FINDINGS_ENDPOINT", DEFAULT_ENDPOINT))
-    ranked.set_defaults(func=cmd_ranked)
+    select = sub.add_parser("select", help="choose the items the first report lists")
+    select.add_argument("--items", default=DEFAULT_ITEMS_PATH)
+    select.add_argument("--scores", default=DEFAULT_SCORES_PATH)
+    select.add_argument("--limits", default=DEFAULT_LIMITS_PATH)
+    select.add_argument("--out", default=DEFAULT_SHOWN_PATH)
+    select.add_argument("--exclude", action="append", metavar="ID", help="a queue id `register` named as suppressed")
+    select.set_defaults(func=cmd_select)
 
     args = parser.parse_args(argv)
     try:

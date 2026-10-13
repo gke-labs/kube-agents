@@ -168,6 +168,7 @@ HISTORY_DEPTH = 50
 # roster of required checks the trigger must contain. The workflow's header says
 # what may go on the list and why `Prettier Check` is not on it.
 WATCHED_WORKFLOWS = (
+    "A2A Module Tests",
     "Actionlint",
     "Docker Build",
     "Documentation Checks",

@@ -546,6 +546,20 @@ const (
 	// `hermes send` (agents/platform/scripts/chat_notify.py).
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
+	a2aNotifyPlatformSlack  = "slack"
+	// The Slack home channel the same route posts to on a Slack-armed
+	// gateway, from slack.homeChannel.
+	a2aSlackHomeChannelEnvVar = "A2A_SLACK_HOME_CHANNEL"
+	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
+	// letter and at least two characters after it, as the gateway checks.
+	a2aSlackMinChannelIDLen = 3
+	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
+	// and kanban_event_routing.py, which addresses a card to the conversation):
+	// the platform whose gateway conversations a card reports back to. Its own
+	// variable because the route serves conversations with no home channel,
+	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
+	// and so needs one.
+	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
 	a2aChatDisplayModeEnvVar = "A2A_CHAT_DISPLAY_MODE"
@@ -1185,11 +1199,22 @@ func a2aAgentDoorEnabled() bool {
 	return os.Getenv(a2aAgentDoorEnvVar) == "true"
 }
 
+// a2aGchatNotifyArmed reports whether the gateway arms its chat.notify route
+// for this install's Google Chat: Chat consumed by the next stack, and a home
+// channel that is either unset (the route then serves conversation requests,
+// a kanban card's report back to the conversation it came from) or a Chat
+// space name (home posts too). A malformed one leaves the route unarmed
+// (a2a/gateway/notify.go, NewGchatNotifier).
+func a2aGchatNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aChatArmed(agent) {
+		return false
+	}
+	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" || a2aGchatHomeSpace(agent) != ""
+}
+
 // a2aGchatHomeSpace is googleChat.homeChannel trimmed, when it is a Chat space
-// name ("spaces/<id>", nothing nested), and "" otherwise. It is the condition
-// the gateway arms its chat.notify route on (a2a/gateway/notify.go,
-// NewGchatNotifier), so the agent is told to route proactive posts there
-// exactly when something will answer them.
+// name ("spaces/<id>", nothing nested), and "" otherwise: the home channel the
+// gateway's chat.notify route posts proactive messages to.
 func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
 	if !googleChatEnabled(agent) {
 		return ""
@@ -1198,6 +1223,38 @@ func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
 	id, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)
 	if !ok || id == "" || strings.Contains(id, "/") {
 		return ""
+	}
+	return home
+}
+
+// a2aSlackNotifyArmed is whether the gateway arms Slack's chat.notify route:
+// whenever it holds Slack, unless slack.homeChannel is set but is not a
+// channel id, which the gateway refuses at start. With no home channel the
+// route serves conversation requests only.
+func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aSlackArmed(agent) {
+		return false
+	}
+	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
+}
+
+// a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
+// ("C...") or private ("G...") channel id, and "" otherwise: the same test
+// the gateway arms its Slack chat.notify route on (a2a/gateway/notify.go,
+// NewSlackNotifier), so the agent is told to route proactive posts there
+// exactly when something will answer them.
+func a2aSlackHomeChannel(agent *agentv1alpha1.PlatformAgent) string {
+	if !slackEnabled(agent) {
+		return ""
+	}
+	home := strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel)
+	if len(home) < a2aSlackMinChannelIDLen || (home[0] != 'C' && home[0] != 'G') {
+		return ""
+	}
+	for _, r := range home[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return ""
+		}
 	}
 	return home
 }
@@ -4473,6 +4530,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
 			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
 		}
+		// Proactive posts land here (the chat.notify route), as on Chat.
+		// Unset leaves home posts unarmed; a card's conversation posts are
+		// served either way.
+		if home := strings.TrimSpace(slack.HomeChannel); home != "" {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackHomeChannelEnvVar, Value: home})
+		}
 	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
@@ -4503,8 +4566,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aGchatTokenPathEnvVar, Value: a2aGchatTokenPath},
 		}
 		// Proactive posts land here (the chat.notify route). Unset leaves
-		// the route unarmed, which is what an install with no home channel
-		// had under today too: nowhere to post.
+		// the route serving a kanban card's report back to its conversation
+		// only: proactive posts have nowhere to go, as on today with no home
+		// channel.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}

@@ -1120,3 +1120,37 @@ make uninstall
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
   ```
 - For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).
+
+### 5. Slack Bot Doesn't Answer
+
+When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
+
+- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope and Event Subscriptions (`app_mention`, `message.*`) must be enabled.
+  - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
+  - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
+  - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
+  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Unlisted users are ignored without a reply; an empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
+- **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+
+**Which logs to read:**
+
+- **Default (`mode: today`):**
+  - Check Socket Mode connectivity and token validation in the credential proxy:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
+    ```
+  - Check message reception, allowlist filtering, and agent processing in the gateway pod:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c platform-agent
+    ```
+- **A2A Stack (`spec.mode: next`):**
+  - Check the A2A gateway pod for Socket Mode connection, token errors, and session spawning:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway
+    ```
+  - Check the `PlatformAgent` CR status for gateway enablement:
+    ```bash
+    kubectl get platformagent platform-agent -n kubeagents-system -o yaml
+    ```
+    (The `A2AGateway` condition is present only while the gateway runs nothing: `status: False` with reason `NoChatBackend` when no chat backend is configured, or `WaitingForReplica` while a scaled-up replica comes back. On an install with Slack enabled it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)

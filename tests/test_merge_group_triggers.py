@@ -7,7 +7,8 @@ status-check timeout. Nothing else notices the trigger going missing: a
 workflow edited without it still runs on every pull request exactly as before.
 This roster is the ten required contexts as of the Tide-to-merge-queue
 migration (gke-labs/kube-agents#1363), less `cla/google`, which is an external
-app's commit status rather than a workflow.
+app's commit status rather than a workflow, plus `Run A2A Module Tests`, which
+became required on 2026-10-13.
 """
 
 import pathlib
@@ -20,6 +21,7 @@ _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 
 _MERGE_GROUP = "merge_group"
 _REQUIRED_CHECK_WORKFLOWS = (
+    "a2a-test.yml",
     "actionlint.yml",
     "docker-build.yml",
     "docs-check.yml",

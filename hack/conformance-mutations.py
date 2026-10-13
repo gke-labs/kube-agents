@@ -745,6 +745,54 @@ Mutation(
         "edit removes",
     ),
     Mutation(
+        "C4-skills-unchecked",
+        ".github/workflows/validate.yml",
+        ("run: make skills-check", "run: true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "drop the offline lock check from validate, which a CI cleanup that "
+        "sees a step with no failures could do; the pins would then go unread",
+    ),
+    Mutation(
+        "C4-skills-check-silenced",
+        ".github/workflows/validate.yml",
+        ("run: make skills-check", "run: make skills-check || true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "keep the step but discard its exit code, so a lock mismatch reports green",
+    ),
+    Mutation(
+        "C4-skills-check-blank-line-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a blank line inside the step, valid YAML that GitHub honours, "
+        "which a reader that stops at the first blank line would miss",
+    ),
+    Mutation(
+        "C4-skills-check-comment-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n      # note\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a comment at the step's own indent; YAML still reads it as a "
+        "key of the step",
+    ),
+    Mutation(
+        "C4-skills-check-skips-lock",
+        "scripts/skill_overlay.py",
+        ("            require_mirrored(skill)\n            verify_copy(skill)\n",
+         "            require_mirrored(skill)\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "drop the lock check from `check` while tidying the loop, so a hand-edited copy passes",
+    ),
+    Mutation(
+        "C4-skills-make-noop",
+        "Makefile",
+        ("SKILL_OVERLAY := python3 scripts/skill_overlay.py", "SKILL_OVERLAY := true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "point the make variable at a no-op, so every skills-* target succeeds without running",
+    ),
+    Mutation(
         "C5-minted-write-verb",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - get\n      - list\n", "      - get\n      - list\n      - patch\n"),
@@ -1746,10 +1794,20 @@ Mutation(
         "then posts as the install's bot for a second principal",
     ),
     Mutation(
+        "A3-bridge-sends-a-slack-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.slack",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the Slack notify subject, "
+        "so a task the bridge runs can make the Slack bot post to the home "
+        "channel without the agent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "

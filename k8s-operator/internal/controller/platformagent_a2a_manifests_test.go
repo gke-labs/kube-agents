@@ -3200,6 +3200,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 				{Name: a2aBusUserEnv, Value: "gateway"},
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
+				{Name: a2aNotifyConversationsEnvVar, Value: "google_chat"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -3243,7 +3244,8 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// A2A_NOTIFY_PLATFORM is the fourth: on this install Chat is not armed,
 	// so the operator renders no value, and a plugin's would reroute the
 	// agent's proactive posts to a route with no gateway behind it.
-	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar} {
+	// A2A_NOTIFY_CONVERSATIONS is the fifth, for the same reason.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
@@ -3257,7 +3259,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
@@ -3289,8 +3291,8 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		// because there it would reroute every Google Chat post from hermes
 		// send to a chat.notify route the install does not have.
 		for _, e := range c.Env {
-			if e.Name == a2aNotifyPlatformEnvVar {
-				t.Errorf("a plugin's %s survived on a today install: %q", a2aNotifyPlatformEnvVar, e.Value)
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar {
+				t.Errorf("a plugin's %s survived on a today install: %q", e.Name, e.Value)
 			}
 		}
 	}
@@ -4738,7 +4740,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 		"a2a.topics.shared.annotations",
 	}
 	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
-	wantPublish = append(wantPublish, "chat.notify.gchat", "_INBOX."+a2aAgentBusUser+".>")
+	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "_INBOX."+a2aAgentBusUser+".>")
 	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
 		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
 	}
@@ -4868,7 +4870,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -5875,13 +5877,14 @@ const (
 // The chat.notify route's two subjects, spelled here independently of the
 // render's constants so a renamed constant cannot carry the check with it.
 const (
-	notifyRequest = "chat.notify.gchat"
-	notifyReply   = "chat.notify.reply.agent.>"
+	notifyRequest      = "chat.notify.gchat"
+	notifyRequestSlack = "chat.notify.slack"
+	notifyReply        = "chat.notify.reply.agent.>"
 )
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyReply}
+var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -5915,6 +5918,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{consoleInbound, true},
 		{consoleOutbound, true},
 		{notifyRequest, true},
+		{notifyRequestSlack, true},
 		{notifyReply, true},
 		{"a2a.task.>", true},
 		{"agents.hb.>", true},
@@ -5929,10 +5933,11 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.console.*.status", false},
 		{"chat.console.*.in.x", false},
 		{"chat.console.>", false},
-		// The notify route admits its two subjects and nothing around them:
-		// a sibling backend not yet routed, the namespace wildcard, the reply
-		// namespace widened to every principal, and one literal inside it.
-		{"chat.notify.slack", false},
+		// The notify route admits its subjects (one per routed backend, and
+		// the reply namespace) and nothing around them: a sibling backend not
+		// yet routed, the namespace wildcard, the reply namespace widened to
+		// every principal, and one literal inside it.
+		{"chat.notify.discord", false},
 		{"chat.notify.>", false},
 		{"chat.notify.reply.>", false},
 		{"chat.notify.reply.agent.x", false},
@@ -7617,8 +7622,10 @@ func notifyDoorViolations(ids []a2aIdentity) []string {
 		grants               func(a2aIdentity) []string
 	}{
 		{"publish", notifyRequest, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", notifyRequestSlack, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequestSlack, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
 	}
 	var out []string
@@ -7665,8 +7672,10 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	}
 	for _, want := range []struct{ user, verb, pattern string }{
 		{a2aAgentBusUser, "publish", notifyRequest},
+		{a2aAgentBusUser, "publish", notifyRequestSlack},
 		{a2aAgentBusUser, "subscribe", notifyReply},
 		{"gateway", "subscribe", notifyRequest},
+		{"gateway", "subscribe", notifyRequestSlack},
 		{"gateway", "publish", notifyReply},
 	} {
 		if !holds(want.user, want.verb, want.pattern) {
@@ -7685,6 +7694,7 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 		user, verb, grant string
 	}{
 		{a2aBridgeUser, "publish", "chat.notify.gchat"},
+		{a2aBridgeUser, "publish", "chat.notify.slack"},
 		{"web", "subscribe", "chat.notify.reply.>"},
 	} {
 		mutated := slices.Clone(ids)

@@ -645,6 +645,15 @@
                   "type": "object"
                 }
               }
+            },
+            "agentAPIAuth": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
+              }
             }
           }
         },
@@ -846,6 +855,18 @@
                     "additionalProperties": false,
                     "properties": {
                       "name": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "caBundleRef": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "key": {
                         "type": "string"
                       }
                     }

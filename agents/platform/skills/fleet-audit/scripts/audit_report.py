@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import bisect
 import contextlib
 import copy
 import fcntl
@@ -68,6 +69,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -427,6 +429,23 @@ AUDITS: dict[str, AuditSpec] = {
             "psc-routing-deadlock",
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
+            "firewall-world-open-ingress",
+        ),
+        # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
+        # subnet for the IPAM check, one `project/<id>` entry for the other
+        # five. This stream enumerates no clusters.
+        scopes=(
+            ("subnet", ("subnet-ip-exhaustion",)),
+            (
+                "project",
+                (
+                    "cloud-nat-exhaustion",
+                    "psc-routing-deadlock",
+                    "mtu-packet-fragmentation",
+                    "cloud-armor-false-positive",
+                    "firewall-world-open-ingress",
+                ),
+            ),
         ),
     ),
     "gce-compute-fleet-audit": AuditSpec(
@@ -473,6 +492,7 @@ COLLECTOR_AUDITS = frozenset(
         "fleet-consistency-drift",
         "fleet-wide-cost-analysis",
         "gce-compute-fleet-audit",
+        "gcp-networking-fabric-audit",
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
@@ -482,6 +502,15 @@ COLLECTOR_AUDITS = frozenset(
 SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
+MANIFEST_REMEDIATION_KIND = "manifest"
+MANUAL_REMEDIATION_KIND = "manual"
+# The fields `carry_unchanged_findings` always copies from the previous run.
+# Severity is not in the list: the collector calculates it, so it is not
+# wording. `recommendation` and `remediation` carry together when
+# `_remediation_may_carry` accepts the pair, so the Recommendation line and
+# Remediation block never come from different runs.
+CARRIED_FINDING_FIELDS = ("title", "impact")
+CARRIED_REMEDIATION_FIELDS = ("recommendation", "remediation")
 
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
@@ -1327,6 +1356,22 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
+# The end of the note `degrade_missing_remediations` writes for a manifest
+# file that the audit did not write.
+DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run the audit.)_"
+# The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
+# fix that Config Connector reverts.
+KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
+# Text that `finish` itself writes into a remediation note. A note that holds
+# one of these is not the worker's wording, and `carry_unchanged_findings`
+# does not copy it: the pass that wrote it runs again on each run and writes
+# it again when its condition is still true.
+HARNESS_NOTE_MARKS = (
+    SHARED_ACCOUNT_SHIELD_NOTE.split("{", 1)[0],
+    DECLINED_FIX_NOTE.split("{", 1)[0],
+    DEGRADED_REMEDIATION_TAIL,
+    KCC_REVERTED_NOTE_MARK,
+)
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -1463,6 +1508,18 @@ TARGET_KIND_PROJECT = "project"
 TARGET_KIND_SUBNET = "subnet"
 PROJECT_TARGET_PREFIX = "project/"
 TARGET_KINDS = frozenset({TARGET_KIND_CLUSTER, TARGET_KIND_PROJECT, TARGET_KIND_SUBNET})
+# The order in which `scope_phrase` counts the target kinds.
+SCOPE_PHRASE_KINDS = (TARGET_KIND_CLUSTER, TARGET_KIND_SUBNET, TARGET_KIND_PROJECT)
+# Forge `capabilities.fileUrl` template tokens and fallback ref.
+CAPABILITIES_OP = "capabilities"
+CAPABILITY_FILE_URL_KEY = "fileUrl"
+FILE_URL_REF_TOKEN = "{ref}"
+FILE_URL_PATH_TOKEN = "{path}"
+DEFAULT_FILE_REF = "HEAD"
+# Header, separator, blank line above, and overflow line below the index table.
+INDEX_OVERHEAD_MARGIN = 200
+# Fallback target label when a `scope.clusters` entry has an empty name.
+UNNAMED_EVIDENCE_TARGET = "(unnamed)"
 # Set by the cost and stockout collectors on a `project/<id>` entry whose
 # `gcloud container clusters list` completed and came back empty, or was
 # refused because that project's own Kubernetes Engine API is off -- no
@@ -1476,14 +1533,25 @@ CLUSTERS_LISTED_KEY = "clusters_listed"
 # except `out-of-scope`, the collector saying the target is not this audit's,
 # which is neither cross-checked nor owed by the document.
 # The collector's wall-clock stop. Carried, not read, everywhere except the
-# staleness guard in `load_manifest`.
+# staleness guard in `load_manifest` and the `collect_s` timer.
 MANIFEST_FINISHED_KEY = "finished_at"
+# The collector's wall-clock start. Read only for the `collect_s` timer.
+MANIFEST_STARTED_KEY = "started_at"
 MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # How much of a collector's `error` a refusal quotes back.
 MANIFEST_ERROR_EXCERPT = 200
 # How many finding ids a log line names before eliding the rest.
 MANIFEST_LOG_IDS = 5
+# The phase timers that `finish` adds to its JSON line and to the report
+# envelope, in seconds. Report data only: nothing decides on them. A timer
+# whose input is missing is left out, never given as zero.
+INSPECT_SECONDS_KEY = "inspect_s"
+PUBLISH_SECONDS_KEY = "publish_s"
+COLLECT_SECONDS_KEY = "collect_s"
+PHASE_TIMER_KEYS = (INSPECT_SECONDS_KEY, PUBLISH_SECONDS_KEY, COLLECT_SECONDS_KEY)
+# Decimal places a phase timer keeps.
+PHASE_TIMER_DIGITS = 1
 # What the held comment shows as the collector's command when the manifest
 # recorded a candidate for a check and no `rc == 0` command on that target.
 COLLECTOR_COMMAND_UNRECORDED = "(the collector recorded no command for this check here)"
@@ -2106,6 +2174,34 @@ def scoped_target_kind(spec: "AuditSpec", name: str) -> str:
     return kind
 
 
+def scope_phrase(audit_id: str, targets: list[dict], qualifier: str = "") -> str:
+    """How many targets a run read, counted by kind: "3 cluster(s)".
+
+    `scope.clusters` can hold projects and subnets too, so its length is not a
+    cluster count. A stream that read only clusters gets the same text as
+    before. Each name is classified as `audit_target_checks` classifies it, so
+    a qualified cluster name counts as a cluster on a stream that declares no
+    subnet scope. `qualifier` goes after the first count only: "3 audited
+    cluster(s) and 2 project(s)".
+    """
+    spec = AUDITS.get(audit_id)
+    counts: dict[str, int] = {}
+    for target in targets:
+        name = str(target.get("name", "")).strip() if isinstance(target, dict) else ""
+        kind = scoped_target_kind(spec, name) if spec else target_kind(name)
+        counts[kind] = counts.get(kind, 0) + 1
+    word = f"{qualifier} " if qualifier else ""
+    parts = [
+        f"{counts[kind]} {word if i == 0 else ''}{kind}(s)"
+        for i, kind in enumerate(k for k in SCOPE_PHRASE_KINDS if counts.get(k))
+    ]
+    if not parts:
+        return f"0 {word}{TARGET_KIND_CLUSTER}(s)"
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
 def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
     """The roster subset `target_name` is answerable for.
 
@@ -2244,6 +2340,9 @@ def inflight_path_for(audit_id: str) -> str:
 # it sooner is an operator's action from outside the session, described in
 # agents/platform/cron/README.md; the CLI has no flag for it on purpose.
 INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+# The keys of the in-flight note that `start` writes.
+INFLIGHT_AUDIT_KEY = "audit"
+INFLIGHT_STARTED_KEY = "started_at"
 
 
 def _in_flight_since(path: Path) -> float | None:
@@ -2391,7 +2490,7 @@ def claim_in_flight(audit_id: str) -> None:
         staged = Path(f"{path}.tmp")
         try:
             staged.write_text(
-                json.dumps({"audit": audit_id, "started_at": time.time()}),
+                json.dumps({INFLIGHT_AUDIT_KEY: audit_id, INFLIGHT_STARTED_KEY: time.time()}),
                 encoding="utf-8",
             )
             os.replace(staged, path)
@@ -2425,6 +2524,67 @@ def release_in_flight(audit_id: str) -> None:
     is a change to the SOP contract and not made here.
     """
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
+
+
+def inflight_started_at(audit_id: str, now: float) -> float | None:
+    """The `started_at` that `start` wrote in this stream's in-flight note.
+
+    `None` when the note is missing, does not parse, names a different
+    stream, or gives a time outside `(0, now]` or `datetime`'s range.
+    `_in_flight_since` uses the mtime of a note that does not parse, because
+    a lease must fail closed. A timer must not: that mtime is not the start
+    of this run. A note older than the lease stays valid here, so a run
+    longer than the lease keeps its timer while no later `start` has
+    replaced the note. As in `release_in_flight`, `start` and `finish` share
+    no run identity: if a run outlives the lease (or an operator releases
+    the note) and a later `start` replaces the note before this run's
+    `finish`, `inspect_s` reads that later `start` time.
+    """
+    try:
+        note = json.loads(Path(inflight_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(note, dict) or note.get(INFLIGHT_AUDIT_KEY) != audit_id:
+        return None
+    started = note.get(INFLIGHT_STARTED_KEY)
+    if not isinstance(started, (int, float)) or isinstance(started, bool):
+        return None
+    try:
+        datetime.fromtimestamp(started, timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return None
+    if started <= 0 or started > now:
+        return None
+    return float(started)
+
+
+def inspect_seconds(audit_id: str, now: datetime) -> float | None:
+    """Seconds from `start` to `now`, the time the worker used to inspect.
+
+    `start` and `finish` are different processes. The in-flight note is the
+    one record of the start time that `finish` can read, so read it before
+    `handle_finish` releases the note. `None` when the note gives no time.
+    """
+    started = inflight_started_at(audit_id, now.timestamp())
+    if started is None:
+        return None
+    return round(now.timestamp() - started, PHASE_TIMER_DIGITS)
+
+
+def collector_seconds(manifest: dict | None) -> float | None:
+    """Seconds from the manifest's `started_at` to its `finished_at`.
+
+    `None` when there is no manifest, when a stamp is missing or does not
+    parse, or when the stop is before the start. A timer is report data, so
+    a bad stamp gives no number and does not stop the run.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    started = parse_gh_timestamp(manifest.get(MANIFEST_STARTED_KEY))
+    finished = parse_gh_timestamp(manifest.get(MANIFEST_FINISHED_KEY))
+    if started is None or finished is None or finished < started:
+        return None
+    return round((finished - started).total_seconds(), PHASE_TIMER_DIGITS)
 
 
 # --------------------------------------------------------------------------- #
@@ -2557,6 +2717,8 @@ def report_envelope(
     rather than print a zero.
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
+    The phase timers (`PHASE_TIMER_KEYS`) are copied from `payload`, and a
+    timer that `payload` does not have is left out.
 
     `repo` names the store directory the envelope is written under, and is
     checked again on the read: issue numbers are per repository, so a store
@@ -2587,6 +2749,8 @@ def report_envelope(
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
         "id_scheme": ID_SCHEME,
+        # The phase timers, copied from the JSON line when it has them.
+        **{key: payload[key] for key in PHASE_TIMER_KEYS if payload.get(key) is not None},
         "ledger_body": ledger_body,
         "document": _redact_document(document),
         **(
@@ -2785,6 +2949,67 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         log(f"WARNING: stored report for {audit_id} has no readable ledger body; {MEMORY_UNKNOWABLE}")
         return None
     return envelope
+
+
+def _envelope_document(envelope: object, key: str) -> dict | None:
+    """The findings document `envelope` carries for `key`, or None."""
+    if not isinstance(envelope, dict):
+        return None
+    if _ledger_key(envelope.get("repo")) != key:
+        return None
+    if envelope.get("id_scheme") != ID_SCHEME:
+        return None
+    document = envelope.get("ledger_document")
+    if isinstance(document, dict):
+        return document
+    if envelope.get("ledger_held_open"):
+        return None
+    document = envelope.get("document")
+    return document if isinstance(document, dict) else None
+
+
+def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
+    """The document that the previous run of this stream stored for `repo`, or None.
+
+    Only `carry_unchanged_findings` reads this, and it reads it before the
+    dry-run split, so that a dry run shows the same wording as the real run.
+    It reads `ledger_document` when the previous run held the open ledger
+    without rewriting its body, so a held-open zero-finding run does not
+    replace the live ledger's wording with an empty document. When a held-open
+    `latest.json` has no `ledger_document` (because `previous_run_memory` was
+    lost on that run) or `latest.json` is absent, it walks the `runs/` ring
+    from newest to oldest for the last envelope that carries a findings
+    document.
+    It does not do the issue checks of `read_report_memory`. Those checks
+    keep the delta correct: a store for a different issue makes the wrong
+    ids new or resolved. The carry does not count ids. It copies wording only
+    for a finding with the same id, the same evidence and the same severity,
+    so a store from an earlier issue of the same stream and repository is
+    safe to read. A store for a different repository or a different id
+    scheme is not read. A missing or unreadable store gives None, and the
+    run then uses the worker's wording, as it did before the carry existed.
+    """
+    if not repo:
+        return None
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError:
+        return None
+    key = _ledger_key(repo)
+    candidates = [directory / REPORT_LATEST_NAME]
+    try:
+        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+    except OSError:
+        pass
+    for path in candidates:
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        document = _envelope_document(envelope, key)
+        if document is not None:
+            return document
+    return None
 
 
 def invalidate_report_memory(audit_id: str, repo: str) -> None:
@@ -5164,6 +5389,15 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 "failed in `limitations`, so the run reports the gap instead of "
                 "publishing over it."
             )
+        manifest_limitations = str(manifest_cluster.get("limitations") or "").strip()
+        if manifest_limitations and not str(cluster.get("limitations") or "").strip():
+            raise ValidationError(
+                f"scope.clusters: {name!r} has no `limitations`, but the collector "
+                f"manifest for {audit_id} records `limitations` on {name!r} "
+                f"({manifest_limitations!r}). Copy the collector's limitation "
+                "into `limitations`, so the run reports the gap instead of "
+                "publishing over it."
+            )
         for slug in claimed:
             if slug not in ok_checks:
                 raise ValidationError(
@@ -5347,6 +5581,106 @@ def adopt_arm_impact(findings: list[dict], manifest: dict | None) -> list[str]:
             finding["impact"] = impact
             adopted.append(str(finding.get("id") or ""))
     return adopted
+
+
+def _remediation_is_file_backed(remediation: object) -> bool:
+    """Whether `remediation` names a file that the run writes."""
+    if not isinstance(remediation, dict):
+        return False
+    return remediation.get("kind") == MANIFEST_REMEDIATION_KIND or bool(
+        str(remediation.get("path") or "").strip()
+    )
+
+
+def _harness_wrote_note(remediation: object) -> bool:
+    """Whether `finish` wrote part of the note in `remediation`."""
+    if not isinstance(remediation, dict):
+        return False
+    note = str(remediation.get("note") or "")
+    return any(mark in note for mark in HARNESS_NOTE_MARKS)
+
+
+def _remediation_may_carry(before: object, now: object) -> bool:
+    """Whether the previous run's remediation can replace this run's.
+
+    Not when one of the two names a file. A `manifest` remediation names a
+    file that this run must write: the previous path can point at nothing,
+    and an old note over a new manifest removes a real fix.
+
+    Not when the previous note is `manual` and this run's is not. That
+    direction replaces a command that the reader can run with a paragraph.
+    The other direction is safe and is the one the carry is for: a `gcloud`
+    command from the previous run stays when the worker now writes `manual`.
+
+    Not when `finish` wrote part of either note. The pass that wrote it
+    runs again after the carry, so a copied note gets the text two times,
+    or keeps a statement that is not true for this run.
+    """
+    if not isinstance(before, dict) or not isinstance(now, dict):
+        return False
+    if _remediation_is_file_backed(before) or _remediation_is_file_backed(now):
+        return False
+    if before.get("kind") == MANUAL_REMEDIATION_KIND and now.get("kind") != MANUAL_REMEDIATION_KIND:
+        return False
+    return not (_harness_wrote_note(before) or _harness_wrote_note(now))
+
+
+def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> list[str]:
+    """Keep the previous run's wording for a finding whose evidence did not change.
+
+    `previous` is the document the previous run stored (`previous_run_document`).
+    A finding with the same id, the same `evidence` and the same `severity` is
+    the same problem on the same object in the same state. The worker writes
+    new words for it on each run, and the new words are not always better: on
+    one install, each of 92 unchanged findings got new prose between two runs,
+    and 83 got a new remediation. Two of the changes were wrong. One turned a
+    `gcloud` command into a `manual` note. One proposed a zone list without
+    the only zone that had nodes. So this pass keeps `CARRIED_FINDING_FIELDS`,
+    and keeps `CARRIED_REMEDIATION_FIELDS` (`recommendation` and `remediation`)
+    together when `_remediation_may_carry` allows it.
+
+    "Evidence did not change" is a full comparison of the `evidence` object,
+    command and excerpt. `adopt_collector_evidence` runs first and puts the
+    collector's text in both, so on an unchanged fleet the two runs agree.
+    The store keeps a redacted copy, so this run's evidence is redacted the
+    same way before the comparison. A change in severity stops the carry: the
+    collector calculates severity, so a new severity is a new observation,
+    and the old impact can give the old reason.
+
+    The copied text did not go through `validate_findings` in this run, so
+    `normalise_finding_commands` runs on it again.
+
+    Returns the ids whose wording changed, for the caller to log.
+    """
+    if not isinstance(previous, dict) or not isinstance(previous.get("findings"), list):
+        return []
+    before_by_id = {
+        str(entry["id"]): entry
+        for entry in previous["findings"]
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    carried: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id") or "")
+        before = before_by_id.get(fid)
+        if before is None:
+            continue
+        if before.get("evidence") != _redact_document(finding.get("evidence")):
+            continue
+        if before.get("severity") != finding.get("severity"):
+            continue
+        fields = list(CARRIED_FINDING_FIELDS)
+        if _remediation_may_carry(before.get("remediation"), finding.get("remediation")):
+            fields.extend(CARRIED_REMEDIATION_FIELDS)
+        changed = False
+        for field in fields:
+            if field in before and before[field] != finding.get(field):
+                finding[field] = copy.deepcopy(before[field])
+                changed = True
+        if changed:
+            normalise_finding_commands(finding)
+            carried.append(fid)
+    return carried
 
 
 def collector_flagged_ids(manifest: dict | None) -> set[str]:
@@ -7472,9 +7806,10 @@ def _branch_slug(text: str) -> str:
 def group_branch_for(audit_id: str, group: list[dict]) -> str:
     """Name a remediation branch after the *files* the group stages.
 
-    The branch name is the only durable link between a finding and its pull
-    request — one listing of its proposals by branch reconstructs the whole mapping
-    with no state kept anywhere else. That makes its stability load-bearing.
+    The branch name finds the pull request for a finding — one listing of its
+    proposals by branch reconstructs the whole mapping with no state kept
+    anywhere else. For a merged or closed pull request, its delta block then
+    limits which findings it claims (`_pr_covers`). The branch must be stable.
 
     Keying it on the lowest finding id looked reasonable and was not: finding
     ids are regenerated from scratch every run, so the day a group's lowest id
@@ -7956,15 +8291,13 @@ def parse_remediate_commands(
                     "comment_id": node_id,
                     "author": author,
                     "reasons": [
-                        # States what was observed rather than what it implies.
-                        # The old wording asserted "does not have write access",
-                        # which the harness never checks and which was flatly
-                        # untrue of the App that tripped this path — it merges
-                        # pull requests here. A gate that misreports its own
-                        # reason teaches the reader to discount the next one.
-                        f"@{author} is not recorded as a collaborator on this "
-                        f"repository (`authorAssociation: {association or 'NONE'}`), "
-                        f"so this command was not acted on. A remediation {noun} "
+                        # The forge's `canWrite` answer for this login sets
+                        # `authorAssociation` (see `read_comments`), so the text
+                        # gives that answer. It does not cite the field: its
+                        # value is made by this harness, not read from the forge.
+                        f"@{author} does not have write access to this "
+                        "repository, so "
+                        f"this command was not acted on. A remediation {noun} "
                         "may only be requested by someone who could merge it."
                     ],
                 }
@@ -8721,21 +9054,89 @@ def index_overhead(
 
     The index is not charged to any single finding, so it has to be reserved up
     front — but the reservation cannot know the final selection, since selection
-    is what the reservation is an input to. It does not need to: the rendered
-    set is always a prefix of the sorted order, so the first `MAX_DELTA_ROWS`
-    sorted findings bound the table whatever the budget later admits.
+    is what the reservation is an input to. The rendered set is always a prefix
+    of `_fair_share_order`, and the index shows the first `MAX_DELTA_ROWS` of
+    that set in display order. A prefix of the fair-share order is not a prefix
+    of the display order, so this walks every prefix and keeps the most
+    expensive table that any of them can show. That bounds the table whatever
+    the budget later admits.
 
     This replaced a flat per-row allowance that a real finding id had already
     outgrown — ids run to 100 characters and a state cell carries a full pull
     request URL, so the table could quietly cost twice what was set aside.
     """
+    # (display key, row cost) of the rows the index shows for the current
+    # prefix, in display order.
+    shown: list[tuple[tuple, int]] = []
     measured = 0
-    for finding in sort_findings(findings)[:MAX_DELTA_ROWS]:
+    worst = 0
+    for finding in _fair_share_order(sort_findings(findings)):
         fid = str(finding.get("id", ""))
         row = _index_row(finding, states.get(fid, STATE_OPEN), pr_urls.get(fid))
-        measured += len(row) + 1  # + the newline joining it to the next row
+        cost = len(row) + 1  # + the newline joining it to the next row
+        bisect.insort(shown, (_display_key(finding), cost))
+        measured += cost
+        if len(shown) > MAX_DELTA_ROWS:
+            measured -= shown.pop()[1]
+        worst = max(worst, measured)
     # Header, separator, the blank line above, and the overflow line below.
-    return measured + 200
+    return worst + INDEX_OVERHEAD_MARGIN
+
+
+def _blocked_note(fid: str, pr: dict, noun: str) -> str:
+    """Why the sweep opens no fix for a finding that a settled pull request blocks.
+
+    See `blocking_prs`. Without this line the finding reads as open with no
+    fix, and nothing on the ledger says why the sweep did not propose one.
+    """
+    how = "merged" if pr_is_merged(pr) else "closed by a person"
+    # The URL, as the other state lines link: `#N` links an issue on GitLab.
+    ref = str(pr.get("url") or "") or f"#{pr.get('number', '?')}"
+    return (
+        f"  No {noun} for this finding: a {noun} on the same branch, {how}, "
+        f"blocks an automatic one — {ref}. A `/remediate {fid}` proposes a fix "
+        "for every finding in the group that still reproduces."
+    )
+
+
+def blocking_prs(
+    pr_by_finding: dict[str, dict | None], claimed: dict[str, dict | None]
+) -> dict[str, dict]:
+    """The findings that a settled pull request blocks but does not claim.
+
+    `promotion_candidates` skips a finding whose branch holds a merged pull
+    request or one a person closed, whatever that pull request names. One the
+    harness closed as stale (`pr_closed_by_harness`) does not block: the sweep
+    opens the group again.
+    """
+    return {
+        fid: pr
+        for fid, pr in pr_by_finding.items()
+        if pr is not None and claimed.get(fid) is None and not pr_closed_by_harness(pr)
+    }
+
+
+def format_file_url(file_url: str | None, path: str, ref: str = DEFAULT_FILE_REF) -> str:
+    """Fill `{ref}` and `{path}` in a forge `fileUrl` template, or return `path`.
+
+    Both values are percent-encoded with `/` kept, so a path segment or ref with
+    spaces, `#`, or `%` resolves in the browser while directory separators stay
+    intact. When `file_url` is absent (an older broker, or a forge with no file
+    page) or lacks either placeholder, the bare path is returned unchanged.
+    """
+    if (
+        not file_url
+        or not path
+        or FILE_URL_REF_TOKEN not in file_url
+        or FILE_URL_PATH_TOKEN not in file_url
+    ):
+        return path
+    encoded_ref = urllib.parse.quote(str(ref or DEFAULT_FILE_REF), safe="/")
+    encoded_path = urllib.parse.quote(str(path), safe="/")
+    try:
+        return file_url.format(ref=encoded_ref, path=encoded_path)
+    except Exception:  # noqa: BLE001 -- a template `str.format` rejects for any reason keeps the bare path
+        return path
 
 
 def render_finding(
@@ -8745,6 +9146,10 @@ def render_finding(
     pr_url: str | None = None,
     new: bool = False,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    blocked_by: dict | None = None,
+    file_url: str | None = None,
+    file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> list[str]:
     fid = str(finding.get("id", ""))
     # Every free-text field is clipped, not only the evidence. The body budget
@@ -8781,6 +9186,8 @@ def render_finding(
                 "The remediation was incomplete, or something outside this "
                 f"repository reverted it — the merged {noun} is not reopened."
             )
+        if blocked_by:
+            lines.append(_blocked_note(fid, blocked_by, noun))
     lines.append("")
 
     evidence = finding.get("evidence") or {}
@@ -8811,9 +9218,16 @@ def render_finding(
     lines.append("")
     if kind == "manifest":
         path = str(remediation.get("path", ""))
-        note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
+        raw_note = str(remediation.get("note", ""))
+        is_new_file = (
+            raw_note.startswith(GENERATED_FIX_NOTE)
+            or str(finding.get("check") or "") == GENERATED_FIX_CHECK
+            or path in unlinked_paths
+        )
+        target = path if is_new_file else format_file_url(file_url, path, ref=file_ref)
+        note = clip_text(raw_note, MAX_NOTE_CHARS)
         suffix = f" — {note}" if note else ""
-        lines.append(f"- **Remediation (manifest):** [`{path}`]({path}){suffix}")
+        lines.append(f"- **Remediation (manifest):** [`{path}`]({target}){suffix}")
     elif kind == "gcloud":
         lines.append("- **Remediation (gcloud):**")
         lines.append("")
@@ -8835,13 +9249,54 @@ def sort_findings(findings: list[dict]) -> list[dict]:
     an unchanged fleet must produce the same findings section whatever order the
     model happened to emit.
     """
-    return sorted(
-        findings,
-        key=lambda f: (
-            SEVERITY_RANK.get(str(f.get("severity", "")), len(SEVERITIES)),
-            _finding_sort_key(f),
-        ),
-    )
+    return sorted(findings, key=_display_key)
+
+
+def _severity_band(finding: dict) -> int:
+    """The finding's severity rank. An unknown grade ranks below every known one."""
+    return SEVERITY_RANK.get(str(finding.get("severity", "")), len(SEVERITIES))
+
+
+def _display_key(finding: dict) -> tuple:
+    """The key `sort_findings` sorts on: severity first, then the stable key."""
+    return (_severity_band(finding), _finding_sort_key(finding))
+
+
+def _fair_share_order(ordered: list[dict]) -> list[dict]:
+    """`ordered` in a new sequence: in each severity band, each target's first
+    finding comes before the second finding of any target.
+
+    The stable key starts with the target name (`cluster`). Thus, when the body
+    is truncated, a cut of the sorted list decides by alphabet which targets
+    show at all. A live run cut four of twenty-nine `minor` findings, and two
+    of the four were all the rows of the one cluster with real workloads,
+    because its name sorted late.
+
+    This order gives each target its first row before any target gets a second
+    row. When a band has fewer slots than targets, the targets late in the
+    alphabet still lose their rows; no target loses a row to another target's
+    second one. It is not a severity judgement. The bands stay apart, so a minor
+    finding never goes before a critical one. `ordered` must be the output of
+    `sort_findings`: then the order is the same on each run.
+    """
+    out: list[dict] = []
+    start = 0
+    while start < len(ordered):
+        band = _severity_band(ordered[start])
+        end = start
+        by_target: dict[str, list[dict]] = {}
+        while end < len(ordered) and _severity_band(ordered[end]) == band:
+            finding = ordered[end]
+            by_target.setdefault(str(finding.get("cluster", "")), []).append(finding)
+            end += 1
+        # Dicts keep insertion order, so each round visits the targets in
+        # display order.
+        queues = [queue[::-1] for queue in by_target.values()]
+        while queues:
+            out += [queue.pop() for queue in queues]
+            queues = [queue for queue in queues if queue]
+        start = end
+    return out
 
 
 def select_rendered_findings(
@@ -8852,23 +9307,33 @@ def select_rendered_findings(
     pr_urls: dict[str, str] | None = None,
     new_ids: set[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    blocked_by: dict[str, dict] | None = None,
+    file_url: str | None = None,
+    file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
-    Selection walks the severity-first order and stops at the first finding that
-    does not fit, so the rendered set is always a prefix: truncation only ever
-    eats the least-severe end, and criticals are structurally safe. At least one
-    finding always renders — a body with a single oversized finding is still
-    more useful than a body with none.
+    Selection walks the severity bands in order and stops at the first finding
+    that does not fit, so truncation only ever eats the least-severe end, and
+    criticals are structurally safe. At least one finding always renders — a
+    body with a single oversized finding is still more useful than a body with
+    none.
+
+    In each band the walk follows `_fair_share_order`, not the display order, so
+    no target gets a second row before every target in the band has one. The rendered set is
+    a prefix of that order, which `index_overhead` relies on. Both lists return
+    in display order: the fair-share order decides which findings render, never
+    where they show.
 
     Each finding is charged for its own rendered text *and* for the slot its id
     occupies in the hidden delta block, because that block is itself unbounded:
     1,250 ids render over 80,000 characters of marker alone.
     """
-    ordered = sort_findings(findings)
+    candidates = _fair_share_order(sort_findings(findings))
     used = 0
     fitted = 0
-    for finding in ordered:
+    for finding in candidates:
         fid = str(finding.get("id", ""))
         # Charged against the *rendered* text, state line included: the state
         # and PR link are per-finding, so estimating without them would
@@ -8879,6 +9344,10 @@ def select_rendered_findings(
             pr_url=(pr_urls or {}).get(fid),
             new=fid in (new_ids or set()),
             noun=noun,
+            blocked_by=(blocked_by or {}).get(fid),
+            file_url=file_url,
+            file_ref=file_ref,
+            unlinked_paths=unlinked_paths,
         )
         cost = len("\n".join(rendered)) + 2
         cost += len(fid) + 3  # its slot in the hidden delta block
@@ -8886,7 +9355,7 @@ def select_rendered_findings(
             break
         used += cost
         fitted += 1
-    return ordered[:fitted], ordered[fitted:]
+    return sort_findings(candidates[:fitted]), sort_findings(candidates[fitted:])
 
 
 def _dry_run_repo(audit_id: str, repo: str | None) -> str | None:
@@ -8991,7 +9460,7 @@ def _render_scope(
     show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
     roster = audit_checks(audit_id)
 
-    out = ["", "## Scope", "", f"Audited {len(clusters)} cluster(s) on {stamp}."]
+    out = ["", "## Scope", "", f"Audited {scope_phrase(audit_id, clusters)} on {stamp}."]
     header = "| Cluster | Location | Project |"
     rule = "| ------- | -------- | ------- |"
     if roster:
@@ -9036,7 +9505,9 @@ def _render_scope(
             "",
             "### Skipped",
             "",
-            f"**Coverage is partial.** {len(skipped)} cluster(s) could not be audited, "
+            f"**Coverage is partial.** "
+            f"{scope_phrase(audit_id, [{'name': e.get('cluster', '')} for e in skipped])} "
+            "could not be audited, "
             "so this report says nothing about them — treat them as unknown, not clean.",
             "",
             "| Cluster | Reason |",
@@ -9159,6 +9630,10 @@ def _render_findings(
     gaps: list[str] | None = None,
     new_ids: set[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    blocked_by: dict[str, dict] | None = None,
+    file_url: str | None = None,
+    file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -9191,8 +9666,18 @@ def _render_findings(
     )
 
     new_ids = new_ids or set()
+    blocked_by = blocked_by or {}
     rendered, omitted = select_rendered_findings(
-        findings, budget, states=states, pr_urls=pr_urls, new_ids=new_ids, noun=noun
+        findings,
+        budget,
+        states=states,
+        pr_urls=pr_urls,
+        new_ids=new_ids,
+        noun=noun,
+        blocked_by=blocked_by,
+        file_url=file_url,
+        file_ref=file_ref,
+        unlinked_paths=unlinked_paths,
     )
 
     # A one-row-per-finding index, so the state of the whole stream is legible
@@ -9229,6 +9714,10 @@ def _render_findings(
                 pr_url=pr_urls.get(fid),
                 new=fid in new_ids,
                 noun=noun,
+                blocked_by=blocked_by.get(fid),
+                file_url=file_url,
+                file_ref=file_ref,
+                unlinked_paths=unlinked_paths,
             )
 
     if omitted:
@@ -9707,67 +10196,88 @@ def _render_check_evidence(
     open the issue for. It yields the whole section rather than half of one when
     the budget runs out: a truncated evidence list reads as "these are the
     commands", and it would not be.
+
+    One row for each check and command, not one for each cluster. A check that
+    reads a project-wide surface once gives each cluster the same command, and
+    one row per cluster repeats that string many times. The same applies to a
+    not-applicable reason: each Autopilot cluster gives the same reason in the
+    same words. The row names every cluster it answers for. A command that
+    names its own cluster (`kubectl --context <cluster>`) collapses nothing.
     """
     if not audit_checks(audit_id):
         return []
-    rows: list[tuple[str, str, str]] = []
-    na_rows: list[tuple[str, str, str]] = []
+    # Keyed by (check, command) and (check, reason), in order of first
+    # appearance, so a run where each command is different gives the same
+    # rows as one row per cluster.
+    grouped: dict[tuple[str, str], list[str]] = {}
+    na_grouped: dict[tuple[str, str], list[str]] = {}
     for cluster in clusters:
-        name = str(cluster.get("name", "")).strip() or "(unnamed)"
+        name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
         for entry in cluster.get("checks_run") or []:
             if not isinstance(entry, dict):
                 continue
             check = str(entry.get("check", "")).strip()
             command = str(entry.get("command", "")).strip()
             if check and command:
-                rows.append((name, check, command))
+                grouped.setdefault((check, command), []).append(name)
         for entry in cluster.get("checks_not_applicable") or []:
             if not isinstance(entry, dict):
                 continue
             check = str(entry.get("check", "")).strip()
             reason = str(entry.get("reason", "")).strip()
             if check and reason:
-                na_rows.append((name, check, reason))
-    if not rows and not na_rows:
+                na_grouped.setdefault((check, reason), []).append(name)
+    # Counted before the rows collapse: the reader is owed the number of
+    # (cluster, check) pairs, not the number of different commands.
+    ran = sum(len(names) for names in grouped.values())
+    declared = sum(len(names) for names in na_grouped.values())
+    if not grouped and not na_grouped:
         return []
+
+    def names_cell(names: list[str]) -> str:
+        # Each name is clipped alone, never the list, so every cluster stays
+        # visible.
+        return ", ".join(f"`{_cell(name)}`" for name in names)
 
     out = [
         "",
         "<details>",
-        f"<summary>How this run checked the fleet ({len(rows)} checks)</summary>",
+        f"<summary>How this run checked the fleet ({ran} checks)</summary>",
         "",
-        "One row per check that ran, with the command that ran it, as reported "
-        "by the audit. The harness cannot confirm a command was issued — these "
+        "One row per check and command, with the clusters it ran on, as "
+        "reported by the audit. A command that answers for several clusters "
+        "gets one row. The harness cannot confirm a command was issued — these "
         "are re-runnable so that it does not have to be taken on trust.",
         "",
-        "| Cluster | Check | Command |",
-        "| ------- | ----- | ------- |",
+        "| Clusters | Check | Command |",
+        "| -------- | ----- | ------- |",
     ]
-    for name, check, command in rows:
+    for (check, command), names in grouped.items():
         # The command keeps its own ceiling: validation already refused
         # anything over MAX_COMMAND_CHARS, so this clips only a value the
         # escaping above pushed past what was accepted.
         out.append(
-            f"| `{_cell(name)}` | `{_cell(check)}` "
+            f"| {names_cell(names)} | `{_cell(check)}` "
             f"| `{_cell(command, limit=MAX_COMMAND_CHARS)}` |"
         )
-    if na_rows:
+    if na_grouped:
         # Published for the same reason the commands are. A check declared
         # inapplicable leaves the coverage denominator, so this is the one claim
         # in the document that can make a partial run look complete — it belongs
         # where a reader can weigh the excuse against the cluster.
         out += [
             "",
-            f"**Not applicable ({len(na_rows)})** — checks excluded from the "
+            f"**Not applicable ({declared})** — checks excluded from the "
             "coverage count above, and why. These did not run because there was "
             "nothing to run them against; a check that could have run and did "
-            "not is a gap, and is reported as one.",
+            "not is a gap, and is reported as one. One row per check and reason, "
+            "with the clusters that gave it.",
             "",
-            "| Cluster | Check | Why it cannot apply |",
-            "| ------- | ----- | ------------------- |",
+            "| Clusters | Check | Why it cannot apply |",
+            "| -------- | ----- | ------------------- |",
         ]
-        for name, check, reason in na_rows:
-            out.append(f"| `{_cell(name)}` | `{_cell(check)}` | {_cell(reason)} |")
+        for (check, reason), names in na_grouped.items():
+            out.append(f"| {names_cell(names)} | `{_cell(check)}` | {_cell(reason)} |")
     out.append("")
     out.append("</details>")
     if len("\n".join(out)) <= budget:
@@ -9777,10 +10287,10 @@ def _render_check_evidence(
     # runs whose findings crowded it out, which are the runs where a fabricated
     # check would matter most, and silence there leaves a document that looks
     # complete. Name the omission and say where the commands survive.
-    excluded = f" and the {len(na_rows)} exclusion(s)" if na_rows else ""
+    excluded = f" and the {declared} exclusion(s)" if na_grouped else ""
     notice = [
         "",
-        f"_The {len(rows)} command(s) behind this run's checks{excluded} do not "
+        f"_The commands behind this run's {ran} check(s){excluded} do not "
         "fit GitHub's body limit and are omitted here. They are kept in full in "
         "this run's stored report; ask the agent for that report to re-run any "
         "of them._",
@@ -9807,8 +10317,15 @@ def render_issue_body(
     held_carried: bool = False,
     noun: str = "pull request",
     new_ids: set[str] | None = None,
+    blocked_by: dict[str, dict] | None = None,
+    file_url: str | None = None,
+    file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
+
+    `blocked_by` maps a finding to the settled pull request that blocks its
+    automatic fix without claiming it (`blocking_prs`); its state line says so.
 
     `new_ids` is the findings to mark new since the last run (`NEW_MARKER`);
     None, the default, marks none, which is what a run whose delta is unknown
@@ -9898,6 +10415,10 @@ def render_issue_body(
             gaps=gaps,
             new_ids=new_ids,
             noun=noun,
+            blocked_by=blocked_by,
+            file_url=file_url,
+            file_ref=file_ref,
+            unlinked_paths=unlinked_paths,
         )
 
     findings_lines, omitted = select(0)
@@ -10145,7 +10666,7 @@ def render_clean_comment(
             f"### `{audit_id}` found nothing — but {LOST_RECORD}",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(audit_id, clusters, 'audited')}: {names}.",
             "",
             "**This is not an all-clear, and the ledger stays open.** With no "
             "trusted record of the findings this ledger carries, the run cannot "
@@ -10161,7 +10682,7 @@ def render_clean_comment(
             f"### `{audit_id}` found nothing — but did not see the whole fleet",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(audit_id, clusters, 'audited')}: {names}.",
             "",
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
@@ -10184,7 +10705,7 @@ def render_clean_comment(
             f"### `{audit_id}` is now clean — closing",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(audit_id, clusters, 'audited')}: {names}.",
             "",
             "Every finding previously reported here is gone, so this ledger is being "
             "closed as completed. The next run that finds anything opens a fresh one.",
@@ -10336,7 +10857,7 @@ def render_held_comment(
         f"previous {count_word}, so the ledger stays open",
         "",
         f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-        f"{len(clusters)} audited cluster(s): {names}.",
+        f"{scope_phrase(audit_id, clusters, 'audited')}: {names}.",
         "",
         "**This is not an all-clear.** This ledger reported each finding below, "
         "and this run's own `checks_run` says the check that found it ran again "
@@ -11475,8 +11996,10 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     human made. And when it closed, for the other half of the same rule: a
     `/remediate` only overrules a human close if it was written after it, and
     that comparison needs a time on both sides. And the branch it targets, so a
-    refresh of an open pull request is cut from that branch. All three come back
-    as `pr_record` names them.
+    refresh of an open pull request is cut from that branch. The ledger also
+    reads its body: the delta block there says which findings a merged or
+    closed pull request claims (`_pr_covers`). All of them come back as
+    `pr_record` names them.
 
     Read to the last page. A page that is missing reads as "no pull request"
     for every finding it would have covered, so a lookup that fails partway
@@ -11520,14 +12043,46 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     return prs
 
 
+def _pr_covers(pr: dict | None) -> set[str] | None:
+    """The finding ids a pull request claims. None means "the whole group".
+
+    An OPEN pull request claims its whole group. Runs do not rewrite it, but
+    while it is open its branch is busy and the sweep cannot open a second
+    pull request there, so the link tells the reader what blocks a new
+    finding in the group. A merged or closed pull request keeps only the
+    findings it was opened for. `group_branch_for` keys the branch on the file set alone,
+    so a different check that later writes the same file joins the same
+    settled branch. If the ledger linked that pull request to the new
+    finding, it would show a fix that never named the finding, and
+    `comment_on_merged_but_persisting` would comment on the wrong pull
+    request.
+
+    This changes only what the ledger and the comments say (`claimed_prs`).
+    Promotion still reads the branch join for the whole group: a promoted
+    finding opens its whole group, so a new finding on a settled branch would
+    propose the settled fix again, on that same branch. The ledger names that
+    block on the finding instead (`blocking_prs`).
+
+    A body that this run cannot join against (no delta block, or a different
+    `ID_SCHEME`) claims the whole group, as before this check existed.
+    """
+    if pr is None or str(pr.get("state", "")).upper() == "OPEN":
+        return None
+    body = str(pr.get("body", "") or "")
+    if parse_id_scheme(body) != ID_SCHEME:
+        return None
+    return set(parse_delta_block(body))
+
+
 def reconcile_remediation_prs(
     audit_id: str, findings: list[dict], prs: list[dict]
 ) -> tuple[dict[str, dict | None], dict[str, str]]:
     """Map every live finding to the pull request on its group's branch.
 
-    The branch name is the whole join key — no state is kept anywhere outside
+    The branch name finds the pull request — no state is kept anywhere outside
     GitHub. Findings in one group share a branch, so they share a pull request
-    and therefore a state.
+    and therefore a state. This is the mapping that promotion reads. What the
+    ledger shows is `claimed_prs` of it.
     """
     pr_by_finding: dict[str, dict | None] = {}
     url_by_finding: dict[str, str] = {}
@@ -11539,6 +12094,25 @@ def reconcile_remediation_prs(
             if pr and pr.get("url"):
                 url_by_finding[fid] = str(pr["url"])
     return pr_by_finding, url_by_finding
+
+
+def claimed_prs(
+    pr_by_finding: dict[str, dict | None],
+) -> tuple[dict[str, dict | None], dict[str, str]]:
+    """`pr_by_finding` less the links that a settled pull request does not claim.
+
+    For the ledger's states and links and for the comments on merged pull
+    requests. Promotion keeps reading `pr_by_finding` itself: see `_pr_covers`.
+    """
+    claimed: dict[str, dict | None] = {}
+    url_by_finding: dict[str, str] = {}
+    for fid, pr in pr_by_finding.items():
+        covers = _pr_covers(pr)
+        mine = pr if covers is None or fid in covers else None
+        claimed[fid] = mine
+        if mine and mine.get("url"):
+            url_by_finding[fid] = str(mine["url"])
+    return claimed, url_by_finding
 
 
 def carrying_prs(prs: list[dict], findings: list[dict]) -> list[dict]:
@@ -11656,7 +12230,7 @@ def sync_open_remediation_labels(
     request. `promotion_candidates` diverts a finding whose pull request is
     OPEN into `already_open` and never promotes it, and
     `reconcile_remediation_prs` hands every finding in a group the *same* pull
-    request — so a newly-appeared sibling finding cannot drag the group into
+    request while that pull request is open — so a newly-appeared sibling finding cannot drag the group into
     `open_remediation_pr` either. Both halves were measured against the
     reference installation, not inferred: `/remediate` on the finding that owned
     pull request 103 reported `already_open`, and so did a second finding added
@@ -12569,6 +13143,15 @@ class _RepositoryProbe:
         self._paths: dict[str, tuple[bool, str]] = {}
         self._unreadable = False
 
+    @property
+    def base_sha(self) -> str:
+        """The commit SHA of the already-opened broker workspace, or empty."""
+        return str(getattr(self._workspace, "base_sha", "") or "")
+
+    def known_absent(self, path: str) -> bool:
+        """Whether an earlier `has_path` call already found `path` absent."""
+        return path in self._paths and not self._paths[path][0]
+
     def broker(self):
         # Asked twice at most: once for the Config Connector scan and once
         # more at planning, so one refused open does not end generation.
@@ -12992,6 +13575,15 @@ def load_findings(path: str, audit_id: str) -> dict:
         data = json.loads(findings_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValidationError(f"--findings-file: {path} is not valid JSON: {exc}") from exc
+    # A collector manifest given as the findings document fails validation on
+    # its shape, and that message does not tell the worker what to do next.
+    if isinstance(data, dict) and "clusters" in data and not FINDINGS_DOCUMENT_KEYS & set(data):
+        raise ValidationError(
+            f"--findings-file: {path} is a collector manifest, not a findings document. "
+            f"Write the findings document from it with `audit_report.py draft --audit {audit_id} "
+            f"--manifest-file {path} --out <findings file>`, fill each recommendation, then give "
+            "that file as --findings-file and the manifest as --manifest-file."
+        )
     return validate_findings(data, audit_id)
 
 
@@ -13066,8 +13658,7 @@ def degrade_missing_remediations(
         remediation["kind"] = "manual"
         remediation["path"] = ""
         remediation["note"] = (f"{note} " if note else "") + (
-            f"_(The audit {reason}. Apply the recommendation above by hand, or "
-            "re-run the audit.)_"
+            f"_(The audit {reason}. {DEGRADED_REMEDIATION_TAIL}"
         )
         degraded.append(fid)
     return degraded
@@ -13518,8 +14109,8 @@ def degrade_reverted_gcloud_remediations(
         # states the end state, and an operator who has already changed the
         # file may want it to close the gap before the next sync.
         prose = (
-            f"This object is declared {where}, whose spec sets `{field}`. Config "
-            "Connector holds that field against out-of-band changes, so the "
+            f"This object is declared {where}, whose spec sets `{field}`. "
+            f"{KCC_REVERTED_NOTE_MARK}, so the "
             "command below is reverted on the next reconcile and this finding "
             "returns on the next run. Make the change in that file instead."
         )
@@ -13650,6 +14241,91 @@ def _head_sha(tree: Path) -> str:
     """`git rev-parse HEAD` in a directory-mode checkout; empty when git cannot say."""
     result = git(["rev-parse", "HEAD"], check=False, cwd=tree)
     return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+def _repo_file_url(repo: str) -> str | None:
+    """The forge's `fileUrl` template from `capabilities`, or None when absent."""
+    answer = try_forge(CAPABILITIES_OP, repo, {})
+    if not isinstance(answer, dict):
+        return None
+    template = answer.get(CAPABILITY_FILE_URL_KEY)
+    if not isinstance(template, str):
+        return None
+    template = template.strip()
+    return (
+        template
+        if FILE_URL_REF_TOKEN in template and FILE_URL_PATH_TOKEN in template
+        else None
+    )
+
+
+def _repo_file_ref(
+    repo: str,
+    root: Path | None,
+    data: dict,
+    record: dict | None = None,
+    probe: "_RepositoryProbe | None" = None,
+) -> str:
+    """The commit SHA for `{ref}` in `fileUrl` on `repo`, or `DEFAULT_FILE_REF` when unknown."""
+    key = _ledger_key(repo.strip()) if repo else ""
+    for entry in (record or {}).get(RUN_RECORD_SEARCHED_KEY) or []:
+        if not isinstance(entry, str) or "@" not in entry:
+            continue
+        slug, _, sha = entry.rpartition("@")
+        sha = sha.strip()
+        if sha and _ledger_key(slug.strip()) == key:
+            return sha
+    if probe is not None and getattr(probe, "base_sha", ""):
+        return str(probe.base_sha)
+    if not content_mode() and root is not None:
+        sha = _head_sha(root)
+        if sha:
+            return sha
+    for entry in data.get(DECLARED_INTENT_SEARCHED_KEY) or []:
+        if not isinstance(entry, str) or "@" not in entry:
+            continue
+        slug, _, sha = entry.rpartition("@")
+        sha = sha.strip()
+        if sha and _ledger_key(slug.strip()) == key:
+            return sha
+    return DEFAULT_FILE_REF
+
+
+def _unlinked_manifest_paths(
+    findings: list[dict],
+    manifest: dict | None,
+    planned: dict[str, tuple[str, str]],
+    probe: "_RepositoryProbe | None" = None,
+) -> frozenset[str]:
+    """Manifest paths newly written in this run, which do not exist at `file_ref`."""
+    declared_by_id = {
+        _candidate_identity(entry, candidate): str(
+            (candidate.get("declaration") or {}).get("path") or ""
+        )
+        if isinstance(candidate.get("declaration"), dict)
+        and candidate.get("check") != GENERATED_FIX_CHECK
+        else ""
+        for entry, candidate in _candidates(manifest)
+    }
+    unlinked: set[str] = {path for path, _ in planned.values()}
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        if remediation.get("kind") != "manifest":
+            continue
+        path = str(remediation.get("path") or "")
+        if not path:
+            continue
+        if (
+            str(remediation.get("note") or "").startswith(GENERATED_FIX_NOTE)
+            or str(finding.get("check") or "") == GENERATED_FIX_CHECK
+            or (probe is not None and probe.known_absent(path))
+        ):
+            unlinked.add(path)
+            continue
+        cid = derive_finding_id(finding)
+        if cid in declared_by_id and declared_by_id[cid] != path:
+            unlinked.add(path)
+    return frozenset(unlinked)
 
 
 class _Copy(NamedTuple):
@@ -14347,13 +15023,18 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
         ]
         if not_applicable:
             cluster["checks_not_applicable"] = not_applicable
-        # A check whose read failed neither ran nor was found inapplicable;
-        # `finish` requires it named in `limitations`.
+        # A check whose read failed neither ran nor was found inapplicable, and
+        # a check that ran can still leave part of the target undecided in the
+        # manifest entry's `limitations`; `finish` requires both in `limitations`.
         unevaluated = sorted(
             str(e.get("check")) for e in entry.get("checks_unevaluated") or [] if isinstance(e, dict) and e.get("check")
         )
-        if unevaluated:
-            cluster["limitations"] = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unevaluated)}"
+        entry_limitations = str(entry.get("limitations") or "").strip()
+        unmentioned = [c for c in unevaluated if c not in entry_limitations]
+        unevaluated_note = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unmentioned)}" if unmentioned else ""
+        limitations = "; ".join(part for part in (entry_limitations, unevaluated_note) if part)
+        if limitations:
+            cluster["limitations"] = limitations
         clusters.append(cluster)
         for candidate in entry.get("candidates") or []:
             if not isinstance(candidate, dict):
@@ -14824,7 +15505,7 @@ def _remediation_outcomes(
                 "person *after* this request was written, so the close answers "
                 f"it. Comment `/remediate {fid}` again to overrule that."
             )
-        elif url:
+        elif url and str(pr.get("state", "") or "").upper() not in ("MERGED", "CLOSED"):
             outcomes[fid] = f"{noun} refreshed — {url}"
         elif refusal:
             outcomes[fid] = f"no {noun} was opened: {refusal}"
@@ -15235,26 +15916,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"evidence: adopted the collector's command and excerpt for "
                 f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
             )
-        # A pass that reuses the previous run's wording when evidence is
-        # unchanged is planned for this spot, and this adoption has to stay
-        # below it when it lands: such a carry triggers on byte-identical
-        # evidence, evidence adoption exists to make evidence byte-identical,
-        # and between them a corrected arm sentence would never reach a
-        # finding already on the ledger.
-        for fid in adopt_arm_impact(data["findings"], manifest):
-            log(
-                f"{fid}: impact taken from the collector, which knows which arm "
-                "of the check fired."
-            )
-    # After the adoption, and ahead of the dry-run split so the preview and the
-    # real run publish the same command. `validate_findings` already ran this
-    # repair, but the DNS arm is read off `evidence.excerpt`, which was the
-    # model's prose until the adoption above put the collector's in its place.
-    for fid in repair_remediation_commands(data["findings"]):
-        log(
-            f"{fid}: its remediation was missing a flag without which the "
-            "command does not clear the finding it is published under."
-        )
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
@@ -15310,6 +15971,36 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # when `--repo` was given.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
+    # Before the dry-run split, so that the preview and the real run publish
+    # the same words. After `adopt_collector_evidence`, which makes the
+    # evidence of an unchanged finding the same on each run. Before the
+    # remediation passes of both paths, so that the notes they write are
+    # written on the remediation that the run publishes. The store is read
+    # here and not with the memory below, because the memory needs the open
+    # issue, and a dry run does not ask the forge for it. `_dry_run_repo`
+    # gives the real run its resolved repository, and a dry run the same
+    # repository on a best-effort basis.
+    previous_document = previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
+    for fid in carry_unchanged_findings(data["findings"], previous_document):
+        log(f"{fid}: unchanged since the previous run; its wording is carried forward.")
+    # After the carry: an impact sentence that tells which arm of a check
+    # fired is an observation, not wording, so a corrected one must replace
+    # a carried one.
+    for fid in adopt_arm_impact(data["findings"], manifest):
+        log(
+            f"{fid}: impact taken from the collector, which knows which arm "
+            "of the check fired."
+        )
+    # After the adoptions and the carry, and ahead of the dry-run split so the
+    # preview and the real run publish the same command. `validate_findings`
+    # already ran this repair, but the DNS arm is read off `evidence.excerpt`,
+    # which was the model's prose until the adoption above put the collector's
+    # in its place, and a carried note did not go through it in this run.
+    for fid in repair_remediation_commands(data["findings"]):
+        log(
+            f"{fid}: its remediation was missing a flag without which the "
+            "command does not clear the finding it is published under."
+        )
     # The harness's search first, then the withhold against the record. The
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
@@ -15326,6 +16017,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     findings = list(data["findings"])
     declared = list(data.get("declared") or [])
     now = datetime.now(timezone.utc)
+    # The phase timers. `inspect_s` is from `start` to here, `publish_s` is
+    # from here to the JSON line, and `collect_s` is the collector's own run.
+    # They are report data only and cannot make the run fail.
+    inspect_s = inspect_seconds(audit_id, now)
+    collect_s = collector_seconds(manifest)
+    publish_clock = time.monotonic()
+
+    def timer_payload() -> dict:
+        """The phase timers for the JSON line, without a timer that has no value."""
+        timers = {
+            INSPECT_SECONDS_KEY: inspect_s,
+            PUBLISH_SECONDS_KEY: round(time.monotonic() - publish_clock, PHASE_TIMER_DIGITS),
+            COLLECT_SECONDS_KEY: collect_s,
+        }
+        return {key: value for key, value in timers.items() if value is not None}
 
     if args.dry_run:
         _handle_finish_dry_run(
@@ -15659,30 +16365,41 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         planned, answered = plan_generated_fixes(
             findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped
         )
+        # A decline of a budget `finish` can write is not taken: the worker's
+        # reason was the shortcut the refusal exists to stop.
+        for fid in sorted(set(declines) & set(planned)):
+            if decline_names_a_pull_request(declines[fid]):
+                # A person's pull request already carrying the budget is the one
+                # decline the planner cannot see for itself; it stands.
+                planned.pop(fid)
+                continue
+            log(
+                f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget "
+                "itself unless the reason carries the URL of the pull request already carrying it"
+            )
+            declines.pop(fid)
+        decline_unwritten_fixes(findings, unwritten, declines)
+        remaining = {
+            fid: fix
+            for fid, fix in unwritten.items()
+            if fid not in declines and fid not in planned and fid not in answered
+        }
+        if remaining and has_run_record(audit_id, repo):
+            raise ValidationError(unwritten_refusal_message(remaining, skipped))
+        write_generated_fixes(findings, planned, root)
+        unlinked_paths = _unlinked_manifest_paths(findings, manifest, planned, probe)
+        file_url = (
+            _repo_file_url(repo)
+            if any((f.get("remediation") or {}).get("kind") == "manifest" for f in findings)
+            else None
+        )
+        file_ref = (
+            _repo_file_ref(repo, root, data, record, probe)
+            if file_url is not None
+            else DEFAULT_FILE_REF
+        )
     finally:
         probe.close()
-    # A decline of a budget `finish` can write is not taken: the worker's
-    # reason was the shortcut the refusal exists to stop.
-    for fid in sorted(set(declines) & set(planned)):
-        if decline_names_a_pull_request(declines[fid]):
-            # A person's pull request already carrying the budget is the one
-            # decline the planner cannot see for itself; it stands.
-            planned.pop(fid)
-            continue
-        log(
-            f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget "
-            "itself unless the reason carries the URL of the pull request already carrying it"
-        )
-        declines.pop(fid)
-    decline_unwritten_fixes(findings, unwritten, declines)
-    remaining = {
-        fid: fix
-        for fid, fix in unwritten.items()
-        if fid not in declines and fid not in planned and fid not in answered
-    }
-    if remaining and has_run_record(audit_id, repo):
-        raise ValidationError(unwritten_refusal_message(remaining, skipped))
-    write_generated_fixes(findings, planned, root)
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
@@ -16050,6 +16767,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             UNACCOUNTED_KEY: [entry["id"] for entry in unaccounted],
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
+            **timer_payload(),
         }
         # The store's claim about the live ledger. A ledger held open was only
         # commented on, so its body still renders what the previous run put
@@ -16110,12 +16828,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # --- Findings: publish the ledger, then propose fixes separately. ---
     # Every finding in the document reproduces by definition — the resolved ones
     # are the ids that are absent from it.
-    pr_by_finding, pr_urls = reconcile_remediation_prs(
+    pr_by_finding, _ = reconcile_remediation_prs(
         audit_id, findings, remediation_prs
     )
+    # The ledger and the merged-PR comments read only what each pull request
+    # claims. Promotion below reads the whole-group join.
+    claimed, pr_urls = claimed_prs(pr_by_finding)
+    blocked_by = blocking_prs(pr_by_finding, claimed)
     states = {
         str(f.get("id", "")): derive_finding_state(
-            True, pr_by_finding.get(str(f.get("id", "")))
+            True, claimed.get(str(f.get("id", "")))
         )
         for f in findings
     }
@@ -16226,6 +16948,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
         new_ids=new_marked,
+        blocked_by=blocked_by,
+        file_url=file_url,
+        file_ref=file_ref,
+        unlinked_paths=unlinked_paths,
     )
     if rendered.partial:
         log(
@@ -16299,7 +17025,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     # A merged fix whose finding still reproduces is said once, on the pull
     # request, and the pull request is never reopened.
-    comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now, noun=noun)
+    comment_on_merged_but_persisting(repo, audit_id, findings, claimed, now, noun=noun)
 
     # Retiring a pull request means asserting its finding no longer reproduces.
     # Over incomplete coverage that assertion is unfounded, so nothing is
@@ -16362,12 +17088,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # The ledger was written before those pull requests existed, so it does
         # not yet link them, and neither would the acknowledgement below.
         refreshed = list_remediation_prs(repo, audit_id)
-        pr_by_finding, pr_urls = reconcile_remediation_prs(
+        pr_by_finding, _ = reconcile_remediation_prs(
             audit_id, findings, refreshed
         )
+        claimed, pr_urls = claimed_prs(pr_by_finding)
+        blocked_by = blocking_prs(pr_by_finding, claimed)
         states = {
             str(f.get("id", "")): derive_finding_state(
-                True, pr_by_finding.get(str(f.get("id", "")))
+                True, claimed.get(str(f.get("id", "")))
             )
             for f in findings
         }
@@ -16389,6 +17117,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
+                blocked_by=blocked_by,
+                file_url=file_url,
+                file_ref=file_ref,
+                unlinked_paths=unlinked_paths,
             ).body
             relinked = try_forge("issue-update", repo, {"number": number, "body": relink})
             if relinked is not None:
@@ -16525,6 +17257,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # empty here; carried so the line has one shape.
         UNACCOUNTED_KEY: [],
         **collector_payload(plan.uncorroborated),
+        **timer_payload(),
     }
     write_report(
         audit_id,

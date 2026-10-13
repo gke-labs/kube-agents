@@ -8,6 +8,7 @@ parallelism, and both never reading as a shorter candidate list.
 """
 
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -18,6 +19,8 @@ import subprocess
 import sys
 import textwrap
 import unittest
+import os
+from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -25,6 +28,16 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
+
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 from collect import Run  # noqa: E402
 
 
@@ -409,6 +422,46 @@ def context_of(dump=None, **overrides):
         # else -- pass it outright.
         base["pod_namespaces"] = {wl["ns"] for wl in base["workloads"] if wl["kind"] == "Pod"}
     return base
+
+
+class TestSweepPool(unittest.TestCase):
+    # The credential proxy admits four requests at once under its child memory
+    # budget at the operator's default 1Gi limit
+    # (docs/designs/credential-proxy-child-memory-budget.md §2.2). stall_watch.py and
+    # cluster_agent_reconcile.py pin the same figure for their listing pools; the
+    # broker computes the admitted count at runtime from its container limit and
+    # exposes no constant, so this pins the shared figure the pools agree on at the
+    # default limit -- four -- not the broker's running count. A non-default proxy
+    # limit is the caller's to re-sync (see collect.py and #2639).
+    DEFAULT_LIMIT_ADMITTED_COUNT = 4
+
+    def test_collector_pools_pin_the_default_limit_admitted_count(self):
+        self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
+        here = Path(__file__).resolve().parent
+        # Every module in this directory that runs a worker pool is a sweep
+        # collector and must be pinned. Discovered by the pool it runs
+        # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
+        # a collector added under MAX_WORKERS, LIST_WORKERS, WORKERS or any other
+        # name fails this test rather than slipping through unpinned.
+        pooled = sorted(
+            path
+            for path in here.glob("*.py")
+            if not path.name.startswith("test_") and "ThreadPoolExecutor(" in path.read_text()
+        )
+        self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
+        for path in pooled:
+            with self.subTest(collector=path.name):
+                mod = importlib.import_module(path.stem)
+                self.assertTrue(
+                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
+                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
+                    "name its pool MAX_WORKERS and its entry collect_fleet, or widen this scan",
+                )
+                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
+                self.assertEqual(
+                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+                    mod.MAX_WORKERS,
+                )
 
 
 class TestNoRequests(unittest.TestCase):
@@ -12354,6 +12407,92 @@ class TestDefaultRun(unittest.TestCase):
         self.assertIsInstance(result.stdout, str)
         self.assertIsInstance(result.stderr, str)
 
+
+
+def run_of(rc: int, stdout: str = "", stderr: str = "") -> collect.Run:
+    return collect.Run(argv=[], rc=rc, stdout=stdout, stderr=stderr, duration_s=0.0)
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        collect.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["ops-mgmt", "payments-prod"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("payments-staging (denied)", discovery.partial)
+        self.assertIn("fleet_scope tool", discovery.partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        collect.declared_scope.set("ops-mgmt payments-prod", "")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: run_of(1))
+        self.assertEqual((discovery.projects, discovery.partial), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        collect.declared_scope.set(None, None)
+        self.assertEqual(collect.discover_fleet(None, run=run).projects, ["acme", "other"])
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        # With a declared scope the override is still a single-project run, but
+        # it cannot name a project the scope does not list, and it cannot run
+        # at all on a scoped sandbox without the tool's flags.
+        collect.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(collect.discover_fleet("payments-prod", run=lambda *a, **k: run_of(1)).projects, ["payments-prod"])
+        outside = collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertEqual(outside.projects, [])
+        self.assertIn("declared scope does not list", outside.error)
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            collect.declared_scope.set(None, None)
+            self.assertIn("got no collector_args", collect.discover_fleet("ops-mgmt", run=lambda *a, **k: run_of(1)).error)
+        collect.declared_scope.set(None, None)
+        self.assertEqual(collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(collect.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        collect.declared_scope.set("", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("no project this install could read", discovery.error)
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, collect.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

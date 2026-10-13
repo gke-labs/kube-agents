@@ -403,6 +403,7 @@ done
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
+  roles/compute.securityAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \

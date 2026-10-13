@@ -50,11 +50,40 @@ readonly HELM_DOWNLOAD_RETRIES=5
 # 2 MB per run; the byte cap is the belt for a log with long lines.
 readonly GATEWAY_LOG_TAIL_LINES=20000
 readonly GATEWAY_LOG_MAX_BYTES=$((8 * 1024 * 1024))
-# The failure dump's litellm and envoy tails. At 1000 and 2000 lines a
-# six-hour run came back clipped to its last minutes, without the 429s and
-# token failures those two logs are collected for.
-readonly LITELLM_LOG_TAIL_LINES=20000
+# The failure dump's envoy tail. At 2000 lines a six-hour run came back
+# clipped to its last minutes, without the token failures the log is
+# collected for.
 readonly ENVOY_LOG_TAIL_LINES=20000
+
+# ─── LiteLLM log capture ─────────────────────────────────────────────────────
+# collect_litellm_log keeps the inference gateway's log as an artifact of
+# every eval run, green ones included, as litellm.log. It used to be taken
+# only by the failure dump, so a green run kept no record of the
+# thinking-replay hook: its per-request "thinking replay: dropped N" line is
+# the only sign it touched the run's traffic. The 429s, Workload Identity
+# token fetches and Vertex 403/404s the failure dump took it for are here too.
+# Every replica: the chart runs two, each serving its own share of requests,
+# and `logs deployment/...` reads one of them. Bounded like the gateway log:
+# kubectl's line tail, which it applies per pod (at 1000 lines a six-hour run
+# came back clipped to its last minutes), then a byte cap on the whole file,
+# twice the gateway log's for the chart's two replicas. kubectl prints the
+# pods one after another, so a file over the cap loses the first pod's oldest
+# lines first. Two full line tails fit under it at up to ~400 bytes a line,
+# so the cap is the belt for a log with long lines.
+readonly LITELLM_LOG_TAIL_LINES=20000
+readonly LITELLM_LOG_MAX_BYTES=$((16 * 1024 * 1024))
+readonly LITELLM_LOG_ARTIFACT="litellm.log"
+# The existence check gives up after this, so an unreachable cluster costs
+# the trap seconds rather than a hang inside the deadline's grace. The log
+# read itself is unbounded, like the gateway log's: a timeout there would cut
+# a large read short.
+readonly LITELLM_LOG_REQUEST_TIMEOUT="30s"
+# The Deployment that says LiteLLM is installed at all, and the pod label and
+# container its pods carry; the chart and the kustomize base render the same
+# three (charts/kube-agents/templates/litellm.yaml).
+readonly LITELLM_LOG_DEPLOYMENT="deployment/litellm"
+readonly LITELLM_LOG_POD_SELECTOR="app=litellm"
+readonly LITELLM_LOG_CONTAINER="litellm-container"
 
 # ─── Agent pod diagnostics ───────────────────────────────────────────────────
 # collect_agent_pod_diagnostics keeps, on every eval run, what says why a pod
@@ -222,6 +251,41 @@ collect_gateway_log() {
   kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} logs deployment/platform-agent-gateway \
     -n "${ns}" --tail="${GATEWAY_LOG_TAIL_LINES}" 2>&1 \
     | tail -c "${GATEWAY_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-gateway.log" || true
+}
+
+# ─── LiteLLM Log Collection (runs on PASS as well as on failure) ──────────────
+# The LITELLM_LOG_ constants above say what and why. Same contract as
+# collect_gateway_log: every command ends in `|| true`, so `$?` is left for
+# the dumper; pinned to AGENT_CLUSTER_CONTEXT for the same reason; once per
+# process, so the failure dumper's call after the trap's keeps the first
+# capture rather than writing the file again with different contents.
+# An install without the Deployment (litellm.enabled=false, or one that names
+# it otherwise) is a note, not a failure: the note goes to the job log and is
+# the file's content, so the artifact says why it holds no log. A `get` that
+# fails for any other reason (an unreachable cluster) is written the same way.
+# `--ignore-errors` so one replica's failed read does not stop the other's.
+LITELLM_LOG_COLLECTED=""
+collect_litellm_log() {
+  [ -z "${LITELLM_LOG_COLLECTED:-}" ] || return 0
+  LITELLM_LOG_COLLECTED=1
+  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
+  local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  local log="${artifact_dir}/${LITELLM_LOG_ARTIFACT}"
+  local kctl=(kubectl)
+  if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then
+    kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
+  fi
+  mkdir -p "${artifact_dir}" || true
+  local found=""
+  if ! found=$("${kctl[@]}" get "${LITELLM_LOG_DEPLOYMENT}" -n "${ns}" -o name \
+    --request-timeout="${LITELLM_LOG_REQUEST_TIMEOUT}" 2>&1); then
+    echo "note: no LiteLLM log for this run: ${LITELLM_LOG_DEPLOYMENT} in ${ns} could not be read: ${found//$'\n'/ }" \
+      | tee "${log}" || true
+    return 0
+  fi
+  "${kctl[@]}" logs -l "${LITELLM_LOG_POD_SELECTOR}" -c "${LITELLM_LOG_CONTAINER}" -n "${ns}" \
+    --prefix --ignore-errors --tail="${LITELLM_LOG_TAIL_LINES}" 2>&1 \
+    | tail -c "${LITELLM_LOG_MAX_BYTES}" > "${log}" || true
 }
 
 # ─── Agent Pod Watch (the eval's lifetime) ───────────────────────────────────
@@ -465,8 +529,10 @@ dump_prow_artifacts_on_failure() {
     kubectl logs deployment/kube-agents-controller-manager -n "${ns}" --tail=1000 > "${artifact_dir}/controller-manager.log" 2>&1 || true
     # The model path runs through LiteLLM, and with vertex_ai its failure
     # domain (Workload Identity token fetch, aiplatform 403s, model 404s)
-    # is visible only in this pod's log -- the gateway just relays the text.
-    kubectl logs deployment/litellm -n "${ns}" --tail="${LITELLM_LOG_TAIL_LINES}" > "${artifact_dir}/litellm.log" 2>&1 || true
+    # is visible only in its pods' log -- the gateway just relays the text.
+    # The every-run collector, called here for the same reason as the two
+    # above; a process that already took it keeps that capture.
+    collect_litellm_log
     # The gateway capture above reads the pod's default container (platform-agent);
     # a dropped port-forward stream is only visible from the auth sidecar's side.
     kubectl logs deployment/platform-agent-gateway -c agent-api-auth -n "${ns}" --tail=2000 > "${artifact_dir}/agent-api-auth.log" 2>&1 || true
