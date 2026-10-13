@@ -12,6 +12,7 @@ import importlib
 import inspect
 import io
 import json
+import os
 import re
 import shlex
 import shutil
@@ -12407,6 +12408,32 @@ class TestDefaultRun(unittest.TestCase):
         self.assertIsInstance(result.stdout, str)
         self.assertIsInstance(result.stderr, str)
 
+class PrepareKubeconfigTest(unittest.TestCase):
+    """A root hand run over `kubectl exec` must not leave a kubeconfig directory
+    or file the uid-1000 tick cannot open."""
+
+    def test_directory_is_world_writable_and_a_stale_kubeconfig_is_replaced(self):
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "nested" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            # Under a hardened umask the directory is still world-writable.
+            mask = os.umask(0o077)
+            try:
+                collect.prepare_kubeconfig(kc)
+            finally:
+                os.umask(mask)
+            self.assertEqual(kc.parent.stat().st_mode & 0o777, collect.KUBECONFIG_DIR_MODE)
+            # A kubeconfig this uid cannot write (another uid's 0600 file, as gcloud writes it) is
+            # removed before `get-credentials` would read it; root can write any file and keeps it.
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            collect.prepare_kubeconfig(kc)
+            self.assertEqual(kc.exists(), os.geteuid() == 0)
+            # `fetch_credentials` prepares the path before it runs gcloud.
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
+                path, _ = collect.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.exists()), (kc, os.geteuid() == 0))
 
 
 def run_of(rc: int, stdout: str = "", stderr: str = "") -> collect.Run:

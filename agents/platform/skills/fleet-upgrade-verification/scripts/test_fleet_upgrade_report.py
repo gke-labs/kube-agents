@@ -1040,6 +1040,27 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+class PrepareKubeconfigTest(unittest.TestCase):
+    def test_directory_is_world_writable_and_a_stale_kubeconfig_is_replaced(self):
+        # A root hand run over `kubectl exec` must not leave a kubeconfig directory or file the
+        # uid-1000 agent cannot open: the directory is made with the umask cleared, and a file this
+        # uid cannot write is removed before `get-credentials` reads it (root can write any file and
+        # keeps it).
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        kubeconfig_dir = os.path.join(root, "nested", "kubeconfigs")
+        path = report.kubeconfig_path(kubeconfig_dir, "p1", "seeded-a", "us-central1-a")
+        mask = os.umask(0o077)
+        try:
+            report.prepare_kubeconfig(kubeconfig_dir, path)
+        finally:
+            os.umask(mask)
+        self.assertEqual(os.stat(kubeconfig_dir).st_mode & 0o777, report.KUBECONFIG_DIR_MODE)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("stale")
+        os.chmod(path, 0o400)
+        report.prepare_kubeconfig(kubeconfig_dir, path)
+        self.assertEqual(os.path.exists(path), os.geteuid() == 0)
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

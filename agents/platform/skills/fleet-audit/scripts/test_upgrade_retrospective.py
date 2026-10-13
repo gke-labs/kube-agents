@@ -2515,19 +2515,74 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual([r["cluster"] for r in result["reviews"]], [GEMMA])
         self.assertIn("- " + ur.SETTLING_LINE.format(cluster=SEEDED, operation="UPGRADE_NODES", target="pinned-inference-pool", end="2026-10-15T17:50:00Z", minutes=15), ur.render_report(result))
         self.assertNotIn("operation-fresh", json.dumps(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]))
-        # Fifteen minutes on, a settled and a fresher operation on the one cluster: the settled one is
-        # reviewed now, the fresher one named as waiting and left out of the record for the next wake.
+        # Fifteen minutes on, a settled and a fresher operation on the one cluster: the floor applies
+        # per cluster, so it waits whole and nothing is written (a review of the settled half would
+        # grade the fresher pool's displaced pods against a window that does not name their
+        # operation); the held line counts the settled operation waiting with it.
         fresher = copy.deepcopy(just_ended)
         fresher.update(name="operation-fresher", startTime="2026-10-15T18:05:00Z", endTime="2026-10-15T18:10:00Z")
-        settled, _ = self.collect(FakeFleet(operations=OPERATIONS + [just_ended, gemma_op, fresher]), now=later + timedelta(minutes=15), full=False, after_upgrade=True)
-        self.assertEqual([r["cluster"] for r in settled["reviews"]], [SEEDED])
-        self.assertEqual([op["name"] for op in settled["reviews"][0]["what_happened"]["operations"]], ["operation-fresh"])
-        self.assertIn(ur.SETTLING_REASON_FORMAT.format(count=1, minutes=15), settled["reviews"][0]["what_happened"]["reasons"])
+        waiting, _ = self.collect(FakeFleet(operations=OPERATIONS + [just_ended, gemma_op, fresher]), now=later + timedelta(minutes=15), full=False, after_upgrade=True)
+        self.assertTrue(waiting["quiet"])
+        self.assertEqual(waiting["reviews"], [])
+        self.assertEqual([(u["cluster"], u["operation"]["name"], u.get("settling"), u.get("waiting")) for u in waiting["upgrading"]], [(SEEDED, "operation-fresher", True, 1)])
+        self.assertEqual(ur._upgrading_line(waiting["upgrading"][0], str), ur.SETTLING_LINE.format(cluster=SEEDED, operation="UPGRADE_NODES", target="pinned-inference-pool", end="2026-10-15T18:10:00Z", minutes=15) + ur.SETTLED_WAITING_FORMAT.format(count=1))
         recorded = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]
-        self.assertEqual([o["id"] for o in recorded if o["route"] == ur.ROUTE_AFTER_UPGRADE], ["operation-fresh"])
+        self.assertEqual([o["id"] for o in recorded if o["route"] == ur.ROUTE_AFTER_UPGRADE], [])
+        # Once both have settled, one review covers both pools and records both operations.
         last, _ = self.collect(FakeFleet(operations=OPERATIONS + [just_ended, gemma_op, fresher]), now=later + timedelta(minutes=30), full=False, after_upgrade=True)
+        self.assertEqual([r["cluster"] for r in last["reviews"]], [SEEDED])
         self.assertEqual([op["name"] for op in last["reviews"][0]["what_happened"]["operations"]], ["operation-fresh", "operation-fresher"])
-        self.assertEqual([op.get("already_reviewed", {}).get("route") for op in last["reviews"][0]["what_happened"]["operations"]], [ur.ROUTE_AFTER_UPGRADE, None])
+        self.assertEqual([op.get("already_reviewed") or None for op in last["reviews"][0]["what_happened"]["operations"]], [None, None])
+        self.assertIn(ur.AFTER_UPGRADE_REASON_FORMAT.format(count=2, floor=ur.fmt_ts(later + timedelta(minutes=30) - ur.AFTER_UPGRADE_SETTLE)), last["reviews"][0]["what_happened"]["reasons"])
+        recorded = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]
+        self.assertEqual([o["id"] for o in recorded if o["route"] == ur.ROUTE_AFTER_UPGRADE], ["operation-fresh", "operation-fresher"])
+
+    def test_usage_errors_are_refused_before_the_lock_and_the_state_files(self):
+        # A refused flag set neither waits on another run's lock nor reads a state file: the
+        # operator is told the flags are wrong at once, and a corrupt ledger is not set aside by a
+        # run that was never going to proceed.
+        (self.home / ur.LEDGER_FILENAME).write_text("{not json")
+        refused = (
+            (["--full", "--project", PROJECT, "--cluster", SEEDED], ur.FULL_WITH_CLUSTER_TEXT),
+            (["--full"], ur.FULL_WITHOUT_PROJECT_TEXT),
+            (["--full", "--project", PROJECT, "--since", "7"], ur.FULL_WITH_SINCE_TEXT),
+            (["--after-upgrade", "--full", "--project", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT),
+            (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT),
+            (["--project", PROJECT, "--report", str(self.home / ur.LATEST_REPORT_LINK)], ur.REPORT_IS_LINK_TEXT.format(name=ur.LATEST_REPORT_LINK)),
+            (["--project", PROJECT, "--since", "yesterday"], "--since takes"),
+        )
+        with mock.patch.object(ur, "acquire_lock", side_effect=AssertionError("the lock must not be taken")), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            for argv, text in refused:
+                with self.subTest(argv=argv):
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                        self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
+                    self.assertIn(text, err.getvalue())
+        self.assertEqual((self.home / ur.LEDGER_FILENAME).read_text(), "{not json")
+        self.assertEqual([p.name for p in self.home.glob("*unreadable*")], [])
+
+    def test_kubeconfig_directory_and_a_stale_kubeconfig_survive_a_root_hand_run(self):
+        # The kubeconfig directory is made like the store's, whatever the umask, and a kubeconfig
+        # this uid cannot write (another uid's 0600 file, as gcloud writes it) is removed before
+        # `get-credentials` reads it; root can write any file and keeps it. The sibling collectors
+        # do the same.
+        seeded = {"project": PROJECT, "name": "seeded-a", "location": LOCATION}
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: home}):
+            kc = ur.kubeconfig_path(PROJECT, "seeded-a", LOCATION)
+            self.assertEqual(kc, Path(home) / ur.KUBECONFIG_SUBDIR / f"kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml")
+            mask = os.umask(0o077)
+            try:
+                self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            finally:
+                os.umask(mask)
+            self.assertEqual(stat.S_IMODE(kc.parent.stat().st_mode), ur.STORE_DIR_MODE)
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            ur.prepare_kubeconfig(kc)
+            self.assertEqual(kc.exists(), os.geteuid() == 0)
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            self.assertEqual(kc.exists(), os.geteuid() == 0)
 
     def test_after_upgrade_rejects_full_and_cluster(self):
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -3941,6 +3996,42 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(SEEDED, [r["cluster"] for r in third["reviews"]])
         self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertEqual([(g["first_seen"], g["reviews"]) for g in third["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 2)])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_a_raising_recheck_is_a_failed_read_of_every_kind_it_would_have_read(self):
+        # The exception boundary around a re-check: the reads it would have made are failed reads,
+        # so the unchanged row lists their checks as unevaluated, the listing backs the operation
+        # check alone, the guards are held untouched with no candidate, and the run is partial, as
+        # after a credentials failure, rather than every check claimed as run beside a limitation
+        # saying none was evaluated.
+        first, _ = self.collect()
+        held = [g for g in first["guards"] if g["cluster"] == SEEDED]
+        before = {g["id"]: (g["last_seen"], g["reviews"]) for g in held}
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("planted")
+
+        with mock.patch.object(ur, "collect_symptoms", boom):
+            second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        needed = ur.recheck_reads_needed(held, refresh=True)
+        self.assertTrue({"pods", "nodes", "owners"} <= needed)
+        [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
+        self.assertEqual((recheck["failed_reads"], recheck["cleared"], recheck["refreshed"], recheck["commands"]), (sorted(needed), [], [], {}))
+        self.assertEqual(recheck["held"], {g["id"]: sorted(ur.recheck_reads_for(g)) for g in held})
+        self.assertEqual(recheck["errors"], ["re-check failed: RuntimeError('planted')"])
+        unevaluated = [check for check, read in ur.CHECK_READS if read in needed]
+        self.assertEqual(len(unevaluated), 5)
+        row = next(u for u in second["unchanged"] if u["cluster"] == SEEDED)
+        self.assertEqual(([c["check"] for c in row["commands"]], [c["check"] for c in row["checks_unevaluated"]]), ([ur.CHECK_OPERATION_FAILED], unevaluated))
+        self.assertIn("re-check failed: RuntimeError('planted')", row["limitations"])
+        self.assertEqual({g["id"]: (g["last_seen"], g["reviews"]) for g in second["guards"] if g["cluster"] == SEEDED}, before)
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual((seeded["outcome"], [c["check"] for c in seeded["commands"]], seeded["candidates"]), (ur.MANIFEST_OUTCOME_COLLECTED, [ur.CHECK_OPERATION_FAILED], []))
+        self.assertEqual([c["check"] for c in seeded["checks_unevaluated"]], unevaluated)
+        self.assertTrue(manifest["partial"])
+        self.assertEqual([h for h in manifest["still_flagged"] if h["cluster"] == SEEDED], [])
+        self.assertIn(ur.RECHECK_HELD_FORMAT.format(count=len(held)), ur.render_report(second))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_three_guards_on_one_object_are_one_candidate(self):

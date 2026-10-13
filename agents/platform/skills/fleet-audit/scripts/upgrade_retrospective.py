@@ -206,7 +206,9 @@ LATEST_REPORT_LINK = "upgrade-retro-report.md"
 REPORT_TEMP_SUFFIX = ".tmp"
 LINK_TEMP_SUFFIX = ".tmp-link"
 # The same kubeconfig directory `collect.py` and the SOPs use, one file per
-# cluster, passed per command rather than exported.
+# cluster, passed per command rather than exported; made like the store's
+# directories, with a kubeconfig the running uid cannot write replaced before
+# it is read (`prepare_kubeconfig`).
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILENAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
@@ -233,9 +235,11 @@ MESSAGE_EXCERPT_CHARS = 400
 # run replaces them through their directory, so no write bit is needed.
 STORE_FILE_MODE = 0o644
 TEMP_SUFFIX = ".tmp"
-# The lock and the store's directories are made with the umask cleared: a
-# hand run over `kubectl exec` lands as root while the tick runs as uid 1000,
-# and a 0600 root lock or a 0755 root directory would refuse every later run.
+# The lock, the store's directories and the kubeconfig directory are made
+# with the umask cleared: a hand run over `kubectl exec` lands as root while
+# the tick runs as uid 1000, and a 0600 root lock or a 0755 root directory
+# would refuse every later run, as the 0600 root kubeconfig gcloud leaves
+# would (`prepare_kubeconfig` replaces one).
 LOCK_FILE_MODE = 0o644
 STORE_DIR_MODE = 0o777
 
@@ -926,19 +930,21 @@ NO_OPERATION_LINE = "no upgrade operation in the window"
 # The after-upgrade route (--after-upgrade): the clusters with an
 # UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least this long before
 # the run and that the ledger does not list as reviewed, as a scoped run; a
-# fresher operation waits for the next wake so its replacement pods settle.
+# fresher operation waits for the next wake so its replacement pods settle,
+# and its cluster's settled operations wait with it, so one review covers
+# the whole upgrade.
 AFTER_UPGRADE_SETTLE = timedelta(minutes=15)
 AFTER_UPGRADE_WITH_FULL_TEXT = "--after-upgrade is a scoped run and cannot be combined with --full"
 AFTER_UPGRADE_WITH_CLUSTER_TEXT = "--after-upgrade finds its clusters from the operations listing and the ledger and cannot be combined with --cluster"
 AFTER_UPGRADE_SCOPE_TEXT = "--after-upgrade reviews the clusters with an upgrade operation not yet reviewed"
 AFTER_UPGRADE_REASON_FORMAT = "{count} upgrade operation(s) not yet reviewed, ended by {floor}"
-SETTLING_REASON_FORMAT = "{count} operation(s) ended under {minutes} min ago wait for the next wake"
 AFTER_UPGRADE_QUIET_LOG = "after-upgrade: no settled operation awaits review; nothing written"
 # The route diffs against a baseline a full run established; without one it
 # says so and writes nothing, so an install that predates the job gets its
 # first report from a full run, never from a sweep over a fortnight.
 NO_BASELINE_TEXT = "no baseline yet; the first full run establishes it"
 SETTLING_LINE = "{cluster}: {operation} {target} ended {end}, under {minutes} min ago; reviewed on the next after-upgrade wake"
+SETTLED_WAITING_FORMAT = ", with {count} settled operation(s) not yet reviewed"
 # The ledger lists the operations each cluster's reviews covered, with the
 # route that reviewed them; a run that meets one again reports it as such.
 LEDGER_OPERATIONS_KEY = "operations_reviewed"
@@ -1254,7 +1260,6 @@ def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], 
         if target and op.get("operationType") in UPGRADE_OPERATION_TYPES:
             by_target.setdefault((op.get("project") or "", target[0], target[1]), []).append(op)
     settle_floor = (now or now_utc()) - AFTER_UPGRADE_SETTLE
-    settle_minutes = int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)
     selected, unchanged, upgrading = [], [], []
     for cluster in clusters:
         key = cluster_key(cluster["project"], cluster["location"], cluster["name"])
@@ -1285,13 +1290,18 @@ def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], 
             settled = [op for op in ops if _op_end(op) <= settle_floor]
             fresh = [op for op in settled if op.get("name") not in reviewed_ids]
             settling = [op for op in ops if _op_end(op) > settle_floor and op.get("name") not in reviewed_ids]
-            if fresh:
+            if settling:
+                # The floor applies per cluster: while any unreviewed
+                # operation is settling the cluster waits whole, its settled
+                # operations with it, so one review covers the upgrade. A
+                # review of the settled half would grade the settling pool's
+                # displaced pods against a window that does not name their
+                # operation, then file them again under another check when
+                # the next wake reviews that pool.
+                upgrading.append({"cluster": key, "operation": operation_summary(settling[0]), "settling": True, "waiting": len(fresh)})
+            elif fresh:
                 reasons.append(AFTER_UPGRADE_REASON_FORMAT.format(count=len(fresh), floor=fmt_ts(settle_floor)))
-                if settling:
-                    reasons.append(SETTLING_REASON_FORMAT.format(count=len(settling), minutes=settle_minutes))
                 selected.append(Selection(cluster, key, STATUS_NEW if entry is None else STATUS_UPGRADED, reasons, window_start, settled))
-            elif settling:
-                upgrading.append({"cluster": key, "operation": operation_summary(settling[0]), "settling": True})
             else:
                 unchanged.append(unchanged_row)
             continue
@@ -1367,9 +1377,24 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
     return hermes_home() / KUBECONFIG_SUBDIR / KUBECONFIG_FILENAME.format(project=project, cluster=cluster, location=location)
 
 
+def prepare_kubeconfig(kc: Path) -> None:
+    """The kubeconfig directory made like the store's (`STORE_DIR_MODE`, the
+    umask cleared), and a kubeconfig this uid cannot write removed before
+    `get-credentials` reads it: gcloud writes the file 0600 for whoever ran,
+    so a root hand run would otherwise leave one that every later uid-1000
+    run fails to open, and the directory's write bit is enough to replace
+    it. The sibling collectors' `fetch_credentials` do the same."""
+    make_store_dir(kc.parent)
+    if kc.exists() and not os.access(kc, os.W_OK):
+        try:
+            kc.unlink()
+        except OSError:
+            pass  # the directory refuses it too; get-credentials reports that
+
+
 def fetch_credentials(cluster: dict, *, run: RunFn) -> tuple[Path, str | None]:
     kc = kubeconfig_path(cluster["project"], cluster["name"], cluster["location"])
-    kc.parent.mkdir(parents=True, exist_ok=True)
+    prepare_kubeconfig(kc)
     env = {**os.environ, "KUBECONFIG": str(kc)}
     result = run(["gcloud", "container", "clusters", "get-credentials", cluster["name"], "--location", cluster["location"], "--project", cluster["project"]], env=env)
     if result.rc != 0:
@@ -3514,6 +3539,31 @@ def parse_version(v: str) -> tuple[int, int, int, int] | None:
 # --------------------------------------------------------------------------- #
 
 
+def recheck_reads_for(guard: dict) -> set[str]:
+    """The reads a guard's re-check needs: a risk guard's recorded reads; a
+    failure guard's pods, owners and nodes, with the budget, workload or
+    event read its entry or source adds."""
+    if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_RISK:
+        return set(guard.get("reads") or SPEC_SHAPE_READS)
+    reads = set(RECHECK_FAILURE_READS)
+    if guard.get("entry") == ENTRY_BUDGET:
+        reads |= set(RECHECK_BUDGET_READS)
+    if guard.get("entry") == ENTRY_SPREAD:
+        reads |= set(RECHECK_SPREAD_READS)
+    if guard.get("source") == GUARD_SOURCE_EVENT:
+        reads |= set(RECHECK_EVENT_READS)
+    return reads
+
+
+def recheck_reads_needed(cluster_guards: list[dict], refresh: bool) -> set[str]:
+    """Every read a re-check of these guards makes, plus the refresh reads on
+    a full run."""
+    needed: set[str] = set(REFRESH_READS) if refresh else set()
+    for guard in cluster_guards:
+        needed |= recheck_reads_for(guard)
+    return needed
+
+
 def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False, now: datetime | None = None) -> dict:
     """Re-read an unchanged cluster for the guards it holds: the symptom or
     shape behind each is looked for again with only the reads it needs (an
@@ -3521,27 +3571,13 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     and whose reads all answered, is cleared; one a needed read failed for is
     held as it stands, named in `held` with the reads that did not answer."""
 
-    def reads_for(guard: dict) -> set[str]:
-        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_RISK:
-            return set(guard.get("reads") or SPEC_SHAPE_READS)
-        reads = set(RECHECK_FAILURE_READS)
-        if guard.get("entry") == ENTRY_BUDGET:
-            reads |= set(RECHECK_BUDGET_READS)
-        if guard.get("entry") == ENTRY_SPREAD:
-            reads |= set(RECHECK_SPREAD_READS)
-        if guard.get("source") == GUARD_SOURCE_EVENT:
-            reads |= set(RECHECK_EVENT_READS)
-        return reads
-
-    needed: set[str] = set(REFRESH_READS) if refresh else set()
-    for guard in cluster_guards:
-        needed |= reads_for(guard)
+    needed = recheck_reads_needed(cluster_guards, refresh)
     result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "held": {}, "failed_reads": [], "errors": [], "symptom_baseline": None, "commands": {}}
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
         result["errors"].append(error)
         result["failed_reads"] = sorted(needed)
-        result["held"] = {guard["id"]: sorted(reads_for(guard)) for guard in cluster_guards}
+        result["held"] = {guard["id"]: sorted(recheck_reads_for(guard)) for guard in cluster_guards}
         return result
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     reads: dict[str, list] = {}
@@ -3578,7 +3614,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     failing_objects = {g["object"] for g in fresh_failure}
     for guard in cluster_guards:
         kind = guard.get("kind", GUARD_KIND_FAILURE)
-        reads_needed = reads_for(guard)
+        reads_needed = recheck_reads_for(guard)
         present = guard["id"] in fresh
         if kind == GUARD_KIND_FAILURE:
             present = present or (guard.get("source") == GUARD_SOURCE_EVENT and guard.get("object") in failing_objects) or (guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero) or (guard.get("entry") == ENTRY_SPREAD and guard.get("object") in unavailable) or (guard.get("entry") == ENTRY_WINDOW and guard.get("object") in skewed)
@@ -3596,7 +3632,12 @@ def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: R
         return recheck_cluster(key, cluster, cluster_guards, run=run, refresh=refresh, now=now)
     except Exception as exc:  # noqa: BLE001 -- the boundary is the point
         log(f"{key}: re-check failed: {exc!r}")
-        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "held": {g["id"]: [] for g in cluster_guards}, "failed_reads": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None, "commands": {}}
+        # A re-check that raised is a failed read of every kind it would have
+        # made: the unchanged row then lists those checks as unevaluated and
+        # the run as partial, as after a credentials failure, rather than
+        # claiming every check ran on the listing's strength beside a
+        # limitation saying none did.
+        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "held": {g["id"]: sorted(recheck_reads_for(g)) for g in cluster_guards}, "failed_reads": sorted(recheck_reads_needed(cluster_guards, refresh)), "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None, "commands": {}}
 
 
 def _bare_what_happened(selection: Selection) -> dict:
@@ -4350,7 +4391,10 @@ def _upgrading_line(row: dict, cell: Callable[[object], str]) -> str:
     after-upgrade route, ended too recently for its pods to have settled."""
     op = row["operation"]
     if row.get("settling"):
-        return SETTLING_LINE.format(cluster=cell(row["cluster"]), operation=cell(op["type"]), target=cell(op["target"]), end=op["end"] or "?", minutes=int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE))
+        line = SETTLING_LINE.format(cluster=cell(row["cluster"]), operation=cell(op["type"]), target=cell(op["target"]), end=op["end"] or "?", minutes=int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE))
+        if row.get("waiting"):
+            line += SETTLED_WAITING_FORMAT.format(count=row["waiting"])
+        return line
     return UPGRADING_LINE.format(cluster=cell(row["cluster"]), operation=cell(op["type"]), target=cell(op["target"]), start=op["start"] or "?")
 
 
@@ -4422,6 +4466,36 @@ def parse_since(text: str | None, now: datetime) -> datetime:
     if parsed is None:
         raise argparse.ArgumentTypeError(f"--since takes <days>, <days>d or an RFC 3339 timestamp, not {text!r}")
     return parsed
+
+
+def forced_clusters(args: argparse.Namespace) -> set[str]:
+    return {c.strip() for c in args.cluster or [] if c.strip()}
+
+
+def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None:
+    """The flag set refused as a usage error before the lock is taken and
+    before a state file is read: a bad hand run is told its flags are wrong
+    at once, rather than waiting on another run to be told the lock was in
+    the way, and a corrupt ledger is not set aside by a run that was never
+    going to proceed. `main` calls it before the lock; `collect` repeats it
+    for callers that skip `main`."""
+    forced = forced_clusters(args)
+    full = bool(getattr(args, "full", False))
+    if full:
+        if forced:
+            raise argparse.ArgumentTypeError(FULL_WITH_CLUSTER_TEXT)
+        if not args.project:
+            raise argparse.ArgumentTypeError(FULL_WITHOUT_PROJECT_TEXT)
+        if args.since:
+            raise argparse.ArgumentTypeError(FULL_WITH_SINCE_TEXT)
+    if getattr(args, "after_upgrade", False):
+        if full:
+            raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_FULL_TEXT)
+        if forced:
+            raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_CLUSTER_TEXT)
+    if args.report and Path(args.report).name == LATEST_REPORT_LINK:
+        raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
+    parse_since(getattr(args, "since", None), now or now_utc())
 
 
 def _operations_record(previous: list[dict], fresh: list[dict], seen_at: str, route: str, floor: datetime | None) -> list[dict]:
@@ -4518,6 +4592,8 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish
     now = now or now_utc()
     seen_at = fmt_ts(now)
+    # Refused before any state file is read; `main` refused it before the lock.
+    validate_args(args, now)
     since = parse_since(args.since, now)
     ledger_path = Path(args.ledger) if args.ledger else data_dir() / LEDGER_FILENAME
     guards_path = Path(args.guards) if args.guards else data_dir() / GUARDS_FILENAME
@@ -4532,22 +4608,8 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
                 raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1]))
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
     guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
-    forced = {c.strip() for c in args.cluster or [] if c.strip()}
-    if getattr(args, "full", False):
-        if forced:
-            raise argparse.ArgumentTypeError(FULL_WITH_CLUSTER_TEXT)
-        if not args.project:
-            raise argparse.ArgumentTypeError(FULL_WITHOUT_PROJECT_TEXT)
-        if args.since:
-            raise argparse.ArgumentTypeError(FULL_WITH_SINCE_TEXT)
+    forced = forced_clusters(args)
     after_upgrade = bool(getattr(args, "after_upgrade", False))
-    if after_upgrade:
-        if getattr(args, "full", False):
-            raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_FULL_TEXT)
-        if forced:
-            raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_CLUSTER_TEXT)
-    if args.report and Path(args.report).name == LATEST_REPORT_LINK:
-        raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
     if after_upgrade and not ledger.get(LEDGER_PROJECTS_KEY):
         # No full run has recorded the fleet: nothing to diff against.
         log(NO_BASELINE_TEXT)
@@ -4850,7 +4912,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-file", help="also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against)")
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters, writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
-    parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run; with nothing to review it prints nothing and writes nothing. Not with --full or --cluster")
+    parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full or --cluster")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing; with --reset-ledger, list the crash records and move none")
     return parser
 
@@ -4924,6 +4986,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.reset_ledger:
         print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
         return 0
+    try:
+        validate_args(args)
+    except argparse.ArgumentTypeError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
     lock = None
     if not args.dry_run:
         lock_path = data_dir() / LOCK_FILENAME

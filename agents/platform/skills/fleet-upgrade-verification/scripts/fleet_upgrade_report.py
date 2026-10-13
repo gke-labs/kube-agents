@@ -250,6 +250,10 @@ HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
+# The directory is made with the umask cleared: a hand run over `kubectl exec`
+# lands as root while the agent runs as uid 1000, and a 0755 root directory
+# would refuse the agent's kubeconfigs (`prepare_kubeconfig`).
+KUBECONFIG_DIR_MODE = 0o777
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
 # holding `/` or `..` from steering the path out of the directory.
@@ -672,6 +676,26 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
+def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> None:
+    """The kubeconfig directory writable by whichever uid runs next
+    (`KUBECONFIG_DIR_MODE`, the umask cleared), and a kubeconfig this uid
+    cannot write removed before `get-credentials` reads it: gcloud writes the
+    file 0600 for whoever ran, so a root hand run would otherwise leave one
+    that every later uid-1000 run fails to open, and the directory's write bit
+    is enough to replace it. The fleet-audit collectors carry the same
+    function."""
+    mask = os.umask(0)
+    try:
+        os.makedirs(kubeconfig_dir, mode=KUBECONFIG_DIR_MODE, exist_ok=True)
+    finally:
+        os.umask(mask)
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass  # the directory refuses it too; get-credentials reports that
+
+
 def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:
     """(items, error, kubeconfig): the PDBs and workloads of one member, read through kubectl.
 
@@ -681,7 +705,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tu
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
     try:
-        os.makedirs(kubeconfig_dir, exist_ok=True)
+        prepare_kubeconfig(kubeconfig_dir, path)
     except OSError as e:
         return None, f"cannot create kubeconfig directory {kubeconfig_dir}: {e}", path
     env = {**os.environ, KUBECONFIG_ENV: path}
