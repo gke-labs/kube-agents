@@ -147,6 +147,10 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            # Beside config.yaml, where LiteLLM resolves a custom callback module.
+            - name: config-volume
+              mountPath: /app/litellm_thinking_replay_callback.py
+              subPath: litellm_thinking_replay_callback.py
             - name: tmp
               mountPath: /tmp
       volumes:

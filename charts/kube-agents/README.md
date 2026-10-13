@@ -241,7 +241,7 @@ states the trade in full.
 
 `litellm.redaction.enabled=true` makes the gateway redact every request body
 before it reaches the provider: the ConfigMap gains the shared redactor module,
-a LiteLLM pre-call hook and a `redaction.yaml` rule file, all mounted beside
+the redaction pre-call hook and a `redaction.yaml` rule file, all mounted beside
 `/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
 plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
 pseudonyms. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,

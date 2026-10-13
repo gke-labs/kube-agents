@@ -470,7 +470,7 @@ absent renders no max_tokens).
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render stays byte-identical to the kustomize base
+  otherwise, so the default render matches the kustomize base
   (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
   no such key on purpose. One value for all three aliases: they are one
   upstream model, and the budget is the backend's property, not the alias's.

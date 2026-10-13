@@ -6,8 +6,9 @@
 > `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`,
 > `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
 > `fleet_waste.py` one for `fleet-wide-cost-analysis`, `fleet_stockout.py` one for
-> `stockout-prevention`, and `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
-> `gce-compute-fleet-audit`;
+> `stockout-prevention`, `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
+> `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
+> `gcp-networking-fabric-audit`;
 > each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
@@ -460,7 +461,8 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 `AuditSpec.scopes`; an empty `scopes` measures every target against the whole roster, and a kind
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
 and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
-are all projects, declares `project` alone. A fleet that holds no cluster is not
+are all projects, declares `project` alone; the networking stream declares a `subnet` kind for
+`subnet-ip-exhaustion` and a `project` kind for its other five checks. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs

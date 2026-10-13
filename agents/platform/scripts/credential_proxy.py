@@ -472,7 +472,9 @@ GCLOUD_EXTRA_SURFACES = frozenset({"components", "iam", "init", "resource-manage
 # content_workspace.WORKSPACE_GIT_SUBCOMMANDS, and the git vocabulary is the
 # union of those two, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's
 # list is labelled by name without a second edit here.
-GIT_READ_SUBCOMMANDS = frozenset({"blame", "describe", "log", "ls-files", "show", "status"})
+GIT_READ_SUBCOMMANDS = frozenset(
+    {"blame", "cat-file", "describe", "log", "ls-files", "rev-list", "show", "status", "version"}
+)
 FORGE_CLI_SUBCOMMANDS = frozenset(
     {
         "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -3157,6 +3159,55 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
     }
 )
 
+# Keys permitted to be written via repository-local `git config`. Only committer
+# identity configuration is needed by GitOps workspace setup; writing aliases,
+# filters, or execution hooks is refused.
+ALLOWED_GIT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
+
+# Actions that make a `git config` invocation a read-only query.
+# Must appear in option position (before the first positional argument).
+GIT_CONFIG_QUERY_ACTIONS = frozenset(
+    {
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--list",
+        "-l",
+        "--get-color",
+        "--get-colorbool",
+    }
+)
+
+# Mutation actions that write or unset configuration keys.
+GIT_CONFIG_WRITE_ACTIONS = frozenset(
+    {
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+        "--edit",
+        "-e",
+    }
+)
+
+# Options that take a separate argument before positional parameters.
+GIT_CONFIG_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--default",
+        "--type",
+        "-t",
+        "--blob",
+        "--comment",
+        "--value",
+        "--url",
+        "--file",
+        "-f",
+    }
+)
+
 # git's own global options, split by whether they consume the next argument.
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
 # audit_report issues) without mistaking a flag for a verb. Includes options
@@ -3166,14 +3217,14 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {
         "-C",
         "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--exec-path",
-        "--super-prefix",
         "--attr-source",
         "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
         "--shallow-file",
+        "--super-prefix",
+        "--work-tree",
     }
 )
 
@@ -3257,6 +3308,29 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "update-ref",
     }
 )
+
+
+def _allowed_git_subcommands() -> frozenset[str]:
+    from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
+
+    return (
+        GIT_MUTATING_SUBCOMMANDS
+        | GIT_READ_SUBCOMMANDS
+        | VCS_GIT_SUBCOMMANDS
+        | WORKSPACE_GIT_SUBCOMMANDS
+        | frozenset({"config"})
+    )
+
+
+# The closed set of subcommands the product and its skills issue: the union of
+# the four git verb sets this module already tracks (`GIT_MUTATING_SUBCOMMANDS`,
+# `GIT_READ_SUBCOMMANDS`, `VCS_GIT_SUBCOMMANDS`, and `WORKSPACE_GIT_SUBCOMMANDS`)
+# plus `config` (whose own `_git_config_violation` gate restricts writes to
+# `ALLOWED_GIT_CONFIG_KEYS`). A verb outside this union is refused. On the
+# `/v1/exec` path the check runs after `resolve_git_command` has expanded a
+# repository-local alias, so an alias is judged by what it expands to rather
+# than refused for being one.
+ALLOWED_GIT_SUBCOMMANDS = _allowed_git_subcommands()
 
 # Where a credential refresh helper is staged. A forge's helper is found by its
 # own name under this directory, which is how the generic route reaches a
@@ -3396,6 +3470,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--attr-source": "reads gitattributes from a tree-ish which can select caller-named filters or diff drivers",
     "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
@@ -3519,16 +3594,14 @@ _GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
 # executes <payload> in the credential container, as do
 # `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
 #
-# **This is a denylist over a set that is not closed, and it is the weakest
-# thing in this file.** git keeps a command in configuration for `difftool`,
-# `mergetool`, `web--browse`, `instaweb`, `help`, and the `p4`/`svn`
-# bridges, and a new one can arrive in any release. The structurally correct
-# fix is to allowlist the ~20 subcommands the product actually issues and fail
-# closed on the rest, which is a change to the denylist-not-allowlist decision
-# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
-# unknown *read* verb failing closed against a concurrency race, and was not
-# weighing it against arbitrary code execution. Revisit it with that evidence
-# rather than treating this list as sufficient.
+# **Named-reason denylist paired with `ALLOWED_GIT_SUBCOMMANDS`.** git keeps a
+# command in configuration for `difftool`, `mergetool`, `web--browse`,
+# `instaweb`, `help`, and the `p4`/`svn` bridges, and a new one can arrive in
+# any release. `ALLOWED_GIT_SUBCOMMANDS` fails closed on the subcommand slot
+# resolved by `_git_plan` for any verb outside the product's four verb sets plus
+# `config`, while this table scans every token in `argv` so these dangerous
+# built-ins are refused with their specific explanation even if a future git
+# release adds a value-taking global option not yet in `_GIT_GLOBAL_WITH_VALUE`.
 _GIT_REFUSED_SUBCOMMANDS = {
     "bisect": "runs a command the caller names (`bisect run`)",
     "difftool": "runs a command the caller names (`--extcmd`)",
@@ -3566,14 +3639,11 @@ _GIT_REFUSED_SUBCOMMANDS = {
     # containing a bare `help` (checked across `agents/`, `k8s-operator/` and
     # `scripts/`), and the refusal is loud and names the rule.
     #
-    # Matching the subcommand *slot* instead would remove the collision and was
-    # considered. It is not done, and the reason is measurable: git has
-    # value-taking global options this file does not know about, so resolving
-    # the slot is a guess about git's parser. `git --attr-source HEAD help -m
-    # git` executes the payload, while `_git_plan` reports the subcommand as
-    # `HEAD` — a position-aware check would allow it. Scanning every token
-    # cannot disagree with git about where the subcommand is, and over-refusing
-    # a commit message is the direction this is meant to fail in.
+    # Kept as an whole-argv token check alongside `ALLOWED_GIT_SUBCOMMANDS`
+    # (which checks the subcommand slot resolved by `_git_plan`, with
+    # `--attr-source` in `_GIT_GLOBAL_WITH_VALUE` and refused outright) so a
+    # future value-taking global option not yet listed in `_GIT_GLOBAL_WITH_VALUE`
+    # cannot hide `help` behind its argument value.
     "help": "runs a caller-named viewer command (`help -m`, `help -w`)",
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
@@ -3906,19 +3976,16 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
     return None
 
 
-def git_argument_violation(argv: list[str]) -> str | None:
+def git_argument_violation(argv: list[str], *, check_subcommand: bool = True) -> str | None:
     """Why this git argv may not run, or None if it may.
 
-    Matched across the whole argv rather than only the global-option region
-    before the subcommand, which is the only place git honours these. That is
-    deliberate: a check that has to agree with git about where the options end
-    is a *guess* about git's parser, and every serious defect found in this
-    policy layer so far was a checker and an executor parsing the same input
-    differently. Scanning everything cannot disagree with git about scope.
-
-    The cost is refusing a git command with a literal `-c` somewhere in its
-    arguments — a commit message, a pathspec. Nothing shipped does that, and
-    refusing something harmless is the direction this is meant to fail in.
+    Refused flags and `_GIT_REFUSED_SUBCOMMANDS` are matched across the whole
+    argv rather than only the global-option region before the subcommand, so a
+    flag or refused verb cannot slip past a parser disagreement about where the
+    options end. `_git_plan` then resolves the subcommand slot (after skipping
+    `_GIT_GLOBAL_WITH_VALUE`) and enforces `ALLOWED_GIT_SUBCOMMANDS` (when
+    `check_subcommand` is True) and `_git_config_violation` (when the subcommand
+    is `config`).
     """
     if not argv or Path(argv[0]).name != "git":
         return None
@@ -3957,20 +4024,116 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
-    if "config" in rest:
-        for argument in rest:
-            clean = argument.split("=", 1)[0].strip().lower()
-            if (
-                clean.startswith("alias.")
-                or clean == "alias"
-                or clean.startswith("include.")
-                or clean.startswith("includeif.")
-                or clean == "include"
-            ):
-                return (
-                    "`git config` configuring an alias or config include is refused: "
-                    "git aliases and includes cannot be configured through the credential proxy."
-                )
+    subcommand, _ = _git_plan(argv)
+    if check_subcommand and subcommand is not None and subcommand not in ALLOWED_GIT_SUBCOMMANDS:
+        return f"`git {subcommand}` is refused: subcommand is not supported by the credential proxy."
+    if subcommand == "config":
+        config_violation = _git_config_violation(argv)
+        if config_violation is not None:
+            return config_violation
+    return None
+
+
+def _git_config_option_positionals(args: list[str]) -> tuple[set[str], list[str]]:
+    """Walk `git config` options using PARSE_OPT_STOP_AT_NON_OPTION and prefix resolution."""
+    actions: set[str] = set()
+    positionals: list[str] = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if not arg.startswith("-") or arg == "--":
+            if arg == "--":
+                idx += 1
+            positionals = args[idx:]
+            break
+        name = arg.split("=", 1)[0]
+        is_long_prefix = name.startswith("--") and len(name) > 2
+        matched_writes = {
+            w for w in GIT_CONFIG_WRITE_ACTIONS
+            if w == name or (is_long_prefix and w.startswith(name))
+        }
+        matched_queries = {
+            q for q in GIT_CONFIG_QUERY_ACTIONS
+            if q == name or (is_long_prefix and q.startswith(name))
+        }
+        if matched_writes:
+            actions.update(matched_writes)
+        elif matched_queries:
+            actions.update(matched_queries)
+        consumes_value = name in GIT_CONFIG_OPTIONS_WITH_VALUE or (
+            is_long_prefix
+            and any(o.startswith(name) for o in GIT_CONFIG_OPTIONS_WITH_VALUE if o.startswith("--"))
+        )
+        if consumes_value and "=" not in arg:
+            idx += 1
+        idx += 1
+    return actions, positionals
+
+
+def _git_config_violation(argv: list[str]) -> str | None:
+    """Why this git config argv may not run, or None if it may.
+
+    Git parses `git config` options using PARSE_OPT_STOP_AT_NON_OPTION: options
+    must precede the first positional argument.
+
+    Query actions (--get, --list, get, list, etc.) are non-mutating reads and are
+    allowed. Configuration writes (implicit set with >= 2 positionals, git >= 2.46
+    set/unset subcommands, or write actions like --add, --replace-all, --unset and
+    their parse-options abbreviations) are restricted to case-insensitive author
+    identity keys (user.name, user.email). Any attempt to write or unset other keys
+    is refused.
+    """
+    config_index = _find_subcommand_index(argv)
+    if config_index is None or argv[config_index] != "config":
+        return None
+
+    actions, positionals = _git_config_option_positionals(argv[config_index + 1:])
+    if not actions and positionals and positionals[0] in {
+        "list", "get", "set", "unset", "rename-section", "remove-section", "edit"
+    }:
+        subverb = positionals[0]
+        _, sub_positionals = _git_config_option_positionals(positionals[1:])
+        if subverb == "list":
+            if not sub_positionals:
+                return None
+            return "`git config list` with extra arguments is refused."
+        if subverb == "get":
+            if len(sub_positionals) == 1:
+                return None
+            return "`git config get` requires exactly one configuration key."
+        if subverb in {"rename-section", "remove-section", "edit"}:
+            return (
+                f"`git config {subverb}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
+        actions = {"--add" if subverb == "set" else "--unset"}
+        positionals = sub_positionals
+
+    if actions & {"--rename-section", "--remove-section"}:
+        return (
+            "`git config` section mutation is refused: only author identity configuration "
+            "(user.name, user.email) and query options are permitted."
+        )
+
+    if actions & {"--edit", "-e"}:
+        return (
+            "`git config --edit` is refused: only author identity configuration "
+            "(user.name, user.email) and query options are permitted."
+        )
+
+    if actions and not (actions & GIT_CONFIG_WRITE_ACTIONS) and (actions & GIT_CONFIG_QUERY_ACTIONS):
+        return None
+
+    is_write = bool(actions & GIT_CONFIG_WRITE_ACTIONS) or len(positionals) >= 2
+    if is_write:
+        if not positionals:
+            return "`git config` write is refused: missing configuration key."
+        target_key = positionals[0]
+        if target_key.lower() not in ALLOWED_GIT_CONFIG_KEYS:
+            return (
+                f"`git config {target_key}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
     return None
 
 
@@ -6575,7 +6738,11 @@ class CommandExecutor:
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
+            command_environment.pop("KUBECONFIG", None)
+            command_environment.pop("CLOUDSDK_CONFIG", None)
             command_environment.update(self.git_identity)
+        elif argv and Path(argv[0]).name == "kubectl":
+            command_environment.pop("GH_CONFIG_DIR", None)
         if extra_config:
             # Rebuilt rather than appended to, because the count and the keys
             # have to move together. The caller's pairs go first so the forced
@@ -7917,7 +8084,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # over anything argv can say; this refuses the flags that would
         # otherwise re-enable git's hook execution, and it refuses them before
         # the lease check because it does not depend on the working directory.
-        violation = git_argument_violation(argv)
+        has_resolver = hasattr(self.executor, "resolve_git_command")
+        violation = git_argument_violation(argv, check_subcommand=not has_resolver)
         if violation is not None:
             LOGGER.warning(
                 "git argument refused request_id=%s", request_id,
@@ -7944,7 +8112,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # request ends with a response and the trail with a terminal
             # record rather than an exception out of the handler.
             try:
-                if hasattr(self.executor, "resolve_git_command"):
+                if has_resolver:
                     violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
                 else:
                     violation = self.executor.git_lease_violation(argv, cwd)
@@ -7973,6 +8141,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+
+            if has_resolver:
+                arg_violation = git_argument_violation(exec_argv)
+                if arg_violation is not None:
+                    LOGGER.warning(
+                        "git argument refused request_id=%s", request_id,
+                        extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
+                    )
+                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "status": "blocked",
+                            "code": "SECURITY_POLICY_BLOCKED",
+                            "rule": RULE_GIT_ARGUMENT_REFUSED,
+                            "message": arg_violation,
+                        },
+                    )
+                    return
 
             # Runs after the credential denylist above, so rules like
             # `kubernetes.token-disclosure` keep their own ids and messages rather

@@ -84,11 +84,13 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   finding↔PR link.** It survives anyone editing the issue body, and a single
   `gh pr list --label audit:<audit-id> --label audit:remediation --state all
 --json number,headRefName,state,mergedAt,closedAt,url,body,labels` reconstructs the whole mapping in
-  one API call. No body marker is needed and none is added. Two of those fields are load-bearing
-  rather than incidental. `labels` carries §3.3's harness-close-versus-human-close discriminator,
-  `audit:stale-closed`, so dropping it from the projection would silently make every close look
-  final. `closedAt` is what §3.1's superseded rule compares a `/remediate` timestamp against;
-  without it every stale command wins by default, which is the failure that rule exists to prevent.
+  one API call. Three of those fields are load-bearing rather than incidental. `body` carries the
+  pull request's own delta block and its `audit-id-scheme` stamp, which say which findings a merged
+  or closed pull request claims (see the bullet on settled pull requests below). `labels` carries
+  §3.3's harness-close-versus-human-close discriminator, `audit:stale-closed`, so dropping it from
+  the projection would silently make every close look final. `closedAt` is what §3.1's superseded
+  rule compares a `/remediate` timestamp against; without it every stale command wins by default,
+  which is the failure that rule exists to prevent.
 - **The branch is keyed on the files, not on the finding ids.** An earlier draft of this section
   named the branch after the lowest-sorted member id, which does not survive contact with the way
   the model actually works: ids are regenerated from scratch every run, so the day an SOP heading is
@@ -96,6 +98,21 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   lowest id — the branch name changes, the `headRefName` lookup misses, and the harness opens a
   second pull request proposing a fix that is already sitting in review. The set of paths a fix
   touches is the stable thing, so that is what the name is derived from.
+- **A settled pull request claims only the findings it names.** The file-set key has one
+  consequence: a finding that the delta block of a merged or closed pull request does not name — a
+  different check that later writes the same file, for example — lands on that pull request's
+  branch. An open pull request claims its whole group: runs do not
+  rewrite it, but while it is open its branch is busy and the sweep cannot open a second pull request
+  there, so the link shows the reader what blocks a new finding. A merged or closed one claims only
+  the ids in its own delta block, so the merged-but-persists comment does not name the new finding.
+  A merged pull request, or one a person closed, still blocks automatic promotion for every finding
+  on its branch: a promotion opens the whole group, so it would propose the settled fix again on that
+  branch. The ledger shows the new finding with no pull request and names the blocking pull request
+  on its state line. An explicit `/remediate` follows the rules of §3.1. A pull request the harness
+  closed as stale blocks nothing, and the sweep opens the group again. When the body has no delta
+  block under the current id scheme, the pull request claims the whole group; so after a change to
+  `ID_SCHEME`, every settled pull request claims its whole group again, and the ledger links new
+  findings on those branches to the old pull request.
 - **The finding id is still constrained**, to `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..`
   segment and no `.lock` suffix — even though the path digest took it out of the branch name. The
   original justification was that it was a git ref component; that is no longer true, and a rule
@@ -110,7 +127,9 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   SOPs already build ids deterministically from lowercased slugs; the rule makes that a hard gate
   rather than a convention, and `hack/check-docs-terminology.sh` now extracts the pattern from
   `FINDING_ID_RE` and fails the build if any document quotes a different one.
-- Body carries only that finding: evidence, impact, the recommendation, and the diff.
+- Body carries only that finding (or one section per member for a group): evidence, impact, the
+  recommendation, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus
+  `<!-- audit-id-scheme -->` stamp.
 - Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`.
 
 ## 3. Decisions
@@ -165,14 +184,15 @@ stays below both floors — defence-in-depth work a reader may reasonably never 
 kinds of closed PR. One the harness closed itself as stale carries the `audit:stale-closed` label,
 and if the finding comes back, re-proposing the fix is exactly right. One a **human** closed is a
 considered rejection, and re-opening it every morning would be the harness overruling a person on a
-schedule. A merged PR is likewise not re-promoted — that finding is `pr-merged-persists` (§4), which
-is a different problem and gets a different treatment.
+schedule. A merged PR is likewise not re-promoted — a finding it claims is `pr-merged-persists`
+(§4), which is a different problem and gets a different treatment, and a finding it does not claim
+is `open` and blocked (§2).
 
 **The human trigger is an issue comment command:** `/remediate <finding-id>`, or `/remediate all` to
 promote every eligible finding in the stream. On its next run the audit parses the ledger issue's
 comments, promotes the named findings, and replies once with the PR links. The command is honoured
-only from a commenter with write access to the repo — `authorAssociation` of `OWNER`, `MEMBER`, or
-`COLLABORATOR` (§13 Q5).
+only from a commenter with write access to the repo (`canWrite: true` from the forge's `identity`
+operation, mapped internally by `read_comments` to `"COLLABORATOR"` versus `"NONE"`; §13 Q5).
 
 Only `manifest` remediations are promotable. `/remediate` naming a `gcloud` or `manual` finding is
 refused with a comment explaining that its remediation is a command to run, not a file to merge — a
@@ -228,8 +248,11 @@ public ledger, so there is nothing to guess. A reader that believed any comment 
 the finding still reproduces", leaving no trace but the comment itself. Each read is therefore
 gated on `viewerDidAuthor`, GitHub's answer to "did the caller write this", with the `[bot]` login
 suffix as the fallback for a comment struct that arrived without it. The pull-request _body_ is not
-read at all: the harness never writes a marker into one, so a body match could only have come from
-whoever can edit the body, which on a remediation branch includes its author.
+read for these once-only comment markers (though it does carry the creation-time
+`<!-- audit-findings -->` delta block and `<!-- audit-id-scheme -->` stamp that `_pr_covers` reads in
+§2): the harness never writes a persistence or stale-close marker into a body, so a body match for
+those could only have come from whoever can edit the body, which on a remediation branch includes its
+author.
 
 Keying the `/remediate` markers on the **comment node id**, not the finding id, is what lets a later
 `/remediate` for the same finding be answered again: the second comment is a different comment, and
@@ -336,6 +359,12 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
 | `resolved-merged`    | no longer reproduces; branch PR is merged             | not rendered — see below              | none; a merged fix that worked is the expected ending   |
 
+Every row that names a PR state applies only when that PR claims the finding; a merged or closed PR
+claims only the ids in its delta block (§2). An `open` finding can also sit on a branch whose merged
+pull request, or one a person closed, does not name it. The ledger shows no PR state for it, and its
+state line links that pull request as the reason the sweep opens no fix; a `/remediate` proposes a
+fix for every finding in the group that still reproduces.
+
 **The last two rows have no rendering, and the "Rendered as" column cannot be made to give them
 one.** A finding that no longer reproduces is absent from the run's document, so there is no row in
 the findings table to carry a state — `derive_finding_state` is only ever called with
@@ -389,11 +418,14 @@ practice groups are almost always singletons.
 - Group key: the sorted tuple of manifest paths, unioned transitively across findings that share any
   path.
 - Branch name for a group: `platform-agent/fix-<audit-id>-<slug>-<digest>` over that same sorted
-  path tuple (§2), with every member finding named in the PR body and each linking back to the same
-  PR from the ledger. Deriving the name from the group key rather than from a member id is what
+  path tuple (§2), with every member finding named in the PR body and, while that PR is open, each
+  linking back to it from the ledger (see the last bullet for a settled PR). Deriving the name from the group key rather than from a member id is what
   makes it stable across runs: the key is the set of files, and the group survives its members being
   renumbered or partially fixed.
 - Promoting any member of a group promotes the whole group. The reply comment says so.
+- A merged pull request, or one a person closed, claims only the members its delta block names. A
+  member it does not name shows on the ledger with no pull request, and the settled pull request
+  still blocks its automatic promotion (§2).
 
 ## 6. Script surface
 
@@ -636,18 +668,18 @@ lose and anything present is debris from a run that did not finish.
 
 ## 7. Rendering
 
-| Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                   |
-| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1).               |
-| Scope                 | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)). |
-| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                         |
-| Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                             |
-| Clean-close comment   | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                   |
-| Remediation PR title  | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), and the risk note. For a group, one section per member.                                                                                                                                                                                                                                                                                                                          |
-| Stale-close comment   | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                                                                                                                                                      |
+| Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation (`manifest` links fill the `fileUrl` template from the forge's `capabilities` response at the repository commit when the forge supplies one and the file exists at that commit, and keep the bare path for a newly written file or when `fileUrl` is absent), PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1). |
+| Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                |
+| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                                                                                                                                                                                                                                                                        |
+| Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                                                                                                                                                                                                                                                                            |
+| Clean-close comment   | Date and the targets covered (counted by kind: clusters, subnets, projects), then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Remediation PR title  | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), the risk note, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus `<!-- audit-id-scheme -->` stamp. For a group, one section per member.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Stale-close comment   | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 ### 7.1 Size budget
 
@@ -673,7 +705,11 @@ headroom for the trailing marker and for anything a later section appends.
   measured after the findings and before the evidence appendix, degrading to identity lines and then
   to a note rather than displacing a finding (collector design §3.3). Findings are selected **severity-first**, so
   truncation only ever eats the least-severe end and criticals are structurally safe — a fleet with
-  five criticals and three hundred minors publishes all five criticals no matter what.
+  five criticals and three hundred minors publishes all five criticals no matter what. In a
+  severity band, selection takes one finding for each target in turn while the band has space: no
+  target gets a second row before every target in the band has one. When the band has fewer slots
+  than targets, the targets late in the alphabet still lose their rows. The body still shows the
+  selected findings in display order.
 - **Truncation is stated, counts are not.** When findings are omitted the body says so explicitly,
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
@@ -847,7 +883,8 @@ Four changes close it, and none of them pretend to verify anything:
   list. Ten distinct plausible per-cluster invocations are not, and they have to be redone per
   cluster.
 - **The commands are published.** The ledger's last section, _How this run checked the fleet_, is a
-  collapsed table of every entry, rendered against whatever body budget the findings left and
+  collapsed table of every entry, one row per check and command with every cluster that ran it
+  named in the row, rendered against whatever body budget the findings left and
   dropped whole rather than half if it does not fit — with a notice pointing at the run's stored
   report, which keeps every entry.
 
@@ -1385,10 +1422,11 @@ would just make them ask again.
 unqualified comment trigger is an unauthenticated write path: on a public or widely-collaborated
 repo, a comment from a stranger would open branches and PRs in the GitOps repo.
 
-_Resolved: honour the command only from an author whose `authorAssociation` is `OWNER`, `MEMBER`, or
-`COLLABORATOR`._ Anyone else gets a single reply saying the command requires write access, recorded
-by the `audit-refused` marker of §3.1 so they are not told twice. `gh issue view --json comments`
-exposes `authorAssociation` on each comment, so this costs no extra API call.
+_Resolved: honour the command only from an author with write access to the repository._ `read_comments`
+queries the forge's `identity` operation (`canWrite`) once per distinct commenter login and maps the
+answer to `"COLLABORATOR"` or `"NONE"` for `parse_remediate_commands`. Anyone without write access
+gets a single reply saying that they do not have write access to the repository and that the command
+was not acted on, recorded by the `audit-refused` marker of §3.1 so they are not told twice.
 
 ## 14. Accepted risks
 
@@ -1420,8 +1458,9 @@ good news.
 
 _Why it is accepted:_ every fix crosses a boundary this design deliberately holds. A heartbeat issue
 per stream reintroduces exactly the always-open, always-noisy artifact §1 exists to remove; a
-liveness check needs state outside GitHub, and §2's whole premise is that the branch name is the
-only join key; a metrics export needs a monitoring stack this repository does not own. _What it
+liveness check needs state outside GitHub, and §2's whole premise is that the forge holds the only
+record: the branch finds each pull request, and a settled one's delta block limits what it claims;
+a metrics export needs a monitoring stack this repository does not own. _What it
 costs:_ a stream that stops running is invisible until somebody notices the absence, and nobody
 notices absence. _What would change it:_ the right home for this is CronJob-level alerting in the
 operator — `PlatformAgent` already reconciles the schedule and knows the expected cadence, so it can
