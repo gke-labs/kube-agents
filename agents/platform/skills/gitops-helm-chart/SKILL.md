@@ -137,6 +137,14 @@ ahead without it."
   chart; when the guide and other sources disagree, the guide wins, and the
   PR body says which sources you saw. No guide that names a chart: stop and
   ask for the source.
+- **No chart at all.** When the project's documented install is an installer
+  script or CLI that fills in values and renders manifests itself (Agent
+  Substrate's `ate-setup deploy` is one), there is no declarative package to
+  pin. Stop with: "`<component>` has no Helm chart or manifest release; its
+  documented install is `<installer>`, which this agent does not run. I
+  have changed nothing." A chart by the same name from a fork is not a
+  substitute (for Substrate, `ghcr.io/kagent-dev` is a fork with different
+  images and snapshot storage).
 - **Version.** The version the user named. Otherwise the highest semantic
   version with no `-rc`, `-alpha` or `-beta` suffix, from the project's
   releases page or the chart repository's index. Compare versions, not
