@@ -700,13 +700,15 @@ class VcsRequestCountingTest(_BrokerFixture):
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
-    def vcs_count(self, verb, status):
-        """The series' value, waiting briefly: the outcome is recorded after the
-        response is written, so a scrape right behind the answer can precede it."""
+    def vcs_count(self, verb, status, expected=1):
+        """The series' value once it reaches `expected`, or the last value seen
+        at the deadline: the outcome is recorded after the response is written,
+        so a scrape right behind the answer can precede the increment, and a
+        series that already exists from an earlier request reads one short."""
         deadline = time.monotonic() + 2.0
         while True:
             count = _series(self.families(), "kubeagents_vcs_requests_total", verb=verb, status=status)
-            if count is not None or time.monotonic() > deadline:
+            if count == expected or time.monotonic() > deadline:
                 return count
             time.sleep(0.02)
 
@@ -789,7 +791,7 @@ class VcsRequestCountingTest(_BrokerFixture):
                 got, _ = self.post_vcs("proposal-list", {"repository": "nonsense"})
             self.assertEqual(status, got)
             counted[want] = counted.get(want, 0) + 1
-            self.assertEqual(counted[want], self.vcs_count("proposal-list", want), (status, want))
+            self.assertEqual(counted[want], self.vcs_count("proposal-list", want, counted[want]), (status, want))
 
     def test_a_caller_that_leaves_the_queue_counts_as_abandoned(self):
         @contextlib.contextmanager
