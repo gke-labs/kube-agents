@@ -528,21 +528,39 @@ class DriftPubsubOrdering(unittest.TestCase):
 
     def test_the_cluster_is_destroyed_before_the_ingress(self) -> None:
         body = _module_body(self.composition, CLUSTER_MODULE)
-        references = _depends_on_references(body)
-        self.assertIsNotNone(
-            references,
-            f'module "{CLUSTER_MODULE}" declares no depends_on at all, so nothing orders '
-            f"the cluster's teardown ahead of the topic's deletion",
-        )
         self.assertIn(
             f"{_MODULE}.{INGRESS_MODULE}",
-            references,
-            f'module "{CLUSTER_MODULE}" must depend on {_MODULE}.{INGRESS_MODULE}. Terraform '
-            f"destroys dependents before dependencies, so this edge is the only thing "
-            f"keeping the topic alive until the control plane has stopped emitting; "
+            _reference_text(body),
+            f'module "{CLUSTER_MODULE}" must take a value from {_MODULE}.{INGRESS_MODULE}. '
+            f"Terraform destroys dependents before dependencies, so this edge is the only "
+            f"thing keeping the topic alive until the control plane has stopped emitting; "
             f"without it the topic goes minutes early and every audit record that lands "
             f"after it mails the project's owners (#2426). The edge is for the destroy "
             f"order, so no apply and no plan will show it missing",
+        )
+
+    def test_the_cluster_is_ordered_by_a_value_and_not_by_depends_on(self) -> None:
+        """The edge has to be an input; a depends_on here breaks the install.
+
+        A module-level depends_on defers every data source inside the module
+        while its target has a planned change, and gke-cluster reads one --
+        data.google_container_cluster.existing, the source of cluster_endpoint
+        when create_cluster is false. Deferring it leaves provider "helm"
+        without a host, and a helm provider that cannot reach the cluster
+        reports every release as absent: the plan plans helm_release as a
+        create and the apply trips over a name still in use. Both spellings
+        order the destroy identically, so nothing else distinguishes them and
+        the cheaper-looking one is the broken one.
+        """
+        body = _module_body(self.composition, CLUSTER_MODULE)
+        references = _depends_on_references(body) or []
+        self.assertNotIn(
+            f"{_MODULE}.{INGRESS_MODULE}",
+            references,
+            f'module "{CLUSTER_MODULE}" names {_MODULE}.{INGRESS_MODULE} in depends_on. '
+            f"Pass it as an input instead -- create_after, which only the cluster "
+            f"resources depend on -- so that the data source reading an existing "
+            f"cluster stays outside the edge",
         )
 
     def test_the_composition_still_grants_the_detector_its_subscription(self) -> None:

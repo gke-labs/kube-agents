@@ -396,46 +396,31 @@ module "gke_cluster" {
     "kube-agents-host" = "true"
   }
 
-  # module.drift_pubsub is here for the DESTROY order, not the apply one.
-  # Terraform destroys dependents before dependencies, so naming the ingress
-  # here is what puts the cluster's teardown ahead of the topic's deletion.
-  # The cluster emits mutating audit records for as long as its control plane
-  # is up -- measured at ~4 minutes past the point the topic used to be deleted
-  # -- and each one that lands on a missing topic mails every project owner
-  # (#2426). The module's sink_drain cannot cover that: it is a fixed timer and
-  # the teardown's length varies with the cluster. This edge removes the race
-  # instead of widening the margin, leaving the drain to do the job it is
-  # actually sized for, the Log Router's own propagation lag once the cluster
-  # has gone quiet -- which is also the whole of it when create_cluster is
-  # false and no cluster is in this state's destroy graph at all.
+  # The DESTROY order, not the apply one. Terraform destroys dependents before
+  # dependencies, so the cluster has to depend on the drift ingress for its
+  # teardown to precede the topic's deletion. The control plane emits mutating
+  # audit records for as long as it is up -- measured at ~4 minutes past the
+  # point the topic used to go -- and each one that lands on a missing topic
+  # mails every project owner (#2426). sink_drain cannot cover that: it is a
+  # fixed timer and a teardown's length varies with the cluster.
   #
-  # On apply it means the ingress is built before the cluster. That is correct
-  # -- a sink with no cluster to watch exports nothing -- but it is not free,
-  # in two ways worth knowing before anyone widens the edge.
+  # Passed as a value rather than named in depends_on, and the difference is
+  # load-bearing. A module-level depends_on defers every data source inside
+  # the module while the target has a planned change. Here that would reach
+  # data.google_container_cluster.existing, which exists when create_cluster
+  # is false and is where cluster_endpoint comes from -- so an ordinary edit
+  # to the ingress would leave provider "helm" (providers.tf) without a host,
+  # and a helm provider that cannot reach the cluster reports every release as
+  # absent: the plan plans helm_release.kube_agents and cert_manager as
+  # creates, and the apply trips over a name still in use. An input reaches
+  # only the gate the two cluster resources depend on, so the data source
+  # stays outside the edge and the destroy order is unchanged.
   #
-  # It serialises what used to run in parallel. The cluster is the install's
-  # long pole, and it now waits for the whole ingress, including
-  # time_sleep.logging_identity's own wait. A greenfield install with
-  # enable_drift_pubsub on is longer by roughly the ingress's critical path.
-  # The ingress's documented "Service account ... does not exist" failure also
-  # now aborts before the cluster is requested rather than after it is built,
-  # which makes the retry cheaper and the first failure earlier.
-  #
-  # And a module-level depends_on defers every data source inside the module
-  # whenever a target has a planned change -- the mechanism the drift_pubsub
-  # call below and the scope_resolver call document for themselves. Here that
-  # reaches data.google_container_cluster.existing, which exists only when
-  # create_cluster is false, so on a bring-your-own-cluster install an apply
-  # whose only change is in the ingress defers that read to apply time and
-  # with it the Workload Identity and NetworkPolicy postconditions, which are
-  # written to refuse a plan rather than fail partway through one. Narrowing
-  # the edge does not avoid it: Terraform resolves an indexed depends_on
-  # reference to the whole resource, and a root depends_on cannot name
-  # anything finer than a module. It is the price of the ordering rather than
-  # an oversight, and it is confined to the case where the ordering buys
-  # nothing anyway -- an external cluster outlives the destroy, so the drain
-  # is doing the work there.
-  depends_on = [google_project_service.required, module.drift_pubsub]
+  # one(), not [0]: the ingress is count-gated and this has to resolve to null
+  # when it is off.
+  create_after = one(module.drift_pubsub[*].topic_name)
+
+  depends_on = [google_project_service.required]
 }
 
 module "gke_backup_plan" {

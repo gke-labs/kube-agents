@@ -788,10 +788,14 @@ enabled APIs.
 `roles/pubsub.subscriber` and `roles/pubsub.viewer` on the subscription for the
 agent's GSA are granted here rather than inside the module, next to the module
 call. That is what keeps the module clear of `kube-agents-iam`, and so clear of
-the cluster: the cluster module depends on the ingress, which makes Terraform
-destroy the cluster first and delete the topic last. Without that ordering the
-topic goes while the control plane is still emitting matching audit records,
-and each one mails every project owner. The module README's
+the cluster: `gke_cluster` takes the ingress's topic name as its `create_after`
+input, which makes Terraform destroy the cluster first and delete the topic
+last. Without that ordering the topic goes while the control plane is still
+emitting matching audit records, and each one mails every project owner. An
+input rather than a `depends_on` on the module call, because a module-level
+`depends_on` would also defer `gke-cluster`'s data sources — including the one
+a `create_cluster = false` install reads the endpoint from, which the Helm
+provider needs at plan time. The module README's
 [ordering section](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
 is canonical; `moved` blocks beside the two grants keep an install created
 by an earlier version, which had them inside the module, from planning a
