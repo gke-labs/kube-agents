@@ -512,6 +512,65 @@ Mutation(
         "a 404 and the gke tools stop working with no policy refusal to read",
     ),
     Mutation(
+        "C1-watcher-token-in-the-agent-container",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('              name: agent-credential-proxy-token\n              readOnly: true\n',
+         '              name: agent-credential-proxy-token\n              readOnly: true\n'
+         '            - mountPath: /var/run/secrets/kubeagents/watcher-proxy\n'
+         '              name: watcher-credential-proxy-token\n'
+         '              readOnly: true\n'),
+        "test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth",
+        "mount the watcher token beside the chat token in platform-agent so a "
+        "skill can reuse it -- the model's container then holds a token that "
+        "reads every fleet cluster's events and objects through the broker",
+    ),
+    Mutation(
+        "C1-watcher-route-allows-a-list",
+        "agents/platform/scripts/watcher_policy.py",
+        ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
+         '_EVENTS_LIST = re.compile(r"api/v1/(events|pods)")\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "let the watcher list pods too, for a richer triage message -- the "
+        "events-only route becomes a fleet-wide pod dump on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-legacy-watch-path",
+        "agents/platform/scripts/watcher_policy.py",
+        ('REFUSED_PATH_SEGMENTS = frozenset({"watch", "proxy"})\n',
+         'REFUSED_PATH_SEGMENTS = frozenset({"proxy"})\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "drop `watch` from the refused segments as a leftover of an older API -- "
+        "the server still serves watch/secrets, and the named-GET rule reads it "
+        "as an object called `secrets`",
+    ),
+    Mutation(
+        "C1-watcher-subscription-unpinned",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not subscription or match.group("sub") != subscription:\n',
+         '        if not subscription:\n'),
+        "test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription",
+        "drop the equality check when renaming the subscription env -- the "
+        "relay then pulls and acks any subscription the broker can reach",
+    ),
+    Mutation(
+        "C1-watcher-routes-opened-to-chat",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),\n",
+         "    (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER, CALLER_ROLE_CHAT)),\n"),
+        "test_C1_only_the_watcher_role_reaches_the_watcher_routes",
+        "let the gateway's chat token read fleet objects for a new tool -- the "
+        "Hermes container then reaches every fleet API server through the broker",
+    ),
+    Mutation(
+        "C1-drift-default-subscription-drift",
+        "k8s-operator/internal/controller/platformagent_broker_split.go",
+        ('\tdriftDetectorDefaultSubscription = "platform-agent-drift-audit-sub"\n',
+         '\tdriftDetectorDefaultSubscription = "platform-agent-drift-sub"\n'),
+        "test_C1_the_operator_pins_the_drift_detectors_own_default_subscription",
+        "rename the default on one side -- the broker then refuses every pull "
+        "the detector makes on an install that never named a subscription",
+    ),
+    Mutation(
         "B1-slack-remove-allowlist-widened",
         "agents/platform/scripts/credential_proxy.py",
         ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',

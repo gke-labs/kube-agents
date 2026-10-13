@@ -167,7 +167,8 @@ func applyJoinThrottle(cfg *rest.Config) {
 }
 
 // profilesDiscovery is the profile scan discoverProfileClusters runs. Its zero
-// value reaches the real GKE API with this process's own Google credentials;
+// value reaches the real GKE API with this process's own Google credentials, or
+// through the credential proxy when clusterprofiles.BrokerFromEnv names one;
 // the tests replace its Describe and TokenSource fields so the scan needs
 // neither. OnSkip is set per call instead, because the message it writes is
 // this binary's rather than the package's.
@@ -344,6 +345,16 @@ func discoverProfileClusters(ctx context.Context, dir string, directlyReached *c
 	d := profilesDiscovery
 	d.OnSkip = skip
 	d.Want = want
+	// The credential proxy, as in k8s-event-watcher: when the operator names
+	// one it replaces the pod's Workload Identity for the describe and for
+	// every profile cluster's reads. A Broker already on the seam is a test's.
+	if d.Broker == nil {
+		broker, err := clusterprofiles.BrokerFromEnv()
+		if err != nil {
+			return scan, err
+		}
+		d.Broker = broker
+	}
 	discovered, err := d.Discover(ctx, dir)
 	if err != nil {
 		return scan, err

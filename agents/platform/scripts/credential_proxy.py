@@ -47,6 +47,7 @@ import providers
 import repo_ref
 import scoped_sa_pool
 import vcs_broker
+import watcher_policy
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
 # file is in its pod and not in this one; these are the vocabulary both sides
@@ -332,6 +333,27 @@ MCP_RELAY_PROTOCOL_VERSION_SHAPE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 # The quota project, from the broker's own credential. The agent's mcp-remote
 # used to send it from its own ADC lookup; it no longer has one.
 MCP_RELAY_USER_PROJECT = "X-Goog-User-Project"
+
+# The watcher routes (`watcher_policy` decides what they relay). The Google half
+# shares the Cloud API relay's credential, timeouts and cap. The query keys the
+# Go API clients add to every call, and nothing else, are forwarded.
+WATCHER_GCP_QUERY_KEYS = frozenset({"alt", "prettyPrint"})
+# The Kubernetes half. The broker finds each cluster's control plane with the
+# GKE API and remembers it this long, so a watch reconnect does not cost a
+# describe call. A connect or TLS failure forgets it, so an address or CA that
+# rotates inside the window costs the request that found out.
+WATCHER_ENDPOINT_TTL_S = 300
+WATCHER_K8S_PORT = 443
+# A list or a named read is bounded like a relayed Google read. A watch is a
+# stream: each read may wait this long (above client-go's 5-10 minute watch
+# timeout, inside Envoy's 1200 s stream idle timeout), and the whole stream is
+# cut at the cap, which client-go answers by re-watching.
+WATCHER_WATCH_READ_TIMEOUT_S = 1100
+WATCHER_WATCH_MAX_S = 3600
+# Forwarded from the caller when it has this shape: client-go negotiates JSON or
+# protobuf with it.
+WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+WATCHER_GCP_CONTENT_TYPE = "application/json"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -760,6 +782,11 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # read-only posture command_policy enforces is the view it gets. A demo aid
 # until declarative profiles carry a session's identity and tools.
 CALLER_ROLE_SESSION = "session"
+# The gateway pod's agent-api-auth container: the k8s-event-watcher and the
+# drift-detector. Its token is projected into that container only, never into
+# the Hermes container beside it, and it reaches the watcher routes and nothing
+# else.
+CALLER_ROLE_WATCHER = "watcher"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -768,7 +795,13 @@ TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
 # a way that cannot tell those two apart.
-CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT, CALLER_ROLE_SESSION)
+CALLER_ROLES = (
+    CALLER_ROLE_SHELL,
+    CALLER_ROLE_CHAT,
+    CALLER_ROLE_A2A_CHAT,
+    CALLER_ROLE_SESSION,
+    CALLER_ROLE_WATCHER,
+)
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
 # whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
@@ -935,6 +968,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # admitted here yet: that is a new read path for them, argued in the change
     # that wires them, not by default.
     (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
+    # The watchers' Google calls: theirs alone. The Hermes container beside
+    # them holds the chat token and cannot present this one.
+    (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
+    (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -2030,6 +2067,16 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; any allowed caller presenting the session audience gets the session "
                     "role, and nothing keeps a session caller off the other audiences"
                 )
+        # The gateway watchers' audience, read raw for the same reason.
+        watcher_audience = os.getenv("CREDENTIAL_PROXY_WATCHER_AUDIENCE", "").strip()
+        if watcher_audience and watcher_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_WATCHER_AUDIENCE equals the %s audience; the watcher "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[watcher_audience] or CALLER_ROLE_SHELL,
+            )
+        elif watcher_audience:
+            audience_roles[watcher_audience] = CALLER_ROLE_WATCHER
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -2433,6 +2480,24 @@ class GoogleApiRelay:
             )
         finally:
             connection.close()
+
+
+def watcher_cluster_address(cluster: dict[str, Any]) -> tuple[str, str] | None:
+    """`(host, CA PEM or "")` from a GKE `Cluster`, or None. See `_watcher_cluster_endpoint`."""
+    endpoints = cluster.get("controlPlaneEndpointsConfig") or {}
+    dns = endpoints.get("dnsEndpointConfig") or {}
+    dns_endpoint = dns.get("endpoint") or ""
+    endpoint = cluster.get("endpoint") or ""
+    if dns_endpoint and (dns.get("allowExternalTraffic") or endpoint == dns_endpoint):
+        return dns_endpoint, ""
+    ca = ((cluster.get("masterAuth") or {}).get("clusterCaCertificate")) or ""
+    if not endpoint or not ca:
+        return None
+    try:
+        pem = base64.b64decode(ca, validate=True).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return endpoint, pem
 
 
 class GoogleChatRelay:
@@ -7884,6 +7949,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # exists. None only in a test that has not set it, where the route
     # answers 503.
     api_relay: GoogleApiRelay | None = None
+    # The drift detector's subscription, `projects/<p>/subscriptions/<s>`, the
+    # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
+    # and every Pub/Sub call is refused.
+    watcher_subscription: str = ""
+    # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
+    # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
+    watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
+    watcher_endpoints_lock = threading.Lock()
     base_branch: str = ""
     # (forge host, path) -> the base every proposal onto that repository must
     # target, from `parse_pinned_bases`. Each pinned branch is also protected
@@ -8035,6 +8108,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()
             return
+        if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
+            self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
+            self._handle_watcher_k8s()
+            return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
             # The optional server-to-client SSE channel. None of the relayed
             # servers streams, and the spec's answer for that is 405.
@@ -8107,6 +8186,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
             self._handle_mcp_relay()
+            return
+        if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
+            self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
+            # GET only; reaches the handler so the refusal names its rule.
+            self._handle_watcher_k8s()
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
@@ -8975,6 +9061,266 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(reply_body)))
         self.end_headers()
         self.wfile.write(reply_body)
+
+    def _handle_watcher_gcp(self) -> None:
+        """`/v1/watcher/gcp/<host>/<path>`: one GKE or Pub/Sub call for the watchers.
+
+        The k8s-event-watcher and the drift-detector used to make these calls on
+        the gateway pod's own Workload Identity. `watcher_policy.evaluate_gcp`
+        is the table; the forwarding is the Cloud API relay's, with a body for
+        the Pub/Sub POSTs, and the status, Content-Type and body pass back.
+        """
+        request_id = str(uuid.uuid4())
+        parts = urllib.parse.urlsplit(self.path)
+        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
+        body = b""
+        if self.command == watcher_policy.METHOD_POST:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0 or length > self.max_request_bytes:
+                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
+                return
+            body = self.rfile.read(length)
+        problem = api_relay_target_problem(host, path, "")
+        query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
+            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+        if problem is not None:
+            code, reason = problem
+            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
+            return
+        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        if not decision.allowed:
+            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return
+        if self.api_relay is None:
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
+            )
+            return
+        authorization = self._relay_authorization("watcher gcp", request_id)
+        if authorization is None:
+            return
+        target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
+        extra: dict[str, Any] = {}
+        if self.command == watcher_policy.METHOD_POST:
+            extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
+        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        if upstream is None:
+            return
+        if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
+            LOGGER.warning(
+                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                request_id,
+                upstream.status,
+                upstream.over_cap,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+            )
+            return
+        LOGGER.info(
+            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            request_id,
+            decision.rule_id,
+            upstream.status,
+            len(upstream.body),
+        )
+        self.send_response(upstream.status)
+        if upstream.content_type:
+            self.send_header("Content-Type", sanitize_header(upstream.content_type))
+        self.send_header("Content-Length", str(len(upstream.body)))
+        self.end_headers()
+        self.wfile.write(upstream.body)
+
+    def _watcher_cluster_endpoint(self, target: dict[str, str], request_id: str) -> tuple[str, str] | None:
+        """`(host, CA PEM or "")` for a fleet cluster's control plane, or None after answering.
+
+        The same choice `clusterprofiles.ClientConfigForIdentity` makes in Go, on
+        the same GKE API fields: the DNS endpoint wherever it takes external
+        traffic, or wherever GKE mirrors it into `endpoint` (no CA: it is a
+        Google front end with a public certificate); otherwise the IP endpoint
+        with the cluster's own CA. Remembered for WATCHER_ENDPOINT_TTL_S.
+        """
+        key = (target["project"], target["location"], target["cluster"])
+        now = time.monotonic()
+        with self.watcher_endpoints_lock:
+            cached = self.watcher_endpoints.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1], cached[2]
+        if self.api_relay is None:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"})
+            return None
+        authorization = self._relay_authorization("watcher k8s", request_id)
+        if authorization is None:
+            return None
+        describe = f"/v1/projects/{key[0]}/locations/{key[1]}/clusters/{key[2]}"
+        upstream = self._relay_fetch("watcher k8s", request_id, watcher_policy.GKE_HOST, describe, authorization)
+        if upstream is None:
+            return None
+        try:
+            cluster = json.loads(upstream.body) if upstream.status == HTTPStatus.OK else None
+        except ValueError:
+            cluster = None
+        resolved = watcher_cluster_address(cluster) if isinstance(cluster, dict) else None
+        if resolved is None:
+            LOGGER.warning(
+                "watcher k8s endpoint unresolved request_id=%s describe_status=%d", request_id, upstream.status
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the cluster's control plane could not be found", "code": "CLUSTER_ENDPOINT_UNRESOLVED"},
+            )
+            return None
+        with self.watcher_endpoints_lock:
+            self.watcher_endpoints[key] = (now + WATCHER_ENDPOINT_TTL_S, resolved[0], resolved[1])
+        return resolved
+
+    def _watcher_k8s_connection(self, host: str, ca_pem: str) -> http.client.HTTPConnection:
+        """A TLS connection to a fleet control plane; the seam a test points at a fake.
+
+        Verified against the cluster's own CA for an IP endpoint, against the
+        system roots for a DNS endpoint. The connect is bounded like the Cloud
+        API relay's.
+        """
+        context = ssl.create_default_context(cadata=ca_pem) if ca_pem else ssl.create_default_context()
+        return http.client.HTTPSConnection(
+            host, WATCHER_K8S_PORT, timeout=API_RELAY_CONNECT_TIMEOUT_S, context=context
+        )
+
+    def _handle_watcher_k8s(self) -> None:
+        """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
+
+        The event watcher's list and watch of events, and the drift detector's
+        read of one named object, on the broker's credential.
+        `watcher_policy.evaluate_k8s` is the table. A watch is streamed through
+        as the API server sends it; everything else is streamed too, with the
+        Cloud API relay's deadline on each read.
+        """
+        request_id = str(uuid.uuid4())
+        if self.command != watcher_policy.METHOD_GET:
+            drain_request_body(self, self.max_request_bytes)
+        parts = urllib.parse.urlsplit(self.path)
+        rest = parts.path[len(watcher_policy.WATCHER_K8S_PREFIX) :]
+        if len(parts.query) > API_RELAY_MAX_QUERY_BYTES or not API_RELAY_QUERY_SHAPE.match(parts.query):
+            # The same bound the Cloud API relay puts on a query it forwards:
+            # bytes http.client will put on a request line, and not too many.
+            LOGGER.warning("watcher k8s rejected request_id=%s code=%s", request_id, API_RELAY_BAD_QUERY)
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "the query is not in a form the relay forwards", "code": API_RELAY_BAD_QUERY},
+            )
+            return
+        query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        decision = watcher_policy.evaluate_k8s(self.command, rest, query)
+        if not decision.allowed:
+            LOGGER.warning("watcher k8s blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return
+        target, k8s_path = watcher_policy.split_k8s_target(rest)
+        resolved = self._watcher_cluster_endpoint(target, request_id)
+        if resolved is None:
+            return
+        host, ca_pem = resolved
+        authorization = self._relay_authorization("watcher k8s", request_id)
+        if authorization is None:
+            return
+        watching = watcher_policy.is_watch(query)
+        read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
+        connection = self._watcher_k8s_connection(host, ca_pem)
+        started = time.monotonic()
+        answered = False
+        try:
+            connection.connect()
+            connection.sock.settimeout(read_timeout)
+            target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
+            connection.putrequest(watcher_policy.METHOD_GET, target_path, skip_accept_encoding=True)
+            connection.putheader("Authorization", authorization)
+            accept = self.headers.get("Accept")
+            if accept and WATCHER_K8S_ACCEPT_SHAPE.match(accept):
+                connection.putheader("Accept", accept)
+            connection.endheaders()
+            response = connection.getresponse()
+            if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
+                LOGGER.warning("watcher k8s redirect refused request_id=%s status=%d", request_id, response.status)
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
+                )
+                return
+            LOGGER.info(
+                "watcher k8s forwarded request_id=%s rule=%s status=%d watch=%s",
+                request_id,
+                decision.rule_id,
+                response.status,
+                watching,
+            )
+            self.send_response(response.status)
+            answered = True
+            content_type = response.getheader("Content-Type", "")
+            if content_type:
+                self.send_header("Content-Type", sanitize_header(content_type))
+            self.end_headers()
+            # No Content-Length: the handler speaks HTTP/1.0 and closes after the
+            # body, which is how a stream of unknown length ends.
+            sent = 0
+            while True:
+                if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
+                    break
+                chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                sent += len(chunk)
+            LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
+        except (OSError, http.client.HTTPException) as exc:
+            # Before the status line, an answer, and the cached address is
+            # forgotten in case it is what failed; after it, nothing more is
+            # written and the stream is cut, which the client answers by
+            # re-listing or re-watching, as it would on any dropped watch.
+            LOGGER.warning(
+                "watcher k8s upstream failed request_id=%s type=%s answered=%s",
+                request_id,
+                type(exc).__name__,
+                answered,
+            )
+            if answered:
+                self.close_connection = True
+            else:
+                key = (target["project"], target["location"], target["cluster"])
+                with self.watcher_endpoints_lock:
+                    self.watcher_endpoints.pop(key, None)
+                with contextlib.suppress(OSError):
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": "the API server could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+                    )
+        finally:
+            connection.close()
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.
@@ -9946,6 +10292,7 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
+    CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

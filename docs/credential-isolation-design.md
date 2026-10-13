@@ -230,7 +230,9 @@ Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
 pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
-the gateway and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
+alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
+broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
@@ -960,8 +962,9 @@ file and never a `.git` it can write into.
   runs under `<agent>-shell`, annotated with nothing.
 - `automountServiceAccountToken: false` applies to the Pod.
 - The event watcher's projected ServiceAccount token is mounted only by
-  `agent-api-auth`. The `platform-agent` container mounts one of its own — the
-  broker-audience token it presents to the broker Service — and the dashboard
+  `agent-api-auth`, and so is the watchers' broker token (audience
+  `kubeagents-credential-proxy-watcher`). The `platform-agent` container mounts one of its own — the
+  chat-audience token it presents to the broker Service — and the dashboard
   mounts none.
 - Secret and credential-state volumes are mounted only in the broker Pod.
 - Every container runs non-root, drops all Linux capabilities, disallows

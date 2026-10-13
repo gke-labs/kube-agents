@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -128,6 +129,18 @@ SOURCES: dict[str, Source] = {
         "agents/platform/scripts/mcp_policy.py",
         ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
     ),
+    # C1 imports this module: what the broker relays for the gateway's
+    # watchers under the watcher role.
+    "watcher_policy": Source(
+        "agents/platform/scripts/watcher_policy.py",
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX"),
+    ),
+    # C1 holds the operator's copy of the drift detector's default
+    # subscription to the detector's own.
+    "drift_detector_main_go": Source(
+        "k8s-operator/cmd/drift-detector/main.go",
+        ("defaultSubscriptionName =",),
+    ),
     # --- the agent's MCP servers ------------------------------------------
     # B1 reads where each profile's remote MCP servers point. The Platform
     # Agent's config is the shared defaults merged with its overlay, and the
@@ -182,7 +195,8 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
+         "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",

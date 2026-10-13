@@ -103,7 +103,8 @@ type Cluster struct {
 
 // Discoverer scans a profiles directory. The zero value reaches the real GKE
 // API with this process's own Google credentials and reports nothing about the
-// profiles it skips; the fields below replace those pieces.
+// profiles it skips; the fields below replace those pieces, and Broker replaces
+// the credentials.
 type Discoverer struct {
 	// Describe reads one cluster's control-plane addressing. nil asks the GKE
 	// API. A field rather than a package-level variable so a test can answer
@@ -113,8 +114,16 @@ type Discoverer struct {
 
 	// TokenSource mints the credential every discovered cluster is reached
 	// with. nil uses this process's Application Default Credentials at
-	// GKEAuthScope. A field for the same reason as Describe.
+	// GKEAuthScope. A field for the same reason as Describe. Unused when
+	// Broker is set.
 	TokenSource func(ctx context.Context) (oauth2.TokenSource, error)
+
+	// Broker, when set, routes discovery through the credential proxy instead
+	// of this process's Google credentials: the describe goes to the proxy's
+	// GKE route (unless Describe is set, which still wins), and each config
+	// addresses the proxy's route for that cluster rather than its control
+	// plane, so no token is minted here at all. nil is Workload Identity.
+	Broker *Broker
 
 	// Want decides whether a profile's cluster is one this caller wants at all,
 	// from its identity alone and before anything is spent on reaching it. nil
@@ -150,6 +159,9 @@ func (d Discoverer) describe(ctx context.Context, id Identity) (*container.Clust
 	if d.Describe != nil {
 		return d.Describe(ctx, id)
 	}
+	if d.Broker != nil {
+		return d.Broker.describeCluster(ctx, id)
+	}
 	return describeClusterViaAPI(ctx, id)
 }
 
@@ -158,6 +170,30 @@ func (d Discoverer) tokenSource(ctx context.Context) (oauth2.TokenSource, error)
 		return d.TokenSource(ctx)
 	}
 	return defaultTokenSource(ctx)
+}
+
+// describedBy names who answered the describe, for the skip message.
+func (d Discoverer) describedBy() string {
+	if d.Broker != nil && d.Describe == nil {
+		return "the GKE API through the credential proxy"
+	}
+	return "the GKE API"
+}
+
+// clientConfig is the config one discovered cluster is reached with. Through
+// the proxy the describe still runs -- it is what proves the cluster exists and
+// carries the Autopilot bit -- but its addressing is not used: the proxy
+// resolves the control plane itself.
+func (d Discoverer) clientConfig(id Identity, described *container.Cluster, ts oauth2.TokenSource) (*rest.Config, error) {
+	if d.Broker != nil {
+		return d.Broker.ClientConfig(id)
+	}
+	cfg, err := ClientConfigForIdentity(described)
+	if err != nil {
+		return nil, err
+	}
+	UseGoogleTokenSource(cfg, ts)
+	return cfg, nil
 }
 
 func (d Discoverer) skip(profile string, err error) {
@@ -356,7 +392,7 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 			continue
 		}
 
-		if tokenSource == nil {
+		if d.Broker == nil && tokenSource == nil {
 			tokenSource, err = d.tokenSource(ctx)
 			if err != nil {
 				d.skip(e.Name(), fmt.Errorf("this pod has no Google credentials, so its control plane cannot be reached: %w", err))
@@ -365,15 +401,14 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		}
 		described, err := d.describe(ctx, *identity)
 		if err != nil {
-			d.skip(e.Name(), fmt.Errorf("asking the GKE API where %s is: %w", identity, err))
+			d.skip(e.Name(), fmt.Errorf("asking %s where %s is: %w", d.describedBy(), identity, err))
 			continue
 		}
-		cfg, err := ClientConfigForIdentity(described)
+		cfg, err := d.clientConfig(*identity, described, tokenSource)
 		if err != nil {
 			d.skip(e.Name(), err)
 			continue
 		}
-		UseGoogleTokenSource(cfg, tokenSource)
 
 		seen[identity.String()] = e.Name()
 		clusters = append(clusters, Cluster{

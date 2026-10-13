@@ -219,8 +219,12 @@ Two flags reach `spec.harness.driftDetector`, `subscription` and `gitopsManagers
 where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector
 joins its own cluster and every Cluster Agent profile, whichever project it names, without being asked.
 
-Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
-agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
+Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
+and `WATCHER_BROKER_TOKEN_FILE`, set by the operator; the broker relays the four calls on the one
+configured subscription, and fleet reads the same way as the event watcher's). The credential behind
+those calls is then the broker's, which needs `roles/pubsub.subscriber` on the subscription; with
+neither variable set, Application Default Credentials need it — the Workload Identity the
+`drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
 for the startup ack-deadline check described under
 [Three things to know before changing it](#three-things-to-know-before-changing-it): subscriber does
 not carry `subscriptions.get`. The module grants both, so this is a note for a

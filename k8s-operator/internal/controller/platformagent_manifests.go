@@ -3310,6 +3310,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// watcher here, and so does the token the agent presents across the network.
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	volumes = append(volumes, buildWatcherTokenVolume())
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 	}
@@ -4063,6 +4064,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watcher's --profiles-dir and its dedup snapshots, both under
 			// CREDENTIAL_PROXY_WORKSPACE_ROOT above.
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
+			// The watchers' broker token. Here and in no other container of this
+			// Pod: the watcher role is what reaches the fleet through the broker.
+			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4093,6 +4097,9 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		// The watcher authenticates to the Session KV server with this; see
 		// start-services.sh --token-env.
 		{Name: "SESSION_KV_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)}},
+		// The watchers make their Google calls through the broker with this.
+		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
+		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
@@ -4254,7 +4261,13 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+		// The watchers' audience, in both modes: agent-api-auth always runs
+		// them.
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
 	)
+	if driftDetectorEnabled(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherSubscriptionEnvVar, Value: watcherPubsubSubscription(agent)})
+	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods' audience. Rendered only with the flag, so a
 		// broker on an install without it has no session role to confer
@@ -4441,6 +4454,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// One that could set the session callers could unbind the session
 		// ServiceAccount from its audience, or bind another to it.
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		// One that could set the watcher audience would decide who holds the
+		// watcher role; one that could set the subscription would point the
+		// watcher relay at any subscription the broker's credential can pull;
+		// and the two on agent-api-auth would point the watchers' token at a
+		// listener of their own.
+		"CREDENTIAL_PROXY_WATCHER_AUDIENCE",
+		watcherSubscriptionEnvVar,
+		watcherBrokerURLEnvVar,
+		watcherBrokerTokenFileEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a

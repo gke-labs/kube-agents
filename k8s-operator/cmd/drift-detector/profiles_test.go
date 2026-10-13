@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -675,5 +677,76 @@ func TestUnreachableClustersCapsTheNameSet(t *testing.T) {
 	}
 	if strings.Contains(joined, "past-the-cap-") {
 		t.Errorf("a new name past the cap was stored:\n%s", joined)
+	}
+}
+
+// With the credential proxy named in the environment, the zero discovery seam
+// describes through the proxy and each profile cluster's config addresses the
+// proxy's route for it, with the projected token and the join's throttle --
+// and Application Default Credentials, pointed at a missing file, are never
+// read.
+func TestDiscoverProfileClustersThroughTheBroker(t *testing.T) {
+	saved := profilesDiscovery
+	t.Cleanup(func() { profilesDiscovery = saved })
+	profilesDiscovery = clusterprofiles.Discoverer{}
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/watcher/gcp/container.googleapis.com/") {
+			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1"}`)
+			return
+		}
+		fmt.Fprint(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
+	}))
+	defer srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("sa-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	t.Setenv(clusterprofiles.BrokerURLEnv, srv.URL)
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, tokenFile)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-example-project-prod-us-central1", "example-project", "prod", "us-central1")
+
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("discoverProfileClusters: %v", err)
+	}
+	if scan.Skipped != 0 || len(scan.Clusters) != 1 {
+		t.Fatalf("got %d clusters, %d skipped; want 1 and 0", len(scan.Clusters), scan.Skipped)
+	}
+	cfg := scan.Clusters[0].Config
+	if want := srv.URL + "/v1/k8s/example-project/us-central1/prod"; cfg.Host != want {
+		t.Errorf("Host = %q, want %q", cfg.Host, want)
+	}
+	if cfg.BearerTokenFile != tokenFile || cfg.QPS != joinClientQPS {
+		t.Errorf("BearerTokenFile = %q QPS = %v, want %q and %v", cfg.BearerTokenFile, cfg.QPS, tokenFile, joinClientQPS)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/example-project/locations/us-central1/clusters/prod Bearer sa-token"
+	if len(requests) != 1 || requests[0] != want {
+		t.Errorf("requests = %v, want [%s]", requests, want)
+	}
+}
+
+// Half the pair stops the scan rather than falling back to the pod's own
+// Google identity.
+func TestDiscoverProfileClustersRefusesHalfABroker(t *testing.T) {
+	stubGKE(t)
+	t.Setenv(clusterprofiles.BrokerURLEnv, "")
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, "/var/run/token")
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-example-project-prod-us-central1", "example-project", "prod", "us-central1")
+	if _, err := discoverProfileClusters(context.Background(), dir, nil); err == nil ||
+		!strings.Contains(err.Error(), clusterprofiles.BrokerURLEnv) {
+		t.Errorf("discoverProfileClusters error = %v, want one naming %s", err, clusterprofiles.BrokerURLEnv)
 	}
 }

@@ -23,7 +23,10 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/api/option"
 	pubsub "google.golang.org/api/pubsub/v1"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 const (
@@ -236,9 +239,20 @@ type pubsubSource struct {
 
 // newPubsubSource builds a source for a subscription, using Application
 // Default Credentials -- inside the agent pod, the Workload Identity the
-// drift-pubsub module granted roles/pubsub.subscriber to.
+// drift-pubsub module granted roles/pubsub.subscriber to -- unless
+// clusterprofiles.BrokerFromEnv names the credential proxy, in which case every
+// call (Get, Pull, Acknowledge, ModifyAckDeadline) goes to the proxy's Pub/Sub
+// route with the pod's projected token and no Google credential is read here.
 func newPubsubSource(ctx context.Context, project, subscription string) (*pubsubSource, error) {
-	service, err := pubsub.NewService(ctx)
+	broker, err := clusterprofiles.BrokerFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	var opts []option.ClientOption
+	if broker != nil {
+		opts = broker.GoogleAPIOptions(clusterprofiles.PubsubAPIHost)
+	}
+	service, err := pubsub.NewService(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("pubsub client: %w", err)
 	}

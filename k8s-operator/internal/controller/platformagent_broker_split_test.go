@@ -954,3 +954,33 @@ func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
 		}
 	}
 }
+
+// TestTheBrokerPinsTheDriftDetectorsOwnSubscription: the watcher relay refuses
+// every Pub/Sub call but the subscription named here, so it has to be the one
+// the detector itself resolves (cmd/drift-detector subscriptionPath): a bare
+// name qualified with the harness project, a qualified name kept as it is, and
+// no name meaning the detector's default.
+func TestTheBrokerPinsTheDriftDetectorsOwnSubscription(t *testing.T) {
+	for _, tc := range []struct {
+		name, subscription, want string
+	}{
+		{"default", "", "projects/test-project/subscriptions/" + driftDetectorDefaultSubscription},
+		{"bare", "my-sub", "projects/test-project/subscriptions/my-sub"},
+		{"qualified", "projects/other-project/subscriptions/x-sub", "projects/other-project/subscriptions/x-sub"},
+		{"by number", "projects/123456789/subscriptions/x-sub", "projects/123456789/subscriptions/x-sub"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true), Subscription: tc.subscription})
+			if got := watcherPubsubSubscription(agent); got != tc.want {
+				t.Errorf("watcherPubsubSubscription = %q, want %q", got, tc.want)
+			}
+			if value, found := brokerEnvValue(buildCredentialProxyEnv(agent), watcherSubscriptionEnvVar); !found || value != tc.want {
+				t.Errorf("broker %s = %q (present=%v), want %q", watcherSubscriptionEnvVar, value, found, tc.want)
+			}
+		})
+	}
+	off := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})
+	if _, found := brokerEnvValue(buildCredentialProxyEnv(off), watcherSubscriptionEnvVar); found {
+		t.Errorf("with the detector off the broker must name no subscription, so every Pub/Sub call is refused")
+	}
+}

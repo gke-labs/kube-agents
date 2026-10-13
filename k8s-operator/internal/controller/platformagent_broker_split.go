@@ -95,6 +95,31 @@ const (
 
 	agentCredentialProxyTokenVolume = "agent-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
 
+	// credentialProxyWatcherAudience is the gateway's watchers' audience: the
+	// k8s-event-watcher and the drift-detector in agent-api-auth make their
+	// Google calls through the broker under the `watcher` role. Its own
+	// audience because the role is conferred by audience, and its token is
+	// projected into agent-api-auth only, so the Hermes container beside it
+	// holds the chat token and cannot reach these routes. Spelled identically
+	// in credential_proxy.py.
+	credentialProxyWatcherAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	// watcherTokenVolume and watcherTokenMountPath carry that token.
+	watcherTokenVolume    = "watcher-credential-proxy-token"            // #nosec G101 -- Volume name, not a credential
+	watcherTokenMountPath = "/var/run/secrets/kubeagents/watcher-proxy" // #nosec G101 -- Mount path, not a credential
+	// watcherBrokerURLEnvVar and watcherBrokerTokenFileEnvVar tell the two
+	// watchers where the broker is and which token to present; the Go side
+	// reads them in internal/clusterprofiles (BrokerFromEnv).
+	watcherBrokerURLEnvVar       = "WATCHER_BROKER_URL"
+	watcherBrokerTokenFileEnvVar = "WATCHER_BROKER_TOKEN_FILE" // #nosec G101 -- Env var name, not a credential
+	// watcherSubscriptionEnvVar is the broker's copy of the drift detector's
+	// subscription, fully qualified: the one Pub/Sub target its watcher routes
+	// reach.
+	watcherSubscriptionEnvVar = "WATCHER_PUBSUB_SUBSCRIPTION"
+	// driftDetectorDefaultSubscription is the detector's own default, the
+	// subscription the drift-pubsub module creates (cmd/drift-detector/main.go
+	// defaultSubscriptionName). tests/conformance holds the two equal.
+	driftDetectorDefaultSubscription = "platform-agent-drift-audit-sub"
+
 	// mcpRelayURLEnvVar names the broker's remote MCP relay for the agent
 	// container. The agent configs interpolate it into each mcp-remote
 	// server's URL (`${KUBE_AGENTS_MCP_RELAY_URL}/gke`), so every
@@ -214,6 +239,37 @@ func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 			}}},
 		}},
 	}
+}
+
+// buildWatcherTokenVolume projects the token the gateway's watchers present to
+// the broker, for the watcher audience. Mounted into agent-api-auth only.
+func buildWatcherTokenVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: watcherTokenVolume,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0400)),
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience: credentialProxyWatcherAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
+			}}},
+		}},
+	}
+}
+
+// watcherPubsubSubscription is the drift detector's subscription as the broker
+// pins it: `projects/<p>/subscriptions/<s>`. The detector takes a bare name or a
+// qualified one, and defaults the name when the CR gives none
+// (cmd/drift-detector/main.go defaultSubscriptionName); this resolves all three
+// the same way the detector does.
+func watcherPubsubSubscription(agent *agentv1alpha1.PlatformAgent) string {
+	name := driftDetectorSubscription(agent)
+	if strings.HasPrefix(name, "projects/") {
+		return name
+	}
+	if name == "" {
+		name = driftDetectorDefaultSubscription
+	}
+	project, _, _ := driftDetectorHarness(agent)
+	return fmt.Sprintf("projects/%s/subscriptions/%s", project, name)
 }
 
 // buildCredentialBrokerTokenReviewRole lets the broker verify the tokens its

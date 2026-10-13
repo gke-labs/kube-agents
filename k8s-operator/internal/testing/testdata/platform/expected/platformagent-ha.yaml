@@ -1044,6 +1044,8 @@ spec:
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
               value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+            - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
+              value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1645,6 +1647,10 @@ spec:
                   key: SESSION_KV_API_KEY
                   name: platform-agent-secrets
                   optional: true
+            - name: WATCHER_BROKER_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: WATCHER_BROKER_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/watcher-proxy/token
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -1703,6 +1709,9 @@ spec:
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /var/run/secrets/kubeagents/watcher-proxy
+              name: watcher-credential-proxy-token
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsGroup: 10000
@@ -1787,6 +1796,14 @@ spec:
             sources:
               - serviceAccountToken:
                   audience: kubeagents-credential-proxy-chat
+                  expirationSeconds: 3600
+                  path: token
+        - name: watcher-credential-proxy-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
         - name: sandbox-ssh-secret
