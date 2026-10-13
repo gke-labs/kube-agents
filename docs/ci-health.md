@@ -849,7 +849,7 @@ mean "retest" by that word, and this one has nothing to retest for.
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
 past which it starts no check and cuts every command short, so a stall costs the reads it
 hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
-scan's own ceiling (1620 s: five waves of seven projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
+scan's own ceiling (1620 s: five waves of eight projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
 laptop as whoever is logged in.
