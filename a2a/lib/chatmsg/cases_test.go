@@ -8,9 +8,9 @@ import (
 )
 
 // casesDir holds the shared cases, from this package's directory: each file
-// is an input lifted from a today presenter test and the chat messages the
-// emitter owes for it (tests/conformance/chat, read by the Python presenters'
-// reader too).
+// is an input from a today presenter test, or built to show the rule one
+// pins, and the chat messages the emitter owes for it (tests/conformance/chat,
+// read by the Python presenters' reader too).
 const casesDir = "../../../tests/conformance/chat"
 
 // sharedCase is the part of a case file this test reads.

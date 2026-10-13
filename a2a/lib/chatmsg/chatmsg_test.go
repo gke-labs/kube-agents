@@ -593,6 +593,17 @@ func TestAssertion27(t *testing.T) {
 		if r := ReadArtifact(Result, replaced); r.Fallback != "final" || r.Message == nil {
 			t.Errorf("ReadArtifact(replace) = %+v", r)
 		}
+		// A replaced chunk's chat message goes with it: neither a second
+		// message nor a misplaced one counts once the artifact is replaced.
+		for name, draft := range map[string]lib.ArtifactUpdate{
+			"a whole answer republished": chunk([]lib.Part{text("draft"), dataPart(t, full())}, false, true),
+			"a misplaced draft":          chunk([]lib.Part{text("draft"), dataPart(t, full())}, false, false),
+		} {
+			final := chunk([]lib.Part{text("final"), dataPart(t, full())}, false, true)
+			if r := ReadArtifact(Turn, []lib.ArtifactUpdate{draft, final}); r.Fallback != "final" || r.Message == nil || len(r.Problems) != 0 {
+				t.Errorf("ReadArtifact(%s) = %+v", name, r)
+			}
+		}
 	})
 }
 
