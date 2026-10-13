@@ -204,6 +204,17 @@ class PlantTest(unittest.TestCase):
         self.assertTrue(self.report.is_symlink())
         self.assertEqual(target.read_text(), _PLANTED)
 
+    def test_never_writes_through_a_link_at_a_temporary_name(self):
+        # The shell runs as root in a directory the model can write.
+        victim = self.sandbox / "victim"
+        victim.write_text("UNTOUCHED\n")
+        (self.sandbox / (self.report.name + ".tmp")).symlink_to(victim)
+        result = self._run(_CREATE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(victim.read_text(), "UNTOUCHED\n")
+        self.assertIn("set -C", _CREATE)
+        self.assertNotIn("chown", _CREATE)
+
     def test_the_planted_file_is_not_the_real_report(self):
         module = _MODULE.read_text()
         self.assertIn('report_name = "INVENTORY.bench-${var.case_suffix}.md"', module)

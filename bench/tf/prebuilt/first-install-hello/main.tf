@@ -132,11 +132,13 @@ resource "null_resource" "planted_report" {
       # One remote step, so nothing lands between the check and the write: the
       # link fails rather than replace a file that appeared meanwhile. A file
       # holding this stack's own text is one an earlier run left and is kept;
-      # anything else at the path is not this case's to replace. The copy is
-      # owned as the data volume is, so the plugin's read as the terminal's
-      # login can open it.
+      # anything else at the path is not this case's to replace. The shell
+      # runs as root in a directory the model can write, so the temporary file
+      # is created exclusively (noclobber) under a name no earlier run used,
+      # never through a link planted there; umask 022 leaves it readable by
+      # the terminal's login, which the plugin reads as.
       result="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
-        'b64="$(cat)"; planted="$(printf "%s" "$b64" | base64 -d)"; if ${local.report_ours}; then echo ours; elif ! { ${local.report_absent}; }; then echo other; elif printf "%s" "$b64" | base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$(dirname "$1")")" "$1.tmp" && chmod 0644 "$1.tmp" && ln "$1.tmp" "$1"; then rm -f "$1.tmp"; echo planted; else rm -f "$1.tmp"; echo raced; fi' \
+        'b64="$(cat)"; planted="$(printf "%s" "$b64" | base64 -d)"; if ${local.report_ours}; then echo ours; elif ! { ${local.report_absent}; }; then echo other; else tmp="$1.$$.tmp"; umask 022; set -C; if printf "%s" "$b64" | base64 -d > "$tmp" && ln "$tmp" "$1"; then rm -f "$tmp"; echo planted; else rm -f "$tmp"; echo raced; fi; fi' \
         sh "$REPORT_PATH")"
       case "$result" in
         planted) echo "Planted $REPORT_PATH on $sandbox_pod." ;;

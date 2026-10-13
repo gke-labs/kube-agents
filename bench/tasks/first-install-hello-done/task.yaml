@@ -112,6 +112,22 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["in this chat", "in the chat", "posted"]
 
+  # The in-progress greeting's two points: it is still looking, and it will
+  # post what it finds later. "In this chat" alone cannot tell the greetings
+  # apart, since the in-progress one may say it too.
+  - name: does-not-say-the-scan-is-running
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - "when (it'?s|it is|i'?m|i am) (done|finished)"
+        - "once (it'?s|it is|i'?m|i am) (done|finished)"
+        - "when it finishes"
+        - "\\b(i'?ll|i will|will) (post|share|send)"
+        - "\\b(i'?m|i am) taking"
+        - "still (running|looking|scanning)"
+
   - name: asks-one-question-and-ends-on-it
     role: objective
     mode: assert
