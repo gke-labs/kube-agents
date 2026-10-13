@@ -3550,6 +3550,21 @@ def merge_guards(existing: dict, fresh: list[dict], reviewed: set[str], seen_at:
                 old["check"] = guard["check"]
         else:
             merged.append(guard)
+    # One object, one check: every failure guard of an object a fresh guard
+    # re-filed this run takes that guard's check, one a keep rule re-submitted
+    # or a failed read held included, so the held path cannot file a second
+    # identity beside the one the re-grade moved. The review's guards come
+    # first in `fresh` and agree per object (`_symptom_group_check`).
+    object_check: dict[tuple[str, str], str] = {}
+    for guard in fresh:
+        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE and guard.get("check") and guard.get("entry") != ENTRY_OPERATION:
+            object_check.setdefault((str(guard.get("cluster")), str(guard.get("object"))), guard["check"])
+    for guard in merged:
+        if guard.get("kind", GUARD_KIND_FAILURE) != GUARD_KIND_FAILURE or guard.get("entry") == ENTRY_OPERATION:
+            continue
+        check = object_check.get((str(guard.get("cluster")), str(guard.get("object"))))
+        if check:
+            guard["check"] = check
     merged.sort(key=_guard_order)
     return {"version": GUARDS_VERSION, "updated_at": seen_at, "guards": merged}
 
@@ -4808,20 +4823,21 @@ def candidate_objects(candidates: list[dict]) -> set[tuple[str, str]]:
 
 
 def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, str]], commands: dict[str, str], seen_at: str, unevaluated: set[str] | frozenset[str] = frozenset()) -> tuple[list[dict], list[dict]]:
-    """One candidate per (check, object) for the failure guards this run
-    observed again on a cluster (`last_seen` is this run: re-observed by the
-    re-check or kept by a keep rule) whose object has no incident this run
-    (`covered`, per `candidate_objects`), under the check its finding was
-    filed under, with its persistence; and the still-flagged identities
-    beside them. A guard a failed read held emits nothing: a candidate with
-    no read behind it would vouch for an observation nobody made; its check
-    is unevaluated and the run partial instead."""
-    groups: dict[tuple[str, str], list[dict]] = {}
+    """One candidate per object for the failure guards this run observed
+    again on a cluster (`last_seen` is this run: re-observed by the re-check
+    or kept by a keep rule) whose object has no incident this run
+    (`covered`, per `candidate_objects`), under the check the object's
+    guards record (one per object, which `merge_guards` keeps; were they to
+    disagree, the check of the guard reviewed most), with its persistence;
+    and the still-flagged identities beside them. A guard a failed read held
+    emits nothing: a candidate with no read behind it would vouch for an
+    observation nobody made; its check is unevaluated and the run partial
+    instead."""
+    groups: dict[str, list[dict]] = {}
     for guard in guards:
         if guard.get("last_seen") != seen_at:
             continue
-        check = _guard_check(guard)
-        if check in unevaluated:
+        if _guard_check(guard) in unevaluated:
             # The check's own read failed this run (a budget kept at zero
             # through the pdbs read while pods failed): no candidate under
             # a check the manifest calls unevaluated.
@@ -4829,9 +4845,11 @@ def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, s
         namespace, obj = _split_object(guard["object"])
         if (namespace, obj) in covered:
             continue
-        groups.setdefault((check, guard["object"]), []).append(guard)
+        groups.setdefault(guard["object"], []).append(guard)
     candidates, flagged = [], []
-    for (check, full_object), held in sorted(groups.items()):
+    for full_object, held in sorted(groups.items()):
+        held.sort(key=lambda g: (-int(g.get("reviews") or 1), g.get("entry") or 0, g["id"]))
+        check = _guard_check(held[0])
         held.sort(key=lambda g: (g.get("entry") or 0, g["id"]))
         namespace, obj = _split_object(full_object)
         excerpt = "; ".join(f"guard {g['id']} {HELD_PERSISTS_FORMAT.format(since=g['first_seen'], reviews=int(g.get('reviews') or 1))}: {g['evidence']}" for g in held)
@@ -5550,12 +5568,21 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # The same rule for entry 3: a workload still unavailable keeps its guard
     # while the operation its outage fell inside is out of the window.
     unavailable = {(r["cluster"], obj) for r in reviews for obj in r.get("unavailable_workloads") or []}
+    # A kept guard follows the object's fresh guard this run: one object, one
+    # check (`merge_guards` holds the same rule for every guard it merges).
+    fresh_check_by_object = {}
+    for fresh in fresh_guards:
+        if fresh.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE and fresh.get("check"):
+            fresh_check_by_object.setdefault((fresh["cluster"], fresh["object"]), fresh["check"])
     for guard in guards.get("guards") or []:
         if guard.get("kind", GUARD_KIND_FAILURE) != GUARD_KIND_FAILURE or guard["id"] in fresh_ids:
             continue
         where = (guard.get("cluster"), guard.get("object"))
         if (guard.get("entry") == ENTRY_BUDGET and where in zero_budgets) or (guard.get("entry") == ENTRY_SPREAD and where in unavailable):
-            fresh_guards.append({**guard, "last_seen": seen_at})
+            kept = {**guard, "last_seen": seen_at}
+            if fresh_check_by_object.get(where):
+                kept["check"] = fresh_check_by_object[where]
+            fresh_guards.append(kept)
     new_guards = merge_guards(guards, fresh_guards, reviewed, seen_at, answered, removed)
     # Unchanged clusters holding live guards: re-read only what the guards
     # need, clear what is gone, refresh what is still there.

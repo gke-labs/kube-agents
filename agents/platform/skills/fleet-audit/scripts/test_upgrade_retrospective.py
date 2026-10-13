@@ -4837,6 +4837,60 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn(self.audit_report.published_id(old_identity), self.audit_report.collector_flagged_ids(manifest))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
+    def test_two_guards_on_one_object_follow_one_check_across_a_regrade(self):
+        # Sunday A files inventory-api's entry-3 outage and its unclassified pod symptom as one Error
+        # under `upgrade-broke-workload`, two guards on one object. Sunday B reviews the cluster again
+        # with the pool operation outside the window: no entry-3 row, the keep rule re-submits that
+        # guard, and the pod symptom, recorded now, re-grades the object; every guard of the object
+        # takes the new check, so the old identity is resolved once. Sunday C, unchanged, re-checks
+        # both and emits one held candidate and one `still_flagged` entry, never a second finding
+        # under the identity B resolved.
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        inventory = next(w for w in workloads if w["metadata"]["name"] == "inventory-api")
+        inventory["spec"]["replicas"] = 2
+        for cond in inventory["status"]["conditions"]:
+            if cond["type"] == "Available":
+                cond["lastTransitionTime"] = "2026-10-07T04:08:00Z"
+        pods = copy.deepcopy(READS["seeded-a"]["pods"])
+        next(p for p in pods if p["metadata"]["name"].startswith("inventory-api-"))["spec"]["nodeName"] = "gke-seeded-a-default-pool-62ac8ee0-d595"
+        obj = "seeded-stall/Deployment/inventory-api"
+        spread, unclassified = ur.guard_id(SEEDED, 3, obj), ur.guard_id(SEEDED, None, obj)
+        later = copy.deepcopy(next(o for o in ops_for("seeded-a") if "idle-batch-pool" in o["targetLink"]))
+        later.update(name="operation-later", startTime="2026-10-15T16:00:00Z", endTime="2026-10-15T16:05:00Z")
+        old_identity = {"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-stall", "object": "Deployment/inventory-api"}
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "workloads": workloads, "pods": pods}}):
+            first, _ = self.collect()
+            self.assertEqual({g["id"]: g["check"] for g in first["guards"] if g["object"] == obj}, {spread: ur.CHECK_BROKE_WORKLOAD, unclassified: ur.CHECK_BROKE_WORKLOAD})
+            second, _ = self.collect(FakeFleet(operations=OPERATIONS + [later]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+            [review] = [r for r in second["reviews"] if r["cluster"] == SEEDED]
+            self.assertEqual([s for s in review["what_failed"] if s["category"] == ur.CATEGORY_UNAVAILABLE], [])
+            self.assertIn(obj, review["unavailable_workloads"])
+            checks = {g["id"]: g["check"] for g in second["guards"] if g["object"] == obj}
+            self.assertEqual(set(checks), {spread, unclassified})
+            [moved] = set(checks.values())
+            self.assertNotEqual(moved, ur.CHECK_BROKE_WORKLOAD)
+            manifest = json.loads(Path(second["manifest_path"]).read_text())
+            seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+            self.assertEqual([c["check"] for c in seeded["candidates"] if c["object"] == "Deployment/inventory-api"], [moved])
+            self.assertNotIn(self.audit_report.published_id(old_identity), self.audit_report.collector_flagged_ids(manifest))
+            self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+            third, _ = self.collect(FakeFleet(operations=OPERATIONS + [later]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        self.assertIn(SEEDED, [u["cluster"] for u in third["unchanged"]])
+        [recheck] = [r for r in third["rechecks"] if r["cluster"] == SEEDED]
+        self.assertTrue({spread, unclassified} <= set(recheck["refreshed"]))
+        manifest = json.loads(Path(third["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        [held] = [c for c in seeded["candidates"] if c["object"] == "Deployment/inventory-api"]
+        self.assertEqual((held["check"], len(held["persistence"])), (moved, 2))
+        [flagged] = [h for h in manifest["still_flagged"] if h["object"] == "Deployment/inventory-api"]
+        self.assertEqual((flagged["check"], sorted(flagged["guards"])), (moved, sorted([spread, unclassified])))
+        self.assertNotIn(self.audit_report.published_id(old_identity), self.audit_report.collector_flagged_ids(manifest))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # The belt and braces: were two checks ever to reach the held path, one object is one candidate.
+        disagreeing = [{**g, "check": ur.CHECK_BROKE_WORKLOAD if g["id"] == spread else moved, "last_seen": "x"} for g in third["guards"] if g["object"] == obj]
+        candidates, flagged = ur._held_candidates(SEEDED, disagreeing, set(), {}, "x")
+        self.assertEqual((len(candidates), len(flagged), candidates[0]["object"]), (1, 1, "Deployment/inventory-api"))
+
     def test_an_unread_declared_project_is_held_and_is_the_manifests_limitation(self):
         # `--scope-unread`: the project is not swept, its known clusters are "Reads that failed"
         # lines and `unreachable` manifest entries the document skips, its entry and guards are held,
