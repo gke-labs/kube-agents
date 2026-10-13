@@ -437,20 +437,24 @@ Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.t
 from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
-ledger case passes three repetitions anywhere, so the ledger path is the harness's to prove. The GitLab nightly runs the
-same list once a night on its own leased project (`ci-kube-agents-eval-nightly-gitlab`, #2832), and
-never appends to the evidence store, since a case's record is per case, not per forge; nothing
-runs the cases this file leaves out against GitLab.
+ledger case passes three repetitions anywhere, so nothing grades the GitLab ledger issue until
+#2920, a per-run harness probe of the issue path, lands or a ledger case earns a line. The GitLab
+nightly runs the same list once a night on its own leased project
+(`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
+case's record is per case, not per forge; nothing runs the cases this file leaves out against
+GitLab.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on
-the GitHub presubmit. The lane's first two seats are held out, so the job cannot red a pull
-request on a graded failure yet, and the job stays optional in Prow until it has a green
-history; rungs 1 to 3 red it like every case. Bringing GitLab into the gate is a later edit in
-two places: a forge-grading case earning its roster line on the record, and the job's `optional`
-flag in oss-test-infra. Until then the file needs the normal approvers, like `nightly-cases.txt`
-and the inject-lane files: it changes what one optional lane runs, not what can red a pull
-request. It moves under the eval-crew rule the day the lane gates.
+the GitHub presubmit. None of the lane's cases is on the roster, so the job cannot red a pull
+request on a graded failure; rungs 1 to 3 red it like every case. GitLab runs on demand
+(`/test pull-kube-agents-smoke-test-gitlab`) and nightly, not as a blocking presubmit: the agent
+goes through the same forge abstraction on both forges, so the GitHub presubmit already grades
+what a pull request can break in the agent; what GitLab can break on its own is the provider
+and the forge, which the nightly catches within a day and the on-demand run checks for a pull
+request that touches the provider. The file needs the normal approvers, like
+`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the
+nightly run, not what can red a pull request.
 
 ## Demoting a flaky case
 

@@ -22,14 +22,17 @@
 # WHAT CAN RED THE LANE. The blocking roster still applies, intersected with
 # this list: a roster case here arms rung 4 on the lane; a held-out case here
 # runs and reports without arming it, as it does on the GitHub presubmit.
-# Rungs 1-3 red the lane like every case. Both seats below are held out, so
-# the lane cannot red a pull request on a graded failure today, and the job
-# stays optional in Prow until it has a green history (oss-test-infra#2724).
+# Rungs 1-3 red the lane like every case. None of the three cases below is
+# on the roster, so the lane cannot red a pull request on a graded failure.
+# The job runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and
+# nightly, never as a blocking presubmit: the agent goes through the same
+# forge abstraction on both forges, so the GitHub presubmit grades what a
+# pull request can break in the agent; what GitLab can break on its own is
+# the provider and the forge, and the nightly catches that within a day.
 #
 # WHO APPROVES. The normal approvers (root OWNERS), as for nightly-cases.txt
-# and the inject-lane files: this file changes what one optional lane runs,
-# not what can red a pull request. It moves under the eval-crew rule in
-# hack/OWNERS the day the lane gates.
+# and the inject-lane files: this file changes what one on-demand lane and
+# the nightly run, not what can red a pull request.
 #
 # BUDGET. Three cases, nine units at EVAL_REPETITIONS of 3, every one in the
 # fan-out's second phase (each requests a merge request; unit_phase in the
@@ -37,8 +40,7 @@
 # vcs-spent-branch-reuse (1000s) and vcs-review-feedback-read-back (700s)
 # are ~150 minutes of units at the hints, plus ~16 minutes of lease, build
 # and deploy: inside the job's 360-minute deadline, and longer than the
-# GitHub presubmit's ~136-minute median. Dropping pdb-remediation-pr is the
-# lighter lane, if the lane ever runs on every pull request.
+# GitHub presubmit's ~136-minute median.
 #
 # WHY THESE. The two vcs cases exist to exercise the forge (a branch reused
 # after its first proposal closed; a second revision read back before it is
@@ -46,8 +48,9 @@
 # a red here points at GitLab, not at the agent. No ledger case is in the
 # lane: none passes three repetitions anywhere today (the compliance canary
 # publishes a ledger in about half its runs on either forge, the agent's
-# doing), so the ledger path is proven by the harness (the per-repetition
-# ledger reset, and a harness-side probe to come), not by a case.
+# doing), so nothing grades the GitLab ledger issue until kube-agents#2920,
+# a per-run harness probe of the issue path, lands or a ledger case earns a
+# line here.
 
 # A second proposal under a branch name whose first proposal was closed:
 # branch lookup, delete, push and open on the forge (pull_request_opened).
