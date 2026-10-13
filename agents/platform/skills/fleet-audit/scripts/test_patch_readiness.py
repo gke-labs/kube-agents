@@ -10,7 +10,7 @@ import unittest
 import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 import audit_report  # noqa: E402
@@ -29,6 +29,20 @@ _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-
 
 def run_of(rc: int, stdout: str = "", stderr: str = "") -> pr.Run:
     return pr.Run(["gcloud"], rc, stdout, stderr, 0.01)
+
+
+class Clock:
+    """A monotonic clock a reporter stub moves forward, so a test walks the
+    budget running out between two reporter runs without sleeping through it."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def cluster(name="prod-usc1", location="us-central1", master="1.30.5-gke.100", channel="REGULAR", autopilot=False, node_pools=None, **overrides):
@@ -97,7 +111,7 @@ def collect_both(project, *, run, now):
     """Both collector phases over one project, as `collect_fleet` runs them:
     the ten metadata checks, then 3.11 over the result."""
     entries = pr.collect_project(project, run=run, now=now)
-    pr.collect_upgrade_blocked(project, entries, run=run)
+    pr.collect_upgrade_blocked(project, entries, run=run, now=now)
     return entries
 
 
@@ -1626,7 +1640,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         if deadline is None:
             return collect_both("acme", run=run, now=NOW)
         entries = pr.collect_project("acme", run=run, now=NOW)
-        pr.collect_upgrade_blocked("acme", entries, run=run, deadline=deadline)
+        pr.collect_upgrade_blocked("acme", entries, run=run, deadline=deadline, now=NOW)
         return entries
 
     def report_path(self, name="lag", location="us-central1"):
@@ -1915,14 +1929,18 @@ class UpgradeBlockedTest(unittest.TestCase):
             raise AssertionError(f"unstubbed command: {joined}")
 
         by = {e["location"]: e for e in self.project(run) if short(e) == "prod"}
+        # The reporter writes a per-run file beside each report path; a graded
+        # row moves it onto the path, which is what the recorded command names.
         outputs = {argv[argv.index("--cluster") + 1]: argv[argv.index("--output") + 1] for argv in self.calls}
-        self.assertEqual(outputs, {"us-central1/prod": self.report_path("prod", "us-central1"), "europe-west1/prod": self.report_path("prod", "europe-west1")})
-        for spec, path in outputs.items():
+        paths = {"us-central1/prod": self.report_path("prod", "us-central1"), "europe-west1/prod": self.report_path("prod", "europe-west1")}
+        self.assertEqual(outputs, {spec: path + pr.READINESS_OUTPUT_PENDING_SUFFIX for spec, path in paths.items()})
+        for spec, path in paths.items():
             location = spec.split("/")[0]
+            self.assertFalse(os.path.exists(outputs[spec]))
             with open(path, encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle)["members"][0]["location"], location)
             recorded = next(c for c in by[location]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
-            self.assertIn(f"--output {path}", recorded)
+            self.assertIn(f"--output {path} --state-dir", recorded)
         self.assertEqual([c["check"] for c in by["us-central1"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.UPGRADE_BLOCKED_CHECK])
         self.assertEqual([c for c in by["europe-west1"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
 
@@ -2157,6 +2175,108 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotEqual(stamps["us-central1/a"], seeded["us-central1/a"])
         self.assertNotEqual(stamps["us-central1/b"], seeded["us-central1/b"])
 
+    def test_a_budget_spent_mid_project_stamps_the_clusters_that_ran_and_the_skipped_ones_lead_next_week(self):
+        """The walk the order exists for: the budget runs out after the first
+        reporter run, the clusters after it are skipped and keep their stamps,
+        and they lead the next run. The reporter stub moves a fake clock, so
+        the budget is spent between two runs without sleeping through it; the
+        stamps are the run's `now`, the clock this suite pins."""
+        clusters = [cluster(name=n, master=self.BEHIND) for n in ("a", "b", "c")]
+        state_dir = os.path.join(self.scratch.name, pr.READINESS_STATE_SUBDIR, "acme")
+        os.makedirs(state_dir)
+        path = os.path.join(state_dir, pr.READINESS_LAST_RUN_FILE)
+        seeded = {"us-central1/a": "2026-01-14T00:00:00Z", "us-central1/b": "2026-01-01T00:00:00Z"}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(seeded, handle)
+        clock = Clock()
+        cost = 20
+        self.calls = []
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "clusters list" in joined:
+                return run_of(0, json.dumps(clusters))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
+            if REPORTER_NEEDLE in joined:
+                self.calls.append(argv[argv.index("--cluster") + 1])
+                clock.advance(cost)
+                return NO_REPORTER
+            raise AssertionError(joined)
+
+        # Budget for one run and a little: never-reported c runs, the clock
+        # moves past the floor, and b and a are skipped with the budget reason.
+        with mock.patch("time.monotonic", clock):
+            by = {short(e): e for e in self.project(run, deadline=clock() + pr.READINESS_MIN_TIMEOUT_S + cost // 2)}
+        self.assertEqual(self.calls, ["us-central1/c"])
+        for name in ("a", "b"):
+            self.assertIn("readiness budget", self.unevaluated(by[name])[pr.UPGRADE_BLOCKED_CHECK])
+        with open(path, encoding="utf-8") as handle:
+            stamps = json.load(handle)
+        self.assertEqual(stamps, {**seeded, "us-central1/c": NOW.strftime(pr.LAST_RUN_STAMP_FORMAT)})
+        # Next week, with budget to spare: b (two weeks ago), a (yesterday), then c.
+        self.calls = []
+        self.project(run)
+        self.assertEqual(self.calls, ["us-central1/b", "us-central1/a", "us-central1/c"])
+
+    def test_projects_the_budget_skipped_lead_the_next_week(self):
+        """Phase 2 runs the projects against one budget in submission order,
+        so the order decides which projects a spent budget skips: least
+        recently served first, a project never served before all of them,
+        read from each project's own `last-run.json`, and each turn stamped
+        with its place in the queue so the projects served in one week keep
+        that week's order the next. Eight projects, six holding a behind
+        cluster, a budget that lets four reporter runs start: the two
+        projects skipped this week lead next week, the two that then miss
+        lead the week after, and the ring closes."""
+        clock = Clock()
+        cost = 20
+        served: list[str] = []
+
+        def project_of(argv):
+            for i, arg in enumerate(argv):
+                if arg == "--project":
+                    return argv[i + 1]
+                if arg.startswith("--project="):
+                    return arg.split("=", 1)[1]
+            raise AssertionError(f"no --project in {argv}")
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "projects list" in joined:
+                return run_of(0, "".join(f"p{i}\n" for i in range(1, 9)))
+            if "config get-value project" in joined:
+                return run_of(0, "p1\n")
+            if "clusters list" in joined:
+                behind = int(project_of(argv)[1:]) <= 6
+                return run_of(0, json.dumps([cluster(name="lag" if behind else "cur", master=self.BEHIND if behind else self.CURRENT)]))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
+            if REPORTER_NEEDLE in joined:
+                served.append(project_of(argv))
+                clock.advance(cost)
+                return NO_REPORTER
+            return run_of(1, "", f"unstubbed: {joined}")
+
+        weeks = []
+        with mock.patch("time.monotonic", clock), mock.patch.object(pr, "READINESS_FLEET_BUDGET_S", 5 * cost):
+            for week in range(3):
+                served.clear()
+                manifest = pr.collect_fleet(run=run, now=NOW + timedelta(days=7 * week), max_workers=1)
+                skipped = sorted(
+                    e["project"]
+                    for e in manifest["clusters"]
+                    if e.get("outcome") == "collected" and "readiness budget" in self.unevaluated(e).get(pr.UPGRADE_BLOCKED_CHECK, "")
+                )
+                weeks.append((list(served), skipped))
+        self.assertEqual(weeks[0], (["p1", "p2", "p3", "p4"], ["p5", "p6"]))
+        self.assertEqual(weeks[1], (["p5", "p6", "p1", "p2"], ["p3", "p4"]))
+        self.assertEqual(weeks[2], (["p3", "p4", "p5", "p6"], ["p1", "p2"]))
+        # The stamps stay per project, each in that project's state directory.
+        for i in range(1, 7):
+            self.assertTrue(os.path.exists(os.path.join(self.scratch.name, pr.READINESS_STATE_SUBDIR, f"p{i}", pr.READINESS_LAST_RUN_FILE)))
+        self.assertFalse(os.path.exists(os.path.join(self.scratch.name, pr.READINESS_STATE_SUBDIR, "p7")))
+
     def test_a_no_channel_cluster_whose_pool_skew_was_not_judged_is_unevaluated_not_declared(self):
         """The no-channel arm is the third gate that declares 3.11 inapplicable,
         and it gates on the same two checks as the others: a static cluster
@@ -2242,9 +2362,10 @@ class UpgradeBlockedTest(unittest.TestCase):
 
     def test_a_cluster_the_budget_skips_keeps_last_weeks_report_file(self):
         """The ledger's open finding and SOP 3.11 point at the report file; a
-        week the budget skips the cluster must leave it where it is, since the
-        unlink exists only to stop a stale file being read back and a skipped
-        cluster is never read."""
+        week the budget skips the cluster must leave it where it is, as must a
+        run whose reporter fails: the collector reads only the per-run file it
+        handed the reporter, so last week's report is never read back and
+        never removed before a graded row replaces it."""
         import time as _time
 
         path = self.report_path("lag")
@@ -2268,10 +2389,13 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn("readiness budget", self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK])
         with open(path, encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["week"], "last")
-        # With budget, the run clears the file before the reporter writes anew.
+        # With budget, a run whose reporter fails leaves last week's file
+        # where it is as well, and the per-run file is not left behind.
         self.project(run)
         self.assertEqual(len(self.calls), 1)
-        self.assertFalse(os.path.exists(path))
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["week"], "last")
+        self.assertFalse(os.path.exists(path + pr.READINESS_OUTPUT_PENDING_SUFFIX))
 
     def test_a_static_cluster_with_a_pool_only_lag_and_a_clean_budget_read_is_a_clean_run_not_a_declaration(self):
         """The target matters only to the ceiling. On a static cluster whose
@@ -2698,8 +2822,10 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn(pr.UNEVALUATED_UNRECOGNISED_BLOCK, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
 
     def test_a_stale_report_is_never_read_back(self):
-        """The output path is the same every run. A reporter that dies before
-        writing must not leave last run's budget to be republished."""
+        """The report path is the same every run. A reporter that dies before
+        writing must not have last run's budget republished from the file
+        still there: the collector reads only the per-run file it handed the
+        reporter, and leaves that file where the ledger points."""
         os.makedirs(os.path.dirname(self.report_path()), exist_ok=True)
         with open(self.report_path(), "w", encoding="utf-8") as handle:
             json.dump({"members": [self.member("lag", pdbs=[self.BUDGET])], "narrowed_to": ["us-central1/lag"]}, handle)
@@ -2708,7 +2834,51 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
         self.assertIn("no readable report", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
-        self.assertFalse(os.path.exists(self.report_path()))
+        # Not read, and not removed: it stays where the open finding points
+        # until a graded row replaces it, and the per-run file is not there.
+        with open(self.report_path(), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["members"][0]["cluster"], "lag")
+        self.assertFalse(os.path.exists(self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX))
+
+    def test_a_reporter_that_times_out_or_fails_leaves_last_weeks_report_where_the_command_points(self):
+        """The ledger's open finding carries the recorded command and, past
+        three budgets, the count forms, both naming the report path. A week
+        the reporter is stopped at its budget or exits non-zero, that file is
+        last week's graded report, kept byte for byte, and the per-run file
+        the reporter was handed is gone."""
+        last_week = json.dumps({"members": [self.member("lag", pdbs=[self.BUDGET])], "errors": [], "narrowed_to": ["us-central1/lag"], "week": "last"}, indent=2)
+        for rc, reason in ((pr.TIMEOUT_RC, "ran past its budget"), (2, "failed (rc 2)")):
+            with self.subTest(rc=rc):
+                with open(self.report_path(), "w", encoding="utf-8") as handle:
+                    handle.write(last_week)
+                by = self.collect([cluster(name="lag", master=self.BEHIND)], reporter_rc=rc, write_report=False)
+                entry = by["lag"]
+                argv = self.calls[0]
+                self.assertEqual(argv[argv.index("--output") + 1], self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX)
+                self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+                self.assertIn(reason, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+                with open(self.report_path(), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), last_week)
+                self.assertFalse(os.path.exists(self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX))
+
+    def test_a_graded_run_moves_its_report_onto_the_path_the_recorded_command_names(self):
+        """The reporter writes a per-run file; once the row is graded the
+        collector moves it onto the report path, in place of last week's, and
+        the recorded command names that path, not the per-run file."""
+        with open(self.report_path(), "w", encoding="utf-8") as handle:
+            json.dump({"members": [], "errors": [], "narrowed_to": ["us-central1/lag"], "week": "last"}, handle)
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
+        entry = by["lag"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("--output") + 1], self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX)
+        recorded = next(c for c in entry["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
+        self.assertIn(f"--output {self.report_path()} --state-dir", recorded)
+        with open(self.report_path(), encoding="utf-8") as handle:
+            written = json.load(handle)
+        self.assertNotIn("week", written)
+        self.assertEqual(written["members"][0]["cluster"], "lag")
+        self.assertFalse(os.path.exists(self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX))
 
     def test_a_partial_exit_still_vouches_for_the_rows_it_graded(self):
         """The reporter exits 1 when any member in the project errored and

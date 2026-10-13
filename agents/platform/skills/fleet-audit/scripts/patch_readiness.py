@@ -71,6 +71,7 @@ projects.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import re
@@ -266,6 +267,12 @@ DEFAULT_SCRATCH_DIR = "/opt/data/scratch"
 # per project because projects are collected concurrently, so it neither reads
 # nor rewrites the skill's own history.
 READINESS_OUTPUT_FORMAT = "upgrade-readiness_{project}_{location}_{cluster}.json"
+# The reporter writes to this file beside the report path, and the collector
+# moves it onto the path once the row is graded: a reporter that times out,
+# fails or dies before writing leaves last week's report where the recorded
+# command and the count forms point, and nothing stale is read back because
+# the collector reads only the per-run file it handed the reporter.
+READINESS_OUTPUT_PENDING_SUFFIX = ".tmp"
 READINESS_STATE_SUBDIR = "upgrade-readiness-state"
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
@@ -293,6 +300,7 @@ UNEVALUATED_REPORT_MALFORMED = "the readiness reporter's report was not in the s
 # reporter run and no report behind it, so the reason names the phase, not a
 # report that does not exist.
 UNEVALUATED_PHASE_CRASHED = "the collector's 3.11 phase crashed before reaching this cluster ({error})"
+UNEVALUATED_REPORT_NOT_KEPT_FORMAT = "the collector could not move the reporter's report onto {path}, where the recorded command would point ({error})"
 UNEVALUATED_REPORT_NOT_NARROWED_FORMAT = "the readiness reporter's report is not marked as narrowed to {spec} (narrowed_to: {found!r}), so its rows are not this cluster's to read"
 UNEVALUATED_STATUS_FORMAT = "status {status!r}{note}"
 UNEVALUATED_REPORT_MESSAGE_CHARS = 200
@@ -1535,7 +1543,7 @@ def _declared_scope_argv(project: str) -> list[str]:
     return [fleet_scope_args.SCOPE_PROJECTS_FLAG, project]
 
 
-def _read_last_run(state_dir: str, project: str) -> dict[str, str]:
+def _read_last_run(state_dir: str, project: str, *, log_errors: bool = True) -> dict[str, str]:
     """When each of the project's clusters last had a reporter run started for
     it, by `<location>/<name>`; empty when there is no file or it cannot be read."""
     path = os.path.join(state_dir, READINESS_LAST_RUN_FILE)
@@ -1545,9 +1553,25 @@ def _read_last_run(state_dir: str, project: str) -> dict[str, str]:
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
-        log(f"{project}: cannot read {path} ({exc}); running the behind clusters in listing order")
+        if log_errors:
+            log(f"{project}: cannot read {path} ({exc}); running the behind clusters in listing order")
         return {}
     return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _state_dir(project: str) -> str:
+    """The reporter's state directory for one project under scratch, per
+    project because projects are collected concurrently: the audit's rollout
+    records, kept apart from the skill's own, and the project's `last-run.json`."""
+    return os.path.join(_scratch_dir(), READINESS_STATE_SUBDIR, project)
+
+
+def _last_turn(project: str) -> str:
+    """When the project last had a reporter run started in it: the newest
+    stamp in its `last-run.json`, "" when it never had one. The key
+    `collect_fleet` orders the 3.11 phase by, least recently served first."""
+    stamps = _read_last_run(_state_dir(project), project, log_errors=False)
+    return max(stamps.values(), default="")
 
 
 def _write_last_run(state_dir: str, project: str, stamps: dict[str, str]) -> None:
@@ -1560,7 +1584,17 @@ def _write_last_run(state_dir: str, project: str, stamps: dict[str, str]) -> Non
         log(f"{project}: cannot write {path} ({exc}); next week's order will not know this run")
 
 
-def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, deadline: float | None = None) -> None:
+def _reporter_argv(project: str, spec: str, report: str, state_dir: str) -> list[str]:
+    """The reporter invocation for one behind cluster, writing its report to
+    `report`. The scope flag sits between the project and the cluster, as the
+    SOP's 3.11 Command bullet spells the invocation the `commands` entry records."""
+    return [
+        sys.executable, str(READINESS_REPORTER), "--project", project, *_declared_scope_argv(project), "--cluster", spec,
+        "--readiness", "--output", report, "--state-dir", state_dir,
+    ]
+
+
+def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, deadline: float | None = None, now: datetime | None = None) -> None:
     """§3.11 over one project's collected entries, in place.
 
     Run by `collect_fleet` as the second phase, after every project's ten
@@ -1586,7 +1620,12 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     requires a `limitations` line for it. A cluster 3.1 or 3.2 never judged
     is unevaluated before the reporter runs: `_due` is the one reading of
     judged, behind and which causes apply that this gate, the join and the
-    hit all take.
+    hit all take. `now` is the instant a started reporter run is stamped
+    with in the project's `last-run.json`: `collect_fleet` passes the run's
+    instant plus the project's place in the 3.11 queue, in seconds, so that
+    next week's order among the projects served this run follows this run's
+    order rather than the listing; a direct caller that passes none gets
+    the clock.
     """
     collected = [e for e in entries if e.get("outcome") == OUTCOME_COLLECTED]
     behind: list[dict] = []
@@ -1611,7 +1650,8 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     if not behind:
         return
     scratch = _scratch_dir()
-    state_dir = os.path.join(scratch, READINESS_STATE_SUBDIR, project)
+    state_dir = _state_dir(project)
+    stamp = (now or datetime.now(timezone.utc)).strftime(LAST_RUN_STAMP_FORMAT)
     try:
         os.makedirs(scratch, exist_ok=True)
     except OSError as exc:
@@ -1629,16 +1669,23 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     # clusters are behind and however wide the declared scope is: the scope
     # flag names this project alone, `_declared_scope_argv`). Within a
     # project the runs spend the fleet budget one after another, so a slow
-    # read costs the clusters after it time,
-    # never a row of their own; they go least recently reported first (a
-    # cluster never reported before all of them, the listing order breaking
-    # ties), so a spent budget lands on a different tail each week.
+    # read costs the clusters after it time, never a row of their own; they
+    # go least recently reported first (a cluster never reported before all
+    # of them, the listing order breaking ties), so a spent budget lands on a
+    # different tail each week. Across projects `collect_fleet` orders the
+    # phase the same way, by each project's newest stamp (`_last_turn`).
     last_run = _read_last_run(state_dir, project)
     behind.sort(key=lambda e: last_run.get(CLUSTER_SPEC_FORMAT.format(location=e["location"], name=e["_bare_name"]), ""))
     stamped = False
     for entry in behind:
         spec = CLUSTER_SPEC_FORMAT.format(location=entry["location"], name=entry["_bare_name"])
         output = os.path.join(scratch, READINESS_OUTPUT_FORMAT.format(project=project, location=entry["location"], cluster=entry["_bare_name"]))
+        # The reporter writes here, and the file moves onto `output` only once
+        # the row is graded (`_join_readiness`). `output` is the path the
+        # recorded command and the count forms name, so a run that times out,
+        # fails or dies before writing leaves last week's report there, and
+        # nothing stale is read back because this file is the only one read.
+        pending = output + READINESS_OUTPUT_PENDING_SUFFIX
         timeout = READINESS_TIMEOUT_S
         if deadline is not None:
             timeout = min(READINESS_TIMEOUT_S, int(deadline - time.monotonic()))
@@ -1649,32 +1696,31 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
                 _unevaluated(entry, UNEVALUATED_BUDGET_SPENT.format(budget=READINESS_FLEET_BUDGET_S))
                 continue
         try:
-            # The path is the same every week, so a reporter that dies before
-            # writing -- a traceback, a failed `--output` write, both exit 1
-            # -- would otherwise be read back as last week's report, and last
-            # week's budget republished (or this week's hidden). No file is a
-            # gap; a stale file is a wrong answer. Cleared only once the run
-            # is going ahead, so a cluster the budget skips keeps its file.
-            if os.path.exists(output):
-                os.unlink(output)
+            # A per-run file a crashed collector left behind would otherwise
+            # be read back as this run's report when the reporter dies before
+            # writing -- a traceback, a failed `--output` write, both exit 1.
+            # No file is a gap; a stale file is a wrong answer. The report at
+            # `output` is not touched: last week's stays until a graded row
+            # replaces it.
+            if os.path.exists(pending):
+                os.unlink(pending)
         except OSError as exc:
-            log(f"{project}/{entry['_bare_name']}: cannot clear {output} ({exc}); upgrade-blocked unavailable there")
-            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=output, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
+            log(f"{project}/{entry['_bare_name']}: cannot clear {pending} ({exc}); upgrade-blocked unavailable there")
+            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=pending, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
             continue
-        # The scope flag sits between the project and the cluster, as the SOP's
-        # 3.11 Command bullet spells the invocation the `commands` entry records.
-        argv = [
-            sys.executable, str(READINESS_REPORTER), "--project", project, *_declared_scope_argv(project), "--cluster", spec,
-            "--readiness", "--output", output, "--state-dir", state_dir,
-        ]
+        # What runs writes the per-run file; what the entry records names the
+        # path the report is moved onto, where a reader finds it and where a
+        # re-run of the command writes it.
+        argv = _reporter_argv(project, spec, pending, state_dir)
+        recorded = _reporter_argv(project, spec, output, state_dir)
         result = run(argv, timeout=timeout)
         # Stamped when the reporter was started, graded or not: a run that
         # fails every week still yields its turn. A cluster the budget skipped
         # keeps its stamp and leads next week.
-        last_run[spec] = datetime.now(timezone.utc).strftime(LAST_RUN_STAMP_FORMAT)
+        last_run[spec] = stamp
         stamped = True
         try:
-            _join_readiness(project, [entry], argv, result, output, timeout)
+            _join_readiness(project, [entry], recorded, result, pending, output, timeout)
         except Exception as exc:  # noqa: BLE001 -- a malformed report must not cost the project its other ten checks
             log(f"{project}/{entry['_bare_name']}: the readiness report could not be joined ({exc!r}); upgrade-blocked unevaluated there")
             # Whatever the join managed before it raised is withdrawn: the
@@ -1688,14 +1734,22 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             else:
                 entry.pop("checks_not_applicable", None)
             _unevaluated(entry, UNEVALUATED_REPORT_MALFORMED.format(error=type(exc).__name__))
+        finally:
+            # A graded row moved the per-run file onto `output`; any other
+            # outcome discards it, so no later run finds it.
+            with contextlib.suppress(OSError):
+                os.unlink(pending)
     if stamped:
         _write_last_run(state_dir, project, last_run)
 
 
-def _join_readiness(project: str, behind: list[dict], argv: list[str], result: Run, output: str, timeout: int) -> None:
-    """Join the reporter's rows to the behind clusters. Anything unexpected in
-    the report's shape raises out to the caller, which marks the clusters
-    unevaluated; the project's other checks are not this function's to lose."""
+def _join_readiness(project: str, behind: list[dict], argv: list[str], result: Run, report: str, output: str, timeout: int) -> None:
+    """Join the reporter's rows to the behind clusters, from the per-run file
+    at `report`; once a row is graded the file moves onto `output`, the path
+    the recorded command (`argv`) and the count forms name. Anything
+    unexpected in the report's shape raises out to the caller, which marks
+    the clusters unevaluated; the project's other checks are not this
+    function's to lose."""
     members: dict[tuple[str, str], dict] = {}
     # Every branch below names what it found; `no_report` is the reason the
     # behind clusters carry when the report has no row for them.
@@ -1705,21 +1759,21 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         log(f"{project}: readiness reporter ran past {timeout}s and was stopped; upgrade-blocked unevaluated there")
     elif result.rc in (0, READINESS_EXIT_PARTIAL):
         try:
-            with open(output, encoding="utf-8") as handle:
-                report = json.load(handle)
-            if not isinstance(report, dict):
-                raise TypeError(f"report is {type(report).__name__}, not an object")
+            with open(report, encoding="utf-8") as handle:
+                written = json.load(handle)
+            if not isinstance(written, dict):
+                raise TypeError(f"report is {type(written).__name__}, not an object")
             # The reporter marks a `--cluster` run with the specs it was
             # narrowed to. A report without the mark, or marked for another
             # cluster, is not the one this invocation wrote (a full run's
             # file, or a reporter that ignored the flag), and its rows are
             # not this cluster's to read.
             expected = [CLUSTER_SPEC_FORMAT.format(location=e["location"], name=e["_bare_name"]) for e in behind]
-            if report.get(REPORT_NARROWED_KEY) != expected:
-                no_report = UNEVALUATED_REPORT_NOT_NARROWED_FORMAT.format(spec=", ".join(expected), found=report.get(REPORT_NARROWED_KEY))
-                log(f"{project}: the readiness report at {output} is not marked as narrowed to {', '.join(expected)}; upgrade-blocked unevaluated there")
+            if written.get(REPORT_NARROWED_KEY) != expected:
+                no_report = UNEVALUATED_REPORT_NOT_NARROWED_FORMAT.format(spec=", ".join(expected), found=written.get(REPORT_NARROWED_KEY))
+                log(f"{project}: the readiness report at {report} is not marked as narrowed to {', '.join(expected)}; upgrade-blocked unevaluated there")
             else:
-                for member in report.get("members") or []:
+                for member in written.get("members") or []:
                     if isinstance(member, dict):
                         members[(str(member.get("cluster", "")), str(member.get("location", "")))] = member
                 # A report with no rows and an errors[] entry is the reporter
@@ -1727,17 +1781,18 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
                 # is what the limitation should carry. No rows and no error is
                 # the reporter's listing coming back empty where the collector's
                 # did not, which `UNEVALUATED_EMPTY_REPORT` already says.
-                errors = [e for e in report.get("errors") or [] if isinstance(e, dict) and e.get("message")]
+                errors = [e for e in written.get("errors") or [] if isinstance(e, dict) and e.get("message")]
                 if not members and errors:
                     no_report = UNEVALUATED_REPORT_ERROR_FORMAT.format(message=str(errors[0]["message"])[:UNEVALUATED_REPORT_MESSAGE_CHARS])
         except (OSError, ValueError) as exc:
             no_report = UNEVALUATED_UNREADABLE_FORMAT.format(
                 rc=result.rc, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS], stderr=_stderr_excerpt(result)[:UNEVALUATED_REPORT_MESSAGE_CHARS] or "(empty)"
             )
-            log(f"{project}: the readiness reporter exited {result.rc} but left no readable report at {output} ({exc}); upgrade-blocked unavailable there")
+            log(f"{project}: the readiness reporter exited {result.rc} but left no readable report at {report} ({exc}); upgrade-blocked unavailable there")
     else:
         no_report = UNEVALUATED_REPORTER_FAILED_FORMAT.format(rc=result.rc, stderr=_stderr_excerpt(result)[:UNEVALUATED_REPORT_MESSAGE_CHARS])
         log(f"{project}: readiness reporter failed (rc={result.rc}): {_stderr_excerpt(result)}; upgrade-blocked unavailable there")
+    kept = False
     for entry in behind:
         member = members.get((entry["_bare_name"], entry["location"]))
         readiness = (member or {}).get("readiness") or {}
@@ -1815,6 +1870,17 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             log(f"{project}/{entry['_bare_name']}: readiness not graded ({why}); upgrade-blocked unevaluated there")
             _unevaluated(entry, why)
             continue
+        # The row is graded: the report it came from becomes the one at
+        # `output`, in place of last week's, which until here was not touched.
+        if not kept:
+            try:
+                os.replace(report, output)
+            except OSError as exc:
+                why = UNEVALUATED_REPORT_NOT_KEPT_FORMAT.format(path=output, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS])
+                log(f"{project}/{entry['_bare_name']}: {why}; upgrade-blocked unevaluated there")
+                _unevaluated(entry, why)
+                continue
+            kept = True
         # The row is graded, so the command succeeded for this cluster
         # whatever another member did to the process exit code.
         record = _record(shlex.join(argv), result._replace(rc=0))
@@ -1990,7 +2056,23 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 results[index] = future.result()
             except Exception as exc:  # noqa: BLE001 — see crashed_entries
                 results[index] = crashed_entries(projects[index], exc)
-        readiness = {pool.submit(collect_upgrade_blocked, p, results[i], run=run, deadline=deadline): i for i, p in enumerate(projects)}
+        # Phase 2 draws on the one budget `max_workers` projects at a time,
+        # in submission order, so the order decides which projects a spent
+        # budget skips. Least recently served first (`_last_turn`), a project
+        # never served before all of them: a project the budget skipped this
+        # week keeps an older stamp than every project that ran, so next week
+        # it sorts ahead of them and the skipped tail moves. The stamp each
+        # project's turn leaves is the run's instant plus its place in this
+        # queue, in seconds, so the projects served in one run keep this
+        # run's order next week (a ring over the weeks) rather than falling
+        # back to the listing, which would serve the first-listed of them
+        # every week. Within a project the clusters rotate the same way
+        # (`collect_upgrade_blocked`), each project from its own file.
+        order = sorted(range(len(projects)), key=lambda i: _last_turn(projects[i]))
+        readiness = {
+            pool.submit(collect_upgrade_blocked, projects[i], results[i], run=run, deadline=deadline, now=now + timedelta(seconds=rank)): i
+            for rank, i in enumerate(order)
+        }
         for future in as_completed(readiness):
             index = readiness[future]
             try:
