@@ -334,7 +334,11 @@ class Retired(Base):
         sandbox = FakeSandbox(partial)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "upgrade readiness watch: the version table was partial (1 read error(s) in p1, exit 1); a version is retired only once every project that pends it has been read")
+        self.assertEqual(
+            out.strip(),
+            "upgrade readiness watch: the version table was partial (1 read error(s) in p1, exit 1); a version is retired only once "
+            "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it",
+        )
         self.assertIn(OLDER_TARGET, self.ledger()["targets"])
 
 
@@ -611,7 +615,7 @@ class Budget(Base):
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["p1"])
-        self.assertIn("the version table was partial (1 read error(s) in p2, exit 0); a version is retired only once every project that pends it has been read", out)
+        self.assertIn("the version table was partial (1 read error(s) in p2, exit 0); a version is retired only once every project that pends it has been read, or a readiness run", out)
         self.assertEqual(sorted(self.ledger()["table_runs"]), ["p1"])
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["p1/us-central1-a/a", "p2/us-central1-a/b"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
@@ -729,6 +733,8 @@ class Budget(Base):
             code, out = self.run_tick(FakeSandbox(versions, readiness))
         self.assertEqual(code, 0)
         self.assertIn(f"{OLDER_TARGET} is no longer pending", out)
+        self.assertIn("the version table was partial (1 read error(s) in p2, exit 0)", out)
+        self.assertIn("or a readiness run has listed every cluster pending it as no longer below it", out, "the partial line states the rule this tick retires by")
         self.assertNotIn(OLDER_TARGET, self.ledger()["targets"])
         self.assertFalse((self.home / "reports" / OLDER_TARGET).exists(), "the retired version's directory goes with it")
 
@@ -876,7 +882,7 @@ class Budget(Base):
         self.assertEqual(self.ledger(), before, "a failed tick writes nothing to the ledger")
         self.assertTrue(self.marker().exists())
 
-    def test_a_number_first_tabled_on_a_describe_outage_is_re_keyed_once_its_id_is_learned(self) -> None:
+    def test_a_number_the_report_cannot_resolve_keys_nothing_until_its_id_is_learned(self) -> None:
         # Day one: the number's first table run falls on a `projects describe` outage, so the script keys its cluster by the number.
         versions = envelope([member("a", "lagging", project="my-proj"), member("b", "lagging", project="p2", target=OLDER_TARGET)])
         readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready"), member("b", "lagging", project="p2", target=OLDER_TARGET, readiness="ready")])
@@ -884,22 +890,49 @@ class Budget(Base):
         with mock.patch.dict(os.environ, env):
             code, out = self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, describe_down={"123456"}))
         self.assertEqual(code, 0)
-        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
-        self.assertEqual(self.ledger()["project_ids"], {"p2": "p2"}, "a number the script handed back unresolved is not learned as an id")
-        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["123456/us-central1-a/a"], "keyed by the number until the id is learned")
-        self.assertIn("123456", self.ledger()["readiness_runs"])
-        # Day two: describe is back, a has upgraded, and p2's table fails, so the table is partial and
-        # retires a version only once every project that pended it has been read.
-        upgraded = envelope([member("a", "current", project="my-proj"), member("b", "lagging", project="p2", target=OLDER_TARGET)])
-        with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=1)):
-            code, out = self.run_tick(FakeSandbox(upgraded, readiness, aliases={"123456": "my-proj"}, table_failing_projects={"p2"}))
-        self.assertEqual(code, 0)
-        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj", "p2": "p2"})
-        self.assertIn("the version table was partial (1 read error(s) in p2, exit 0)", out)
-        self.assertIn(f"{TARGET} is no longer pending", out, "the entry written under the number was re-keyed to the id, so the read project settled it")
+        self.assertIn("the version table was partial (1 read error(s) in 123456, exit 1)", out, "the unresolved number is the table's gap, named by the spelling")
+        self.assertIn(f"new target version {OLDER_TARGET}, 1 cluster(s) pending (b): 0 blocked, 1 ready;", out)
+        self.assertNotIn(TARGET, out, "a run the report keyed by an unresolved number keys no member")
         self.assertNotIn(TARGET, self.ledger()["targets"])
-        self.assertEqual(sorted(self.ledger()["readiness_runs"]), ["my-proj", "p2"], "the run stamp moved with the key")
-        self.assertEqual(self.ledger()["targets"][OLDER_TARGET]["pending"], ["p2/us-central1-a/b"], "the unread project's clusters are carried forward")
+        self.assertNotIn("123456", json.dumps(self.ledger()["targets"]) + json.dumps(self.ledger()["readiness_runs"]), "the ledger never holds a key under a number")
+        self.assertEqual(self.ledger()["project_ids"], {"p2": "p2"}, "a number the script handed back unresolved is not learned")
+        self.assertEqual(sorted(self.ledger()["table_runs"]), ["123456", "p2"], "the run completed, so the stamp rotates the order")
+        # Day two: describe is back, so the number resolves and the version it hid is new, keyed by the id.
+        with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=1)):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("the version table reads every project again", out)
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj", "p2": "p2"})
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["123456"], "the readiness run is asked for by the roster's spelling")
+
+    def test_two_spellings_on_the_number_s_first_describe_outage_day_table_one_project_once(self) -> None:
+        versions = envelope([member("a", "lagging", project="my-proj")])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready")])
+        env = {watch.PROJECTS_ENV: "123456,my-proj"}
+        with mock.patch.dict(os.environ, env):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, describe_down={"123456"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out, "the id's run lists the project; the number's keys nothing")
+        self.assertNotIn("2 cluster(s)", out)
+        self.assertIn("the version table was partial (1 read error(s) in 123456, exit 1)", out)
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["my-proj"], "one readiness run, by the id")
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
+        self.assertEqual(sorted(self.ledger()["readiness_runs"]), ["my-proj"])
+        self.assertEqual(self.ledger()["project_ids"], {"my-proj": "my-proj"})
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("1 cluster(s) are below this version: my-proj/us-central1-a/a.", text)
+        # Describe is back: the number resolves to the id already tabled, so the id spelling is skipped and the table is whole.
+        with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=1)):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["123456"], "one project, one table run")
+        self.assertEqual(out, "upgrade readiness watch: the version table reads every project again\n")
+        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj", "my-proj": "my-proj"})
 
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()

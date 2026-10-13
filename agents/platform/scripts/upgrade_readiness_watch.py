@@ -15,8 +15,10 @@ has never seen is *new*, and a new version earns a readiness report at once.
 After that the report is refreshed every ``REFRESH_DAYS_DEFAULT`` days (with
 ten minutes of slack for the tick's own drift) while a cluster is still pending
 it, and a version no cluster is pending any more is retired from the ledger
-once every project that pended it has been read: a project the table did not
-read keeps its clusters pending from the ledger, so a failed listing cannot
+once every project that pended it has been read, or once a readiness run,
+which lists every cluster of its project whether or not the table reached it,
+shows every cluster pending it as no longer below it: a project the table did
+not read keeps its clusters pending from the ledger, so a failed listing cannot
 erase a version and have it come back as new. A report whose readiness reads graded none of a version's
 pending clusters is written but not recorded, and the version is tried again
 the next day, up to ``UNGRADED_ATTEMPTS_BEFORE_WEEKLY`` days in a row, after
@@ -195,6 +197,7 @@ BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could 
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
 TABLE_CUT_SHORT_DETAIL = "the version table's run for project {project} was cut short by its share of the budget"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
+TABLE_UNRESOLVED_DETAIL = "version table for {project} not keyed: the project number did not resolve to its id (`gcloud projects describe` failed); read again tomorrow"
 PROJECT_NOT_RUN_DETAIL = "readiness run for {project} not started: {error}"
 PROJECT_CUT_SHORT_DETAIL = "readiness run for {project} cut short by the tick budget; it goes first next time"
 STDERR_EXCERPT_CHARS = 300
@@ -241,11 +244,11 @@ READINESS_RUNS_KEY = "readiness_runs"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
 # watch's own read errors and stamps. learn_project_id is the one place that
-# decides the id a spelling is keyed by and when that is final: a table run
-# that resolves an id learns it; a number the script handed back unresolved (a
-# `projects describe` outage) is provisional, and what was keyed under it is
-# re-keyed once the id is learned; and every envelope is rewritten to the
-# learned ids (canonicalise_projects) before the watch reads it.
+# decides the id a spelling is keyed by: a table run that resolves an id learns
+# it, and a number the script handed back unresolved (a `projects describe`
+# outage) keys nothing, its run being that spelling's listing failure until the
+# id is learned, so the ledger never holds a key under a number; every envelope
+# is rewritten to the learned ids (canonicalise_projects) before the watch reads it.
 PROJECT_IDS_KEY = "project_ids"
 REPORT_PROJECTS_KEY = "projects"
 ANNOUNCED_KEY = "announced"
@@ -278,7 +281,10 @@ BLOCKED_NAMES = " ({names})"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s){where}, exit {code}); a version is retired only once every project that pends it has been read"
+PARTIAL_LINE = (
+    "{prefix} watch: the version table was partial ({errors} read error(s){where}, exit {code}); a version is retired only once "
+    "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it"
+)
 # The projects the read errors name, so the line says which project went
 # unread; the announcement stays keyed on the kinds, so the names are the day's.
 PARTIAL_WHERE = " in {projects}"
@@ -314,6 +320,7 @@ NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} cons
 # daily, or a timeout's figure, does not re-post the line.
 ERROR_KIND_UNRUN = "table not run to completion by the budget"
 ERROR_KIND_TABLE_FAILED = "table failed"
+ERROR_KIND_UNRESOLVED = "project number not resolved"
 # The watch writes its own read errors with the kind on them; the report
 # script's carry no kind and are classified by their shape.
 ERROR_KIND_KEY = "kind"
@@ -546,55 +553,31 @@ def is_project_number(spelling: str) -> bool:
 
 def canonical_project(spelling: str, ids: dict[str, str]) -> str:
     """The id the ledger keys a project by: the one learned for the spelling,
-    else the spelling itself. For a number no run has resolved yet that key is
-    provisional, and ``learn_project_id`` re-keys it once the id is learned."""
+    else the spelling itself. No member is ever keyed by a number
+    (``learn_project_id``); for a number no run has resolved, the spelling this
+    returns names the project in the table's own read errors and matches the
+    spelling against itself in the sets the sweep keeps."""
     return ids.get(spelling, spelling)
 
 
-def learn_project_id(ledger: dict, spelling: str, resolved: object) -> None:
+def learn_project_id(ids: dict[str, str], spelling: str, resolved: object) -> str | None:
     """Decide, from the ``projects`` a table run resolved for ``spelling``, the
-    id the ledger keys it by and whether that is final. An id that differs from
-    the spelling is final. The spelling itself is final only when it is an id:
-    on a day ``projects describe`` fails the report script hands back the
-    number it was asked for, so a number echoing itself was not resolved and
-    is not learned, and an id learned earlier stands through the outage. A
-    final id that arrives after keys were written under the number re-keys
-    them, so no pending cluster is stranded under a spelling no later reader
-    joins against."""
-    if not (isinstance(resolved, list) and len(resolved) == 1 and isinstance(resolved[0], str) and resolved[0]):
-        return
-    learned = resolved[0]
-    ids = ledger[PROJECT_IDS_KEY]
-    if learned == spelling:
-        if not is_project_number(spelling):
+    id the run is read under, learning it when the run resolved one: an id
+    that differs from the spelling, or the spelling itself when it is an id. A
+    number echoing itself was not resolved (on a day ``projects describe``
+    fails the report script hands back the number it was asked for), and a
+    number is keyed only by a learned id: the run is read under the id learned
+    earlier, if any, and otherwise under nothing, ``None``, which the caller
+    records as that spelling's listing failure and keys no member by, so the
+    ledger never holds a key a later reader cannot join against. A report
+    without a usable ``projects`` learns nothing and is read the same way."""
+    if isinstance(resolved, list) and len(resolved) == 1 and isinstance(resolved[0], str) and resolved[0]:
+        learned = resolved[0]
+        if learned != spelling:
+            ids[spelling] = learned
+        elif not is_project_number(spelling):
             ids.setdefault(spelling, spelling)
-        return
-    previous = canonical_project(spelling, ids)
-    ids[spelling] = learned
-    if previous != learned:
-        rekey_project(ledger, previous, learned)
-
-
-def rekey_member_key(key: str, old: str, new: str) -> str:
-    if project_of(key) != old:
-        return key
-    return MEMBER_KEY_SEPARATOR.join([new] + key.split(MEMBER_KEY_SEPARATOR)[1:])
-
-
-def rekey_project(ledger: dict, old: str, new: str) -> None:
-    """Move everything the ledger keys by project ``old`` under ``new``: every
-    version's pending clusters, the readiness-run stamp, and the projects an
-    ungraded announcement names. The table-run stamps are keyed by the roster's
-    spelling, which does not change."""
-    for entry in ledger[TARGETS_KEY].values():
-        entry[PENDING_KEY] = sorted({rekey_member_key(key, old, new) for key in entry.get(PENDING_KEY) or []})
-    runs = ledger[READINESS_RUNS_KEY]
-    if old in runs:
-        moved = runs.pop(old)
-        runs[new] = max(moved, runs.get(new, ""))
-    for record in (announced(ledger).get(ANNOUNCED_UNGRADED_KEY) or {}).values():
-        if record.get(SIGNATURE_KEY):
-            record[SIGNATURE_KEY] = signature_pairs({(new if project == old else project): kind for project, kind in record[SIGNATURE_KEY]})
+    return ids.get(spelling) if is_project_number(spelling) else canonical_project(spelling, ids)
 
 
 # --- the gate --------------------------------------------------------------
@@ -910,12 +893,16 @@ def empty_envelope() -> dict:
     return {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {key: [] for key in PROJECT_KEYED_LISTS}}
 
 
+def merge_exit(merged: dict, envelope: dict) -> None:
+    if envelope.get(ENVELOPE_EXIT_KEY) != EXIT_OK and merged[ENVELOPE_EXIT_KEY] == EXIT_OK:
+        merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
+
+
 def merge_envelope(merged: dict, envelope: dict) -> None:
     merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
     for key in PROJECT_KEYED_LISTS:
         merged[ENVELOPE_REPORT_KEY][key] += envelope[ENVELOPE_REPORT_KEY].get(key) or []
-    if envelope.get(ENVELOPE_EXIT_KEY) != EXIT_OK and merged[ENVELOPE_EXIT_KEY] == EXIT_OK:
-        merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
+    merge_exit(merged, envelope)
 
 
 def versions_by_project(names: list[str], deadline: float, ledger: dict, now: datetime) -> dict:
@@ -924,14 +911,17 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
     into one envelope. A project whose run failed, or that the budget did not reach, is a
     read error with no location, the shape a failed ``clusters list`` has, so
     the table counts as partial: nothing is retired, and the ledger's pending
-    clusters of that project are carried forward. The ledger's table-run stamps
-    are set for every project that ran to completion or to its own cap, so the
-    next table starts with the ones it did not, and a run that resolves a
-    project's id teaches the ledger (``learn_project_id``)."""
+    clusters of that project are carried forward. So is a run for a project
+    number the report could not resolve: it is keyed by nothing, since the
+    ledger never holds a key under a number (``learn_project_id``), and when
+    the roster also spells the project by its id, that spelling's run lists
+    it. The ledger's table-run stamps are set for every project that ran to
+    completion or to its own cap, so the next table starts with the ones it
+    did not, and a run that resolves a project's id teaches the ledger."""
     last_runs = ledger[TABLE_RUNS_KEY]
     ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
-    completed: list[str] = []
+    ran: list[str] = []
     unrun: list[str] = []
     cut_short: list[str] = []
     failed: dict[str, Exception] = {}
@@ -973,12 +963,21 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             )
             continue
         last_runs[project] = iso(now)
-        learn_project_id(ledger, project, envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY))
+        ran.append(project)
+        key = learn_project_id(ids, project, envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY))
+        if key is None:
+            # A number the report could not resolve keys nothing: the run is
+            # this spelling's listing failure, read again tomorrow, so its
+            # members never enter under a key the ledger would not join against.
+            merge_exit(merged, envelope)
+            merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRESOLVED, MESSAGE_KEY: TABLE_UNRESOLVED_DETAIL.format(project=project)}
+            )
+            continue
         # The id just learned is tabled too, so the other spelling of it is skipped.
-        tabled.add(keyed(project))
-        completed.append(project)
+        tabled.add(key)
         merge_envelope(merged, envelope)
-    if failed and not completed and not unrun and not cut_short:
+    if failed and not ran and not unrun and not cut_short:
         # Every project the table ran failed and the budget left none untried:
         # that is the sandbox or the credential, not a project. One failure
         # line for the tick, announced once, rather than a partial table nobody

@@ -226,7 +226,9 @@ never reaches the end of the list does not leave the same project unread
 twice, whichever versions are due. Three guards
 keep the ledger honest: a version is
 retired only when the version table read every project, or read every project
-that still pended it and none does, a report that
+that still pended it and none does, or a readiness run (which lists every
+cluster of its project, reached by the table or not) showed every cluster
+pending it as no longer below it, a report that
 graded none of a version's pending clusters is written but not recorded (the
 chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
