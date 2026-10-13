@@ -2532,6 +2532,13 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Another of the same shape: infra lock, a plant that publishes a burst and
+    # then waits out the human record's card, then an agent turn that is a
+    # board read. Priced at the band rather than at the 566-677s its
+    # dev-install repetitions measured, because those met a quiet board and the
+    # nightly's is shared. hack/eval/nightly-cases.txt's 2026-10-13 paragraph
+    # carries the measurements and the budget arithmetic.
+    gitops-drift-noise-filtered-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev
