@@ -366,6 +366,10 @@ STARTING_REASONS = ("ContainerCreating", "PodInitializing")
 STARTING_GRACE = timedelta(minutes=10)
 OUTSIDE_FLEET_GUARD_TEXT = "no guard: the cluster is outside the fleet and is not recorded."
 STARTING_TEXT = "Starting, not graded ({count} pod(s) under {minutes} min with containers still being created): {pods}."
+# A pod held by scheduling gates (a queue admission controller's) is waiting
+# for admission, not failing: listed under Info, never graded.
+SCHEDULING_GATED_REASON = "SchedulingGated"
+GATED_TEXT = "Scheduling gated, not graded ({count} pod(s) held by scheduling gates, waiting for admission): {pods}."
 SECONDS_PER_MINUTE = 60
 # Entries whose mechanism is the control plane's; their gate is an
 # UPGRADE_MASTER in the window rather than a node-pool operation.
@@ -1611,6 +1615,13 @@ def _pod_onset(pod: dict, activity: datetime | None) -> datetime | None:
     return transition or started
 
 
+def _pod_is_gated(pod: dict) -> bool:
+    """A Pending pod the scheduler holds on its scheduling gates (a queue
+    admission controller's): waiting for admission, whatever its age."""
+    scheduled = _condition(pod, "PodScheduled")
+    return (pod.get("status") or {}).get("phase") == PHASE_PENDING and scheduled.get("status") == "False" and scheduled.get("reason") == SCHEDULING_GATED_REASON
+
+
 def _pod_is_starting(pod: dict, now: datetime | None) -> bool:
     """A pod younger than the grace whose containers are still being created
     or initialised, with no restart: not a symptom yet."""
@@ -1628,7 +1639,7 @@ def _pod_is_starting(pod: dict, now: datetime | None) -> bool:
     return bool(reasons & set(STARTING_REASONS)) and not (reasons - set(STARTING_REASONS) - {None}) and not restarted and young
 
 
-def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None) -> list[dict]:
+def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None, gated: list[str] | None = None) -> list[dict]:
     """One row per (top owner, category, reason), carrying the pods behind
     it; the row's detail (node, containers, images) is the example pod's.
     A pod whose last activity predates `window_start` is not the upgrade's."""
@@ -1644,6 +1655,11 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
         if _pod_is_starting(pod, now):
             if starting is not None:
                 starting.append(f"{meta.get('namespace', '')}/{meta.get('name', '')}")
+            continue
+        if _pod_is_gated(pod):
+            # Held by scheduling gates: waiting for admission, not failing.
+            if gated is not None:
+                gated.append(f"{meta.get('namespace', '')}/{meta.get('name', '')}")
             continue
         activity = _pod_last_activity(pod)
         if window_start and activity and activity < window_start and phase != PHASE_PENDING:
@@ -1869,12 +1885,12 @@ def pins_of_selector(selector: dict | None) -> list[dict[str, list[str]]]:
 
 
 def _pinned_pools(pins: list[dict[str, list[str]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
-    """The pools a pod's pins name: by the pool label directly, else by any
-    label the pools' nodes carry; the union over the terms. Empty when
-    nothing pins, and when the pins resolve to every pool there is: a label
-    every node carries (`kubernetes.io/os`) is no preference."""
-    # "Every pool" is every pool a node reports, not every pool the cluster
-    # record lists: a labelled pool at zero nodes carries no node label.
+    """The pools a pod's pins narrow it to, out of the pools a pod could land
+    on: every pool a node reports (not every pool the cluster record lists; a
+    labelled pool at zero nodes carries no node label). A pin by the pool
+    label itself always counts, on one pool as on many. A pin by any other
+    label counts only when it narrows that set, so a label every node carries
+    (`kubernetes.io/os`) is no preference. The union over the terms."""
     universe: set[str] = set().union(*(found for (key, _), found in label_pools.items() if key == NODEPOOL_LABEL))
     pools: set[str] = set()
     for pin in pins:
@@ -1882,9 +1898,11 @@ def _pinned_pools(pins: list[dict[str, list[str]]], label_pools: dict[tuple[str,
         for key, values in pin.items():
             matching = set(values) if key == NODEPOOL_LABEL else {pool for value in values for pool in label_pools.get((key, value), set())}
             term = matching if term is None else term & matching
-        pools |= term or set()
-    if universe and pools >= universe:
-        return set()
+        term = term or set()
+        # Narrowing: anything short of covering every pool with nodes (a
+        # labelled pool at zero nodes included).
+        if NODEPOOL_LABEL in pin or not universe or not term >= universe:
+            pools |= term
     return pools
 
 
@@ -2163,7 +2181,10 @@ def _dropped_label(symptom: dict, ctx: Context) -> str:
     pins = symptom.get("node_pins")
     if pins is None:
         pins = pins_of_selector(symptom.get("node_selector"))
-    pool = next(iter(sorted(_pinned_pools(pins, ctx.label_pools))), "")
+    # The pool to grade against is named by the pins other than the dropped
+    # label itself: a label no node carries any more resolves to no pool.
+    placing = [{key: values for key, values in pin.items() if key not in DROPPED_NODE_LABELS} for pin in pins]
+    pool = next(iter(sorted(_pinned_pools(placing, ctx.label_pools))), "")
     parsed = parse_version(ctx.pool_versions.get(pool) or ctx.control_plane or "")
     for label in sorted({key for pin in pins for key in pin}):
         dropped_at = DROPPED_NODE_LABELS.get(label)
@@ -2646,12 +2667,17 @@ def _last_closing(window: dict, now: datetime) -> tuple[bool, datetime | None]:
             return False, None
     except ValueError:
         return False, None
+    open_now = False
     for offset in range(NEXT_WINDOW_SEARCH_DAYS + 1):
         candidate = datetime.combine((now - timedelta(days=offset)).date(), start_t)
         if candidate > now or (days and candidate.weekday() not in days):
             continue
-        return (True, None) if now < candidate + length else (False, candidate + length)
-    return False, None
+        if now < candidate + length:
+            # Open now; the previous occurrence's close is still the reference.
+            open_now = True
+            continue
+        return open_now, candidate + length
+    return open_now, None
 
 
 def version_skew(cluster: dict, nodes: list[dict], now: datetime) -> dict:
@@ -2720,12 +2746,14 @@ def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None
     if now is None:
         return []
     reading = version_skew(cluster, nodes, now)
-    if not reading["skews"] or reading["state"]:
+    if not reading["skews"]:
         return []
     previous = set(baseline or [])
     rows = []
     for (pool, text), key in zip(reading["skews"], reading["keys"]):
-        if not reading["overdue"] and key not in previous:
+        # An open window or an active exclusion holds only a skew not yet
+        # recorded: a recorded one has stood across a close already.
+        if key not in previous and (reading["state"] or not reading["overdue"]):
             continue
         detail = reading["reference"] if reading["overdue"] else SKEW_PERSISTED_FORMAT.format(reference=reading["reference"] or SKEW_NO_REFERENCE_TEXT)
         rows.append({
@@ -2752,6 +2780,9 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     failing_objects: dict[str, str] = {}
     for pod in pods:
         meta, status = pod.get("metadata") or {}, pod.get("status") or {}
+        if _pod_is_gated(pod):
+            # Waiting for admission: not a failure anything agrees with.
+            continue
         what = ""
         for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []):
             state = cs.get("state") or {}
@@ -2781,7 +2812,7 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     return failing_pods, failing_objects
 
 
-def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None) -> list[dict]:
+def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None, gated: list[str] | None = None) -> list[dict]:
     """Every symptom in the read, each with its classifications, user
     namespaces first."""
     nodes = reads.get("nodes") or []
@@ -2808,7 +2839,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         control_plane=versions_of(cluster)["control_plane"] or "",
     )
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
-    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []), now, starting)
+    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []), now, starting, gated)
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
@@ -3461,9 +3492,10 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     # A workload still unavailable keeps its entry-3 guard: the operation its
     # outage fell inside cannot be re-observed, the outage can.
     unavailable = set(_unavailable_workloads(reads.get("workloads") or []))
-    # A skew that still stands, the window closed, keeps its entry-5 guard.
+    # A skew that still stands keeps its entry-5 guard, whatever the window
+    # is doing at this hour: a guard is cleared only when the skew is gone.
     skew = version_skew(cluster, reads.get("nodes") or [], now) if now is not None else {"skews": [], "state": "", "keys": []}
-    skewed = {_object_ref("", "NodePool", pool) for pool, _ in skew["skews"]} if not skew["state"] else set()
+    skewed = {_object_ref("", "NodePool", pool) for pool, _ in skew["skews"]}
     symptoms = collect_symptoms(cluster, reads, [], EPOCH, now=now)
     if refresh and set(REFRESH_READS) <= answered:
         result["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms} | set(skew["keys"]))
@@ -3559,6 +3591,7 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "answered": [],
             "commands": [],
             "starting": [],
+            "gated": [],
             "skew_notes": [],
             "unavailable_workloads": [],
         }
@@ -3589,6 +3622,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "answered": [],
         "commands": [],
         "starting": [],
+        "gated": [],
         "skew_notes": [],
         "unavailable_workloads": [],
     }
@@ -3621,10 +3655,12 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     # ledger moves and absent guards drop -- only when every core read answered.
     review["reviewed"] = not review["partial"]
     starting: list[str] = []
+    gated: list[str] = []
     entry = (ledger.get("clusters") or {}).get(selection.key) or {}
     stored = entry.get("symptoms") if entry.get("last_run") else None
-    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored)
+    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored, gated=gated)
     review["starting"] = starting
+    review["gated"] = gated
     skew = version_skew(cluster, reads.get("nodes") or [], now or now_utc())
     if skew["skews"] and not any(sym["category"] == CATEGORY_VERSION_SKEW for sym in symptoms):
         skews_text = "; ".join(text for _, text in skew["skews"])
@@ -3769,6 +3805,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "partial": review.get("partial") or [],
                 "outside_fleet": bool(review.get("outside_fleet")),
                 "starting": review.get("starting") or [],
+                "gated": review.get("gated") or [],
                 "skew_notes": review.get("skew_notes") or [],
                 "next_upgrade": review["next_upgrade"],
                 "shapes": review["shapes"],
@@ -3777,7 +3814,16 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
             })
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
+    # The reads a stale guard could not be re-observed through: a partial
+    # review's core reads, or a reviewed cluster's failed shape read (an
+    # entry-3 guard needs `workloads`).
+    read_names = {name for name, _ in KUBECTL_READS}
     partial_reads = {r["cluster"]: r["partial"] for r in reviews if r.get("partial") and not r["reviewed"]}
+    for r in reviews:
+        if r["reviewed"]:
+            failed = [e.split(":")[0] for e in r.get("read_errors") or [] if e.split(":")[0] in read_names]
+            if failed:
+                partial_reads[r["cluster"]] = failed
     upgrading_keys = {row["cluster"] for row in upgrading or []}
     not_recheckable = {gid for r in rechecks or [] for gid in r.get("not_recheckable") or []}
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
@@ -3974,6 +4020,8 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [PARTIAL_READ_TEXT.format(failed=", ".join(row["partial"])), ""]
     if row.get("starting"):
         lines += [STARTING_TEXT.format(count=len(row["starting"]), minutes=int(STARTING_GRACE.total_seconds() // SECONDS_PER_MINUTE), pods=", ".join(_cell(p) for p in row["starting"])), ""]
+    if row.get("gated"):
+        lines += [GATED_TEXT.format(count=len(row["gated"]), pods=", ".join(_cell(p) for p in row["gated"])), ""]
     for note in row.get("skew_notes") or []:
         lines += [_cell(note), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
@@ -4367,7 +4415,10 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             entries[key].pop("partial_read", None)
     return {"version": LEDGER_VERSION, "updated_at": seen_at, LEDGER_PROJECTS_KEY: ledger.get(LEDGER_PROJECTS_KEY) or [], "clusters": entries}
 
-def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None) -> dict:
+def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS) -> dict:
+    """The run. `max_workers` sizes every pool the run opens (the server
+    configs, the reviews, the re-checks); the default is the figure the
+    sibling collectors pin to the credential proxy's admitted count."""
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish
@@ -4469,12 +4520,12 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     # cluster: the next target is printed for unchanged clusters too.
     locations = sorted({(c["project"], c["location"]) for c in clusters})
     server_configs: dict[tuple[str, str], dict | None] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for (project, location), (config, error) in zip(locations, pool.map(lambda pl: fetch_server_config(pl[0], pl[1], run=run), locations)):
             server_configs[(project, location)] = config
             if error:
                 failed_reads.append(f"{project}/{location}: {error}")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         reviews = list(pool.map(lambda s: _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now, operations_command=operations_commands.get(s.cluster["project"])), selected))
     reviews.sort(key=lambda r: r["cluster"])
     # Only a run invoked with --full is full: it records the fleet's project
@@ -4560,7 +4611,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         for row in unchanged
         if row["cluster"] in by_key and (row["cluster"] in held or (not scoped and row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0] in new_fleet))
     ]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         rechecks = list(pool.map(lambda item: _safe_recheck(item[0], item[1], item[2], run=run, refresh=item[3], now=now), to_recheck))
     refreshed_baselines = {r["cluster"]: r["symptom_baseline"] for r in rechecks if r.get("symptom_baseline") is not None}
     cleared_ids = {gid for r in rechecks for gid in r["cleared"]}
@@ -4629,6 +4680,11 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     write_json_atomically(guards_path, new_guards)
     write_json_atomically(ledger_path, new_ledger)
     return result
+
+
+# `collect` is the name the tests and `main` call; `collect_fleet` is the
+# entry the sweep-pool test across the collectors pins.
+collect = collect_fleet
 
 
 def prune_reports(reports_dir: Path) -> list[str]:
