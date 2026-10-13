@@ -954,6 +954,20 @@ LEDGER_AUDIT_IDS = frozenset(
     }
 )
 
+# The same ids as a type, for a check's `audit` field: a typo fails at
+# spec-load time rather than as an unfindable ledger or store at run time.
+AuditId = Literal[
+    "ai-security-audit",
+    "compliance-audit",
+    "fleet-consistency-drift",
+    "fleet-wide-cost-analysis",
+    "gce-compute-fleet-audit",
+    "gcp-networking-fabric-audit",
+    "obtainability-audit",
+    "security-patch-orchestrator",
+    "stockout-prevention",
+]
+
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
@@ -1861,17 +1875,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     type: Literal["ledger_issue_contains"]
     # Which stream's ledger. Validated against the registered ids so a typo
     # fails at spec-load time rather than as an unfindable ledger at run time.
-    audit: Literal[
-        "ai-security-audit",
-        "compliance-audit",
-        "fleet-consistency-drift",
-        "fleet-wide-cost-analysis",
-        "gce-compute-fleet-audit",
-        "gcp-networking-fabric-audit",
-        "obtainability-audit",
-        "security-patch-orchestrator",
-        "stockout-prevention",
-    ]
+    audit: AuditId
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
@@ -4635,17 +4639,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     """
 
     type: Literal["audit_report_stored"]
-    audit: Literal[
-        "ai-security-audit",
-        "compliance-audit",
-        "fleet-consistency-drift",
-        "fleet-wide-cost-analysis",
-        "gce-compute-fleet-audit",
-        "gcp-networking-fabric-audit",
-        "obtainability-audit",
-        "security-patch-orchestrator",
-        "stockout-prevention",
-    ]
+    audit: AuditId
     status: str | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and

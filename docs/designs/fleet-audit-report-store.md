@@ -28,7 +28,7 @@ Both are the same missing thing: the run's structured output, kept where it was 
 
 ## 2. The store
 
-`finish` keeps what it publishes. On the exit-0 path only — clean and findings branches alike, never
+`finish` keeps what it publishes. On the exit-0 path only — clean, findings and no-forge branches alike, never
 on `--dry-run`, never after a rejection, never from `remediate` — it writes one envelope under
 `<root>/<audit-id>/<owner>/<name>/`, the directory of the repository the run published to:
 

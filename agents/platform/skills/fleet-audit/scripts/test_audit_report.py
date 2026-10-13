@@ -25008,8 +25008,11 @@ class TestNoForge(BaseTestCase):
         self.patch_attr("run_cmd", self.recorder)
         no_remote = type(sys)("github_token_refresh")
         no_remote.get_current_git_repo = lambda cwd=None: None
+        # What `managed_repos` holds before parsing; blank is nothing registered.
+        self.managed_text = ""
         for patcher in (
             patch("gitops_workspace.get_managed_repos", return_value=[]),
+            patch("gitops_workspace._read_state_text", lambda key: self.managed_text),
             patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
             patch.dict(sys.modules, {"github_token_refresh": no_remote}),
         ):
@@ -25050,14 +25053,31 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(self.recorder.calls, [])
 
     def test_an_unreadable_repository_list_is_not_taken_for_no_forge(self):
-        with patch(
-            "gitops_workspace.get_managed_repos",
-            side_effect=RuntimeError("Failed to read ConfigMap platform-agent-gitops-state"),
+        unreadable = RuntimeError("Failed to read ConfigMap platform-agent-gitops-state")
+        with patch("gitops_workspace.get_managed_repos", side_effect=unreadable), patch(
+            "gitops_workspace._read_state_text", side_effect=unreadable
         ):
             code = self.run_main(["start", "--audit", AUDIT])
         self.assertEqual(code, 1)
         self.assertIn("Failed to read ConfigMap", self.err)
         self.assertEqual(self.out, "")
+
+    def test_an_empty_list_is_nothing_registered(self):
+        self.managed_text = "[]"
+        self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
+
+    def test_a_registered_value_the_image_cannot_use_is_not_taken_for_no_forge(self):
+        for text in (
+            '{"type": "github", "url": "https://github.com/acme/gitops"}',
+            '[{"url": "https://github.com/acme/gitops"}]',
+            '[{"type": "gitea", "url": "https://gitea.example.com/acme/gitops"}]',
+            "[not json",
+        ):
+            with self.subTest(text=text):
+                self.managed_text = text
+                self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+                self.assertIn("Could not resolve the target repository", self.err)
+                self.assertEqual(self.out, "")
 
     def test_finish_stores_the_findings_and_prints_a_summary(self):
         doc = make_doc(findings=THREE_SEVERITIES)
@@ -25097,6 +25117,34 @@ class TestNoForge(BaseTestCase):
         fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
         self.assertFalse(fixed["silent_ok"])
+
+    def test_a_finding_the_collector_still_flags_is_held_not_resolved(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        previous = set(json.loads((self.store() / "latest.json").read_text())["current_ids"])
+        kept = make_doc(findings=THREE_SEVERITIES[1:])
+        kept_ids = set(audit_report.finding_ids(audit_report.load_findings(self.write_findings(kept), AUDIT)["findings"]))
+        (left_out,) = previous - kept_ids
+        self.patch_attr("still_flagged_ids", lambda manifest, data: {left_out})
+
+        out = self.finish(kept)
+
+        self.assertEqual(out["resolved"], 0)
+        self.assertIn(left_out, out["summary"])
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertIn(left_out, latest["current_ids"])
+
+    def test_a_failed_store_write_says_the_message_is_the_only_record(self):
+        self.reports_dir.mkdir(parents=True)
+        (self.reports_dir / AUDIT).write_text("not a directory", encoding="utf-8")
+
+        out = self.finish(make_doc())
+
+        self.assertEqual(out["no_forge"], audit_report.NO_FORGE_UNSTORED_NOTE)
+        self.assertEqual(out["summary"].splitlines()[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_the_summary_names_the_object(self):
+        out = self.finish(make_doc(findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="")]))
+        self.assertIn("(prod-us-east/ClusterRoleBinding/debug-binding)", out["summary"])
 
     def test_an_unreadable_record_makes_the_delta_unknown(self):
         self.finish(make_doc())

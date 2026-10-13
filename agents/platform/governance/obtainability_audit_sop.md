@@ -530,6 +530,7 @@ One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `pr
 
 - On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
 
 What to report in each case:
 

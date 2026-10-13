@@ -163,13 +163,14 @@ Every finding must conform to the full findings schema:
 python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gce-compute-fleet-audit \
   --findings-file /opt/data/scratch/findings_gce-compute-fleet-audit.json \
   --manifest-file /opt/data/scratch/manifest_gce-compute-fleet-audit.json
-# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
 - **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
 
 ---

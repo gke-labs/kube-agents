@@ -166,6 +166,7 @@ What that workspace contains depends on the install, and `start` tells you which
   repository out of: use `list` and `fetch` (below) for that.
 - **`directory`** — the workspace is a clone of the GitOps repository on the shared volume, and the
   harness runs `checkout`, `add`, `commit` and `push` inside it.
+- **`none`** — no forge is configured; see [No forge configured](#no-forge-configured).
 
 Everything else is identical, including where you write manifests and what `finish` publishes. Where
 the two differ, this file says which mode it is talking about.
@@ -238,9 +239,9 @@ manifest written anywhere else is a file the harness will never find — the fin
 manual one, or, for a fix the sweep would open, `finish` refuses until it is there. `start` scrubs that directory before handing it to you;
 `finish` does not, which is what lets the files you write in between survive.
 
-`mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
-workspace is empty rather than a checkout. Read it rather than guessing from what is on disk.
-`mode: "none"` means no forge is configured; see [No forge configured](#no-forge-configured).
+`mode` is `content`, `directory` or `none`. Between the first two it changes one thing you can see:
+in `content` mode the workspace is empty rather than a checkout. Read it rather than guessing from
+what is on disk. `none` means no forge is configured; see [No forge configured](#no-forge-configured).
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
@@ -528,8 +529,8 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (and no `--repo`) has
 no forge to write a ledger to. The audit runs anyway:
 
-- `start` prints `"mode": "none"`, `"repo": null`, `"issue": null`, a `no_forge` note, and an empty
-  `workspace`. Pass that `workspace` to the collector as the SOP says. There is no repository, so
+- `start` skips the credential, the labels and the ledger lookup, and prints `"mode": "none"`,
+  `"repo": null`, `"issue": null`, a `no_forge` note, and a `workspace` path to an empty directory. Pass that `workspace` to the collector as the SOP says. There is no repository, so
   `declared_intent_repos` lists only `context_repos`, and `fetch`, `list`, `grep` and `remediate`
   have nothing to act on: do not run them.
 - Run every check as the SOP says and write the findings document as usual. A `manifest`

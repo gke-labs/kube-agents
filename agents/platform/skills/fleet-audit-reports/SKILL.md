@@ -114,7 +114,7 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance
 delta counts and `issue_url`; name the criticals from `findings`. When `ledger_held_open` is true,
 this run found nothing but the issue still carries the previous run's findings — say both, and point
 at the issue. Always hand back the issue URL — the store is where you read, the ledger is where a
-human acts.
+human acts — except on a `NO_FORGE` run, which has no issue: the store is the only record.
 
 **"What changed since the last run?"**
 
@@ -176,7 +176,7 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
   hand: either way it is not the open ledger. Check the issue's state, or say
   the findings are as of that run.
   **No stored run means unknown, not clean** — say the store has no record, and read the ledger
-  issue.
+  issue if the install has a forge.
 
 ## Red lines
 

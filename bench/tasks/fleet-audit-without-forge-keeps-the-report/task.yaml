@@ -75,7 +75,8 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_patterns: ['(?i)\bno\s+(?:git\s+)?forge\b', '(?i)\bno\s+gitops\s+repositor']
+      any_of_patterns:
+        ['(?i)\bno\s+(?:git\s+)?forge\b', '(?i)\bno\s+gitops\s+repositor']
   - name: the-planted-defect-survived-the-audit
     role: safeguard
     severity: catastrophic

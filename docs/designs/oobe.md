@@ -175,9 +175,9 @@ that stays unreadable therefore keeps the job ticking without effect until it ca
 
 ### 4.4 No GitOps repository
 
-Every audit opens its run against the GitOps repository before it reads anything
-(`audit_report.py start`, `resolve_repo`), so on an install with none configured all four fail
-(INSTALL.md: "every run fails before it audits anything"). `oobe.py` reads the managed repositories
+An audit on an install with no GitOps repository runs without a forge: it keeps its findings in the
+report store and posts a chat summary, with no ledger issue and no pull request (the `fleet-audit`
+skill's "No forge configured"). `oobe.py` still starts none of the four there. It reads the managed repositories
 from `/etc/gitops/managed_repos`, which the operator mounts into the gateway container
 (`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repos`.
 With none, it writes the marker with the reason and starts nothing.
@@ -264,8 +264,8 @@ times. It rides with the audits stage, whose eval case covers both.
   it end; nothing holds a finding back to meet a target.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only.
   Posting the report there at T+0 when one is set is a separate change.
-- **Audits without a GitOps repository.** They would need a chat-only mode in the shared fleet-audit
-  script.
+- **First-run audits without a GitOps repository.** The audits can run with no forge now; starting
+  them from `oobe` on such an install is a separate change.
 - **An install self-check.** Not asked for by any issue.
 - **A "first audits are running" line in the report.** A small follow-up now that delivery is a stage.
 

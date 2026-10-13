@@ -814,6 +814,12 @@ NO_FORGE_NOTE = (
     "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
     "remediation pull request was opened. The findings are in the report store."
 )
+NO_FORGE_UNSTORED_NOTE = (
+    "No forge is configured (no GitOps repository is registered in "
+    "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
+    "remediation pull request was opened. The report store could not be "
+    "written either, so this message is the only record of the findings."
+)
 # The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
 # How many findings the chat summary names, most severe first; the store keeps
@@ -2859,8 +2865,11 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def write_report(
     audit_id: str, envelope: dict, now: datetime, *, ledger_unchanged: bool = False
-) -> None:
+) -> bool:
     """Keep what this run just published. Best-effort: never fails the run.
+
+    Returns whether the envelope was written, for a caller whose report says
+    where the findings are kept.
 
     Called on the exit-0 publish path only; a dry run, a rejected document and
     `remediate` return before reaching it. `ledger_unchanged` says this run
@@ -2872,7 +2881,7 @@ def write_report(
         directory = reports_dir_for(audit_id, str(envelope.get("repo")))
     except ValueError as exc:
         log(f"WARNING: report store write for {audit_id} skipped: {exc}")
-        return
+        return False
     runs = directory / REPORT_RUNS_DIR
     try:
         _make_store_dirs(runs)
@@ -2887,7 +2896,7 @@ def write_report(
             # Nothing was published to the body, so the record from before is
             # still exactly the ledger; dropping it would cost the next run a
             # memory it had no reason to lose.
-            return
+            return False
         # `latest.json` now describes an older run, and nothing in it says so:
         # same ledger, same scheme, so the next run would trust a memory that
         # lacks everything this one published. Absent is honest; stale is not.
@@ -2898,7 +2907,7 @@ def write_report(
                 f"WARNING: could not drop the stale latest.json for {audit_id}: "
                 f"{unlink_exc}{_ownership_note(unlink_exc)}"
             )
-        return
+        return False
     try:
         for stale in sorted(runs.glob("*.json"))[:-REPORT_HISTORY]:
             stale.unlink()
@@ -2906,6 +2915,7 @@ def write_report(
         # Not the invalidating path above: the envelope landed and is correct,
         # and an over-long ring costs disk rather than accuracy.
         log(f"WARNING: report store prune for {audit_id} failed: {exc}")
+    return True
 
 
 def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> dict | None:
@@ -11752,17 +11762,19 @@ def resolve_repo(
 def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
     """`resolve_repo`, or `NO_FORGE_REPO` on an install that registers no repository.
 
-    Only a managed list read as empty means no forge. A list that cannot be
-    read raises from `get_managed_repos` here as it does inside
-    `resolve_repo`, so a failed ConfigMap read is never taken for an install
-    without a forge, and neither is a `--repo` that did not resolve.
+    Only a `managed_repos` value that is blank or an empty list means no forge.
+    A value that does not parse, or whose entries the image cannot serve,
+    keeps the resolver's error: that install registered something, and telling
+    its operator nothing is registered would be false. A list that cannot be
+    read raises here as it does inside `resolve_repo`, and so does a `--repo`
+    that did not resolve.
     """
     try:
         return resolve_repo(audit_id=audit_id, repo=repo)
     except RuntimeError:
         import gitops_workspace
 
-        if (repo and str(repo).strip()) or gitops_workspace.get_managed_repos():
+        if (repo and str(repo).strip()) or gitops_workspace.managed_repos_registered():
             raise
         return NO_FORGE_REPO
 
@@ -15935,13 +15947,16 @@ def render_no_forge_summary(
     new_ids: list[str],
     resolved_ids: list[str],
     delta_known: bool,
+    held: list[str],
+    note: str,
 ) -> str:
     """The chat summary of a run with no forge, which is the only report its operator gets.
 
     The headline counts, the most severe findings up to
-    `NO_FORGE_SUMMARY_FINDINGS`, the coverage gaps, and the note that says
-    why nothing was published. Redacted like the ledger body, because it is
-    delivered to a channel the same way.
+    `NO_FORGE_SUMMARY_FINDINGS` with the object each one names, the ids the
+    collector still flags that the document left out, the coverage gaps, and
+    `note`. Redacted like the ledger body, because it is delivered to a
+    channel the same way.
     """
     findings = list(data.get("findings") or [])
     clusters = len((data.get("scope") or {}).get("clusters") or [])
@@ -15959,16 +15974,27 @@ def render_no_forge_summary(
     ordered = sorted(findings, key=lambda f: rank.get(str(f.get("severity")), len(SEVERITIES)))
     for finding in ordered[:NO_FORGE_SUMMARY_FINDINGS]:
         where = "/".join(
-            part for part in (str(finding.get("cluster") or ""), str(finding.get("namespace") or "")) if part
+            part
+            for part in (
+                str(finding.get("cluster") or ""),
+                str(finding.get("namespace") or ""),
+                str(finding.get("object") or ""),
+            )
+            if part
         )
         lines.append(
-            f"- [{finding.get('severity')}] {redact_secrets(str(finding.get('title') or ''))} ({where})"
+            f"- [{finding.get('severity')}] {redact_secrets(str(finding.get('title') or ''))} "
+            f"({redact_secrets(where)})"
         )
     if len(ordered) > NO_FORGE_SUMMARY_FINDINGS:
         lines.append(f"- and {len(ordered) - NO_FORGE_SUMMARY_FINDINGS} more in the report store")
+    if held:
+        lines.append(
+            f"Still flagged by the collector but not in this run's document: {', '.join(held)}"
+        )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
-    lines.append(NO_FORGE_NOTE)
+    lines.append(note)
     return "\n".join(lines)
 
 
@@ -15984,11 +16010,13 @@ def _finish_without_forge(
     """Keep a run on an install with no forge in the report store, and print its line.
 
     Everything `finish` does with a ledger is skipped: the issue, its delta
-    comment, the held set, the remediation sweep and the stale closes all need
-    a repository. The checks still ran, so the delta is taken against the
-    previous no-forge envelope and the JSON line carries a `summary` for the
-    run to deliver to chat. A document `finish` would refuse is refused the
-    same way, since validation runs before this.
+    comment, the remediation sweep and the stale closes all need a repository.
+    The checks still ran, so the delta is taken against the previous no-forge
+    envelope and the JSON line carries a `summary` for the run to deliver to
+    chat. A previous finding the collector still flags is held, as the ledger
+    holds it: the document leaving it out is not the condition clearing. A
+    document `finish` would refuse is refused the same way, since validation
+    runs before this.
     """
     findings = list(data["findings"])
     declared = [entry for entry in data.get("declared") or [] if isinstance(entry, dict)]
@@ -16001,9 +16029,13 @@ def _finish_without_forge(
     current_ids = finding_ids(findings)
     previous_ids = previous_no_forge_ids(audit_id)
     delta_known = previous_ids is not None
+    held = sorted(
+        (set(previous_ids or []) & still_flagged_ids(manifest, data)) - set(current_ids)
+    )
+    stored_ids = sorted(set(current_ids) | set(held))
     new_ids = sorted(set(current_ids) - set(previous_ids or []))
     # Over a coverage gap an absence means "not checked", not fixed.
-    resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(current_ids))
+    resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(stored_ids))
     if not delta_known:
         new_ids, resolved_ids = [], []
     payload = {
@@ -16035,13 +16067,9 @@ def _finish_without_forge(
         ),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
-        "no_forge": NO_FORGE_NOTE,
-        "summary": render_no_forge_summary(
-            audit_id, data, gaps, new_ids, resolved_ids, delta_known
-        ),
         **timers(),
     }
-    write_report(
+    stored = write_report(
         audit_id,
         report_envelope(
             audit_id,
@@ -16053,10 +16081,17 @@ def _finish_without_forge(
             ledger_body="",
             new_ids=new_ids,
             resolved_ids=resolved_ids,
-            rendered_ids=current_ids,
+            rendered_ids=stored_ids,
             delta_known=delta_known,
         ),
         now,
+    )
+    # The store is the only record on this install, so the note says whether
+    # it holds this run rather than promising it.
+    note = NO_FORGE_NOTE if stored else NO_FORGE_UNSTORED_NOTE
+    payload["no_forge"] = note
+    payload["summary"] = render_no_forge_summary(
+        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note
     )
     print(json.dumps(payload))
 
