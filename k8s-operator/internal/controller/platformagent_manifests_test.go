@@ -3088,8 +3088,8 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
 
-	if len(role.Rules) != 8 {
-		t.Fatalf("expected 8 PolicyRules, got %d", len(role.Rules))
+	if len(role.Rules) != 12 {
+		t.Fatalf("expected 12 PolicyRules, got %d", len(role.Rules))
 	}
 
 	// Core group rule
@@ -3120,6 +3120,59 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	expectedMetricsVerbs := []string{"get", "list"}
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
+	}
+}
+
+// The agent reads the GitOps reconcilers' sync objects to learn which repository
+// and directory syncs a cluster. Nothing in that grant may write or reach a Secret
+// (Argo CD keeps cluster and repository credentials in Secrets), and the kinds the
+// sync lookup does not need stay out, so the readable inline values are bounded
+// to what Applications and Kustomizations carry.
+func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
+	role := buildMinimalPlatformRole(&agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	})
+	want := map[string][]string{
+		"argoproj.io":                 {"applications"},
+		"kustomize.toolkit.fluxcd.io": {"kustomizations"},
+		"source.toolkit.fluxcd.io":    {"gitrepositories", "ocirepositories"},
+		"configsync.gke.io":           {"rootsyncs", "reposyncs"},
+	}
+	excluded := map[string]string{
+		"helmreleases":     "helm.toolkit.fluxcd.io",
+		"applicationsets":  "argoproj.io",
+		"appprojects":      "argoproj.io",
+		"helmrepositories": "source.toolkit.fluxcd.io",
+	}
+	readOnly := []string{"get", "list", "watch"}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.Resources, "secrets") {
+			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
+		}
+		if slices.Contains(rule.Resources, "*") || slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Verbs, "*") {
+			t.Errorf("minimal role carries a wildcard: %+v", rule)
+		}
+		for _, resource := range rule.Resources {
+			if group, ok := excluded[resource]; ok && slices.Contains(rule.APIGroups, group) {
+				t.Errorf("minimal role grants %s.%s, which carries inline values or templates", resource, group)
+			}
+		}
+		for _, group := range rule.APIGroups {
+			resources, ok := want[group]
+			if !ok {
+				continue
+			}
+			if !slices.Equal(rule.Resources, resources) {
+				t.Errorf("%s: resources %v, want %v", group, rule.Resources, resources)
+			}
+			if !slices.Equal(rule.Verbs, readOnly) {
+				t.Errorf("%s: verbs %v, want %v", group, rule.Verbs, readOnly)
+			}
+			delete(want, group)
+		}
+	}
+	for group := range want {
+		t.Errorf("minimal role has no rule for %s", group)
 	}
 }
 
