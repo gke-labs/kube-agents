@@ -1,0 +1,83 @@
+{
+  "name": "reactions-delegated-pause-then-settle",
+  "source": "deploy/docker/patches/test_slack_ux_reactions.py::DisplayTest.test_pause_goes_on_while_a_card_waits_on_you_and_off_when_you_answer",
+  "notes": "The turn that filed cards keeps the ask on its terminal. A repeated block changes nothing. The card's notifies carry each new state; a notify needs its text, so PR 3 rides the mark on the card's own post.",
+  "input": {
+    "events": [
+      {
+        "ask": "fix it"
+      },
+      {
+        "terminal": "completed",
+        "filed_cards": [
+          "t_a"
+        ]
+      },
+      {
+        "task_id": "t_a",
+        "kind": "blocked"
+      },
+      {
+        "task_id": "t_a",
+        "kind": "review_requested"
+      },
+      {
+        "task_id": "t_a",
+        "kind": "unblocked"
+      },
+      {
+        "task_id": "t_a",
+        "kind": "completed"
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "progress",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    {
+      "carrier": "terminal",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change",
+          "settle": "blocked"
+        }
+      }
+    },
+    null,
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "settle": "done"
+        }
+      }
+    }
+  ]
+}

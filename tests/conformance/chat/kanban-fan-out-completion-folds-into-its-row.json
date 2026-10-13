@@ -1,0 +1,53 @@
+{
+  "name": "kanban-fan-out-completion-folds-into-its-row",
+  "source": "deploy/docker/patches/test_kanban_progress_lines.py::SlackMomentsHookTest.test_a_fanned_out_cards_completion_folds_into_its_row",
+  "notes": "A completed card under an open fan-out posts nothing of its own; its row carries the result. Failures and questions still post.",
+  "input": {
+    "rows": [
+      {
+        "task_id": "t_e0c1",
+        "title": "seeded-a",
+        "lines": [
+          "reading version"
+        ],
+        "status": "in_progress",
+        "note": "reading version",
+        "steps": 1
+      }
+    ],
+    "events": [
+      {
+        "task_id": "t_e0c1",
+        "kind": "completed",
+        "payload": {
+          "summary": "seeded-a: 1.33.4 = default."
+        },
+        "fanned_out": true
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "seeded-a",
+          "items": [
+            {
+              "id": "t_e0c1",
+              "title": "seeded-a: 1.33.4 = default.",
+              "status": "complete",
+              "steps": [
+                "reading version"
+              ],
+              "stepCount": 1,
+              "result": "seeded-a: 1.33.4 = default."
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}
