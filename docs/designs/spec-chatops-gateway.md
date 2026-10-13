@@ -1422,8 +1422,9 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
-escaped text instead. The gateway acks no Slack interaction, so a button on such a card would
-be clicked into a timeout: the gateway refuses any interactive block or element (an `actions`
+escaped text instead. The gateway answers clicks only on the choice buttons it draws itself
+from a chat message (the Slack adapter section), so a button on such a card would be clicked
+into nothing: the gateway refuses any interactive block or element (an `actions`
 or `input` block, a button, a select, a date or time picker, a text input), and the agent sends
 the card without its buttons, a link button turned into a plain link. The blocks are decoded into slack-go's types and sent again,
 so a block type it does not know travels as written and a field it does not model may not. A
@@ -1632,6 +1633,29 @@ resolved through the same rule as the requester, the allowed-users list and then
 so a mapped member the list refuses is recorded by their raw backend id, never under the
 principal the gateway declined to grant them, and a listed member the map does not name
 as `slack:<user_id>`, the principal they get as a requester.
+
+**Reactions, clicks and Agent Sessions.** The adapter draws a chat message's `mark`
+(spec-a2a-payloads.md) as reactions on the asking message: today's emoji per ask kind, ⏸️ for
+`blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the chain's newest
+task's mark, the terminal default, a conversation notify's mark) and records what it drew on
+the chain's root history entry, so a mark draws only its difference, across a restart too; the
+adapter owns which emoji a token shows, and removes only its own reactions. Interactive
+envelopes are acked like events. A click on a choice button the renderer drew is a message from
+the clicker whose text is the choice's reply, handed to the gateway like a typed one, so the
+allowlist and the map judge it the same way and it carries no intent. The gateway tells the
+adapter whether each message's sender passed (`VerifiedObserver`), and only then does the
+adapter rewrite the clicked question: its choice buttons and waiting line removed, "✓ <name>:
+<label>" added, the name from `users.info` (display name, real name, handle; never an id). A
+typed reply in a conversation whose question is still open answers it the same way, with the
+reply's first words; a gateway command (a stop, a status ask, `/session`, a delegate) answers
+nothing. A question is answered once, and a second click on it is dropped. The open question
+and the answered set live in the process, so a question posted before a restart keeps its
+buttons until clicked, and a typed reply then rewrites nothing. A thread's Agent Session is
+`processing` from `TaskStarted` until the chain ends, and past that while the chain's mark
+still carries its ask (card work still open), `suspended` while the settle is `blocked`, and
+`closed` after; the thread is renamed once from its first verified ask, with today's title
+sanitiser. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
+three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses
