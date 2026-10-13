@@ -7,6 +7,18 @@
         "tasks": [
           {
             "status": "in_progress",
+            "task_id": "t_3",
+            "title": "check payments",
+            "type": "task_card"
+          },
+          {
+            "status": "in_progress",
+            "task_id": "t_4",
+            "title": "check payments",
+            "type": "task_card"
+          },
+          {
+            "status": "in_progress",
             "task_id": "t_5",
             "title": "check payments",
             "type": "task_card"
@@ -32,18 +44,6 @@
           {
             "status": "in_progress",
             "task_id": "t_9",
-            "title": "check payments",
-            "type": "task_card"
-          },
-          {
-            "status": "in_progress",
-            "task_id": "t_10",
-            "title": "check payments",
-            "type": "task_card"
-          },
-          {
-            "status": "in_progress",
-            "task_id": "t_11",
             "title": "check payments",
             "type": "task_card"
           },
