@@ -118,12 +118,15 @@ NAME_RE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 SUBJECT_RE = re.compile(
     r"[a-z][a-z0-9.]*(/[a-z0-9][a-z0-9.-]*|\?[A-Za-z0-9][A-Za-z0-9._/=,-]*|\?)"
 )
-# One path step: a key, optionally followed by `[*]`, `[N]` or a
-# `[?(@.key=='value')]` filter. Keys allow the hyphens GKE puts in exclusion
-# names (`maintenanceExclusions.hold-the-minor-lag`).
+# One path step: a key, optionally followed by `[*]`, `[N]`, a
+# `[?(@.key=='value')]` filter, or a `["quoted.key"]` sub-key for a name the
+# bare form cannot carry -- a label or selector key with dots and a slash,
+# `metadata.labels["pod-security.kubernetes.io/enforce-version"]` -- so one
+# key of a map is asserted without comparing the whole map. Bare keys allow
+# the hyphens GKE puts in exclusion names (`maintenanceExclusions.hold-the-minor-lag`).
 PATH_STEP_RE = re.compile(
     r"(?P<key>[A-Za-z0-9_-]+)"
-    r"(?:\[(?:(?P<all>\*)|(?P<index>\d+)|\?\(@\.(?P<fkey>[A-Za-z0-9_-]+)=='(?P<fval>[^']*)'\))\])?"
+    r"(?:\[(?:(?P<all>\*)|(?P<index>\d+)|\?\(@\.(?P<fkey>[A-Za-z0-9_-]+)=='(?P<fval>[^']*)'\)|\"(?P<qkey>[^\"]+)\")\])?"
 )
 
 # Comparison operators, applied to the LIST of values a path matched. `eq`,
@@ -209,9 +212,10 @@ def _warn(message: str) -> None:
 def parse_path(path: str) -> list[tuple]:
     """`status.conditions[?(@.type=='Ready')].status` -> a list of steps.
 
-    Each step is ("key", name) followed optionally by ("all",), ("index", n)
-    or ("filter", key, value). Raises CatalogError on anything else, so a typo
-    in the catalog fails the run rather than matching nothing forever.
+    Each step is ("key", name) followed optionally by ("all",), ("index", n),
+    ("filter", key, value) or, for `["quoted.key"]`, a second ("key", name).
+    Raises CatalogError on anything else, so a typo in the catalog fails the
+    run rather than matching nothing forever.
     """
     steps: list[tuple] = []
     pos = 0
@@ -226,6 +230,8 @@ def parse_path(path: str) -> list[tuple]:
             steps.append(("index", int(m.group("index"))))
         elif m.group("fkey"):
             steps.append(("filter", m.group("fkey"), m.group("fval")))
+        elif m.group("qkey"):
+            steps.append(("key", m.group("qkey")))
         pos = m.end()
         if pos < len(path):
             if path[pos] != ".":

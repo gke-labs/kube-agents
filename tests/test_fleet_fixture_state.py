@@ -448,9 +448,18 @@ class CatalogTest(unittest.TestCase):
         ]
         assert ffs.parse_path("subjects[0].namespace") == [("key", "subjects"), ("index", 0), ("key", "namespace")]
         assert ffs.parse_path("maintenanceExclusions.hold-the-minor-lag.endTime")[1] == ("key", "hold-the-minor-lag")
+        assert ffs.parse_path('metadata.labels["pod-security.kubernetes.io/enforce-version"]') == [
+            ("key", "metadata"),
+            ("key", "labels"),
+            ("key", "pod-security.kubernetes.io/enforce-version"),
+        ]
+        assert ffs.parse_path('spec.nodeSelector["cloud.google.com/gke-accelerator"].x')[-2:] == [
+            ("key", "cloud.google.com/gke-accelerator"),
+            ("key", "x"),
+        ]
 
     def test_malformed_paths_are_repository_bugs(self):
-        for bad in ("", "a..b", "a.", "a[?(@.x=y)]", "a b", "a[*"):
+        for bad in ("", "a..b", "a.", "a[?(@.x=y)]", "a b", "a[*", 'a["b', 'a["b"', 'a[""]', 'a["b]'):
             with self.subTest(path=bad), self.assertRaises(ffs.CatalogError):
                 ffs.parse_path(bad)
 
@@ -539,6 +548,27 @@ class EvaluateTest(unittest.TestCase):
         assert problem == "deployment/x status.readyReplicas eq 2: observed 0"
         problem = ffs.evaluate(self._entry("any_eq", "OOMKilled", path="status.containerStatuses[*].lastState.terminated.reason"), [{"status": {"containerStatuses": [{"lastState": {}}]}}])
         assert problem.endswith("observed nothing")
+
+    def test_an_object_value_compares_structurally_whatever_the_key_order(self):
+        """kubectl returns map keys sorted and the catalog may write them in any
+        order; equal objects are the designed state either way, and `{}` is
+        the empty object the emptyDir assertion names."""
+        want = {"a": 1, "b": {"c": [1, 2]}}
+        assert ffs.evaluate(self._entry("eq", want), [{"v": {"b": {"c": [1, 2]}, "a": 1}}]) is None
+        assert ffs.evaluate(self._entry("eq", want), [{"v": {"a": 1, "b": {"c": [2, 1]}}}]) is not None
+        assert ffs.evaluate(self._entry("any_eq", {}), [{"v": {}}]) is None
+        assert ffs.evaluate(self._entry("any_eq", {}), [{"v": {"medium": "Memory"}}]) is not None
+
+    def test_a_quoted_step_reads_one_key_of_a_map(self):
+        """A label or selector key with dots and a slash is one step in quotes,
+        so the assertion names that key and the rest of the map is nobody's
+        business."""
+        entry = self._entry("eq", "latest", path='metadata.labels["pod-security.kubernetes.io/enforce-version"]', subject="namespace/x")
+        labels = {"pod-security.kubernetes.io/enforce-version": "latest", "owner": "someone"}
+        assert ffs.evaluate(entry, [{"metadata": {"labels": labels}}]) is None
+        assert ffs.evaluate(entry, [{"metadata": {"labels": {"owner": "someone"}}}]) == (
+            'namespace/x metadata.labels["pod-security.kubernetes.io/enforce-version"] eq "latest": observed nothing'
+        )
 
 
 class PassTest(_Harness):
@@ -708,7 +738,7 @@ class PassTest(_Harness):
             "deprecated-label-selector": (
                 "deployment/arch-pinned-worker",
                 {"spec": {"template": {"spec": {"nodeSelector": {"kubernetes.io/arch": "amd64"}}}}, "status": {"readyReplicas": 1, "replicas": 1}},
-                'spec.template.spec.nodeSelector eq {"beta.kubernetes.io/arch": "amd64"}: observed {"kubernetes.io/arch": "amd64"}',
+                'spec.template.spec.nodeSelector["beta.kubernetes.io/arch"] eq "amd64": observed nothing',
             ),
             "containerd-socket-agent": (
                 "daemonset/node-runtime-probe",
@@ -723,7 +753,7 @@ class PassTest(_Harness):
             "moving-admission-default": (
                 "namespace/seeded-defaults",
                 {"metadata": {"name": "seeded-defaults", "labels": {"kubernetes.io/metadata.name": "seeded-defaults", "managed-by": "kube-agents-seeded-fleet", "pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/enforce-version": "v1.34", "pod-security.kubernetes.io/warn": "baseline", "pod-security.kubernetes.io/warn-version": "v1.34"}}},
-                "namespace/seeded-defaults metadata.labels eq",
+                'metadata.labels["pod-security.kubernetes.io/enforce-version"] eq "latest": observed "v1.34"',
             ),
             "stale-client-skew": (
                 "cronjob/stale-kubectl-client",
@@ -767,28 +797,35 @@ class PassTest(_Harness):
             assert line in files[role], (role, files[role])
 
     def test_a_pending_shape_pod_is_the_after_state_not_the_fixture(self):
+        """A pod that cannot schedule is not ready, and the Deployment says so:
+        readyReplicas is omitted at zero and the missing pod counts as
+        unavailable."""
         world = _healthy_world()
         world["kubectl"]["pod?app=arch-pinned-worker"] = _pods(_pod(restarts=0, last_reason=None, phase="Pending"))
+        world["kubectl"]["deployment/arch-pinned-worker"]["status"] = {"replicas": 1, "unavailableReplicas": 1}
         done = self.run_script(world)
         assert set(self.drift_files()) == {"deprecated-label-selector"}, done.stderr
-        assert 'status.phase any_eq "Running": observed "Pending"' in self.drift_files()["deprecated-label-selector"]
+        assert "deployment/arch-pinned-worker status.readyReplicas eq 1: observed nothing" in self.drift_files()["deprecated-label-selector"]
+        assert "deployment/arch-pinned-worker status.unavailableReplicas absent: observed 1" in self.drift_files()["deprecated-label-selector"]
 
     def test_a_shape_pod_restarted_into_backoff_is_drift_though_its_phase_is_running(self):
         """Under restartPolicy Always a container that ran once and now waits in
         ImagePullBackOff or CrashLoopBackOff leaves the pod's phase Running;
-        readiness is what tells the before-state from that after-state."""
+        the Deployment's readiness count is what tells the before-state from
+        that after-state."""
         world = _healthy_world()
         world["kubectl"]["pod?app=legacy-registry-pull"] = _pods(_pod(restarts=1, last_reason=None, waiting_reason="ImagePullBackOff"))
+        world["kubectl"]["deployment/legacy-registry-pull"]["status"] = {"replicas": 1, "unavailableReplicas": 1}
         done = self.run_script(world)
         assert set(self.drift_files()) == {"retired-registry-image"}, done.stderr
-        assert "status.containerStatuses[*].ready any_eq true: observed false" in self.drift_files()["retired-registry-image"]
-        assert 'status.phase any_eq "Running"' not in self.drift_files()["retired-registry-image"]
+        assert "deployment/legacy-registry-pull status.readyReplicas eq 1: observed nothing" in self.drift_files()["retired-registry-image"]
 
-    def test_each_shape_pods_readiness_is_asserted_under_its_own_role(self):
+    def test_each_shape_deployments_readiness_is_asserted_under_its_own_role(self):
         """`load_assertions` checks a subject's shape, not which role's list it
-        sits in, so a ready-container assertion filed under another role loads
-        and runs silently and the wrong role's `.drift` file names the pod.
-        Each shape pod made unready must drift its own role and no other."""
+        sits in, so a readiness assertion filed under another role loads and
+        runs silently and the wrong role's `.drift` file names the workload.
+        Each shape Deployment left with no ready pod must drift its own role
+        and no other."""
         shapes = {
             "node-local-state": "cache-on-emptydir",
             "deprecated-label-selector": "arch-pinned-worker",
@@ -802,10 +839,65 @@ class PassTest(_Harness):
             with self.subTest(role=role):
                 world = _healthy_world()
                 world["kubectl"][f"pod?app={app}"] = _pods(_pod(restarts=1, last_reason=None, waiting_reason="CrashLoopBackOff"))
+                world["kubectl"][f"deployment/{app}"]["status"] = {"replicas": 1, "unavailableReplicas": 1}
                 self.provision()
                 done = self.run_script(world)
                 assert set(self.drift_files()) == {role}, (role, done.stderr)
-                assert "status.containerStatuses[*].ready any_eq true: observed false" in self.drift_files()[role], role
+                assert f"deployment/{app} status.readyReplicas eq 1: observed nothing" in self.drift_files()[role], role
+
+    def test_a_wedged_rolling_update_is_drift_though_its_old_pod_stays_ready(self):
+        """A template edit on a one-replica RollingUpdate Deployment surges the
+        new pod before the old one goes. When the new pod cannot start (the
+        image no longer pulls, the volume cannot attach) the old pod stays
+        Running and ready, so a pod list quantified with any_eq passes on it;
+        the Deployment counts the waiting pod as unavailable, and that is what
+        the roles read."""
+        shapes = {
+            "node-local-state": "cache-on-emptydir",
+            "deprecated-label-selector": "arch-pinned-worker",
+            "intree-pd-volume": "intree-pd-reader",
+            "retired-registry-image": "legacy-registry-pull",
+            "moving-admission-default": "baseline-edge-worker",
+            "cgroup-blind-runtime": "cgroup-blind-jvm",
+            "multi-process-container": "multi-process-worker",
+        }
+        for role, app in shapes.items():
+            with self.subTest(role=role):
+                world = _healthy_world()
+                world["kubectl"][f"pod?app={app}"] = _pods(
+                    _pod(restarts=0, last_reason=None),
+                    _pod(restarts=0, last_reason=None, waiting_reason="ImagePullBackOff"),
+                )
+                world["kubectl"][f"deployment/{app}"]["status"] = {
+                    "replicas": 2,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 1,
+                }
+                self.provision()
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {role}, (role, done.stderr)
+                assert f"deployment/{app} status.unavailableReplicas absent: observed 1" in self.drift_files()[role], role
+                assert "status.readyReplicas eq 1" not in self.drift_files()[role], role
+
+    def test_a_halted_daemon_set_rollout_is_drift_though_one_node_stays_ready(self):
+        """A DaemonSet rolling update replaces one node's pod at a time; when the
+        new pod cannot start there, the other node's old pod keeps numberReady
+        above zero and the halted node is counted unavailable."""
+        for role, name in (("containerd-socket-agent", "node-runtime-probe"), ("node-image-coupled-agent", "cni-shaped-agent")):
+            with self.subTest(role=role):
+                world = _healthy_world()
+                world["kubectl"][f"daemonset/{name}"]["status"] = {
+                    "desiredNumberScheduled": 2,
+                    "numberReady": 1,
+                    "updatedNumberScheduled": 1,
+                    "numberUnavailable": 1,
+                }
+                self.provision()
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {role}, (role, done.stderr)
+                assert f"daemonset/{name} status.numberUnavailable absent: observed 1" in self.drift_files()[role], role
 
     def test_an_oom_killed_cgroup_shape_is_drift_though_its_pod_runs_again(self):
         """An OOM-killed container restarts and is ready again between kills;
@@ -818,12 +910,13 @@ class PassTest(_Harness):
             assert set(self.drift_files()) == {role}, (role, done.stderr)
             assert 'status.containerStatuses[*].lastState.terminated.reason none_eq "OOMKilled": observed "OOMKilled"' in self.drift_files()[role], role
 
-    def test_an_object_value_compares_structurally_whatever_the_key_order(self):
-        """kubectl returns map keys sorted and the catalog may write them in any
-        order; equal objects are the designed state either way."""
+    def test_an_extra_label_or_selector_key_is_not_drift(self):
+        """The assertions name the Pod Security keys and the one selector key,
+        not the whole map, so a label an operator adds, a later fleet_labels
+        key, or a second selector key changes nothing."""
         world = _healthy_world()
-        labels = world["kubectl"]["namespace/seeded-defaults"]["metadata"]["labels"]
-        world["kubectl"]["namespace/seeded-defaults"]["metadata"]["labels"] = dict(reversed(list(labels.items())))
+        world["kubectl"]["namespace/seeded-defaults"]["metadata"]["labels"]["owner"] = "someone"
+        world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
         assert "30 role(s) in their designed state, 0 drifted" in done.stderr
