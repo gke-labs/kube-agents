@@ -117,20 +117,45 @@ var slackUXOnValues = map[string]bool{"1": true, "true": true, "yes": true, "on"
 // slackUXOn reads KAGE_SLACK_UX as slack_presenter.enabled does.
 func slackUXOn() bool {
 	value, set := os.LookupEnv(slackUXEnv)
-	return !set || slackUXOnValues[strings.ToLower(strings.TrimSpace(value))]
+	return !set || slackUXOnValues[strings.ToLower(pyStrip(value))]
 }
 
-// asciiWords stands in for Python's Unicode \s and \b, which RE2 spells in
-// ASCII: a non-ASCII space becomes a space, and a non-ASCII letter or number
-// becomes "_", a word character in both engines that no keyword holds, so
-// every boundary and space run reads as the presenter reads it.
+// pySpaceChars is Python's \s on str, which RE2's \s ([\t\n\f\r ]) is not:
+// the ASCII ones with \v, the separators U+001C-U+001F, U+0085, and every
+// Unicode space separator (\p{Z}). pySpace is it as a class; pyURLRun is a
+// markdown link url's character, anything but a parenthesis or one of them.
+const (
+	pySpaceChars = `\t\n\v\f\r \x{1c}-\x{1f}\x{85}\p{Z}`
+	pySpace      = `[` + pySpaceChars + `]`
+	pyURLRun     = `[^()` + pySpaceChars + `]`
+)
+
+// isPySpace is Python's str.isspace: unicode.IsSpace and the separators
+// U+001C-U+001F, which Go does not count.
+func isPySpace(r rune) bool { return unicode.IsSpace(r) || (r >= '\x1c' && r <= '\x1f') }
+
+// pyStrip is Python's str.strip(): isPySpace trimmed from both ends.
+func pyStrip(s string) string { return strings.TrimFunc(s, isPySpace) }
+
+// pyFolds are the non-ASCII letters Python's re.IGNORECASE matches to an
+// ASCII keyword letter: dotted and dotless i, long s, the Kelvin sign.
+var pyFolds = map[rune]rune{'İ': 'i', 'ı': 'i', 'ſ': 's', 'K': 'k'}
+
+// asciiWords stands in for Python's Unicode \s, \b and case folding, which
+// RE2 spells in ASCII: a space Python's \s takes becomes a space, a letter
+// Python folds to an ASCII one becomes it, and any other non-ASCII letter or
+// number becomes "_", a word character in both engines that no keyword
+// holds, so every boundary and space run reads as the presenter reads it.
 func asciiWords(text string) string {
 	return strings.Map(func(r rune) rune {
+		if folded, ok := pyFolds[r]; ok {
+			return folded
+		}
 		switch {
+		case r == '\v' || (r >= '\x1c' && r <= '\x1f') || (r >= utf8.RuneSelf && isPySpace(r)):
+			return ' '
 		case r < utf8.RuneSelf:
 			return r
-		case unicode.IsSpace(r):
-			return ' '
 		case unicode.IsLetter(r) || unicode.IsNumber(r):
 			return '_'
 		}
@@ -140,7 +165,7 @@ func asciiWords(text string) string {
 
 // askKind is the mark.ask token for an ask, from its words alone.
 func askKind(text string) string {
-	clean := asciiWords(strings.TrimSpace(askMention.ReplaceAllString(text, " ")))
+	clean := asciiWords(pyStrip(askMention.ReplaceAllString(text, " ")))
 	for _, c := range askClasses {
 		if c.words.MatchString(clean) {
 			return c.kind
@@ -156,7 +181,7 @@ func askKind(text string) string {
 }
 
 func askIsQuestion(text string) bool {
-	if strings.HasSuffix(strings.TrimRightFunc(text, unicode.IsSpace), "?") {
+	if strings.HasSuffix(strings.TrimRightFunc(text, isPySpace), "?") {
 		return true
 	}
 	first := askFirstWord.FindString(text)
@@ -171,7 +196,7 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 	if headline == "" {
 		return chatmsg.Message{}, false
 	}
-	rest := strings.TrimSpace(strings.Join(body, "\n\n"))
+	rest := pyStrip(strings.Join(body, "\n\n"))
 	msg := chatmsg.Message{Schema: chatmsg.Schema, Headline: headline}
 	switch n := runeLen(rest); {
 	case n > chatFoldTextMax:
@@ -211,9 +236,9 @@ func progressParts(line, ask string) []lib.Part {
 
 var (
 	fenceLine    = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})")
-	headingLine  = regexp.MustCompile(`^\s{0,3}#{1,6}\s+`)
-	listMarker   = regexp.MustCompile(`^\s*([-*+]|\d+[.)])\s+`)
-	mdLink       = regexp.MustCompile(`\[([^\[\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)`)
+	headingLine  = regexp.MustCompile(`^` + pySpace + `{0,3}#{1,6}` + pySpace + `+`)
+	listMarker   = regexp.MustCompile(`^` + pySpace + `*([-*+]|\p{Nd}+[.)])` + pySpace + `+`)
+	mdLink       = regexp.MustCompile(`\[([^\[\]]+)\]\((` + pyURLRun + `+(?:\(` + pyURLRun + `*\)` + pyURLRun + `*)*)\)`)
 	backtickRun  = regexp.MustCompile("`+")
 	codeHeld     = regexp.MustCompile("\x00(\\d+)\x00")
 	abbreviation = []string{"e.g", "i.e", "vs", "approx", "incl", "cf", "etc", "esp", "ex", "fig", "rev", "ver",
@@ -235,7 +260,7 @@ func nextFence(line, fence string) string {
 		}
 		return mark
 	}
-	closes := mark[0] == fence[0] && len(mark) >= len(fence) && strings.Trim(strings.TrimSpace(line), mark[:1]) == ""
+	closes := mark[0] == fence[0] && len(mark) >= len(fence) && strings.Trim(pyStrip(line), mark[:1]) == ""
 	if closes {
 		return ""
 	}
@@ -256,7 +281,7 @@ func paragraphs(md string) []string {
 	}
 	for _, line := range strings.Split(md, "\n") {
 		fence = nextFence(line, fence)
-		if fence == "" && strings.TrimSpace(line) == "" {
+		if fence == "" && pyStrip(line) == "" {
 			flush()
 			continue
 		}
@@ -265,7 +290,7 @@ func paragraphs(md string) []string {
 	flush()
 	kept := out[:0]
 	for _, p := range out {
-		if strings.TrimSpace(p) != "" {
+		if pyStrip(p) != "" {
 			kept = append(kept, p)
 		}
 	}
@@ -326,7 +351,7 @@ func restoreCode(text string, spans []heldSpan, content bool) string {
 			return m
 		}
 		if content {
-			return strings.TrimSpace(spans[i].content)
+			return pyStrip(spans[i].content)
 		}
 		return spans[i].whole
 	})
@@ -366,13 +391,13 @@ func boldAt(rs []rune, i int) (end int, content string, ok bool) {
 		}
 		prev, hasPrev := at(rs, i-1)
 		next, hasNext := at(rs, i+2)
-		if (!hasPrev || !isWord(prev)) && hasNext && !unicode.IsSpace(next) {
+		if (!hasPrev || !isWord(prev)) && hasNext && !isPySpace(next) {
 			for j := i + 3; j+2 <= len(rs); j++ {
 				k := j - 1
 				if rs[k] == '\n' || hasAt(rs, k, marker) {
 					break
 				}
-				if hasAt(rs, j, marker) && !unicode.IsSpace(rs[j-1]) {
+				if hasAt(rs, j, marker) && !isPySpace(rs[j-1]) {
 					after, hasAfter := at(rs, j+2)
 					if marker == "__" && hasAfter && isWord(after) {
 						continue
@@ -383,7 +408,7 @@ func boldAt(rs []rune, i int) (end int, content string, ok bool) {
 		}
 		if marker == "**" && hasPrev && isWord(prev) {
 			j := i + 2
-			for j < len(rs) && rs[j] != '*' && !unicode.IsSpace(rs[j]) {
+			for j < len(rs) && rs[j] != '*' && !isPySpace(rs[j]) {
 				j++
 			}
 			if j > i+2 && hasAt(rs, j, "**") {
@@ -405,7 +430,7 @@ func italicAt(rs []rune, i int) (end int, content string, ok bool) {
 	if prev, has := at(rs, i-1); has && (isWord(prev) || prev == m) {
 		return 0, "", false
 	}
-	if next, has := at(rs, i+1); !has || unicode.IsSpace(next) || next == '.' {
+	if next, has := at(rs, i+1); !has || isPySpace(next) || next == '.' {
 		return 0, "", false
 	}
 	for j := i + 1; j < len(rs); j++ {
@@ -415,7 +440,7 @@ func italicAt(rs []rune, i int) (end int, content string, ok bool) {
 		if rs[j] != m {
 			continue
 		}
-		if j == i+1 || unicode.IsSpace(rs[j-1]) {
+		if j == i+1 || isPySpace(rs[j-1]) {
 			return 0, "", false
 		}
 		if after, has := at(rs, j+1); has && (isWord(after) || after == m) {
@@ -443,7 +468,7 @@ func replaceSpans(text string, match func([]rune, int) (int, string, bool)) stri
 
 // plainLine is one line of markdown as plain text (_plain).
 func plainLine(md string) string {
-	text, spans := holdCode(strings.TrimSpace(strings.ReplaceAll(md, "\x00", "")))
+	text, spans := holdCode(pyStrip(strings.ReplaceAll(md, "\x00", "")))
 	if loc := headingLine.FindStringIndex(text); loc != nil {
 		text = text[loc[1]:]
 	}
@@ -453,7 +478,7 @@ func plainLine(md string) string {
 	text = mdLink.ReplaceAllString(text, "$1")
 	text = replaceSpans(text, boldAt)
 	text = replaceSpans(text, italicAt)
-	return strings.TrimSpace(restoreCode(text, spans, true))
+	return pyStrip(restoreCode(text, spans, true))
 }
 
 // sentenceEnds yields each candidate sentence end in line, as rune
@@ -462,11 +487,11 @@ func plainLine(md string) string {
 func sentenceEnds(rs []rune) [][2]int {
 	var out [][2]int
 	for i := 0; i < len(rs); i++ {
-		if !unicode.IsSpace(rs[i]) || i == 0 || !endsSentence(rs[:i]) {
+		if !isPySpace(rs[i]) || i == 0 || !endsSentence(rs[:i]) {
 			continue
 		}
 		j := i
-		for j < len(rs) && unicode.IsSpace(rs[j]) {
+		for j < len(rs) && isPySpace(rs[j]) {
 			j++
 		}
 		if j < len(rs) && !(rs[j] >= 'a' && rs[j] <= 'z') {
@@ -503,7 +528,7 @@ func endsInAbbreviation(stem []rune, tail int, words []string, seps string) bool
 		start := k
 		if k > 0 {
 			sep := lower[k-1]
-			if !unicode.IsSpace(sep) && !strings.ContainsRune(seps, sep) {
+			if !isPySpace(sep) && !strings.ContainsRune(seps, sep) {
 				continue
 			}
 			start = k - 1
@@ -531,7 +556,7 @@ func openerIn(s, marker string) bool {
 			continue
 		}
 		next, has := at(rs, i+len([]rune(marker)))
-		if !has || unicode.IsSpace(next) || single && next == '.' {
+		if !has || isPySpace(next) || single && next == '.' {
 			continue
 		}
 		return true
@@ -548,7 +573,7 @@ func closerIn(s, marker string) bool {
 		if !hasAt(rs, i, marker) {
 			continue
 		}
-		if prev, has := at(rs, i-1); !has || unicode.IsSpace(prev) {
+		if prev, has := at(rs, i-1); !has || isPySpace(prev) {
 			continue
 		}
 		if next, has := at(rs, i+len([]rune(marker))); has && (isWord(next) || single && string(next) == marker) {
@@ -576,7 +601,7 @@ func firstSentence(line string) (string, string) {
 		if numbered || endsInAbbreviation(stem, tail, abbreviation, "([") {
 			continue
 		}
-		rest := strings.TrimSpace(string(rs[end[1]:]))
+		rest := pyStrip(string(rs[end[1]:]))
 		for _, marker := range []string{"**", "__"} {
 			if countMarker(sentence, marker)%2 == 1 && openerIn(sentence, marker) && closerIn(rest, marker) {
 				sentence, rest = sentence+marker, marker+rest
@@ -610,7 +635,7 @@ func clipRunes(text string, limit int) string {
 	if runeLen(cut)*chatClipMinShare < runeLen(hard) {
 		cut = hard
 	}
-	return strings.TrimRightFunc(cut, unicode.IsSpace) + chatEllipsis
+	return strings.TrimRightFunc(cut, isPySpace) + chatEllipsis
 }
 
 // splitAnswer is the presenter's split_answer: the first sentence of the
@@ -632,7 +657,7 @@ func splitAnswer(md string) (string, []string) {
 	}
 	joinedLines := make([]string, wrapped)
 	for i, line := range lines[:wrapped] {
-		joinedLines[i] = strings.TrimSpace(line)
+		joinedLines[i] = pyStrip(line)
 	}
 	joined := strings.Join(joinedLines, " ")
 	moreLines := strings.Join(lines[wrapped:], "\n")
@@ -651,7 +676,7 @@ func splitAnswer(md string) (string, []string) {
 	}
 	tail := strings.Join(tailParts, "\n")
 	var body []string
-	if strings.TrimSpace(tail) != "" {
+	if pyStrip(tail) != "" {
 		body = append(body, tail)
 	}
 	return headline, append(body, rest...)

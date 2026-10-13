@@ -298,10 +298,27 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.deliver_row(adapter, dict(self.SUB, task_id="t_b"), 2, "b", "reading")
             await slack_ux_status.settle_row(adapter, dict(self.SUB), "unblocked", "", "a")
             await slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "fine", "a")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "fine", "b")
 
         asyncio.run(run())
         marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent if "mark" in s["chat"]]
-        self.assertEqual(marks, [("plan", {"ask": "fleet"}), ("plan", {"settle": "failed"}), ("plan-2", {"ask": "fleet"})])
+        self.assertEqual(marks, [("plan", {"ask": "fleet"}), ("plan", {"settle": "failed"}), ("plan-2", {"ask": "fleet"}),
+                                 ("plan-2", {"settle": "done"})])
+
+    def test_an_earlier_asks_failed_card_does_not_fail_a_later_ask(self):
+        # A gave up and was never retried; the next ask's card succeeds, and its
+        # ask settles done, as today settles each ask by its own cards.
+        adapter = _ConversationAdapter(ask="fleet")
+
+        async def run():
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB), 1, "a", "reading")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "gave_up", "", "a")
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB, task_id="t_b"), 2, "b", "reading")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "fine", "b")
+
+        asyncio.run(run())
+        marks = [s["chat"]["mark"] for s in adapter.sent if "mark" in s["chat"]]
+        self.assertEqual(marks, [{"ask": "fleet"}, {"settle": "failed"}, {"ask": "fleet"}, {"settle": "done"}])
 
     def test_with_no_recorded_ask_a_lifted_pause_still_goes(self):
         adapter = _ConversationAdapter(ask="")

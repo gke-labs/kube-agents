@@ -521,20 +521,26 @@ def _plan_key(key: tuple) -> str:
 
 
 def _thread_rows(key: tuple, plan: _Plan) -> list:
-    """Every row on the thread's plans, the current one, any set aside, and ``plan``, as
-    :func:`_plan_session` reads them for the session status."""
-    plans = [*_lapsed.get(key, ()), *([_plans[key]] if key in _plans else [])]
-    if not any(old is plan for old in plans):
-        plans.append(plan)
-    return [row for old in plans for row in old.rows.values()]
+    """The rows the thread's ask state is read from: every row of the thread's current plan
+    (``plan`` when there is none), and the live rows, running or waiting, of every other plan
+    in the thread, as :func:`_plan_session` reads them for the session status.
+
+    A settled row on another plan is an earlier ask's: a card there that gave up must not mark
+    a later ask failed, and one that completed must not mark it done.
+    """
+    current = _plans.get(key) or plan
+    others = [old for old in (*_lapsed.get(key, ()), plan) if old is not current]
+    live = {id(row): row for old in others for row in old.rows.values() if _live(row)}
+    return [*current.rows.values(), *live.values()]
 
 
 def _thread_mark(adapter: Any, key: tuple, plan: _Plan) -> dict | None:
     """The ask's state the thread's cards leave, when it changed since the thread's plans last carried it.
 
-    From every plan in the thread, since one set aside can still hold a card that
-    waits or runs. With no ask recorded on the route, a lifted pause is still sent
-    (``{}``), as nothing else would take ⏸️ off.
+    Read from :func:`_thread_rows`: the current plan's cards decide done or failed, and a
+    card still running or waiting on any plan in the thread holds the ask or its pause. With
+    no ask recorded on the route, a lifted pause is still sent (``{}``), as nothing else would
+    take ⏸️ off.
     """
     ask_of = getattr(adapter, "ask", None)
     if not callable(ask_of):

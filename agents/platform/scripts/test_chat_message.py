@@ -118,6 +118,11 @@ class ChoicesTest(unittest.TestCase):
         self.assertEqual(chat["choices"][0], {"text": "seeded-a", "reply": "seeded-a\n\n(Clicked on the question from card t_1.)"})
         self.assertNotIn("choices", cm.needs_you_settled(chat))
 
+    def test_an_option_with_inner_space_keeps_its_buttons(self):
+        chat = cm.needs_you_message("Which one?\n- Scale  to 3\n- Leave\tit", "t_1")
+        self.assertEqual([c["text"] for c in chat["choices"]], ["Scale to 3", "Leave it"])
+        self.assertEqual(chat["choices"][0]["reply"], "Scale to 3\n\n(Clicked on the question from card t_1.)")
+
     def test_a_severity_alone_is_the_rows_text(self):
         chat = cm.report_message("x", rows=[{"severity": "high"}])
         self.assertEqual(chat["rows"], [{"text": "`high`"}])

@@ -348,6 +348,34 @@
       "body": [
         "Ensuite rien."
       ]
+    },
+    {
+      "in": "# Summary\nThe pod restarted.",
+      "headline": "Summary",
+      "body": [
+        "The pod restarted."
+      ]
+    },
+    {
+      "in": "١. Checkout is down. More follows.",
+      "headline": "Checkout is down.",
+      "body": [
+        "More follows."
+      ]
+    },
+    {
+      "in": "Pods restart. Then\u001cmore.",
+      "headline": "Pods restart.",
+      "body": [
+        "Then\u001cmore."
+      ]
+    },
+    {
+      "in": "See [logs](https://x.io/a b) now. Next.",
+      "headline": "See [logs](https://x.io/a b) now.",
+      "body": [
+        "Next."
+      ]
     }
   ],
   "plain": [
@@ -664,6 +692,26 @@
     {
       "in": "café costs?",
       "kind": "cost"
+    },
+    {
+      "in": "fıx it",
+      "kind": "change"
+    },
+    {
+      "in": "ſcale the pool",
+      "kind": "change"
+    },
+    {
+      "in": "Kubernetes upgrade",
+      "kind": "upgrade"
+    },
+    {
+      "in": "which\u000bclusters are down",
+      "kind": "fleet"
+    },
+    {
+      "in": "why\u001dis it slow",
+      "kind": "investigate"
     }
   ]
 }

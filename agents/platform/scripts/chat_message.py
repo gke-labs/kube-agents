@@ -434,15 +434,20 @@ def needs_you_message(reason: str, card: str = "", buttons: bool = True) -> dict
     them there when they cannot all be buttons.
     """
     headline, rest, options = _moments._question(reason, buttons)
-    if options and any(_choice(o, NEEDS_YOU_REPLY.format(label=o, card=card) if card else "") is None for o in options):
+    choices = [_needs_you_choice(option, card) for option in options]
+    if any(choice is None for choice in choices):
         headline, rest, options = _moments._question(reason, False)
+        choices = []
     if not headline:
         return None
     title = _presenter._clip(_line(_moments._headline_text(headline)), _presenter.HEADLINE_MAX)
-    choices = [
-        _choice(option, NEEDS_YOU_REPLY.format(label=option, card=card) if card else "") for option in options
-    ]
     return message(headline=title, detail=_moments._detail(rest), tone=TONE_ATTENTION, choices=choices)
+
+
+def _needs_you_choice(option: str, card: str) -> dict | None:
+    """An option as a choice: its label as the button shows it, the reply built from that label."""
+    label = _presenter._clip(_line(option), _presenter.BUTTON_TEXT_MAX)
+    return _choice(label, NEEDS_YOU_REPLY.format(label=label, card=card) if card else "")
 
 
 def needs_you_settled(chat: Mapping[str, Any]) -> dict:
