@@ -678,6 +678,9 @@ FLEET_RECONCILER_ROLES = {
     # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
     # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
     "roles/compute.instanceAdmin.v1",
+    # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
+    # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
+    "roles/compute.securityAdmin",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
@@ -879,8 +882,8 @@ _UNREAD_PATTERNS = (
     re.compile(r"problem refreshing your current auth tokens", re.I),
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
-    # the scan runs seven projects at once, and one wave of 429s would read
-    # as three drifted. gRPC's retryable statuses, as gcloud prints them
+    # the scan runs eight projects at once, and one wave of 429s would read
+    # as several drifted. gRPC's retryable statuses, as gcloud prints them
     # (upper case, so a lower-case "unknown" in a message is not one); a
     # resource named kube-agents-evals-500 does not match.
     re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"),

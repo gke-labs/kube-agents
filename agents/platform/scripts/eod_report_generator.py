@@ -291,7 +291,7 @@ def load_intercepted_events(
                 "message": r[6] or "",
                 "severity": r[7] or "",
                 "occurrences": int(r[8] or 1),
-                "notified": bool(r[9]),
+                "notified": 2 if r[9] == 2 else bool(r[9]),
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
             }
@@ -388,6 +388,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # row at all is the whole question.
     cap_dropped_incidents: set = set()
     delivery_failed = 0
+    dispatched_headless = 0
     workload_map: Dict[str, Dict[str, Any]] = {}
 
     for event in events:
@@ -441,9 +442,15 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # future writer batches sightings into one row.
         cap_row = False
         event_delivery_failed = bool(event.get("delivery_error"))
+        notified_val = event.get("notified")
         if event_delivery_failed:
             delivery_failed += 1
-        elif event.get("notified"):
+        elif notified_val == 2 and not isinstance(notified_val, bool):
+            # Dispatched on a headless install with no chat platform enabled:
+            # neither a failed chat post nor an alert that "went to chat".
+            if not excluded:
+                dispatched_headless += 1
+        elif notified_val:
             if not excluded:
                 alerts_posted += 1
         elif severity == "Info":
@@ -543,6 +550,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # renders the same way twice for the same day.
         "clusters": sorted(clusters_seen),
         "alerts_posted": alerts_posted,
+        "dispatched_headless": dispatched_headless,
         "suppressed_info": suppressed_info,
         "cap_dropped": cap_dropped,
         "cap_dropped_alerts": len(cap_dropped_incidents),
@@ -603,7 +611,8 @@ def generate_markdown_report(
     # over every row in scope while the listing below them holds `Info` alone.
     # A delivered alert is already accounted for in words — "*N alerts* went to
     # chat", "*Alerts Raised:* N" — so the residue that nothing explains is the
-    # ceiling drop and the failed delivery, and those two are the gate. Without
+    # ceiling drop, the failed delivery, and a headless dispatch (`notified = 2`,
+    # where no chat post was attempted), and those three are the gate. Without
     # it a day of 30 cap-dropped Criticals reports 30 events across 30 groups
     # over a listing naming none of them, and the reader who tries to reconcile
     # the two is reading a card whose numbers do not add up.
@@ -617,7 +626,11 @@ def generate_markdown_report(
     # on a day whose whole traffic was excluded — and a note printed three
     # times is read none.
     qualifiers: List[str] = []
-    if summary.get("cap_dropped") or summary.get("delivery_failed"):
+    if (
+        summary.get("cap_dropped")
+        or summary.get("delivery_failed")
+        or summary.get("dispatched_headless")
+    ):
         qualifiers.append("Counts cover every severity; only informational events are listed.")
     if summary.get("excluded_occurrences"):
         qualifiers.append("Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope.")
@@ -631,7 +644,10 @@ def generate_markdown_report(
     # not report", which owns the naming/counting line.
     #
     # Both counts are also read for a second purpose: they veto the ✅ all-clear and
-    # the 🟢 header. Not reporting an alert is the choice; asserting it did not
+    # the 🟢 header (`dispatched_headless` deliberately does not veto `all_clear`,
+    # because on a headless install the triage turn was dispatched as intended and
+    # nothing was held back from or refused by chat). Not reporting an alert is the
+    # choice; asserting it did not
     # happen is a different thing, and a recap that prints "nothing was held back
     # from chat" over a day the ceiling ate 30 Criticals is not silent about them,
     # it denies them.

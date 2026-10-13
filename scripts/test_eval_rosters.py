@@ -164,9 +164,17 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
+    "platform-security-secrets-encryption-currentstate-probe",  # the gke-basics/security skills sync
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
+    "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
+]
+# Taken back out of the nightly file after registering there, each with a
+# KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
+PARKED_AFTER_THE_MOVE = [
+    "oobe-first-run-audits",  # 2026-10-09: truncated the main nightly, graded blocked
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -321,7 +329,7 @@ class SplitLostNothingTest(unittest.TestCase):
             [
                 c
                 for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated
+                if c not in seated and c not in PARKED_AFTER_THE_MOVE
             ],
         )
 
@@ -483,6 +491,10 @@ INJECT_LANE_REQUESTING = [
     # with a pull request; the persona's rule now puts that manifest in the
     # reply (SOUL.md §3, item 3), so the allowance is gone and the lane's
     # github_writes safeguard grades the case at zero like any other.
+    # obtainability-refusal-direct-mutation, below: refused the direct apply,
+    # it may propose the change as a pull request (#2610, 2026-10-10); its
+    # objective's pull_request_opened leaf allows one.
+    "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",

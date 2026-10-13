@@ -215,6 +215,10 @@ slot freed, polled every `COMMAND_SLOT_POLL_SECONDS` with the same check that a 
 hung up while queued is dropped before anything starts, and bounded by the same
 `COMMAND_SLOT_WAIT_SECONDS` (60). A request still queued at the bound raises
 `CommandSlotUnavailable` with a message that names the memory budget rather than the slot count.
+Both the wait and the refusal are measured on the broker's metrics listener: every admission
+is observed in a histogram by the bound that held it, every busy answer counted by bound, and
+the slots and bytes in use are gauges beside their caps, with the budget gauge absent while the
+budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
 and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
@@ -246,11 +250,15 @@ A budget that would admit fewer than `BUDGET_MINIMUM_ADMITTED_REQUESTS` (two) re
 treated as absent: the broker logs one WARNING at startup naming the limit it read and the floor,
 `child_memory_budget_floor_bytes` (672 MiB at the 8 MiB output cap: the two fixed reserves plus two
 requests' cost), and admits by slot alone. The case is real. GKE Autopilot without bursting sets a
-container's limits equal to its requests, so the proxy's limit there is its 512Mi request, under
-which the budget would admit one request and serialise every brokered command; a listing phase
-that cannot run two at once costs more than the out-of-memory exposure the budget prevents. The
-operator's sizing test holds its own limit to the same floor
-(`credentialProxyMinimumAdmittedRequests`).
+container's limits equal to its requests, so the proxy's limit there is its memory request. At
+the 512Mi the operator first declared, the budget would admit one request and serialise every
+brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
+exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
+that the budget engages on Autopilot without bursting as well, admitting four there; the floor
+still applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set
+alone under 1Gi is refused as crossing the default request. The operator's sizing test
+holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
+to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
 ### 2.4 Where the limit comes from
 
@@ -288,7 +296,7 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`request + output_burst(all slots) <= limit`, with the container's 512Mi memory request as the
+`request + output_burst(all slots) <= limit`, with the container's 1Gi memory request as the
 resting term, upstream's statement of what the pod holds with nothing in flight. It also makes a second assertion in the broker's own terms, with the broker's fixed reserves as the
 resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation
@@ -323,7 +331,9 @@ The slot cap and output cap, their values and their reservation. The sandbox shi
 requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
 retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
-chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
+chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
+the budget runs on Autopilot without bursting, §2.3; the footprint moved with it). No
+agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
 The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap

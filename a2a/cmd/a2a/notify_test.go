@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -235,6 +237,22 @@ func TestNotifyARefusedPublishIsARefusalNotAnUnknown(t *testing.T) {
 	}
 }
 
+// TestNotifyBlocksFileMustBeReadableJSON: --blocks-file is refused before
+// anything reaches the bus when it is missing or is not JSON.
+func TestNotifyBlocksFileMustBeReadableJSON(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte("[{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"missing": filepath.Join(dir, "none.json"), "not JSON": bad} {
+		err := runNotify([]string{"--platform", "slack", "--blocks-file", path, "--", "x"})
+		if err == nil || !strings.Contains(err.Error(), "--blocks-file") && !strings.Contains(err.Error(), "not JSON") {
+			t.Errorf("%s: err = %v, want a --blocks-file refusal", name, err)
+		}
+	}
+}
+
 // A refused reply subscription is caught before the request is published: the
 // gateway would otherwise post a text whose answer this client cannot hear,
 // and the caller, told "nothing was posted", would send it again.
@@ -282,5 +300,31 @@ func TestNotifyARefusedSubscribeSendsNothing(t *testing.T) {
 	}
 	if msg, err := requests.NextMsg(500 * time.Millisecond); err == nil {
 		t.Fatalf("the gateway received %q; a refused subscribe must not publish", msg.Data)
+	}
+}
+
+// --conversation and --context aim the request at a conversation: both go
+// out on the wire, and each without the other, or beside --thread, is refused
+// before anything is sent.
+func TestNotifyAimsAtAConversation(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	got, _ := answerNotify(t, s.ClientURL(), lib.NotifyReply{MessageID: "m", ThreadID: "gchat:spaces/A/threads/B"})
+	if err := run([]string{"notify", "--platform", "google_chat", "--conversation", "gchat:spaces/A/threads/B",
+		"--context", "ctx-1", "--", "3 nodes"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if req := <-got; req.Conversation != "gchat:spaces/A/threads/B" || req.ContextID != "ctx-1" || req.Thread != "" {
+		t.Fatalf("request = %+v", req)
+	}
+	for _, args := range [][]string{
+		{"--conversation", "gchat:spaces/A/threads/B"},
+		{"--context", "ctx-1"},
+		{"--conversation", "gchat:spaces/A/threads/B", "--context", "ctx-1", "--thread", "spaces/A/threads/B"},
+	} {
+		argv := append([]string{"notify", "--platform", "google_chat"}, append(args, "x")...)
+		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) {
+			t.Errorf("%v: err = %v, want a usage refusal", args, err)
+		}
 	}
 }

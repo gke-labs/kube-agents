@@ -164,11 +164,24 @@ KNOWN_UNREGISTERED = {
     # still needs first: Compute network permission for the CI runners,
     # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
     # room on the main part's infra-lock chain, measured with
-    # oobe-first-run-audits in it (or stack cases moved to a second project).
+    # oobe-first-run-audits in it if that parked case returns first (or stack
+    # cases moved to a second project).
     # The entry goes when the case joins hack/eval/nightly-cases.txt.
     "networking-audit-subnet-range-exhaustion": (
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
+    ),
+    # Parked out of hack/eval/nightly-cases.txt on 2026-10-09 after its first
+    # night (build 2108346853085941760): its three repetitions held the infra
+    # lock 140 minutes and the deadline cut the main part, and each graded
+    # blocked, because its no-tool turn leaves an empty trajectory, which the
+    # gate's liveness rung reads as no agent run. The entry goes when the case
+    # can record a pass or a fail (#2699's tool_calls_optional would let its
+    # reply pass that rung) and the main part's infra-lock chain has room for
+    # it (or it runs on a job of its own); #2806 tracks both.
+    "oobe-first-run-audits": (
+        "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
+        "nightly, and its empty trajectory grades every repetition blocked"
     ),
 }
 
@@ -185,6 +198,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "networking-world-open-ingress": (
+        "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
+        "every pool project (fleet re-apply); no pool project has a rule opening a "
+        "management port to the internet"
+    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "
@@ -212,9 +230,18 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "fleet-audit-sweeps-the-declared-scope": (
+        "#1865: needs an install with a declared scope and a third GCP project the "
+        "agent's service account can list but the scope does not declare; the "
+        "evaluation fleet has one project per install today, so no CI tier can run "
+        "it; run it by hand against such an install, substituting the outside "
+        "project's id at the case's two sites: the command check's first forbidden "
+        "pattern and the ledger check's forbidden phrase"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
-        "service account can read, holding a PSC endpoint its service attachment "
+        "service account can read, declared in the install's spec.scope.projects (or an "
+        "install that declares none), holding a PSC endpoint its service attachment "
         "rejects; the evaluation fleet has one project per install today, so no "
         "CI tier can run it; run it by hand against an install with such a project"
     ),
@@ -394,6 +421,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: whether the run that delivered the report completed is the
     # whole assertion.
     "bootstrap_delivered": (),
+    # This repository, sandbox-reading: how many of the batch's critical
+    # findings the onboarding report lists, against `limit`.
+    "bootstrap_report_criticals": ("limit",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in

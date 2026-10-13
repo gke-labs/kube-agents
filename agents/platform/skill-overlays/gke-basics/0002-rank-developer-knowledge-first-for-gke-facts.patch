@@ -1,0 +1,60 @@
+Subject: Rank Developer Knowledge first for GKE facts
+
+Why: upstream ranks only the interfaces for live cluster operations, so a GKE fact the agent needs (a field, a version lifecycle, a quota) falls through to web search. This repository ranks Developer Knowledge first for those lookups and web search as the fallback, in cli-reference.md and in the Reference Directory entries that describe it and mcp-usage.md.
+Local-Issue: none (#945, #2357)
+Upstream-Issue: none filed yet
+Retire-When: upstream ranks Developer Knowledge first for GKE facts
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -60,10 +60,10 @@ Managed Kubernetes platform on Google Cloud. Defaults to Autopilot mode unless S
+ 
+ -   [Core Concepts](references/core-concepts.md): Architecture, cluster modes (Autopilot vs Standard), networking, scaling, and security model.
+ 
+--   [CLI Usage & Tool Reference](references/cli-reference.md): Tool preference hierarchy (MCP vs gcloud vs kubectl), `gcloud container` commands, and user preference overrides.
++-   [CLI Usage & Tool Reference](references/cli-reference.md): Tool preference hierarchies (Knowledge lookups vs Cluster Operations), `gcloud container` commands, and user preference overrides.
+ 
+ -   [Client Libraries](references/client-library-usage.md): Official Kubernetes and Google Cloud Container client libraries in Python, Go, Node.js, and Java.
+ 
+--   [MCP Usage](references/mcp-usage.md): Connecting to and using the 23 structured GKE MCP tools for cluster management, K8s resources, and diagnostics.
++-   [MCP Usage](references/mcp-usage.md): Connecting to and using the GKE MCP and Developer Knowledge MCP tools for cluster management, K8s resources, and authoritative documentation.
+ 
+ -   [Infrastructure as Code](references/iac-usage.md): Terraform examples for `google_container_cluster` (Autopilot), Kubernetes provider resources, and YAML samples.
+diff --git a/references/cli-reference.md b/references/cli-reference.md
+--- a/references/cli-reference.md
++++ b/references/cli-reference.md
+@@ -2,6 +2,24 @@
+ 
+ ## Tool Preference
+ 
++Tool usage follows two distinct, domain-specific preference hierarchies:
++
++### 1. Knowledge & Documentation Lookups (GKE Facts, Schemas, Best Practices)
++
++Default preference order:
++
++```
++1. Developer Knowledge MCP  (preferred — authoritative, curated first-party documentation)
++2. Web Search               (fallback — third-party tooling, open-source CVEs, or DK cache miss)
++```
++
++| Interface                                               | When to Use                                                                                                           | Examples                                                                                                      |
++| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
++| **Developer Knowledge MCP** (`mcp-developer_knowledge`) | Default for all GKE/GCP facts, API schemas, version lifecycles, and configuration semantics.                          | GKE Autopilot constraints, Ingress/Gateway API spec fields, release version deprecations, quota requirements. |
++| **Web Search** (`web_search`)                           | Third-party software documentation, non-Google helm charts, community error discussions, or when DK returns no match. | Investigating an open-source operator error, third-party CNI details, or external blog posts.                 |
++
++### 2. Live Cluster Operations & State Management
++
+ Default preference order:
+ 
+ ```
+@@ -10,7 +28,7 @@ Default preference order:
+ 3. kubectl        (fallback — purely in-cluster ops not covered by MCP)
+ ```
+ 
+-### When to use each
++### When to use each (Cluster Operations)
+ 
+ | Interface         | When to Use                | Examples                    |
+ | ----------------- | -------------------------- | --------------------------- |

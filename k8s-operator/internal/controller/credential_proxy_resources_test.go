@@ -40,6 +40,17 @@ func proxyAgentWithResources(override *corev1.ResourceRequirements) *agentv1alph
 	return agent
 }
 
+func agentAPIAuthAgentWithResources(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{}}},
+	}
+	if override != nil {
+		agent.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: override}
+	}
+	return agent
+}
+
 func assertQuantity(t *testing.T, list corev1.ResourceList, name corev1.ResourceName, want string) {
 	t.Helper()
 	got, ok := list[name]
@@ -58,7 +69,7 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 	for _, deployment := range []*agentv1alpha1.DeploymentSpec{nil, {}, {CredentialProxy: &agentv1alpha1.CredentialProxySpec{}}} {
 		got := resolveCredentialProxyResources(deployment)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
-		assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
+		assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
 		assertQuantity(t, got.Limits, corev1.ResourceMemory, "2Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
@@ -83,7 +94,7 @@ func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	got := container.Resources
 	assertQuantity(t, got.Limits, corev1.ResourceMemory, "3Gi")
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
-	assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
+	assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
 	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
 }
@@ -152,6 +163,42 @@ func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T
 	}
 }
 
+// TestAgentAPIAuthEmptyDirFollowsARaisedEphemeralStorageLimit: the sidecar's /tmp
+// is the credential-proxy-tmp emptyDir, and the kubelet evicts the gateway pod
+// when it passes its sizeLimit. So a raised agentAPIAuth ephemeral limit must
+// widen that volume, a limit at or under the 2Gi default moves it not at all, and
+// the sidecar's own override drives it, independently of the broker's.
+func TestAgentAPIAuthEmptyDirFollowsARaisedEphemeralStorageLimit(t *testing.T) {
+	cases := []struct {
+		limit, tmp string
+	}{
+		{"", "2Gi"},
+		{"1Gi", "2Gi"},
+		{"3Gi", "3Gi"},
+		{"10Gi", "10Gi"},
+	}
+	for _, tc := range cases {
+		var override *corev1.ResourceRequirements
+		if tc.limit != "" {
+			override = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(tc.limit)},
+			}
+		}
+		agent := agentAPIAuthAgentWithResources(override)
+		if got := emptyDirSizeLimits(buildAgentAPIAuthVolumes(agent))["credential-proxy-tmp"]; got != tc.tmp {
+			t.Errorf("limit %q: gateway /tmp %s, want %s", tc.limit, got, tc.tmp)
+		}
+	}
+
+	// The sidecar's override widens the gateway pod's volume, not the broker's.
+	agent := agentAPIAuthAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+	})
+	if got := emptyDirSizeLimits(buildCredentialProxyRuntimeVolumes(agent))["credential-proxy-tmp"]; got != "2Gi" {
+		t.Errorf("broker /tmp %s, want the 2Gi default; the sidecar's override must not widen the broker's volume", got)
+	}
+}
+
 // TestCredentialProxyOverrideDoesNotAliasTheCR: the render builds maps of its
 // own rather than handing back the CR's, and copies each quantity, so writing
 // to the rendered Requests or Limits, or to a rendered quantity in place,
@@ -213,6 +260,18 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
+	}
+	// GKE Autopilot without bursting sets a container's limits equal to its
+	// requests, so there the broker reads the request as its limit. The
+	// request therefore has to clear the floor on its own, or the budget is
+	// off exactly where a default install runs and the broker admits by slot
+	// alone, with the out-of-memory exposure the budget exists to remove.
+	defaultRequest := resource.MustParse(credentialProxyMemoryRequest)
+	if floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); defaultRequest.Value() < floor {
+		t.Errorf("the default memory request %s is under the budget's %d MiB floor, so on Autopilot without bursting the budget is off", defaultRequest.String(), floor/mib)
+	}
+	if got := credentialProxyAdmittedRequests(defaultRequest.Value(), credentialProxyOutputCapBytes); got < credentialProxyMinimumAdmittedRequests {
+		t.Errorf("at its request the proxy admits %d requests, want at least %d: that is the figure on Autopilot without bursting", got, credentialProxyMinimumAdmittedRequests)
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != credentialProxyMemoryFloorBytesAtDefaultCap {
 		t.Errorf("floor = %d bytes, but credentialProxyMemoryFloorBytesAtDefaultCap declares %d; the declared copy the chart and the broker are compared with has drifted from the function", got, credentialProxyMemoryFloorBytesAtDefaultCap)

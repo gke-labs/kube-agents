@@ -14,9 +14,13 @@ not be scanned (permission denied)") is kept, as written, on its own line under
 the headline, since a silent gap reads as clean; a sentence it shares with the
 scan counts is split at its clauses, so the counts stay in the headline. A gap
 named after the list joins it from the roll-up, which both layouts leave out,
-and on the card from the closing lines too, which only the text keeps. The top two findings and every
-finding labelled critical follow (the whole list when it runs past the SOP's
-five, which the SOP allows only for an all-critical list), a row each, led by its severity as inline
+and on the card from the closing lines too, which only the text keeps. A
+roll-up that counts critical findings the report left out ("14 more items, 2
+of them critical") is the exception: both layouts keep it as written, under
+the rows, since the total says neither that criticals are waiting nor when
+they arrive. Every
+finding the report lists follows, since the report is already the selection
+(``inventory_findings.py select``), a row each, led by its severity as inline
 code when the report labels a finding's severity. Each finding keeps its
 headline and, on the line under it, the sentence the report wrote there,
 unchanged. The total is the listed items plus the roll-up's count, the
@@ -43,14 +47,14 @@ roll-up, the total is a closing line's "all <n> findings", then the
 posture's "<n> findings" after a scan verb, then the largest of the closing
 lines' "<n> findings in total" (one may count one cluster), then any other
 "<n> findings" in the posture, then the listed items. The rest of the
-findings, the rest of the posture and the roll-up paragraph are left out;
+findings, the rest of the posture and any other roll-up paragraph are left out;
 every other closing line is kept as written, counts and all, since they are
 how a text reader asks for the rest. When the roll-up was the last of them,
 "Ask me to see all <n>." takes its place.
 
 ``blocks`` is the same card as Block Kit, which ``bootstrap_delivery``
 posts itself when it can: the headline, lead and top rows with no count
-above them, then a primary "Fix the first one" button and, when the total is
+above them, a kept roll-up as a line under them, then a primary "Fix the first one" button and, when the total is
 more than the rows shown, a "See all N" button, both answered as the
 clicker's turn: a click posts the button's label in the card's thread.
 The closing lines are left out too: "See all N" asks for the rest.
@@ -64,13 +68,9 @@ import re
 
 from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
 
-TOP_COUNT = 2
-#: The most items the SOP lists (Step 5) unless every one is critical: a longer
-#: list is all criticals, labelled or not, and criticals are never capped.
-SOP_LIST_CAP = 5
 BOLD_MARK = "**"
 PARAGRAPH_BREAK = "\n\n"
-#: Severities that earn the "worth fixing" lead; criticals are never rolled up.
+#: Severities that earn the "worth fixing" lead.
 CRITICAL = "critical"
 URGENT_SEVERITIES = frozenset({CRITICAL, "major"})
 #: A bold span ending in one of these is a whole headline; the text after it
@@ -371,6 +371,12 @@ SEVERITY_TERM = re.compile(r"\s+(?:critical|high|major|medium|moderate|minor|low
 HEADS_BREAKDOWN = re.compile(r"(?:\s+[\w-]+){0,4}?\s*[:(]", re.IGNORECASE)
 #: The text layout's ask, when the roll-up it drops was the last line.
 ASK_ALL = "Ask me to see all {count}."
+#: A roll-up counting critical findings the report left out ("14 more items, 2
+#: of them critical"), which both layouts keep, since the headline's total does
+#: not say that criticals are waiting or when they arrive.
+DEFERRED_CRITICALS = re.compile(
+    COUNT + r"\s+(?:of\s+(?:them|those|these)\s+|more\s+)?(?:are\s+)?critical\b", re.IGNORECASE
+)
 #: A paragraph that is one bold span: a title written without a "#".
 BOLD_PARAGRAPH = re.compile(r"^\*\*([^*]+)\*\*$")
 
@@ -624,19 +630,18 @@ class _Shape:
     """A parsed report reduced to its top rows, its total and the closing lines."""
 
     def __init__(self, posture: str, items: list[Item], tail: list[str]):
-        if len(items) > SOP_LIST_CAP:
-            self.top = list(items)
-        else:
-            self.top = [item for i, item in enumerate(items) if i < TOP_COUNT or item[0] == CRITICAL]
+        self.top = list(items)
         counted = [p for p in tail if _rollup_count(p, len(items)) is not None]
         rollup = next((p for p in counted if ROLLUP_STRONG.search(p)), counted[0] if counted else None)
-        # Only the roll-up goes: the headline carries its count, and a closing
-        # line with a count in it is still how a text reader asks.
+        # A roll-up that counts left-out criticals is kept, under the rows, in both layouts.
+        self.deferred = rollup if rollup is not None and DEFERRED_CRITICALS.search(rollup) else ""
+        # Otherwise only the roll-up goes: the headline carries its count, and a
+        # closing line with a count in it is still how a text reader asks.
         self.closing = [p for p in tail if p is not rollup]
         clauses = [c.strip() for c in CLAUSE_END.split(posture.replace(BOLD_MARK, "")) if c.strip()]
         split = [_split_gap(c) for c in clauses]
-        # The roll-up is left out of both layouts, so a gap it names joins the posture's.
-        self.gaps = [gaps for gaps, _ in split] + [gap_parts(rollup or "")]
+        # A roll-up left out of both layouts has its gap join the posture's.
+        self.gaps = [gaps for gaps, _ in split] + [gap_parts("" if self.deferred else rollup or "")]
         # Only the card leaves out the closing lines, so only the card lifts their gaps.
         self.closing_gaps = [gap_parts(p) for p in self.closing]
         self.scanned = [rest for _, rest in split if SCAN_VERB.search(rest)]
@@ -666,7 +671,11 @@ class _Shape:
             total = len(items)
         # Never fewer than the report lists.
         self.total = max(total, len(items))
-        self.ask = ASK_ALL.format(count=self.total) if rollup is not None and tail[-1] is rollup and self.total > len(self.top) else ""
+        self.ask = (
+            ASK_ALL.format(count=self.total)
+            if rollup is not None and tail[-1] is rollup and self.total > len(self.top) and not self.deferred
+            else ""
+        )
 
 
 def _shape(report: str) -> _Shape | None:
@@ -684,7 +693,7 @@ def present(report: str) -> str:
     headline, note, detail = card_headline(shape)
     head = f"{BOLD_MARK}{headline}{BOLD_MARK}" + (f" {note}" if note else "") + (f"\n{detail}" if detail else "")
     rows = "\n".join(_with_sentence(_row(severity, h), sentence) for severity, h, sentence in shape.top)
-    return PARAGRAPH_BREAK.join([head, rows, *shape.closing, *filter(None, [shape.ask])]) + "\n"
+    return PARAGRAPH_BREAK.join([head, rows, *filter(None, [shape.deferred]), *shape.closing, *filter(None, [shape.ask])]) + "\n"
 
 
 def _rows(items: list[Item]) -> list[dict]:
@@ -765,5 +774,6 @@ def blocks(report: str) -> tuple[list[dict], str] | None:
         rows=top,
         choices=choices,
         action_id_prefix=ACTION_ID_PREFIX,
+        after_rows=" ".join(shape.deferred.split()),
     )
     return built, fallback_text(" ".join(part for part in (headline, note, detail) if part), rows=top)

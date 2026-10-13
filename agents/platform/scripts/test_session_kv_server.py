@@ -159,6 +159,12 @@ class TestSessionKvServerUtils(unittest.TestCase):
                 self.assertIn(label, session_kv_server.ALERT_DAILY_LIMITS)
 
 
+def closing_db():
+    import sqlite3
+    from contextlib import closing
+    return closing(sqlite3.connect(session_kv_server.SESSION_KV_DB_PATH))
+
+
 class TestSessionKvServerApi(unittest.TestCase):
 
     def setUp(self):
@@ -194,6 +200,58 @@ class TestSessionKvServerApi(unittest.TestCase):
         data = meta_resp.json()
         self.assertEqual(data.get("platform"), "k8s-watcher")
         self.assertIn("created_at", data)
+
+    def test_a_conversation_route_is_recorded_for_a_bridge_session(self):
+        # What the hermes-bridge records before a turn, read back where
+        # kanban_event_routing reads it, under its own key: the row's
+        # platform/chat_id/thread_id address a chat thread for other readers
+        # (send_notification) and stay unset.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "slack", "conversation": "slack:dm/D123", "context_id": "ctx-0123abcd"}
+        response = self.client.put(f"/v1/sessions/{sid}/route", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        meta = self.client.get(f"/v1/sessions/{sid}/metadata").json()
+        self.assertEqual(meta["conversation_route"],
+                         {"platform": "slack", "conversation": "slack:dm/D123", "context_id": "ctx-0123abcd"})
+        self.assertNotIn("chat_id", meta)
+        self.assertNotIn("thread_id", meta)
+        # Again on the next turn, after something else wrote the row: an
+        # upsert that keeps the other keys.
+        with closing_db() as conn:
+            row = json.loads(conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (sid,)).fetchone()[0])
+            row["kept"] = True
+            conn.execute("UPDATE session_metadata SET metadata = ? WHERE session_id = ?", (json.dumps(row), sid))
+            conn.commit()
+        body["conversation"] = "slack:C1/1712.0001"
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        meta = self.client.get(f"/v1/sessions/{sid}/metadata").json()
+        self.assertEqual(meta["conversation_route"]["conversation"], "slack:C1/1712.0001")
+        self.assertTrue(meta["kept"])
+
+    def test_a_hashed_session_takes_its_own_context(self):
+        # The bridge hashes a context id that is not path-safe
+        # (a2a/hermes-bridge/api.go, apiSessionID); the route is accepted for
+        # that session and no other.
+        import hashlib
+        ctx = "ctx/odd id"
+        sid = "a2a-h-" + hashlib.sha256(ctx.encode()).hexdigest()[:32]
+        body = {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B", "context_id": ctx}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.put("/v1/sessions/a2a-h-0000/route", json=body).status_code, 400)
+
+    def test_a_conversation_route_is_refused_outside_its_shape(self):
+        good = {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B", "context_id": "ctx-1"}
+        for sid, body, why in (
+            ("a2a-ctx-other", good, "another session's cards re-addressed to this context"),
+            ("k8s-evt-12345678", good, "an alert session cannot be re-addressed"),
+            ("a2a-ctx-1", dict(good, platform="discord"), "a backend the gateway cannot hold for notify"),
+            ("a2a-ctx-1", dict(good, conversation="slack:C1/1.2"), "a key for the other backend"),
+            ("a2a-ctx-1", dict(good, conversation="gchat:"), "an empty key"),
+            ("a2a-ctx-1", dict(good, context_id=""), "no context id"),
+            ("a2a-ctx-1", dict(good, context_id="x" * 600), "an oversized context id"),
+        ):
+            response = self.client.put(f"/v1/sessions/{sid}/route", json=body)
+            self.assertEqual(response.status_code, 400, why)
 
     def test_store_and_get_incident(self):
         # Store incident
@@ -772,6 +830,12 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
     only surviving channel.
     """
 
+    def setUp(self):
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            p.start()
+            self.addCleanup(p.stop)
+
     def _row(self, row_id):
         import sqlite3
         with sqlite3.connect(temp_db_path) as conn:
@@ -914,6 +978,10 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
     """The Slack text goes to Slack only, and the title is recorded only for a Slack thread."""
 
     def setUp(self):
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            p.start()
+            self.addCleanup(p.stop)
         patcher = patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat", "slack"])
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1019,6 +1087,11 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/findings/expire-snoozes", None),
         ("GET", "/v1/findings/publication/backlog", None),
         ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
+        ("PUT", "/v1/sessions/sess-1/route", {"platform": "slack", "conversation": "slack:dm/D1", "context_id": "c"}),
+        ("GET", "/v1/intercepted-events", None),
+        ("GET", "/v1/sessions/sess-1/tasks", None),
+        ("GET", "/v1/tasks", None),
+        ("GET", "/v1/tasks/t-1", None),
     )
 
     def setUp(self):
@@ -1067,6 +1140,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 path.split("?")[0]
                 .replace("sess-1", "{session_id}")
                 .replace("f-1", "{finding_id}")
+                .replace("t-1", "{task_id}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -1605,6 +1679,10 @@ class TestAlertPlatformFallback(unittest.TestCase):
     """
 
     def setUp(self):
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            p.start()
+            self.addCleanup(p.stop)
         patcher = patch.object(
             session_kv_server, "enabled_chat_platforms",
             return_value=["google_chat", "slack"])
@@ -4195,6 +4273,7 @@ class TestFindingsQueueApi(unittest.TestCase):
             with conn:
                 conn.execute("DELETE FROM findings")
                 conn.execute("DELETE FROM queue_publications")
+                conn.execute("DELETE FROM findings_additions")
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
@@ -4288,6 +4367,34 @@ class TestFindingsQueueApi(unittest.TestCase):
             self.client.get(f"/v1/findings/additions?day={day}").json(),
             {"day": day, "critical": 0, "noncritical": 1},
         )
+
+    def test_the_first_report_marks_a_critical_addition(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        added = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        ).json()
+        self.assertEqual(added["added_class"], "critical")
+        day = added["first_shown_at"][:10]
+        self.assertEqual(
+            self.client.get(f"/v1/findings/additions?day={day}").json(),
+            {"day": day, "critical": 1, "noncritical": 0},
+        )
+
+    def test_the_first_report_may_not_mark_a_dismissed_finding(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        self.client.patch(f"/v1/findings/{fid}", json={"state": "dismissed"})
+
+        refused = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        )
+
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("dismissed", refused.json()["detail"])
+        self.assertEqual(self.client.get("/v1/findings/additions").json()["critical"], 0)
 
     def test_a_decision_on_one_id_covers_its_gathered_line(self):
         self._register(self._finding(), self._finding(object="Deployment/cart"))
@@ -5097,6 +5204,531 @@ class TestStallInject(unittest.TestCase):
             [line for line in card.splitlines() if line.startswith("## ")],
             ["## What's wrong", "## Why", "## What to do"],
         )
+
+
+class TestReadOnlyActivityFeed(unittest.TestCase):
+    """Read-only HTTP activity feed for intercepted events and kanban tasks."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.kanban_path = self.root / "kanban.db"
+
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM intercepted_events")
+            conn.execute("DELETE FROM alert_quota")
+
+        for attribute, value in (
+            ("KANBAN_DB_PATH", str(self.kanban_path)),
+            # Point both config layers at nothing and clear `A2A_NOTIFY_PLATFORM`
+            # (which `chat_notify.routes` checks ahead of both files) so the
+            # suite host's environment or `/etc/hermes/config.yaml` never decides
+            # whether `trigger_agent_troubleshooter` runs the headless path.
+            ("MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"),
+            ("CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"),
+        ):
+            patcher = patch.object(session_kv_server, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        env_patch = patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": ""}, clear=False)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _create_kanban_schema(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    body TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    priority INTEGER,
+                    session_id TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    last_heartbeat_at REAL,
+                    result TEXT,
+                    last_failure_error TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    profile TEXT,
+                    status TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    outcome TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    run_id INTEGER,
+                    kind TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    author TEXT,
+                    body TEXT,
+                    created_at REAL
+                );
+                """
+            )
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_intercepted_events_feed_returns_statuses_and_paginates_by_since_id(self, _mock_trigger):
+        empty = self.client.get("/v1/intercepted-events").json()
+        self.assertEqual(empty, {"events": [], "truncated": False, "next_since_id": 0})
+
+        sentinel_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="sentinel",
+            object_uid="u0",
+            object_kind="Pod",
+            reason="Pulled",
+            message="prior row",
+            severity="Info",
+            occurrences=1,
+            notified=False,
+            session_id="k8s-evt-0",
+        )
+        self.assertIsNotNone(sentinel_id)
+
+        r1 = self.client.post(
+            "/sessions/k8s-evt-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "type": "Warning",
+                        "reason": "BackOff",
+                        "namespace": "prod",
+                        "involvedObject": {"kind": "Pod", "name": "api-7b9f-abcde", "uid": "u1"},
+                        "message": "Back-off restarting failed container",
+                        "cluster": "gke-1",
+                    }
+                )
+            },
+        )
+        self.assertEqual(r1.status_code, 200)
+
+        id_undelivered = session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="db",
+            object_uid="u2",
+            object_kind="StatefulSet",
+            reason="FailedScheduling",
+            message="0/3 nodes available",
+            severity="Critical",
+            occurrences=1,
+            notified=True,
+            session_id="k8s-evt-2",
+        )
+        session_kv_server.mark_delivery_failed(id_undelivered, "chat post failed")
+
+        session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="worker",
+            object_uid="u3",
+            object_kind="Pod",
+            reason="Pulled",
+            message="Successfully pulled image",
+            severity="Info",
+            occurrences=1,
+            notified=False,
+            session_id="k8s-evt-3",
+        )
+        session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="cache",
+            object_uid="u4",
+            object_kind="Pod",
+            reason="Unhealthy",
+            message="Readiness probe failed",
+            severity="Warning",
+            occurrences=2,
+            notified=False,
+            session_id="k8s-evt-4",
+        )
+
+        initial = self.client.get("/v1/intercepted-events?limit=2").json()
+        self.assertTrue(initial["truncated"])
+        self.assertEqual(len(initial["events"]), 2)
+        self.assertEqual(initial["events"][0]["session_id"], "k8s-evt-4")
+        self.assertEqual(initial["events"][0]["status"], "suppressed")
+        self.assertEqual(initial["events"][1]["session_id"], "k8s-evt-3")
+        self.assertEqual(initial["events"][1]["status"], "filtered")
+
+        # Polling with the empty-ledger cursor (`since_id=0`) enters oldest-first
+        # cursor mode rather than falling back to newest-first.
+        from_zero = self.client.get("/v1/intercepted-events?since_id=0&limit=2").json()
+        self.assertTrue(from_zero["truncated"])
+        self.assertEqual(
+            [e["session_id"] for e in from_zero["events"]],
+            ["k8s-evt-0", "k8s-evt-1"],
+        )
+
+        polled = self.client.get(f"/v1/intercepted-events?since_id={sentinel_id}&limit=10").json()
+        self.assertFalse(polled["truncated"])
+        self.assertEqual(
+            [(e["session_id"], e["status"]) for e in polled["events"]],
+            [
+                ("k8s-evt-1", "injected"),
+                ("k8s-evt-2", "undelivered"),
+                ("k8s-evt-3", "filtered"),
+                ("k8s-evt-4", "suppressed"),
+            ],
+        )
+        self.assertEqual(polled["next_since_id"], polled["events"][-1]["id"])
+
+    def test_kanban_task_feeds_and_detail(self):
+        # Before kanban.db exists: empty list feed with board=False, 404 on detail
+        empty_sess = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        self.assertEqual(empty_sess, {"tasks": [], "truncated": False, "board": False})
+        empty_all = self.client.get("/v1/tasks").json()
+        self.assertEqual(empty_all, {"tasks": [], "truncated": False, "board": False})
+        self.assertEqual(self.client.get("/v1/tasks/t_1").status_code, 404)
+
+        self._create_kanban_schema()
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at, started_at, completed_at, result) "
+                "VALUES ('t_1', 'Triage prod', 'triage body', 'cluster-a', 'done', 1, 'k8s-evt-1', 100.0, 101.0, 120.0, 'Root cause found')"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at, started_at, last_heartbeat_at) "
+                "VALUES ('t_2', 'Open PR', 'pr body', 'platform', 'in_progress', 1, 'k8s-evt-1', 121.0, 122.0, 130.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
+                "VALUES ('t_1', 'cluster-a', 'completed', 101.0, 120.0, 'completed', 'Found bad env var')"
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES ('t_1', 1, 'heartbeat', 'checking pod logs', 110.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES ('t_1', 'cluster-a', ' verified replicaset', 115.0)"
+            )
+
+        sess_feed = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        self.assertTrue(sess_feed["board"])
+        self.assertFalse(sess_feed["truncated"])
+        self.assertEqual([t["id"] for t in sess_feed["tasks"]], ["t_1", "t_2"])
+        self.assertEqual(sess_feed["tasks"][0]["summary"], "Found bad env var")
+        self.assertEqual(sess_feed["tasks"][0]["result"], "Root cause found")
+
+        by_assignee = self.client.get("/v1/tasks?since=125&assignee=platform").json()
+        self.assertEqual([t["id"] for t in by_assignee["tasks"]], ["t_2"])
+
+        detail = self.client.get("/v1/tasks/t_1").json()
+        self.assertEqual(detail["task"]["id"], "t_1")
+        self.assertEqual(detail["task"]["body"], "triage body")
+        self.assertEqual(len(detail["runs"]), 1)
+        self.assertEqual(len(detail["events"]), 1)
+        self.assertEqual(len(detail["comments"]), 1)
+        self.assertEqual(self.client.get("/v1/tasks/no-such-task").status_code, 404)
+
+    def test_init_db_adds_session_id_column_idempotently_to_legacy_ledger(self):
+        import sqlite3
+
+        legacy_db = self.root / "legacy_session_kv.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                """
+                CREATE TABLE intercepted_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
+                    namespace   TEXT NOT NULL DEFAULT '',
+                    workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
+                    object_kind TEXT NOT NULL DEFAULT '',
+                    reason      TEXT NOT NULL DEFAULT '',
+                    message     TEXT NOT NULL DEFAULT '',
+                    severity    TEXT NOT NULL DEFAULT '',
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    notified    INTEGER NOT NULL DEFAULT 0,
+                    delivery_error TEXT NOT NULL DEFAULT '',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO intercepted_events (cluster, namespace, workload, reason, severity) "
+                "VALUES ('gke-1', 'prod', 'old-pod', 'BackOff', 'Warning')"
+            )
+
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+            # Simulate a second replica that read PRAGMA table_info before the
+            # first replica's ALTER TABLE committed and then hits `duplicate column name: session_id`.
+            real_connect = session_kv_server.sqlite3.connect
+
+            class _RacyConn:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __enter__(self):
+                    self._inner.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self._inner.__exit__(*args)
+
+                def close(self):
+                    return self._inner.close()
+
+                def execute(self, sql, *args, **kwargs):
+                    if "PRAGMA table_info(intercepted_events)" in sql:
+                        return [(0, "id", "INTEGER", 0, None, 1)]
+                    return self._inner.execute(sql, *args, **kwargs)
+
+            with patch.object(
+                session_kv_server.sqlite3,
+                "connect",
+                side_effect=lambda *a, **kw: _RacyConn(real_connect(*a, **kw)),
+            ):
+                session_kv_server.init_db()
+            row_id = session_kv_server.record_intercepted_event(
+                cluster="gke-1",
+                namespace="prod",
+                workload="new-pod",
+                object_uid="uid-new",
+                object_kind="Pod",
+                reason="BackOff",
+                message="restarting",
+                severity="Warning",
+                occurrences=1,
+                notified=True,
+                session_id="k8s-evt-migrated",
+            )
+            self.assertIsNotNone(row_id)
+            feed = self.client.get("/v1/intercepted-events").json()
+            by_name = {e["name"]: e["session_id"] for e in feed["events"]}
+            self.assertEqual(by_name["old-pod"], "")
+            self.assertEqual(by_name["new-pod"], "k8s-evt-migrated")
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_drift_and_stall_injects_stamp_session_id_in_feed(self, _mock_trigger):
+        drift_resp = self.client.post(
+            "/sessions/drift-sess-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "kind": "gitops-drift",
+                        "cluster": "gke-1",
+                        "insert_id": "ins-1",
+                        "principal": "alice@example.com",
+                        "verb": "patch",
+                        "resource": {
+                            "group": "apps",
+                            "version": "v1",
+                            "resource": "deployments",
+                            "namespace": "prod",
+                            "name": "checkout",
+                        },
+                    }
+                )
+            },
+        )
+        self.assertEqual(drift_resp.status_code, 200)
+
+        stall_resp = self.client.post(
+            "/sessions/stall-sess-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "kind": "controller-stall",
+                        "cluster": "gke-1",
+                        "namespace": "prod",
+                        "objects": [
+                            {
+                                "object": "Deployment/checkout",
+                                "heuristic": "stale-condition",
+                                "stalled_for": "15m",
+                            }
+                        ],
+                    }
+                )
+            },
+        )
+        self.assertEqual(stall_resp.status_code, 200)
+
+        feed = self.client.get("/v1/intercepted-events").json()
+        by_reason = {e["reason"]: e["session_id"] for e in feed["events"]}
+        self.assertEqual(by_reason[session_kv_server.DRIFT_LEDGER_REASON], "drift-sess-1")
+        self.assertEqual(by_reason[session_kv_server.STALL_LEDGER_REASON], "stall-sess-1")
+
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_post_initial_alert")
+    @patch.object(session_kv_server, "mark_delivery_failed")
+    def test_headless_install_with_chat_disabled_keeps_status_injected(
+        self, mock_mark_failed, mock_post, mock_create_session, _mock_build_query, mock_start_turn
+    ):
+        import sqlite3
+
+        managed_cfg = self.root / "managed-config.yaml"
+        managed_cfg.write_text(
+            "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        failed_chat_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="broken-chat",
+            object_uid="u-broken",
+            object_kind="Pod",
+            reason="BackOff",
+            message="restarting",
+            severity="Warning",
+            occurrences=1,
+            notified=True,
+            session_id="k8s-evt-broken-chat",
+        )
+        # Real DB write on the earlier failed chat row before switching to headless.
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET notified = 0, delivery_error = 'no message id' WHERE id = ?",
+                (failed_chat_id,),
+            )
+
+        with patch.object(session_kv_server, "MANAGED_CONFIG_PATH", str(managed_cfg)):
+            row_id = session_kv_server.record_intercepted_event(
+                cluster="gke-1",
+                namespace="prod",
+                workload="api",
+                object_uid="u-headless",
+                object_kind="Pod",
+                reason="BackOff",
+                message="restarting",
+                severity="Warning",
+                occurrences=1,
+                notified=True,
+                session_id="k8s-evt-headless",
+            )
+            session_kv_server.trigger_agent_troubleshooter("k8s-evt-headless", "alert", {}, row_id)
+            mock_post.assert_not_called()
+            mock_mark_failed.assert_not_called()
+            mock_create_session.assert_called_once()
+            mock_start_turn.assert_called_once()
+
+            with sqlite3.connect(temp_db_path) as conn:
+                notified_col, err_col = conn.execute(
+                    "SELECT notified, delivery_error FROM intercepted_events WHERE id = ?",
+                    (row_id,),
+                ).fetchone()
+            self.assertEqual((notified_col, err_col), (session_kv_server.NOTIFIED_HEADLESS, ""))
+
+            import eod_report_generator
+
+            recap_rows = eod_report_generator.load_intercepted_events(temp_db_path)
+            recap_summary = eod_report_generator.filter_and_aggregate_events(recap_rows)
+            self.assertEqual(recap_summary["alerts_posted"], 0)
+            self.assertEqual(recap_summary["dispatched_headless"], 1)
+            self.assertEqual(recap_summary["delivery_failed"], 1)
+            recap_md = eod_report_generator.generate_markdown_report(recap_summary)
+            self.assertIn(
+                "Counts cover every severity; only informational events are listed.",
+                recap_md,
+            )
+
+            feed = self.client.get("/v1/intercepted-events").json()
+            by_sid = {e["session_id"]: e["status"] for e in feed["events"]}
+            self.assertEqual(by_sid["k8s-evt-headless"], "injected")
+            self.assertEqual(by_sid["k8s-evt-broken-chat"], "undelivered")
+
+            # Under `spec.mode: next`, the managed config also has `enabled: false`
+            # for both platforms while `A2A_NOTIFY_PLATFORM` routes posts through
+            # the gateway; `_chat_platforms_disabled()` must return False and post.
+            mock_post.return_value = "spaces/A/threads/T-next"
+            with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}), patch.object(
+                session_kv_server, "_register_session_routing"
+            ) as mock_route:
+                self.assertFalse(session_kv_server._chat_platforms_disabled())
+                next_row_id = session_kv_server.record_intercepted_event(
+                    cluster="gke-1",
+                    namespace="prod",
+                    workload="api-next",
+                    object_uid="u-next",
+                    object_kind="Pod",
+                    reason="BackOff",
+                    message="restarting",
+                    severity="Warning",
+                    occurrences=1,
+                    notified=True,
+                    session_id="k8s-evt-next",
+                )
+                session_kv_server.trigger_agent_troubleshooter("k8s-evt-next", "alert", {}, next_row_id)
+                mock_post.assert_called_once_with("google_chat", "alert")
+                mock_route.assert_called_once_with("k8s-evt-next", "google_chat", "spaces/A/threads/T-next")
+
+        # Toggling chat back on later must not flip either historical row's status.
+        feed_after_toggle = self.client.get("/v1/intercepted-events").json()
+        by_sid_after = {e["session_id"]: e["status"] for e in feed_after_toggle["events"]}
+        self.assertEqual(by_sid_after["k8s-evt-headless"], "injected")
+        self.assertEqual(by_sid_after["k8s-evt-broken-chat"], "undelivered")
+
+    def test_out_of_range_since_id_and_since_return_400_instead_of_500(self):
+        overflow = (1 << 63)
+        for bad in (-1, overflow):
+            with self.subTest(bad=bad):
+                r_events = self.client.get(f"/v1/intercepted-events?since_id={bad}")
+                self.assertEqual(r_events.status_code, 400)
+                r_tasks = self.client.get(f"/v1/tasks?since={bad}")
+                self.assertEqual(r_tasks.status_code, 400)
+
+    def test_kanban_db_path_uses_hermes_resolver_and_falls_back_to_agent_home(self):
+        import types
+
+        with patch.object(session_kv_server, "KANBAN_DB_PATH", None):
+            package = types.ModuleType("hermes_cli")
+            module = types.ModuleType("hermes_cli.kanban_db")
+            module.kanban_db_path = lambda: Path("/opt/data/kanban/boards/ops/kanban.db")
+            package.kanban_db = module
+            with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": module}):
+                self.assertEqual(
+                    session_kv_server._kanban_db_path(),
+                    "/opt/data/kanban/boards/ops/kanban.db",
+                )
+
+            with patch.dict(sys.modules, {"hermes_cli": None, "hermes_cli.kanban_db": None}), patch.dict(
+                os.environ,
+                {"PLATFORM_AGENT_HOME": "/custom/home", "HERMES_HOME": "/custom/home/profiles/platform"},
+            ):
+                self.assertEqual(
+                    session_kv_server._kanban_db_path(),
+                    "/custom/home/kanban.db",
+                )
+
+
 
 if __name__ == "__main__":
     # Clean up temp database file on exit

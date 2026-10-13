@@ -233,7 +233,7 @@ card-wake replay planted, read before the harness archives it), and `reply_is_si
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule).
 
-Eight read the install under test, seven of them from that file. `bootstrap_fanout` compares the
+Nine read the install under test, eight of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -252,7 +252,11 @@ extract` writes through the worker's terminal. It passes when those items carry 
 `(check, object)` pairs listed in `expected_findings`. `bootstrap_report_read` reads the
 sandbox too, and passes when onboarding's delivery job has claimed the ranked report
 (`.bootstrap_completed` on the agent pod) and renamed the sandbox's `INVENTORY.md` to
-`INVENTORY.delivered.md`, which it does after reading it. `bootstrap_delivered` reads the
+`INVENTORY.delivered.md`, which it does after reading it. `bootstrap_report_criticals` reads
+that report and the worker's `INVENTORY.scores.json` there, and passes when the report's numbered
+items name exactly `limit` of the batch's critical items and none of its non-critical ones; a worker that scored `limit` or fewer
+critical is an error, since such a run cannot tell a capped report from one listing every
+critical. `bootstrap_delivered` reads the
 agent pod's `cron/executions.db` instead and passes when the delivery job's run that claimed
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's

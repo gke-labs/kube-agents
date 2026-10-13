@@ -565,13 +565,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 // session; follow-ups run on the api executor only) posts at once like the
 // rest, so the room hears it while the task runs. It also records
 // that the task's addressee speaks steer notices (postSteerShortfall says
-// why).
+// why), and whether its newest one said it refuses follow-ups
+// (steersRefusedBy, for routeTurn's status matcher).
 func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, taskID string, n lib.SteerNotice) {
 	if rs.answered == nil {
 		rs.answered, rs.queued, rs.ended = make(map[string]bool), make(map[string]bool), make(map[string]bool)
 	}
+	addressee := rec.AddresseeFor(taskID)
 	g.mu.Lock()
-	g.steerNoticesFrom[rec.AddresseeFor(taskID)] = true
+	g.steerNoticesFrom[addressee] = true
+	switch {
+	case n.Reason == lib.SteerReasonNoResume:
+		g.steersRefusedBy[addressee] = true
+	case n.Steer == lib.SteerQueued:
+		delete(g.steersRefusedBy, addressee)
+	}
 	g.mu.Unlock()
 	rs.answered[n.EnvelopeID] = true
 	switch {
@@ -621,6 +629,14 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState) {
 	}
 }
 
+// refusesFollowUps reports whether addressee's newest steer notice was a
+// no-resume refusal (steersRefusedBy).
+func (g *Gateway) refusesFollowUps(addressee string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.steersRefusedBy[addressee]
+}
+
 // postSteerShortfall tells the room, after the deliverable, about follow-ups
 // it was told would be taken and were not: ones the executor never answered
 // (they reached the stream after its terminal), queued ones whose turn never
@@ -632,6 +648,14 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState) {
 // the CR pins separately) answers none, and every follow-up would read as
 // missed. So the line posts only once this gateway has heard a steer notice
 // from the task's addressee, on this task or another since it started.
+//
+// The not-run count is best-effort across a gateway restart. turnsStarted
+// counts every turn answer relayed since the restart, including turns run
+// for follow-ups queued before it, whose queued notices this process never
+// saw; such a turn cancels out a follow-up queued after the restart that
+// never ran (a bridge crash), so the count reads low, never high. Nothing on
+// the stream ties a turn to the follow-up it ran, so the relay cannot tell
+// the two apart.
 func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID string) {
 	g.mu.Lock()
 	sent := rs.steersSent

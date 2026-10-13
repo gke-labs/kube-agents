@@ -1052,6 +1052,25 @@ class TestShownMarker(QueueTestCase):
             fq.mark_surfaced(self.conn, self.fid, publisher="nudge", added_class="major")
         self.assertIsNone(fq.get_finding(self.conn, self.fid)["first_shown_at"])
 
+    def test_a_paced_publisher_may_not_show_a_decided_row(self):
+        # A re-armed first report can name a finding the user dismissed earlier.
+        for state, patch in (
+            ("dismissed", {"state": "dismissed"}),
+            ("accepted", {"state": "accepted"}),
+            ("snoozed", {"state": "snoozed", "snoozed_until": "2099-01-01T00:00:00Z"}),
+        ):
+            with self.subTest(state=state):
+                fq.patch_finding(self.conn, self.fid, patch)
+                for publisher in fq.PACED_PUBLISHERS:
+                    with self.assertRaises(fq.FindingError):
+                        fq.mark_surfaced(self.conn, self.fid, publisher=publisher, added_class="critical", run="r1")
+                row = fq.get_finding(self.conn, self.fid)
+                self.assertEqual((row["state"], row["surface_count"]), (state, 0))
+                self.assertIsNone(row["first_shown_at"])
+                self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM findings_additions").fetchone()[0], 0)
+        # A pull still names it.
+        self.assertEqual(fq.mark_surfaced(self.conn, self.fid)["surface_count"], 1)
+
     def test_a_recurrence_is_new_again(self):
         fq.mark_surfaced(self.conn, self.fid, publisher="nudge", added_class="noncritical")
         fq.record_verification(self.conn, self.fid, "resolved")
@@ -1126,6 +1145,16 @@ class TestAdditions(QueueTestCase):
         fq.mark_surfaced(self.conn, fq.validate_finding(pulled)["id"])
         fq.mark_surfaced(self.conn, fq.validate_finding(joined)["id"], publisher="nudge")
         self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 0, "noncritical": 0})
+
+    def test_the_first_report_is_a_paced_publisher(self):
+        # bootstrap_delivery.py marks each row of the report's items with one run.
+        members = [sample(object=f"Deployment/d{i}", rubric=CRITICAL_RUBRIC) for i in range(2)]
+        self.register(*members)
+        for member in members:
+            fid = fq.validate_finding(member)["id"]
+            fq.mark_surfaced(self.conn, fid, publisher="first_report", added_class="critical", run="2026-10-07T09:00:00Z")
+            self.assertIsNotNone(fq.get_finding(self.conn, fid)["first_shown_at"])
+        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 1, "noncritical": 0})
 
     def test_a_day_must_be_a_date(self):
         for day in ("", "yesterday", "2026-10-06T00:00:00", None, "2026-99-99", "2026-02-30", "20261006", "٢٠٢٦-١٠-٠٦"):
@@ -1665,7 +1694,7 @@ class SopRubricParityTests(unittest.TestCase):
     def test_the_sop_names_the_commands_and_enum_values_it_tells_the_worker_to_send(self):
         self.assertIn("inventory_findings.py extract", self.text)
         self.assertIn("inventory_findings.py register", self.text)
-        self.assertIn("inventory_findings.py ranked", self.text)
+        self.assertIn("inventory_findings.py select", self.text)
         for kind in fq.REMEDIATION_KINDS:
             self.assertIn(f"`{kind}`", self.text)
         for kind in fq.VERIFICATION_KINDS:

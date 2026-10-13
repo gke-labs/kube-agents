@@ -146,7 +146,7 @@ def _around(claim: datetime = CLAIM) -> tuple[datetime, datetime]:
 
 def test_the_job_and_marker_are_the_ones_the_delivery_script_uses() -> None:
     script = DELIVERY.read_text()
-    assert f'DELIVERY_JOB_ID = "{onboarding.DELIVERY_JOB_ID}"' in script
+    assert f'OOBE_JOB_ID = "{onboarding.DELIVERY_JOB_ID}"' in script
     assert f'"{Path(onboarding.COMPLETED_MARKER).name}"' in script
 
 
@@ -305,7 +305,7 @@ def test_a_claim_no_run_spans_fails(store: Store) -> None:
     store.run("completed", earlier, earlier + timedelta(seconds=1))
     result = _verify()
     assert result.status == "fail"
-    assert "no run of bootstrap-inventory-delivery" in result.reason
+    assert "no run of oobe" in result.reason
 
 
 def test_an_unreadable_agent_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:

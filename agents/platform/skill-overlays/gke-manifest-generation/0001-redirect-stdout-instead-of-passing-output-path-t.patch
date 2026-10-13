@@ -1,0 +1,26 @@
+Subject: Redirect stdout instead of passing output-path to gcloud
+
+Why: gcloud runs in the credential proxy's container, which refuses `--output-path`, so the step redirects stdout instead.
+Local-Issue: none (#723)
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; the credential proxy is this repository's
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -203,9 +203,14 @@ hallucinations and optimize configurations:
+           --model-server={server_name} \
+           --accelerator-type={accelerator_type} \
+           --output=manifest \
+-          --output-path={output_file_path}
++          > {output_file_path}
+         ```
+ 
++        Redirect stdout rather than passing `--output-path`: `gcloud` runs in
++        the credential proxy's container, so that flag writes the manifest
++        next to the credentials instead of in your workspace, and the proxy
++        refuses it.
++
+     -   *Constraint*: You must include all resources returned by this command
+         (Deployments, Services, PodMonitoring, etc.) without filtering.
+ 

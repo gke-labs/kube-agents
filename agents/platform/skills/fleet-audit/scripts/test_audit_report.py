@@ -913,6 +913,17 @@ class BaseTestCase(unittest.TestCase):
     def stdout_json(self):
         return json.loads(self.out.strip())
 
+    def stdout_json_without_publish_timer(self):
+        """The JSON line without `publish_s`, which reads a real clock.
+
+        The test still checks that the timer is there and is not negative.
+        """
+        payload = self.stdout_json()
+        publish_s = payload.pop(audit_report.PUBLISH_SECONDS_KEY)
+        self.assertIsInstance(publish_s, float)
+        self.assertGreaterEqual(publish_s, 0)
+        return payload
+
     def write_findings(self, doc):
         path = self.tmp_path / "findings.json"
         path.write_text(json.dumps(doc), encoding="utf-8")
@@ -3384,7 +3395,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "OPENED",
                 "issue_url": "https://github.com/acme/fleet/issues/7",
@@ -3446,7 +3457,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertTrue(self.harness.forge_calls("issue-comment", number=42))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "UPDATED",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -4348,7 +4359,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("branch", "-D"))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "CLEAN",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -4383,7 +4394,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.forge_calls("issue-close"))
         self.assertFalse(self.harness.forge_calls("issue-comment"))
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_without_publish_timer(),
             {
                 "status": "CLEAN",
                 "issue_url": None,
@@ -9026,6 +9037,8 @@ class TestRenderBudget(BaseTestCase):
         dropped = audit_report._render_check_evidence(clusters, AUDIT, 400)
         self.assertNotIn("</details>", "\n".join(dropped))
         self.assertIn("omitted here", "\n".join(dropped))
+        # It counts the (cluster, check) pairs and says so.
+        self.assertRegex("\n".join(dropped), r"The commands behind this run's \d+ check\(s\)")
         self.assertIn("stored report", "\n".join(dropped))
         self.assertEqual(audit_report._render_check_evidence(clusters, AUDIT, 10), [])
 
@@ -9166,7 +9179,7 @@ class TestRenderBudget(BaseTestCase):
         self.assertLess(len(rendered), 4000)
         self.assertIn("truncated", rendered.lower())
 
-    def test_selection_is_a_prefix_of_the_sorted_order(self):
+    def test_selection_takes_the_most_severe_band_first(self):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
@@ -9178,6 +9191,44 @@ class TestRenderBudget(BaseTestCase):
     def test_at_least_one_finding_always_renders(self):
         rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
+
+    def test_a_target_late_in_the_alphabet_keeps_a_row_when_the_body_truncates(self):
+        early = [
+            {**f, "cluster": cluster}
+            for cluster in ("alpha", "bravo")
+            for f in bulk_findings(4, prefix=f"{cluster}")
+        ]
+        late = [{**f, "cluster": "zulu"} for f in bulk_findings(2, prefix="zulu")]
+        findings = early + late
+        one = len("\n".join(audit_report.render_finding(early[0]))) + 2 + len(early[0]["id"]) + 3
+        rendered, omitted = audit_report.select_rendered_findings(findings, one * 4)
+        clusters = [f["cluster"] for f in rendered]
+        self.assertIn("zulu", clusters)
+        self.assertEqual(len(rendered) + len(omitted), len(findings))
+        # The fair-share order decides membership only. Both lists keep the
+        # display order.
+        self.assertEqual(rendered, audit_report.sort_findings(rendered))
+        self.assertEqual(omitted, audit_report.sort_findings(omitted))
+
+    def test_fair_share_never_moves_a_finding_across_a_severity_band(self):
+        # Without bands, the cycle would take zulu's critical, then alpha's
+        # minor before alpha's second critical.
+        findings = (
+            [{**f, "cluster": "alpha"} for f in bulk_findings(2, severity="critical", prefix="ac")]
+            + [{**f, "cluster": "alpha"} for f in bulk_findings(2, severity="minor", prefix="am")]
+            + [{**f, "cluster": "zulu"} for f in bulk_findings(1, severity="critical", prefix="zc")]
+        )
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        self.assertEqual(
+            [(f["severity"], f["cluster"]) for f in order],
+            [
+                ("critical", "alpha"),
+                ("critical", "zulu"),
+                ("critical", "alpha"),
+                ("minor", "alpha"),
+                ("minor", "alpha"),
+            ],
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -9247,6 +9298,152 @@ class TestFindingAnchors(BaseTestCase):
         self.assertNotIn("href", title)
 
 
+class TestCheckEvidenceCollapse(BaseTestCase):
+    """One evidence row per check and command, not one per cluster.
+
+    A check that reads a project-wide surface once gives every cluster the
+    same command. One row per cluster repeated that string, and the table is
+    the first section the body budget drops.
+    """
+
+    NAMES = ("prod-us-east", "stage-eu", "zz-late")
+
+    def clusters(self, command=None, reason=None):
+        out = []
+        for name in self.NAMES:
+            entry = {"name": name, "location": "us-east1", "project": "acme"}
+            entry["checks_run"] = [
+                {"check": "netpol-missing", "command": command or f"kubectl --context {name} get netpol -A"}
+            ]
+            if reason:
+                entry["checks_not_applicable"] = [{"check": "privileged-container", "reason": reason}]
+            out.append(entry)
+        return out
+
+    def rows(self, lines, check):
+        return [line for line in lines if f"| `{check}` |" in line]
+
+    def test_one_shared_command_is_one_row_that_names_every_cluster(self):
+        lines = audit_report._render_check_evidence(
+            self.clusters(command="gcloud compute networks subnets list-usable"), AUDIT, 10**6
+        )
+        rows = self.rows(lines, "netpol-missing")
+        self.assertEqual(len(rows), 1)
+        for name in self.NAMES:
+            self.assertIn(f"`{name}`", rows[0])
+        # The count stays the number of (cluster, check) pairs.
+        self.assertIn(f"How this run checked the fleet ({len(self.NAMES)} checks)", "\n".join(lines))
+
+    def test_one_shared_reason_is_one_row_that_names_every_cluster(self):
+        lines = audit_report._render_check_evidence(
+            self.clusters(reason="Autopilot blocks privileged pods."), AUDIT, 10**6
+        )
+        rows = self.rows(lines, "privileged-container")
+        self.assertEqual(len(rows), 1)
+        for name in self.NAMES:
+            self.assertIn(f"`{name}`", rows[0])
+        self.assertIn(f"Not applicable ({len(self.NAMES)})", "\n".join(lines))
+
+    def test_a_command_that_names_its_cluster_keeps_one_row_per_cluster(self):
+        lines = audit_report._render_check_evidence(self.clusters(), AUDIT, 10**6)
+        rows = self.rows(lines, "netpol-missing")
+        self.assertEqual(
+            rows,
+            [
+                f"| `{name}` | `netpol-missing` | `kubectl --context {name} get netpol -A` |"
+                for name in self.NAMES
+            ],
+        )
+
+
+class TestScopePhrase(BaseTestCase):
+    """The ledger counts its targets by kind, not all as clusters.
+
+    `scope.clusters` holds projects and subnets too. Before this, a run that
+    read two clusters and one project said "Audited 3 cluster(s)", which
+    overstates the coverage of the fleet's clusters.
+    """
+
+    COST = "fleet-wide-cost-analysis"
+    COMPUTE = "gce-compute-fleet-audit"
+
+    def targets(self, *names):
+        return [{"name": name, "location": "us-east1", "project": "acme"} for name in names]
+
+    def test_a_cluster_only_stream_keeps_its_text(self):
+        self.assertEqual(
+            audit_report.scope_phrase(AUDIT, self.targets("prod-us-east", "stage-eu")),
+            "2 cluster(s)",
+        )
+        self.assertEqual(audit_report.scope_phrase(AUDIT, []), "0 cluster(s)")
+
+    def test_project_entries_are_counted_as_projects(self):
+        targets = self.targets("prod-us-east", "stage-eu", "project/acme-prod")
+        self.assertEqual(
+            audit_report.scope_phrase(self.COST, targets), "2 cluster(s) and 1 project(s)"
+        )
+        self.assertEqual(
+            audit_report.scope_phrase(self.COST, targets, "audited"),
+            "2 audited cluster(s) and 1 project(s)",
+        )
+        self.assertEqual(
+            audit_report.scope_phrase(self.COMPUTE, self.targets("project/a", "project/b")),
+            "2 project(s)",
+        )
+
+    def test_a_qualified_cluster_counts_as_a_cluster_without_a_subnet_scope(self):
+        targets = self.targets("acme/us-east1/prod", "acme/europe-west1/stage")
+        self.assertEqual(audit_report.scope_phrase(self.COST, targets), "2 cluster(s)")
+
+    def test_skipped_targets_are_counted_by_kind(self):
+        doc = make_doc(
+            findings=[make_finding()],
+            audit=self.COST,
+            skipped=[
+                {"cluster": "stage-eu", "reason": "unreachable"},
+                {"cluster": "project/acme-stage", "reason": "permission denied"},
+            ],
+        )
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("**Coverage is partial.** 1 cluster(s) and 1 project(s) could not be audited", body)
+
+    def test_the_ledger_scope_line_and_the_clean_comment_count_by_kind(self):
+        targets = self.targets("prod-us-east", "project/acme-prod")
+        doc = make_doc(findings=[make_finding()], audit=self.COST, clusters=targets)
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("Audited 1 cluster(s) and 1 project(s) on ", body)
+        clean_doc = make_doc(findings=[], audit=self.COST, clusters=targets)
+        clean = audit_report.render_clean_comment(
+            self.COST, clean_doc, NOW, gaps=[]
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s): ", clean)
+        partial = audit_report.render_clean_comment(
+            self.COST, clean_doc, NOW, gaps=["cluster `stage`: unreachable"]
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s):", partial)
+        lost = audit_report.render_clean_comment(
+            self.COST, clean_doc, NOW, gaps=[audit_report.LOST_MEMORY_GAP]
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s):", lost)
+        held = audit_report.render_held_comment(
+            self.COST,
+            clean_doc,
+            [
+                {
+                    "id": "idle-pool.prod-us-east..nodepool-np",
+                    "title": "t",
+                    "check": "idle-nodepool",
+                    "cluster": "prod-us-east",
+                    "namespace": "",
+                    "object": "NodePool/np",
+                    "commands": ["kubectl get nodes"],
+                }
+            ],
+            NOW,
+        )
+        self.assertIn("across 1 audited cluster(s) and 1 project(s):", held)
+
+
 class TestIndexOverhead(BaseTestCase):
     """The index is reserved out of the budget, not charged to a finding.
 
@@ -9294,6 +9491,35 @@ class TestIndexOverhead(BaseTestCase):
         )
         reserved = audit_report.index_overhead(findings, states, urls)
         self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+
+    def test_the_reservation_bounds_the_table_of_a_fair_share_selection(self):
+        # A rendered set is a prefix of the fair-share order, not of the
+        # display order. Here the display order puts the short `alpha` rows
+        # first, but a truncated selection alternates alpha and zulu, so the
+        # table shows the wide zulu rows too. The reservation must cover each
+        # table that a selection can show.
+        cap = audit_report.MAX_DELTA_ROWS
+        wide = "z" + "-wide" * 18
+        alpha = [{**f, "cluster": "alpha"} for f in bulk_findings(cap + 10, prefix="a")]
+        zulu = [
+            {**f, "id": f"{wide}-{i:03d}", "cluster": "zulu"}
+            for i, f in enumerate(bulk_findings(cap + 10, prefix="z"))
+        ]
+        findings = alpha + zulu
+        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+        urls = {f["id"]: "https://github.com/an-org/a-repository/pull/12345" for f in zulu}
+        reserved = audit_report.index_overhead(findings, states, urls)
+        one = len("\n".join(audit_report.render_finding(alpha[0], state=audit_report.STATE_PR_OPEN)))
+        for count in (cap // 2, cap, cap + cap // 2):
+            with self.subTest(count=count):
+                rendered, _ = audit_report.select_rendered_findings(
+                    findings, one * count, states=states, pr_urls=urls
+                )
+                table = sum(
+                    len(audit_report._index_row(f, states[f["id"]], urls.get(f["id"]))) + 1
+                    for f in rendered[:cap]
+                )
+                self.assertGreaterEqual(reserved, table)
 
     def test_the_reservation_bounds_a_table_that_hits_the_row_cap(self):
         findings = bulk_findings(audit_report.MAX_DELTA_ROWS + 20)
@@ -10013,12 +10239,11 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(len(refusals), 1)
         reason = refusals[0]["reasons"][0]
-        self.assertIn("not recorded as a collaborator", reason)
-        self.assertIn("`authorAssociation: NONE`", reason)
-        # The refusal reports the association it read, not a permission it
-        # never queried. The old wording claimed the commenter "does not have
-        # write access", which was untrue of the App that tripped this path.
-        self.assertNotIn("does not have write access", reason)
+        # The refusal gives the forge's write-access answer. It does not cite
+        # `authorAssociation`, because the harness makes that value from the
+        # answer.
+        self.assertIn("@drive-by does not have write access to this repository, so", reason)
+        self.assertNotIn("authorAssociation", reason)
         self.assertEqual(refusals[0]["comment_id"], "IC_1")
 
     def test_a_non_manifest_target_is_refused(self):
@@ -10526,6 +10751,64 @@ class TestReconcileRemediationPrs(BaseTestCase):
         self.assertEqual(set(by_finding), {"a", "b", "c"})
         self.assertTrue(all(v is None for v in by_finding.values()))
         self.assertEqual(urls, {})
+
+    def test_a_merged_pr_claims_only_the_findings_its_body_names(self):
+        # The pull request merged a fix for `a`. Later `b`, a different check,
+        # writes the same file and so lands on the same branch. The ledger
+        # must not link `b` to that pull request, but promotion still sees it.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        merged = pr(
+            9, branch, state="MERGED", merged_at="2026-08-03T00:00:00Z",
+            body=audit_report.delta_block(["a"]),
+        )
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [merged]
+        )
+        claimed, urls = audit_report.claimed_prs(by_finding)
+        self.assertEqual(claimed["a"]["number"], 9)
+        self.assertIsNone(claimed["b"])
+        self.assertNotIn("b", urls)
+        self.assertEqual(by_finding["b"]["number"], 9)
+        plan = audit_report.promotion_candidates(self.findings[:2], by_finding)
+        self.assertEqual(plan.promote, [])
+
+    def test_a_human_closed_pr_claims_only_the_findings_its_body_names(self):
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        closed = pr(9, branch, state="CLOSED", body=audit_report.delta_block(["a"]))
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [closed]
+        )
+        claimed, _ = audit_report.claimed_prs(by_finding)
+        self.assertEqual(claimed["a"]["number"], 9)
+        self.assertIsNone(claimed["b"])
+        self.assertEqual(by_finding["b"]["number"], 9)
+
+    def test_a_settled_pr_with_an_unjoinable_body_still_covers_the_group(self):
+        # No delta block, or one under an older id scheme: this run cannot
+        # tell which findings the pull request named, so it keeps the branch
+        # join and opens no new fix on a branch a human settled.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        old_scheme = audit_report.delta_block(["a"]).replace(
+            f"audit-id-scheme: {audit_report.ID_SCHEME}", "audit-id-scheme: 1"
+        )
+        for state, body in (("MERGED", ""), ("MERGED", old_scheme), ("CLOSED", "")):
+            with self.subTest(state=state, body=body):
+                settled = pr(9, branch, state=state, body=body)
+                by_finding, _ = audit_report.reconcile_remediation_prs(
+                    AUDIT, self.findings, [settled]
+                )
+                claimed, _ = audit_report.claimed_prs(by_finding)
+                self.assertEqual(claimed["a"]["number"], 9)
+                self.assertEqual(claimed["b"]["number"], 9)
+
+    def test_an_open_pr_covers_the_whole_group_whatever_its_body_names(self):
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        live = pr(9, branch, body=audit_report.delta_block(["a"]))
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [live]
+        )
+        claimed, _ = audit_report.claimed_prs(by_finding)
+        self.assertEqual(claimed["b"]["number"], 9)
 
 
 class TestOpenRemediationPr(HarnessTestCase):
@@ -11380,6 +11663,84 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         )
         self.assertEqual(self.run_finish(doc), 0, self.err)
         self.assertEqual(self.stdout_json()["prs_still_open"], [])
+
+    def settled_mixed_group(self, state, merged_at=None, labels=()):
+        """A settled pull request that names `a`, and a new `b` on the same file.
+
+        Runs `finish` and returns (a's id, b's id, the ledger body).
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        a = make_finding(fid="a")
+        b = make_finding(fid="b", check="privileged-container", title="Privileged container")
+        doc = make_doc(findings=[a, b])
+        a_id = audit_report.derive_finding_id(dict(a))
+        b_id = audit_report.derive_finding_id(dict(b))
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        settled = pr(
+            5, branch, state=state, merged_at=merged_at,
+            body=audit_report.delta_block([a_id]),
+        )
+        settled["labels"] = [{"name": name} for name in labels]
+        self.harness.replies["proposal-list"] = proposals_view([settled])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        bodies = self.harness.bodies_for("issue-create")
+        self.assertEqual(len(bodies), 1)
+        return a_id, b_id, bodies[0]
+
+    def finding_block(self, body, fid):
+        block = body.split(f"<!-- finding:{fid} -->", 1)[1]
+        return block.split("Evidence — reproduce with:", 1)[0]
+
+    def state_line(self, body, fid):
+        block = body.split(f"<!-- finding:{fid} -->", 1)[1]
+        return next(line for line in block.splitlines() if line.startswith("- **State:**"))
+
+    def test_a_human_closed_pr_on_a_mixed_group_opens_nothing_and_claims_only_its_finding(self):
+        # Promoting `b` would open its whole group, `a` too, on the closed
+        # pull request's branch: the human close would be overruled.
+        a_id, b_id, body = self.settled_mixed_group("CLOSED")
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertIn("pull/5", self.state_line(body, a_id))
+        self.assertNotIn("pull/5", self.state_line(body, b_id))
+        self.assertNotIn(b_id, json.dumps(self.harness.forge_calls("proposal-comment")))
+        # The ledger says why the sweep opened nothing for `b`.
+        self.assertIn(
+            "No pull request for this finding: a pull request on the same branch, "
+            "closed by a person, blocks an automatic one — "
+            f"https://github.com/acme/fleet/pull/5. A `/remediate {b_id}` proposes a fix "
+            "for every finding in the group that still reproduces.",
+            self.finding_block(body, b_id),
+        )
+        self.assertNotIn("blocks an automatic one", self.finding_block(body, a_id))
+
+    def test_a_merged_pr_on_a_mixed_group_opens_nothing_and_comments_only_on_its_finding(self):
+        a_id, b_id, body = self.settled_mixed_group("MERGED", merged_at="2026-07-01T00:00:00Z")
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertIn("pull/5", self.state_line(body, a_id))
+        self.assertNotIn("pull/5", self.state_line(body, b_id))
+        comments = json.dumps(self.harness.forge_calls("proposal-comment"))
+        self.assertIn(a_id, comments)
+        self.assertNotIn(b_id, comments)
+        self.assertIn(
+            "a pull request on the same branch, merged, blocks an automatic one — "
+            "https://github.com/acme/fleet/pull/5.",
+            self.finding_block(body, b_id),
+        )
+
+    def test_the_block_line_falls_back_to_the_number_without_a_url(self):
+        note = audit_report._blocked_note(
+            "b", {"number": 5, "state": "MERGED", "url": ""}, "merge request"
+        )
+        self.assertIn("blocks an automatic one — #5.", note)
+
+    def test_a_harness_closed_pr_on_a_mixed_group_blocks_nothing(self):
+        # A stale close does not block the sweep, so the ledger names no block.
+        a_id, b_id, body = self.settled_mixed_group(
+            "CLOSED", labels=(audit_report.STALE_CLOSED_LABEL,)
+        )
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+        self.assertNotIn("blocks an automatic one", body)
 
     def test_the_ledger_is_rewritten_once_the_pull_request_exists(self):
         # The body was rendered before the PR had a number, so it could not
@@ -13085,8 +13446,14 @@ class TestChecksRun(unittest.TestCase):
         self.assertEqual(audit_report.coverage_gaps(doc), [])
 
     def test_every_check_inapplicable_needs_a_collector_stream(self):
+        # Every stream runs a collector now. The test takes one out of the set
+        # to model a stream with no collector to corroborate the declarations.
         stream = "gcp-networking-fabric-audit"
-        self.assertNotIn(stream, audit_report.COLLECTOR_AUDITS)
+        patcher = patch.object(
+            audit_report, "COLLECTOR_AUDITS", audit_report.COLLECTOR_AUDITS - {stream}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         roster = audit_report.audit_target_checks(stream, "project/acme-prod")
         doc = make_doc(
             audit=stream,
@@ -14788,6 +15155,316 @@ class TestDryRunParity(HarnessTestCase):
         out, _ = self.dry(make_doc())
         self.assertIn("## Findings", out)
         self.assertIn("audit-findings:", out)
+
+
+class TestCarryUnchangedFindings(unittest.TestCase):
+    """A finding whose evidence did not change keeps the previous run's words."""
+
+    FID = "single-zone-nodepool.spot._.nodepool-spot-pool"
+
+    def before(self, **overrides):
+        finding = {
+            "id": self.FID,
+            "title": "spot-pool is locked to a single zone",
+            "impact": "A zonal stockout halts autoscaling for this pool.",
+            "recommendation": {"action": "Add us-east4-b and us-east4-c."},
+            "remediation": {"kind": "manual", "note": "Add nodeLocations."},
+            "evidence": {"command": "gcloud container node-pools list", "excerpt": "a"},
+            "severity": "major",
+        }
+        finding.update(overrides)
+        return finding
+
+    def carry(self, before, now):
+        findings = [now]
+        ids = audit_report.carry_unchanged_findings(findings, {"findings": [before]})
+        return ids, findings[0]
+
+    def test_new_prose_on_the_same_evidence_is_replaced(self):
+        now = self.before(
+            title="spot-pool is a single-zone autoscaling node pool",
+            impact="This Standard cluster's Spot pool is locked to us-east4-a.",
+            recommendation={"action": "Add one or more additional zones."},
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [self.FID])
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(out["impact"], "A zonal stockout halts autoscaling for this pool.")
+        self.assertEqual(out["recommendation"], {"action": "Add us-east4-b and us-east4-c."})
+
+    def test_a_manual_note_on_both_sides_is_carried(self):
+        keep = {"kind": "manual", "note": "nodeLocations: [a, b, c]"}
+        ids, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "nodeLocations: [b, c]"}),
+        )
+        self.assertEqual(out["remediation"], keep)
+        self.assertEqual(ids, [self.FID])
+
+    def test_a_previous_gcloud_command_is_not_replaced_by_a_manual_note(self):
+        keep = {"kind": "gcloud", "note": "gcloud container clusters update c --location=l"}
+        _, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "Work it out."}),
+        )
+        self.assertEqual(out["remediation"], keep)
+
+    def test_a_new_gcloud_command_is_not_replaced_by_a_previous_manual_note(self):
+        mine = {"kind": "gcloud", "note": "gcloud container clusters update c --location=l"}
+        my_rec = {"action": "Run gcloud container clusters update c --location=l."}
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "Work it out."}),
+            self.before(title="reworded", recommendation=my_rec, remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        self.assertEqual(out["recommendation"], my_rec)
+        # The prose still carries. The recommendation and remediation stay as a pair.
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(ids, [self.FID])
+
+    def test_a_new_manifest_is_not_replaced_by_a_previous_manual_note(self):
+        mine = {"kind": "manifest", "path": "clusters/spot/pool.yaml", "note": "n"}
+        my_rec = {"action": "Apply clusters/spot/pool.yaml."}
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "by hand"}),
+            self.before(title="reworded", recommendation=my_rec, remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        self.assertEqual(out["recommendation"], my_rec)
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(ids, [self.FID])
+
+    def test_a_previous_manifest_is_not_carried_over_a_manual_note(self):
+        # The previous path names a file that this run did not write.
+        mine = {"kind": "manual", "note": "by hand"}
+        my_rec = {"action": "Update the node pool by hand."}
+        _, out = self.carry(
+            self.before(remediation={"kind": "manifest", "path": "clusters/a.yaml", "note": "n"}),
+            self.before(recommendation=my_rec, remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        self.assertEqual(out["recommendation"], my_rec)
+
+    def test_a_note_that_finish_wrote_is_not_carried(self):
+        degraded = {
+            "kind": "manual",
+            "note": "n _(The audit did not write it. "
+            + audit_report.DEGRADED_REMEDIATION_TAIL,
+        }
+        reverted = {
+            "kind": "manual",
+            "note": f"Declared at x. {audit_report.KCC_REVERTED_NOTE_MARK}, so ...",
+        }
+        declined = {
+            "kind": "manual",
+            "note": audit_report.DECLINED_FIX_NOTE.format(reason="a PR is open") + " n",
+        }
+        for written in (degraded, reverted, declined):
+            with self.subTest(note=written["note"]):
+                clean = {"kind": "manual", "note": "clean"}
+                _, out = self.carry(
+                    self.before(remediation=written), self.before(remediation=dict(clean))
+                )
+                self.assertEqual(out["remediation"], clean)
+                _, out = self.carry(
+                    self.before(remediation=clean), self.before(remediation=dict(written))
+                )
+                self.assertEqual(out["remediation"], written)
+
+    def test_the_notes_that_finish_writes_hold_their_marks(self):
+        # The marks are only useful while the passes still write them.
+        with tempfile.TemporaryDirectory() as tmp:
+            finding = self.before(
+                remediation={"kind": "manifest", "path": "missing.yaml", "note": "n"}
+            )
+            audit_report.degrade_missing_remediations([finding], Path(tmp))
+        self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]))
+
+    def test_a_carried_gcloud_note_is_normalised(self):
+        stale = self.before(
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=REGULAR",
+            }
+        )
+        now = self.before(
+            title="a rewrite",
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=regular",
+            },
+        )
+        _, out = self.carry(stale, now)
+        self.assertEqual(
+            out["remediation"]["note"],
+            "gcloud container clusters update c --release-channel=regular",
+        )
+
+    def test_changed_evidence_keeps_the_new_words(self):
+        now = self.before(
+            title="a new title",
+            evidence={"command": "gcloud container node-pools list", "excerpt": "b"},
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "a new title")
+
+    def test_a_changed_severity_keeps_the_new_words(self):
+        now = self.before(title="a new title", severity="critical")
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "a new title")
+        self.assertEqual(out["severity"], "critical")
+
+    def test_evidence_is_compared_as_the_store_keeps_it(self):
+        # The store keeps a redacted copy of the evidence.
+        excerpt = "password: hunter2correcthorse"
+        self.assertNotEqual(audit_report.redact_secrets(excerpt), excerpt)
+        stored = self.before(
+            evidence={
+                "command": "kubectl get cm",
+                "excerpt": audit_report.redact_secrets(excerpt),
+            }
+        )
+        now = self.before(
+            title="a new title", evidence={"command": "kubectl get cm", "excerpt": excerpt}
+        )
+        ids, out = self.carry(stored, now)
+        self.assertEqual(ids, [self.FID])
+        self.assertEqual(out["evidence"]["excerpt"], excerpt)
+
+    def test_a_finding_the_previous_run_did_not_have_is_not_changed(self):
+        now = self.before(id="single-zone-nodepool.other._.nodepool-x", title="fresh")
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "fresh")
+
+    def test_no_previous_document_changes_nothing(self):
+        for previous in (None, {}, {"findings": "x"}):
+            findings = [self.before(title="mine")]
+            self.assertEqual(audit_report.carry_unchanged_findings(findings, previous), [])
+            self.assertEqual(findings[0]["title"], "mine")
+
+    def test_an_identical_run_reports_nothing_carried(self):
+        ids, _ = self.carry(self.before(), self.before())
+        self.assertEqual(ids, [])
+
+
+class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
+    """`finish` reads the previous run's document and keeps its wording, in a
+    dry run and in the real run alike."""
+
+    OLD_TITLE = "Payments namespace has no NetworkPolicy (previous run)"
+    NEW_TITLE = "No NetworkPolicy selects the payments namespace (new words)"
+
+    def finding(self, title, excerpt="No resources found in payments namespace."):
+        return make_finding(
+            title=title,
+            excerpt=excerpt,
+            remediation={"kind": "manual", "note": "Apply a default-deny NetworkPolicy."},
+        )
+
+    def store(
+        self,
+        document,
+        repo="acme/fleet",
+        scheme=None,
+        ledger_document=None,
+        ledger_held_open=False,
+        ring_name=None,
+    ):
+        directory = self.store_dir(AUDIT, repo)
+        directory.mkdir(parents=True, exist_ok=True)
+        envelope = {
+            "audit_id": AUDIT,
+            "repo": repo,
+            "issue_number": None,
+            "ledger_body": "",
+            "current_ids": [],
+            "id_scheme": audit_report.ID_SCHEME if scheme is None else scheme,
+            "ledger_held_open": ledger_held_open,
+            "document": document,
+            **({"ledger_document": ledger_document} if ledger_document is not None else {}),
+        }
+        if ring_name is not None:
+            runs = directory / audit_report.REPORT_RUNS_DIR
+            runs.mkdir(parents=True, exist_ok=True)
+            (runs / ring_name).write_text(json.dumps(envelope), encoding="utf-8")
+        else:
+            (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+
+    def previous(self, **kwargs):
+        finding = self.finding(self.OLD_TITLE, **kwargs)
+        finding["id"] = derived_id()
+        return {"findings": [finding]}
+
+    def test_a_dry_run_shows_the_previous_wording(self):
+        self.store(self.previous())
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertNotIn(self.NEW_TITLE, self.out)
+        self.assertIn("wording is carried forward", self.err)
+
+    def test_a_held_open_run_still_carries_the_ledger_document_wording(self):
+        self.store({"findings": []}, ledger_document=self.previous(), ledger_held_open=True)
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertNotIn(self.NEW_TITLE, self.out)
+
+    def test_a_held_open_run_without_ledger_document_falls_back_to_the_ring_or_none(self):
+        # When a clean run held the open ledger while memory was lost,
+        # `latest.json` has `ledger_held_open: True` and no `ledger_document`.
+        # With no ring entry carrying a findings document, `previous_run_document`
+        # returns `None` instead of the held-open run's empty `document`.
+        self.store({"findings": []}, ledger_held_open=True)
+        self.store({"findings": []}, ledger_held_open=True, ring_name="2026-08-02T090000Z.json")
+        self.assertIsNone(audit_report.previous_run_document(AUDIT, "acme/fleet"))
+        # With an earlier findings envelope in `runs/`, it carries from that ring entry.
+        self.store(self.previous(), ring_name="2026-08-01T090000Z.json")
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertNotIn(self.NEW_TITLE, self.out)
+
+    def test_the_real_run_publishes_the_previous_wording(self):
+        self.store(self.previous())
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/77"),
+        }
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]))
+        self.assertEqual(rc, 0)
+        body = self.harness.forge_calls("issue-create")[0]["body"]
+        self.assertIn(self.OLD_TITLE, body)
+        self.assertNotIn(self.NEW_TITLE, body)
+
+    def test_changed_evidence_publishes_the_new_wording(self):
+        self.store(self.previous(excerpt="an older excerpt"))
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.NEW_TITLE, self.out)
+        self.assertNotIn(self.OLD_TITLE, self.out)
+
+    def test_a_store_for_another_repository_or_scheme_is_not_read(self):
+        for repo, scheme in (("acme/other", None), ("acme/fleet", audit_report.ID_SCHEME - 1)):
+            with self.subTest(repo=repo, scheme=scheme):
+                shutil.rmtree(self.reports_dir, ignore_errors=True)
+                self.store(self.previous(), repo=repo, scheme=scheme)
+                if repo != "acme/fleet":
+                    # Copied under this repository's directory, as a moved store.
+                    shutil.copytree(self.store_dir(AUDIT, repo), self.store_dir(AUDIT))
+                rc = self.run_finish(
+                    make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"]
+                )
+                self.assertEqual(rc, 0)
+                self.assertIn(self.NEW_TITLE, self.out)
+
+    def test_no_store_publishes_the_new_wording(self):
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.NEW_TITLE, self.out)
 
 
 class TestRepoResolution(BaseTestCase):
@@ -16528,6 +17205,16 @@ class TestCrossCheckManifest(unittest.TestCase):
         doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
         audit_report.cross_check_manifest(doc, manifest)
 
+    def test_a_manifest_limitation_requires_limitations(self):
+        note = "firewall-world-open-ingress could not decide 1 rule(s): gke-ap-node-ssh"
+        manifest = self.manifest(limitations=note)
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("limitations", str(ctx.exception))
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = note
+        audit_report.cross_check_manifest(doc, manifest)
+
     def test_a_check_the_manifest_never_ran_is_rejected(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())
@@ -17551,6 +18238,29 @@ class TestDraftFindings(BaseTestCase):
         self.assertNotIn(na, " ".join(audit_report.coverage_gaps(validated)))
         self.assertIn(unevaluated, cluster["limitations"])
 
+    def test_a_manifest_entry_limitation_carries_into_the_draft(self):
+        """A check that ran can still leave part of the target undecided on the
+        manifest entry's `limitations`; `draft` carries that note forward and
+        does not duplicate a check already named in it."""
+        note = "firewall-world-open-ingress could not decide 1 rule(s): gke-ap-node-ssh"
+        manifest = self.manifest()
+        entry = manifest["clusters"][0]
+        entry["limitations"] = note
+        draft = audit_report.draft_findings(manifest, AUDIT)
+        for finding in draft["findings"]:
+            finding["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        validated = audit_report.validate_findings(copy.deepcopy(draft), AUDIT)
+        audit_report.cross_check_manifest(validated, manifest)
+        self.assertEqual(draft["scope"]["clusters"][0]["limitations"], note)
+        self.assertTrue(audit_report.coverage_gaps(validated))
+        checks = [c["check"] for c in entry["commands"]]
+        unevaluated = checks[-1]
+        entry["commands"] = [c for c in entry["commands"] if c["check"] != unevaluated]
+        entry["checks_unevaluated"] = [{"check": unevaluated, "reason": "forbidden"}]
+        entry["limitations"] = f"{unevaluated} could not be evaluated (forbidden)"
+        combined = audit_report.draft_findings(manifest, AUDIT)["scope"]["clusters"][0]["limitations"]
+        self.assertEqual(combined, f"{unevaluated} could not be evaluated (forbidden)")
+
     def test_the_subcommand_writes_the_draft(self):
         path = self.tmp_path / "manifest.json"
         path.write_text(json.dumps(self.manifest()), encoding="utf-8")
@@ -17804,6 +18514,14 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         Path(audit_report.manifest_path_for(AUDIT)).write_text(json.dumps({"clusters": []}))
         self.assertEqual(self.run_finish(make_doc(), ("--no-collector-manifest", "skipped it")), 2)
         self.assertIn("pass it with --manifest-file", self.err)
+
+    def test_a_manifest_given_as_the_findings_file_names_draft(self):
+        path = Path(self.workspace) / "manifest.json"
+        path.write_text(json.dumps({"version": 1, "audit": AUDIT, "clusters": []}))
+        with self.assertRaises(audit_report.ValidationError) as refused:
+            audit_report.load_findings(str(path), AUDIT)
+        self.assertIn("is a collector manifest", str(refused.exception))
+        self.assertIn("audit_report.py draft", str(refused.exception))
 
     def test_a_findings_file_written_before_start_is_refused(self):
         self.harness.replies = {"issue-list": issues_view([])}
@@ -18906,26 +19624,25 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         import fleet_waste
         import patch_readiness
 
-        # The GCE stream's collector ships in its own skill, beside its SOP.
-        spec = importlib.util.spec_from_file_location(
-            "compute_fleet_audit",
-            Path(__file__).resolve().parents[2] / "gce-compute-fleet-audit" / "scripts" / "compute_fleet_audit.py",
-        )
-        compute_fleet_audit = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(compute_fleet_audit)
+        # The GCE compute and networking collectors ship in their own skills,
+        # beside their SOPs.
+        def load(skill: str, module: str):
+            spec = importlib.util.spec_from_file_location(
+                module, Path(__file__).resolve().parents[2] / skill / "scripts" / f"{module}.py"
+            )
+            loaded = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(loaded)
+            return loaded
+
+        compute_fleet_audit = load("gce-compute-fleet-audit", "compute_fleet_audit")
+        networking_audit = load("gcp-networking-fabric-audit", "networking_audit")
 
         expected = set(collect.CHECK_TABLES) | {
             fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
-            compute_fleet_audit.AUDIT_ID,
+            compute_fleet_audit.AUDIT_ID, networking_audit.AUDIT_SLUG,
         }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
-
-    def test_streams_with_no_collector_are_not_held_to_it(self):
-        for audit in ("gcp-networking-fabric-audit",):
-            with self.subTest(audit=audit):
-                self.assertIn(audit, audit_report.AUDITS)
-                self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)
 
     def test_no_flag_is_refused_and_nothing_is_published(self):
         self.harness.replies = {"issue-list": issues_view([])}
@@ -22021,6 +22738,9 @@ GOLDEN_TMP_TOKEN = "<TMP>"
 # `log()` stamps each line with the wall clock, outside the frozen `datetime`.
 GOLDEN_LOG_STAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ", re.M)
 GOLDEN_LOG_STAMP_TOKEN = "[<TS>] "
+# `publish_s` reads a real clock, outside the frozen `datetime`.
+GOLDEN_PUBLISH_TIMER_RE = re.compile(r'"publish_s": \d+(\.\d+)?')
+GOLDEN_PUBLISH_TIMER_TOKEN = '"publish_s": "<SECONDS>"'
 
 
 class _FrozenDatetime(datetime):
@@ -22031,7 +22751,7 @@ class _FrozenDatetime(datetime):
         return NOW if tz is None else NOW.astimezone(tz)
 
 
-BASE_HELD_COMMENT = '### `compliance-audit` found nothing — but did not account for 1 previous finding, so the ledger stays open\n\nThe Security & RBAC Posture Audit run on 2026-08-01 09:30 UTC found **0 findings** across 1 audited cluster(s): `prod-us-east`.\n\n**This is not an all-clear.** This ledger reported each finding below, and this run\'s own `checks_run` says the check that found it ran again on that cluster — yet the document neither reports the finding again nor carries a `resolved_because` entry saying what that check showed. From here "fixed" and "not written down" are the same absence, so nothing has been reported as resolved, no remediation pull request has been closed, and the ledger stays open. It closes on the next run that reports each of these again, or says per finding why it is gone; `start` lists them under `carried`.\n\n- `cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding` — debug-binding grants cluster-admin — `ClusterRoleBinding/debug-binding` in `prod-us-east` / _cluster-scoped_; `cluster-admin-binding` ran there as `kubectl get clusterrolebindings -o json \\| jq \'.items[] \\| select(.roleRef.name=="cluster-admin")\' xxxxxxxxxxxxxxxxxxxx…`\n\n<details>\n<summary>How this run checked the fleet (1 checks)</summary>\n\nOne row per check that ran, with the command that ran it, as reported by the audit. The harness cannot confirm a command was issued — these are re-runnable so that it does not have to be taken on trust.\n\n| Cluster | Check | Command |\n| ------- | ----- | ------- |\n| `prod-us-east` | `cluster-admin-binding` | `kubectl get clusterrolebindings -o json \\| jq \'.items[]\'` |\n\n</details>'
+BASE_HELD_COMMENT = '### `compliance-audit` found nothing — but did not account for 1 previous finding, so the ledger stays open\n\nThe Security & RBAC Posture Audit run on 2026-08-01 09:30 UTC found **0 findings** across 1 audited cluster(s): `prod-us-east`.\n\n**This is not an all-clear.** This ledger reported each finding below, and this run\'s own `checks_run` says the check that found it ran again on that cluster — yet the document neither reports the finding again nor carries a `resolved_because` entry saying what that check showed. From here "fixed" and "not written down" are the same absence, so nothing has been reported as resolved, no remediation pull request has been closed, and the ledger stays open. It closes on the next run that reports each of these again, or says per finding why it is gone; `start` lists them under `carried`.\n\n- `cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding` — debug-binding grants cluster-admin — `ClusterRoleBinding/debug-binding` in `prod-us-east` / _cluster-scoped_; `cluster-admin-binding` ran there as `kubectl get clusterrolebindings -o json \\| jq \'.items[] \\| select(.roleRef.name=="cluster-admin")\' xxxxxxxxxxxxxxxxxxxx…`\n\n<details>\n<summary>How this run checked the fleet (1 checks)</summary>\n\nOne row per check and command, with the clusters it ran on, as reported by the audit. A command that answers for several clusters gets one row. The harness cannot confirm a command was issued — these are re-runnable so that it does not have to be taken on trust.\n\n| Clusters | Check | Command |\n| -------- | ----- | ------- |\n| `prod-us-east` | `cluster-admin-binding` | `kubectl get clusterrolebindings -o json \\| jq \'.items[]\'` |\n\n</details>'
 
 
 class TestGcloudEnumCasing(unittest.TestCase):
@@ -23037,12 +23757,16 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     `two_findings`' `major` finding, below the floor on this stream, is now
     named in the bodies' below-floor block, and the dry run logs it on
     stderr. So is compliance-audit gaining a declared-intent step: its bodies carry the
-    `Declared-intent search:` line every declaring stream's bodies carry. Nothing else moved.
+    `Declared-intent search:` line every declaring stream's bodies carry. The JSON line
+    carries `publish_s`, the time `finish` used to publish. It reads a real clock, so the
+    transcripts record it as a token. No transcript has `inspect_s` or `collect_s`: these
+    runs have no in-flight note and no manifest. Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
-    stderr line but the per-call `forge ...` trace are what `gh` produced. One
-    call is new — the `proposal-update` that labels a pull request
+    stderr line but the per-call `forge ...` trace are what `gh` produced. Two
+    calls are new on the findings path — the `capabilities` read that asks for
+    `fileUrl`, and the `proposal-update` that labels a pull request
     `proposal-create` cannot. `identity`, which reads who wrote a comment, is
     asked only of a conversation that has comments, and none of these
     transcripts reads one.
@@ -23064,6 +23788,7 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
         if text is None:
             return None
         text = text.replace(str(self.tmp_path), GOLDEN_TMP_TOKEN)
+        text = GOLDEN_PUBLISH_TIMER_RE.sub(GOLDEN_PUBLISH_TIMER_TOKEN, text)
         return GOLDEN_LOG_STAMP_RE.sub(GOLDEN_LOG_STAMP_TOKEN, text)
 
     def transcript(self, rc):
@@ -23875,6 +24600,401 @@ class TestDetectContentMode(BaseTestCase):
             self.assertIn("check the credential-proxy pod and re-run the same command", section)
         self.assertIn("From `finish`, the run is still in flight", exit_codes)
         self.assertIn("re-run `finish`, never `start`", exit_codes)
+
+
+class TestPhaseTimers(HarnessTestCase):
+    """`finish` reports how long each phase of the run took, as report data."""
+
+    def write_note(self, started_at, audit=AUDIT):
+        """Leave the in-flight note that `start` writes, with `started_at`."""
+        path = Path(audit_report.inflight_path_for(audit))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"audit": audit, "started_at": started_at}), encoding="utf-8")
+        return path
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text())
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def stamp(self, offset_s):
+        moment = datetime.fromtimestamp(time.time() + offset_s, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_inspect_s_is_the_time_from_start_to_finish(self):
+        note = self.write_note(time.time() - 120)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertGreaterEqual(payload["inspect_s"], 120)
+        self.assertLess(payload["inspect_s"], 180)
+        self.assertEqual(self.stored()["inspect_s"], payload["inspect_s"])
+        # `finish` read the note before `handle_finish` released it.
+        self.assertFalse(note.exists())
+
+    def test_publish_s_is_on_the_line_and_on_the_envelope(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        publish_s = self.stdout_json()["publish_s"]
+        self.assertIsInstance(publish_s, float)
+        self.assertGreaterEqual(publish_s, 0)
+        self.assertEqual(self.stored()["publish_s"], publish_s)
+
+    def test_the_findings_path_carries_the_timers_too(self):
+        self.write_note(time.time() - 60)
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "OPENED")
+        for key in ("inspect_s", "publish_s"):
+            with self.subTest(key=key):
+                self.assertIn(key, payload)
+                self.assertEqual(self.stored()[key], payload[key])
+
+    def test_a_run_without_a_note_or_a_manifest_has_no_inspect_or_collect_timer(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        for surface in (self.stdout_json(), self.stored()):
+            for key in ("inspect_s", "collect_s"):
+                with self.subTest(key=key):
+                    self.assertNotIn(key, surface)
+
+    def test_collect_s_is_the_collectors_own_time(self):
+        manifest = _full_manifest()
+        manifest.update(started_at=self.stamp(-30), finished_at=self.stamp(30))
+        self.harness.replies = {"issue-list": {"issues": []}}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["collect_s"], 60.0)
+        self.assertEqual(self.stored()["collect_s"], 60.0)
+
+    def test_a_manifest_without_its_stamps_gives_no_collect_timer(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("collect_s", self.stdout_json())
+        self.assertNotIn("collect_s", self.stored())
+
+    def test_a_dry_run_prints_no_timers(self):
+        self.write_note(time.time() - 60)
+        self.assertEqual(self.run_finish(make_doc(findings=[]), ["--dry-run"]), 0, self.err)
+        for key in audit_report.PHASE_TIMER_KEYS:
+            with self.subTest(key=key):
+                self.assertNotIn(f'"{key}"', self.out)
+
+    def test_a_note_that_gives_no_start_time_gives_no_inspect_timer(self):
+        now = datetime.now(timezone.utc)
+        path = Path(audit_report.inflight_path_for(AUDIT))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cases = {
+            # `_in_flight_since` uses the mtime of such a note; a timer must not.
+            "does not parse": "{",
+            "names another stream": json.dumps({"audit": "other", "started_at": now.timestamp() - 60}),
+            "has no started_at": json.dumps({"audit": AUDIT}),
+            "has a boolean": json.dumps({"audit": AUDIT, "started_at": True}),
+            "has a string": json.dumps({"audit": AUDIT, "started_at": "yesterday"}),
+            "is in the future": json.dumps({"audit": AUDIT, "started_at": now.timestamp() + 60}),
+            "is infinite": '{"audit": "%s", "started_at": -Infinity}' % AUDIT,
+            "overflows float": json.dumps({"audit": AUDIT, "started_at": 10**400}),
+            "is before datetime range": json.dumps({"audit": AUDIT, "started_at": -1e300}),
+            "is negative": json.dumps({"audit": AUDIT, "started_at": -1}),
+        }
+        for name, text in cases.items():
+            with self.subTest(note=name):
+                path.write_text(text, encoding="utf-8")
+                self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
+        path.unlink()
+        self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
+
+    def test_a_run_longer_than_the_lease_keeps_its_inspect_timer(self):
+        # While no later `start` has replaced the expired note, the note at
+        # `finish` is still this run's note.
+        now = datetime.now(timezone.utc)
+        path = Path(audit_report.inflight_path_for(AUDIT))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        elapsed = audit_report.INFLIGHT_TTL_SECONDS + 60
+        path.write_text(json.dumps({"audit": AUDIT, "started_at": now.timestamp() - elapsed}), encoding="utf-8")
+        self.assertEqual(audit_report.inspect_seconds(AUDIT, now), float(elapsed))
+        path.unlink()
+
+    def test_a_bad_manifest_stamp_gives_no_collect_timer(self):
+        good = {"started_at": "2026-08-01T09:00:00Z", "finished_at": "2026-08-01T09:10:30Z"}
+        self.assertEqual(audit_report.collector_seconds(good), 630.0)
+        cases = {
+            "no manifest": None,
+            "no started_at": {"finished_at": good["finished_at"]},
+            "no finished_at": {"started_at": good["started_at"]},
+            "a stamp that does not parse": {**good, "started_at": "soon"},
+            "a stop before the start": {**good, "finished_at": "2026-08-01T08:59:00Z"},
+        }
+        for name, manifest in cases.items():
+            with self.subTest(manifest=name):
+                self.assertIsNone(audit_report.collector_seconds(manifest))
+
+    def test_the_envelope_copies_only_the_timers_the_line_has(self):
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED", "inspect_s": 812.4, "publish_s": 21.0, "collect_s": None},
+            make_doc(),
+            NOW,
+            repo="acme/fleet",
+            issue_number=42,
+            ledger_body="body",
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=[],
+        )
+        self.assertEqual((envelope["inspect_s"], envelope["publish_s"]), (812.4, 21.0))
+        self.assertNotIn("collect_s", envelope)
+
+
+class TestManifestRemediationLinks(HarnessTestCase):
+    """Manifest remediation links on the ledger use `capabilities.fileUrl` when present."""
+
+    GITHUB_TEMPLATE = "https://github.com/o/r/blob/{ref}/{path}"
+    GITLAB_TEMPLATE = "https://host/g/p/-/blob/{ref}/{path}"
+    SHA = "0123456789abcdef0123456789abcdef01234567"
+    PATH = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def test_github_and_gitlab_templates_fill_ref_and_path(self):
+        finding = make_finding(
+            remediation={"kind": "manifest", "path": self.PATH, "note": "apply netpol"}
+        )
+        for template, expected_prefix in (
+            (self.GITHUB_TEMPLATE, f"https://github.com/o/r/blob/{self.SHA}/"),
+            (self.GITLAB_TEMPLATE, f"https://host/g/p/-/blob/{self.SHA}/"),
+        ):
+            with self.subTest(template=template):
+                text = "\n".join(
+                    audit_report.render_finding(
+                        finding, file_url=template, file_ref=self.SHA
+                    )
+                )
+                self.assertIn(
+                    f"- **Remediation (manifest):** [`{self.PATH}`]({expected_prefix}{self.PATH}) — apply netpol",
+                    text,
+                )
+                body = audit_report.render_issue_body(
+                    make_doc(findings=[finding]),
+                    generated_at=NOW,
+                    file_url=template,
+                    file_ref=self.SHA,
+                ).body
+                self.assertIn(f"[`{self.PATH}`]({expected_prefix}{self.PATH})", body)
+
+    def test_path_and_ref_segments_are_percent_encoded_with_slashes_kept(self):
+        path = "clusters/prod us/netpol#1%a.yaml"
+        ref = "release/2026#1%a"
+        target = audit_report.format_file_url(self.GITHUB_TEMPLATE, path, ref=ref)
+        self.assertEqual(
+            target,
+            "https://github.com/o/r/blob/release/2026%231%25a/clusters/prod%20us/netpol%231%25a.yaml",
+        )
+
+    def test_missing_or_incomplete_template_keeps_bare_path_link(self):
+        finding = make_finding(
+            remediation={"kind": "manifest", "path": self.PATH, "note": "n"}
+        )
+        for bad_template in (
+            None,
+            "",
+            "https://github.com/o/r/blob/{path}",
+            "https://github.com/o/r/blob/{ref}",
+            "https://github.com/o/r/blob/{ref}/{path}/{other}",
+            "https://github.com/o/r/blob/{ref}/{path}#{ref[a]}",
+            "https://github.com/o/r/blob/{ref}/{path}?{ref.x}",
+        ):
+            with self.subTest(template=bad_template):
+                text = "\n".join(
+                    audit_report.render_finding(
+                        finding, file_url=bad_template, file_ref=self.SHA
+                    )
+                )
+                self.assertIn(
+                    f"- **Remediation (manifest):** [`{self.PATH}`]({self.PATH}) — n",
+                    text,
+                )
+
+    def test_generated_and_newly_written_manifests_keep_bare_path_link(self):
+        generated = make_finding(
+            remediation={
+                "kind": "manifest",
+                "path": "clusters/prod/payments/checkout-pdb.yaml",
+                "note": f"{audit_report.GENERATED_FIX_NOTE} Written.",
+            }
+        )
+        text = "\n".join(
+            audit_report.render_finding(
+                generated, file_url=self.GITHUB_TEMPLATE, file_ref=self.SHA
+            )
+        )
+        self.assertIn(
+            "[`clusters/prod/payments/checkout-pdb.yaml`](clusters/prod/payments/checkout-pdb.yaml)",
+            text,
+        )
+
+        # A candidate whose collector entry has no existing declaration at the
+        # remediation path is also kept as a bare path in `render_issue_body`.
+        new_file = make_finding(
+            obj="Namespace/payments",
+            remediation={"kind": "manifest", "path": self.PATH, "note": "new"},
+        )
+        manifest = {
+            "audit": AUDIT,
+            "clusters": [
+                {
+                    "name": "prod-us-east",
+                    "candidates": [
+                        {
+                            "check": "netpol-missing",
+                            "namespace": "payments",
+                            "object": "Namespace/payments",
+                            "declaration": None,
+                        }
+                    ],
+                }
+            ],
+        }
+        unlinked = audit_report._unlinked_manifest_paths(
+            [new_file], manifest, {}, None
+        )
+        self.assertIn(self.PATH, unlinked)
+        body = audit_report.render_issue_body(
+            make_doc(findings=[new_file]),
+            generated_at=NOW,
+            file_url=self.GITHUB_TEMPLATE,
+            file_ref=self.SHA,
+            unlinked_paths=unlinked,
+        ).body
+        self.assertIn(f"[`{self.PATH}`]({self.PATH})", body)
+
+    def test_select_rendered_findings_charges_the_expanded_url_against_the_budget(self):
+        findings = [
+            make_finding(
+                fid=f"netpol-missing.prod-us-east.payments.namespace-p{i}",
+                cluster=f"cluster-{i:02d}",
+                obj=f"Namespace/p{i}",
+            )
+            for i in range(25)
+        ]
+        bare_rendered, _ = audit_report.select_rendered_findings(findings, 8000)
+        expanded_rendered, _ = audit_report.select_rendered_findings(
+            findings,
+            8000,
+            file_url=self.GITHUB_TEMPLATE,
+            file_ref=self.SHA,
+        )
+        self.assertLess(len(expanded_rendered), len(bare_rendered))
+
+    def test_finish_reads_capabilities_once_and_fills_links_including_relink(self):
+        self.touch(self.PATH)
+        self.harness.replies = {
+            "capabilities": {
+                "fileUrl": "https://github.com/acme/fleet/blob/{ref}/{path}"
+            },
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/42"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+            "proposal-list": {
+                "proposals": [
+                    {
+                        "number": 8,
+                        "title": "fix",
+                        "url": "https://github.com/acme/fleet/pull/8",
+                        "state": "OPEN",
+                        "headRefName": "platform-agent/fix-compliance-audit-payments-netpol-12756a4288",
+                        "body": '<!-- audit-findings: ["netpol-missing.prod-us-east.payments.namespace-payments"] -->\n<!-- audit-id-scheme: 6 -->',
+                        "labels": ["agent:audit", "audit:compliance-audit"],
+                    }
+                ],
+                "count": 1,
+                "truncated": False,
+            },
+        }
+        doc = make_doc()
+        doc["declared_intent_searched"] = [f"acme/fleet@{self.SHA}"]
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("capabilities")), 1)
+        expected_link = (
+            f"[`{self.PATH}`](https://github.com/acme/fleet/blob/{self.SHA}/{self.PATH})"
+        )
+        created_body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(expected_link, created_body)
+        relinked_body = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn(expected_link, relinked_body)
+
+    def test_finish_falls_back_to_rev_parse_head_and_bare_path_when_capabilities_omits_file_url(self):
+        self.touch(self.PATH)
+        self.harness.replies = {
+            "capabilities": {
+                "fileUrl": "https://gitlab.example.com/group/fleet/-/blob/{ref}/{path}"
+            },
+            "rev-parse HEAD": f"{self.SHA}\n",
+            "issue-create": created("issue", "https://gitlab.example.com/group/fleet/-/issues/42"),
+        }
+        doc = make_doc(findings=[make_finding(check="privileged-container", obj="Pod/root")])
+        doc.pop("declared_intent_searched", None)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        created_body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(
+            f"[`{self.PATH}`](https://gitlab.example.com/group/fleet/-/blob/{self.SHA}/{self.PATH})",
+            created_body,
+        )
+
+        # When `capabilities` omits `fileUrl`, the bare path link stands.
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        self.harness.replies = {
+            "capabilities": {},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/43"),
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        fallback_body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(f"[`{self.PATH}`]({self.PATH})", fallback_body)
+
+    def test_harness_sha_outranks_model_declared_sha_and_settled_pr_is_not_reported_refreshed(self):
+        record_sha = "b" * 40
+        probe_sha = "c" * 40
+        model_sha = "d" * 40
+        data = {"declared_intent_searched": [f"acme/fleet@{model_sha}"]}
+        record = {"searched": [f"acme/fleet@{record_sha}"]}
+        probe = audit_report._RepositoryProbe("acme/fleet", Path("/tmp"))
+        probe._workspace = type("W", (), {"base_sha": probe_sha})()
+        self.assertEqual(
+            audit_report._repo_file_ref("acme/fleet", None, data, record, probe),
+            record_sha,
+        )
+        self.assertEqual(
+            audit_report._repo_file_ref("acme/fleet", None, data, None, probe),
+            probe_sha,
+        )
+        # An unopened probe never opens a broker workspace just to read `base_sha`.
+        unopened = audit_report._RepositoryProbe("acme/fleet", Path("/tmp"))
+        self.assertEqual(
+            audit_report._repo_file_ref("acme/fleet", None, data, None, unopened),
+            model_sha,
+        )
+        self.assertEqual(unopened._attempts, 0)
+
+        # If a promoted `/remediate` over a settled PR fails to open a replacement
+        # PR, `_remediation_outcomes` must not report the settled PR as refreshed.
+        requests = audit_report.RemediateRequests(["b"], [], {})
+        plan = audit_report.PromotionPlan(promote=["b"], withheld=[], already_open=[])
+        for state in ("MERGED", "CLOSED"):
+            out = audit_report._remediation_outcomes(
+                requests,
+                plan,
+                {"b": {"url": "https://github.com/acme/fleet/pull/5", "state": state}},
+                [],
+            )
+            self.assertIn("no pull request was opened", out["b"])
+            self.assertNotIn("refreshed", out["b"])
 
 
 if __name__ == "__main__":

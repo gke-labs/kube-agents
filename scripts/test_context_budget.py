@@ -36,7 +36,7 @@ def run_main() -> tuple[int, str]:
 
 
 class IsImportTest(unittest.TestCase):
-    """`is_import` -- what gets excluded from the char count."""
+    """`is_import` -- what gets excluded from the byte count."""
 
     def test_bare_import_directive(self):
         self.assertTrue(check_context_budget.is_import("@AGENTS.md\n"))
@@ -116,6 +116,33 @@ class LoadedSizeTest(unittest.TestCase):
             (root / "b.md").write_text("@a.md\nB\n", encoding="utf-8")
             self.assertEqual(check_context_budget.loaded_size(root / "a.md"), len("A\nB\n"))
 
+    def test_multibyte_utf8_is_charged_in_bytes(self):
+        # Antigravity's 24,000-byte per-file rule cap truncates on UTF-8 byte
+        # count, not character count, so `—` (3 bytes) and `🔴` (4 bytes) must
+        # be charged their UTF-8 byte length rather than 1 char each.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "AGENTS.md"
+            text = "— → 🔴\n"
+            path.write_text(text, encoding="utf-8")
+            self.assertEqual(
+                check_context_budget.loaded_size(path),
+                len(text.encode("utf-8")),
+            )
+            self.assertGreater(
+                check_context_budget.loaded_size(path),
+                len(text),
+            )
+
+    def test_crlf_line_endings_are_charged_two_bytes_per_newline(self):
+        # `Path.read_text` translates `\r\n` to `\n` before encoding, under-counting
+        # CRLF files on Windows checkouts by 1 byte per line; `loaded_size` must
+        # measure exact bytes on disk.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "AGENTS.md"
+            raw = b"line one\r\nline two\r\n"
+            path.write_bytes(raw)
+            self.assertEqual(check_context_budget.loaded_size(path), len(raw))
+
 
 class MeasureTest(unittest.TestCase):
     """`measure` -- the roots share one `seen` set, so nothing is double-charged."""
@@ -135,13 +162,36 @@ class MeasureTest(unittest.TestCase):
 class RealFilesTest(unittest.TestCase):
     """The repository's own files are inside the budget."""
 
+    def test_budget_does_not_exceed_rule_file_byte_cap(self):
+        self.assertLessEqual(
+            check_context_budget.BUDGET,
+            check_context_budget.RULE_FILE_BYTE_CAP,
+            f"BUDGET ({check_context_budget.BUDGET}) must not exceed "
+            f"RULE_FILE_BYTE_CAP ({check_context_budget.RULE_FILE_BYTE_CAP}): "
+            "Antigravity silently truncates any rule file above that limit",
+        )
+
+    def test_each_rule_file_within_byte_cap(self):
+        rules_dir = check_context_budget.REPO / check_context_budget.RULES_DIR
+        rule_files = sorted(rules_dir.glob(check_context_budget.RULE_GLOB))
+        self.assertTrue(rule_files, f"no rule files found in {rules_dir}")
+        for rule in rule_files:
+            with self.subTest(rule=rule.name):
+                size = check_context_budget.loaded_size(rule)
+                self.assertLessEqual(
+                    size,
+                    check_context_budget.RULE_FILE_BYTE_CAP,
+                    f"{rule.relative_to(check_context_budget.REPO)} is {size} bytes, "
+                    f"exceeding RULE_FILE_BYTE_CAP ({check_context_budget.RULE_FILE_BYTE_CAP})",
+                )
+
     def test_within_budget(self):
         total = sum(check_context_budget.measure().values())
         self.assertLessEqual(
             total,
             check_context_budget.BUDGET,
-            f"{total} chars across {check_context_budget.FILES} exceeds the "
-            f"{check_context_budget.BUDGET}-char budget; see the module docstring "
+            f"{total} bytes across {check_context_budget.FILES} exceeds the "
+            f"{check_context_budget.BUDGET}-byte budget; see the module docstring "
             "in check_context_budget.py for what to do about it",
         )
 
@@ -165,8 +215,10 @@ class FailurePathTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FAIL", output)
         # The remedy is in the message, not just the number: a gate that says
-        # only "too big" gets answered by deleting a rule.
+        # only "too big" gets answered by deleting a rule or raising BUDGET past
+        # Antigravity's per-file truncation cap.
         self.assertIn("docs/pull-request-workflow.md", output)
+        self.assertIn(f"{check_context_budget.RULE_FILE_BYTE_CAP:,} bytes", output)
 
     def test_small_overage_is_not_reported_as_zero(self):
         real = sum(check_context_budget.measure().values())

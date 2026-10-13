@@ -74,7 +74,7 @@ fi
 #
 # render_install_env.sh makes this check for the reconcile path, under
 # --strict. This is the same guarantee for the rebuild path, and the two have
-# to agree: deploy-environment.yml offers `autopush` and `staging` in its
+# to agree: deploy-environment.yml offers the long-lived environments in its
 # dropdown, so without it the escape hatch you reach for when a reconcile
 # cannot converge is also the one route into these environments that does not
 # ask about the allowlist.
@@ -182,8 +182,8 @@ fi
 # clears of the variable. `next` is applied after the install, at the bottom.
 platform_agent_mode_resolve || exit 1
 # And `next` only on the ephemeral environments; the helper says why.
-# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush and staging,
-# read with the same truthiness as the allowlist guard above.
+# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush, autopush-next and
+# staging, read with the same truthiness as the allowlist guard above.
 if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
   platform_agent_mode_refuse_long_lived true "${GKE_CLUSTER_NAME:-}" || exit 1
 fi
@@ -381,15 +381,14 @@ fi
 echo "==> Provisioning the environment at the candidate commit via canonical install.sh..."
 ./install.sh "${INSTALL_ARGS[@]}"
 
-# spec.mode: next, set on the CR the install just created, then the gate that
-# waits for what the operator renders for it. install.sh on this tree takes no
-# mode, so the switch is the same merge patch the next-mode dev clusters were
-# installed with. The install's --mode flag (#2524) replaces the patch once it
-# merges: that installer takes PLATFORM_AGENT_MODE from the environment this
-# script leaves it exported in under `next` (only rc and nightly get here
-# with it; the long-lived environments are refused above), so the
-# platform_agent_mode_patch_next call below is then the one line to delete
-# (with this paragraph's patch sentences). The wait stays either way.
+# spec.mode: next, then the gate that waits for what the operator renders for
+# it. install.sh reads PLATFORM_AGENT_MODE from the environment this script
+# leaves it exported in under `next` (only rc and nightly get here with it;
+# the long-lived environments are refused above), so the install already
+# renders spec.mode: next and the merge patch below applies a value the CR
+# already holds. The patch is redundant and stays only because removing it
+# moves the tests that pin it; that removal is its own change. The wait
+# stays either way.
 #
 # install.sh has already pointed kubectl at the cluster and checked the
 # context; the context is still named on each call, so nothing here can reach

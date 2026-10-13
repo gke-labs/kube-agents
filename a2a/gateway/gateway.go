@@ -28,6 +28,14 @@ const sessionProfile = "chat"
 // surface that carries every message without a mention.
 const sessionKindDM = "dm"
 
+// topLevelNothingRunningNotice answers a "stop" or a status question typed
+// in a message the adapter marked TopLevel: one that roots a conversation of
+// its own (a top-level Slack DM), so nothing is running in it and the task
+// the user means is in another thread. The notice says where to send it. A
+// thread with nothing running, a question refused at the session cap among
+// them, gets the plain reply: the user is already in the right place.
+const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
+
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
 // one leaves the route, and the user needs to hear which did not happen.
@@ -175,6 +183,14 @@ type Gateway struct {
 	// notice from since it started, under mu: the relay's evidence that the
 	// executor answers follow-ups at all (postSteerShortfall).
 	steerNoticesFrom map[string]bool
+	// steersRefusedBy is each addressee whose newest steer notice to this
+	// gateway was a no-resume refusal - an executor that cannot continue a
+	// session, the bridge's cli executor - under mu, and cleared by a
+	// queued notice from it. routeTurn gives such an addressee the wide
+	// status matcher (isStatusQuery says why). The gateway cannot see the
+	// executor, so the first follow-up to one is acknowledged and refused
+	// before this is learned.
+	steersRefusedBy map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
 	// message that names none is attributed to. Since the mux and the side
@@ -418,6 +434,7 @@ func New(o Options) (*Gateway, error) {
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
 		steerNoticesFrom: map[string]bool{},
+		steersRefusedBy:  map[string]bool{},
 		backend:          backend,
 		injectPM:         injectPM,
 		injectAudience:   injectAudience,
@@ -785,6 +802,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	g.healActiveTask(ctx, rec)
 
 	active := rec.ActiveTask
+	// The status matcher's wide rule only where a stolen steer costs
+	// nothing: a running task whose executor refuses follow-ups
+	// (steersRefusedBy). A detached task gets the exact phrases: after a
+	// stop, the wide reading of "any update on the rollout" would steal a
+	// NEW task to replay a dead one.
+	wideStatus := active != nil && !active.Detached && g.refusesFollowUps(rec.AddresseeFor(active.TaskID))
 	// A slash command resolves before everything else (architecture 02,
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
@@ -828,8 +851,14 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text):
+	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
+	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text, false):
+		// A status question that roots its own conversation has no task to
+		// report on and must not become one that reads "any update?".
+		// isStatusQuery is a phrase set (text.go), so a real question such
+		// as "how is the deploy doing" still starts a task.
+		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -841,9 +870,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// task that literally reads "stop": the impatient second "stop"
 		// (cancel sent, terminal pending) and a bare "stop" with nothing
 		// running both land here, answered deterministically.
-		if active != nil {
+		switch {
+		case active != nil:
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
-		} else {
+		case msg.TopLevel:
+			g.post(rec.Key, topLevelNothingRunningNotice)
+		default:
 			g.post(rec.Key, "🤷 nothing is running")
 		}
 	case active != nil && !active.Detached:
@@ -1561,6 +1593,13 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
 	if off {
+		// A top-level message in a Slack DM roots a conversation of its own,
+		// so a top-level /session off cannot reach the thread the user routed.
+		// Say where it goes instead of answering for the fresh conversation.
+		if msg.TopLevel && !rec.SessionRouted {
+			g.post(rec.Key, topLevelSessionOffNotice)
+			return true
+		}
 		if !rec.SessionRouted {
 			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
 			return true
@@ -1628,14 +1667,24 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	return true
 }
 
+// topLevelSessionOffNotice answers a /session off typed at the top of a
+// Slack DM, where it roots a fresh conversation rather than reaching the
+// thread whose session the user means.
+const topLevelSessionOffNotice = "ℹ️ `/session off` acts on the thread it's typed in — reply `/session off` in that question's thread"
+
 // sessionOnAck is the reply to a bare /session. It promises what the backend
 // will deliver: the Slack adapter forwards an unmentioned channel-thread
 // reply only once the gateway has started a task in that thread, and a
 // /session binding starts none, so in a Slack channel the next message needs
-// the mention. DMs carry every message; the other backends route the next
+// the mention. A Slack DM carries every message, but each top-level DM is a
+// conversation of its own, so the binding holds only for replies in the
+// thread the /session was typed in. The other backends route the next
 // message on their own rules.
 func sessionOnAck(backend, kind, defaultAddressee string) string {
-	if backend == slackBackend && kind != sessionKindDM {
+	if backend == slackBackend && kind == sessionKindDM {
+		return "🧵 session route on — reply in this thread to open a session pod; `/session off` returns to `" + defaultAddressee + "`"
+	}
+	if backend == slackBackend {
 		return "🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); `/session off` returns to `" + defaultAddressee + "`"
 	}
 	return "🧵 session route on — your next message opens a session pod; `/session off` returns to `" + defaultAddressee + "`"

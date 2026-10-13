@@ -182,8 +182,41 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 	}
 }
 
-// TestAfterAStopANonExactStatusAskIsANewTask: the status matcher is the exact
-// phrase set everywhere, so after a stop a status-shaped but
+// The wide matcher an addressee that refuses follow-ups earns (gh#2723
+// items 5 and 16) stays off for a detached task: after a stop, "any update
+// on the rollout" is a NEW task even on such an addressee, never a replay
+// of the dead one.
+func TestAfterAStopTheWideMatcherStaysOffForANoResumeAddressee(t *testing.T) {
+	r := startRig(t)
+	r.g.mu.Lock()
+	r.g.steersRefusedBy["platform"] = true
+	r.g.mu.Unlock()
+	conv := "discord:g1/thread-detachwide-noresume"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dn-1", Text: "run the audit"}
+	r.awaitTask(t, "platform")
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dn-2", Text: "stop"}
+	waitFor(t, "task detached", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dn-3", Text: "any update on the rollout"}
+	waitFor(t, "new task started", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && len(rec.Tasks) == 2 &&
+			rec.ActiveTask != nil && rec.ActiveTask.Ask == "any update on the rollout"
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🔎 task") {
+			t.Fatalf("a detached task's status was replayed: %q", p)
+		}
+	}
+}
+
+// TestAfterAStopANonExactStatusAskIsANewTask: a detached task gets the exact
+// phrase set only, so after a stop a status-shaped but
 // non-exact ask is a NEW task, not a replay of the dead one — while the
 // exact phrases still answer status.
 func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
@@ -209,7 +242,10 @@ func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
 }
 
 // On the fixed route an interrogative that is not an exact phrase is a
-// steer, published to the running task, not answered by replay.
+// steer, published to the running task, not answered by replay, while the
+// addressee has sent no no-resume refusal (steersRefusedBy; the wide rule
+// for an executor that refuses follow-ups is
+// TestNoResumeAddresseeGetsTheWideStatusMatcher).
 func TestFixedRouteWideAskIsASteer(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-wide"
