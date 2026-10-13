@@ -8,11 +8,14 @@ network in it: what the adapter does with a deliverable on an install where
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
+import urllib.error
 from pathlib import Path
 
 
@@ -529,6 +532,224 @@ class InlineFallbackTest(unittest.TestCase):
 
         self.assertEqual(len(adapter.sent), 1, "no report follows a refused caption")
         self.assertEqual(len(adapter.fallback_calls), 1)
+
+
+class StandaloneSenderTest(unittest.TestCase):
+    """The relay-backed standalone_sender_fn installed on the google_chat entry.
+
+    Covers the gap in #741: the relay patch never wired standalone_sender_fn,
+    so cron and k8s-event-watcher sends bypassed the credential proxy.
+    """
+
+    def setUp(self):
+        self.saved = _install_gateway_stub()
+        self.addCleanup(self._restore)
+        os.environ["GOOGLE_CHAT_RELAY_URL"] = "http://127.0.0.1:1"
+        self.addCleanup(os.environ.pop, "GOOGLE_CHAT_RELAY_URL", None)
+        # Remove any direct credential so relay path is exercised by default.
+        os.environ.pop("GOOGLE_CHAT_SERVICE_ACCOUNT_JSON", None)
+        sys.modules.pop("google_chat_relay_patch", None)
+
+        # Give PlatformRegistry a register() method and the two entry maps the
+        # patch's pre-registration sweep reads, so install() can hook it.
+        registry_class = sys.modules["gateway.platform_registry"].PlatformRegistry
+        registry_class._entries = {}
+        registry_class._scoped_entries = {}
+
+        def _register(self_inner: object, entry: object, *args: object, **kwargs: object) -> None:
+            registry_class._entries[getattr(entry, "name", None)] = entry
+
+        registry_class.register = _register
+
+        import google_chat_relay_patch
+
+        self.patch = google_chat_relay_patch
+
+    def _restore(self) -> None:
+        for name, module in self.saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def _entry(self, name: str = "google_chat") -> object:
+        class FakeEntry:
+            pass
+
+        entry = FakeEntry()
+        entry.name = name  # type: ignore[attr-defined]
+
+        async def _standalone(pconfig: object, chat_id: object, message: object, *, thread_id: object = None, **kwargs: object) -> dict:
+            return {"success": True, "original": True}
+
+        entry.standalone_sender_fn = _standalone  # type: ignore[attr-defined]
+        return entry
+
+    def _registry(self) -> object:
+        return sys.modules["gateway.platform_registry"].PlatformRegistry
+
+    def _send(self, entry: object, chat_id: str, message: str, *, thread_id: object = None) -> dict:
+        return asyncio.run(
+            entry.standalone_sender_fn(None, chat_id, message, thread_id=thread_id)  # type: ignore[attr-defined]
+        )
+
+    def _fake_relay_response(self, body: dict) -> object:
+        content = json.dumps(body).encode()
+
+        class _Resp:
+            def __enter__(self) -> object:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+            def read(self) -> bytes:
+                return content
+
+        return _Resp()
+
+    # -- Registration hook ---------------------------------------------------
+
+    def test_install_swaps_standalone_sender_on_register(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        self.assertTrue(
+            getattr(entry.standalone_sender_fn, "_credential_proxy_relay_patched", False),  # type: ignore[attr-defined]
+            "google_chat entry's standalone_sender_fn must be relay-patched",
+        )
+
+    def test_non_gchat_entry_is_not_swapped(self) -> None:
+        self.patch.install()
+        entry = self._entry(name="discord")
+        original = entry.standalone_sender_fn  # type: ignore[attr-defined]
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        self.assertIs(entry.standalone_sender_fn, original)  # type: ignore[attr-defined]
+
+    def test_second_install_does_not_double_wrap(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+        first_sender = entry.standalone_sender_fn  # type: ignore[attr-defined]
+
+        self.patch.install()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        self.assertIs(entry.standalone_sender_fn, first_sender)  # type: ignore[attr-defined]
+
+    # -- Relay send ----------------------------------------------------------
+
+    def test_relay_sender_posts_to_relay(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        calls: list[dict] = []
+        resp = self._fake_relay_response({"response": {"name": "spaces/X/messages/m1"}})
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            calls.append(json.loads(req.data))  # type: ignore[attr-defined]
+            return resp
+
+        with unittest.mock.patch("urllib.request.urlopen", fake_urlopen):
+            result = self._send(entry, "spaces/X", "hello world")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["parent"], "spaces/X")
+        self.assertEqual(calls[0]["arguments"]["body"]["text"], "hello world")
+        self.assertNotIn("thread", calls[0]["arguments"]["body"])
+
+    def test_relay_sender_threads_a_reply(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        calls: list[dict] = []
+        resp = self._fake_relay_response(
+            {"response": {"name": "spaces/X/messages/m2", "thread": {"name": "spaces/X/threads/T"}}}
+        )
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            calls.append(json.loads(req.data))  # type: ignore[attr-defined]
+            return resp
+
+        with unittest.mock.patch("urllib.request.urlopen", fake_urlopen):
+            result = self._send(
+                entry, "spaces/X", "reply text", thread_id="spaces/X/threads/T"
+            )
+
+        self.assertTrue(result["success"])
+        args = calls[0]["arguments"]
+        self.assertEqual(args["body"]["thread"]["name"], "spaces/X/threads/T")
+        self.assertEqual(args["messageReplyOption"], self.patch.GCHAT_REPLY_FALLBACK_OPTION)
+
+    def test_relay_sender_returns_thread_id_from_response(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        resp = self._fake_relay_response(
+            {"response": {"name": "spaces/X/messages/m3", "thread": {"name": "spaces/X/threads/T2"}}}
+        )
+
+        with unittest.mock.patch("urllib.request.urlopen", return_value=resp):
+            result = self._send(entry, "spaces/X", "msg")
+
+        self.assertEqual(result["thread_id"], "spaces/X/threads/T2")
+        self.assertEqual(result["message_id"], "spaces/X/messages/m3")
+
+    def test_relay_sender_falls_back_when_env_credential_present(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        os.environ["GOOGLE_CHAT_SERVICE_ACCOUNT_JSON"] = '{"type":"service_account"}'
+        self.addCleanup(os.environ.pop, "GOOGLE_CHAT_SERVICE_ACCOUNT_JSON", None)
+
+        result = self._send(entry, "spaces/X", "hello")
+        self.assertTrue(result.get("original"))
+
+    def test_relay_sender_falls_back_when_pconfig_has_credential(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        class _PConfig:
+            extra = {"service_account_json": '{"type":"service_account"}'}
+
+        result = asyncio.run(
+            entry.standalone_sender_fn(_PConfig(), "spaces/X", "hi")  # type: ignore[attr-defined]
+        )
+        self.assertTrue(result.get("original"))
+
+    def test_relay_sender_returns_error_on_relay_failure(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            raise urllib.error.URLError("connection refused")
+
+        with unittest.mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertLogs("google-chat-relay-patch", level="WARNING"):
+                result = self._send(entry, "spaces/X", "hello")
+
+        self.assertFalse(result["success"])
+        self.assertIn("error", result)
+
+    def test_relay_sender_skips_empty_message(self) -> None:
+        self.patch.install()
+        entry = self._entry()
+        self._registry()().register(entry)  # type: ignore[operator]
+
+        with self.assertLogs("google-chat-relay-patch", level="INFO"):
+            result = self._send(entry, "spaces/X", "   ")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result.get("skipped"), "empty_text")
 
 
 if __name__ == "__main__":
