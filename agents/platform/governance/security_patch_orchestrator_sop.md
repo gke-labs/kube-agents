@@ -275,7 +275,7 @@ each is waiting for whoever schedules it.
 - **Unevaluated:** a behind cluster the reporter could not grade — its objects could not be
   read, the reporter failed for that cluster or ran out of its four-minute budget, or it graded
   `blocked` for a cause this check does not know — and a cluster 3.1 or 3.2 never judged, carry
-  `upgrade-blocked` in the entry's `checks_unevaluated` with the reason. A `blocked` grade whose
+  `upgrade-blocked` in the entry's `checks_unevaluated` with the reason. An `unknown` the reporter owes to a maintenance exclusion it could not decide is not one of these: the exclusion is 3.8's subject, the budget read answered and the ceiling was graded, so the check ran clean, in `commands`, as on a block resting on an exclusion alone. A `blocked` grade whose
   cause is node-pool skew is a finding even when the budget read failed beside it, when the
   ceiling can block the upgrade due (a behind control plane, or a pool ahead of it): the skew is
   definite. On a cluster whose only lag is a pool behind its control plane the ceiling blocks

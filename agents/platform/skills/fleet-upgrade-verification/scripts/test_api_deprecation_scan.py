@@ -472,6 +472,10 @@ class MainTest(unittest.TestCase):
             rc, out, err = self.run_main(["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")])
             self.assertEqual(rc, scan.EXIT_USAGE)
             self.assertIn("narrowed by --cluster to us-central1/old", err)
+            # The remedy is the one change that works: the two flags together
+            # are refused before the file is opened.
+            self.assertIn("replace --versions with --current-version <version>", err)
+            self.assertNotIn("or pass --current-version", err)
             self.assertNotIn("API deprecation scan", out)
             # A full run's file carries the key as null and is read as before.
             versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": None}))

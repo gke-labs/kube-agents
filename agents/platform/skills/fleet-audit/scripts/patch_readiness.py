@@ -1847,6 +1847,20 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         # pool-ahead lag on a static cluster never reaches the reporter: the
         # gate in `collect_upgrade_blocked` declares it first.
         no_target = not (member or {}).get("target_version") and (member or {}).get("channel") in NO_CHANNEL_SPELLINGS
+        # What this check reads is the budget read and the skew ceiling, on
+        # the lag they apply to. The reporter's summary `status` also folds in
+        # a maintenance exclusion it could not decide, which is 3.8's subject
+        # and moves this check in neither direction (a block resting on an
+        # exclusion alone is the check running clean), so "graded" is read
+        # from the row's own fields and never from the status: the budget
+        # read answered (`read_error` empty) and, where the ceiling applies,
+        # the target was known and every pool's skew was graded
+        # (`skew.unknown` empty). An `unknown` resting on an undecided
+        # exclusion alone is then the check running clean, in `commands`. A
+        # budget block is definite whatever the ceiling grading did, as a
+        # skew block is whatever the budget read did: blocked beats unknown.
+        ceiling_ungraded = due.skew_applies and (not (member or {}).get("target_version") or bool((readiness.get("skew") or {}).get("unknown")))
+        budget_blocked = due.budget_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("pdbs") or {}).get("blocking"))
         why = None
         if not members:
             why = no_report
@@ -1863,7 +1877,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # declared and run as budgets come and go, and last week's
             # finding retires only against a clean read this week.
             pass
-        elif not skew_blocked and (readiness.get("read_error") or readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY)):
+        elif not skew_blocked and not budget_blocked and (readiness.get("read_error") or ceiling_ungraded):
             # The reporter's own notes say why a row is `unknown`: the grade's
             # note (no target, so skew and exclusion scope ungraded) and the
             # row's (why there is no target: no channel, or a get-server-config

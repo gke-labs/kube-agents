@@ -2815,10 +2815,61 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn("not in the shape", reasons[0])
 
     def test_an_unknown_row_carries_the_reporters_note(self):
+        # The row as the reporter writes it with no target: every pool's skew
+        # ungraded, so the ceiling, which applies on this lag, was not read.
         row = self.member("lag", status="unknown")
+        row["target_version"] = None
+        row["readiness"]["skew"]["unknown"] = ["default-pool"]
         row["readiness"]["note"] = "no target; exclusion scope and skew not graded"
         by = self.collect([cluster(name="lag", master=self.BEHIND)], [row])
         self.assertIn("no target; exclusion scope and skew not graded", self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK])
+
+    def test_an_unknown_that_rests_on_an_undecided_exclusion_alone_is_the_check_running_clean(self):
+        """`readiness_status` folds a maintenance exclusion the reporter could
+        not decide (an unparsable time, a scope it does not know) into
+        `unknown`. The exclusion is 3.8's subject and moves this check in
+        neither direction: the budget read answered and the ceiling was
+        graded, so the row is the check running clean, in `commands`, not a
+        limitation that holds the stream partial and keeps last week's finding
+        open. A budget block beside the same exclusion is still a candidate."""
+        c = cluster(name="lag", master=self.BEHIND)
+        row = self.member("lag", status="unknown")
+        row["readiness"]["maintenance"]["undecided_exclusions"] = ["freeze"]
+        row["readiness"]["note"] = "exclusion(s) not evaluated: freeze"
+        entry = self.collect([c], [row])["lag"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+        held = self.member("lag", status="blocked", pdbs=[self.BUDGET])
+        held["readiness"]["maintenance"]["undecided_exclusions"] = ["freeze"]
+        entry = self.collect([c], [held])["lag"]
+        self.assertEqual([x["severity"] for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.CRITICAL])
+
+    def test_a_pool_whose_skew_the_reporter_could_not_grade_is_a_gap_only_where_the_ceiling_applies(self):
+        """The sibling route into `unknown`: a pool whose skew the reporter could
+        not grade. Where the ceiling can block the upgrade due (a behind
+        control plane) a cause 3.11 reads was left ungraded, so the row is
+        unevaluated with the reporter's note; a budget block beside it is
+        still a candidate, blocked beating unknown; on a pool-only lag the
+        ceiling blocks nothing that is due, the budget read answered, and the
+        row is the check running clean."""
+        row = self.member("lag", status="unknown")
+        row["readiness"]["skew"]["unknown"] = ["odd-pool"]
+        row["readiness"]["note"] = "skew not graded for odd-pool"
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [row])["lag"]
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertIn("skew not graded for odd-pool", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+        held = self.member("lag", status="blocked", pdbs=[self.BUDGET])
+        held["readiness"]["skew"]["unknown"] = ["odd-pool"]
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [held])["lag"]
+        self.assertEqual([x["severity"] for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.CRITICAL])
+        pools = [pool("default-pool", "1.27.0-gke.1")]
+        row = self.member("skewed", status="unknown", gap=0)
+        row["readiness"]["skew"]["unknown"] = ["default-pool"]
+        entry = self.collect([cluster(name="skewed", master=self.CURRENT, node_pools=pools)], [row])["skewed"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
 
     def test_a_report_with_no_rows_names_the_reporters_own_error(self):
         def run(argv, **kwargs):

@@ -239,7 +239,8 @@ error (exit 2).
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
   enter into it. A file from a `--cluster` run (`narrowed_to` set) is refused: its floor is one
-  cluster's, not the fleet's; rerun the report without `--cluster`, or pass `--current-version`.
+  cluster's, not the fleet's; rerun the report without `--cluster`, or replace `--versions` with
+  `--current-version <version>` (the two flags together are refused before the file is read).
   `--current-version <version>` replaces the file when there is none.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
 - Without `--repo` the script scans every repository under `managed_repos`, on every forge, the

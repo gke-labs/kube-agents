@@ -172,7 +172,9 @@ EXIT_USAGE = 2
 # its lowest control-plane minor is one cluster's, not the fleet's, and a floor
 # read from it drops every removal the clusters it left out still serve.
 REPORT_NARROWED_KEY = "narrowed_to"
-NARROWED_VERSIONS_FORMAT = "--versions {path}: the report was narrowed by --cluster to {specs}, so its floor is one cluster's and not the fleet's; rerun fleet_upgrade_report.py without --cluster, or pass --current-version"
+# The remedy names the one change that works: `--current-version` beside
+# `--versions` is refused before the file is opened, so the flag replaces it.
+NARROWED_VERSIONS_FORMAT = "--versions {path}: the report was narrowed by --cluster to {specs}, so its floor is one cluster's and not the fleet's; rerun fleet_upgrade_report.py without --cluster, or replace --versions with --current-version <version>"
 
 
 Version = tuple[int, int]
