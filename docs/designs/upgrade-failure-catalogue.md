@@ -658,8 +658,8 @@ misreads its limit.
 A new version can change how NetworkPolicy is enforced, which DNS serves the cluster, or how a
 specific flow is handled.
 
-- Before: dataplane and DNS provider, policy count, the known issues for the target version.
-- Where to look: the GKE API for the dataplane and DNS provider; the Kubernetes API for the policy count; the target version's known-issue notes.
+- Before: dataplane and DNS provider, whether the cluster enforces NetworkPolicy today (`networkPolicy.enabled`, or Dataplane V2, which always enforces), the policies present where nothing enforces them, the known issues for the target version.
+- Where to look: the GKE API for the dataplane, the DNS provider and the enforcement setting; the Kubernetes API for the NetworkPolicy objects per namespace; the target version's known-issue notes.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
 - Mitigate before: rehearse the target version on a staging cluster with the same dataplane, and keep NetworkPolicy explicit rather than relying on defaults.
 - Mitigate after: a completed node pool can be downgraded in place to the previous version while GKE still offers it; the control plane cannot go back.
