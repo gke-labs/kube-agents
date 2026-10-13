@@ -760,6 +760,24 @@ Mutation(
         "keep the step but discard its exit code, so a lock mismatch reports green",
     ),
     Mutation(
+        "C4-skills-check-blank-line-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a blank line inside the step, valid YAML that GitHub honours, "
+        "which a reader that stops at the first blank line would miss",
+    ),
+    Mutation(
+        "C4-skills-check-comment-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n      # note\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a comment at the step's own indent; YAML still reads it as a "
+        "key of the step",
+    ),
+    Mutation(
         "C4-skills-check-skips-lock",
         "scripts/skill_overlay.py",
         ("            require_mirrored(skill)\n            verify_copy(skill)\n",

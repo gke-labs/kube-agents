@@ -249,7 +249,7 @@ second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: a
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
 project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
-Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
+Pub/Sub topic and subscription that carry the project's, and each scoped project's, GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it
 means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. Only the run
 that creates `install.env` records the flag it was passed; over a file that is already
@@ -260,7 +260,7 @@ an exported `ENABLE_DRIFT_DETECTOR=false` is just as unrecorded and currently wa
 nothing, so the file is the only opt-out that survives the shell it was typed in.
 Setting it to `false` is still the one boolean `write_tfvars_from_state` omits rather than
 writing, so an install carrying a `TF_VAR_enable_drift_pubsub=true` line keeps its ingress
-and only loses the detector — a written `false` would outrank that line and take the sink,
+and only loses the detector — a written `false` would outrank that line and take the sinks,
 topic and subscription with it, up to 31 days of retained messages included.
 
 `MEMORY` is the only one of the keys above that the generator goes and asks the cluster
@@ -314,7 +314,7 @@ which used to replace the Secret and restart every pod holding it.
 
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
 `SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS`
-are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from
+are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install, and the drift ingress's list of projects to export, from
 the same value: the generator renders them as the composition's `scope` object, the IAM module binds
 the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
 folder and organisation named, and the read roles in every project a Shared VPC host or Metrics

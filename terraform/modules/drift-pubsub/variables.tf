@@ -19,6 +19,30 @@ variable "cluster_names" {
   default     = []
 }
 
+variable "source_projects" {
+  description = "Projects beyond project_id whose GKE admin-activity audit logs are exported into this topic as well: one Log Router sink per project, named sink_name with project_id appended, publishing as that project's own Logging service agent, which is granted roles/pubsub.publisher on the topic before the sink exists, as the host's is. The full-install composition passes the projects the install's declaration lists at plan time, scope.projects and the selectors' members (kube-agents-iam's scope_export_projects), less its drift_pubsub_source_exclude_projects. project_id itself is ignored here; its sink is the module's own. cluster_names does not narrow these sinks: it names bare cluster names in project_id, and a cluster of the same name elsewhere is another cluster. The identity applying this needs, in each project listed, resourcemanager.projects.get to read its number, the Service Usage call that mints its Logging service agent, and logging.sinks.create; roles/owner carries all three, and the identity that bound the scope's read roles there (an install's own setup) ordinarily does."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for project in var.source_projects : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))])
+    error_message = "source_projects holds GCP project IDs (^[a-z][a-z0-9-]{4,28}[a-z0-9]$); a legacy domain-scoped ID cannot be in an install's scope and is not accepted here."
+  }
+}
+
+variable "source_sink_writer_identity_overrides" {
+  description = "Per source project, keyed by its project ID, the principal to grant roles/pubsub.publisher on the topic instead of the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the module derives for it: what sink_writer_identity_override is for project_id, for the same dead end (a source sink reporting some other writer identity fails its postcondition on every later plan). Include the \"serviceAccount:\" prefix; an empty value means no override, and a key naming a project outside source_projects is ignored. As the host's override, a value also pins that project's grant against the replacement a plan that defers the module's project-number reads would otherwise make (the host grant's comment in main.tf). Leave empty unless an apply has told you to set one."
+  type        = map(string)
+  default     = {}
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for project, member in var.source_sink_writer_identity_overrides : member == "" || can(regex("^serviceAccount:.+@.+$", member))])
+    error_message = "every source_sink_writer_identity_overrides value carries the \"serviceAccount:\" prefix, as writer_identity does, or is empty to use the identity the module derives."
+  }
+}
+
 variable "exclude_machine_lease_heartbeats" {
   description = "Drop coordination.k8s.io Lease writes made by machine identities (system: principals and *.iam.gserviceaccount.com service accounts) at the sink. These are leader-election and node heartbeats, never GitOps-managed, and measured at ~96% of all mutating calls. Lease writes by human principals still pass through. Set false to export the unfiltered stream for debugging."
   type        = bool
@@ -55,7 +79,7 @@ variable "sink_name" {
 }
 
 variable "sink_drain_duration" {
-  description = "How long a destroy waits, after deleting the sink, before removing the topic and the sink's publish grant. Cloud Logging stops exporting some minutes after the sink is gone, and an export that lands in that gap mails every project owner a sink configuration error; the wait is a timer because Logging offers nothing to wait on. The 120s default is a chosen margin, not a measured convergence time: Google documents no bound, so lengthening it buys margin and shortening it trades destroy time for the chance of that email. Paid once per destroy and never on apply. A change to this takes effect only once an apply has recorded it: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, so raising it and going straight to a destroy waits the old value. Apply first, then destroy."
+  description = "How long a destroy waits, after deleting the sink, before removing the topic and the sink's publish grant, and how long a scope shrink waits between deleting a removed source project's sink and revoking its grant (each source project has a drain of its own, with this duration). Cloud Logging stops exporting some minutes after the sink is gone, and an export that lands in that gap mails every project owner a sink configuration error; the wait is a timer because Logging offers nothing to wait on. The 120s default is a chosen margin, not a measured convergence time: Google documents no bound, so lengthening it buys margin and shortening it trades destroy time for the chance of that email. Paid once per destroy and never on apply. A change to this takes effect only once an apply has recorded it: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, so raising it and going straight to a destroy waits the old value. Apply first, then destroy."
   type        = string
   default     = "120s"
 

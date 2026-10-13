@@ -299,7 +299,8 @@ when it was added on 2026-10-07, `A3-agent-answers-its-own-notify` (KILLED) and
 `A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
 they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
 `C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
-`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07;
+`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
+`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13;
 re-run the harness rather than trusting these numbers, which is the sentence this
 paragraph exists to make cheap.
 Note that the summary line the harness prints accounts for 113 of the 115: a
