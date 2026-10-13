@@ -1,0 +1,65 @@
+{
+  "name": "reactions-paused-card-gives-up",
+  "source": "deploy/docker/patches/test_slack_ux_reactions.py::DisplayTest.test_a_card_that_finishes_while_paused_takes_the_pause_off_with_the_arrival",
+  "notes": "A card that gives up while paused lifts the pause and the ask together and settles failed.",
+  "input": {
+    "events": [
+      {
+        "ask": "fix it"
+      },
+      {
+        "terminal": "completed",
+        "filed_cards": [
+          "t_a"
+        ]
+      },
+      {
+        "task_id": "t_a",
+        "kind": "blocked"
+      },
+      {
+        "task_id": "t_a",
+        "kind": "gave_up"
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "progress",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    {
+      "carrier": "terminal",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change",
+          "settle": "blocked"
+        }
+      }
+    },
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "settle": "failed"
+        }
+      }
+    }
+  ]
+}

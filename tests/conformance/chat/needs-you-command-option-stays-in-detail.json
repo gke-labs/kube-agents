@@ -1,0 +1,19 @@
+{
+  "name": "needs-you-command-option-stays-in-detail",
+  "source": "agents/platform/scripts/test_slack_moments.py::NeedsYouTest.test_no_buttons_keeps_the_options_in_the_text",
+  "notes": "A click on 'stop' would cancel the task, so the option cannot be a choice (chattext.IsCommand). As when an option is too long for a button, every option stays in the detail.",
+  "input": {
+    "reason": "Should I go on with the drain?\n- continue\n- stop"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Should I go on with the drain?",
+        "detail": "- continue\n- stop",
+        "tone": "attention"
+      }
+    }
+  ]
+}

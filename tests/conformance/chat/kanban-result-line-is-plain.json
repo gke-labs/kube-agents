@@ -1,0 +1,52 @@
+{
+  "name": "kanban-result-line-is-plain",
+  "source": "deploy/docker/patches/test_kanban_progress_lines.py::ResultLineTest",
+  "notes": "result_line: the completed event's summary, first line, markdown dropped, clipped as a note.",
+  "input": {
+    "rows": [
+      {
+        "task_id": "t_a",
+        "title": "check payments",
+        "lines": [
+          "reading pods"
+        ],
+        "status": "in_progress",
+        "note": "reading pods",
+        "steps": 1
+      }
+    ],
+    "events": [
+      {
+        "task_id": "t_a",
+        "kind": "completed",
+        "payload": {
+          "summary": "## **Both pods are up**"
+        }
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "check payments",
+          "items": [
+            {
+              "id": "t_a",
+              "title": "Both pods are up",
+              "status": "complete",
+              "steps": [
+                "reading pods"
+              ],
+              "stepCount": 1,
+              "result": "Both pods are up"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}
