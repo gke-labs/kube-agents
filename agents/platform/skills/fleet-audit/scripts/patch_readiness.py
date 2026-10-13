@@ -162,6 +162,11 @@ import fleet_scope_args  # noqa: E402
 
 # The scope this collector was handed, set by main from the two flags.
 declared_scope = fleet_scope_args.DeclaredScope()
+# What joins the values of those flags when this collector hands them on to
+# the readiness reporter: the comma `collector_args` uses
+# (fleet_scope_targets.collector_args); the parsers accept it among
+# fleet_scope_args.SCOPE_ARG_SEPARATORS.
+SCOPE_ARG_JOIN = ","
 
 # `--project` skips discovery, so a scoped run names no other project. Without
 # a row saying so the manifest reads as a fleet of one project, and `finish`
@@ -1508,6 +1513,31 @@ def _upgrade_blocked_hit(entry: dict, member: dict, report_path: str, due: Due) 
     }
 
 
+def _declared_scope_argv() -> list[str]:
+    """The install's declared scope, handed on to the reporter the way the
+    fleet_scope tool spells it (`collector_args`): `--scope-projects` with the
+    sweep comma-joined, then `--scope-unread` with each unread project as
+    `project=outcome`, when there are any. The reporter is a collector too:
+    on a sandbox whose operator says a scope is declared it refuses a bare
+    `--project` (`fleet_scope_args`), so a run that kept the flags to itself
+    would land every behind cluster's 3.11 in `checks_unevaluated`. Nothing
+    is handed on when no scope was handed to this collector: without a
+    declared scope the reporter reads the project as before, and on a scoped
+    sandbox that handed no flags this collector refused to run before any
+    reporter started."""
+    if not declared_scope.declared or declared_scope.args_missing:
+        return []
+    argv: list[str] = []
+    if declared_scope.projects:
+        argv += [fleet_scope_args.SCOPE_PROJECTS_FLAG, SCOPE_ARG_JOIN.join(declared_scope.projects)]
+    if declared_scope.unread:
+        argv += [
+            fleet_scope_args.SCOPE_UNREAD_FLAG,
+            SCOPE_ARG_JOIN.join(f"{project}{fleet_scope_args.SCOPE_UNREAD_OUTCOME_SEPARATOR}{outcome}" for project, outcome in declared_scope.unread),
+        ]
+    return argv
+
+
 def _read_last_run(state_dir: str, project: str) -> dict[str, str]:
     """When each of the project's clusters last had a reporter run started for
     it, by `<location>/<name>`; empty when there is no file or it cannot be read."""
@@ -1632,8 +1662,10 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             log(f"{project}/{entry['_bare_name']}: cannot clear {output} ({exc}); upgrade-blocked unavailable there")
             _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=output, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
             continue
+        # The scope flags sit between the project and the cluster, as the SOP's
+        # 3.11 Command bullet spells the invocation the `commands` entry records.
         argv = [
-            sys.executable, str(READINESS_REPORTER), "--project", project, "--cluster", spec,
+            sys.executable, str(READINESS_REPORTER), "--project", project, *_declared_scope_argv(), "--cluster", spec,
             "--readiness", "--output", output, "--state-dir", state_dir,
         ]
         result = run(argv, timeout=timeout)

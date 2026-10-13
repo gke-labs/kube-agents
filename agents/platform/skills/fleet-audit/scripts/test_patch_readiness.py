@@ -2363,6 +2363,55 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         self.assertIn("not in the shape", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
 
+    def test_a_declared_scope_is_forwarded_to_the_reporter_as_the_tool_spells_it(self):
+        """The reporter is a collector too: on a scoped install it refuses a
+        bare `--project` (`fleet_scope_args`), so the run hands on the
+        `collector_args` this collector was given, `--scope-projects` with the
+        sweep and `--scope-unread` with each unread project as
+        `project=outcome`, between `--project` and `--cluster`, and the
+        recorded command carries them."""
+        self.addCleanup(pr.declared_scope.set, None, None)
+        for scope_projects, scope_unread, forwarded in (
+            (
+                "acme,ops-mgmt",
+                "payments-staging=denied,declared-scope=unresolved",
+                ["--scope-projects", "acme,ops-mgmt", "--scope-unread", "payments-staging=denied,declared-scope=unresolved"],
+            ),
+            ("acme", None, ["--scope-projects", "acme"]),
+        ):
+            with self.subTest(scope_projects=scope_projects, scope_unread=scope_unread):
+                pr.declared_scope.set(scope_projects, scope_unread)
+                self.assertFalse(pr.declared_scope.args_missing)
+                by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
+                self.assertEqual(len(self.calls), 1)
+                argv = self.calls[0]
+                self.assertEqual(argv[argv.index("--project") : argv.index("--cluster") + 2], ["--project", "acme", *forwarded, "--cluster", "us-central1/lag"])
+                recorded = next(c for c in by["lag"]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
+                self.assertIn(" ".join(forwarded), recorded)
+                self.assertEqual([x["check"] for x in by["lag"]["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.UPGRADE_BLOCKED_CHECK])
+
+    def test_without_a_declared_scope_the_reporter_gets_a_bare_project(self):
+        """No scope handed to this collector, no scope flags handed on: the
+        reporter reads the project as before. The same on a scoped sandbox
+        that handed no flags at all (`args_missing`): this collector refused
+        to run before any reporter started, and the builder forwards nothing
+        it does not have."""
+        self.addCleanup(pr.declared_scope.set, None, None)
+        self.addCleanup(os.environ.pop, pr.fleet_scope_args.SCOPE_DECLARED_ENV, None)
+        for sandbox_says_declared in (False, True):
+            with self.subTest(sandbox_says_declared=sandbox_says_declared):
+                if sandbox_says_declared:
+                    os.environ[pr.fleet_scope_args.SCOPE_DECLARED_ENV] = pr.fleet_scope_args.SCOPE_DECLARED_TRUE
+                else:
+                    os.environ.pop(pr.fleet_scope_args.SCOPE_DECLARED_ENV, None)
+                pr.declared_scope.set(None, None)
+                self.assertEqual(pr.declared_scope.args_missing, sandbox_says_declared)
+                self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
+                argv = self.calls[0]
+                self.assertEqual(argv[argv.index("--project") : argv.index("--cluster") + 2], ["--project", "acme", "--cluster", "us-central1/lag"])
+                self.assertNotIn(pr.fleet_scope_args.SCOPE_PROJECTS_FLAG, argv)
+                self.assertNotIn(pr.fleet_scope_args.SCOPE_UNREAD_FLAG, argv)
+
     def test_a_malformed_row_costs_its_own_cluster_only(self):
         # One reporter run per behind cluster: a malformed row for one leaves
         # the other's declaration where the join put it (a static cluster on
