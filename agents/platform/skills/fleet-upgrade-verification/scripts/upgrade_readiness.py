@@ -47,13 +47,17 @@ from readiness_rules import (
     audit_log,
     capacity,
     cgroup_v2_runtime,
+    changed_defaults,
+    client_addon_skew,
     container_runtime,
     dataplane,
+    deprecated_api_callers,
     gpu_driver_mismatch,
     group_oom_kill,
     intree_volumes,
     node_image_coupled_agent,
     node_local_state,
+    removed_api_callers,
     removed_node_label,
     retired_registry,
     zonal_control_plane,
@@ -407,6 +411,10 @@ RULE_NONE = "no rules"
 EXTRA_RULES = [
     capacity,  # entry 2
     node_local_state,  # entry 4
+    removed_api_callers,  # entry 6
+    changed_defaults,  # entry 8
+    deprecated_api_callers,  # entry 9
+    client_addon_skew,  # entry 10
     zonal_control_plane,  # entry 11
     removed_node_label,  # entry 12
     container_runtime,  # entry 13
