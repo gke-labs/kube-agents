@@ -71,8 +71,11 @@ hand run that widens the window and advances no last-run time.
 with an outcome (`collected`; `unreachable` when its credentials failed;
 `gate-failed` when its reads failed, its project's listing failed or it is
 upgrading now; `out-of-scope` outside the fleet), the command behind each
-of the SOP's checks (`CHECK_READS`), `checks_unevaluated` for a check whose
-read failed, a candidate per Error (`major`) and Warning (`minor`) with the
+of the SOP's checks (`CHECK_READS`; an unchanged cluster carries all six,
+backed by the operations listing that found no upgrade, or by the read the
+re-check made for the checks that read pods or nodes), `checks_unevaluated`
+for a check whose read ran and failed, never backed by the listing, a
+candidate per Error (`major`) and Warning (`minor`) with the
 mitigation text the report prints, the identity tuples of guards held but
 not re-observed, and the per-cluster facts the SOP copies. The newest fourteen reports of each kind are kept. Each
 symptom carries an onset. The pod's own evidence is every symptom's
@@ -101,7 +104,11 @@ by onset alone and says so. Confidence is high only when the signature names
 the entry's own mechanism and an operation in the window reached the object
 (its pool; the control plane for 6 and 7); entry 14 also needs a runtime
 image below the floor, entry 20 the same image still running on an
-untouched pool. A crash record beside no ledger blocks every run until
+untouched pool. Row 12 (a node label removed) is decided by the nodes read,
+not the scheduler's message: it holds only when no node carries the pod's
+pinned labels, and is medium unless the label is in `DROPPED_NODE_LABELS`,
+empty until a GKE source names a removal. A crash record beside no ledger
+blocks every run until
 `--reset-ledger` archives it; a run starts from empty only when neither
 exists.
 
@@ -521,22 +528,29 @@ CORE_READS = ("pods", "nodes", "events", "pdbs", "owners")
 # the containerd socket a node agent couples itself to (13), and the names
 # that say a node-local volume holds state (4).
 DEPRECATED_NODE_LABEL_PREFIXES = ("beta.kubernetes.io/", "failure-domain.beta.kubernetes.io/")
-# Entry 12's after-signal grades high only when the selector names a label a
-# kubelet or node image stopped setting at or before the pool's minor; a
-# `didn't match` clause alone also fits an autoscaled pool at zero, a label a
-# pool never carried or a deleted pool. The table is the catalogue entry's
-# "labels dropped" list by (major, minor): kubeadm stopped applying
-# `node-role.kubernetes.io/master` in v1.24 (kubernetes/kubeadm#2200 and the
-# v1.24 changelog); the beta labels above are deprecated but still set
+# Entry 12's after-signal grades high only when the selector names a label
+# GKE's node image or kubelet stopped setting at or before the pool's minor:
+# label to (major, minor), each entry with its source the way
+# `removed_apis.json` beside `api_deprecation_scan.py` cites one. The table
+# is empty. An entry needs a GKE release note or GKE document that names the
+# label and the minor, never a kubeadm or upstream change and never memory:
+# kubeadm's `node-role.kubernetes.io/master`, lost at 1.24, is a label no
+# GKE node carried (the entry-12 reproduction's nodes show `ROLES <none>`
+# before and after the rebuild), so it is not an entry; the beta labels
+# above are deprecated but still set
 # (https://kubernetes.io/docs/reference/labels-annotations-taints/), so they
-# are the before-signal, not a drop.
-DROPPED_NODE_LABELS = {"node-role.kubernetes.io/master": (1, 24)}
+# are the before-signal, not a drop. Until an entry is sourced every row-12
+# match is medium, and the high branch is reached only by the test that
+# injects an entry.
+DROPPED_NODE_LABELS: dict[str, tuple[int, int]] = {}
 LABEL_DROPPED_FORMAT = "{label} dropped in {major}.{minor}"
-LABEL_NOT_DROPPED_TEXT = "selector names no label the catalogue lists as dropped by the pool's minor"
-# Row 12 on a scheduler message whose clause set (the sentence up to the
-# first period) mixes selector misses with other reasons: medium, the other
-# clauses named; the pod's own pool refused it for one of them.
-MIXED_CLAUSES_FORMAT = "clauses beside the selector miss: {clauses}"
+NO_NODE_CARRIES_FORMAT = "no node carries {labels}"
+LABEL_NOT_DROPPED_TEXT = "the catalogue lists no GKE label removal"
+# Row 12's discriminator is the nodes read, not the scheduler's message: the
+# clause set (the comma-separated reasons after `available: ` up to the
+# `preemption:` sentence) is quoted as evidence, and the clauses that are not
+# selector misses name the pool's own reason in the detail.
+OWN_POOL_REASON_FORMAT = "the pool's own reason: {clauses}"
 CLAUSE_LIST_MARKER = "available: "
 CLAUSE_SEPARATOR = ", "
 RETIRED_IMAGE_HOSTS = ("k8s.gcr.io/", "gcr.io/google-containers/", "gcr.io/google_containers/", "gcr.io/kubernetes-helm/")
@@ -708,14 +722,11 @@ RECREATED_TEXT = "the pod was recreated by the upgrade; the failure may predate 
 # Image references without a host are Docker Hub's.
 DEFAULT_IMAGE_HOST = "docker.io"
 OOM_REASON = "OOMKilled"
-# How a scheduling message counts the nodes that failed each predicate; entry
-# 12 is `high` only when every node failed the selector.
-SCHEDULING_TOTAL_RE = re.compile(r"0/(\d+) nodes are available")
 # The scheduler's clause set ends where its preemption sentence begins, not at
 # the first period: taint keys (`{cloud.google.com/gke-spot: true}`) and
-# `Insufficient nvidia.com/gpu` carry dots of their own.
+# `Insufficient nvidia.com/gpu` carry dots of their own. Row 12 quotes the
+# set as evidence; the nodes read decides the row.
 SCHEDULING_TAIL_RE = re.compile(r"\. (?:no new claims to deallocate, )?preemption:")
-SELECTOR_MISS_COUNT_RE = re.compile(r"(\d+) node\(s\) didn't match (?!PersistentVolume)[^,.]*node (?:selector|affinity)")
 WEBHOOK_NAME_RE = re.compile(r'failed calling webhook "([^"]+)"')
 IMAGE_HOST_RE = re.compile(r"^([^/]+\.[^/]+|localhost(?::\d+)?)/")
 
@@ -1925,6 +1936,13 @@ def _pinned_pools(pins: list[dict[str, list[str]]], label_pools: dict[tuple[str,
     return pools
 
 
+def _a_node_carries(pins: list[dict[str, list[str]]], node_labels: tuple) -> bool:
+    """Whether a node's labels satisfy one of the pod's terms, each term read
+    as the `In` selector the scheduler reads it as (`_selector_matches`)."""
+    selectors = [{"matchExpressions": [{"key": key, "operator": AFFINITY_OPERATOR_IN, "values": values} for key, values in sorted(pin.items())]} for pin in pins if pin]
+    return any(_selector_matches(selector, labels) for labels in node_labels for selector in selectors)
+
+
 def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_pins: list[dict[str, list[str]]], pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
     """The pools a budget's pod belongs to: where it sits, else the pools its
     own or its owner's pins name (nodeSelector or required node affinity, by
@@ -2059,6 +2077,7 @@ class Context(NamedTuple):
     images_on_untouched_pools: frozenset = frozenset()  # images Running on a pool no operation touched
     operations_known: bool = True  # False when the project's operations listing failed
     label_pools: dict = {}  # (label, value) -> the pools whose nodes carry it
+    node_labels: tuple | None = None  # each node's labels; None when the nodes read did not answer
     failing_pods: dict = {}  # (namespace, pod) -> the API-set field that shows it failing
     failing_objects: dict = {}  # owner object -> the API-set field that shows it failing
     pool_versions: dict = {}  # pool -> its version from the cluster describe
@@ -2125,12 +2144,10 @@ def _scopes_of(symptom: dict) -> dict[str, list[tuple[str, bool, str | None]]]:
         scopes[SCOPE_CONTAINER] = [(c["message"], not _container_text_is_tenant(c), c["container"]) for c in containers if c["message"]]
     return scopes
 
-def _selector_detail(symptom: dict) -> str:
-    selector = symptom.get("node_selector") or {}
-    if selector:
-        return "selector " + ",".join(f"{k}={v}" for k, v in sorted(selector.items()))
-    terms = [",".join(f"{k} In [{'|'.join(v)}]" for k, v in sorted(pin.items())) for pin in symptom.get("node_pins") or [] if pin]
-    return "node affinity " + " or ".join(terms) if terms else "node affinity"
+def _pins_text(pins: list[dict[str, list[str]]]) -> str:
+    """A pod's terms as text: `key=value` for one value, `key In [a|b]` for
+    several, terms joined by ` or `."""
+    return " or ".join(",".join(f"{k}={v[0]}" if len(v) == 1 else f"{k} In [{'|'.join(v)}]" for k, v in sorted(pin.items())) for pin in pins if pin)
 
 
 def _image_host(image: str) -> str:
@@ -2224,27 +2241,34 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
         index, (text, api_set, container) = next(((i, hit) for i, hit in hits if hit[1]), hits[0])
         m = pattern.search(text)
         detail = ""
+        clauses = ""
         if entry == ENTRY_NODE_LABEL:
-            # The clause set is the sentence up to the first period; the
-            # `preemption:` sentence after it has its own `0/N nodes are
-            # available`. The scheduler writes a selector-miss clause for
-            # every node group a pinned pod does not target, beside the clause
-            # that says why its own pool refused it: a mixed set is medium,
-            # and only misses alone that name a dropped label are high.
+            # The discriminator is the nodes read, not the message. The
+            # scheduler writes a selector-miss clause for every node group a
+            # pinned pod does not target, so on a cluster with more than one
+            # pool every pinned Pending pod carries one. When a node carries
+            # the labels of one of the pod's terms, the pod's own pool
+            # evaluated it and refused it for the reason in that pool's
+            # clause: rows 2 and 18 were tried first, and what remains is
+            # unclassified, never 12. Row 12 holds only when no node carries
+            # the pinned labels, and is medium even then (a label the pool
+            # never carried, a deleted pool or a pool at zero nodes read the
+            # same) unless the label is in `DROPPED_NODE_LABELS`. An event
+            # row's pins are its owner's template's; with no pins, or no
+            # nodes read, nothing can say.
+            pins = symptom.get("node_pins")
+            if pins is None:
+                pins = pins_of_selector(symptom.get("node_selector"))
+            if not pins or ctx.node_labels is None or _a_node_carries(pins, ctx.node_labels):
+                continue
             clauses = SCHEDULING_TAIL_RE.split(text, 1)[0].rstrip(".")
-            total, missed = SCHEDULING_TOTAL_RE.search(clauses), SELECTOR_MISS_COUNT_RE.search(clauses)
-            detail = _selector_detail(symptom)
+            others = [clause.strip() for clause in clauses.split(CLAUSE_LIST_MARKER, 1)[-1].split(CLAUSE_SEPARATOR) if clause.strip() and not pattern.search(clause)]
             dropped = _dropped_label(symptom, ctx)
-            if dropped:
-                detail += f"; {dropped}"
-            if total and missed and int(missed.group(1)) < int(total.group(1)):
+            detail = f"{NO_NODE_CARRIES_FORMAT.format(labels=_pins_text(pins))}; {dropped or LABEL_NOT_DROPPED_TEXT}"
+            if others:
+                detail += f"; {OWN_POOL_REASON_FORMAT.format(clauses=', '.join(others))}"
+            if not dropped:
                 confidence = MEDIUM
-                others = [clause.strip() for clause in clauses.split(CLAUSE_LIST_MARKER, 1)[-1].split(CLAUSE_SEPARATOR) if clause.strip() and not SELECTOR_MISS_COUNT_RE.search(clause)]
-                detail += f"; {MIXED_CLAUSES_FORMAT.format(clauses=', '.join(others) or '?')}"
-            elif not dropped:
-                # The clause alone does not say the pool lost the label.
-                confidence = MEDIUM
-                detail += f"; {LABEL_NOT_DROPPED_TEXT}"
         elif entry == ENTRY_WEBHOOK:
             name = WEBHOOK_NAME_RE.search(text)
             detail = f"webhook {name.group(1)}" if name else ""
@@ -2273,7 +2297,13 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
         # A reason-only hit is evidenced by that container's reason with its
         # message: the reason and any scopes list the row's own entry first
         # and then each container in order, so the index names the container.
-        evidence = scopes[SCOPE_ANY][index][0] if scope == SCOPE_REASON else (text if scope == SCOPE_ANY else m.group(0))
+        # Row 12 quotes the clause set whole; it decided nothing.
+        if clauses:
+            evidence = clauses
+        elif scope == SCOPE_REASON:
+            evidence = scopes[SCOPE_ANY][index][0]
+        else:
+            evidence = text if scope == SCOPE_ANY else m.group(0)
         if not api_set:
             # Text a namespace user can write: quoted as the object's own, and
             # never high on its own.
@@ -2859,6 +2889,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         images_on_untouched_pools=frozenset(untouched_images),
         operations_known=operations_known,
         label_pools=pool_labels(cluster, nodes),
+        node_labels=None if reads.get("nodes") is None else tuple((n.get("metadata") or {}).get("labels") or {} for n in nodes),
         failing_pods=failing_pods,
         failing_objects=failing_objects,
         pool_versions=versions_of(cluster)["node_pools"],

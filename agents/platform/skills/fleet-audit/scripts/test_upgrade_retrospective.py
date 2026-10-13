@@ -347,11 +347,14 @@ class ClassifierFixtureTest(unittest.TestCase):
         [row] = symptoms_of("seeded-a", reads={"pods": [runner], "nodes": nodes, "events": [], "pdbs": []})
         self.assertEqual(entries(row), {(2, ur.HIGH)})
         self.assertEqual(row["classifications"][0]["evidence"], "1 of 1 pods: Insufficient cpu; e.g. pinned-batch-runner-6d5f8b7c9-x2k4q")
-        # Every clause a selector miss: the selector names a label the pool lost, entry 12.
+        # A label no seeded-a node carries (`seeded-role` is `pinned-inference` on the one node that has
+        # it): the nodes read says no node can take the pod, entry 12 at medium, the clause set quoted.
+        self.assertNotIn("batch", {n["metadata"]["labels"].get("seeded-role") for n in nodes})
         pure = pod("pinned-batch-runner-6d5f8b7c9-x2k4q", namespace="seeded-upgrade", scheduled_message="0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.", node_selector={"seeded-role": "batch"})
         [row] = symptoms_of("seeded-a", reads={"pods": [pure], "nodes": nodes, "events": [], "pdbs": []})
         self.assertEqual(entries(row), {(12, ur.MEDIUM)})
-        self.assertEqual(row["classifications"][0]["detail"], f"selector seeded-role=batch; {ur.LABEL_NOT_DROPPED_TEXT}")
+        self.assertEqual(row["classifications"][0]["detail"], f"{ur.NO_NODE_CARRIES_FORMAT.format(labels='seeded-role=batch')}; {ur.LABEL_NOT_DROPPED_TEXT}")
+        self.assertEqual(row["classifications"][0]["evidence_core"], "0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector")
         # The order is one table the classifier iterates, most specific first, 12 last.
         self.assertEqual(ur.ENTRY_ORDER, (7, 6, 19, 18, 14, 15, 20, 17, 3, 2, 1, 5, 12))
         self.assertEqual(set(ur.ENTRY_MATCHERS), set(ur.ENTRY_ORDER))
@@ -508,47 +511,103 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual(entries(row), {(18, ur.MEDIUM)})
         self.assertEqual(row["classifications"][0]["detail"], ur.FROM_EVENT_TEXT_DETAIL.format(source=ur.TEXT_SOURCE_TERMINATION))
 
-    def test_entry_12_is_high_only_when_the_selector_names_a_dropped_label(self):
+    def test_entry_12_holds_only_when_no_node_carries_the_pinned_label(self):
+        # The discriminator is the nodes read, not the scheduler's message. Every fixture node carries
+        # `beta.kubernetes.io/arch=amd64`; one carries `seeded-role=pinned-inference`; none carries `team`.
+        nodes = READS["seeded-a"]["nodes"]
+        carried = {(k, v) for n in nodes for k, v in n["metadata"]["labels"].items()}
+        self.assertIn(("beta.kubernetes.io/arch", "amd64"), carried)
+        self.assertIn(("seeded-role", "pinned-inference"), carried)
+        self.assertNotIn("team", {k for k, _ in carried})
         miss = "0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
-        # A deprecated label still set: the clause alone does not say the pool lost it.
+        # Misses alone with a label no node carries: row 12, medium (a label the pool never carried, a
+        # deleted pool or a pool at zero nodes read the same), the clause set quoted as evidence.
+        [row] = self.classify(pods=[pod("legacy", scheduled_message=miss, node_selector={"team": "legacy"})])
+        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], f"no node carries team=legacy; {ur.LABEL_NOT_DROPPED_TEXT}")
+        self.assertEqual(row["classifications"][0]["evidence_core"], "0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector")
+        # The same message with a label every node carries: the pod's own pool evaluated it and refused
+        # it for a reason the message does not keep; unclassified, never 12.
         [row] = self.classify(pods=[pod("arch-pinned", scheduled_message=miss, node_selector={"beta.kubernetes.io/arch": "amd64"})])
-        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
-        self.assertEqual(row["classifications"][0]["detail"], f"selector beta.kubernetes.io/arch=amd64; {ur.LABEL_NOT_DROPPED_TEXT}")
-        # A label the table lists as dropped at or before the pool's minor: the mechanism, high.
-        self.assertEqual(ur.DROPPED_NODE_LABELS, {"node-role.kubernetes.io/master": (1, 24)})
-        [row] = self.classify(pods=[pod("on-master", scheduled_message=miss, node_selector={"node-role.kubernetes.io/master": ""})])
-        self.assertEqual(entries(row), {(12, ur.HIGH)})
-        self.assertEqual(row["classifications"][0]["detail"], "selector node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24")
-        # A mixed message, the dropped label named: the pod's own pool refused it for another reason,
-        # so medium, with the other clauses named.
-        mixed = "0/4 nodes are available: 1 node(s) were unschedulable, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
-        [row] = self.classify(pods=[pod("on-master", scheduled_message=mixed, node_selector={"node-role.kubernetes.io/master": ""})])
-        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
-        self.assertEqual(row["classifications"][0]["detail"], "selector node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24; " + ur.MIXED_CLAUSES_FORMAT.format(clauses="1 node(s) were unschedulable"))
-        # A taint clause carries a dotted key: the clause set ends at the preemption sentence, not at
-        # the first period, so the message is still read as mixed and the taint named in full.
+        self.assertEqual(entries(row), {(None, ur.MEDIUM)})
+        # A pin a node carries beside the clause naming the pool's refusal: rows 2 and 18 were tried
+        # first; a taint, a pod-count ceiling or a cordon is neither, so unclassified.
+        pinned = {"seeded-role": "pinned-inference"}
+        for own in ("1 node(s) had untolerated taint {dedicated: batch}", "1 Too many pods", "1 node(s) were unschedulable"):
+            with self.subTest(own=own):
+                message = f"0/4 nodes are available: {own}, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
+                [row] = self.classify(pods=[pod("batch", scheduled_message=message, node_selector=pinned)])
+                self.assertEqual(entries(row), {(None, ur.MEDIUM)})
+        # The same clauses with a label no node carries: row 12 holds and the detail names the pool's
+        # own reason; a dotted taint key does not end the clause set, which runs to the preemption
+        # sentence.
         spot = "0/5 nodes are available: 2 node(s) had untolerated taint {cloud.google.com/gke-spot: true}, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/5 nodes are available: 5 Preemption is not helpful for scheduling."
-        [row] = self.classify(pods=[pod("on-master", scheduled_message=spot, node_selector={"node-role.kubernetes.io/master": ""})])
+        [row] = self.classify(pods=[pod("legacy", scheduled_message=spot, node_selector={"team": "legacy"})])
         self.assertEqual(entries(row), {(12, ur.MEDIUM)})
-        self.assertIn(ur.MIXED_CLAUSES_FORMAT.format(clauses="2 node(s) had untolerated taint {cloud.google.com/gke-spot: true}"), row["classifications"][0]["detail"])
+        self.assertEqual(row["classifications"][0]["detail"], f"no node carries team=legacy; {ur.LABEL_NOT_DROPPED_TEXT}; " + ur.OWN_POOL_REASON_FORMAT.format(clauses="2 node(s) had untolerated taint {cloud.google.com/gke-spot: true}"))
+        self.assertEqual(row["classifications"][0]["evidence_core"], "0/5 nodes are available: 2 node(s) had untolerated taint {cloud.google.com/gke-spot: true}, 3 node(s) didn't match Pod's node affinity/selector")
+        # A GPU clause files as row 18, which precedes 12.
         gpu = "0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 2 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
-        [row] = self.classify(pods=[pod("trainer", scheduled_message=gpu, node_selector={"beta.kubernetes.io/arch": "amd64"})])
-        self.assertEqual({c["entry"] for c in row["classifications"]}, {18})  # row 18 wins first; the clause set is read whole
-        # The repository's entry-12 reproduction (bench/upgrade-scenarios/evidence/12/label.txt), read
-        # during the drain: the clause set ends at the first period, the preemption sentence's own
-        # `0/3 nodes are available` is not the total, and the row files at medium.
-        reproduction = "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
-        [row] = self.classify(pods=[pod("label-pinned-5746f57c68-ghnpj", scheduled_message=reproduction, node_selector={"beta.kubernetes.io/arch": "amd64"})])
+        [row] = self.classify(pods=[pod("trainer", scheduled_message=gpu, node_selector={"team": "legacy"})])
+        self.assertEqual({c["entry"] for c in row["classifications"]}, {18})
+        # The repository's entry-12 reproduction (bench/upgrade-scenarios/evidence/12/label.txt) once
+        # the pool is rebuilt: the replacement node does not carry `team=legacy`, the message is misses
+        # alone, and the preemption sentence's own `0/3 nodes are available` is not part of the set.
+        rebuilt = "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("label-pinned-5746f57c68-ghnpj", scheduled_message=rebuilt, node_selector={"team": "legacy"})])
         self.assertEqual(entries(row), {(12, ur.MEDIUM)})
-        self.assertIn(ur.MIXED_CLAUSES_FORMAT.format(clauses="1 node(s) were unschedulable"), row["classifications"][0]["detail"])
-        # On a cluster below that minor the label is not yet dropped.
-        old = cluster_doc("seeded-a")
-        old["currentMasterVersion"] = "1.23.17-gke.1700"
-        for p in old["nodePools"]:
-            p["version"] = "1.23.17-gke.1700"
-        reads = {"pods": [pod("on-master", scheduled_message=miss, node_selector={"node-role.kubernetes.io/master": ""})], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}
-        [row] = ur.collect_symptoms(old, reads, ops_for("seeded-a"), SINCE)
+        self.assertEqual(row["classifications"][0]["evidence_core"], "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector")
+        # Its drain-time message on a settled cluster whose node still carries the label (a cordon by
+        # hand): the cordon refused the pod, unclassified.
+        drain = "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("label-pinned-5746f57c68-ghnpj", scheduled_message=drain, node_selector=pinned)])
+        self.assertEqual(entries(row), {(None, ur.MEDIUM)})
+        # No nodes read: nothing can say, unclassified. A nodes read that lists no node: row 12.
+        legacy = pod("legacy", scheduled_message=miss, node_selector={"team": "legacy"})
+        [row] = symptoms_of("seeded-a", reads={"pods": [legacy], "events": [], "pdbs": []})
+        self.assertEqual(entries(row), {(None, ur.MEDIUM)})
+        [row] = self.classify(pods=[legacy], nodes=[])
         self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        # A FailedScheduling event row takes its pins from its owner's template, as the pool gate
+        # does; with none it is unclassified, never 12.
+        workloads = copy.deepcopy([w for w in READS["seeded-a"]["workloads"] if w["metadata"]["name"] == "payments-api"])
+        workloads[0]["spec"]["template"]["spec"]["nodeSelector"] = {"team": "legacy"}
+        gone = event("FailedScheduling", miss, name="payments-api-79b77b8c67-gone1", namespace="seeded-debug")
+        [row] = by_object(self.classify(events=[gone], owners=READS["seeded-a"]["owners"], workloads=workloads), PAYMENTS)
+        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        self.assertTrue(row["classifications"][0]["detail"].startswith(f"no node carries team=legacy; {ur.LABEL_NOT_DROPPED_TEXT}"), row["classifications"][0]["detail"])
+        [row] = by_object(self.classify(events=[gone], owners=READS["seeded-a"]["owners"]), PAYMENTS)
+        self.assertEqual(entries(row), {(None, ur.MEDIUM)})
+
+    def test_entry_12_is_high_only_with_a_sourced_dropped_label_entry(self):
+        # The shipped table is empty: no GKE release note or document names a label removal, and
+        # kubeadm's `node-role.kubernetes.io/master` is a label no GKE node carried. The high branch is
+        # reached only with an entry injected here.
+        self.assertEqual(ur.DROPPED_NODE_LABELS, {})
+        miss = "0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
+        master = {"node-role.kubernetes.io/master": ""}
+        [row] = self.classify(pods=[pod("on-master", scheduled_message=miss, node_selector=master)])
+        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], f"no node carries node-role.kubernetes.io/master=; {ur.LABEL_NOT_DROPPED_TEXT}")
+        with mock.patch.dict(ur.DROPPED_NODE_LABELS, {"node-role.kubernetes.io/master": (1, 24)}):
+            [row] = self.classify(pods=[pod("on-master", scheduled_message=miss, node_selector=master)])
+            self.assertEqual(entries(row), {(12, ur.HIGH)})
+            self.assertEqual(row["classifications"][0]["detail"], "no node carries node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24")
+            # The clause set decides no row: the pool's own reason beside the misses is named, the
+            # grade stands.
+            mixed = "0/4 nodes are available: 1 node(s) were unschedulable, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
+            [row] = self.classify(pods=[pod("on-master", scheduled_message=mixed, node_selector=master)])
+            self.assertEqual(entries(row), {(12, ur.HIGH)})
+            self.assertEqual(row["classifications"][0]["detail"], "no node carries node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24; " + ur.OWN_POOL_REASON_FORMAT.format(clauses="1 node(s) were unschedulable"))
+            # On a cluster below that minor the label is not yet dropped.
+            old = cluster_doc("seeded-a")
+            old["currentMasterVersion"] = "1.23.17-gke.1700"
+            for p in old["nodePools"]:
+                p["version"] = "1.23.17-gke.1700"
+            reads = {"pods": [pod("on-master", scheduled_message=miss, node_selector=master)], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}
+            [row] = ur.collect_symptoms(old, reads, ops_for("seeded-a"), SINCE)
+            self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+            self.assertEqual(row["classifications"][0]["detail"], f"no node carries node-role.kubernetes.io/master=; {ur.LABEL_NOT_DROPPED_TEXT}")
 
     def test_entry_19_volume_affinity_is_not_entry_12(self):
         [row] = self.classify(pods=[pod("pd-reader", scheduled_message="0/4 nodes are available: 1 node(s) had volume node affinity conflict, 3 node(s) didn't match PersistentVolume's node affinity.")])
@@ -1016,13 +1075,15 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertNotIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
         [row] = by_object(ur.collect_symptoms(cluster, reads, [o for o in ops if o["operationType"] == "UPGRADE_MASTER"], SINCE), PAYMENTS)
         self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
-        # (c) The dropped-label table grades against the pinned pool's minor, not the control plane's.
+        # (c) An injected dropped-label entry grades against the pinned pool's minor, not the control
+        # plane's: the pool at 1.23 has not dropped a label lost at 1.24.
         old = copy.deepcopy(cluster)
         old["nodePools"][0]["version"] = "1.23.17-gke.1700"
         reads = {"pods": [pod("on-master", scheduled_message="0/2 nodes are available: 2 node(s) didn't match Pod's node affinity/selector.", node_selector={"node-role.kubernetes.io/master": "", "cloud.google.com/gke-nodepool": "default-pool"})], "nodes": nodes, "events": [], "pdbs": [], "owners": []}
-        [row] = ur.collect_symptoms(old, reads, ops, SINCE)
+        with mock.patch.dict(ur.DROPPED_NODE_LABELS, {"node-role.kubernetes.io/master": (1, 24)}):
+            [row] = ur.collect_symptoms(old, reads, ops, SINCE)
         self.assertEqual(entries(row), {(12, ur.MEDIUM)})
-        self.assertIn(ur.LABEL_NOT_DROPPED_TEXT, row["classifications"][0]["detail"])
+        self.assertEqual(row["classifications"][0]["detail"], f"no node carries cloud.google.com/gke-nodepool=default-pool,node-role.kubernetes.io/master=; {ur.LABEL_NOT_DROPPED_TEXT}")
 
     def test_cluster_universal_selector_does_not_link_a_budget_to_every_pool(self):
         # Every covered replica unplaced and pinned only by `kubernetes.io/os: linux`, the template too:
@@ -3769,6 +3830,118 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == "Deployment/payments-api"], [])
         self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertNotIn(filed_id, self.audit_report.collector_flagged_ids(manifest))
+
+    def test_every_collected_entry_carries_the_six_checks_the_roster_reads(self):
+        # The contract main's `coverage_gaps` reads: every `scope.clusters` entry is measured against
+        # the stream's roster, and a check in neither `checks_run` nor `checks_not_applicable` is a
+        # gap. A reviewed cluster carries all six with the read that decided each. An unchanged
+        # cluster carries all six too: the operations listing that found no upgrade, with the
+        # cluster's versions, answers every check that asks what the upgrade did, and a check whose
+        # read the re-check made is backed by that read instead. The roster is `CHECK_READS`; until
+        # the SOP registers it in `AUDITS`, the test registers it the same way.
+        roster = tuple(check for check, _ in ur.CHECK_READS)
+        self.assertEqual(len(roster), 6)
+        spec = self.audit_report.AuditSpec("Upgrade retrospective", "upgrade_retrospective_sop.md", roster)
+        first, _ = self.collect()
+        second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(sorted(u["cluster"] for u in second["unchanged"]), [GEMMA, SEEDED])
+        with mock.patch.dict(self.audit_report.AUDITS, {ur.AUDIT_ID: spec}):
+            for label, run in (("reviewed", first), ("unchanged", second)):
+                with self.subTest(label):
+                    manifest = json.loads(Path(run["manifest_path"]).read_text())
+                    self.assertEqual([c["outcome"] for c in manifest["clusters"]], [ur.MANIFEST_OUTCOME_COLLECTED] * 2)
+                    for entry in manifest["clusters"]:
+                        self.assertEqual([c["check"] for c in entry["commands"]], list(roster))
+                        self.assertNotIn("checks_unevaluated", entry)
+                        self.assertNotIn("limitations", entry)
+                    self.assertEqual(self.audit_report.coverage_gaps(self.document_from(manifest)), [])
+                    self.assertFalse(manifest["partial"])
+            seeded = next(c for c in json.loads(Path(second["manifest_path"]).read_text())["clusters"] if c["name"] == SEEDED)
+            commands = {c["check"]: c["command"] for c in seeded["commands"]}
+            self.assertTrue(commands[ur.CHECK_OPERATION_FAILED].startswith("gcloud container operations list"))
+            self.assertIn(" kubectl get pods -A -o json", commands[ur.CHECK_BROKE_WORKLOAD])
+            self.assertIn(" kubectl get nodes -o json", commands[ur.CHECK_NODE_BROKEN])
+            # A read that ran and failed is the gap `coverage_gaps` names: the four pod checks leave
+            # `checks_run`, the read is the limitation, and the run is partial.
+            third, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+            manifest = json.loads(Path(third["manifest_path"]).read_text())
+            [gap] = self.audit_report.coverage_gaps(self.document_from(manifest))
+            self.assertTrue(gap.startswith(f"{SEEDED}: partially audited — 4 of 6 applicable checks did not run ({ur.CHECK_BROKE_WORKLOAD}, "), gap)
+            self.assertIn("reads that failed: pods", gap)
+            self.assertTrue(manifest["partial"])
+
+    def test_a_guard_keeps_its_id_first_seen_and_reviews_across_a_run_that_did_not_read_it(self):
+        # Sunday 1 files the entry-1 finding on inference-server's budget. Sunday 2 the pdbs read
+        # fails: the guard is held as it stands, no candidate for it, the read is a limitation and the
+        # run is partial, so `finish` resolves nothing and the entry leaves the ledger body for the
+        # week. Sunday 3 reads: the candidate returns under Sunday 1's id with the first-seen date
+        # and the review count the gap did not move.
+        budget = "seeded-capacity/PodDisruptionBudget/inference-server"
+        identity = {"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-capacity", "object": "PodDisruptionBudget/inference-server"}
+        guard = ur.guard_id(SEEDED, 1, budget)
+        first, _ = self.collect()
+        manifest = json.loads(Path(first["manifest_path"]).read_text())
+        [filed] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
+        self.assertEqual((filed["check"], filed["severity"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR))
+        filed_id = self.audit_report.published_id(filed)
+        self.assertEqual(filed_id, self.audit_report.published_id(identity))
+        self.assertEqual([(g["first_seen"], g["reviews"]) for g in first["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 1)])
+        second, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pdbs")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
+        self.assertEqual(recheck["held"][guard], ["pdbs"])
+        self.assertTrue(all(missing == ["pdbs"] for missing in recheck["held"].values()), recheck["held"])
+        self.assertEqual([(g["first_seen"], g["reviews"], g["last_seen"]) for g in second["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 1, "2026-10-08T18:00:00Z")])
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
+        self.assertEqual([c for c in seeded["candidates"] if c["object"] == identity["object"]], [])
+        self.assertTrue(seeded["limitations"].startswith("reads that failed: pdbs:"), seeded["limitations"])
+        self.assertTrue(manifest["partial"])
+        self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        document = self.document_from(manifest)
+        self.assertTrue(any(gap.startswith(f"{SEEDED}: partially audited") for gap in self.audit_report.coverage_gaps(document)))
+        self.audit_report.cross_check_manifest(document, manifest)
+        third, _ = self.collect(now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(third["manifest_path"]).read_text())
+        [again] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
+        self.assertEqual(self.audit_report.published_id(again), filed_id)
+        self.assertEqual((again["check"], again["persistence"]), (ur.CHECK_BROKE_WORKLOAD, ["persists since 2026-10-08T18:00:00Z, 2 review(s)"]))
+        self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        self.assertEqual([(g["first_seen"], g["reviews"]) for g in third["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 2)])
+        self.assertFalse(manifest["partial"])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_a_guard_keeps_its_record_across_a_sunday_its_cluster_was_upgrading(self):
+        # The same gap with the cluster upgrading on Sunday 2: `gate-failed`, nothing read, no
+        # candidate, the guard untouched (the ledger keeps Sunday 1 as its last run). Sunday 3 reviews
+        # the cluster on the operation that ended and files the hold afresh, an Error under Sunday 1's
+        # id with no persistence note; the guard carries its first-seen date and two reviews.
+        budget = "seeded-capacity/PodDisruptionBudget/inference-server"
+        identity = {"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-capacity", "object": "PodDisruptionBudget/inference-server"}
+        guard = ur.guard_id(SEEDED, 1, budget)
+        first, _ = self.collect()
+        filed_id = self.audit_report.published_id(identity)
+        self.assertIn(filed_id, self.audit_report.collector_flagged_ids(json.loads(Path(first["manifest_path"]).read_text())))
+        running = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"]))
+        running.update(name="operation-second-pinned", startTime="2026-10-15T16:00:00Z", endTime=None, status="RUNNING")
+        second, _ = self.collect(FakeFleet(operations=OPERATIONS + [running]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_GATE_FAILED)
+        self.assertNotIn("candidates", seeded)
+        self.assertTrue(manifest["partial"])
+        self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        self.assertEqual([(g["first_seen"], g["reviews"], g["last_seen"]) for g in second["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 1, "2026-10-08T18:00:00Z")])
+        done = {**running, "status": "DONE", "endTime": "2026-10-15T17:05:00Z"}
+        third, _ = self.collect(FakeFleet(operations=OPERATIONS + [done]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(third["manifest_path"]).read_text())
+        [again] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
+        self.assertEqual(self.audit_report.published_id(again), filed_id)
+        self.assertEqual((again["check"], again["severity"], "persistence" in again), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR, False))
+        self.assertIn(SEEDED, [r["cluster"] for r in third["reviews"]])
+        self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        self.assertEqual([(g["first_seen"], g["reviews"]) for g in third["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 2)])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_three_guards_on_one_object_are_one_candidate(self):
         # Two event-only guards on inference-server (a volume attach, a webhook rejection) beside its
