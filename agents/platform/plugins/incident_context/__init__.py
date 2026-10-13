@@ -90,7 +90,9 @@ def on_inbound(*, event, **_):
 # session_kv_server's `_CONTROL_TOKEN_RE` — and this is the copy that guards the
 # hop no human ever reads, so it cannot be the weakest of the three. It is also
 # the only one a relayed report meets: the relay stores the report as the job
-# wrote it, so every chat-template token `_CONTROL_TOKEN_RE` names is listed here. `\s*` on the
+# wrote it, so the template tokens multiuser_memory's scrub lists (ChatML, Llama
+# 3, Gemma, Llama 2) are listed here, every one `_CONTROL_TOKEN_RE` names among
+# them; test_incident_context reads that pattern to keep the two in step. `\s*` on the
 # markdown-shaped pair matches `_neutralize_tokens` for the same reason it does
 # there: `###System:` is the same instruction with the space removed.
 _TOKENS = (
@@ -100,6 +102,13 @@ _TOKENS = (
     (r"<\|system\|>", "[token_system]"),
     (r"<\|user\|>", "[token_user]"),
     (r"<\|assistant\|>", "[token_assistant]"),
+    (r"<\|start_header_id\|>", "[token_start_header_id]"),
+    (r"<\|end_header_id\|>", "[token_end_header_id]"),
+    (r"<\|eot_id\|>", "[token_eot_id]"),
+    (r"<start_of_turn>", "[token_start_of_turn]"),
+    (r"<end_of_turn>", "[token_end_of_turn]"),
+    (r"<<SYS>>", "[SYS_TEXT]"),
+    (r"<</SYS>>", "[/SYS_TEXT]"),
     (r"###\s*System:", "[SYSTEM_TEXT]:"),
     (r"###\s*Instruction:", "[INSTRUCTION_TEXT]:"),
     (r"\[INST\]", "[INST_TEXT]"),

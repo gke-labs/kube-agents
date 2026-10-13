@@ -71,8 +71,7 @@ TIMEOUT_SECONDS = 30
 
 PUBLISHER = "nudge"
 
-# `deliver: "chat"` relays this through a Chat Agent turn. Without a heading a
-# short message reads as conversation rather than as a report to reproduce.
+# The first line names the message in the channel.
 HEADING = "Findings queue"
 
 # A gathered item lists this many of its other objects by name, then counts

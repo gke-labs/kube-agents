@@ -2491,7 +2491,7 @@ def trigger_agent_troubleshooter(
 
 
 # --------------------------------------------------------------------------
-# Scheduled-report relay: the specialist reasons, the Chat Agent speaks.
+# Scheduled-report relay: the specialist's report, in a thread the Chat Agent answers.
 #
 # A cron job on a specialist roster (platform, or a scaffolded cluster profile)
 # runs under its own HERMES_HOME, so it keeps its own skills, model and turn
@@ -2500,10 +2500,9 @@ def trigger_agent_troubleshooter(
 # process that actually owns the conversation with the user — never learns the
 # finding happened.
 #
-# This relay closes that gap by separating who reasons (the specialist) from
-# who speaks (the Chat Agent). The specialist finishes its work and hands the
-# finished report here; the Chat Agent is given one turn to present it, and the
-# report plus the Chat Agent's framing land in the thread the user replies into.
+# This relay closes that gap. The specialist finishes its work and hands the
+# finished report here; it is posted as written into a thread, and stored
+# against that thread so a reply there reaches the Chat Agent with it attached.
 #
 # It deliberately does NOT reuse /sessions/{id}/inject. That route is an
 # incident path: it classifies severity, spends `alert_quota`, and hands the
@@ -2516,7 +2515,7 @@ _CRON_REPORT_SESSION_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 # A report is a chat message, not a document. The cap is generous enough for a
 # full audit summary and small enough that a job which accidentally cats a log
-# cannot push a megabyte through the model and into the channel.
+# cannot push a megabyte into the channel.
 #
 # It is a truncation point and not a rejection: see :func:`_truncate_report`.
 CRON_REPORT_MAX_CHARS = int(os.getenv("CRON_REPORT_MAX_CHARS", "12000") or "12000")
@@ -3296,8 +3295,8 @@ def relay_cron_report(
     # of the day. Order matters: the owner goes last, because the top-level
     # `platform`/`chat_id`/`thread_id` fields hold one address and the last
     # write wins. The owner is the routed platform when it landed, else the
-    # first that did — so a follow-up question reaches a session that has the
-    # report rather than one addressed at a platform it never arrived on, and a
+    # first that did — so the one address points at a platform the report
+    # arrived on rather than one it never reached, and a
     # leg that fails once does not lose its thread for the rest of the day.
     owner = routed_platform if routed_platform in threads else next(
         p for p in platforms if p in threads

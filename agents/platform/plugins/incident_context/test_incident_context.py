@@ -13,6 +13,7 @@ package's `__init__.py`, and the gateway imports it as `incident_context`.
 
 import importlib.util
 import pathlib
+import re
 import unittest
 from unittest.mock import patch
 
@@ -208,11 +209,28 @@ class UntrustedReportFramingTest(unittest.TestCase):
         Audit evidence quotes annotations and event text verbatim; a template that
         parses special tokens in text would read these as turn boundaries.
         """
-        tokens = ("<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|system|>", "<|user|>", "<|assistant|>")
+        tokens = ("<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|system|>", "<|user|>", "<|assistant|>",
+                  "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<start_of_turn>", "<end_of_turn>",
+                  "<<SYS>>", "<</SYS>>")
         text = self.frame("annotation: " + " ".join(t.upper() if i % 2 else t for i, t in enumerate(tokens)))
         body = text.split("<untrusted_report>\n", 1)[1].split("\n</untrusted_report>", 1)[0]
         for token in tokens:
             self.assertNotIn(token, body.lower(), f"{token!r} survived into the fenced body")
+
+    def test_every_token_session_kv_server_scrubs_is_scrubbed_here_too(self):
+        """The two lists are kept in step by hand; this holds the claim.
+
+        session_kv_server's `_CONTROL_TOKEN_RE` names the chat-template tokens
+        the server neutralises; a relayed report reaches a model only through
+        this hop, so each of them has to be in `_TOKENS` as well.
+        """
+        server = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "session_kv_server.py"
+        match = re.search(r'_CONTROL_TOKEN_RE = re\.compile\(r"<\\\|\(\?:([a-z_|]+)\)\\\|>"', server.read_text())
+        self.assertIsNotNone(match, "the _CONTROL_TOKEN_RE pattern moved; update this reader")
+        tokens = [f"<|{name}|>" for name in match.group(1).split("|")]
+        body = self.frame(" ".join(tokens)).split("<untrusted_report>\n", 1)[1]
+        for token in tokens:
+            self.assertNotIn(token, body, f"{token!r} survived into the fenced body")
 
     def test_one_changed_letter_does_not_get_a_token_through(self):
         """The scrub is case-insensitive, and that is what makes it a scrub.

@@ -121,8 +121,7 @@ LOG_PREFIX = "feedback_prompt"
 FORM_URL = "https://gke-labs.github.io/kube-agents/feedback"
 REPOSITORY = "gke-labs/kube-agents"
 
-# `deliver: "chat"` relays this through a Chat Agent turn. A heading keeps the
-# message reading as a report to reproduce rather than a greeting to answer.
+# The first line names the message in the channel.
 HEADING = "How is kube-agents working out?"
 MESSAGE = f"""{HEADING}
 
