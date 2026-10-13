@@ -130,8 +130,13 @@ def _pod(
     last_reason: str | None,
     phase: str = "Running",
     waiting_reason: str | None = None,
+    ready: bool | None = None,
 ) -> dict:
-    status: dict = {"restartCount": restarts, "lastState": {}}
+    # A container is ready when it runs; one waiting in a back-off is not,
+    # though its pod's phase stays Running under restartPolicy Always.
+    if ready is None:
+        ready = phase == "Running" and waiting_reason is None
+    status: dict = {"restartCount": restarts, "lastState": {}, "ready": ready}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
     if waiting_reason:
@@ -767,6 +772,39 @@ class PassTest(_Harness):
         done = self.run_script(world)
         assert set(self.drift_files()) == {"deprecated-label-selector"}, done.stderr
         assert 'status.phase any_eq "Running": observed "Pending"' in self.drift_files()["deprecated-label-selector"]
+
+    def test_a_shape_pod_restarted_into_backoff_is_drift_though_its_phase_is_running(self):
+        """Under restartPolicy Always a container that ran once and now waits in
+        ImagePullBackOff or CrashLoopBackOff leaves the pod's phase Running;
+        readiness is what tells the before-state from that after-state."""
+        world = _healthy_world()
+        world["kubectl"]["pod?app=legacy-registry-pull"] = _pods(_pod(restarts=1, last_reason=None, waiting_reason="ImagePullBackOff"))
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"retired-registry-image"}, done.stderr
+        assert "status.containerStatuses[*].ready any_eq true: observed false" in self.drift_files()["retired-registry-image"]
+        assert 'status.phase any_eq "Running"' not in self.drift_files()["retired-registry-image"]
+
+    def test_an_oom_killed_cgroup_shape_is_drift_though_its_pod_runs_again(self):
+        """An OOM-killed container restarts and is ready again between kills;
+        the last termination is where the after-state shows."""
+        for role, app in (("cgroup-blind-runtime", "cgroup-blind-jvm"), ("multi-process-container", "multi-process-worker")):
+            world = _healthy_world()
+            world["kubectl"][f"pod?app={app}"] = _pods(_pod(restarts=2, last_reason="OOMKilled"))
+            self.provision()
+            done = self.run_script(world)
+            assert set(self.drift_files()) == {role}, (role, done.stderr)
+            assert 'status.containerStatuses[*].lastState.terminated.reason none_eq "OOMKilled": observed "OOMKilled"' in self.drift_files()[role], role
+
+    def test_an_object_value_compares_structurally_whatever_the_key_order(self):
+        """kubectl returns map keys sorted and the catalog may write them in any
+        order; equal objects are the designed state either way."""
+        world = _healthy_world()
+        labels = world["kubectl"]["namespace/seeded-defaults"]["metadata"]["labels"]
+        world["kubectl"]["namespace/seeded-defaults"]["metadata"]["labels"] = dict(reversed(list(labels.items())))
+        done = self.run_script(world)
+        assert done.returncode == 0, done.stderr
+        assert "30 role(s) in their designed state, 0 drifted" in done.stderr
+        assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
         world = _healthy_world()

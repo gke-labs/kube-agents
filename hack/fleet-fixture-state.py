@@ -442,11 +442,14 @@ def walk(steps: list[tuple], roots: list) -> list:
 
 def _same(observed, expected) -> bool:
     """Equality that lets the catalog write `2` for a JSON 2 and `"True"` for
-    a string status without caring which type the API chose."""
+    a string status without caring which type the API chose, and compares an
+    object or a list structurally, so the catalog's key order does not matter."""
     if isinstance(observed, bool) or isinstance(expected, bool):
         return str(observed).lower() == str(expected).lower()
     if isinstance(observed, (int, float)) and isinstance(expected, (int, float)):
         return float(observed) == float(expected)
+    if isinstance(observed, (dict, list)) or isinstance(expected, (dict, list)):
+        return observed == expected
     return str(observed) == str(expected)
 
 

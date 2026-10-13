@@ -193,8 +193,12 @@ print(json.dumps(answers[key]))
 '''
 
 
-def _pod(*, restarts, last_reason, phase="Running", waiting_reason=None):
-    status = {"restartCount": restarts, "lastState": {}}
+def _pod(*, restarts, last_reason, phase="Running", waiting_reason=None, ready=None):
+    # A container is ready when it runs; one waiting in a back-off is not,
+    # though its pod's phase stays Running under restartPolicy Always.
+    if ready is None:
+        ready = phase == "Running" and waiting_reason is None
+    status = {"restartCount": restarts, "lastState": {}, "ready": ready}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
     if waiting_reason:
