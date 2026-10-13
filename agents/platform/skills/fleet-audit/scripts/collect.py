@@ -820,10 +820,12 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
     if current is None:
         # Made at the caller's umask and chmodded below: the umask is
         # process-wide, and a toggle here would race the other threads.
-        directory.mkdir(parents=True, exist_ok=True)
         try:
+            directory.mkdir(parents=True, exist_ok=True)
             current = directory.stat()
         except OSError as exc:
+            # A parent this uid cannot create in: the note, as the reporter's
+            # copy of this rule and every other refusal here.
             return f"{directory} could not be made ({exc})"
     if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
         try:

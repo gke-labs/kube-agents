@@ -12486,6 +12486,15 @@ class PrepareKubeconfigTest(unittest.TestCase):
                 note = collect.prepare_kubeconfig(kc)
             self.assertEqual(note, f"{kc.parent} could not be read ([Errno 13] Permission denied)")
 
+    def test_a_directory_this_uid_cannot_make_is_a_note_not_a_raise(self):
+        # A `$HERMES_HOME` this uid cannot create in: the note, as the reporter's copy of the rule
+        # makes it, rather than a PermissionError out of the collectors' credentials step.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "home" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            with patch.object(Path, "mkdir", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} could not be made ([Errno 13] Permission denied)")
+
     def test_a_stale_kubeconfig_this_uid_cannot_write_is_removed_before_gcloud(self):
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"

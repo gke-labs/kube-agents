@@ -1381,13 +1381,14 @@ class ClassifierSignatureTest(unittest.TestCase):
         nodes[0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.34.1-gke.1000000"
         [row] = [s for s in ur.collect_symptoms(seeded, {**READS["seeded-a"], "nodes": nodes}, ops_for("seeded-a"), SINCE, now=NOW) if s["category"] == ur.CATEGORY_VERSION_SKEW]
         self.assertEqual((row["name"], row["classifications"][0]["evidence"], row["classifications"][0]["detail"]), ("default-pool", "pool default-pool nodes on 1.34.1-gke.1000000, 1.35.8-gke.1380001", "the maintenance window ended 2026-10-03T07:00:00Z, 131 h before this run"))
-        # No window and no exclusion: nothing ended to measure against on a first observation; a
-        # recorded skew is still graded, and says so.
+        # No maintenance policy: no window to be too short, so row 5 never holds, on a first
+        # observation or with the skew recorded; the stored set still carries it.
         bare = cluster_doc("seeded-a")
         bare.pop("maintenancePolicy")
-        self.assertEqual(ur.version_skew(bare, nodes, NOW)["overdue"], False)
-        [row] = [s for s in ur.collect_symptoms(bare, {**READS["seeded-a"], "nodes": nodes}, [], SINCE, now=NOW, baseline=ur.skew_keys(bare, nodes, NOW)) if s["category"] == ur.CATEGORY_VERSION_SKEW]
-        self.assertEqual(row["classifications"][0]["detail"], ur.SKEW_PERSISTED_FORMAT.format(reference=ur.SKEW_NO_REFERENCE_TEXT))
+        reading = ur.version_skew(bare, nodes, NOW)
+        self.assertEqual((reading["overdue"], reading["no_policy"], len(reading["skews"]), len(reading["keys"])), (False, True, 1, 1))
+        self.assertEqual([s for s in ur.collect_symptoms(bare, {**READS["seeded-a"], "nodes": nodes}, [], SINCE, now=NOW) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        self.assertEqual([s for s in ur.collect_symptoms(bare, {**READS["seeded-a"], "nodes": nodes}, [], SINCE, now=NOW, baseline=ur.skew_keys(bare, nodes, NOW)) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
 
     def test_entry_14_gates_on_the_oom_pods_own_pool(self):
         # idle-batch-pool (cgroup v2) was not touched this week; default-pool was. The OOM pod on the untouched pool is medium.
@@ -2997,6 +2998,25 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn(ur.STALE_PARTIAL_TEXT.format(failed="pods"), report)
         self.assertNotIn("cluster not read this run", report)
 
+    def test_a_skew_on_a_cluster_with_no_maintenance_policy_is_an_info_line_and_never_row_5(self):
+        # Row 5 needs a window; a cluster with no maintenance policy whose pool sits two minors behind
+        # gets the Info line naming the readiness watch's pool-skew rule, no entry-5 symptom on the
+        # first run or the next, and is not re-selected for the skew.
+        bare = cluster_doc("gemma-gpu-upgraded")
+        bare.pop("maintenancePolicy")
+        bare["currentMasterVersion"] = "1.32.13-gke.2427000"
+        bare["nodePools"][0]["version"] = "1.30.5-gke.1000000"
+        first, _ = self.collect(FakeFleet(clusters=[bare]))
+        [review] = first["reviews"]
+        skews_text = "pool default-pool at 1.30.5-gke.1000000, control plane at 1.32.13-gke.2427000 (2 minors apart)"
+        self.assertEqual(review["skew_notes"], [ur.SKEW_NO_POLICY_TEXT.format(skews=skews_text)])
+        self.assertEqual([s for s in review["what_failed"] if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        self.assertTrue(any(ur.CATEGORY_VERSION_SKEW in key for key in ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["symptoms"]))
+        second, _ = self.collect(FakeFleet(clusters=[bare]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(([r["cluster"] for r in second["reviews"]], [u["cluster"] for u in second["unchanged"]]), ([], [GEMMA]))
+        self.assertEqual([i for i in second["sections"]["warnings"] if i["object"].startswith("NodePool/")], [])
+        self.assertIn(ur.SKEW_NO_POLICY_TEXT.format(skews=skews_text), ur.render_report(first))
+
     def test_a_forced_cluster_reads_its_own_project_alone(self):
         # `--cluster` without `--project` reads the cluster's own project and nothing else: no
         # `projects list` on an undeclared install, no other declared project's listings, and the
@@ -3012,6 +3032,18 @@ class LedgerAndGuardsTest(unittest.TestCase):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(ur.main(["--cluster", SEEDED, "--no-report"]), 0)
         self.assertFalse(any("projects list" in " ".join(c) or "other-project" in " ".join(c) for c in listing.calls))
+
+    def test_a_malformed_cluster_key_is_a_usage_error(self):
+        # `--cluster seeded-a` is a bare name, not <project>/<location>/<name>: refused before the
+        # lock rather than swept as a project id; an empty part is refused the same way.
+        for bad in ("seeded-a", f"{PROJECT}//seeded-a", f"{PROJECT}/{LOCATION}/seeded-a/extra"):
+            with self.assertRaises(argparse.ArgumentTypeError) as caught:
+                self.collect(scope_projects=None, project=None, cluster=[bad], full=False)
+            self.assertEqual(str(caught.exception), ur.CLUSTER_SHAPE_TEXT.format(cluster=bad))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ur.main(["--cluster", "seeded-a"]), ur.EXIT_USAGE)
+        self.assertIn(ur.CLUSTER_SHAPE_TEXT.format(cluster="seeded-a"), err.getvalue())
+        self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
 
     def test_a_forced_cluster_names_its_project_under_the_overrides_rule(self):
         # `--cluster` names a project as `--project` does: free on an undeclared install, and on a
@@ -5090,7 +5122,7 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(ur.BUDGET_SPENT_TEXT.format(cluster=SEEDED, seconds=ur.RUN_DEADLINE_S, count=1), first["failed_reads"])
         self.assertEqual([w for w in first["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD], [])
         report = ur.render_report(first)
-        self.assertIn(ur.INFO_BUDGET_SPENT.format(seconds=ur.RUN_DEADLINE_S, reviewed=1, rechecked=0, deferred=1, deferred_rechecks=0), report)
+        self.assertIn(ur.INFO_BUDGET_SPENT.format(seconds=ur.RUN_DEADLINE_S, reviewed=1, rechecked=0, cut=0, cut_rechecks=0, deferred=1, deferred_rechecks=0), report)
         manifest = json.loads(Path(first["manifest_path"]).read_text())
         entry = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         self.assertEqual((entry["outcome"], entry["error"], manifest["partial"]), (ur.MANIFEST_OUTCOME_GATE_FAILED, ur.BUDGET_SPENT_REASON.format(seconds=ur.RUN_DEADLINE_S), True))
@@ -5149,6 +5181,17 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(manifest["partial"])
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["partial_read"], "2026-10-08T18:00:00Z")
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_a_budget_spent_inside_the_last_review_is_said_on_the_report(self):
+        # With nothing queued behind it, a read cut inside the last review deferred nothing, yet the
+        # budget was spent: the flag comes from the cut reads and the clock, the budget dict counts
+        # the cut review, and the Info line is printed.
+        fleet = FakeFleet(clusters=[cluster_doc("gemma-gpu-upgraded")], stall={("gemma-gpu-upgraded", "pods"): 30.0})
+        with mock.patch.object(ur, "RUN_DEADLINE_S", 1), redirect_stderr(io.StringIO()):
+            result = ur.collect(args(manifest_file=str(self.home / "manifest.json")), run=fleet, now=NOW, max_workers=1)
+        self.assertEqual((result["deferred"], result["deferred_rechecks"], result["budget_spent"], result["budget"]["cut"], result["budget"]["cut_rechecks"]), ([], 0, True, 1, 0))
+        self.assertIn(ur.INFO_BUDGET_SPENT.format(seconds=1, reviewed=1, rechecked=0, cut=1, cut_rechecks=0, deferred=0, deferred_rechecks=0), ur.render_report(result))
+        self.assertTrue(json.loads(Path(result["manifest_path"]).read_text())["partial"])
 
     def test_api_disabled_project_does_not_make_the_run_partial(self):
         # A project whose Kubernetes Engine API is off is an empty project, not a failed read, as the

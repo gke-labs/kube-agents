@@ -297,7 +297,7 @@ BUDGET_SPENT_TEXT = "{cluster}: not read this run; the read budget ({seconds} s)
 BUDGET_SPENT_REASON = "not read this run: the read budget ({seconds} s) was spent; held, read first next run"
 RECHECK_DEFERRED_TEXT = "the read budget ({seconds} s) was spent before its re-check started"
 RECHECK_DEFERRED_LINE = "re-check not started, the read budget spent; {guards} guard(s) held"
-INFO_BUDGET_SPENT = "Read budget spent: {seconds} s after {reviewed} review(s) and {rechecked} re-check(s); {deferred} cluster(s) held for the next run, {deferred_rechecks} re-check(s) not started."
+INFO_BUDGET_SPENT = "Read budget spent: {seconds} s after {reviewed} review(s) and {rechecked} re-check(s); {cut} review(s) and {cut_rechecks} re-check(s) cut mid-read, {deferred} cluster(s) held for the next run, {deferred_rechecks} re-check(s) not started."
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
@@ -481,6 +481,10 @@ SKEW_OPEN_TEXT = "Version skew held: {skews}; {state}, so the roll may still com
 SKEW_FIRST_SEEN_TEXT = "Version skew first seen: {skews}; {reference}; graded at the next full run if it still stands."
 SKEW_PERSISTED_FORMAT = "recorded at the previous full run and still standing; {reference}"
 SKEW_NO_REFERENCE_TEXT = "no maintenance window close or exclusion end to measure against"
+# A cluster with no maintenance policy has no window to be too short: row 5
+# does not hold there, and the skew is the pool-skew reading the readiness
+# watch's shipped rule makes (entry 10); listed, never graded or re-selected.
+SKEW_NO_POLICY_TEXT = "Version skew, no maintenance policy: {skews}; entry 5 needs a window, and the readiness watch's pool-skew rule reads a standing skew before the next upgrade; not graded here."
 SKEW_RESELECT_REASON = "version skew recorded at the previous run; graded now that the window has closed since"
 STATUS_NEW, STATUS_UPGRADED, STATUS_FORCED, STATUS_REGRADED = "new", "upgraded", "forced", "re-graded"
 # A symptom against the ledger's baseline from the cluster's last review.
@@ -524,6 +528,10 @@ EXIT_PROJECTS_NONE = "none"
 EXIT_NOTE_FORMAT = " ({note})"
 # A `--cluster` names its project under `--project`'s rule: inside the readable scope.
 FORCED_OUTSIDE_SCOPE_TEXT = "--cluster {cluster}: {error}"
+# A cluster key is <project>/<location>/<name>, three non-empty parts; a bare
+# name would otherwise be swept as a project id.
+CLUSTER_KEY_PARTS = 3
+CLUSTER_SHAPE_TEXT = "--cluster {cluster}: a cluster is named <project>/<location>/<name>"
 SCOPE_LOG_FORMAT = "scope: the install's declared scope, {count} project(s) from the fleet_scope tool"
 FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
 NOT_FULL_TEXT = "no --full: a scoped run"
@@ -1640,8 +1648,10 @@ def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], 
             recent = [op for op in ops if _op_end(op) >= last_run]
             if recent:
                 reasons.append(f"{len(recent)} upgrade operation(s) since {fmt_ts(last_run)}")
-            if any(BASELINE_SEPARATOR + CATEGORY_VERSION_SKEW + BASELINE_SEPARATOR in key_text for key_text in entry.get("symptoms") or []):
+            if any(BASELINE_SEPARATOR + CATEGORY_VERSION_SKEW + BASELINE_SEPARATOR in key_text for key_text in entry.get("symptoms") or []) and ((cluster.get("maintenancePolicy") or {}).get("window")):
                 # A skew the previous run recorded: the review grades it now.
+                # A cluster with no maintenance policy is never graded for
+                # one (row 5 needs a window), so it is not re-selected for it.
                 if not reasons:
                     status = STATUS_REGRADED
                 reasons.append(SKEW_RESELECT_REASON)
@@ -3194,6 +3204,7 @@ def version_skew(cluster: dict, nodes: list[dict], now: datetime) -> dict:
         if len(found) >= SKEW_MINORS:
             skews.append((pool, SKEW_WITHIN_POOL_FORMAT.format(pool=pool, versions=", ".join(sorted(found)))))
     policy = ((cluster.get("maintenancePolicy") or {}).get("window") or {})
+    no_policy = not policy
     open_now, last_close = _last_closing(policy, now)
     state = WINDOW_OPEN_STATE if open_now else ""
     last_end: tuple[datetime, str] | None = None
@@ -3218,7 +3229,8 @@ def version_skew(cluster: dict, nodes: list[dict], now: datetime) -> dict:
         "skews": skews,
         "state": state,
         "reference": reference_text,
-        "overdue": bool(skews) and not state and bool(overdue_refs),
+        "overdue": bool(skews) and not state and bool(overdue_refs) and not no_policy,
+        "no_policy": no_policy,
         "keys": [BASELINE_SEPARATOR.join((_object_ref("", "NodePool", pool), CATEGORY_VERSION_SKEW, SKEW_REASON)) for pool, _ in skews],
     }
 
@@ -3237,7 +3249,10 @@ def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None
     if now is None:
         return []
     reading = version_skew(cluster, nodes, now)
-    if not reading["skews"]:
+    if not reading["skews"] or reading["no_policy"]:
+        # No policy: no window to be too short, so row 5 never holds; the
+        # review lists the skew (`SKEW_NO_POLICY_TEXT`) and the stored set
+        # carries it, nothing more.
         return []
     previous = set(baseline or [])
     rows = []
@@ -4328,7 +4343,10 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     skew = version_skew(cluster, reads.get("nodes") or [], now or now_utc())
     if skew["skews"] and not any(sym["category"] == CATEGORY_VERSION_SKEW for sym in symptoms):
         skews_text = "; ".join(text for _, text in skew["skews"])
-        review["skew_notes"] = [SKEW_OPEN_TEXT.format(skews=skews_text, state=skew["state"]) if skew["state"] else SKEW_FIRST_SEEN_TEXT.format(skews=skews_text, reference=skew["reference"] or SKEW_NO_REFERENCE_TEXT)]
+        if skew.get("no_policy"):
+            review["skew_notes"] = [SKEW_NO_POLICY_TEXT.format(skews=skews_text)]
+        else:
+            review["skew_notes"] = [SKEW_OPEN_TEXT.format(skews=skews_text, state=skew["state"]) if skew["state"] else SKEW_FIRST_SEEN_TEXT.format(skews=skews_text, reference=skew["reference"] or SKEW_NO_REFERENCE_TEXT)]
     mark_since(symptoms, stored, first_op)
     review["what_failed"] = symptoms
     # Every skew seen joins the stored set, graded or not, so the next full
@@ -5045,7 +5063,7 @@ def render_report(result: dict) -> str:
         lines += [INFO_SCOPE_NOTE.format(note=_cell(result["scope_note"])), ""]
     if result.get("budget_spent"):
         budget = result["budget"]
-        lines += [INFO_BUDGET_SPENT.format(seconds=budget["seconds"], reviewed=budget["reviewed"], rechecked=budget["rechecked"], deferred=budget["deferred"], deferred_rechecks=budget["deferred_rechecks"]), ""]
+        lines += [INFO_BUDGET_SPENT.format(seconds=budget["seconds"], reviewed=budget["reviewed"], rechecked=budget["rechecked"], cut=budget["cut"], cut_rechecks=budget["cut_rechecks"], deferred=budget["deferred"], deferred_rechecks=budget["deferred_rechecks"]), ""]
     if not (info["clean"] or info["unchanged"] or info["failed_reads"] or info.get("removed") or info.get("rechecked") or info.get("upgrading")):
         lines += [NONE_LINE, ""]
     # Severity sections keep `_none_`; Info is never empty after a review.
@@ -5171,11 +5189,14 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
         elif declared_scope.declared and not declared_scope.projects:
             raise argparse.ArgumentTypeError(declared_scope.empty_error())
         for key in sorted(forced):
+            parts = key.split(CLUSTER_KEY_SEPARATOR)
+            if len(parts) != CLUSTER_KEY_PARTS or not all(parts):
+                raise argparse.ArgumentTypeError(CLUSTER_SHAPE_TEXT.format(cluster=key))
             # The project a `--cluster` names is admitted by the override's
             # rule: free on an undeclared install, else inside the readable
             # scope; a sweep of a project outside the declared scope is what
             # the scope exists to refuse, whichever flag names it.
-            forced_error = declared_scope.override_error(key.split(CLUSTER_KEY_SEPARATOR)[0])
+            forced_error = declared_scope.override_error(parts[0])
             if forced_error:
                 raise argparse.ArgumentTypeError(FORCED_OUTSIDE_SCOPE_TEXT.format(cluster=key, error=forced_error))
     full = bool(getattr(args, "full", False))
@@ -5589,6 +5610,14 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         elif guard["id"] in unlisted_operation_ids:
             # Held: its candidate stands as it was, no review having seen it.
             guard["last_seen"] = seen_at
+    # The budget was spent when anything was held or deferred, when a read
+    # inside a review or a re-check was refused for it, or when the clock
+    # says so after the last pool: the last cluster's reads are where it
+    # falls on a fleet that nearly fits, with nothing queued behind them.
+    budget_text = BUDGET_READ_TEXT.format(seconds=RUN_DEADLINE_S)
+    cut_reviews = sorted(r["cluster"] for r in reviews if any(budget_text in e for e in r["read_errors"]))
+    cut_rechecks = sorted(r["cluster"] for r in rechecks if any(budget_text in e for e in r.get("errors") or []) and not r.get("deferred"))
+    budget_spent = bool(deferred or deferred_rechecks or cut_reviews or cut_rechecks) or not budget_left()
     # The report's guard lines carry the store's record of each guard (first
     # seen, reviews), not the fresh dict this run's review built.
     merged_by_id = {g["id"]: g for g in new_guards["guards"]}
@@ -5645,8 +5674,8 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         "held_clusters": held_clusters,
         "deferred": deferred,
         "deferred_rechecks": deferred_rechecks,
-        "budget_spent": bool(deferred or deferred_rechecks),
-        "budget": {"seconds": RUN_DEADLINE_S, "reviewed": len(reviews), "rechecked": len(to_recheck) - deferred_rechecks, "deferred": len(deferred), "deferred_rechecks": deferred_rechecks},
+        "budget_spent": budget_spent,
+        "budget": {"seconds": RUN_DEADLINE_S, "reviewed": len(reviews), "rechecked": len(to_recheck) - deferred_rechecks, "cut": len(cut_reviews), "cut_rechecks": len(cut_rechecks), "deferred": len(deferred), "deferred_rechecks": deferred_rechecks},
         "scope_unread": sorted(unread_outcomes.items()),
         "scope_unresolved": unresolved_outcome,
         "scope_note": scope_note,
