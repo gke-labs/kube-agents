@@ -78,8 +78,11 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
    the readiness check to name before the next upgrade. The line for an unchanged cluster gives the
    date of its last upgrade and its next target version. The line for a cluster the review could
    not read gives the reason. The report lists a cluster in the middle of an upgrade as upgrading
-   now. The review reads it after the upgrade ends. Until then, the tracked issue keeps that
-   cluster's earlier findings. "None" appears only when the count is zero.
+   now. The review reads it after the upgrade ends. Until then, the tracked issue stays open and
+   names the cluster as not read. The checklist does not show that cluster's entries while it is
+   not read. The review keeps each entry's first-seen date and review count in its own record. The
+   entries return with those values when a review reads the cluster and finds the failures. A
+   failure that is gone by then leaves no entry. "None" appears only when the count is zero.
 
 4. **Store the report where the agent can read it,** on the storage its tools use, with the latest
    report at a fixed path. Post one line per reviewed cluster in chat, with the counts and the most
@@ -238,7 +241,9 @@ operation already in the list prints nothing. This is the one statement of what 
 writes; §3.5 and §3.6 defer to it. The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
 each; events too on a cluster holding an event-only guard, §3.5), so the stored set is at most a
-week old rather than as old as the previous upgrade. And each
+week old rather than as old as the previous upgrade; what the stream's checks say about an
+unchanged cluster rests on the operations listing that found no upgrade, and §3.3 states the
+manifest entry that makes such a Sunday a complete run. And each
 symptom carries its own onset. The default is the pod's own evidence: a Pending pod's start, a
 crash-looping or not-ready pod's `Ready=False` transition (falling back to its start when the pod
 has restarted; a container's last termination is the latest crash, not the first, and is never the
@@ -282,9 +287,10 @@ are held unchanged, its clusters are listed under "Reads that failed", and the r
 moves the latest link, the way `fleet_drift.py` and `patch_readiness.py` keep a failed project as
 that project's gap rather than the sweep's. In the collector manifest (§3.3) those clusters are
 entries with `outcome: unreachable` and the listing error, which the harness's cross-check turns
-into the `scope.skipped` requirement on the findings document: the stream's previous findings on
-those clusters are held rather than resolved, the ledger issue stays open, and nothing is posted as
-fixed because a project went unread. Every run without `--full` is _scoped_, whatever its
+into the `scope.skipped` requirement on the findings document: no finding on those clusters is
+announced resolved, the ledger issue stays open with the gap named, and the guards keep each
+finding's id, first-seen date and review count until a run reads the project again; §3.3 says what
+the issue body shows meanwhile. Every run without `--full` is _scoped_, whatever its
 `--project` set: a run narrowed by `--cluster`, by the question that invoked it, or any hand run,
 with or without `--project`. A scoped run reviews only its targets, never
 prunes a ledger entry or a guard outside them, never adds a project to the fleet set (a cluster it
@@ -319,43 +325,69 @@ generic (C) text, which is the out-of-the-box experience.
 The boundary between the collector and the fleet-audit harness is the one every sibling collector
 already uses, the collector manifest
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md)), not a contract of this
-design's own. On a full run the collector writes it beside the report (`--manifest-file`): one
-`clusters[]` entry per cluster it enumerated, with `outcome: collected` and a `commands[]` record
-per check that ran, or `outcome: unreachable` or `gate-failed` with the error for a cluster whose
-project listing failed or whose reads failed; a cluster upgrading now is not `collected` either:
-the run read nothing on it, so it is `gate-failed` with the operation in flight as its `error`, the
-SOP's `draft` lists it in `scope.skipped` with that reason, and `finish` holds the stream's previous
-findings on it rather than resolving them. That costs a partial run: `finish` announces no finding
-as fixed that Sunday and keeps the ledger issue open with a comment naming the gap, until a full
-run reads the cluster (the after-upgrade route reviews it within the half hour, but a scoped run
-files nothing). The alternative was rejected on the manifest's own contract: `checks_not_applicable`
-is for a check that cannot apply to a cluster (Autopilot, no such resource kind), not for one
-deferred, and a candidate re-emitted from `guards.json` with no read behind it would make the
-manifest vouch for an observation nobody made. Then `candidates[]` for every
-incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
-excerpt and the mitigation text. The hold follows the rule the harness implements and no other: a
-previous finding is held, rather than announced resolved, only while a candidate carries the same
-`(check, cluster, namespace, object)` id (`still_flagged_ids` is that set of candidate ids), or
-while the run is partial, when `finish` announces nothing fixed at all (below). So a `failure`
-guard the run observes again, an event-only guard through its events read (§3.5), emits a
-candidate under the check id its finding was first filed with, the unclassified Warning's guard
-among them (§3.5), graded the Warning requirement 3 makes it and carrying the persistence in its
-detail: first seen, and the number of reviews that have seen it. A guard the re-check clears emits
-nothing, and the harness resolves the finding. A guard whose re-check read failed emits nothing
-either, and is held as it stands: a candidate with no read behind it would vouch for an
-observation nobody made, the shape rejected above for an upgrading cluster. Instead the check its
-finding was filed under goes in the cluster's `checks_unevaluated[]`, the failed read in its
-`limitations`, and that check leaves the cluster's `checks_run`, which `finish` reads as a partial
-run: it announces nothing fixed and keeps the ledger issue open naming the gap, as for an upgrading
-cluster, so the finding is neither resolved nor filed again; the guard's review count does not
-move. A persisting finding has no check id of its own: a candidate under a new id would file a new
-finding and let the harness announce the old one fixed, the resolved-plus-new pair the fixed row
-order (§3.4) exists to prevent. A `risk` guard is Info, filed nowhere, and is no candidate, so a
-clean Sunday discloses nothing and runs silent; `checks_unevaluated[]` and `limitations` on a
-cluster whose read failed, in a review or in a re-check; and, in the carried keys the manifest reserves for
-collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
-stream is in `COLLECTOR_AUDITS`, the SOP passes the manifest to `finish`, and `cross_check_manifest`
-enforces what this design would otherwise state as prose: an unreachable cluster must be in
+design's own; the harness's rules are used as they stand on `main`, and this paragraph is the one
+statement of what the manifest carries. The stream's roster, its `AUDITS` entry, is six check ids,
+each decided by one read: `upgrade-operation-failed` by the operations listing;
+`upgrade-broke-workload`, `upgrade-symptom-tentative`, `upgrade-symptom-unclassified` and
+`symptom-predates-upgrade` by the pods list; `node-broken-after-upgrade` by the nodes list.
+`coverage_gaps` measures every `scope.clusters` entry against all six and files a gap for any it
+finds in neither `checks_run` nor `checks_not_applicable`, so each `collected` entry carries all
+six or names its gap. On a full run the collector writes the manifest beside the report
+(`--manifest-file`), one `clusters[]` entry per cluster it enumerated. A reviewed cluster is
+`collected`, with a `commands[]` record per check naming the read that decided it. An unchanged
+cluster is `collected` too: the operations listing, with the cluster's versions, decided that
+nothing upgraded it, which answers every check that asks what the upgrade did, so `commands[]`
+carries all six checks backed by that listing, and a check whose read the re-check made (pods for
+the four workload checks, nodes for the node check) is backed by that read instead; "only the
+reads that guard needs" (§3.2) is a read rule, and the listing is what the checks rest on. A check
+whose read ran and failed, in a review or in a re-check, is in `checks_unevaluated[]` with the
+read, the read is named in `limitations`, and the check is in neither `commands[]` nor
+`checks_run`; a failed operations listing leaves `upgrade-operation-failed` unevaluated on every
+cluster of that project, and an unchanged cluster of that project carries only the checks a
+re-check read backs, so `coverage_gaps` names the rest. A cluster whose project listing failed or
+whose every read failed is `unreachable` or `gate-failed` with the error, and a cluster upgrading
+now is `gate-failed` with the operation in flight as its `error`: the run read nothing on it.
+`candidates[]` carries one candidate per incident the report files, an Error at `major` and a
+Warning at `minor`, with the check id, object, excerpt and the mitigation text, and one per
+`failure` guard the run observed again (§3.5), under the check id its finding was first filed with,
+graded the Warning requirement 3 makes it and carrying the persistence in its detail: first seen,
+and the number of reviews that have seen it. A `risk` guard is Info, filed nowhere, and is no
+candidate. The carried keys the manifest reserves for collector-resolved fleet facts hold the
+versions, operations and incident kinds the SOP copies. The SOP's `draft` builds `scope.clusters`
+from the `collected` entries, with `checks_run` equal to their `commands[]` and the collector's
+`limitations` copied, and `scope.skipped` from the rest with their errors, so on a Sunday where
+every cluster was read and nothing was upgraded `coverage_gaps` is empty, the run is complete, and
+a clean document closes the ledger issue and runs silent (requirements 3(D) and 4).
+
+The hold follows the rule the harness implements and no other. A previous finding is announced
+resolved only on a complete run, and only when no candidate carries its `(check, cluster,
+namespace, object)` id (`still_flagged_ids` is that set of candidate ids). A guard the re-check
+observes again therefore emits its candidate, the unclassified Warning's guard among them (§3.5),
+under its original check id, and a guard the re-check clears emits nothing, so the harness resolves
+the finding. A persisting finding has no check id of its own: a candidate under a new id would
+file a new finding and let the harness announce the old one fixed, the resolved-plus-new pair the
+fixed row order (§3.4) exists to prevent. A cluster the run did not read, upgrading now,
+unreachable, or with a re-check read that failed, emits no candidate: a candidate with no read
+behind it would make the manifest vouch for an observation nobody made, and
+`checks_not_applicable` is for a check that cannot apply to a cluster (Autopilot, no such resource
+kind), not for one deferred. What `finish` does with such a run is fixed: the run is partial, so
+`finish` announces no finding resolved, closes nothing, keeps the ledger issue open and posts a
+comment naming the cluster. The issue body does not keep the unread cluster's entries meanwhile.
+The body is rewritten on every run from the document and the candidates; the validator refuses a
+finding on a cluster in `scope.skipped`; a held row exists only for a candidate
+(`collector_held_entries` is the previous body's ids that candidates still carry); and the harness
+holds nothing on a cluster the run did not read, so those entries leave the body for the gap. The
+stream's memory across the gap is `guards.json`: each guard keeps the finding's id, its first-seen
+date and its review count unchanged, since no run observed it, and the next run that reads the
+cluster decides from its own reads. A failure still present emits the candidate under the same id
+with that persistence in its detail, so the entry returns to the body reading "first seen <date>,
+N reviews"; the delta marks it new to the body, because the previous body lacked it, and the
+entry's own text says it is not. A failure that is gone clears the guard and emits nothing; no
+resolution is announced, since no body carried it, and the report's Info line records the cleared
+guard. The after-upgrade route reads an upgrading cluster within the half hour, but a scoped run
+files nothing, so the gap in the body lasts until the next full run. The stream is in
+`COLLECTOR_AUDITS`, the SOP passes the manifest to `finish`, and `cross_check_manifest` enforces
+what this design would otherwise state as prose: an unreachable cluster must be in
 `scope.skipped`, a check the collector did not run cannot be claimed, every candidate is published
 or disclosed, and the held set is the manifest's. `report.json` and the Markdown remain the human
 report; they are not what `finish` reads.
@@ -404,40 +436,49 @@ floor, a workload with more than one replica: a single replica displaced by a dr
 Pending replacement) or entry 1 (the budget that held its drain), never 3, so
 `seeded-upgrade/pinned-batch-runner` files entry 1 on its budget (§4) and, while its replacement is
 still Pending, a second incident on the Deployment graded by the replacement's scheduling message
-(row 2 when a clause reads `Insufficient cpu` or `memory`, the shape the seeded fleet's pinned
-replicas write; else row 12). Row 12 is the generic one, and the scheduler's clause set is its
-discriminator. The clauses are the comma-separated reasons the scheduler writes after `nodes are
-available:` up to the first period; the `preemption:` sentence that follows is not part of the
-set. The scheduler writes a `didn't match Pod's node affinity/selector` clause for every node group
-a pinned pod does not target, beside the clause that says why its own pool refused it
-(`Insufficient cpu`, `were unschedulable`, an untolerated taint). Row 12 holds when a clause is a
-selector or affinity miss and no earlier row holds, and it is `high` only when every clause is a
-miss. A mixed message is `medium`, and the repository's entry-12 reproduction is one:
-`bench/upgrade-scenarios/evidence/12/label.txt`, captured during the drain, reads `1 node(s) were
-unschedulable, 2 node(s) didn't match Pod's node affinity/selector`, so it files entry 12 at
-`medium`; once the drain ends the same pod's message carries misses alone. Misses alone still do
-not say the pool lost the label: an autoscaled pool at zero nodes, a label a pool never carried or
-a deleted pool write the same message, and the collector holds no before-state of node labels. Row
-12 is therefore `medium` unless every clause is a miss and the selector names a label a kubelet
-stopped setting at or before the pool's minor, and then
-it is `high`. The list is the collector's `DROPPED_NODE_LABELS` table, label to the minor that
-dropped it, each entry with its source the way `removed_apis.json` beside `api_deprecation_scan.py`
-cites one; it is not in the catalogue, whose entry 12 names no dropped label and records that no
-GKE label removal is verified, so the table holds one entry today, `node-role.kubernetes.io/master`,
-which kubeadm stopped applying in 1.24 (kubernetes/kubeadm#2200 and the 1.24 changelog), and the
+(row 2: its selector names a label its pool's nodes carry, and that pool's clause reads
+`Insufficient cpu`). Row 12 is the generic one, and its discriminator is the nodes read, not the
+message. The scheduler writes a `didn't match Pod's node affinity/selector` clause for every node
+group a pinned pod does not target, beside the clause that says why its own pool refused it
+(`Insufficient cpu`, `Too many pods`, `were unschedulable`, an untolerated taint), so on a cluster
+with more than one pool every pinned Pending pod carries a miss clause and the clause proves
+nothing. The collector reads the pod's pins, its `nodeSelector` and required node affinity, against
+the labels the nodes carry. When a node carries the labels of one of the pod's terms, the pod's own
+pool evaluated it and refused it for the reason in that pool's clause: row 2 when the clause reads
+`Insufficient cpu` or `memory`, row 18 for `nvidia.com/gpu`, else unclassified, never 12. Row 12
+holds only when no node carries the pinned labels. That still does not say the pool lost the label:
+a label the pool never carried, a deleted pool or an autoscaled pool at zero nodes read the same,
+and the collector holds no before-state of node labels, so row 12 is `medium`. The repository's
+entry-12 reproduction, `bench/upgrade-scenarios/evidence/12/label.txt`, is this case once the pool
+is rebuilt: the pool's node carried `team=legacy` before the operation and its replacement does
+not, so no node carries the pinned label from then on. Its drain-time message, `1 node(s) were
+unschedulable, 2 node(s) didn't match Pod's node affinity/selector`, is one no run grades, since a
+cluster with an operation in flight is not reviewed (§3.2); a node cordoned by hand on a settled
+cluster that still carries the label makes the pod unclassified, which is right, since the cordon
+refused it. The clause set, the comma-separated reasons after `nodes are available:` up to the
+first period with the `preemption:` sentence excluded, is quoted as evidence and names the pool's
+own reason; it decides no row. A row-12 match is `high` only when the selector names a label in
+the collector's `DROPPED_NODE_LABELS` table, label to the minor at which GKE's node image or
+kubelet stopped setting it, each entry with its source the way `removed_apis.json` beside
+`api_deprecation_scan.py` cites one. The table is empty today. The catalogue's entry 12 records
+that no GKE label removal is verified, and the one public case, kubeadm's
+`node-role.kubernetes.io/master` lost at 1.24, is a label no GKE node ever carried (the
+reproduction's nodes show `ROLES <none>` before and after the rebuild) and is entry 17's evidence,
+so it is not an entry. An entry joins the table only with a GKE release note or GKE document that
+names the label and the minor, never from a kubeadm or upstream change and never from memory; the
 deprecated `beta.kubernetes.io/` and `failure-domain.beta.kubernetes.io/` labels, still set, stay a
-before-signal shape and never a drop. A label the table does not name leaves row 12 at `medium`; an
-entry joins the table with its source, never from memory. An
+before-signal shape and never a drop. Until an entry is sourced every row-12 match is `medium`, and
+the `high` branch is reached only by the unit test that injects an entry. An
 `OOMKilled` container on a migrated pool with an old runtime that also runs several processes is
 entry 14, with entry 15 named in the evidence as a second cause.
 
 A match is _sure_ (`high`) when the signature names the entry's own mechanism and the pool the
 object sits on had an operation in the window: a webhook named in the rejection, a selector that
-names a dropped label in a message of misses alone, a runtime image below the catalogue's floor on
-a pool migrated to cgroup v2, an image that pulls on untouched nodes and fails on rebuilt ones, a
-volume attach error naming a PersistentVolume, a driver error text, a budget with no allowance on a
-drained node. On a first run a match whose only onset is a recreated pod's is capped at `medium`
-(§3.2). Anything less,
+names a label the dropped-label table lists (none today), a runtime image below the catalogue's
+floor on a pool migrated to cgroup v2, an image that pulls on untouched nodes and fails on rebuilt
+ones, a volume attach error naming a PersistentVolume, a driver error text, a budget with no
+allowance on a drained node. On a first run a match whose only onset is a recreated pod's is capped
+at `medium` (§3.2). Anything less,
 a generic `OOMKilled`, an image pull failure with no untouched node to compare, a Pending pod with
 no pool operation, is _tentative_ (`medium`). Text a namespace user can write is never enough for
 `high` on its own: an Event's `reason` and `message` and a container's termination message are
@@ -485,8 +526,10 @@ automatic and both reversible:
   requirement 2 says; the event hour is the limit, and a symptom that recurs less often than hourly
   can be absent at the read, clear, and be filed again when a review sees it (§8). A re-check read
   that fails holds the guard as it stands: no candidate, no review counted, the check in the
-  cluster's `checks_unevaluated[]` and the failed read in its `limitations` (§3.3), so the ledger
-  neither resolves nor re-files the finding. The collector merges the file on
+  cluster's `checks_unevaluated[]` and the failed read in its `limitations`, so the partial run
+  announces nothing resolved; the finding's entry leaves the ledger body for that run and returns,
+  with its first-seen date and review count, when a run reads the cluster and finds it, as §3.3
+  states for every gap. The collector merges the file on
   every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
   shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
   it ships, reads the file through its own sandbox hop and adds a line per live guard to its next
@@ -636,7 +679,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
-   (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file, with check
+   (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` entry with the six check ids §3.3 lists, so findings file, with check
    ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (`start`, the collector and `finish` with its
    manifest where a repository is linked; the collector alone without one) and the first-run stage
    marking this job due without a repository; the `upgrade-retrospective-after-upgrade` roster
@@ -667,8 +710,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 ## 7. Testing
 
 - **Unit.** Each classifier signature against one captured fixture, row 3's against a workload of
-  one replica (entry 2 or 1, never 3) and of two, row 12's against the entry-12 reproduction's
-  mixed message (`medium`) and against misses alone with a dropped label (`high`); selection (new,
+  one replica (entry 2 or 1, never 3) and of two, row 12's against the entry-12 reproduction after
+  the rebuild (no node carries the pinned label: `medium`), against a pinned pod whose pool's nodes
+  carry the label and refuse it for a taint or `Too many pods` (unclassified, never 12), and the
+  `high` branch with a table entry the test injects, the shipped table being empty; selection (new,
   upgraded by version, upgraded by operation, unchanged, forced; `--after-upgrade` against the
   window's two bounds, the reviewed list pruned at the window, and the no-baseline line when no
   full run is recorded); the ledger and guards round trips, an unclassified symptom's guard among
@@ -676,11 +721,14 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   cleared by one that does not; a persisting guard's candidate under its original check id with
   first seen and the review count, a cleared guard emitting nothing, and a guard whose re-check
   read failed emitting nothing with its check in `checks_unevaluated[]` (the manifest against
-  `still_flagged_ids` and `cross_check_manifest`); an Error the after-upgrade route reported,
-  filed at `major` by the next full run; an unreachable cluster and an upgrading cluster recorded
-  without failing the run and without a candidate; the watch marking nothing for a paused,
-  disabled or absent job; the report rendering, including an empty section and the severity of
-  each fixture incident.
+  `still_flagged_ids` and `cross_check_manifest`); the manifest entry of an unchanged cluster
+  carrying all six checks backed by the operations listing, so `coverage_gaps` is empty; a guard's
+  id, first-seen date and review count unchanged across a run that did not read its cluster, and
+  the candidate the next reading run emits carrying them; an Error the after-upgrade route
+  reported, filed at `major` by the next full run; an unreachable cluster and an upgrading cluster
+  recorded without failing the run and without a candidate; the watch marking nothing for a
+  paused, disabled or absent job; the report rendering, including an empty section and the
+  severity of each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
@@ -702,6 +750,11 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   confidence, and the SOP may downgrade one. A wrong guard costs one extra line in a readiness
   report until the next run re-checks the cluster and drops it, the next Sunday run for a guard
   whose only source was events.
+- A cluster a Sunday run cannot read, upgrading at the tick or with a failed read, keeps the ledger
+  issue open and takes its entries out of the issue body for that week; `guards.json` keeps their
+  ids, first-seen dates and review counts, and the next full run restores or clears them from its
+  own reads (§3.3). Not running `finish` on such a Sunday would keep the body whole but freeze the
+  whole fleet's ledger for the week, and was rejected for that.
 - Fourteen days for the first run, and a fixed Sunday evening for the fleet-wide run (the
   after-upgrade watch covers the slot after each window) rather than a slot after each
   install's maintenance window, are starting values.
