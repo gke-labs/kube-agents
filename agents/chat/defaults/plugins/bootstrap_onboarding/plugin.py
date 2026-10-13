@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from pathlib import Path
 from types import ModuleType
@@ -76,9 +77,12 @@ GREETED_MARKER = ".bootstrap_greeted"
 # written_at (epoch seconds, stamped at apply) is refused with a warning, so
 # one a failed destroy leaves behind disarms on its own.
 # JSON: {"phrase": str, "variant": str, "written_at": number,
-# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION)}.
+# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION),
+# "report": str (required with from_report)}.
 # The variant names the greeting, or is EVAL_VARIANT_FROM_REPORT: pick it with
-# the same report check the opening turn makes.
+# the opening turn's report check, run on the file the request's "report" names
+# rather than the real report, so a case never puts a file where onboarding
+# reads one.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
@@ -87,6 +91,9 @@ EVAL_KEY_WRITTEN_AT = "written_at"
 EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
 EVAL_VARIANT_FROM_REPORT = "from_report"
+EVAL_KEY_REPORT = "report"
+# A bare file name beside the real report that nothing in onboarding reads.
+EVAL_REPORT_NAME = re.compile(r"^INVENTORY\.bench-[a-z0-9-]+\.md$")
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
@@ -255,6 +262,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
             variant = str(request.get(EVAL_KEY_VARIANT) or "")
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
             home_channel_set = request.get(EVAL_KEY_HOME_CHANNEL_SET) is True
+            report_name = str(request.get(EVAL_KEY_REPORT) or "")
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError, RecursionError) as e:
@@ -283,9 +291,12 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
                 EVAL_REQUEST_MAX_AGE_SECONDS,
             )
             continue
+        if variant == EVAL_VARIANT_FROM_REPORT and not EVAL_REPORT_NAME.match(report_name):
+            logger.warning("Ignoring %s: %s names no report file matching %s.", marker, EVAL_KEY_REPORT, EVAL_REPORT_NAME.pattern)
+            continue
         logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
         if variant == EVAL_VARIANT_FROM_REPORT:
-            return _report_ready(data_dir), home_channel_set
+            return _report_ready(data_dir, report_name), home_channel_set
         return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
 
@@ -299,8 +310,9 @@ def _load_sandbox_exec() -> ModuleType:
     return module
 
 
-def _report_ready(data_dir: Path) -> bool:
-    """Whether the ranked report is written where delivery will read it.
+def _report_ready(data_dir: Path, name: str = REPORT_NAME) -> bool:
+    """Whether the ranked report, or the eval seam's ``name``, is written where
+    delivery reads the report.
 
     Never raises. A sandbox read that fails or outlasts
     REPORT_CHECK_TIMEOUT_SECONDS is False, and so is anything that keeps this
@@ -310,19 +322,19 @@ def _report_ready(data_dir: Path) -> bool:
         sandbox_exec = _load_sandbox_exec()
         in_sandbox = sandbox_exec.sandbox_enabled()
     except Exception as e:
-        logger.warning("Could not tell whether the shell sandbox is on; checking %s locally: %s", REPORT_NAME, e)
+        logger.warning("Could not tell whether the shell sandbox is on; checking %s locally: %s", name, e)
         in_sandbox = False
     if not in_sandbox:
         try:
-            return (data_dir / REPORT_NAME).exists()
+            return (data_dir / name).exists()
         except OSError:
             return False
     try:
         report = sandbox_exec.read_bytes(
-            f"{SANDBOX_HOME}/{REPORT_NAME}", max_bytes=1, timeout=REPORT_CHECK_TIMEOUT_SECONDS
+            f"{SANDBOX_HOME}/{name}", max_bytes=1, timeout=REPORT_CHECK_TIMEOUT_SECONDS
         )
     except Exception as e:
-        logger.warning("Could not read %s in the shell sandbox; greeting as in progress: %s", REPORT_NAME, e)
+        logger.warning("Could not read %s in the shell sandbox; greeting as in progress: %s", name, e)
         return False
     return report is not None
 

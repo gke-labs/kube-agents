@@ -15,13 +15,12 @@
 """The first-install-hello stack's report plant, run against a stub cluster.
 
 For variant from_report, `bench/tf/prebuilt/first-install-hello/main.tf`
-plants INVENTORY.md on the shell sandbox. Pinned here: the refusals (a person
-waiting on an undelivered report, a ranking card filed and not delivered, other
-than one sandbox pod) stopping the apply before anything is written; a report
-the stack did not plant being left as it is; a file holding the stack's own
-text being kept; a report appearing during the write failing the apply; and the
-destroy removing the report only while it holds that text, and failing when it
-cannot check. As in
+plants INVENTORY.bench-<case_suffix>.md on the shell sandbox. Pinned here: the
+name staying off the real report's path; the refusals (a file the stack did
+not plant, other than one sandbox pod) stopping the apply before anything is
+written; a file holding the stack's own text being kept; a file appearing
+during the write failing the apply; and the destroy removing the file only
+while it holds that text, and failing when it cannot check. As in
 `test_bootstrap_ranking_plant.py`, the provisioners are rendered the way
 Terraform renders them and run against a stub `kubectl` and `gcloud`; the stub
 runs each in-pod script locally, over one directory per pod.
@@ -42,8 +41,8 @@ _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "first-install-hello" / "ma
 _RESOURCE_RE = re.compile(r'resource "null_resource" "planted_report" \{(.*?)\n\}\n', re.S)
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _LOCAL_RE = r'\n  {}\s*=\s*"((?:[^"\\]|\\.)*)"'
-_SUFFIX = "report-ready"
-_REPORT = "/opt/data/INVENTORY.md"
+_SUFFIX = "done"
+_REPORT = f"/opt/data/INVENTORY.bench-{_SUFFIX}.md"
 _POD_HOME = "/opt/data"
 
 _VARS = {
@@ -182,67 +181,34 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(self.report.stat().st_mode & 0o777, 0o644)
         self.assertIn(_SUFFIX, _PLANTED)
 
-    def test_refuses_while_a_person_waits_on_an_undelivered_report(self):
-        (self.agent / ".user_aligned").touch()
-        result = self._run(_CREATE)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("a person has connected", result.stderr)
-        self.assertFalse(self.report.exists())
-
-    def test_plants_once_onboarding_has_delivered(self):
-        (self.agent / ".user_aligned").touch()
-        (self.agent / ".bootstrap_completed").touch()
-        result = self._run(_CREATE)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.report.exists())
-
-    def test_refuses_while_a_ranking_card_is_filed_and_undelivered(self):
-        (self.agent / ".bootstrap_handoff_filed").write_text("sweep=t_sweep\ntask_id=t_rank\nfiled_at=1\n")
-        result = self._run(_CREATE)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("ranking card", result.stderr)
-        self.assertFalse(self.report.exists())
-
-    def test_plants_when_the_hand_off_filed_no_ranking_card(self):
-        (self.agent / ".bootstrap_handoff_filed").write_text("sweep=t_sweep\ntask_id=none\nfiled_at=1\n")
-        result = self._run(_CREATE)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.report.read_text(), _PLANTED)
-
-    def test_plants_after_delivery_whatever_the_hand_off_filed(self):
-        (self.agent / ".bootstrap_handoff_filed").write_text("task_id=t_rank\n")
-        (self.agent / ".bootstrap_completed").touch()
-        result = self._run(_CREATE)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.report.exists())
-
     def test_fails_when_a_report_lands_during_the_write(self):
         result = self._run(_CREATE, RACE="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("could not plant", result.stderr)
         self.assertEqual(self.report.read_text(), "raced\n")
-        self.assertEqual([p.name for p in self.sandbox.iterdir()], ["INVENTORY.md"])
+        self.assertEqual([p.name for p in self.sandbox.iterdir()], [self.report.name])
 
-    def test_refuses_when_the_agent_pod_cannot_be_read(self):
-        result = self._run(_CREATE, EXEC_FAIL="1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.report.exists())
-
-    def test_leaves_a_report_it_did_not_plant(self):
-        self.report.write_text("A REAL RANKED REPORT\n")
+    def test_refuses_a_file_it_did_not_plant_and_leaves_it(self):
+        self.report.write_text("SOMETHING ELSE\n")
         result = self._run(_CREATE)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("plants and removes nothing", result.stdout)
-        self.assertEqual(self.report.read_text(), "A REAL RANKED REPORT\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not plant", result.stderr)
+        self.assertEqual(self.report.read_text(), "SOMETHING ELSE\n")
 
-    def test_leaves_a_symlink_at_the_path(self):
+    def test_refuses_a_symlink_at_the_path(self):
         target = self.sandbox / "elsewhere"
         target.write_text(_PLANTED)
         self.report.symlink_to(target)
         result = self._run(_CREATE)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertTrue(self.report.is_symlink())
         self.assertEqual(target.read_text(), _PLANTED)
+
+    def test_the_planted_file_is_not_the_real_report(self):
+        module = _MODULE.read_text()
+        self.assertIn('report_name = "INVENTORY.bench-${var.case_suffix}.md"', module)
+        self.assertIn('sandbox_report = "/opt/data/${local.report_name}"', module)
+        self.assertNotIn("/opt/data/INVENTORY.md", module)
 
     def test_keeps_a_report_an_earlier_run_left(self):
         self.report.write_text(_PLANTED)
@@ -275,7 +241,7 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(self.report.read_text(), "A REAL RANKED REPORT\n")
         self.assertIn("kept", result.stdout)
 
-    def test_destroy_passes_when_delivery_moved_the_report_aside(self):
+    def test_destroy_passes_when_the_file_is_gone(self):
         result = self._run(_DESTROY)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("absent", result.stdout)

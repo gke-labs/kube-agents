@@ -147,9 +147,8 @@ ADDED_AFTER_THE_MOVE = [
     "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
     "obtainability-window-planning-probe",
     "bootstrap-discovery-fanout",  # the onboarding discovery fan-out, PR #2085
-    "first-install-hello-running",  # the first-install hello, both fixed variants
+    "first-install-hello-running",  # the first-install hello, both variants
     "first-install-hello-done",
-    "first-install-hello-report-ready",  # the greeting the plugin's report check picks, #2143
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
@@ -373,7 +372,6 @@ INJECT_LANE_EXCLUDED = [
     "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
-    "first-install-hello-report-ready",  # the same for the greeting the plugin's report check picks
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
@@ -396,7 +394,6 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-routing-fleet-question": "nightly",
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
-    "first-install-hello-report-ready": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
 }
 

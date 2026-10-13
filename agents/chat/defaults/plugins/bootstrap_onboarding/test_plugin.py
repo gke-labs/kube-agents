@@ -26,6 +26,8 @@ import plugin  # noqa: E402
 # The one bench stack that writes the eval seam's marker.
 EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
 # The repository copy of the module the image ships at plugin.SANDBOX_EXEC_PATH.
+# A report name the eval seam accepts with from_report.
+BENCH_REPORT = "INVENTORY.bench-done.md"
 REPO_SANDBOX_EXEC = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "sandbox_exec.py"
 
 
@@ -524,18 +526,41 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIn("SCAN COMPLETED", result["context"])
         self.assertIn("COMPLETED-INSTRUCTIONS", result["context"])
 
-    def test_eval_marker_from_report_reads_the_report_in_the_sandbox(self):
-        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT)
+    def test_eval_marker_from_report_reads_its_own_file_in_the_sandbox(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, report=BENCH_REPORT)
         for report, tag in ((b"#", "SCAN COMPLETED"), (None, "SCAN IN PROGRESS")):
             with self.subTest(report=report):
                 patch, fake = self._sandbox(read=lambda *a, **k: report)
                 with patch:
                     result = self._eval_call()
                 self.assertIn(tag, result["context"])
-                fake.read_bytes.assert_called_once()
+                fake.read_bytes.assert_called_once_with(
+                    f"{plugin.SANDBOX_HOME}/{BENCH_REPORT}",
+                    max_bytes=1,
+                    timeout=plugin.REPORT_CHECK_TIMEOUT_SECONDS,
+                )
+
+    def test_eval_marker_from_report_never_reads_the_real_report(self):
+        # The real report on the local path, the sandbox off: only the named file counts.
+        (self.data_dir / plugin.REPORT_NAME).write_text("REPORT", encoding="utf-8")
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, report=BENCH_REPORT)
+        self.assertIn("SCAN IN PROGRESS", self._eval_call()["context"])
+        (self.data_dir / BENCH_REPORT).write_text("BENCH", encoding="utf-8")
+        self.assertIn("SCAN COMPLETED", self._eval_call()["context"])
+
+    def test_eval_marker_from_report_needs_a_bench_report_name(self):
+        for report in (None, "", plugin.REPORT_NAME, "../INVENTORY.bench-x.md", "/opt/data/INVENTORY.bench-x.md",
+                       "INVENTORY.bench-X.md", ".ssh/id_rsa"):
+            with self.subTest(report=report):
+                extra = {} if report is None else {"report": report}
+                self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, **extra)
+                patch, fake = self._sandbox(read=lambda *a, **k: b"#")
+                with patch:
+                    self.assertIsNone(self._eval_call())
+                fake.read_bytes.assert_not_called()
 
     def test_eval_marker_from_report_touches_no_onboarding_state(self):
-        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT)
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, report=BENCH_REPORT)
         patch, _ = self._sandbox(read=lambda *a, **k: b"#")
         with patch:
             self.assertIsNotNone(self._eval_call())

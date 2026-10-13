@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/first-install-hello-running,
-# first-install-hello-done and first-install-hello-report-ready.
+# The scenario driver for bench/tasks/first-install-hello-running and
+# first-install-hello-done.
 #
 # The first-install greeting fires once per deployment, on the first turn from
 # a chat platform with durable delivery (the bootstrap_onboarding plugin in
@@ -37,16 +37,12 @@
 # failed destroy leaves behind disarms on its own.
 #
 # With variant from_report the plugin picks the greeting with the opening
-# turn's own check for the ranked report, so this stack also plants
-# INVENTORY.md on the shell sandbox's data volume, where the ranking worker
-# writes it, before it writes the request. Until onboarding has delivered, the
-# apply refuses an install where a person has connected, since the delivery
-# stage would post the planted file to them, and one whose hand-off has filed a
-# ranking card, whose worker would take the planted file for its own report. A
-# report already there is left as it is and read by the plugin. Destroy removes
-# the file only while it still holds what this stack planted. A person's first chat
-# on the install during the case would also find the planted report, so run it
-# on an eval install nobody chats with. The other variants plant nothing else.
+# turn's own report check, run on a file the request names: this stack plants
+# INVENTORY.bench-<case_suffix>.md on the shell sandbox's data volume, beside
+# where the ranking worker writes the real report, before it writes the
+# request. Nothing in onboarding reads that name, so the case leaves the
+# install's onboarding as it found it. Destroy removes the file only while it
+# still holds what this stack planted. The other variants plant nothing else.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -60,9 +56,15 @@ terraform {
 
 locals {
   marker_name = ".bootstrap_greet_eval-${var.case_suffix}"
-  request     = jsonencode({ phrase = var.phrase, variant = var.variant, home_channel_set = var.home_channel_set })
+  # The seam's from_report check reads this file, beside the real report and
+  # read by nothing in onboarding, so planting it cannot touch onboarding.
+  report_name = "INVENTORY.bench-${var.case_suffix}.md"
+  request = jsonencode(merge(
+    { phrase = var.phrase, variant = var.variant, home_channel_set = var.home_channel_set },
+    var.variant == "from_report" ? { report = local.report_name } : {},
+  ))
   # The sandbox's data volume, as bootstrap_delivery.py's SANDBOX_HOME names it.
-  sandbox_report = "/opt/data/INVENTORY.md"
+  sandbox_report = "/opt/data/${local.report_name}"
   # The plugin reads only that the file exists; the text names its owner for
   # anyone who finds it.
   planted_report = "Planted by the bench stack prebuilt/first-install-hello for case ${var.case_suffix}; its destroy removes it.\n"
@@ -127,43 +129,20 @@ resource "null_resource" "planted_report" {
       sandbox_pod="$1"
       in_sandbox=(kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" --)
 
-      # One read that has to answer `clear`, so a failed exec refuses rather
-      # than reading as "no marker". Until onboarding has delivered, a person
-      # who has connected would be sent the planted report, and a ranking card
-      # the hand-off filed would find it, take it for its own and write none.
-      state="$(kubectl exec -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" -c "${var.agent_container}" -- sh -c \
-        'home="$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}"; if [ -e "$home/.bootstrap_completed" ]; then echo clear; elif [ -e "$home/.user_aligned" ]; then echo waiting; else card="$(sed -n -E "s/(^|.*[[:space:]])task_id[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\2/p" "$home/.bootstrap_handoff_filed" 2>/dev/null | head -n 1)"; if [ -n "$card" ] && [ "$card" != none ]; then echo ranking; else echo clear; fi; fi' </dev/null || true)"
-      case "$state" in
-        clear) ;;
-        waiting)
-          echo "ERROR: a person has connected and onboarding has not delivered its report. The delivery stage would post the planted report to them." >&2
-          exit 1
-          ;;
-        ranking)
-          echo "ERROR: the onboarding hand-off has filed a ranking card and onboarding has not delivered. Its worker would find the planted report, take it for its own and write none." >&2
-          exit 1
-          ;;
-        *)
-          echo "ERROR: could not read the onboarding state in ${var.agent_container} (read: $${state:-nothing})." >&2
-          exit 1
-          ;;
-      esac
-
       # One remote step, so nothing lands between the check and the write: the
-      # link fails rather than replace a report that appeared meanwhile. A file
-      # holding this stack's own text is one an earlier run left and is kept. A
-      # report the stack did not plant is read by the plugin as it is, and this
-      # run plants and removes nothing. The copy is owned as the data volume is,
-      # so the plugin's read as the terminal's login can open it.
+      # link fails rather than replace a file that appeared meanwhile. A file
+      # holding this stack's own text is one an earlier run left and is kept;
+      # anything else at the path is not this case's to replace. The copy is
+      # owned as the data volume is, so the plugin's read as the terminal's
+      # login can open it.
       result="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
         'b64="$(cat)"; planted="$(printf "%s" "$b64" | base64 -d)"; if ${local.report_ours}; then echo ours; elif ! { ${local.report_absent}; }; then echo other; elif printf "%s" "$b64" | base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$(dirname "$1")")" "$1.tmp" && chmod 0644 "$1.tmp" && ln "$1.tmp" "$1"; then rm -f "$1.tmp"; echo planted; else rm -f "$1.tmp"; echo raced; fi' \
         sh "$REPORT_PATH")"
       case "$result" in
         planted) echo "Planted $REPORT_PATH on $sandbox_pod." ;;
         ours) echo "$REPORT_PATH on $sandbox_pod already holds this stack's text; kept, and the destroy removes it." ;;
-        other) echo "$REPORT_PATH is already on $sandbox_pod; the plugin reads it, and this run plants and removes nothing." ;;
         *)
-          echo "ERROR: could not plant $REPORT_PATH on $sandbox_pod (read: $${result:-nothing}); a report may have appeared during the write." >&2
+          echo "ERROR: could not plant $REPORT_PATH on $sandbox_pod (read: $${result:-nothing}). Something other than this stack wrote the path, or the write failed." >&2
           exit 1
           ;;
       esac
@@ -195,12 +174,12 @@ resource "null_resource" "planted_report" {
 
       sandbox_pods="$(kubectl get pods -n "${self.triggers.namespace}" -l "${self.triggers.sandbox_selector}" -o name)"
       if [ -z "$sandbox_pods" ]; then
-        echo "ERROR: no shell sandbox pod matches ${self.triggers.sandbox_selector} in ${self.triggers.namespace}, so $REPORT_PATH could not be checked or removed. Until it is, a person's first chat on an install that has not delivered onboarding is sent it as the onboarding report." >&2
+        echo "ERROR: no shell sandbox pod matches ${self.triggers.sandbox_selector} in ${self.triggers.namespace}, so $REPORT_PATH could not be checked or removed. The next run of the case keeps it." >&2
         exit 1
       fi
       for pod in $sandbox_pods; do
-        # Only while it holds what the apply planted: the delivery stage may
-        # have moved it aside, and a report written since is not this case's.
+        # Only while it holds what the apply planted: anything written there
+        # since is not this case's.
         result="$(printf '%s' "$REPORT_B64" | kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- sh -c \
           'planted="$(base64 -d)"; if ${self.triggers.report_absent}; then echo absent; elif ${self.triggers.report_ours}; then rm -f "$1" && echo removed; else echo kept; fi' \
           sh "$REPORT_PATH")"
