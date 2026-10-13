@@ -260,7 +260,8 @@ def _item(row: Any, several: bool) -> dict:
         "title": _status.row_title(row, several),
         "status": status,
     }
-    steps = notes[-_status.STEPS_MAX:]
+    # Each step one line, as the spec holds it; today's rich text shows a note's newlines as breaks.
+    steps = [_line(step) for step in notes[-_status.STEPS_MAX:]]
     if steps:
         item["steps"] = steps
     step_count = int(count) if count is not None else len(notes)
@@ -347,6 +348,9 @@ def _row(row: Any) -> dict:
     if severity and not TOKEN.fullmatch(severity):
         # Not a token the spec takes: kept as the text's lead, as the fallback shows it.
         text, severity = _presenter._clip(_presenter.severity_row(severity, text), _presenter.ROW_TEXT_MAX), ""
+    if not text:
+        # A severity alone, which today shows as its tag: the spec needs a row's text.
+        text, severity = _presenter._clip(f"{_presenter.BACKTICK}{severity}{_presenter.BACKTICK}", _presenter.ROW_TEXT_MAX), ""
     out["text"] = text
     if severity:
         out["severity"] = severity

@@ -350,6 +350,11 @@ type taskRun struct {
 	// under b.mu, while the worker writes it under mu - the two locks never
 	// nest, on purpose.
 	act atomic.Pointer[activityState]
+
+	// routeRecorded says this task's conversation route is in session-kv
+	// (route.go), the one way a card it files reports back; set by the api
+	// executor before its first turn, never by the cli one.
+	routeRecorded atomic.Bool
 }
 
 // Bridge is one running instance. Two connections by design: the lib client
@@ -1700,11 +1705,14 @@ func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.Ta
 // The one carrier with no text fallback. Only where something settles it:
 // the kanban notifier's Slack plan (deploy/docker/patches/slack_ux_status.py)
 // carries the cards' mark, for a Slack conversation with KAGE_SLACK_UX on,
-// which the bridge reads from the agent environment it inherits. Anywhere
-// else the terminal keeps the default and takes the ask off.
+// which the bridge reads from the agent environment it inherits, and only
+// when the task's route was recorded, without which no card post reaches the
+// conversation. Anywhere else the terminal keeps the default and takes the
+// ask off.
 func cardsMark(run *taskRun, state lib.TaskState) (lib.Part, bool) {
 	a := run.act.Load()
-	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !cardsSettleTheAsk(run.origin) {
+	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !run.routeRecorded.Load() ||
+		!cardsSettleTheAsk(run.origin) {
 		return lib.Part{}, false
 	}
 	part, err := chatmsg.MarkPart(chatmsg.Mark{Ask: run.askKind()})

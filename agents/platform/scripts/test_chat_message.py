@@ -98,6 +98,10 @@ class PlanTest(unittest.TestCase):
         self.assertIsNone(cm.plan_mark("", [running]), "no recorded kind: a running plan leaves the mark alone")
         self.assertIsNone(cm.plan_mark("fleet", []))
 
+    def test_each_step_is_one_line(self):
+        rows = [_row("a", "in_progress", lines=["two\nlines"], note="two\nlines", steps=1)]
+        self.assertEqual(cm.plan_message(None, rows)["plan"]["items"][0]["steps"], ["two lines"])
+
     def test_text_is_unescaped(self):
         rows = [_row("a", "in_progress", title="R&D <!here>", note="x", lines=["x"], steps=1)]
         self.assertEqual(cm.plan_text(None, rows), "R&D <!here>\n◌ x")
@@ -113,6 +117,10 @@ class ChoicesTest(unittest.TestCase):
         chat = cm.needs_you_message("Which cluster?\n- seeded-a\n- seeded-b", "t_1")
         self.assertEqual(chat["choices"][0], {"text": "seeded-a", "reply": "seeded-a\n\n(Clicked on the question from card t_1.)"})
         self.assertNotIn("choices", cm.needs_you_settled(chat))
+
+    def test_a_severity_alone_is_the_rows_text(self):
+        chat = cm.report_message("x", rows=[{"severity": "high"}])
+        self.assertEqual(chat["rows"], [{"text": "`high`"}])
 
     def test_an_after_past_five_lines_keeps_the_first_five(self):
         chat = cm.report_message("x", after_rows="\n".join(f"line {i}" for i in range(7)))

@@ -713,7 +713,7 @@ that would turn every follow-up into a steer queued behind hours of idle.
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
 first sentence as `headline`, the rest as `detail`, or under `fold` past `detail`'s cap),
 the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
-`kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on,
+`kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the
 terminal keeps its default. The kanban notifier, in the Hermes gateway process where the
 board is, sends a card's work through `a2a notify --chat-file <object> --update <key>`

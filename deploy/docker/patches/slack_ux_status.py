@@ -248,13 +248,11 @@ class _Row:
 
 class _Plan:
     __slots__ = (
-        "expiry", "fallback", "lapse", "mark", "pending", "rolling", "rows", "team_id", "touched", "ts", "waiting",
+        "expiry", "fallback", "lapse", "pending", "rolling", "rows", "team_id", "touched", "ts", "waiting",
     )
 
     def __init__(self, team_id: str) -> None:
         self.ts = ""
-        #: The ``mark`` the plan last carried over chat.notify (:func:`_render_chat`), None before any.
-        self.mark: dict | None = None
         self.team_id = team_id
         self.rows: OrderedDict[str, _Row] = OrderedDict()
         self.fallback = False
@@ -309,6 +307,9 @@ _lapsing: set = set()
 #: ``(channel, thread) -> how many plans the thread has posted over chat.notify``,
 #: which numbers each plan's ``update`` key (:func:`_render_chat`).
 _plan_keys: OrderedDict[tuple, int] = OrderedDict()
+#: ``(channel, thread) -> the mark the thread's plans last carried over chat.notify``. The
+#: mark is the thread's ask's state, so it is the thread's, not one plan's (:func:`_render_chat`).
+_marks_sent: OrderedDict[tuple, dict] = OrderedDict()
 #: ``(channel, thread) -> suspended`` for a card waiting after a restart, with
 #: no plan to hold it: :func:`_settle_orphan` sends the legacy setter a clear,
 #: and :func:`set_thread_status` reads this once to send the wait instead.
@@ -519,13 +520,39 @@ def _plan_key(key: tuple) -> str:
     return _chat.PLAN_UPDATE if count == 1 else _chat.PLAN_UPDATE_NEXT.format(number=count)
 
 
+def _thread_rows(key: tuple, plan: _Plan) -> list:
+    """Every row on the thread's plans, the current one, any set aside, and ``plan``, as
+    :func:`_plan_session` reads them for the session status."""
+    plans = [*_lapsed.get(key, ()), *([_plans[key]] if key in _plans else [])]
+    if not any(old is plan for old in plans):
+        plans.append(plan)
+    return [row for old in plans for row in old.rows.values()]
+
+
+def _thread_mark(adapter: Any, key: tuple, plan: _Plan) -> dict | None:
+    """The ask's state the thread's cards leave, when it changed since the thread's plans last carried it.
+
+    From every plan in the thread, since one set aside can still hold a card that
+    waits or runs. With no ask recorded on the route, a lifted pause is still sent
+    (``{}``), as nothing else would take ⏸️ off.
+    """
+    ask_of = getattr(adapter, "ask", None)
+    if not callable(ask_of):
+        return None
+    ask = ask_of(key[0])
+    mark = _chat.plan_mark(ask, _thread_rows(key, plan))
+    sent = _marks_sent.get(key)
+    if mark is None and sent is not None and sent.get("settle") == _chat.SETTLE_BLOCKED:
+        mark = _chat.mark(ask)
+    return None if mark is None or mark == sent else mark
+
+
 async def _render_chat(adapter: Any, key: tuple, plan: _Plan, title: str | None, rows: list) -> bool:
     """:func:`_render` over chat.notify: the plan as a chat message, edited in place by its key."""
     chat_id, thread_ts = key
     chat = _chat.plan_message(title or _alert_title(key) or None, rows)
-    ask_of = getattr(adapter, "ask", None)
-    mark = _chat.plan_mark(ask_of(chat_id), rows) if callable(ask_of) else None
-    if mark is not None and mark != plan.mark:
+    mark = _thread_mark(adapter, key, plan)
+    if mark is not None:
         chat["mark"] = mark
     update = plan.ts or _plan_key(key)
     try:
@@ -543,8 +570,8 @@ async def _render_chat(adapter: Any, key: tuple, plan: _Plan, title: str | None,
         plan.fallback = True
         return False
     plan.ts = update
-    if "mark" in chat:
-        plan.mark = mark
+    if mark is not None:
+        _remember(_marks_sent, key, mark, SESSIONS_MAX)
     return True
 
 

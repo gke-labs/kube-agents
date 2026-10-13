@@ -1,14 +1,22 @@
 package hermesbridge
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/nats-io/nuid"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -186,6 +194,7 @@ func TestBridgeSharedCases(t *testing.T) {
 			case ev.Terminal != "":
 				ran++
 				run := &taskRun{origin: slackOrigin(t, c.Input.Events[i-1].Ask)}
+				run.routeRecorded.Store(true)
 				act := newActivityState(false)
 				act.cardsFiled.Store(len(ev.FiledCards) > 0)
 				run.act.Store(act)
@@ -242,56 +251,111 @@ func terminalParts(t *testing.T, url, taskID string) []lib.Part {
 	return nil
 }
 
-// A direct answer's result carries the answer folded and its terminal no
-// mark; a turn that filed a card ends on a mark-only terminal keeping the
-// ask's kind, and a kanban_create that failed files nothing.
-func TestBridge_TheResultIsFoldedAndATurnThatFiledCardsKeepsItsAsk(t *testing.T) {
+// The result carries the answer laid out on either executor. The cli
+// executor records no conversation route, so no card post can settle an ask,
+// and its terminal carries no mark even when the turn filed a card.
+func TestBridge_TheResultCarriesTheAnswerAndACliTerminalNoMark(t *testing.T) {
 	t.Setenv(slackUXEnv, "1")
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
-prompt = sys.argv[-1]
-if "fan" in prompt:
-    call("kanban_create", {"title": "seeded-a"}, "call_1")
-elif "broken" in prompt:
-    call("kanban_create", {"title": "seeded-a"}, "call_1", status="error", error_type="tool_error")
+call("kanban_create", {"title": "seeded-a"}, "call_1")
 print("**Two clusters are restarting.** The first is seeded-a.\n\nseeded-b has 3.")
 `), nil)
 	c := gatewayClient(t, url)
-
-	for _, tc := range []struct {
-		id, conversation, prompt string
-		mark                     map[string]any
-	}{
-		{"task-direct", "slack:C1/1.1", "is checkout-gateway restarting in seeded-a?", nil},
-		{"task-fan", "slack:C1/1.2", "which clusters have pods restarting right now? fan out", map[string]any{"ask": askFleet}},
-		{"task-broken", "slack:C1/1.3", "which clusters are broken right now?", nil},
-		// Only the Slack plan settles the ask, so a Google Chat turn keeps the default.
-		{"task-gchat", "gchat:spaces/A/threads/B", "which clusters have pods restarting right now? fan out", nil},
-	} {
-		submitFrom(t, c, tc.id, "ctx-"+tc.id, tc.conversation, tc.prompt)
-		task := waitTerminal(t, c, tc.id)
-		if task.State != lib.StateCompleted {
-			t.Fatalf("%s: state = %s, want completed", tc.id, task.State)
-		}
-		if err := task.ValidateArtifacts(); err != nil {
-			t.Fatalf("%s: assertion 18: %v", tc.id, err)
-		}
-		result := task.Artifact(lib.ArtifactResult)
-		if result.Parts[0].Text == "" {
-			t.Fatalf("%s: the result lost its text", tc.id)
-		}
-		chat := chatData(t, result.Parts)
-		if chat == nil || chat["headline"] != "Two clusters are restarting." || chat["detail"] != "The first is seeded-a.\n\nseeded-b has 3." {
-			t.Errorf("%s: result chat = %v", tc.id, chat)
-		}
-		terminal := chatData(t, terminalParts(t, url, tc.id))
-		switch {
-		case tc.mark == nil && terminal != nil:
-			t.Errorf("%s: terminal chat = %v, want none", tc.id, terminal)
-		case tc.mark != nil && (terminal == nil || len(terminal) != 2 || !maps.Equal(terminal["mark"].(map[string]any), tc.mark)):
-			t.Errorf("%s: terminal chat = %v, want only mark %v", tc.id, terminal, tc.mark)
-		}
+	submitFrom(t, c, "task-cli", "ctx-task-cli", "slack:C1/1.2", "which clusters have pods restarting right now?")
+	task := waitTerminal(t, c, "task-cli")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
 	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatalf("assertion 18: %v", err)
+	}
+	result := task.Artifact(lib.ArtifactResult)
+	if result.Parts[0].Text == "" {
+		t.Fatal("the result lost its text")
+	}
+	chat := chatData(t, result.Parts)
+	if chat == nil || chat["headline"] != "Two clusters are restarting." || chat["detail"] != "The first is seeded-a.\n\nseeded-b has 3." {
+		t.Errorf("result chat = %v", chat)
+	}
+	if terminal := chatData(t, terminalParts(t, url, "task-cli")); terminal != nil {
+		t.Errorf("terminal chat = %v, want none: the cli executor records no route", terminal)
+	}
+}
+
+// On the api executor a turn that filed a card, with its route recorded,
+// ends on a mark-only terminal keeping the ask's kind. A failed kanban_create
+// files nothing, a direct answer keeps the default, and so does a turn whose
+// route the store refused.
+func TestAPI_ATurnThatFiledCardsKeepsItsAsk(t *testing.T) {
+	t.Setenv(slackUXEnv, "1")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct {
+		name, prompt string
+		storeStatus  int
+		mark         map[string]any
+	}{
+		{"filed", "which clusters have pods restarting right now? fan out", http.StatusOK, map[string]any{"ask": askFleet}},
+		{"failed-call", "which clusters have pods restarting right now? broken", http.StatusOK, nil},
+		{"direct", "is checkout-gateway restarting in seeded-a?", http.StatusOK, nil},
+		{"route-refused", "which clusters have pods restarting right now? fan out", http.StatusBadRequest, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, tc.storeStatus)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				switch {
+				case strings.Contains(tc.prompt, "fan out"):
+					postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+					postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				case strings.Contains(tc.prompt, "broken"):
+					postDeliveryStatus(t, u, shared, c.sessionID, kanbanCreateTool, "call_1", ActivityStatusError)
+				}
+				writeCompletion(w, c.sessionID, "On it: one card per cluster.")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-"+tc.name, "ctx-"+tc.name, "slack:C1/1.2", tc.prompt)
+			if task := waitTerminal(t, c, "task-"+tc.name); task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed", task.State)
+			}
+			terminal := chatData(t, terminalParts(t, url, "task-"+tc.name))
+			switch {
+			case tc.mark == nil && terminal != nil:
+				t.Errorf("terminal chat = %v, want none", terminal)
+			case tc.mark != nil && (terminal == nil || len(terminal) != 2 || !maps.Equal(terminal["mark"].(map[string]any), tc.mark)):
+				t.Errorf("terminal chat = %v, want only mark %v", terminal, tc.mark)
+			}
+		})
+	}
+}
+
+// postDeliveryStatus is postDelivery's closing delivery for a call that ended
+// with status, as hermes reports a failed tool call.
+func postDeliveryStatus(t *testing.T, url, key, sessionID, tool, callID, status string) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostToolCall, "tool_name": tool, "tool_input": map[string]any{"q": "x"},
+		"session_id": sessionID, "delivery_id": nuid.Next(), "timestamp": "2026-10-02T12:00:00Z",
+		"extra": map[string]any{"tool_call_id": callID, "duration_ms": 7, "status": status, "error_type": "tool_error"},
+	})
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write(body)
+	req.Header.Set(hookSignatureHeader, hookSignaturePrefix+hex.EncodeToString(mac.Sum(nil)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Errorf("delivery: %v", err)
+		return
+	}
+	resp.Body.Close()
 }
 
 // slackOrigin is a submission from a Slack conversation asking prompt.

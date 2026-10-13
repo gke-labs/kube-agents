@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -119,9 +120,27 @@ func slackUXOn() bool {
 	return !set || slackUXOnValues[strings.ToLower(strings.TrimSpace(value))]
 }
 
+// asciiWords stands in for Python's Unicode \s and \b, which RE2 spells in
+// ASCII: a non-ASCII space becomes a space, and a non-ASCII letter or number
+// becomes "_", a word character in both engines that no keyword holds, so
+// every boundary and space run reads as the presenter reads it.
+func asciiWords(text string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r < utf8.RuneSelf:
+			return r
+		case unicode.IsSpace(r):
+			return ' '
+		case unicode.IsLetter(r) || unicode.IsNumber(r):
+			return '_'
+		}
+		return r
+	}, text)
+}
+
 // askKind is the mark.ask token for an ask, from its words alone.
 func askKind(text string) string {
-	clean := strings.TrimSpace(askMention.ReplaceAllString(text, " "))
+	clean := asciiWords(strings.TrimSpace(askMention.ReplaceAllString(text, " ")))
 	for _, c := range askClasses {
 		if c.words.MatchString(clean) {
 			return c.kind

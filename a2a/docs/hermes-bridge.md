@@ -697,7 +697,8 @@ answer laid out (its first sentence as the headline, the rest as the detail), an
 published without it if the bus refuses the chunk as too large; every heartbeat holds the
 prompt's kind of ask as `mark.ask`; and the terminal of a completed task that filed a kanban
 card (a `kanban_create` call that did not fail) from a Slack conversation, with
-`KAGE_SLACK_UX` on in the agent environment the bridge inherits, holds that `mark.ask` alone,
+`KAGE_SLACK_UX` on in the agent environment the bridge inherits and the route recorded (so on
+the `api` executor only), holds that `mark.ask` alone,
 so the ask stays marked until the cards' posts settle it. Anywhere else no card post settles
 it, so the terminal carries no mark and the ask comes off.
 

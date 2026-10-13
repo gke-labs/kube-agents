@@ -3,14 +3,18 @@
 Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 
 The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.py``
-reads them). Each runs through the code that sends it under ``spec.mode:
-next``: the pure composers in ``agents/platform/scripts/chat_message.py``, and,
-where a case is a sequence of card events, the gateway patches that drive
-them, with a stand-in for the chat.notify adapter that records what it is
-handed. The entries a case expects on the bridge's own carriers (``progress``
-and ``terminal``) are ``a2a/hermes-bridge``'s, and ``chat_test.go`` runs them
-there; this file checks only that the ask kind they carry is the one
-``chat_message.ask_kind`` gives.
+reads them). A case with one input runs through the composer that lays it out
+(``agents/platform/scripts/chat_message.py``, or ``slack_ux_incident.chat_triage``).
+A case that is a sequence of card events runs through the gateway patches that
+send it, with a stand-in for the chat.notify adapter recording each send:
+``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold
+of a fanned-out child included), ``slack_ux_moments`` for a question. The
+``reactions-*`` cases pin the ask's mark as a ``notify`` of its own; the
+emitter carries it on the plan it sends for the same event (as those cases'
+notes say), so the runner reads the ``mark`` off that plan. The entries on the
+bridge's own carriers (``progress`` and ``terminal``) are
+``a2a/hermes-bridge``'s, which ``chat_test.go`` runs; this file checks only that
+the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 """
 
 import asyncio
@@ -19,6 +23,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
@@ -27,8 +32,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import chat_cases
 import chat_message
+import kanban_notifier
 import kanban_progress_lines
-import slack_status
 import slack_ux_failure
 import slack_ux_incident
 import slack_ux_moments
@@ -37,21 +42,49 @@ import slack_ux_status
 NOTIFY = "notify"
 RESULT = "result"
 BRIDGE_CARRIERS = frozenset({"progress", "terminal"})
+CHAT_ID = "a2a-ctx-1"
+THREAD = "slack:C1/1.2"
+HEADER = "@platform "
 
 
 class _ChatAdapter:
-    """The chat.notify stand-in as the patches see it: ``send_chat`` recorded, always accepted."""
+    """The home chat.notify stand-in as the patches see it: ``send_chat`` and ``send`` recorded, always accepted."""
 
-    def __init__(self, ask: str = ""):
+    def __init__(self):
         self.sent: list[dict] = []
-        self._ask = ask
+        self.posts: list[str] = []
 
     async def send_chat(self, chat_id, content, chat, update="", metadata=None):
         self.sent.append({"chat": chat, "update": update, "text": content, "thread": (metadata or {}).get("thread_id")})
         return SimpleNamespace(success=True, message_id="m", error=None)
 
+    async def send(self, chat_id, content, metadata=None):
+        self.posts.append(content)
+        return SimpleNamespace(success=True, message_id="m", error=None)
+
+    async def edit_message(self, chat_id, message_id, content):
+        return SimpleNamespace(success=False, error="Not supported")
+
+
+class _ConversationAdapter(_ChatAdapter):
+    """The conversation stand-in: it also reads back the kind of ask the route recorded."""
+
+    def __init__(self, ask: str = ""):
+        super().__init__()
+        self._ask = ask
+
     def ask(self, chat_id):
         return self._ask
+
+
+def _sub(card: str, thread: str = THREAD) -> dict:
+    return {"task_id": card, "platform": "slack", "chat_id": CHAT_ID, "thread_id": thread, "team_id": ""}
+
+
+def _reset_status() -> None:
+    for store in (slack_ux_status._plans, slack_ux_status._lapsed, slack_ux_status._seen, slack_ux_status._plan_keys,
+                  slack_ux_status._marks_sent, slack_ux_status._titles, slack_ux_status._alert_titles):
+        store.clear()
 
 
 def _row(spec: dict) -> slack_ux_status._Row:
@@ -74,13 +107,24 @@ def _out(chat: dict | None, carrier: str, update: str = "") -> dict | None:
 
 
 class SharedCasesTest(unittest.TestCase):
-    def setUp(self):
+    @staticmethod
+    def reset() -> None:
+        """Empty in-process state, so each case runs as on a thread of its own."""
         for store in (slack_ux_moments._questions, slack_ux_moments._unsettled, slack_ux_moments._announced,
                       slack_ux_moments._question_keys):
             store.clear()
+        _reset_status()
+
+    def setUp(self):
+        self.reset()
+        # The plan's title never reads an alert's routing row here.
+        self.no_alert = mock.patch.object(slack_ux_status, "_alert_title", return_value="")
+        self.no_alert.start()
+        self.addCleanup(self.no_alert.stop)
 
     def run_case(self, case: dict) -> list:
         """The outputs the emitter gives for ``case``, one per expected entry, as the case spells them."""
+        self.reset()
         given = case["input"]
         if "markdown" in given:
             return [_out(chat_message.answer_message(given["markdown"]), RESULT)]
@@ -121,36 +165,68 @@ class SharedCasesTest(unittest.TestCase):
             outs.append(_out(sent[-1]["chat"], NOTIFY, sent[-1]["update"]) if sent else None)
         return outs
 
+    def deliver(self, adapter, sub: dict, kind: str, payload: dict | None, event_id: int, title: str,
+                fanned_out: bool = False) -> None:
+        """One notifier event through ``kanban_progress_lines.deliver``, with KAGE_SLACK_UX on for the card."""
+        ev = SimpleNamespace(id=event_id, kind=kind, payload=payload or {})
+        message = str((payload or {}).get("summary") or (payload or {}).get("note") or kind)
+
+        async def folds(*_args):
+            return fanned_out
+
+        async def no_reaction(*_args):
+            return None
+
+        with mock.patch.object(kanban_progress_lines, "_slack_quiet", return_value=kanban_notifier), \
+                mock.patch.object(kanban_progress_lines, "_slack_plan", return_value=slack_ux_status), \
+                mock.patch.object(kanban_progress_lines, "_slack_moments", return_value=None), \
+                mock.patch.object(kanban_progress_lines, "_explained_by_wake", return_value=False), \
+                mock.patch.object(kanban_progress_lines, "_folds", folds), \
+                mock.patch.object(kanban_progress_lines, "_settle_reaction", no_reaction):
+            asyncio.run(kanban_progress_lines.deliver(
+                SimpleNamespace(), adapter, sub, kind, ev, message, {"thread_id": sub["thread_id"]}, HEADER,
+                None, title,
+            ))
+
     def run_card_events(self, given: dict) -> list:
-        """A plan's rows moved by card events as ``slack_ux_status`` moves them, the plan after each."""
-        rows = {r["task_id"]: _row(r) for r in given["rows"]}
+        """The plan each card event leaves, as ``deliver`` and ``slack_ux_status`` send it; a fanned-out
+        child's completion folds into its row and posts nothing of its own."""
+        adapter = _ChatAdapter()
+        titles = {r["task_id"]: r.get("title") or "" for r in given["rows"]}
+        event_id = 0
+        for row in given["rows"]:
+            for line in row.get("lines") or ():
+                event_id += 1
+                self.deliver(adapter, _sub(row["task_id"]), "heartbeat", {"note": line}, event_id, titles[row["task_id"]])
         outs = []
         for event in given["events"]:
-            result = kanban_progress_lines.result_line(event["kind"], event.get("payload"))
-            slack_ux_status._move(rows[event["task_id"]], event["kind"], result)
-            outs.append(_out(chat_message.plan_message(None, list(rows.values())), NOTIFY, chat_message.PLAN_UPDATE))
+            event_id += 1
+            sent, posts = len(adapter.sent), len(adapter.posts)
+            self.deliver(adapter, _sub(event["task_id"]), event["kind"], event.get("payload"), event_id,
+                         titles[event["task_id"]], bool(event.get("fanned_out")))
+            plans = adapter.sent[sent:]
+            outs.append(_out(plans[-1]["chat"], NOTIFY, plans[-1]["update"]) if plans else None)
+            self.assertEqual(len(adapter.posts) - posts, 0 if event.get("fanned_out") else 1,
+                             "a fanned-out child's completion posts nothing; any other posts its report")
         return outs
 
     def run_marks(self, given: dict, expected: list) -> list:
-        """The ask's reaction state on a card's notifies: :func:`chat_message.plan_mark` as cards move, sent on change."""
-        outs, rows, ask, sent = [], {}, "", None
+        """The ask's mark on each card event, read off the plan ``slack_ux_status`` sends for it."""
+        outs, ask, adapter, thread = [], "", None, THREAD
         for i, event in enumerate(given["events"]):
             if "ask" in event:
-                ask, rows, sent = chat_message.ask_kind(event["ask"]), {}, None
+                ask = chat_message.ask_kind(event["ask"])
+                adapter, thread = _ConversationAdapter(ask), f"{THREAD}.{i}"
                 outs.append(expected[i] if self.bridge_entry(expected[i], ask) else ("ask", ask))
             elif "terminal" in event:
                 for card in event.get("filed_cards") or ():
-                    row = rows[card] = slack_ux_status._Row(card, card)
-                    row.status = slack_status.TASK_RUNNING
+                    asyncio.run(slack_ux_status.start_row(adapter, _sub(card, thread), card))
                 outs.append(expected[i] if expected[i] is None or self.bridge_entry(expected[i], ask) else ("terminal", ask))
             else:
-                row = rows[event["task_id"]]
-                if not slack_ux_status._move(row, event["kind"]):
-                    outs.append(None)
-                    continue
-                mark = chat_message.plan_mark(ask, list(rows.values()))
-                outs.append(None if mark == sent else _out(chat_message.message(mark=mark), NOTIFY))
-                sent = mark
+                sent = len(adapter.sent)
+                asyncio.run(slack_ux_status.settle_row(adapter, _sub(event["task_id"], thread), event["kind"]))
+                marks = [s["chat"]["mark"] for s in adapter.sent[sent:] if "mark" in s["chat"]]
+                outs.append(_out(chat_message.message(mark=marks[-1]), NOTIFY) if marks else None)
         return outs
 
     @staticmethod
@@ -176,13 +252,11 @@ class ChatRoutePlanTest(unittest.TestCase):
     SUB: ClassVar[dict] = {"task_id": "t_a", "platform": "slack", "chat_id": "a2a-ctx-1", "thread_id": "slack:C1/1.2", "team_id": ""}
 
     def setUp(self):
-        for store in (slack_ux_status._plans, slack_ux_status._lapsed, slack_ux_status._seen,
-                      slack_ux_status._plan_keys, slack_ux_status._titles, slack_ux_status._alert_titles):
-            store.clear()
-        slack_ux_status._alert_titles[("a2a-ctx-1", "slack:C1/1.2")] = ""
+        _reset_status()
+        slack_ux_status._alert_titles[(CHAT_ID, THREAD)] = ""
 
     def test_a_card_note_then_its_completion(self):
-        adapter = _ChatAdapter(ask="fleet")
+        adapter = _ConversationAdapter(ask="fleet")
 
         async def run():
             await slack_ux_status.deliver_row(adapter, dict(self.SUB), 1, "seeded-a", "reading version")
@@ -211,6 +285,41 @@ class ChatRoutePlanTest(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual([s["update"] for s in adapter.sent], ["plan", "plan-2"])
+
+    def test_the_mark_reads_every_plan_in_the_thread(self):
+        # A card that gave up sets its plan aside; the next card runs on plan-2.
+        # When the first is retried and completes on its own plan, the thread's
+        # ask is still running on plan-2, so no done is sent.
+        adapter = _ConversationAdapter(ask="fleet")
+
+        async def run():
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB), 1, "a", "reading")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "gave_up", "", "a")
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB, task_id="t_b"), 2, "b", "reading")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "unblocked", "", "a")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "fine", "a")
+
+        asyncio.run(run())
+        marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent if "mark" in s["chat"]]
+        self.assertEqual(marks, [("plan", {"ask": "fleet"}), ("plan", {"settle": "failed"}), ("plan-2", {"ask": "fleet"})])
+
+    def test_with_no_recorded_ask_a_lifted_pause_still_goes(self):
+        adapter = _ConversationAdapter(ask="")
+
+        async def run():
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB), 1, "a", "reading")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "blocked", "", "a")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "unblocked", "", "a")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "fine", "a")
+
+        asyncio.run(run())
+        marks = [s["chat"]["mark"] for s in adapter.sent if "mark" in s["chat"]]
+        self.assertEqual(marks, [{"settle": "blocked"}, {}, {"settle": "done"}])
+
+    def test_a_home_thread_carries_no_mark(self):
+        adapter = _ChatAdapter()
+        asyncio.run(slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "fine", "a"))
+        self.assertNotIn("mark", adapter.sent[-1]["chat"])
 
     def test_a_refused_post_falls_back_to_progress_lines(self):
         adapter = _ChatAdapter()

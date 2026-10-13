@@ -636,6 +636,34 @@
     {
       "in": "which clusters have pods restarting right now?",
       "kind": "fleet"
+    },
+    {
+      "in": "which clusters are restarting?",
+      "kind": "fleet"
+    },
+    {
+      "in": "fixé the pod",
+      "kind": "question"
+    },
+    {
+      "in": "le pod redémarre, pourquoi?",
+      "kind": "question"
+    },
+    {
+      "in": "checkout　is down",
+      "kind": "incident"
+    },
+    {
+      "in": "upgradé seeded-a",
+      "kind": "question"
+    },
+    {
+      "in": "Ünd all clusters?",
+      "kind": "fleet"
+    },
+    {
+      "in": "café costs?",
+      "kind": "cost"
     }
   ]
 }
