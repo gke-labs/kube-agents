@@ -41,19 +41,31 @@ const hostTrailingPunct = ".,;!"
 // vouch for. A label with no scheme in it makes no claim this check can
 // read, and is prose.
 func LinkLabelMisnamesHost(label, dest string) bool {
-	claims := urlLabelRE.FindAllString(labelMarksRE.ReplaceAllString(label, ""), -1)
-	if len(claims) == 0 {
+	if !labelClaims(label) {
 		return false
 	}
 	du, err := url.Parse(dest)
 	if err != nil {
 		return true
 	}
-	for _, claim := range claims {
+	return LabelMisnamesHost(label, du.Hostname())
+}
+
+// LabelMisnamesHost is LinkLabelMisnamesHost for a caller that has already
+// read the destination's host, without its port or brackets, by its own
+// rules: the chat message validator reads a url as the today presenter
+// does, and must not refuse one for a second reader's parse.
+func LabelMisnamesHost(label, destHost string) bool {
+	for _, claim := range urlLabelRE.FindAllString(labelMarksRE.ReplaceAllString(label, ""), -1) {
 		lu, err := url.Parse(strings.TrimRight(claim, hostTrailingPunct))
-		if err != nil || lu.User != nil || lu.Hostname() == "" || !strings.EqualFold(lu.Hostname(), du.Hostname()) {
+		if err != nil || lu.User != nil || lu.Hostname() == "" || !strings.EqualFold(lu.Hostname(), destHost) {
 			return true
 		}
 	}
 	return false
+}
+
+// labelClaims reports whether label, read as it renders, carries a URL.
+func labelClaims(label string) bool {
+	return urlLabelRE.MatchString(labelMarksRE.ReplaceAllString(label, ""))
 }

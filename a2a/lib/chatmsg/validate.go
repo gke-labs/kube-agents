@@ -2,6 +2,7 @@ package chatmsg
 
 import (
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strings"
 	"unicode"
@@ -55,6 +56,10 @@ const (
 
 // tokenRE is a severity or a mark's ask: 1-16 characters of [a-z0-9-].
 var tokenRE = regexp.MustCompile(`^[a-z0-9-]{1,16}$`)
+
+// ipvFutureRE is the IPvFuture form urlsplit admits in brackets
+// (RFC 3986: "v", a hex version, a dot, then the address).
+var ipvFutureRE = regexp.MustCompile(`^v[a-fA-F0-9]+\..+$`)
 
 var (
 	tones    = map[string]bool{ToneSuccess: true, ToneAttention: true, ToneCritical: true}
@@ -241,10 +246,13 @@ func validateLinks(links []Link) error {
 		if err := between(field+".text", link.Text, buttonTextMax); err != nil {
 			return err
 		}
-		if err := SafeURL(link.URL); err != nil {
+		host, err := urlHost(link.URL)
+		if err != nil {
 			return broke(field+".url", "%v", err)
 		}
-		if chattext.LinkLabelMisnamesHost(link.Text, link.URL) {
+		// The label is checked against the host read above, so one reading
+		// of the url decides both rules.
+		if chattext.LabelMisnamesHost(link.Text, host) {
 			return broke(field+".text", "names a host other than the url's")
 		}
 	}
@@ -327,50 +335,72 @@ func validateMark(m Mark) error {
 // (Python's urlsplit), splitting rather than parsing it, so a path escape
 // or a port that does not parse refuses nothing the presenter accepts.
 func SafeURL(raw string) error {
+	_, err := urlHost(raw)
+	return err
+}
+
+// urlHost is SafeURL's reading of raw, returning the host it found.
+func urlHost(raw string) (string, error) {
 	if n := utf8.RuneCountInString(raw); n > urlMax {
-		return fmt.Errorf("%d characters, at most %d", n, urlMax)
+		return "", fmt.Errorf("%d characters, at most %d", n, urlMax)
 	}
 	for _, r := range raw {
 		if unicode.IsSpace(r) || !unicode.IsPrint(r) {
-			return fmt.Errorf("carries whitespace or an unprintable character %U", r)
+			return "", fmt.Errorf("carries whitespace or an unprintable character %U", r)
 		}
 	}
 	scheme, rest, ok := strings.Cut(raw, authorityStart)
 	if !ok {
-		return fmt.Errorf("no %s after a scheme", authorityStart)
+		return "", fmt.Errorf("no %s after a scheme", authorityStart)
 	}
 	if scheme = strings.ToLower(scheme); scheme != urlSchemeHTTP && scheme != urlSchemeHTTPS {
-		return fmt.Errorf("scheme %q is not http or https", scheme)
+		return "", fmt.Errorf("scheme %q is not http or https", scheme)
 	}
 	authority := rest
 	if end := strings.IndexAny(authority, authorityEnds); end >= 0 {
 		authority = authority[:end]
 	}
 	if strings.Contains(authority, backslash) {
-		return fmt.Errorf("a backslash in the host part")
+		return "", fmt.Errorf("a backslash in the host part")
 	}
 	if strings.Contains(authority, userinfoMark) {
-		return fmt.Errorf("carries userinfo")
+		return "", fmt.Errorf("carries userinfo")
 	}
-	if host(authority) == "" {
-		return fmt.Errorf("has no host")
+	host, err := authorityHost(authority)
+	if err != nil {
+		return "", err
 	}
-	return nil
+	if host == "" {
+		return "", fmt.Errorf("has no host")
+	}
+	return host, nil
 }
 
-// host is authority without its port: a bracketed IPv6 literal's inside,
-// else everything before the last colon.
-func host(authority string) string {
-	if strings.HasPrefix(authority, ipv6Open) {
-		if end := strings.Index(authority, ipv6Close); end >= 0 {
-			return authority[len(ipv6Open):end]
-		}
-		return ""
+// authorityHost is authority's host as urlsplit's hostname reads it: before
+// the first colon, or a bracketed IPv6 (or IPvFuture) literal's inside, where
+// a bracket anywhere else, an IPv4 address in brackets, or anything but a
+// port after the closing bracket is refused, as urlsplit refuses it.
+func authorityHost(authority string) (string, error) {
+	opens, closes := strings.Contains(authority, ipv6Open), strings.Contains(authority, ipv6Close)
+	if !opens && !closes {
+		host, _, _ := strings.Cut(authority, portMark)
+		return host, nil
 	}
-	if colon := strings.LastIndex(authority, portMark); colon >= 0 {
-		return authority[:colon]
+	end := strings.Index(authority, ipv6Close)
+	if !strings.HasPrefix(authority, ipv6Open) || end < 0 {
+		return "", fmt.Errorf("a bracket outside an IPv6 host")
 	}
-	return authority
+	inside, after := authority[len(ipv6Open):end], authority[end+len(ipv6Close):]
+	if after != "" && !strings.HasPrefix(after, portMark) {
+		return "", fmt.Errorf("%q after the bracketed host", after)
+	}
+	if ipvFutureRE.MatchString(inside) {
+		return inside, nil
+	}
+	if addr, err := netip.ParseAddr(inside); err != nil || !addr.Is6() {
+		return "", fmt.Errorf("%q in brackets is not an IPv6 address", inside)
+	}
+	return inside, nil
 }
 
 // capped checks a field of any number of lines against its cap.

@@ -176,6 +176,32 @@ func TestEveryRule(t *testing.T) {
 		{"link url empty ipv6 host", func(m *Message) { m.Links[0].URL = "https://[]/x" }, "links[0].url"},
 		{"link url port alone", func(m *Message) { m.Links[0].URL = "https://:443/x" }, "links[0].url"},
 		{"link url no authority", func(m *Message) { m.Links[0].URL = "https:example.com" }, "links[0].url"},
+		// The host is what precedes the first colon, as urlsplit reads it,
+		// and a bracket holds only an IPv6 or IPvFuture literal. Each
+		// verdict below is slack_presenter._safe_link_url's on the same url.
+		{"link url colons with no host", func(m *Message) { m.Links[0].URL = "https://::/" }, "links[0].url"},
+		{"link url port before a colon", func(m *Message) { m.Links[0].URL = "https://:a:b/" }, "links[0].url"},
+		{"link url empty port", func(m *Message) { m.Links[0].URL = "https://a.example:/" }, ""},
+		{"link url two colons after a host", func(m *Message) { m.Links[0].URL = "https://a:b:c/" }, ""},
+		{"link url word in brackets", func(m *Message) { m.Links[0].URL = "https://[evil]/" }, "links[0].url"},
+		{"link url ipv4 in brackets", func(m *Message) { m.Links[0].URL = "https://[1.2.3.4]/" }, "links[0].url"},
+		{"link url closing bracket alone", func(m *Message) { m.Links[0].URL = "https://x]/" }, "links[0].url"},
+		{"link url opening bracket unclosed", func(m *Message) { m.Links[0].URL = "https://[::1/" }, "links[0].url"},
+		{"link url text after the brackets", func(m *Message) { m.Links[0].URL = "https://[::1]x/" }, "links[0].url"},
+		{"link url text before the brackets", func(m *Message) { m.Links[0].URL = "https://x[::1]/" }, "links[0].url"},
+		{"link url ipv6 with a zone", func(m *Message) { m.Links[0].URL = "https://[fe80::1%25eth0]/" }, ""},
+		{"link url ipvfuture", func(m *Message) { m.Links[0].URL = "https://[v1.x]/" }, ""},
+		// One reading of the url decides both rules: a label naming the host
+		// of a url Go's url.Parse would refuse is still honest.
+		{"label naming the host of a url with a bad escape", func(m *Message) {
+			m.Links[0] = Link{Text: "https://a.example", URL: "https://a.example/%zz"}
+		}, ""},
+		{"label naming the host of a url with a word for a port", func(m *Message) {
+			m.Links[0] = Link{Text: "https://A.example/x", URL: "https://a.example:abc/"}
+		}, ""},
+		{"label naming another host than an ipv6 url's", func(m *Message) {
+			m.Links[0] = Link{Text: "https://good.example", URL: "https://[::1]/"}
+		}, "links[0].text"},
 		{"link url at cap", func(m *Message) { m.Links[0].URL = "https://example.com/" + long(urlMax-20) }, ""},
 		{"link url over cap", func(m *Message) { m.Links[0].URL = "https://example.com/" + long(urlMax-19) }, "links[0].url"},
 		{"label naming the url's host", func(m *Message) {
@@ -514,6 +540,14 @@ func TestAssertion27(t *testing.T) {
 		m.Headline = strings.Repeat("a", headlineMax+1)
 		if r := Read(Terminal, []lib.Part{dataPart(t, m)}); r.Mark == nil || len(r.Problems) != 0 || r.Message != nil {
 			t.Errorf("Read(terminal) read past the mark: %+v", r)
+		}
+		// Nor is a layout field's type: it cannot cost the mark.
+		raw := `{"schema":"kube-agents.chat/v1","rows":"x","plan":7,"mark":{"settle":"failed"}}`
+		if r := Read(Terminal, []lib.Part{rawPart(raw)}); r.Mark == nil || r.Mark.Settle != SettleFailed || len(r.Problems) != 0 {
+			t.Errorf("Read(terminal, a mistyped layout field) = %+v", r)
+		}
+		if r := Read(Terminal, []lib.Part{rawPart(`{"schema":"kube-agents.chat/v2","mark":{"settle":"failed"}}`)}); r.Mark != nil {
+			t.Errorf("Read(terminal) applied a mark under an unknown schema: %+v", r)
 		}
 		if _, err := MarkPart(Mark{Settle: "nope"}); ruleField(err) != "mark.settle" {
 			t.Errorf("MarkPart(bad) = %v", err)

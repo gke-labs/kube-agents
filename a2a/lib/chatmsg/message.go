@@ -236,12 +236,9 @@ func exactKeys(raw json.RawMessage, s *shape) json.RawMessage {
 // left nil and reported by Validate, since a bad mark drops alone; any other
 // decode failure is the returned error, and drops the whole message.
 func Parse(data []byte) (Message, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return Message{}, fmt.Errorf("chat message: not a JSON object: %w", err)
-	}
-	if raw == nil {
-		return Message{}, fmt.Errorf("chat message: null, not a JSON object")
+	raw, err := object(data)
+	if err != nil {
+		return Message{}, err
 	}
 	rawMark, hasMark := raw[markKey]
 	delete(raw, markKey)
@@ -249,20 +246,57 @@ func Parse(data []byte) (Message, error) {
 	if err != nil {
 		return Message{}, fmt.Errorf("chat message: %w", err)
 	}
-	rest := exactKeys(whole, messageShape)
 	var m Message
-	if err := json.Unmarshal(rest, &m); err != nil {
+	if err := json.Unmarshal(exactKeys(whole, messageShape), &m); err != nil {
 		return Message{}, fmt.Errorf("chat message: %w", err)
 	}
-	if hasMark && string(bytes.TrimSpace(rawMark)) != jsonNull {
-		var mark Mark
-		if err := json.Unmarshal(exactKeys(rawMark, messageShape.keys[markKey]), &mark); err != nil {
-			m.markErr = &RuleError{Field: markKey, Rule: "not an object of ask and settle: " + err.Error()}
-		} else {
-			m.Mark = &mark
-		}
+	if hasMark {
+		m.Mark, m.markErr = decodeMark(rawMark)
 	}
 	return m, nil
+}
+
+// ParseMark decodes only the schema and the mark of a chat message, the two
+// keys a renderer reads on a terminal status-update: a layout field of the
+// wrong type there is not read, so it cannot cost the mark.
+func ParseMark(data []byte) (Message, error) {
+	raw, err := object(data)
+	if err != nil {
+		return Message{}, err
+	}
+	var m Message
+	if rawSchema, ok := raw[schemaKey]; ok && json.Unmarshal(rawSchema, &m.Schema) != nil {
+		m.Schema = ""
+	}
+	if rawMark, ok := raw[markKey]; ok {
+		m.Mark, m.markErr = decodeMark(rawMark)
+	}
+	return m, nil
+}
+
+// object decodes data as a JSON object of raw values.
+func object(data []byte) (map[string]json.RawMessage, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("chat message: not a JSON object: %w", err)
+	}
+	if raw == nil {
+		return nil, fmt.Errorf("chat message: null, not a JSON object")
+	}
+	return raw, nil
+}
+
+// decodeMark is a raw mark as a Mark: nil for null, or nil and the reason
+// for one that does not decode, which drops the mark alone.
+func decodeMark(raw json.RawMessage) (*Mark, error) {
+	if string(bytes.TrimSpace(raw)) == jsonNull {
+		return nil, nil
+	}
+	var mark Mark
+	if err := json.Unmarshal(exactKeys(raw, messageShape.keys[markKey]), &mark); err != nil {
+		return nil, &RuleError{Field: markKey, Rule: "not an object of ask and settle: " + err.Error()}
+	}
+	return &mark, nil
 }
 
 // Encode is m as the data object a chat message part carries, with Schema
