@@ -811,3 +811,8 @@
 # the ledger objectives need an install with a GitHub ledger (a token minter
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
+
+# A cluster request ends in a pull request or a stated stop, never a direct
+# create (#2937). On the pool it grades the stop: the pool repositories hold no
+# provisioning/ path. Read-only; may open one pull request.
+./tasks/provisioning-cluster-request-never-creates/task.yaml
