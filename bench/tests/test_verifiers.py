@@ -9726,3 +9726,156 @@ def test_every_forbidden_pattern_has_a_contradiction_row(case):
     rows = {objective: len(lines) for objective, lines in _CONTRADICTIONS.get(case, {}).items()}
     clauses = {objective: len(patterns) for objective, patterns in _forbidden_clauses(case).items()}
     assert rows == clauses, (rows, clauses)
+# The readiness-rule cases for catalogue entries 2, 13, 16 and 19 carry the same cell
+# slot: each quotes what its rule's `describe` (or, where the rule filed a note, the
+# rule's note line) prints on the seeded fleet, and each cell carries a `;`, so the
+# same wraps are held to the same fold through each case's shipped entry. The
+# fleet's own values (a node's name, the per-namespace counts, the disk) are left
+# open by the patterns and stand in here as the fleet would print them.
+_SURGE_CASE = "upgrades-readiness-surge-capacity"
+_DATAPLANE_CASE = "upgrades-readiness-legacy-dataplane"
+_CONTAINERD_CASE = "upgrades-readiness-containerd-socket"
+_INTREE_CASE = "upgrades-readiness-intree-volume"
+_SLOT_NAMES = dict(zip(_SLOT_LETTERS, _SLOTS))
+_SURGE_CELL = (
+    "surge-capacity: pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists; "
+    "draining its node gke-seeded-b-no-surge-pool-1a2b3c4d-x9y8 leaves 250m CPU / 256Mi of pods with no node to take them "
+    "(0m / 0Mi free on the nodes they may schedule on): Deployment seeded-upgrade/pinned-batch-runner (250m / 256Mi, pinned to the pool)"
+)
+_DATAPLANE_RISK_CELL = (
+    "network-dataplane: legacy dataplane with policy enforcement off and NetworkPolicies in seeded-debug (1), seeded-upgrade (2): "
+    "the policies apply nowhere today and start to apply the moment enforcement turns on, at the node rebuild that follows enabling "
+    "the network policy add-on or on a Dataplane V2 cluster (platform-agent-host already enforce them); test what they deny before either"
+)
+_DATAPLANE_NOTE_LINE = "network-dataplane: legacy dataplane, policy enforcement off; network policies: none, nothing to enforce"
+_CONTAINERD_NOTE_LINE = (
+    "container-runtime: 1 workload(s) mount the container runtime socket (DaemonSet seeded-shapes/node-runtime-probe); "
+    "no pool's containerd major changes at the target"
+)
+# The rule's risk cell, the line the case admits on a fleet whose pool does change major.
+_CONTAINERD_RISK_CELL = (
+    "container-runtime: pool default-pool (COS_CONTAINERD) runs containerd 1 on its nodes (containerd://1.7.34) and the target's node image "
+    "ships containerd 2; mounting the runtime socket: DaemonSet seeded-shapes/node-runtime-probe (/run/containerd/containerd.sock)"
+)
+_INTREE_CELL = (
+    "in-tree-volumes: PersistentVolume intree-pd (in-tree gcePersistentDisk seeded-a-intree-pd, claim seeded-shapes/intree-pd, Bound) "
+    "attaches through CSI migration for Deployment seeded-shapes/intree-pd-reader; move it to pd.csi.storage.gke.io"
+)
+_CELL_WRAPS = ("{cell}", '"{cell}"', "'{cell}'", "\u201c{cell}\u201d", "<{cell}>", "`{cell}`")
+
+
+def _case_grades(case: str, objective: str, text: str) -> bool:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="readiness-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _without_cell_slot(text: str) -> str:
+    return "\n".join(line.rsplit("; cell:", 1)[0] for line in text.splitlines())
+
+
+def _surge_report(cell: str = _SURGE_CELL, grade: str = "blocker", other_cell: str = "none") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "b":
+            lines.append(f"{cluster}: pool that removes a node first: no-surge-pool; readiness rule: surge-capacity; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: pool that removes a node first: none; readiness rule: none; graded as: none; cell: {other_cell}")
+    return "\n".join(lines)
+
+
+def _dataplane_report(risk_cell: str = _DATAPLANE_RISK_CELL, note_line: str = _DATAPLANE_NOTE_LINE, note_grade: str = "note") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        grade, cell = (note_grade, note_line) if letter == "c" else ("risk", risk_cell)
+        lines.append(f"{cluster}: kind Cluster; dataplane: legacy; network policies enforced: no; readiness rule: network-dataplane; graded as: {grade}; cell: {cell}")
+    return "\n".join(lines)
+
+
+def _containerd_report(cell: str = _CONTAINERD_NOTE_LINE, blocks: str = "no") -> str:
+    lines = [f"{_SLOT_NAMES['a']}/seeded-shapes/node-runtime-probe: kind DaemonSet; mounts the runtime socket: yes; blocks the upgrade: {blocks}; cell: {cell}"]
+    lines += [f"{cluster}: no runtime socket clients" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
+    return "\n".join(lines)
+
+
+def _intree_report(cell: str = _INTREE_CELL, addon: str = "on", blocks: str = "no") -> str:
+    lines = [f"{_SLOT_NAMES['a']}/intree-pd: kind PersistentVolume; pd csi driver add-on: {addon}; blocks the upgrade: {blocks}; cell: {cell}"]
+    lines += [f"{cluster}: no in-tree volumes" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
+    return "\n".join(lines)
+
+
+_GROUP_CASE_REPORTS = {
+    _SURGE_CASE: (
+        ("every-seeded-cluster-has-a-declared-line", "the-laggard-names-no-surge-pool-as-a-blocker", "the-laggards-line-quotes-the-reports-cell", "the-other-clusters-declare-no-such-pool"),
+        lambda wrap: _surge_report(wrap.format(cell=_SURGE_CELL)),
+    ),
+    _DATAPLANE_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-declared-lines-say-the-dataplane-is-legacy",
+            "the-declared-lines-say-policies-are-not-enforced",
+            "the-declared-lines-name-the-reports-rule",
+            "the-declared-lines-grade-the-finding-by-the-clusters-policies",
+            "the-declared-lines-quote-the-reports-cell",
+        ),
+        lambda wrap: _dataplane_report(wrap.format(cell=_DATAPLANE_RISK_CELL), wrap.format(cell=_DATAPLANE_NOTE_LINE)),
+    ),
+    _CONTAINERD_CASE: (
+        ("the-planted-agent-is-named-and-does-not-block", "the-planted-agents-line-quotes-the-reports-text"),
+        lambda wrap: _containerd_report(wrap.format(cell=_CONTAINERD_NOTE_LINE)),
+    ),
+    _INTREE_CASE: (
+        ("the-planted-volume-is-named-with-the-addon-on-and-does-not-block", "the-planted-volumes-line-quotes-the-reports-cell"),
+        lambda wrap: _intree_report(wrap.format(cell=_INTREE_CELL)),
+    ),
+}
+
+
+@pytest.mark.parametrize("case,objective", [(case, objective) for case, (objectives, _) in _GROUP_CASE_REPORTS.items() for objective in objectives])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_rule_cases_accept_the_cell_however_the_agent_wrapped_it(case, objective, wrap):
+    assert _case_grades(case, objective, _GROUP_CASE_REPORTS[case][1](wrap))
+
+
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_changes_major(wrap):
+    assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=_CONTAINERD_RISK_CELL)))
+
+
+@pytest.mark.parametrize(
+    "case,objective,text",
+    [
+        # A report whose rule is missing prints no cell: `none`, or another text under the rule's id.
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report("none")),
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report('"surge-capacity: something else"')),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(risk_cell="none")),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(note_line='"network-dataplane: something else"')),
+        # Slot c carries no policy: its line quotes the note, not a risk cell it does not have.
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(note_line=_DATAPLANE_RISK_CELL)),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report("none")),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report('"container-runtime: something else"')),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report("none")),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report('"in-tree-volumes: something else"')),
+        # The grade slot names its subject; a wrapped cell does not change the grade.
+        (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _surge_report(f'"{_SURGE_CELL}"', grade="risk")),
+        (_DATAPLANE_CASE, "the-declared-lines-grade-the-finding-by-the-clusters-policies", _dataplane_report(note_grade="risk")),
+        (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _containerd_report(f'"{_CONTAINERD_NOTE_LINE}"', blocks="yes")),
+        (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _intree_report(f'"{_INTREE_CELL}"', blocks="yes")),
+        # A cluster with no such pool declares no cell either.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_cell=_SURGE_CELL)),
+        # A line without the cell slot is the earlier frame and fails the slots that need it.
+        (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _without_cell_slot(_surge_report())),
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _without_cell_slot(_surge_report())),
+        (_DATAPLANE_CASE, "the-declared-lines-grade-the-finding-by-the-clusters-policies", _without_cell_slot(_dataplane_report())),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _without_cell_slot(_dataplane_report())),
+        (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _without_cell_slot(_containerd_report())),
+        (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _without_cell_slot(_intree_report())),
+    ],
+)
+def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
+    assert not _case_grades(case, objective, text)
