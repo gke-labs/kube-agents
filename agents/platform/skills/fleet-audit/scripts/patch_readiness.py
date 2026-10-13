@@ -241,7 +241,7 @@ BEHIND_CHECKS = (MASTER_BEHIND_CHECK, "pool-skew")
 READINESS_TIMEOUT_S = 240
 # The reporter runs sit on `MAX_WORKERS` threads, so a per-run cap bounds one
 # project and not the sum: a fleet with more behind projects than workers
-# queues the rest behind the first eight. This is the budget for all of them
+# queues the rest behind the first `MAX_WORKERS`. This is the budget for all of them
 # together, measured from the moment the fleet collection starts, and a
 # reporter that would start with less than the floor left is not started.
 READINESS_FLEET_BUDGET_S = 420
