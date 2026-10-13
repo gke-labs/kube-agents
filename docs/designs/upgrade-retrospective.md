@@ -855,7 +855,13 @@ existed: the fleet-audit report store's rule (`audit_report.py`'s `REPORT_DIR_MO
 `REPORT_FILE_MODE` and `_adopt_owner`), which the collector carries as the sibling collectors carry
 their copies rather than importing the harness module into the sandbox run, so the uid-1000 tick
 writes after a root hand run and no login but the store's owner can replace its files, where a
-world-writable directory would have let any login on the pod do so. On a repository-linked install
+world-writable directory would have let any login on the pod do so. A directory that already exists
+is left as it is found, mode and owner alike, as the report store leaves it: a root run that
+tightened a root-owned directory an operator had opened for the tick would lock the tick out of a
+store it could write before. A store path the running uid cannot write ends the run with one line
+that names the path and, when it is another uid's, its owner's uid and this run's uid, as the report
+store's `_ownership_note` does, followed by the run's projects for the recovery `finish`; nothing
+more is written and no traceback is printed. On a repository-linked install
 `finish` also keeps the stream's validated document under the report store; this design's own ring
 stands for what `finish` never sees, an install without a repository and the scoped runs;
 in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
@@ -1028,7 +1034,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   their error, the cluster kept as a partial review, and the run ending under the terminal's
   limit with the manifest written; a locked-out full
   run exiting 0 with the lock-held line and
-  writing nothing; a
+  writing nothing; a root run leaving an existing store directory as found, mode and owner alike,
+  while handing a directory it makes to that directory's owner; a store path the run cannot write
+  ending it with one line, the owner named when it is another uid's and the projects at the end,
+  no traceback; a
   persisting guard's candidate under the check its guard records, moved on a re-grade, with first
   seen and the review count, a cleared
   guard emitting nothing, and a guard whose re-check read failed emitting nothing with its check
