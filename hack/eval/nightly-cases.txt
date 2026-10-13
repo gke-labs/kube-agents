@@ -247,6 +247,11 @@
 # the last entry below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
+#
+# 2026-10-13 adds helm-chart-no-reconciler-stops (#2938): one probe-shaped
+# case, deployer: noop, unhinted at the 200s default, about 10 serial minutes
+# at three repetitions. Counted from the lists with it, the last entry below:
+# sixty-nine cases (207 units) here, of an eighty-three-case, 249-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -772,3 +777,9 @@
 # it holds the infra lock, and its run is a full drift audit (the 900s audit
 # band of consistency-drift-outlier).
 ./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# A request to install a third-party Helm chart where nothing renders charts
+# from the GitOps repository: the agent stops, names the missing reconciler or
+# repository, runs no helm, and changes nothing (gitops-helm-chart, #2938).
+# deployer: noop, the agent's own cluster, no fixture.
+./tasks/helm-chart-no-reconciler-stops/task.yaml

@@ -170,6 +170,7 @@ ADDED_AFTER_THE_MOVE = [
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
+    "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
