@@ -712,8 +712,8 @@ def _ledger_line(report: str) -> str:
 def headline_fallback(report: str, ref: LedgerRef) -> str | None:
     """The report's ledger line in bold with the ledger link, for when the issue could not be read.
 
-    The ledger line is the report's last, the SOPs' one line; a sentence the
-    relay turn put above it is not the headline. A last line that is only the
+    The ledger line is the report's last, the SOPs' one line; a sentence above
+    it is not the headline. A last line that is only the
     link falls back to the audit line above it (:func:`_ledger_line` says
     which); with none, there is no headline and the report goes out unchanged.
     """

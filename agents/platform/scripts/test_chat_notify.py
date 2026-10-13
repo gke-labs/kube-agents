@@ -167,10 +167,7 @@ class SessionKVCallersTest(unittest.TestCase):
     def test_the_relay_files_an_exit_3_leg_as_delivered_and_does_not_log_it_undelivered(self):
         skv = self.skv
         with mock.patch.object(skv, "enabled_chat_platforms", return_value=["google_chat"]), \
-                mock.patch.object(skv, "_gateway_api_token", return_value=""), \
                 mock.patch.object(skv, "_ensure_session_row"), \
-                mock.patch.object(skv, "_create_gateway_session", return_value=True), \
-                mock.patch.object(skv, "_run_relay_turn", return_value="composed report"), \
                 mock.patch.object(skv, "_lookup_session_routing", return_value=("", "", "")), \
                 mock.patch.object(skv, "_lookup_platform_threads", return_value={}), \
                 mock.patch.object(skv, "_slack_audit_headline", return_value=None), \

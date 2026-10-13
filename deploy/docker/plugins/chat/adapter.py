@@ -10,8 +10,8 @@ delivery support without editing this module".
 Why a delivery mode and not a prompt instruction
 ------------------------------------------------
 
-The relay itself — the Chat Agent composing the message, and the report being
-stored against the thread it lands in — is ``docs/designs/cron-report-relay.md``.
+The relay itself — the report being posted, and stored against the thread it
+lands in — is ``docs/designs/cron-report-relay.md``.
 This module is only about *what triggers* it.
 
 The first cut triggered it from the job's prompt: call ``report_to_chat``, then
@@ -90,10 +90,10 @@ RELAY_URL_ENV = "CRON_REPORT_RELAY_URL"
 API_KEY_ENV = "SESSION_KV_API_KEY"
 
 #: The route relays synchronously and answers with the outcome, so this has to
-#: cover a whole Chat Agent turn plus the chat round trip -- not just a connect
-#: stall. Sized above ``_run_relay_turn``'s own 300s so the server's verdict is
-#: what the scheduler records; time out first and a delivered report would be
-#: written down as a failure.
+#: cover the sends to every platform and a Slack audit headline's ledger read --
+#: not just a connect stall. The server's verdict has to be what the scheduler
+#: records; time out first and a delivered report would be written down as a
+#: failure. session_kv_server sizes its posts budget at half of this.
 RELAY_TIMEOUT_SECONDS = 360.0
 
 #: Markdown a model wraps around a bare token: emphasis, code spans, and the

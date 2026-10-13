@@ -108,7 +108,7 @@ What the drift branch does differently:
   front door is told to copy verbatim, so a backtick in either would close the span it sits in and
   the rest of the value would read as instruction text. The drift renderers substitute the
   characters that end a span or start a line of their own, replace the chat-template control tokens
-  `_defang_report` already handles, and truncate, so a field stuffed with instructions cannot
+  `_CONTROL_TOKEN_RE` matches, and truncate, so a field stuffed with instructions cannot
   outweigh the prompt around it. Replacement is with U+FFFD rather than deletion, because the card
   is evidence and a reader should see that the value was altered. The event path does not do this
   and is unchanged; its fields come from the kubelet rather than from the caller being reported on.

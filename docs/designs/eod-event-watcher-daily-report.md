@@ -36,7 +36,7 @@ scripts directory. It needs no cluster access.
 The `deliver: "chat"` route does not go through `home_target_env`: `profile_cron_tick.spawn_tick`
 sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target always resolves and the
 relay is always attempted. The home channel is needed one hop later, where the Session KV server
-posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
+posts the report: `_send_to_chat` runs `hermes send --to <platform>` with no
 chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
 there is none the send fails and the roster entry records a `last_delivery_error` that nests three
 layers of wrapping — the relay's own words inside the route's 502 detail inside the plugin's report

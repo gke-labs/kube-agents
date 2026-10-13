@@ -129,8 +129,8 @@ def _reply_text(report, user_text):
     So the report is fenced, labelled untrusted, and stripped of the tokens that
     could close the fence -- the pattern `_sanitize_log_text` already applies to
     pod diagnostics in `platform_mcp_server.py`. Nothing here is shown to a human,
-    which is what lets this hop be blunter than the relay turn, where the same
-    text is composed into a message the user reads.
+    which is what lets this hop be blunter than the post itself, where the same
+    text is the message the user reads.
 
     Deliberately not "k8s incident report". The `incidents` table has three
     writers -- the kanban notifier, which stores the event-triage report it just

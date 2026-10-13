@@ -355,8 +355,8 @@ job fails in the direction of at most once: a post the scheduler recorded as
 undelivered is a lost request, which `chat-delivery-watch` counts like any
 other failed delivery, and which an operator sends again by removing
 `.feedback_prompt_sent` from the profile home, after which the next tick
-claims afresh. One Chat Agent composition is all the job ever costs, on the
-one tick that prints. The clock starts at the first
+claims afresh. One post is all the job ever costs, on the one tick that
+prints. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets
@@ -451,8 +451,8 @@ that Hermes registers like any other. So it is one target among several — a jo
 on `"chat,slack"` relays _and_ posts, and an unreachable relay records
 `last_delivery_error` rather than falling back. Note that `"all"` now expands to
 include the relay, so `"all"` and `"chat"` together deliver once, not twice, but
-`"all"` alone relays too. The full rationale — why the Chat Agent composes but
-does not send, why the session is per job per day, why a mode rather than an
+`"all"` alone relays too. The full rationale — why the report is posted as the
+job wrote it, why the thread is per job per day, why a mode rather than an
 instruction, and what the plugin route costs — is
 [`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
 
