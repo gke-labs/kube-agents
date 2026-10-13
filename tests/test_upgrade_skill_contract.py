@@ -36,6 +36,12 @@ TRACKER = "gke-labs/kube-agents"
 # The period that ends a sentence: followed by whitespace or the end of the
 # text, so the one inside `install.env` or a version number does not end it.
 SENTENCE_END = r"\.(?=\s|$)"
+# The body of one sentence: lazily, characters that contain no sentence end.
+# An opener that recurs in the section ("Remove ..." opens a labels sentence
+# as well as the strip sentence) otherwise matches from its first occurrence
+# to a closer several sentences later, and a pin against the group passes for
+# a term that sits anywhere in that span.
+WITHIN_SENTENCE = rf"(?:(?!{SENTENCE_END}).)+?"
 
 # Identity first: the refusal below turns on "identity is unverified", which is
 # a condition only if the check runs before every kind of write the section
@@ -63,7 +69,7 @@ NOT_INFERRED_FROM = "Do not infer requester eligibility from bot, application or
 
 # (b) The refusal: each condition ends in a local draft, and a regular user
 # never gets a write, whatever the severity and whatever they approve.
-REFUSAL_SENTENCE = re.compile(r"If identity is unverified.+?" + SENTENCE_END)
+REFUSAL_SENTENCE = re.compile(rf"If identity is unverified{WITHIN_SENTENCE}{SENTENCE_END}")
 REFUSAL_CONDITIONS = (
     "identity is unverified",
     "no authoritative source qualifies the requester",
@@ -109,7 +115,7 @@ EXPLICIT_REPO_FLAG = f"`gh` with an explicit `--repo {TRACKER}`"
 # section's own list, read back from its "Remove ..." sentence; the surfaces
 # are what is anonymized before posting; the artifacts are never attached; the
 # duplicate search is anonymized too, since it is also a request to GitHub.
-STRIP_SENTENCE = re.compile(r"Remove (?P<classes>.+?) and other client-specific details" + SENTENCE_END)
+STRIP_SENTENCE = re.compile(rf"Remove (?P<classes>{WITHIN_SENTENCE}) and other client-specific details{SENTENCE_END}")
 CLIENT_DETAIL_CLASSES = (
     "credentials",
     "tokens",
@@ -123,18 +129,18 @@ CLIENT_DETAIL_CLASSES = (
     "IP/email addresses",
     "filesystem paths",
 )
-ANONYMIZE_SENTENCE = re.compile(r"Anonymize the (?P<surfaces>.+?) before posting" + SENTENCE_END)
+ANONYMIZE_SENTENCE = re.compile(rf"Anonymize the (?P<surfaces>{WITHIN_SENTENCE}) before posting{SENTENCE_END}")
 PUBLIC_SURFACES = ("title", "body", "comments", "any attachments")
-ATTACH_SENTENCE = re.compile(r"Never attach raw (?P<artifacts>.+?)" + SENTENCE_END)
+ATTACH_SENTENCE = re.compile(rf"Never attach raw (?P<artifacts>{WITHIN_SENTENCE}){SENTENCE_END}")
 NEVER_ATTACHED = ("`install.env`", "Terraform state", "kubeconfig", "unfiltered logs")
 SEARCH_IS_ANONYMIZED = "Use anonymized search terms; do not send raw client diagnostics"
 PAYLOAD_REVIEW = "Review the complete public payload for client information before sending"
 
 # (e) Labels. Both go on every defect report; p0 is reserved for three
 # conditions, and a failed upgrade over a healthy install is not one of them.
-LABELS_SENTENCE = re.compile(r"Apply (?P<labels>.+?) to a created or updated defect report")
+LABELS_SENTENCE = re.compile(rf"Apply (?P<labels>{WITHIN_SENTENCE}) to a created or updated defect report")
 DEFECT_LABELS = ("`bug`", "`upgrade-failure`")
-P0_SENTENCE = re.compile(r"Add `priority:p0` only for (?P<conditions>.+?)" + SENTENCE_END)
+P0_SENTENCE = re.compile(rf"Add `priority:p0` only for (?P<conditions>{WITHIN_SENTENCE}){SENTENCE_END}")
 P0_CONDITIONS = ("confirmed data loss", "an ongoing outage caused by the defect", "a blocked release")
 P0_IS_NOT_AUTOMATIC = "A failed upgrade with a healthy existing install is not automatically p0"
 
@@ -169,6 +175,21 @@ class ReaderTest(unittest.TestCase):
 
     def test_prose_joins_a_wrapped_bullet(self) -> None:
         self.assertEqual("- ask the user once", prose("- ask the\n  user   once\n"))
+
+    def test_a_sentence_pattern_does_not_cross_a_sentence_end(self) -> None:
+        # "Remove" opens the labels bullet's sentence too, before the strip
+        # sentence. The group must be the strip list alone: a class moved into
+        # the "Allow only" sentence between them is a class no longer stripped,
+        # and a group spanning both sentences would still contain it.
+        text = (
+            "Remove conflicting labels. Allow only URLs. "
+            "Remove credentials and tokens and other client-specific details. Next."
+        )
+        self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
+
+    def test_a_period_inside_a_word_does_not_end_a_sentence(self) -> None:
+        text = "Never attach raw `install.env`, kubeconfig or unfiltered logs. Next."
+        self.assertEqual("`install.env`, kubeconfig or unfiltered logs", ATTACH_SENTENCE.search(text).group("artifacts"))
 
 
 class ReportingContractTest(unittest.TestCase):
