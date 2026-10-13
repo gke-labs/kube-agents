@@ -579,6 +579,23 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = by_object(self.classify(events=[gone], owners=READS["seeded-a"]["owners"]), PAYMENTS)
         self.assertEqual(entries(row), {(None, ur.MEDIUM)})
 
+    def test_rows_2_and_18_read_a_clause_set_with_a_dotted_key_whole(self):
+        # The clause set runs to the scheduler's trailing sentence (`SCHEDULING_TAIL_RE`), so a period
+        # inside a reason, `nvidia.com/gpu` or a `{node.kubernetes.io/not-ready: }` taint key, is part
+        # of it, and rows 2 and 18 read their clauses from the whole set.
+        self.assertEqual(ur.SCHEDULING_TAIL_RE.pattern, r"\. (?:no new claims to deallocate, )?preemption:")
+        pinned = {"seeded-role": "pinned-inference"}
+        gpu = "0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("trainer", scheduled_message=gpu, node_selector=pinned)])
+        self.assertEqual({c["entry"] for c in row["classifications"]}, {18})
+        self.assertEqual(row["classifications"][0]["evidence_core"], "Insufficient nvidia.com/gpu")
+        self.assertEqual(ur.SCHEDULING_TAIL_RE.split(gpu, 1)[0], "0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 2 node(s) didn't match Pod's node affinity/selector")
+        taint = "0/2 nodes are available: 1 node(s) had untolerated taint {node.kubernetes.io/not-ready: }, 1 Insufficient cpu. preemption: 0/2 nodes are available: 2 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("api", scheduled_message=taint, node_selector=pinned)])
+        self.assertEqual({c["entry"] for c in row["classifications"]}, {2})
+        self.assertEqual(row["classifications"][0]["evidence_core"], "Insufficient cpu")
+        self.assertEqual(ur.SCHEDULING_TAIL_RE.split(taint, 1)[0], "0/2 nodes are available: 1 node(s) had untolerated taint {node.kubernetes.io/not-ready: }, 1 Insufficient cpu")
+
     def test_entry_12_is_high_only_with_a_sourced_dropped_label_entry(self):
         # The shipped table is empty: no GKE release note or document names a label removal, and
         # kubeadm's `node-role.kubernetes.io/master` is a label no GKE node carried. The high branch is
@@ -3393,9 +3410,11 @@ class ReportTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             result = ur.collect(args(), run=FakeFleet(operations=ops), now=NOW)
         op_incident = next(i for i in result["sections"]["errors"] if i["kind"] == ur.INCIDENT_OPERATION)
-        self.assertEqual(op_incident["object"], "operation/UPGRADE_NODES idle-batch-pool")
+        # The incident is its own kind, keyed by the operation's name; type and target are in the text.
+        self.assertEqual(op_incident["object"], f"Operation/{bad['name']}")
         report = ur.render_report(result)
-        self.assertIn(f"### operation DONE — {SEEDED} — `operation/UPGRADE_NODES idle-batch-pool`", report)
+        self.assertIn(f"### operation DONE — {SEEDED} — `Operation/{bad['name']}`", report)
+        self.assertIn(ur.OPERATION_GUARD_FORMAT.format(id=ur.guard_id(SEEDED, ur.ENTRY_OPERATION, f"Operation/{bad['name']}"), first_seen="2026-10-08T18:00:00Z", type="UPGRADE_NODES", target="idle-batch-pool"), report)
         self.assertIn(f"{ur.PART_WHAT_FAILED} UPGRADE_NODES on idle-batch-pool ended DONE: Instance", report)
         self.assertIn(f"{ur.PART_MITIGATE} {ur.OPERATION_MITIGATE_TEXT}", report)
         # The manifest candidate's impact is the report's sentence; entry 2's repair joins it only
@@ -4032,6 +4051,145 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(manifest["partial"])
         self.assertEqual([h for h in manifest["still_flagged"] if h["cluster"] == SEEDED], [])
         self.assertIn(ur.RECHECK_HELD_FORMAT.format(count=len(held)), ur.render_report(second))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_a_failed_feeding_read_is_a_limitation_and_an_info_read_is_not(self):
+        # The read map: budgets feed the pod checks, so a failed pdbs read on a review is a limitation
+        # with no check unevaluated; the budget guard it could have shown is held unchanged with no
+        # candidate, what the pods read shows is filed, and the run is partial. The webhooks read costs
+        # Info alone: its failure is a "Reads that failed" line and nothing else.
+        budget = "seeded-capacity/PodDisruptionBudget/inference-server"
+        guard = ur.guard_id(SEEDED, 1, budget)
+        first, _ = self.collect()
+        before = next(g for g in first["guards"] if g["id"] == guard)["last_seen"]
+        pinned = next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"])
+        second_op = {**copy.deepcopy(pinned), "name": "operation-second-pinned", "startTime": "2026-10-15T16:00:00Z", "endTime": "2026-10-15T16:40:00Z"}
+        pdbs_failed, _ = self.collect(FakeFleet(operations=OPERATIONS + [second_op], kubectl_fail=[("seeded-a", "pdbs")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in pdbs_failed["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual(review["partial"], ["pdbs"])
+        manifest = json.loads(Path(pdbs_failed["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
+        self.assertNotIn("checks_unevaluated", seeded)
+        self.assertTrue(seeded["limitations"].startswith("reads that failed: pdbs:"), seeded["limitations"])
+        self.assertEqual([c["check"] for c in seeded["commands"]], [check for check, _ in ur.CHECK_READS])
+        self.assertEqual([g["last_seen"] for g in pdbs_failed["guards"] if g["id"] == guard], [before])
+        objects = [c["object"] for c in seeded["candidates"]]
+        self.assertNotIn("PodDisruptionBudget/inference-server", objects)
+        self.assertIn("Deployment/inference-server", objects)
+        self.assertTrue(manifest["partial"])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        third_op = {**second_op, "name": "operation-third-pinned", "startTime": "2026-10-22T16:00:00Z", "endTime": "2026-10-22T16:40:00Z"}
+        webhooks_failed, _ = self.collect(FakeFleet(operations=OPERATIONS + [second_op, third_op], kubectl_fail=[("seeded-a", "webhooks")]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in webhooks_failed["reviews"] if r["cluster"] == SEEDED)
+        self.assertTrue(review["reviewed"])
+        self.assertEqual(review["baseline"]["shape_reads_failed"], [e for e in review["read_errors"] if e.startswith("webhooks:")])
+        self.assertTrue(any(line.startswith(f"{SEEDED}: webhooks:") for line in webhooks_failed["failed_reads"]))
+        manifest = json.loads(Path(webhooks_failed["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertNotIn("limitations", seeded)
+        self.assertNotIn("checks_unevaluated", seeded)
+        self.assertFalse(manifest["partial"])
+        self.assertIn(ur.INFO_FAILED_READS, ur.render_report(webhooks_failed))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_an_operation_inside_the_settle_floor_holds_its_cluster_on_every_route(self):
+        # The settle floor applies on every route: a cluster whose operation reached DONE less than
+        # fifteen minutes before a full run is listed as settling with the upgrading clusters,
+        # `gate-failed` in the manifest with nothing read and its last run unchanged; a forced
+        # `--cluster` run inside the floor gets the same line; the full run fifteen minutes on reviews it.
+        self.collect()
+        pinned = next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"])
+        fresh = {**copy.deepcopy(pinned), "name": "operation-fresh", "startTime": "2026-10-15T17:40:00Z", "endTime": "2026-10-15T17:55:00Z"}
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        held_run, fleet = self.collect(FakeFleet(operations=OPERATIONS + [fresh]), now=later)
+        self.assertFalse(held_run["scoped"])
+        self.assertEqual([r["cluster"] for r in held_run["reviews"]], [])
+        self.assertEqual([(u["cluster"], u["operation"]["name"], u.get("settling"), u.get("waiting")) for u in held_run["upgrading"]], [(SEEDED, "operation-fresh", True, 0)])
+        self.assertFalse(any("get-credentials" in c and "seeded-a" in c for c in fleet.calls))
+        line = ur.SETTLING_LINE.format(cluster=SEEDED, operation="UPGRADE_NODES", target="pinned-inference-pool", end="2026-10-15T17:55:00Z", minutes=15)
+        self.assertTrue(line.endswith("or the next full run"))
+        self.assertIn("- " + line, ur.render_report(held_run))
+        manifest = json.loads(Path(held_run["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual((seeded["outcome"], "candidates" in seeded, manifest["partial"]), (ur.MANIFEST_OUTCOME_GATE_FAILED, False, True))
+        self.assertIn("under 15 min ago", seeded["error"])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["last_run"], "2026-10-08T18:00:00Z")
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        forced, _ = self.collect(FakeFleet(operations=OPERATIONS + [fresh]), now=later, cluster=[SEEDED], full=False)
+        self.assertEqual(([r["cluster"] for r in forced["reviews"]], [(u["cluster"], u.get("settling")) for u in forced["upgrading"]]), ([], [(SEEDED, True)]))
+        reviewed, _ = self.collect(FakeFleet(operations=OPERATIONS + [fresh]), now=later + timedelta(minutes=15))
+        self.assertEqual([r["cluster"] for r in reviewed["reviews"]], [SEEDED])
+        self.assertIn("operation-fresh", [op["name"] for op in reviewed["reviews"][0]["what_happened"]["operations"]])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["last_run"], "2026-10-15T18:15:00Z")
+
+    def test_a_failed_operation_is_its_own_finding_with_a_guard_re_checked_through_the_listing(self):
+        # A failed operation is an incident of its own kind, `Operation/<name>` under
+        # `upgrade-operation-failed`, with a failure guard re-checked through the listing every run
+        # makes: refreshed while the listing still shows the failure (the held candidate carries the
+        # persistence), held with the check unevaluated when the listing fails, cleared with an Info
+        # line when a later operation of the same type on the same target reaches DONE without error.
+        ops = copy.deepcopy(OPERATIONS)
+        errored = next(o for o in ops if o.get("error"))
+        bad = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/idle-batch-pool" in o["targetLink"])
+        bad["error"], bad["statusMessage"] = errored["error"], errored["statusMessage"]
+        name = bad["name"]
+        obj = f"Operation/{name}"
+        identity = {"check": ur.CHECK_OPERATION_FAILED, "cluster": SEEDED, "namespace": "", "object": obj}
+        guard = ur.guard_id(SEEDED, ur.ENTRY_OPERATION, obj)
+        first, _ = self.collect(FakeFleet(operations=ops))
+        manifest = json.loads(Path(first["manifest_path"]).read_text())
+        [filed] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == obj]
+        self.assertEqual((filed["check"], filed["severity"], filed["namespace"]), (ur.CHECK_OPERATION_FAILED, ur.MANIFEST_SEVERITY_MAJOR, ""))
+        filed_id = self.audit_report.published_id(filed)
+        self.assertEqual(filed_id, self.audit_report.published_id(identity))
+        [record] = [g for g in first["guards"] if g["id"] == guard]
+        self.assertEqual((record["kind"], record["entry"], record["source"], record["check"], record["reviews"], record["reads"], record[ur.OPERATION_GUARD_START_KEY]), (ur.GUARD_KIND_FAILURE, ur.ENTRY_OPERATION, ur.OPERATIONS_READ, ur.CHECK_OPERATION_FAILED, 1, [], "2026-10-08T03:46:22Z"))
+        self.assertTrue(record["evidence"].startswith("UPGRADE_NODES on idle-batch-pool ended DONE: Instance"), record["evidence"])
+        self.assertIn(f"### operation DONE — {SEEDED} — `{obj}`", ur.render_report(first))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # Sunday 2, the listing unchanged: the cluster is unchanged, the guard is refreshed through the
+        # listing and its candidate is held under the same id with the persistence.
+        second, _ = self.collect(FakeFleet(operations=ops), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(second["operation_guards"], {"refreshed": [guard], "cleared": [], "held": []})
+        self.assertIn(SEEDED, [u["cluster"] for u in second["unchanged"]])
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        [held] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == obj]
+        self.assertEqual((held["check"], held["severity"], held["persistence"], held["entries"]), (ur.CHECK_OPERATION_FAILED, ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-08T18:00:00Z, 2 review(s)"], ur.ENTRY_OPERATION))
+        self.assertTrue(held["impact"].startswith(ur.OPERATION_MITIGATE_TEXT))
+        self.assertTrue(held["command"].startswith("gcloud container operations list"))
+        self.assertEqual(self.audit_report.published_id(held), filed_id)
+        self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        self.assertEqual([(g["reviews"], g["last_seen"]) for g in second["guards"] if g["id"] == guard], [(2, "2026-10-15T18:00:00Z")])
+        self.assertIn(ur.OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=1, held=0), ur.render_report(second))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # A Sunday whose listing failed: the guard is held as it stands, the operation check is
+        # unevaluated, no candidate and no stale Warning for it, the run partial.
+        third, _ = self.collect(FakeFleet(operations=ops, ops_fail={PROJECT}), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(third["operation_guards"], {"refreshed": [], "cleared": [], "held": [guard]})
+        self.assertEqual([(g["reviews"], g["last_seen"]) for g in third["guards"] if g["id"] == guard], [(2, "2026-10-15T18:00:00Z")])
+        manifest = json.loads(Path(third["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertIn({"check": ur.CHECK_OPERATION_FAILED, "reason": "operations read failed"}, seeded["checks_unevaluated"])
+        self.assertEqual([c for c in seeded["candidates"] if c["object"] == obj], [])
+        self.assertEqual([w for w in third["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["object"] == obj], [])
+        self.assertTrue(manifest["partial"])
+        self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        # Sunday 4, a later operation of the same type on the same target DONE without error: the
+        # listing reaches the failed operation through the guard's recorded start, the guard is
+        # cleared with an Info line, and no candidate carries the id.
+        retry = {**copy.deepcopy(bad), "name": "operation-retry", "startTime": "2026-10-27T03:00:00Z", "endTime": "2026-10-27T03:12:00Z"}
+        retry.pop("error", None)
+        retry.pop("statusMessage", None)
+        fourth, fleet = self.collect(FakeFleet(operations=ops + [retry]), now=datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc))
+        listing = next(c for c in fleet.calls if "operations" in c and "list" in c)
+        self.assertIn("2026-10-08T03:46:22Z", " ".join(listing))
+        self.assertEqual([(item["id"], item["reason"]) for item in fourth["operation_guards"]["cleared"]], [(guard, ur.OPERATION_GUARD_RETRIED_FORMAT.format(type="UPGRADE_NODES", target="idle-batch-pool", name="operation-retry", end="2026-10-27T03:12:00Z"))])
+        self.assertNotIn(guard, {g["id"] for g in fourth["guards"]})
+        manifest = json.loads(Path(fourth["manifest_path"]).read_text())
+        self.assertEqual([c for e in manifest["clusters"] for c in e.get("candidates") or [] if c["object"] == obj], [])
+        self.assertNotIn(filed_id, self.audit_report.collector_flagged_ids(manifest))
+        self.assertIn("- " + ur.OPERATION_GUARD_CLEARED_FORMAT.format(id=guard, reason=ur.OPERATION_GUARD_RETRIED_FORMAT.format(type="UPGRADE_NODES", target="idle-batch-pool", name="operation-retry", end="2026-10-27T03:12:00Z")), ur.render_report(fourth))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_three_guards_on_one_object_are_one_candidate(self):
