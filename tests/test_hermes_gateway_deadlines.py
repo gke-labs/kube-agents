@@ -31,7 +31,7 @@ class TestGatewayDeadlines(unittest.TestCase):
                 provider = config["model"]["provider"]
                 self.assertEqual(provider, "custom")
                 deadlines = config["providers"][provider]
-                self.assertEqual(deadlines["stale_timeout_seconds"], 300)
+                self.assertEqual(deadlines["stale_timeout_seconds"], 600)
                 self.assertEqual(deadlines["request_timeout_seconds"], 900)
 
 

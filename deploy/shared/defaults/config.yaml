@@ -9,18 +9,19 @@ model:
 # (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
 # detectors: a stream with no first chunk, or no chunk for that long, and a
 # non-streamed call with no answer; then Hermes drops the stream and retries.
-# 300s sits above 99.66% of the times to first token the gateway measured on
-# the next test installs in October 2026, and above the 240s/300s floors Hermes
-# applies for large contexts. request_timeout_seconds is the per-read socket
-# timeout (and the stream read timeout), not a cap on a whole call; the chart's
-# LiteLLM sets no timeout of its own. A call that stalls is retried inside each
-# of Hermes' 3 attempts (agent.api_max_retries) until five stale kills in a row
-# trip its breaker, so it costs five or six 300s windows, about 25 to 30
-# minutes plus backoff, before the turn fails. A one-off stall recovers at the
-# first 300s kill.
+# It is 600s because Gemini thinks in silence on this path: with the request
+# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
+# 140-210s before its first chunk, so a shorter bound would cut off healthy
+# long thinks, and every retry would repeat the same think.
+# request_timeout_seconds is the per-read socket timeout (and the stream read
+# timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
+# its own. A call that stalls is retried inside each of Hermes' 3 attempts
+# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
+# a persistent stall costs five or six 600s windows before the turn fails; a
+# one-off stall recovers at the first 600s kill.
 providers:
   custom:
-    stale_timeout_seconds: 300
+    stale_timeout_seconds: 600
     request_timeout_seconds: 900
 
 # MCP Servers configuration.
