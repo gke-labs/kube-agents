@@ -23,6 +23,21 @@ model:
   base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
+# Model-call deadlines for the gateway above. Hermes reads them per provider
+# (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
+# detectors: no first chunk, or no chunk for that long, on a stream (scaled up
+# for contexts over 50k tokens), and no answer on a non-streamed call; then
+# Hermes reconnects and retries. 300s keeps 99.66% of the gateway's measured
+# time-to-first-token. request_timeout_seconds caps a whole call and is also
+# the stream read timeout; it sits below any total the gateway itself applies,
+# so Hermes always gives up first. With Hermes' default of 3 attempts
+# (agent.api_max_retries), a call that stalls costs at most about 15 minutes
+# before the turn fails.
+providers:
+  custom:
+    stale_timeout_seconds: 300
+    request_timeout_seconds: 900
+
 # MCP Servers configuration. Read-only diagnostics surface only.
 mcp_servers:
   # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit

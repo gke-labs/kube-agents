@@ -1297,6 +1297,15 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # exit used to clear it), and a foreground ssh exit 255 without the cwd marker
 # carries a hint when upstream attached none. See the module docstring in
 # deploy/docker/patches/apply_ssh_shared_master.py.
+#
+# cluster_dns_not_local rides it too: is_local_endpoint() calls any host ending
+# in .local an mDNS LAN box, so the agent's own model endpoint,
+# inference-gateway.<ns>.svc.cluster.local, got local-server handling. That
+# meant a 900s stream stale detector, an 1800s read timeout, no non-stream
+# stale detector, and Ollama/llama.cpp probes the gateway 404s. Kubernetes
+# service DNS (.svc, .cluster.local) now classifies as a cloud endpoint; a
+# real .local host stays local. See the module docstring in
+# deploy/docker/patches/apply_cluster_dns_not_local.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1314,6 +1323,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_api_failure_reason_header.py \
      deploy/docker/patches/apply_ssh_shared_master.py \
      deploy/docker/patches/verify_ssh_shared_master.py \
+     deploy/docker/patches/apply_cluster_dns_not_local.py \
+     deploy/docker/patches/verify_cluster_dns_not_local.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
@@ -1324,6 +1335,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cluster_dns_not_local.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1336,6 +1348,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
     grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
     grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
+    grep -q 'kube-agents patch: cluster-dns-not-local' /opt/hermes/agent/model_metadata.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1343,6 +1356,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cluster_dns_not_local.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
