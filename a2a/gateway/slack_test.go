@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -1992,7 +1993,7 @@ func TestSlackSessionLookupLogLevels(t *testing.T) {
 }
 
 // TestSlackDecodedTextDrivesTheAffordances pins a consequence of decoding the
-// inbound entities that nothing else in the suite notices. normalize() drops
+// inbound entities that nothing else in the suite notices. chattext.Normalize() drops
 // every non-alphanumeric, so the entity escaping used to survive it as
 // letters: "&lt;stop&gt;" normalized to "ltstopgt" and matched nothing.
 // Decoded first, the same wire text normalizes to "stop" — a hard task cancel.
@@ -2003,8 +2004,8 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 
 	// What Slack puts on the wire when a user types "<stop>".
 	const stopWire = "&lt;stop&gt;"
-	if got := normalize(stopWire); got != "ltstopgt" || isStop(stopWire) {
-		t.Fatalf("premise: normalize(%q) = %q, isStop = %v", stopWire, got, isStop(stopWire))
+	if got := chattext.Normalize(stopWire); got != "ltstopgt" || chattext.IsStop(stopWire) {
+		t.Fatalf("premise: chattext.Normalize(%q) = %q, chattext.IsStop = %v", stopWire, got, chattext.IsStop(stopWire))
 	}
 	msg, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", stopWire, "800.0", ""))
 	if !ok {
@@ -2013,7 +2014,7 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	if msg.Text != "<stop>" {
 		t.Fatalf("inbound text = %q, want the decoded form", msg.Text)
 	}
-	if !isStop(msg.Text) {
+	if !chattext.IsStop(msg.Text) {
 		t.Error("a typed <stop> must cancel: the decode is what lets normalize see \"stop\"")
 	}
 }
