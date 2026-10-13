@@ -240,9 +240,12 @@ TABLE_RUNS_KEY = "table_runs"
 READINESS_RUNS_KEY = "readiness_runs"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
-# watch's own read errors and stamps; the id is learned from the first
-# successful table run, and every later envelope is rewritten to it
-# (canonicalise_projects) before the watch reads it.
+# watch's own read errors and stamps. learn_project_id is the one place that
+# decides the id a spelling is keyed by and when that is final: a table run
+# that resolves an id learns it; a number the script handed back unresolved (a
+# `projects describe` outage) is provisional, and what was keyed under it is
+# re-keyed once the id is learned; and every envelope is rewritten to the
+# learned ids (canonicalise_projects) before the watch reads it.
 PROJECT_IDS_KEY = "project_ids"
 REPORT_PROJECTS_KEY = "projects"
 ANNOUNCED_KEY = "announced"
@@ -254,6 +257,13 @@ FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 RECOVERED_LINE = "{prefix} watch: the tick runs again"
 DETAIL_KEY = "detail"
 ATTEMPTS_KEY = "attempts"
+# What an ungraded version's announcement is keyed on: each of its projects
+# and how it went ungraded, never the error text, which a transport outage
+# rewords from one run to the next. The detail rides on the line.
+SIGNATURE_KEY = "signature"
+UNGRADED_KIND_RUN_FAILED = "readiness run failed"
+UNGRADED_KIND_UNRUN = "readiness run not run to completion by the budget"
+UNGRADED_KIND_READS_FAILED = "reads failed"
 REASON_NEW = "new target version"
 REASON_REFRESH = "scheduled refresh"
 
@@ -268,7 +278,10 @@ BLOCKED_NAMES = " ({names})"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}); a version is retired only once every project that pends it has been read"
+PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s){where}, exit {code}); a version is retired only once every project that pends it has been read"
+# The projects the read errors name, so the line says which project went
+# unread; the announcement stays keyed on the kinds, so the names are the day's.
+PARTIAL_WHERE = " in {projects}"
 PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
 DRY_RUN_WOULD_RETIRE = "dry run: would retire {version} (no cluster is pending it)"
 UNGRADED_LINE = (
@@ -307,6 +320,9 @@ ERROR_KIND_KEY = "kind"
 ERROR_KIND_LISTING = "listing failed"
 ERROR_KIND_SERVER_CONFIG = "server config failed"
 ERROR_KIND_READ = "read failed"
+# Each entry of an ungraded announcement's signature: a project and the kind
+# of its failure.
+SIGNATURE_PAIR_FIELDS = (MEMBER_ID_KEYS[0], ERROR_KIND_KEY)
 DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
 DRY_RUN_NOTHING_DUE = "dry run: nothing due; pending versions: {versions}"
 NONE_WORD = "none"
@@ -518,6 +534,69 @@ def run_report(names: list[str], readiness: bool, timeout: float | None = None) 
     return envelope
 
 
+# --- project identity ------------------------------------------------------
+
+
+def is_project_number(spelling: str) -> bool:
+    """A roster spelling that is a project number, not an id: an id begins
+    with a letter, and the report script resolves only an all-digit spelling
+    (``fleet_upgrade_report._normalise_project_id``)."""
+    return spelling.isdigit()
+
+
+def canonical_project(spelling: str, ids: dict[str, str]) -> str:
+    """The id the ledger keys a project by: the one learned for the spelling,
+    else the spelling itself. For a number no run has resolved yet that key is
+    provisional, and ``learn_project_id`` re-keys it once the id is learned."""
+    return ids.get(spelling, spelling)
+
+
+def learn_project_id(ledger: dict, spelling: str, resolved: object) -> None:
+    """Decide, from the ``projects`` a table run resolved for ``spelling``, the
+    id the ledger keys it by and whether that is final. An id that differs from
+    the spelling is final. The spelling itself is final only when it is an id:
+    on a day ``projects describe`` fails the report script hands back the
+    number it was asked for, so a number echoing itself was not resolved and
+    is not learned, and an id learned earlier stands through the outage. A
+    final id that arrives after keys were written under the number re-keys
+    them, so no pending cluster is stranded under a spelling no later reader
+    joins against."""
+    if not (isinstance(resolved, list) and len(resolved) == 1 and isinstance(resolved[0], str) and resolved[0]):
+        return
+    learned = resolved[0]
+    ids = ledger[PROJECT_IDS_KEY]
+    if learned == spelling:
+        if not is_project_number(spelling):
+            ids.setdefault(spelling, spelling)
+        return
+    previous = canonical_project(spelling, ids)
+    ids[spelling] = learned
+    if previous != learned:
+        rekey_project(ledger, previous, learned)
+
+
+def rekey_member_key(key: str, old: str, new: str) -> str:
+    if project_of(key) != old:
+        return key
+    return MEMBER_KEY_SEPARATOR.join([new] + key.split(MEMBER_KEY_SEPARATOR)[1:])
+
+
+def rekey_project(ledger: dict, old: str, new: str) -> None:
+    """Move everything the ledger keys by project ``old`` under ``new``: every
+    version's pending clusters, the readiness-run stamp, and the projects an
+    ungraded announcement names. The table-run stamps are keyed by the roster's
+    spelling, which does not change."""
+    for entry in ledger[TARGETS_KEY].values():
+        entry[PENDING_KEY] = sorted({rekey_member_key(key, old, new) for key in entry.get(PENDING_KEY) or []})
+    runs = ledger[READINESS_RUNS_KEY]
+    if old in runs:
+        moved = runs.pop(old)
+        runs[new] = max(moved, runs.get(new, ""))
+    for record in (announced(ledger).get(ANNOUNCED_UNGRADED_KEY) or {}).values():
+        if record.get(SIGNATURE_KEY):
+            record[SIGNATURE_KEY] = signature_pairs({(new if project == old else project): kind for project, kind in record[SIGNATURE_KEY]})
+
+
 # --- the gate --------------------------------------------------------------
 
 
@@ -529,7 +608,7 @@ def canonical_member_key(member: dict, ids: dict[str, str]) -> str:
     """The member key with the project as its learned id: a report that fell
     back to a numbered spelling keys the same cluster the way the ledger does."""
     canonical = dict(member)
-    canonical[MEMBER_ID_KEYS[0]] = ids.get(str(member.get(MEMBER_ID_KEYS[0], "")), member.get(MEMBER_ID_KEYS[0], ""))
+    canonical[MEMBER_ID_KEYS[0]] = canonical_project(str(member.get(MEMBER_ID_KEYS[0], "")), ids)
     return member_key(canonical)
 
 
@@ -544,7 +623,7 @@ def canonicalise_projects(report: dict, ids: dict[str, str]) -> None:
         for entry in report.get(key) or []:
             project = entry.get(MEMBER_ID_KEYS[0])
             if project is not None:
-                entry[MEMBER_ID_KEYS[0]] = ids.get(str(project), str(project))
+                entry[MEMBER_ID_KEYS[0]] = canonical_project(str(project), ids)
 
 
 def pending_targets(report: dict, ids: dict[str, str] | None = None) -> dict[str, list[str]]:
@@ -592,7 +671,7 @@ def prune_read_projects(ledger: dict, pending: dict[str, list[str]], names: list
     shows below it. Without this a version whose clusters upgraded kept its
     stale list while the table stayed partial, and a later carry-forward
     reported those clusters as pending again."""
-    read = {ids.get(name, name) for name in names} - unlisted_projects(read_errors)
+    read = {canonical_project(name, ids) for name in names} - unlisted_projects(read_errors)
     unconfigured = {
         (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
         for error in read_errors
@@ -693,7 +772,14 @@ def announced_shape_ok(block: object) -> bool:
         and isinstance(entry.get(DETAIL_KEY), str)
         and isinstance(entry.get(ATTEMPTS_KEY), int)
         and isinstance(entry.get(PARKED_KEY, False), bool)
+        and (entry.get(SIGNATURE_KEY) is None or signature_shape_ok(entry[SIGNATURE_KEY]))
         for entry in ungraded.values()
+    )
+
+
+def signature_shape_ok(signature: object) -> bool:
+    return isinstance(signature, list) and all(
+        isinstance(pair, list) and len(pair) == len(SIGNATURE_PAIR_FIELDS) and all(isinstance(part, str) for part in pair) for pair in signature
     )
 
 
@@ -832,22 +918,26 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
         merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
 
 
-def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, str], now: datetime, ids: dict[str, str]) -> dict:
+def versions_by_project(names: list[str], deadline: float, ledger: dict, now: datetime) -> dict:
     """The version table, one sandbox run per project under its own timeout and
     what is left of the table's share of the budget before ``deadline``, merged
     into one envelope. A project whose run failed, or that the budget did not reach, is a
     read error with no location, the shape a failed ``clusters list`` has, so
     the table counts as partial: nothing is retired, and the ledger's pending
-    clusters of that project are carried forward. ``last_runs`` is stamped for
-    every project that ran to completion or to its own cap, so the next table
-    starts with the ones it did not."""
+    clusters of that project are carried forward. The ledger's table-run stamps
+    are set for every project that ran to completion or to its own cap, so the
+    next table starts with the ones it did not, and a run that resolves a
+    project's id teaches the ledger (``learn_project_id``)."""
+    last_runs = ledger[TABLE_RUNS_KEY]
+    ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
+    completed: list[str] = []
     unrun: list[str] = []
     cut_short: list[str] = []
     failed: dict[str, Exception] = {}
 
     def keyed(project: str) -> str:
-        return ids.get(project, project)
+        return canonical_project(project, ids)
 
     # Two spellings of one project (a number and its id) run once: the first
     # spelling the order reaches runs, the other is the same project.
@@ -883,19 +973,17 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
             )
             continue
         last_runs[project] = iso(now)
-        resolved = envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY) or []
-        if len(resolved) == 1 and isinstance(resolved[0], str) and resolved[0]:
-            # A learned id stands: on a day `projects describe` fails the script
-            # falls back to the spelling itself, which must not replace the id.
-            if resolved[0] != project:
-                ids[project] = resolved[0]
-            elif project not in ids:
-                ids[project] = project
+        learn_project_id(ledger, project, envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY))
+        # The id just learned is tabled too, so the other spelling of it is skipped.
+        tabled.add(keyed(project))
+        completed.append(project)
         merge_envelope(merged, envelope)
-    if failed and len(failed) == len(names):
-        # No project read at all is the sandbox or the credential, not a
-        # project: one failure line for the tick, announced once, rather than a
-        # partial table nobody can act on.
+    if failed and not completed and not unrun and not cut_short:
+        # Every project the table ran failed and the budget left none untried:
+        # that is the sandbox or the credential, not a project. One failure
+        # line for the tick, announced once, rather than a partial table nobody
+        # can act on. Judged on the runs, not the roster's spellings, since two
+        # spellings of one project are one run.
         raise next(iter(failed.values()))
     # Both budget shapes are one kind: the announcement must not re-post when a
     # cut-short run comes and goes beside the projects never reached.
@@ -960,12 +1048,44 @@ def readiness_by_project(
     return merged, failures, unfinished
 
 
-def cluster_names(clusters: list[str]) -> str:
-    names = [key.rsplit(MEMBER_KEY_SEPARATOR, 1)[-1] for key in clusters]
+def shown_names(names: list[str]) -> str:
     shown = ", ".join(names[:MAX_NAMES_IN_LINE])
     if len(names) > MAX_NAMES_IN_LINE:
         shown += NAMES_OVERFLOW.format(more=len(names) - MAX_NAMES_IN_LINE)
     return shown
+
+
+def cluster_names(clusters: list[str]) -> str:
+    return shown_names([key.rsplit(MEMBER_KEY_SEPARATOR, 1)[-1] for key in clusters])
+
+
+def error_projects(read_errors: list) -> list[str]:
+    """The projects the read errors name, sorted: which projects a partial table left unread."""
+    return sorted({str(error.get(MEMBER_ID_KEYS[0])) for error in read_errors if error.get(MEMBER_ID_KEYS[0])})
+
+
+def signature_pairs(kinds: dict[str, str]) -> list[list[str]]:
+    return [[project, kinds[project]] for project in sorted(kinds)]
+
+
+def ungraded_signature(projects: set[str], failed: list[str], unrun: list[str]) -> list[list[str]]:
+    """What an ungraded version's announcement is keyed on: each of its
+    projects with how it went ungraded, as ``[project, kind]`` pairs in project
+    order. A project in neither list ran and graded nothing, so its reads
+    failed; the two budget shapes are one kind, as they are for the table."""
+    kinds = {project: UNGRADED_KIND_READS_FAILED for project in projects}
+    kinds.update({project: UNGRADED_KIND_RUN_FAILED for project in failed})
+    kinds.update({project: UNGRADED_KIND_UNRUN for project in unrun})
+    return signature_pairs(kinds)
+
+
+def announced_as(previous: dict, signature: list[list[str]], detail: str) -> bool:
+    """Whether the ungraded line for this condition is already posted: the
+    same signature, or, for a record an earlier release wrote without one, the
+    same detail, so an upgrade does not re-post a version mid-ladder."""
+    if SIGNATURE_KEY in previous:
+        return previous[SIGNATURE_KEY] == signature
+    return previous.get(DETAIL_KEY) == detail
 
 
 def tables_without_the_output_line(tables: str) -> str:
@@ -1079,7 +1199,7 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger = load_ledger(ledger_path)
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger[TABLE_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
@@ -1103,7 +1223,15 @@ def tick(dry_run: bool = False) -> list[str]:
     signature = partial_signature(read_errors) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
     if signature and signature != already:
-        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY)))
+        named = error_projects(read_errors)
+        lines.append(
+            PARTIAL_LINE.format(
+                prefix=LINE_PREFIX,
+                errors=len(read_errors),
+                where=PARTIAL_WHERE.format(projects=shown_names(named)) if named else "",
+                code=versions.get(ENVELOPE_EXIT_KEY),
+            )
+        )
     elif complete and already:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
@@ -1145,6 +1273,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 next_phrase = NEXT_REFRESH_PHRASE.format(date=(now + timedelta(days=days)).strftime(DATE_FORMAT))
             else:
                 detail = failure_text or READS_FAILED_DETAIL
+                condition = ungraded_signature(version_projects, failed_projects, unrun_projects)
                 attempts = (previous.get(ATTEMPTS_KEY) or 0) + 1
                 # Once parked, a version stays on the weekly cadence until graded:
                 # the ladder of daily retries runs once, not once a week.
@@ -1163,14 +1292,14 @@ def tick(dry_run: bool = False) -> list[str]:
                         )
                     )
                     ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
-                elif previous.get(DETAIL_KEY) != detail:
+                elif not announced_as(previous, condition, detail):
                     lines.append(
                         UNGRADED_LINE.format(
                             prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
                             names=cluster_names(clusters), detail=detail, path=path,
                         )
                     )
-                ungraded_announced[version] = {DETAIL_KEY: detail, ATTEMPTS_KEY: attempts, PARKED_KEY: parked}
+                ungraded_announced[version] = {DETAIL_KEY: detail, ATTEMPTS_KEY: attempts, PARKED_KEY: parked, SIGNATURE_KEY: condition}
                 continue
             announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)

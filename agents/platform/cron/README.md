@@ -217,8 +217,10 @@ versions still reported. The whole tick keeps to forty-five minutes of the
 hour Hermes gives a `no_agent` script: the version table and the readiness
 runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
-the budget cannot reach or finish is left unread and named in the line (a
-version none of whose projects ran is not recorded and is retried tomorrow),
+the budget cannot reach or finish is left unread and named: the partial-table
+line names the projects with a read error, and a version's own line the
+project whose readiness run was not started or was cut short (a version none
+of whose projects ran is not recorded and is retried tomorrow),
 and each sweep runs the projects least recently run first, so a budget that
 never reaches the end of the list does not leave the same project unread
 twice, whichever versions are due. Three guards
@@ -229,7 +231,10 @@ graded none of a version's pending clusters is written but not recorded (the
 chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
-tick is announced once, not daily: the ledger keeps what was announced, a
+tick is announced once, not daily: the ledger keeps what was announced (the
+kinds of read error for a partial table; each project and how it went
+ungraded for a version, never the error text, which an outage rewords from
+one run to the next), a
 failed tick (which writes nothing to the ledger) keeps its line in
 `last-failure.txt` beside it, and the next line is the recovery. A version
 none of whose clusters can be read is retried
