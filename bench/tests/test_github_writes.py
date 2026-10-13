@@ -531,6 +531,7 @@ def test_a_branch_after_a_range_or_compare_separator_is_named(text, named):
         {"name": "terminal", "args": {"command": f"python3 vcs.py clone --repo {REPO} --branch {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"python3 vcs.py proposal list --source {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"python3 vcs.py remote-branch view {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"python3 $V clone --branch {PDB_BRANCH} https://github.com/{REPO}"}},
         {"name": "terminal", "args": {"command": f"python3 inspect_repository.py --ref {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"gh pr view {PR39_URL}"}},
         {"name": "terminal", "args": {"command": f"gh pr diff {PR39_URL}"}},
@@ -572,6 +573,9 @@ def test_a_read_in_a_workers_command_does_not_charge_the_write(env, github):
             },
         },
         {"name": "terminal", "args": {"command": f"python3 vcs.py branch {PDB_BRANCH}"}},
+        # version-control's SKILL.md form: the script's path in a variable.
+        {"name": "terminal", "args": {"command": f'V="$HERMES_HOME"/skills/version-control/scripts/vcs.py\npython3 $V branch  {PDB_BRANCH}'}},
+        {"name": "terminal", "args": {"command": f'python3 "${{V}}" proposal create --title t --source {PDB_BRANCH}'}},
         {"name": "terminal", "args": {"command": f"python3 vcs.py proposal create --title t --source {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"cd /tmp/repo && git checkout -b {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"git -C /tmp/repo push -u origin {PDB_BRANCH}"}},

@@ -196,6 +196,10 @@ BRANCH_PATH_PREFIXES = ("refs/heads/", "origin/", "/tree/", "/commits/", "/compa
 #: ``main...<branch>``: git refuses ``..`` inside a ref name, so a branch
 #: after it is whole.
 BRANCH_RANGE_SEPARATOR = ".."
+#: How a call names ``version-control``'s script: by its path, or by the
+#: variable its SKILL.md assigns the path to (``V=.../vcs.py`` then
+#: ``python3 $V branch <name>``).
+VCS_SCRIPT = r"(?:\bvcs(?:\.py)?|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)[\"']?"
 #: The commands that create a branch or a pull request, matched against one
 #: shell segment of a call (:func:`writing_segments`): ``submit-suggestion``'s
 #: ``prepare`` and ``submit``, ``version-control``'s ``branch``, ``publish``
@@ -209,8 +213,8 @@ WRITING_COMMANDS = tuple(
     re.compile(p)
     for p in (
         r"\bsubmit_suggestion(?:\.py)?[\"']?\s+(?:prepare|submit)\b",
-        r"\bvcs(?:\.py)?[\"']?\s+(?:branch|publish|push)\b",
-        r"\bvcs(?:\.py)?[\"']?\s+(?:proposal|pr|mr)\s+(?:create|open)\b",
+        VCS_SCRIPT + r"\s+(?:branch|publish|push)\b",
+        VCS_SCRIPT + r"\s+(?:proposal|pr|mr)\s+(?:create|open)\b",
         r"\bgit(?:\s+-[Cc]\s+\S+)*\s+(?:push|branch|checkout\s+(?:-[bB]|--orphan)|switch\s+(?:-[cC]|--create))\b",
         r"\bgh\b.*\bpr\s+create\b",
         r"\bglab\b.*\bmr\s+create\b",
