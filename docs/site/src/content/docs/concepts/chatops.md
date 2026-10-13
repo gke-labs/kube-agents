@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu). Both are opt-in and default to disabled.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
@@ -55,19 +55,19 @@ Every Chat message carries session context (space, user, thread) that flows thro
 
 ## Slack
 
-Slack is opt-in. Enable it in the installer's chat menu; the installer prompts for the token values below.
+Slack is opt-in. Enable it in the installer's chat menu, where the installer prompts for the token values below, or pass `--enable-slack` with the tokens as flags.
 
 ### How it's wired
 
 - The installer's Slack interview collects `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USERS`, `SLACK_HOME_CHANNEL`, and `SLACK_HOME_CHANNEL_NAME`; the chart stores the tokens in the credentials Secret and wires the CR's `slack` section.
 - The Slack listener itself lives inside the Hermes runtime; it uses Socket Mode (no public webhook required) driven by the app token.
-- Setup for the Slack app itself (creating the app, generating tokens, installing to workspace) is documented in the Hermes docs: [hermes-agent.nousresearch.com/docs/user-guide/messaging/slack](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack).
+- [Slack app setup](/kube-agents/install/slack-app/) covers creating the app, its tokens, the allowlist and how to verify, for both modes.
 
 Under the unsupported `spec.mode: next` toggle, Slack terminates at the A2A gateway instead, on the same app and tokens, unless Google Chat is enabled too (Chat then holds the gateway and Slack stays on Hermes). The Hermes Slack listener and the credential broker's Socket Mode relay are off on such an install, so one app has one Socket Mode consumer, except on version skew (a `spec.mode` the operator does not recognise): the legacy consumer renders again beside the frozen gateway's connection, and each message is answered by whichever consumer receives it, both admitting by the same list (only the gateway refuses another workspace's member) (the `slack` field of [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration) has the detail). Who is answered is decided by the same `allowedUsers` list, as on Google Chat: a sender must be on the list (or the list must be empty, which allows all), and one who is not is dropped with a notice. A member of another workspace, posting in a channel shared with yours through Slack Connect, is never answered, whatever the list says. The gateway's `user_id` principal map (the `a2a-slack-principal-map` Secret) is optional: a sender it names is attributed by the identity it maps them to, and any other admitted sender by their Slack member id. Proactive alerts and scheduled reports reach the [home channel](#home-channel-1) through the gateway, and the gateway takes a single bot token. When the agent sends a structured message beside its answer (a report's headline and rows, a question with its choices, the plan of the cards it filed), the gateway lays it out in Slack the way kube-agents does under `today`: the headline in bold, the rows with their severity, a collapsed section for the detail, buttons, and a coloured side bar; a message Slack cannot show posts as its text instead. Nothing answers a click on those buttons yet, so Slack marks a click as failed; a link button still opens its page. The design of record is [`docs/designs/spec-chatops-gateway.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-chatops-gateway.md).
 
 ### Allowed users
 
-Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack user IDs). Messages from users not on the list are silently ignored — a per-channel allowlist for the harness. Leaving it empty allows all users (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case).
+Slack ingress is gated by `SLACK_ALLOWED_USERS`, a comma-separated list of Slack member IDs such as `U0123ABCD`, matched exactly: an email or display name matches nobody. [Slack app setup](/kube-agents/install/slack-app/#allowed-users) says how to find a member ID. Under `spec.mode: today` a message from a member not on the list is ignored with no reply; under `next` the A2A gateway answers once with a notice naming the member's ID, so an admin can add it. Leaving the list empty allows every member of the workspace (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case), which in a shared workspace lets anyone there drive the agent.
 
 ### Slash commands
 
@@ -118,6 +118,51 @@ With `KAGE_SLACK_UX` on, the alert for a crash-looping workload reads as one lin
 ### Harness messages
 
 With `KAGE_SLACK_UX` on, the harness's own messages stay out of the way on Slack. Scheduled reports arrive without the `Cronjob Response` header, job ID and footer. The long-turn heartbeat, if it is enabled for Slack, says the agent is still working without naming the tool running. The agent does not announce that it is back after a restart, post the session-database warnings (the error stays in the log), or append Hermes' tip about its queueing setting. Its replies about restarting, shutting down, stopping, being busy with an earlier message, a command sent while it is working, a `/steer` it could not take, or the model provider failing or turning a request down are written plainly in its own voice, with no console commands or error text. That covers the English replies; an install set to another display language gets Hermes' translation of the restart and stop replies. Other chat platforms are unchanged, and with the flag off nothing changes.
+
+## How a chat question is answered under `next`
+
+Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from the default `today` mode is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
+
+The commands below assume the default resource names (`platform-agent`) and the `kubeagents-system` namespace. The gateway logs one JSON object per line.
+
+1. **The gateway takes the message.** It refuses a sender the channel's allowed-users list does not admit, posts a status line in the thread that reads `⏳ submitted…`, and publishes the message as a task for the `platform` addressee. When at least as many requests are already waiting or running as the bridge runs at once (10 by default), the status line says how many are ahead of yours instead: `⏳ queued — 10 requests are ahead of yours; I'll start on it as soon as there's room`. Each message that starts a turn logs an `ingress` line with its `taskId`, `conversation` and `addressee`:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"ingress"'
+   ```
+
+2. **The bridge hands it to the Planning Agent.** The `hermes-bridge` container in the agent pod takes the task from the bus and sends its text to the Hermes API server in the same pod, which runs it as a turn under the `default` profile: the Planning Agent (on an install that enables the experimental `platformFrontDoor`, the Platform Agent instead). Every message in one thread lands in the same Hermes session, so a turn sees the thread's earlier turns. The status line changes to `⚙️ working`. The bridge logs which executor it runs when it starts, and a `task accepted` line for each task:
+
+   ```bash
+   kubectl logs deployment/platform-agent-gateway -n kubeagents-system -c hermes-bridge | grep -E 'hermes bridge consuming|task accepted'
+   ```
+
+   The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread, and a card it files does not report back to the thread.
+
+3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message and the status line becomes `✅ completed`. The turn has ended; the work has not. The gateway logs the end of the turn:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"task terminal"'
+   ```
+
+   A message sent while a turn is still running is queued as the next turn in the same session (`✏️ got it, I'll take that next`); the `cli` executor refuses it instead. One sent after the acknowledgement starts a new turn.
+
+4. **The specialist works the card.** The kanban dispatcher in the agent pod starts the specialist against its own profile, with the same identity, permissions and cluster access it has under `today` ([Security and IAM](/kube-agents/reference/security-and-iam/) is canonical). No setting is needed to let it read a cluster. To inspect the cards and read one:
+
+   ```bash
+   kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban list
+   kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban show <task_id>
+   ```
+
+5. **The answer comes back to the thread.** Before a task's first turn the bridge records which conversation its Hermes session answers, so the card is addressed to that conversation. As the specialist works, the gateway posts each progress note into the thread or DM you asked in, and then the card's result. Two things differ from delivery under `today`: each progress note is a message of its own rather than a line added to one message, because the gateway posts but does not edit, and a file the card produced is not attached. If the card blocks or fails, the thread gets the card's own blocked or failed line from the notifier. The Planning Agent's wake for it runs in the bridge's session, and its reply is not posted. The gateway posts only into a conversation it is still holding, the one whose session record carries the card's context, and refuses anything else. It logs each post it makes:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep -E '"msg":"(chat.notify route armed|notify posted|notify refused)'
+   ```
+
+   At startup `chat.notify route armed` should carry `"conversations":true`. Each `notify posted` line names the conversation it posted into in its `thread` field, the same key as the `conversation` field on the question's `ingress` line.
+
+The short-lived session pods that [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) describes are a different path. The gateway starts one only for a message that begins with the word `delegate` (`delegate: check prod-east`), which runs that one task in its own pod, or for a conversation moved onto its session route with the `/session` command. Such a pod reads the cluster only when the operator runs with `A2A_SESSION_CLUSTER_VIEW=true`. Any other message follows the steps above, which that setting does not affect.
 
 ## Proactive alerts (both channels)
 

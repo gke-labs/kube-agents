@@ -76,6 +76,10 @@ const (
 	vcsVerbLabel          = "verb"
 	vcsProposalCreateVerb = "proposal-create"
 	vcsStatusSuccess      = "success"
+	// vcsMergedSeries is the broker's count of its own proposals the forge
+	// reported merged, once each per broker process; no labels, so it is
+	// summed whole.
+	vcsMergedSeries = "kubeagents_vcs_proposals_merged_total"
 	// clusterUpSeries is the watcher's per-cluster gauge, one series per
 	// cluster it built a client for, 1 once that cluster's informer has
 	// synced and is delivering events. Read from the same body as the
@@ -136,6 +140,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 			vcsVerbLabel:               {vcsProposalCreateVerb: true},
 			toolInvocationsStatusLabel: {vcsStatusSuccess: true},
 		}
+	case usageCounterRemediationsMerged:
+		return vcsMergedSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
