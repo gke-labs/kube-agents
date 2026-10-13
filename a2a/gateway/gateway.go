@@ -853,7 +853,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
-	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text):
+	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text, false):
 		// A status question that roots its own conversation has no task to
 		// report on and must not become one that reads "any update?".
 		// isStatusQuery is a phrase set (text.go), so a real question such
