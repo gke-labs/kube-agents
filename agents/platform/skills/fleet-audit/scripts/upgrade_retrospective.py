@@ -216,9 +216,9 @@ LATEST_REPORT_LINK = "upgrade-retro-report.md"
 REPORT_TEMP_SUFFIX = ".tmp"
 LINK_TEMP_SUFFIX = ".tmp-link"
 # The same kubeconfig directory `collect.py` and the SOPs use, one file per
-# cluster, passed per command rather than exported; made like the store's
-# directories, with a kubeconfig the running uid cannot write replaced before
-# it is read (`prepare_kubeconfig`).
+# cluster, passed per command rather than exported; `collect.prepare_kubeconfig`
+# makes it usable for whichever uid runs (sticky and world-writable, another
+# uid's directory moved aside) before `get-credentials` writes into it.
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILENAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
@@ -245,13 +245,16 @@ MESSAGE_EXCERPT_CHARS = 400
 # run replaces them through their directory, so no write bit is needed.
 STORE_FILE_MODE = 0o644
 TEMP_SUFFIX = ".tmp"
-# The lock, the store's directories and the kubeconfig directory are made
-# with the umask cleared: a hand run over `kubectl exec` lands as root while
-# the tick runs as uid 1000, and a 0600 root lock or a 0755 root directory
-# would refuse every later run, as the 0600 root kubeconfig gcloud leaves
-# would (`prepare_kubeconfig` replaces one).
+# The lock is made with the umask cleared and the store's own directories
+# are chmodded to their mode (never a caller-named output path or an
+# ancestor, which keep the caller's umask): a hand run over `kubectl exec`
+# lands as root while the tick runs as uid 1000, and a 0600 root lock or a
+# 0755 root directory would refuse every later run. The kubeconfig directory
+# has its own rule in `collect.prepare_kubeconfig`.
 LOCK_FILE_MODE = 0o644
 STORE_DIR_MODE = 0o777
+STORE_DIR_MODE_MASK = 0o7777
+STORE_DIR_MODE_TEXT = "{path}: not at the store's mode and could not be changed ({error}); a run as another user made it, and the write that follows names it"
 
 # Project discovery, as `collect.py`'s `discover_fleet`: `--project`, else
 # the active gcloud project plus every project `gcloud projects list`
@@ -263,7 +266,10 @@ API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been
 
 OP_UPGRADE_MASTER, OP_UPGRADE_NODES = "UPGRADE_MASTER", "UPGRADE_NODES"
 UPGRADE_OPERATION_TYPES = (OP_UPGRADE_MASTER, OP_UPGRADE_NODES)
-OPERATIONS_FILTER = "operationType:({types}) AND startTime>={since}"
+# Bounded by end time, never by start: every rule downstream is about when an
+# operation ended or whether it is still in flight, and a long one (a
+# blue-green soak) starts well before the window it ends in.
+OPERATIONS_FILTER = "operationType:({types}) AND (endTime>={since} OR status!={done})"
 # `targetLink` is `.../projects/<n>/(zones|locations)/<loc>/clusters/<name>[/nodePools/<pool>]`.
 TARGET_LINK_RE = re.compile(r"/(?:zones|locations)/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)(?:/nodePools/(?P<pool>[^/]+))?$")
 CONTROL_PLANE_TARGET = "control plane"
@@ -293,6 +299,19 @@ NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
 # required node-affinity terms, as the scheduler reads them.
 AFFINITY_REQUIRED_KEY = "requiredDuringSchedulingIgnoredDuringExecution"
 AFFINITY_OPERATOR_IN = "In"
+AFFINITY_OPERATOR_GT, AFFINITY_OPERATOR_LT = "Gt", "Lt"
+# The four operators `_selector_matches` reads; `Gt`, `Lt` and `matchFields`
+# on the node's name are the rest of the NodeSelectorRequirement predicate.
+LABEL_SELECTOR_OPERATORS = ("In", "NotIn", "Exists", "DoesNotExist")
+NODE_NAME_FIELD = "metadata.name"
+# What the scheduler holds a pod to besides its pins: a taint with one of
+# these effects refuses an intolerant pod, and a request for an extended
+# resource (a domain-qualified name outside kubernetes.io, `nvidia.com/gpu`)
+# needs a node that offers it.
+TOLERATION_EXISTS = "Exists"
+BLOCKING_TAINT_EFFECTS = ("NoSchedule", "NoExecute")
+RESOURCE_DOMAIN_SEPARATOR = "/"
+BUILTIN_RESOURCE_DOMAIN = "kubernetes.io/"
 CGROUP_V2_MODE = "EFFECTIVE_CGROUP_MODE_V2"
 CGROUP_V1_MODE = "EFFECTIVE_CGROUP_MODE_V1"
 
@@ -969,6 +988,7 @@ AFTER_UPGRADE_WITH_CLUSTER_TEXT = "--after-upgrade finds its clusters from the o
 AFTER_UPGRADE_SCOPE_TEXT = "--after-upgrade reviews the clusters with an upgrade operation not yet reviewed"
 AFTER_UPGRADE_REASON_FORMAT = "{count} upgrade operation(s) not yet reviewed, ended by {floor}"
 AFTER_UPGRADE_QUIET_LOG = "after-upgrade: no settled operation awaits review; nothing written"
+AFTER_UPGRADE_HELD_LOG = "after-upgrade: nothing settled is reviewable yet; nothing written"
 # The route diffs against a baseline a full run established; without one it
 # says so and writes nothing, so an install that predates the job gets its
 # first report from a full run, never from a sweep over a fortnight.
@@ -1119,13 +1139,15 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | N
 
 
 def operations_argv(project: str, since: datetime) -> list[str]:
-    flt = OPERATIONS_FILTER.format(types=" OR ".join(UPGRADE_OPERATION_TYPES), since=fmt_ts(since))
+    flt = OPERATIONS_FILTER.format(types=" OR ".join(UPGRADE_OPERATION_TYPES), since=fmt_ts(since), done=OPERATION_TERMINAL_STATUS)
     return ["gcloud", "container", "operations", "list", "--project", project, "--filter", flt, "--format", "json"]
 
 
 def list_operations(project: str, since: datetime, *, run: RunFn) -> tuple[list[dict], str | None]:
-    """The upgrade operations in `project` that started at or after `since`.
-    The filter is also applied here, so a gcloud that ignores it changes nothing."""
+    """The upgrade operations in `project` that ended at or after `since`, and
+    every one still in flight whatever its start: a long operation starts
+    before the window it ends in. The filter is also applied here, so a
+    gcloud that ignores it changes nothing."""
     parsed, error = run_json(operations_argv(project, since), run=run)
     if error:
         # The same API that made `clusters list` an empty project refuses this
@@ -1139,8 +1161,8 @@ def list_operations(project: str, since: datetime, *, run: RunFn) -> tuple[list[
     for op in parsed:
         if op.get("operationType") not in UPGRADE_OPERATION_TYPES:
             continue
-        start = parse_ts(op.get("startTime"))
-        if start is None or start < since:
+        end = _op_end(op)
+        if end is not None and end < since:
             continue
         ops.append(op)
     return ops, None
@@ -1232,19 +1254,44 @@ def empty_guards() -> dict:
 
 def make_store_dir(path: Path) -> None:
     """A store directory writable by whichever uid runs next (`STORE_DIR_MODE`,
-    the umask cleared for the call): a directory root made under its umask
-    on a hand run would refuse the tick's writes after the fleet was read."""
-    mask = os.umask(0)
+    set by chmod rather than through the umask, which is process-wide and
+    would race the worker threads): a directory root made under its umask on
+    a hand run would refuse the tick's writes after the fleet was read.
+    Missing ancestors are not the store's and keep the caller's umask. A
+    store directory that exists at another mode is widened when this run
+    owns it or is root; another uid's is left with a logged line, and the
+    write that follows names it."""
+    path.mkdir(parents=True, exist_ok=True)
     try:
-        path.mkdir(mode=STORE_DIR_MODE, parents=True, exist_ok=True)
-    finally:
-        os.umask(mask)
+        if (path.stat().st_mode & STORE_DIR_MODE_MASK) != STORE_DIR_MODE:
+            path.chmod(STORE_DIR_MODE)
+    except OSError as exc:
+        log(STORE_DIR_MODE_TEXT.format(path=path, error=exc))
+
+
+def _under_store(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(data_dir().resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def output_parent(path: Path) -> None:
+    """The directory an output file is written into: the store's own are
+    made as the store's (`make_store_dir`); one the caller named (`--report`,
+    `--output`, `--manifest-file`, `--ledger`, `--guards` outside the store)
+    is made under the caller's umask, never world-writable."""
+    if _under_store(path.parent):
+        make_store_dir(path.parent)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def write_json_atomically(path: Path, doc: object) -> None:
     """A temporary file beside `path`, fsynced, renamed over it: a reader sees
     the whole document or the previous one, never a splice."""
-    make_store_dir(path.parent)
+    output_parent(path)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=TEMP_SUFFIX)
     os.chmod(temporary, STORE_FILE_MODE)
     try:
@@ -1411,24 +1458,17 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
     return hermes_home() / KUBECONFIG_SUBDIR / KUBECONFIG_FILENAME.format(project=project, cluster=cluster, location=location)
 
 
-def prepare_kubeconfig(kc: Path) -> None:
-    """The kubeconfig directory made like the store's (`STORE_DIR_MODE`, the
-    umask cleared), and a kubeconfig this uid cannot write removed before
-    `get-credentials` reads it: gcloud writes the file 0600 for whoever ran,
-    so a root hand run would otherwise leave one that every later uid-1000
-    run fails to open, and the directory's write bit is enough to replace
-    it. The sibling collectors' `fetch_credentials` do the same."""
-    make_store_dir(kc.parent)
-    if kc.exists() and not os.access(kc, os.W_OK):
-        try:
-            kc.unlink()
-        except OSError:
-            pass  # the directory refuses it too; get-credentials reports that
-
-
 def fetch_credentials(cluster: dict, *, run: RunFn) -> tuple[Path, str | None]:
+    """The cluster's kubeconfig through `get-credentials`, or the error. The
+    shared directory is made usable first by the one rule the fleet-audit
+    collectors share (`collect.prepare_kubeconfig`); a directory that cannot
+    be made usable is this read's error, with the reason."""
     kc = kubeconfig_path(cluster["project"], cluster["name"], cluster["location"])
-    prepare_kubeconfig(kc)
+    from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory
+
+    note = prepare_kubeconfig(kc)
+    if note:
+        return kc, f"get-credentials: {note}"
     env = {**os.environ, "KUBECONFIG": str(kc)}
     result = run(["gcloud", "container", "clusters", "get-credentials", cluster["name"], "--location", cluster["location"], "--project", cluster["project"]], env=env)
     if result.rc != 0:
@@ -1597,6 +1637,9 @@ def _pod_detail(pod: dict) -> dict:
         "labels": meta.get("labels") or {},
         "node_selector": spec.get("nodeSelector") or {},
         "node_pins": pod_pins(spec),
+        "node_affinity": required_node_terms(spec),
+        "tolerations": pod_tolerations(spec),
+        "extended_resources": pod_extended_resources(spec),
         "api_markers": _api_marker_hits(pod),
         "api_marker_sources": _api_marker_sources(pod),
         "started": status.get("startTime") or meta.get("creationTimestamp"),
@@ -1949,6 +1992,26 @@ def _selector_matches(selector: dict, labels: dict) -> bool:
     return True
 
 
+def required_node_terms(spec: dict) -> list[dict]:
+    """A pod spec's required node-affinity terms as the API holds them."""
+    return list((((spec.get("affinity") or {}).get("nodeAffinity") or {}).get(AFFINITY_REQUIRED_KEY) or {}).get("nodeSelectorTerms") or [])
+
+
+def pod_tolerations(spec: dict) -> list[dict]:
+    return [t for t in spec.get("tolerations") or [] if isinstance(t, dict)]
+
+
+def pod_extended_resources(spec: dict) -> list[str]:
+    """The extended resources the pod requests: domain-qualified names outside
+    kubernetes.io, such as `nvidia.com/gpu`."""
+    names: set[str] = set()
+    for container in spec.get("containers") or []:
+        for key in ((container.get("resources") or {}).get("requests") or {}):
+            if RESOURCE_DOMAIN_SEPARATOR in key and not key.startswith(BUILTIN_RESOURCE_DOMAIN):
+                names.add(key)
+    return sorted(names)
+
+
 def pod_pins(spec: dict) -> list[dict[str, list[str]]]:
     """A pod spec's placement pins as the scheduler reads them: one mapping of
     label to allowed values per required node-affinity term (terms are
@@ -1995,11 +2058,91 @@ def _pinned_pools(pins: list[dict[str, list[str]]], label_pools: dict[tuple[str,
     return pools
 
 
-def _a_node_carries(pins: list[dict[str, list[str]]], node_labels: tuple) -> bool:
-    """Whether a node's labels satisfy one of the pod's terms, each term read
-    as the `In` selector the scheduler reads it as (`_selector_matches`)."""
-    selectors = [{"matchExpressions": [{"key": key, "operator": AFFINITY_OPERATOR_IN, "values": values} for key, values in sorted(pin.items())]} for pin in pins if pin]
-    return any(_selector_matches(selector, labels) for labels in node_labels for selector in selectors)
+def _requirement_holds(expr: dict, values: dict) -> bool:
+    """One NodeSelectorRequirement against a node's labels (or its fields):
+    the four label operators as `_selector_matches` reads them, `Gt` and
+    `Lt` by an integer compare."""
+    key, op = str(expr.get("key") or ""), str(expr.get("operator") or "")
+    listed = [str(v) for v in expr.get("values") or []]
+    if op in LABEL_SELECTOR_OPERATORS:
+        return _selector_matches({"matchExpressions": [{"key": key, "operator": op, "values": listed}]}, values)
+    if op in (AFFINITY_OPERATOR_GT, AFFINITY_OPERATOR_LT):
+        try:
+            have, want = int(values.get(key)), int(listed[0])
+        except (TypeError, ValueError, IndexError):
+            return False
+        return have > want if op == AFFINITY_OPERATOR_GT else have < want
+    return False
+
+
+def _node_satisfies(selector: dict, terms: list[dict], name: str, labels: dict) -> bool:
+    """The API's own predicate: the node carries every `nodeSelector` label
+    with its value and satisfies any one required term, every expression of
+    the term by its operator, `matchFields` on the node's name."""
+    if any(labels.get(k) != v for k, v in (selector or {}).items()):
+        return False
+    if not terms:
+        return True
+    fields = {NODE_NAME_FIELD: name}
+    return any(all(_requirement_holds(e, labels) for e in term.get("matchExpressions") or []) and all(_requirement_holds(e, fields) for e in term.get("matchFields") or []) for term in terms)
+
+
+def _expression_text(expr: dict) -> str:
+    key, op = expr.get("key") or "", expr.get("operator") or ""
+    values = [str(v) for v in expr.get("values") or []]
+    if op in (AFFINITY_OPERATOR_GT, AFFINITY_OPERATOR_LT):
+        return f"{key} {op} {values[0] if values else '?'}"
+    return f"{key} {op} [{'|'.join(values)}]" if values else f"{key} {op}"
+
+
+def _placement_text(selector: dict, terms: list[dict]) -> str:
+    """The pins as text: `key=value` for the nodeSelector, each required term's
+    expressions by operator, terms joined by ` or `."""
+    pairs = ",".join(f"{k}={v}" for k, v in sorted((selector or {}).items()))
+    rendered = [",".join(_expression_text(e) for e in (term.get("matchExpressions") or []) + (term.get("matchFields") or [])) for term in terms or []]
+    rendered = [r for r in rendered if r]
+    if pairs and rendered:
+        return f"{pairs} and ({' or '.join(rendered)})"
+    return pairs or " or ".join(rendered)
+
+
+def pool_nodes_of(nodes: list[dict]) -> dict[str, list[tuple[list[dict], set[str]]]]:
+    """Per pool, each node's taints and the extended resources it offers."""
+    out: dict[str, list[tuple[list[dict], set[str]]]] = {}
+    for node in nodes:
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        pool = labels.get(NODEPOOL_LABEL, "")
+        if not pool:
+            continue
+        taints = [t for t in (node.get("spec") or {}).get("taints") or [] if isinstance(t, dict)]
+        offered = {k for k in (node.get("status") or {}).get("allocatable") or {} if RESOURCE_DOMAIN_SEPARATOR in k}
+        out.setdefault(pool, []).append((taints, offered))
+    return out
+
+
+def _tolerates(tolerations: list[dict], taint: dict) -> bool:
+    """Whether the pod's tolerations cover a taint; a taint whose effect does
+    not refuse scheduling needs none."""
+    if (taint.get("effect") or "") not in BLOCKING_TAINT_EFFECTS:
+        return True
+    for t in tolerations:
+        key_ok = (t.get("key") or "") == (taint.get("key") or "") or (not t.get("key") and t.get("operator") == TOLERATION_EXISTS)
+        value_ok = t.get("operator") == TOLERATION_EXISTS or (t.get("value") or "") == (taint.get("value") or "")
+        effect_ok = not t.get("effect") or t.get("effect") == taint.get("effect")
+        if key_ok and value_ok and effect_ok:
+            return True
+    return False
+
+
+def _placeable_pools(symptom: dict, ctx: Context) -> set[str] | None:
+    """The pools the scheduler could place the pod on, pins aside: those with
+    a node whose taints the pod tolerates and that offers every extended
+    resource it requests. None without a nodes read."""
+    if ctx.pool_nodes is None:
+        return None
+    tolerations = symptom.get("tolerations") or []
+    requested = set(symptom.get("extended_resources") or [])
+    return {pool for pool, nodes in ctx.pool_nodes.items() if any(all(_tolerates(tolerations, taint) for taint in taints) and requested <= offered for taints, offered in nodes)}
 
 
 def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_pins: list[dict[str, list[str]]], pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
@@ -2136,7 +2279,8 @@ class Context(NamedTuple):
     images_on_untouched_pools: frozenset = frozenset()  # images Running on a pool no operation touched
     operations_known: bool = True  # False when the project's operations listing failed
     label_pools: dict = {}  # (label, value) -> the pools whose nodes carry it
-    node_labels: tuple | None = None  # each node's labels; None when the nodes read did not answer
+    nodes_view: tuple | None = None  # (name, labels) per node; None when the nodes read did not answer
+    pool_nodes: dict | None = None  # pool -> [(taints, extended resources offered)] per node; None without the nodes read
     failing_pods: dict = {}  # (namespace, pod) -> the API-set field that shows it failing
     failing_objects: dict = {}  # owner object -> the API-set field that shows it failing
     pool_versions: dict = {}  # pool -> its version from the cluster describe
@@ -2203,12 +2347,6 @@ def _scopes_of(symptom: dict) -> dict[str, list[tuple[str, bool, str | None]]]:
         scopes[SCOPE_CONTAINER] = [(c["message"], not _container_text_is_tenant(c), c["container"]) for c in containers if c["message"]]
     return scopes
 
-def _pins_text(pins: list[dict[str, list[str]]]) -> str:
-    """A pod's terms as text: `key=value` for one value, `key In [a|b]` for
-    several, terms joined by ` or `."""
-    return " or ".join(",".join(f"{k}={v[0]}" if len(v) == 1 else f"{k} In [{'|'.join(v)}]" for k, v in sorted(pin.items())) for pin in pins if pin)
-
-
 def _image_host(image: str) -> str:
     m = IMAGE_HOST_RE.match(image)
     return m.group(1) if m else DEFAULT_IMAGE_HOST
@@ -2244,7 +2382,14 @@ def _gate_open(symptom: dict, entry: int, ctx: Context) -> bool:
         return any(pool in ctx.upgraded_pools for pool in preferred)
     if symptom["category"] == CATEGORY_EVENT:
         return False
-    return bool(ctx.upgraded_pools)
+    # No pin: the pools the pod could be evaluated on are those whose taints
+    # it tolerates and that offer the extended resources it requests, not
+    # every pool; a CPU pod does not land on a tainted GPU pool, nor a GPU
+    # pod on a CPU pool, so those pools' operations do not open its gate.
+    placeable = _placeable_pools(symptom, ctx)
+    if placeable is None:
+        return bool(ctx.upgraded_pools)
+    return any(pool in ctx.upgraded_pools for pool in placeable)
 
 
 def _api_agreement(symptom: dict, container: str | None, ctx: Context) -> str:
@@ -2305,25 +2450,25 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
             # The discriminator is the nodes read, not the message. The
             # scheduler writes a selector-miss clause for every node group a
             # pinned pod does not target, so on a cluster with more than one
-            # pool every pinned Pending pod carries one. When a node carries
-            # the labels of one of the pod's terms, the pod's own pool
-            # evaluated it and refused it for the reason in that pool's
-            # clause: rows 2 and 18 were tried first, and what remains is
-            # unclassified, never 12. Row 12 holds only when no node carries
-            # the pinned labels, and is medium even then (a label the pool
-            # never carried, a deleted pool or a pool at zero nodes read the
-            # same) unless the label is in `DROPPED_NODE_LABELS`. An event
-            # row's pins are its owner's template's; with no pins, or no
-            # nodes read, nothing can say.
-            pins = symptom.get("node_pins")
-            if pins is None:
-                pins = pins_of_selector(symptom.get("node_selector"))
-            if not pins or ctx.node_labels is None or _a_node_carries(pins, ctx.node_labels):
+            # pool every pinned Pending pod carries one. When a node
+            # satisfies the pins by the API's own predicate (the
+            # nodeSelector and any one required term, every expression by
+            # its operator), the pod's own pool evaluated it and refused it
+            # for the reason in that pool's clause: rows 2 and 18 were tried
+            # first, and what remains is unclassified, never 12. Row 12
+            # holds only when no node satisfies the pins, and is medium even
+            # then (a label the pool never carried, a deleted pool or a pool
+            # at zero nodes read the same) unless the label is in
+            # `DROPPED_NODE_LABELS`. An event row's pins are its owner's
+            # template's; with no pins, or no nodes read, nothing can say.
+            selector = symptom.get("node_selector") or {}
+            terms = [t for t in symptom.get("node_affinity") or [] if t.get("matchExpressions") or t.get("matchFields")]
+            if not (selector or terms) or ctx.nodes_view is None or any(_node_satisfies(selector, terms, name, labels) for name, labels in ctx.nodes_view):
                 continue
             clauses = SCHEDULING_TAIL_RE.split(text, 1)[0].rstrip(".")
             others = [clause.strip() for clause in clauses.split(CLAUSE_LIST_MARKER, 1)[-1].split(CLAUSE_SEPARATOR) if clause.strip() and not pattern.search(clause)]
             dropped = _dropped_label(symptom, ctx)
-            detail = f"{NO_NODE_CARRIES_FORMAT.format(labels=_pins_text(pins))}; {dropped or LABEL_NOT_DROPPED_TEXT}"
+            detail = f"{NO_NODE_CARRIES_FORMAT.format(labels=_placement_text(selector, terms))}; {dropped or LABEL_NOT_DROPPED_TEXT}"
             if others:
                 detail += f"; {OWN_POOL_REASON_FORMAT.format(clauses=', '.join(others))}"
             if not dropped:
@@ -2646,7 +2791,9 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
         symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
         onset = parse_ts(symptom.get("onset"))
         before_operation = bool(first_operation and onset and onset < first_operation)
-        symptom["predates_upgrade"] = recorded or before_operation
+        # A version skew is graded by persistence, never by onset: a recorded
+        # one is the same finding on a week with an operation and without.
+        symptom["predates_upgrade"] = symptom["category"] != CATEGORY_VERSION_SKEW and (recorded or before_operation)
 
 
 def _unavailable_workloads(workloads: list[dict]) -> dict[str, tuple[datetime | None, str, int]]:
@@ -2948,7 +3095,8 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         images_on_untouched_pools=frozenset(untouched_images),
         operations_known=operations_known,
         label_pools=pool_labels(cluster, nodes),
-        node_labels=None if reads.get("nodes") is None else tuple((n.get("metadata") or {}).get("labels") or {} for n in nodes),
+        nodes_view=None if reads.get("nodes") is None else tuple(((n.get("metadata") or {}).get("name") or "", (n.get("metadata") or {}).get("labels") or {}) for n in nodes),
+        pool_nodes=None if reads.get("nodes") is None else pool_nodes_of(nodes),
         failing_pods=failing_pods,
         failing_objects=failing_objects,
         pool_versions=versions_of(cluster)["node_pools"],
@@ -2962,6 +3110,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     specs_by_owner = pod_specs_by_owner(reads.get("workloads") or [], reads.get("pods") or [], resolver)
     owner_selectors = {obj["object"]: (spec.get("nodeSelector") or {}) for obj, spec, _ in specs_by_owner.values()}
     owner_pins = {obj["object"]: pod_pins(spec) for obj, spec, _ in specs_by_owner.values()}
+    owner_specs = {obj["object"]: spec for obj, spec, _ in specs_by_owner.values()}
     # A FailedScheduling or BackOff event on a workload the pod list already
     # reports as Pending or crash-looping says the same thing twice.
     oom_nodes = {node for s in pods for node in (s.get("oom_nodes") or {}).values() if node}
@@ -2973,6 +3122,10 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     for e in events:
         e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
         e.setdefault("node_pins", owner_pins.get(e["object"], []))
+        template = owner_specs.get(e["object"]) or {}
+        e.setdefault("node_affinity", required_node_terms(template))
+        e.setdefault("tolerations", pod_tolerations(template))
+        e.setdefault("extended_resources", pod_extended_resources(template))
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_pins, resolver, ctx.label_pools)
     symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, nodes, now, baseline)
     for symptom in symptoms:
@@ -3817,7 +3970,9 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
 def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str, server_config: dict | None = None, now: datetime | None = None, operations_command: str | None = None) -> dict:
     """`operations_command` is the project's operations listing as `collect`
     ran it, when it answered; without one the review vouches for no operation
-    check, and a review none of whose reads answered vouches for none at all."""
+    check; a review none of whose kubectl reads answered vouches for the
+    operation check alone, since the listing answered, and for none at all
+    when the listing failed too."""
     cluster = selection.cluster
     review = {
         "cluster": selection.key,
@@ -3844,8 +3999,10 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "unavailable_workloads": [],
     }
     review["next_upgrade"] = _safe_next_upgrade(cluster, server_config, now or now_utc(), review["read_errors"])
-    # A failed operation's guard needs no read: written whatever the reads do.
+    # A failed operation's guard needs no read: written whatever the reads do,
+    # and the operation check is backed by the listing before any kubectl read.
     review["guards"] = operation_guards_for(selection.key, review["what_happened"]["operations"], seen_at)
+    review["commands"] = checks_run({OPERATIONS_READ: operations_command}) if operations_command else []
     ops = selection.operations
     first_op = min((parse_ts(op.get("startTime")) for op in ops if parse_ts(op.get("startTime"))), default=None)
     window_start = first_op or selection.window_start
@@ -4396,6 +4553,8 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         incidents_by_cluster.setdefault(incident["cluster"], []).append(incident)
     entries: list[dict] = []
     seen: set[str] = set()
+    operations_unread = set(result.get("operations_unread") or [])
+    listing_errors = {line.split(": ", 1)[0]: line.split(": ", 1)[1] for line in result.get("failed_reads") or [] if ": " in line and line.split(": ", 1)[0] in operations_unread}
 
     def commands_of(rows: list[dict]) -> list[dict]:
         return [{"check": c["check"], "command": c["command"], "rc": 0} for c in rows]
@@ -4412,7 +4571,20 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         # per check and object), so the harness holds rather than resolves
         # it; none under a check whose read failed this run.
         by_check = {c["check"]: c["command"] for c in commands}
-        fresh = [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents_by_cluster.get(key, []) if i["kind"] != INCIDENT_STALE_GUARD]
+        unevaluated_checks = {u["check"] for u in unevaluated or []}
+        # No candidate under a check the entry calls unevaluated, fresh or
+        # held: an event row filed while the pods read failed stays a
+        # Warning in the report and is filed once the read answers.
+        incidents = [i for i in incidents_by_cluster.get(key, []) if i["kind"] != INCIDENT_STALE_GUARD and _incident_check(i) not in unevaluated_checks]
+        fresh = [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents]
+        # The incident's candidate is the object's one candidate this run and
+        # carries the object's guard persistence: the merged guard's first-seen
+        # date and review count, when the object carried a guard before.
+        for candidate in fresh:
+            carried = sorted((g for g in guards_by_cluster.get(key, []) if _split_object(g["object"]) == (candidate["namespace"], candidate["object"]) and g.get("first_seen") != result["generated_at"]), key=lambda g: (str(g.get("entry") or ""), g["id"]))
+            if carried:
+                candidate["persistence"] = [HELD_PERSISTS_FORMAT.format(since=g["first_seen"], reviews=int(g.get("reviews") or 1)) for g in carried]
+                candidate["excerpt"] = _cell(f"{candidate['excerpt']}; {'; '.join(candidate['persistence'])}")[:MESSAGE_EXCERPT_CHARS]
         covered = candidate_objects(fresh)
         held, flagged = _held_candidates(key, guards_by_cluster.get(key, []), covered, by_check, result["generated_at"], {u["check"] for u in unevaluated or []})
         still_flagged.extend(flagged)
@@ -4425,12 +4597,17 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         commands = commands_of(review.get("commands") or [])
         if review.get("outside_fleet"):
             entry.update(outcome=MANIFEST_OUTCOME_OUT_OF_SCOPE, error=OUTSIDE_FLEET_TEXT)
-        elif not review["answered"] and not review["reviewed"]:
+        elif not review["answered"] and not review["reviewed"] and not review["commands"]:
+            # Nothing answered, the project's operations listing included.
             credentials_failed = any(e.startswith("get-credentials") for e in review["read_errors"])
             entry.update(outcome=MANIFEST_OUTCOME_UNREACHABLE if credentials_failed else MANIFEST_OUTCOME_GATE_FAILED, error="; ".join(review["read_errors"])[:ERROR_EXCERPT_CHARS])
         else:
-            failed = {e.split(":")[0] for e in review["read_errors"]}
-            unevaluated = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed or (read == OPERATIONS_READ and review["project"] in set(result.get("operations_unread") or []))]
+            # The listing that decides the operation check answered even when
+            # the cluster's own reads did not (credentials failed): the entry
+            # is collected with that one check, the five kubectl-backed ones
+            # unevaluated, so a failed operation's Error is published.
+            failed = {e.split(":")[0] for e in review["read_errors"]} | set(review.get("partial") or [])
+            unevaluated = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed or (read == OPERATIONS_READ and review["project"] in operations_unread)]
             entry.update(outcome=MANIFEST_OUTCOME_COLLECTED, commands=commands, candidates=candidates_of(key, commands, unevaluated))
             if unevaluated:
                 entry["checks_unevaluated"] = unevaluated
@@ -4438,6 +4615,10 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             # storage, webhook, endpoint-slice and next-upgrade reads cost
             # Info alone (`INFO_ONLY_READS`).
             limiting = [e for e in review["read_errors"] if not info_only_error(e)]
+            if review["project"] in operations_unread:
+                # The project's listing failed: the operation check is
+                # unevaluated above, and the listing is the limitation.
+                limiting.append(listing_errors.get(review["project"]) or f"{OPERATIONS_READ} list failed")
             if limiting:
                 entry["limitations"] = "reads that failed: " + "; ".join(limiting)
         wh = review["what_happened"]
@@ -4815,7 +4996,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         clusters = [c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) in kept]
         unchanged = []
         if not selected:
-            for line in [AFTER_UPGRADE_QUIET_LOG] + failed_reads:
+            # A held cluster is why nothing was written: say so, and name it.
+            held_lines = [_upgrading_line(row, str) for row in upgrading]
+            for line in [AFTER_UPGRADE_HELD_LOG if held_lines else AFTER_UPGRADE_QUIET_LOG] + held_lines + failed_reads:
                 log(line)
             return {"generated_at": seen_at, "since": fmt_ts(since), "projects": projects, "reviews": [], "unchanged": [], "upgrading": upgrading, "failed_reads": failed_reads, "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "report": "", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
     log(f"{len(clusters)} cluster(s) in {len(projects)} project(s); reviewing {len(selected)}, {len(unchanged)} unchanged, {len(upgrading)} upgrading now")
@@ -5023,10 +5206,17 @@ collect = collect_fleet
 
 def prune_reports(reports_dir: Path) -> list[str]:
     """Keep the newest `REPORTS_KEPT` full reports and the newest
-    `REPORTS_KEPT` scoped ones (Markdown and JSON by their shared stamp)."""
+    `REPORTS_KEPT` scoped ones (Markdown and JSON by their shared stamp), and
+    whatever stamp the latest link names: `--no-report` and an outside
+    `--report` leave JSON-only stamps that would otherwise age the linked
+    report out from under its link."""
     pruned = []
     if not reports_dir.is_dir():
         return pruned
+    linked = None
+    with contextlib.suppress(OSError):
+        m = REPORT_NAME_RE.match(os.readlink(reports_dir / LATEST_REPORT_LINK))
+        linked = m.group(1) if m else None
     stamps: dict[bool, set[str]] = {False: set(), True: set()}
     for entry in reports_dir.iterdir():
         m = REPORT_NAME_RE.match(entry.name)
@@ -5034,6 +5224,8 @@ def prune_reports(reports_dir: Path) -> list[str]:
             stamps[bool(m.group(2))].add(m.group(1))
     for scoped, found in stamps.items():
         for stamp in sorted(found, reverse=True)[REPORTS_KEPT:]:
+            if stamp == linked:
+                continue
             for ext in ("md", "json"):
                 victim = reports_dir / f"{stamp}{SCOPED_SUFFIX if scoped else ''}.{ext}"
                 with contextlib.suppress(FileNotFoundError):
@@ -5046,7 +5238,7 @@ def write_report(path: Path, text: str, *, link: bool = True) -> None:
     """The report through a temporary file, the latest link through a
     temporary symlink, each renamed into place: a reader never sees half.
     A scoped run writes no link: the link always names a fleet-wide report."""
-    make_store_dir(path.parent)
+    output_parent(path)
     temporary = path.with_name(path.name + REPORT_TEMP_SUFFIX)
     temporary.write_text(text, encoding="utf-8")
     os.chmod(temporary, STORE_FILE_MODE)

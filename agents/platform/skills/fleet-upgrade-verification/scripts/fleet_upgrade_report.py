@@ -250,10 +250,17 @@ HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
-# The directory is made with the umask cleared: a hand run over `kubectl exec`
-# lands as root while the agent runs as uid 1000, and a 0755 root directory
-# would refuse the agent's kubeconfigs (`prepare_kubeconfig`).
-KUBECONFIG_DIR_MODE = 0o777
+# The default, shared directory is made like /tmp, world-writable with the
+# sticky bit, the rule the fleet-audit collectors' `collect.prepare_kubeconfig`
+# applies to the same directory: a hand run over `kubectl exec` lands as root
+# while the agent runs as uid 1000, and a directory another uid made cannot
+# hold this uid's files, so it is moved aside and remade. A `--kubeconfig-dir`
+# the caller named is made under the caller's umask.
+KUBECONFIG_DIR_MODE = 0o1777
+KUBECONFIG_DIR_MODE_MASK = 0o7777
+KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
+KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
 # holding `/` or `..` from steering the path out of the directory.
@@ -677,23 +684,35 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
 
 
 def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> None:
-    """The kubeconfig directory writable by whichever uid runs next
-    (`KUBECONFIG_DIR_MODE`, the umask cleared), and a kubeconfig this uid
-    cannot write removed before `get-credentials` reads it: gcloud writes the
-    file 0600 for whoever ran, so a root hand run would otherwise leave one
-    that every later uid-1000 run fails to open, and the directory's write bit
-    is enough to replace it. The fleet-audit collectors carry the same
-    function."""
-    mask = os.umask(0)
-    try:
-        os.makedirs(kubeconfig_dir, mode=KUBECONFIG_DIR_MODE, exist_ok=True)
-    finally:
-        os.umask(mask)
-    if os.path.exists(path) and not os.access(path, os.W_OK):
+    """The kubeconfig directory usable before `get-credentials` writes `path`
+    into it, and a kubeconfig this uid cannot write removed. The default
+    shared directory follows `collect.prepare_kubeconfig`'s rule: made at
+    `KUBECONFIG_DIR_MODE` whatever the umask, widened when this uid owns it,
+    moved aside and remade when another uid's. A directory the caller named
+    is made under the caller's umask. Raises OSError, which the caller
+    reports with the directory."""
+    shared = os.path.realpath(kubeconfig_dir) == os.path.realpath(default_kubeconfig_dir())
+    if not shared:
+        os.makedirs(kubeconfig_dir, exist_ok=True)
+    else:
+        euid = os.geteuid()
         try:
-            os.unlink(path)
-        except OSError:
-            pass  # the directory refuses it too; get-credentials reports that
+            current = os.stat(kubeconfig_dir)
+        except FileNotFoundError:
+            current = None
+        if current is not None and current.st_uid != euid and euid != ROOT_UID:
+            aside = os.path.join(os.path.dirname(kubeconfig_dir), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(kubeconfig_dir), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
+            os.rename(kubeconfig_dir, aside)
+            current = None
+        if current is None:
+            # Made at the caller's umask and chmodded below: the umask is
+            # process-wide, and a toggle here would race the other threads.
+            os.makedirs(kubeconfig_dir, exist_ok=True)
+            current = os.stat(kubeconfig_dir)
+        if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+            os.chmod(kubeconfig_dir, KUBECONFIG_DIR_MODE)
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        os.unlink(path)
 
 
 def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:

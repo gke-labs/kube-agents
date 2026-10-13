@@ -3481,31 +3481,23 @@ class RefusedProjectIdTest(unittest.TestCase):
                 self.assertEqual(fs.refusal_owner("acme-prod", stderr, run=run), (True, ""))
 
 class PrepareKubeconfigTest(unittest.TestCase):
-    """A root hand run over `kubectl exec` must not leave a kubeconfig directory
-    or file the uid-1000 tick cannot open."""
-
-    def test_directory_is_world_writable_and_a_stale_kubeconfig_is_replaced(self):
+    def test_fetch_credentials_prepares_the_shared_directory(self):
+        # The shared `.kubeconfigs` is prepared by `collect.prepare_kubeconfig`, the one rule for the
+        # fleet-audit collectors, before gcloud runs: sticky and world-writable whatever the umask, a
+        # directory this uid made at another mode widened, a stale kubeconfig this uid cannot write
+        # removed (root can write any file and keeps it).
         with TemporaryDirectory() as tmp:
-            kc = Path(tmp) / "nested" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
-            # Under a hardened umask the directory is still world-writable.
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("stale")
+            kc.chmod(0o400)
             mask = os.umask(0o077)
             try:
-                fs.prepare_kubeconfig(kc)
+                with patch.object(fs, "KUBECONFIG_DIR", kc.parent):
+                    path, _ = fs.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
             finally:
                 os.umask(mask)
-            self.assertEqual(kc.parent.stat().st_mode & 0o777, fs.KUBECONFIG_DIR_MODE)
-            # A kubeconfig this uid cannot write (another uid's 0600 file, as gcloud writes it) is
-            # removed before `get-credentials` would read it; root can write any file and keeps it.
-            kc.write_text("stale")
-            kc.chmod(0o400)
-            fs.prepare_kubeconfig(kc)
-            self.assertEqual(kc.exists(), os.geteuid() == 0)
-            # `fetch_credentials` prepares the path before it runs gcloud.
-            kc.write_text("stale")
-            kc.chmod(0o400)
-            with patch.object(fs, "KUBECONFIG_DIR", kc.parent):
-                path, _ = fs.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
-            self.assertEqual((path, kc.exists()), (kc, os.geteuid() == 0))
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o1777, os.geteuid() == 0))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

@@ -105,10 +105,6 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
-# The directory is made with the umask cleared: a hand run over `kubectl exec`
-# lands as root while the tick runs as uid 1000, and a 0755 root directory
-# would refuse the tick's kubeconfigs (`prepare_kubeconfig`).
-KUBECONFIG_DIR_MODE = 0o777
 DEFAULT_TIMEOUT_S = 60
 # The credential proxy's admitted count at the operator's default limit;
 # collect.py's MAX_WORKERS comment has the reasoning.
@@ -592,29 +588,13 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
     return KUBECONFIG_DIR / f"kubeconfig_{project}_{cluster}_{location}.yaml"
 
 
-def prepare_kubeconfig(kc: Path) -> None:
-    """The kubeconfig directory writable by whichever uid runs next
-    (`KUBECONFIG_DIR_MODE`, the umask cleared), and a kubeconfig this uid
-    cannot write removed before `get-credentials` reads it: gcloud writes the
-    file 0600 for whoever ran, so a root hand run over `kubectl exec` would
-    otherwise leave one that every later uid-1000 run fails to open, and the
-    directory's write bit is enough to replace it. The sibling collectors
-    carry the same function."""
-    mask = os.umask(0)
-    try:
-        kc.parent.mkdir(mode=KUBECONFIG_DIR_MODE, parents=True, exist_ok=True)
-    finally:
-        os.umask(mask)
-    if kc.exists() and not os.access(kc, os.W_OK):
-        try:
-            kc.unlink()
-        except OSError:
-            pass  # the directory refuses it too; get-credentials reports that
-
-
 def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) -> tuple[Path, Run]:
     kc = kubeconfig_path(project, cluster, location)
-    prepare_kubeconfig(kc)
+    from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+    note = prepare_kubeconfig(kc)
+    if note:
+        log(f"{project}/{location}/{cluster}: {note}")
     env = {**os.environ, "KUBECONFIG": str(kc)}
     result = run(
         ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project],

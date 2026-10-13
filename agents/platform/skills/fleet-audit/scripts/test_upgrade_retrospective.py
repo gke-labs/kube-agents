@@ -247,9 +247,12 @@ class OperationsTest(unittest.TestCase):
         ops, error = ur.list_operations(PROJECT, datetime(2026, 10, 7, tzinfo=timezone.utc), run=fleet)
         self.assertIsNone(error)
         self.assertTrue(all(o["operationType"] in ur.UPGRADE_OPERATION_TYPES for o in ops))
-        self.assertTrue(all(o["startTime"] >= "2026-10-07" for o in ops))
+        # Bounded by end, never by start: an operation that ended inside the window counts whatever
+        # its start, and one still in flight has no end to bound.
+        self.assertTrue(all(ur.parse_ts(o["endTime"]) >= datetime(2026, 10, 7, tzinfo=timezone.utc) for o in ops))
         self.assertIn("--filter", fleet.calls[0])
         self.assertIn("UPGRADE_MASTER OR UPGRADE_NODES", " ".join(fleet.calls[0]))
+        self.assertIn("endTime>=2026-10-07T00:00:00Z OR status!=DONE", " ".join(fleet.calls[0]))
 
     def test_list_operations_records_a_failed_read(self):
         ops, error = ur.list_operations(PROJECT, SINCE, run=lambda argv, **kw: run_of(1, "", "denied"))
@@ -595,6 +598,72 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual({c["entry"] for c in row["classifications"]}, {2})
         self.assertEqual(row["classifications"][0]["evidence_core"], "Insufficient cpu")
         self.assertEqual(ur.SCHEDULING_TAIL_RE.split(taint, 1)[0], "0/2 nodes are available: 1 node(s) had untolerated taint {node.kubernetes.io/not-ready: }, 1 Insufficient cpu")
+
+    def test_the_pool_gate_opens_only_on_a_pool_the_pod_could_land_on(self):
+        # A Pending pod with no pin is not placeable on every pool: a taint it does not tolerate and an
+        # extended resource it requests are hard constraints, so only an upgrade of a pool it could
+        # land on opens its gate. pinned-inference-pool's node is tainted and offers a GPU here.
+        nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
+        gpu_node = next(n for n in nodes if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "pinned-inference-pool")
+        gpu_node.setdefault("spec", {})["taints"] = [{"key": "dedicated", "value": "inference", "effect": "NoSchedule"}]
+        gpu_node.setdefault("status", {}).setdefault("allocatable", {})["nvidia.com/gpu"] = "1"
+        ops = ops_for("seeded-a")
+        gpu_pool_only = [o for o in ops if "/nodePools/pinned-inference-pool" in o["targetLink"]]
+        cpu_pool_only = [o for o in ops if "/nodePools/default-pool" in o["targetLink"]]
+        cpu_pod = pod("web", scheduled_message="0/4 nodes are available: 3 Insufficient cpu, 1 node(s) had untolerated taint {dedicated: inference}. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.")
+        [row] = self.classify(pods=[cpu_pod], nodes=nodes, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+        self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        [row] = self.classify(pods=[cpu_pod], nodes=nodes, ops=cpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        gpu_pod = pod("trainer", scheduled_message="0/4 nodes are available: 1 Insufficient nvidia.com/gpu, 3 Insufficient nvidia.com/gpu. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.")
+        gpu_pod["spec"]["tolerations"] = [{"key": "dedicated", "operator": "Equal", "value": "inference", "effect": "NoSchedule"}]
+        gpu_pod["spec"]["containers"][0]["resources"] = {"requests": {"nvidia.com/gpu": "1"}, "limits": {"nvidia.com/gpu": "1"}}
+        [row] = self.classify(pods=[gpu_pod], nodes=nodes, ops=cpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        [row] = self.classify(pods=[gpu_pod], nodes=nodes, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        # Without a nodes read nothing narrows the fallback: any upgraded pool opens the gate, as before.
+        [row] = symptoms_of("seeded-a", reads={"pods": [cpu_pod], "events": [], "pdbs": []}, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+
+    def test_row_12_reads_every_node_selector_requirement_operator(self):
+        # The node test is the API's own predicate: the nodeSelector and any one required term, every
+        # expression by its operator. A pod kept off spot nodes by `DoesNotExist` or `NotIn [true]` and
+        # refused by its standard pool for `Insufficient cpu` is row 2, the standard node satisfying the
+        # term by absence; `Exists` on a key no node carries is row 12; `Gt` and `Lt` compare integers;
+        # `matchFields` reads the node's name.
+        mixed = "0/3 nodes are available: 1 Insufficient cpu, 2 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
+        misses = "0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling."
+        nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
+        nodes[0]["metadata"]["labels"]["tier-rank"] = "3"
+        hostname = nodes[0]["metadata"]["name"]
+
+        def with_terms(message, *expressions, fields=()):
+            p = pod("api", scheduled_message=message)
+            term = {"matchExpressions": list(expressions)}
+            if fields:
+                term["matchFields"] = list(fields)
+            p["spec"]["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [term]}}}
+            return p
+
+        cases = (
+            ("DoesNotExist", with_terms(mixed, {"key": "cloud.google.com/gke-spot", "operator": "DoesNotExist"}), {(2, ur.HIGH)}),
+            ("NotIn", with_terms(mixed, {"key": "cloud.google.com/gke-preemptible", "operator": "NotIn", "values": ["true"]}), {(2, ur.HIGH)}),
+            ("Exists absent", with_terms(misses, {"key": "team", "operator": "Exists"}), {(12, ur.MEDIUM)}),
+            ("Gt satisfied", with_terms(mixed, {"key": "tier-rank", "operator": "Gt", "values": ["2"]}), {(2, ur.HIGH)}),
+            ("Gt unsatisfied", with_terms(misses, {"key": "tier-rank", "operator": "Gt", "values": ["5"]}), {(12, ur.MEDIUM)}),
+            ("Lt satisfied", with_terms(mixed, {"key": "tier-rank", "operator": "Lt", "values": ["4"]}), {(2, ur.HIGH)}),
+            ("matchFields", with_terms(mixed, fields=({"key": "metadata.name", "operator": "In", "values": [hostname]},)), {(2, ur.HIGH)}),
+            ("matchFields miss", with_terms(misses, fields=({"key": "metadata.name", "operator": "In", "values": ["gone-node"]},)), {(12, ur.MEDIUM)}),
+        )
+        for label, p, expected in cases:
+            with self.subTest(label):
+                [row] = self.classify(pods=[p], nodes=nodes)
+                self.assertEqual(entries(row), expected)
+        [row] = self.classify(pods=[with_terms(misses, {"key": "team", "operator": "Exists"})], nodes=nodes)
+        self.assertEqual(row["classifications"][0]["detail"], f"no node carries team Exists; {ur.LABEL_NOT_DROPPED_TEXT}")
 
     def test_entry_12_is_high_only_with_a_sourced_dropped_label_entry(self):
         # The shipped table is empty: no GKE release note or document names a label removal, and
@@ -1933,7 +2002,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
             os.umask(mask)
         self.assertIsNotNone(held)
         self.assertFalse(held.writable())
-        self.assertEqual((stat.S_IMODE(lock_path.stat().st_mode), stat.S_IMODE(store.stat().st_mode), stat.S_IMODE((self.home / "nested").stat().st_mode)), (ur.LOCK_FILE_MODE, ur.STORE_DIR_MODE, ur.STORE_DIR_MODE))
+        # The store's own directory is 0777; its missing ancestor is not the store's and keeps the
+        # caller's umask.
+        self.assertEqual((stat.S_IMODE(lock_path.stat().st_mode), stat.S_IMODE(store.stat().st_mode), stat.S_IMODE((self.home / "nested").stat().st_mode)), (ur.LOCK_FILE_MODE, ur.STORE_DIR_MODE, ur.STORE_DIR_MODE & ~0o077))
         held.close()
         # A lock file left read-only by another uid still opens: flock(2) needs no writable descriptor.
         lock_path.chmod(0o444)
@@ -2578,10 +2649,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual([p.name for p in self.home.glob("*unreadable*")], [])
 
     def test_kubeconfig_directory_and_a_stale_kubeconfig_survive_a_root_hand_run(self):
-        # The kubeconfig directory is made like the store's, whatever the umask, and a kubeconfig
-        # this uid cannot write (another uid's 0600 file, as gcloud writes it) is removed before
-        # `get-credentials` reads it; root can write any file and keeps it. The sibling collectors
-        # do the same.
+        # The shared `.kubeconfigs` is made usable by `collect.prepare_kubeconfig` before gcloud runs,
+        # in either order of uids: fresh under any umask it is sticky and world-writable; one this uid
+        # made at another mode is widened; another uid's (a root hand run's) is moved aside and remade;
+        # a stale kubeconfig this uid cannot write is removed (root can write any file and keeps it);
+        # a directory that cannot be made usable is the read's error.
+        import collect as fleet_collect  # noqa: PLC0415 -- the shared rule under test
+
         seeded = {"project": PROJECT, "name": "seeded-a", "location": LOCATION}
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: home}):
             kc = ur.kubeconfig_path(PROJECT, "seeded-a", LOCATION)
@@ -2591,15 +2665,115 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
             finally:
                 os.umask(mask)
-            self.assertEqual(stat.S_IMODE(kc.parent.stat().st_mode), ur.STORE_DIR_MODE)
-            kc.write_text("stale")
-            kc.chmod(0o400)
-            ur.prepare_kubeconfig(kc)
-            self.assertEqual(kc.exists(), os.geteuid() == 0)
+            self.assertEqual(stat.S_IMODE(kc.parent.stat().st_mode), fleet_collect.KUBECONFIG_DIR_MODE)
+            kc.parent.chmod(0o755)
             kc.write_text("stale")
             kc.chmod(0o400)
             self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
-            self.assertEqual(kc.exists(), os.geteuid() == 0)
+            self.assertEqual((stat.S_IMODE(kc.parent.stat().st_mode), kc.exists()), (fleet_collect.KUBECONFIG_DIR_MODE, os.geteuid() == 0))
+            # Another uid's directory: moved aside in the parent, which is this uid's, and remade.
+            kc.write_text("root's")
+            with mock.patch.object(os, "geteuid", return_value=kc.parent.stat().st_uid + 1), redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            self.assertFalse(kc.exists())
+            self.assertEqual(len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")]), 1)
+            self.assertEqual(stat.S_IMODE(kc.parent.stat().st_mode), fleet_collect.KUBECONFIG_DIR_MODE)
+            with mock.patch.object(fleet_collect, "prepare_kubeconfig", return_value="refused"):
+                self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, "get-credentials: refused"))
+
+    def test_a_quiet_after_upgrade_wake_names_what_it_holds(self):
+        # A wake that writes nothing says why: nothing settled is reviewable yet, and each held cluster's
+        # line follows; with nothing held at all it says no settled operation awaits review.
+        self.collect()
+        just_ended = copy.deepcopy(next(o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]))
+        just_ended.update(name="operation-fresh", startTime="2026-10-15T17:40:00Z", endTime="2026-10-15T17:50:00Z")
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        with redirect_stderr(io.StringIO()) as err:
+            quiet = ur.collect(args(full=False, after_upgrade=True), run=FakeFleet(operations=OPERATIONS + [just_ended]), now=later)
+        self.assertTrue(quiet["quiet"])
+        logged = err.getvalue()
+        self.assertIn(ur.AFTER_UPGRADE_HELD_LOG, logged)
+        self.assertIn(ur.SETTLING_LINE.format(cluster=SEEDED, operation="UPGRADE_NODES", target="pinned-inference-pool", end="2026-10-15T17:50:00Z", minutes=15), logged)
+        self.assertNotIn(ur.AFTER_UPGRADE_QUIET_LOG, logged)
+        with redirect_stderr(io.StringIO()) as err:
+            nothing = ur.collect(args(full=False, after_upgrade=True), run=FakeFleet(), now=later)
+        self.assertTrue(nothing["quiet"])
+        self.assertIn(ur.AFTER_UPGRADE_QUIET_LOG, err.getvalue())
+
+    def test_an_operation_is_in_the_window_by_its_end_whatever_its_start(self):
+        # A long operation (a blue-green soak) starts before the window it ends in, and one still in
+        # flight has no end: the listing is bounded by end time, so both reach the rules downstream.
+        pinned = next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/nodePools/pinned-inference-pool" in o["targetLink"])
+        long_op = {**copy.deepcopy(pinned), "name": "operation-long", "startTime": "2026-09-20T04:00:00Z", "endTime": "2026-10-07T12:00:00Z"}
+        ops, error = ur.list_operations(PROJECT, SINCE, run=FakeFleet(operations=OPERATIONS + [long_op]))
+        self.assertIsNone(error)
+        self.assertIn("operation-long", [o["name"] for o in ops])
+        result, _ = self.collect(FakeFleet(operations=OPERATIONS + [long_op]))
+        review = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        self.assertIn("operation-long", [op["name"] for op in review["what_happened"]["operations"]])
+        running = {**copy.deepcopy(pinned), "name": "operation-still-running", "startTime": "2026-09-01T04:00:00Z", "status": "RUNNING"}
+        running.pop("endTime", None)
+        held, _ = self.collect(FakeFleet(operations=OPERATIONS + [running]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual([(u["cluster"], u["operation"]["name"]) for u in held["upgrading"]], [(SEEDED, "operation-still-running")])
+
+    def test_a_recorded_skew_keeps_its_check_whatever_the_weeks_operations(self):
+        # A version skew is graded by persistence, never by onset: once recorded it files under
+        # `upgrade-symptom-tentative` on a week with an operation in the window as on one without, so
+        # the finding's identity does not flip and its guard keeps its check.
+        gemma = cluster_doc("gemma-gpu-upgraded")
+        gemma["nodePools"][0]["version"] = "1.30.5-gke.1000000"
+        gemma["maintenancePolicy"]["window"].pop("maintenanceExclusions")
+        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_MASTER" and "/clusters/seeded-a" in o["targetLink"]))
+        master.update(name="operation-gemma-master", targetLink=master["targetLink"].replace("/clusters/seeded-a", "/clusters/gemma-gpu-upgraded"), startTime="2026-10-14T04:00:00Z", endTime="2026-10-14T04:20:00Z")
+        guard = ur.guard_id(GEMMA, 5, "NodePool/default-pool")
+        self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]))
+        with_op, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        [review] = [r for r in with_op["reviews"] if r["cluster"] == GEMMA]
+        self.assertEqual(review["what_happened"]["status"], ur.STATUS_UPGRADED)
+        [incident] = [i for i in with_op["sections"]["warnings"] if i["cluster"] == GEMMA and i["object"] == "NodePool/default-pool"]
+        self.assertEqual((incident["check"], incident["predates_upgrade"]), (ur.CHECK_SYMPTOM_TENTATIVE, False))
+        self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, ur.render_report(with_op).split("`NodePool/default-pool`")[1].split("### ")[0])
+        self.assertEqual([g["check"] for g in with_op["guards"] if g["id"] == guard], [ur.CHECK_SYMPTOM_TENTATIVE])
+        without_op, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma], operations=OPERATIONS + [master]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        [review] = [r for r in without_op["reviews"] if r["cluster"] == GEMMA]
+        self.assertEqual(review["what_happened"]["status"], ur.STATUS_REGRADED)
+        [incident] = [i for i in without_op["sections"]["warnings"] if i["cluster"] == GEMMA and i["object"] == "NodePool/default-pool"]
+        self.assertEqual(incident["check"], ur.CHECK_SYMPTOM_TENTATIVE)
+        self.assertEqual([(g["check"], g["reviews"]) for g in without_op["guards"] if g["id"] == guard], [(ur.CHECK_SYMPTOM_TENTATIVE, 2)])
+
+    def test_the_linked_report_is_never_pruned(self):
+        # `--full --no-report` writes a JSON stamp and no Markdown, and moves no link: after fourteen such
+        # runs the newest stamps are JSON-only and the report the link names would age out of the kept
+        # set; the link's stamp is kept whatever its age.
+        self.collect()
+        reports = self.home / ur.REPORTS_SUBDIR
+        link = reports / ur.LATEST_REPORT_LINK
+        target = os.readlink(link)
+        for day in range(1, ur.REPORTS_KEPT + 2):
+            self.collect(no_report=True, now=NOW + timedelta(days=day))
+        self.assertEqual(os.readlink(link), target)
+        self.assertTrue((reports / target).exists())
+        self.assertTrue(link.resolve().exists())
+        self.assertEqual(len(list(reports.glob("*Z.json"))), ur.REPORTS_KEPT + 1)
+
+    def test_caller_named_output_parents_keep_the_callers_umask(self):
+        # `make_store_dir` clears the umask for the store's own directories alone: a parent a caller-named
+        # `--output`, `--manifest-file` or `--report` creates outside the store is made under the
+        # caller's umask, never world-writable, while `reports/` under the store stays 0777.
+        with tempfile.TemporaryDirectory() as outside:
+            out = Path(outside) / "retro" / "out.json"
+            manifest = Path(outside) / "mf" / "m.json"
+            report = Path(outside) / "rep" / "r.md"
+            mask = os.umask(0o077)
+            try:
+                self.collect(output=str(out), manifest_file=str(manifest))
+                self.collect(report=str(report), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+            finally:
+                os.umask(mask)
+            for created in (out.parent, manifest.parent, report.parent):
+                self.assertEqual(stat.S_IMODE(created.stat().st_mode), ur.STORE_DIR_MODE & ~0o077, created)
+            self.assertTrue(out.exists() and manifest.exists() and report.exists())
+            self.assertEqual(stat.S_IMODE((self.home / ur.REPORTS_SUBDIR).stat().st_mode), ur.STORE_DIR_MODE)
 
     def test_after_upgrade_rejects_full_and_cluster(self):
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -3511,7 +3685,7 @@ class ChecksRunTest(unittest.TestCase):
         operations = by_check[ur.CHECK_OPERATION_FAILED]
         self.assertTrue(operations.startswith(f"gcloud container operations list --project {PROJECT} --filter "), operations)
         self.assertIn("UPGRADE_MASTER OR UPGRADE_NODES", operations)
-        self.assertIn("startTime>=2026-09-24T18:00:00Z", operations)
+        self.assertIn("endTime>=2026-09-24T18:00:00Z OR status!=DONE", operations)
         pods = by_check[ur.CHECK_BROKE_WORKLOAD]
         self.assertEqual(pods, f"KUBECONFIG={self.tmp.name}/.kubeconfigs/kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml kubectl get pods -A -o json")
         self.assertTrue(by_check[ur.CHECK_NODE_BROKEN].endswith(" kubectl get nodes -o json"))
@@ -3525,9 +3699,14 @@ class ChecksRunTest(unittest.TestCase):
         self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
         self.assertIn("pods", seeded["partial"])
 
-    def test_an_unreadable_cluster_carries_no_command(self):
+    def test_an_unreadable_cluster_carries_the_listing_backed_check_alone(self):
+        # Its credentials failed, but the project's operations listing answered: the operation check
+        # ran for it; with the listing failed too, nothing did.
         result, _ = self.collect(FakeFleet(broken={"seeded-a"}))
         seeded = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED])
+        unread, _ = self.collect(FakeFleet(broken={"seeded-a"}, ops_fail={PROJECT}), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        seeded = next(r for r in unread["reviews"] if r["cluster"] == SEEDED)
         self.assertEqual(seeded["commands"], [])
 
     def test_an_unchanged_cluster_is_backed_by_the_listing_and_its_re_check(self):
@@ -3597,11 +3776,11 @@ class ChecksRunTest(unittest.TestCase):
         self.assertEqual(row["checks_unevaluated"], [{"check": ur.CHECK_OPERATION_FAILED, "reason": "operations read failed"}])
         self.assertIn("gcloud container operations", row["limitations"])
 
-    def test_a_review_with_no_answered_read_carries_no_command(self):
+    def test_a_review_with_no_answered_read_carries_the_operation_check_alone(self):
         every_read = {("seeded-a", key) for key in READS["seeded-a"]}
         result, _ = self.collect(FakeFleet(kubectl_fail=every_read))
         seeded = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
-        self.assertEqual((seeded["answered"], seeded["commands"]), ([], []))
+        self.assertEqual((seeded["answered"], [c["check"] for c in seeded["commands"]]), ([], [ur.CHECK_OPERATION_FAILED]))
         self.assertEqual(seeded["partial"], list(ur.CORE_READS))
 
 
@@ -3685,7 +3864,9 @@ class ManifestTest(unittest.TestCase):
         self.assertIsNone(self.audit_report.cross_check_manifest(self.document_from(manifest), manifest))
 
     def test_cross_check_rejects_what_the_manifest_says_did_not_happen(self):
-        result, _ = self.collect(FakeFleet(broken=["gemma-gpu-upgraded"]))
+        # Unreachable: its credentials failed and its project's operations listing failed too, so no
+        # read of it answered (with the listing answered the entry is collected on that one check).
+        result, _ = self.collect(FakeFleet(broken=["gemma-gpu-upgraded"], ops_fail=[PROJECT]))
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         gemma = next(c for c in manifest["clusters"] if c["name"] == GEMMA)
         self.assertEqual(gemma["outcome"], ur.MANIFEST_OUTCOME_UNREACHABLE)
@@ -3836,7 +4017,10 @@ class ManifestTest(unittest.TestCase):
         manifest = json.loads(Path(sunday["manifest_path"]).read_text())
         [again] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
         self.assertEqual((again["check"], again["severity"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR))
-        self.assertNotIn("persistence", again)
+        # The incident's candidate is the object's one candidate and carries the guard's persistence.
+        self.assertEqual(again["persistence"], ["persists since 2026-10-13T17:30:00Z, 2 review(s)"])
+        self.assertTrue(again["excerpt"].endswith("persists since 2026-10-13T17:30:00Z, 2 review(s)"), again["excerpt"])
+        self.assertEqual(len([c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]), 1)
         self.assertEqual(self.audit_report.published_id(again), self.audit_report.published_id(identity))
         self.assertIn(web, [i["object"] for i in sunday["sections"]["errors"]])
         self.assertEqual([(g["check"], g["reviews"], g["first_seen"]) for g in sunday["guards"] if g["id"] == guard], [(ur.CHECK_BROKE_WORKLOAD, 2, "2026-10-13T17:30:00Z")])
@@ -3862,7 +4046,7 @@ class ManifestTest(unittest.TestCase):
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         inference = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
-        self.assertEqual([(c["check"], c["severity"], "persistence" in c) for c in inference], [(ur.CHECK_SYMPTOM_PREDATES, ur.MANIFEST_SEVERITY_MINOR, False)])
+        self.assertEqual([(c["check"], c["severity"], c.get("persistence")) for c in inference], [(ur.CHECK_SYMPTOM_PREDATES, ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-08T18:00:00Z, 2 review(s)"])])
         self.assertEqual([h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"], [])
         self.assertEqual([(g["check"], g["reviews"]) for g in second["guards"] if g["id"] == guard], [(ur.CHECK_SYMPTOM_PREDATES, 2)])
         ids = [self.audit_report.derive_finding_id(f) for f in self.document_from(manifest)["findings"]]
@@ -4011,7 +4195,7 @@ class ManifestTest(unittest.TestCase):
         manifest = json.loads(Path(third["manifest_path"]).read_text())
         [again] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == identity["object"]]
         self.assertEqual(self.audit_report.published_id(again), filed_id)
-        self.assertEqual((again["check"], again["severity"], "persistence" in again), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR, False))
+        self.assertEqual((again["check"], again["severity"], again.get("persistence")), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR, ["persists since 2026-10-08T18:00:00Z, 2 review(s)"]))
         self.assertIn(SEEDED, [r["cluster"] for r in third["reviews"]])
         self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertEqual([(g["first_seen"], g["reviews"]) for g in third["guards"] if g["id"] == guard], [("2026-10-08T18:00:00Z", 2)])
@@ -4190,6 +4374,50 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([c for e in manifest["clusters"] for c in e.get("candidates") or [] if c["object"] == obj], [])
         self.assertNotIn(filed_id, self.audit_report.collector_flagged_ids(manifest))
         self.assertIn("- " + ur.OPERATION_GUARD_CLEARED_FORMAT.format(id=guard, reason=ur.OPERATION_GUARD_RETRIED_FORMAT.format(type="UPGRADE_NODES", target="idle-batch-pool", name="operation-retry", end="2026-10-27T03:12:00Z")), ur.render_report(fourth))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_a_failed_operation_on_an_unreachable_cluster_is_published_through_the_listing(self):
+        # The listing that decides `upgrade-operation-failed` answered although the cluster's credentials
+        # did not: the entry is collected with that one check, the five kubectl-backed checks are
+        # unevaluated, the credentials error is the limitation, and the Error the report shows is the
+        # entry's candidate. With the listing failed too, nothing answered: unreachable, no candidate.
+        ops = copy.deepcopy(OPERATIONS)
+        errored = next(o for o in ops if o.get("error"))
+        bad = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/idle-batch-pool" in o["targetLink"])
+        bad["error"], bad["statusMessage"] = errored["error"], errored["statusMessage"]
+        obj = f"Operation/{bad['name']}"
+        result, _ = self.collect(FakeFleet(operations=ops, broken=["seeded-a"]))
+        self.assertIn(obj, [i["object"] for i in result["sections"]["errors"]])
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual((seeded["outcome"], [c["check"] for c in seeded["commands"]]), (ur.MANIFEST_OUTCOME_COLLECTED, [ur.CHECK_OPERATION_FAILED]))
+        self.assertEqual([c["check"] for c in seeded["checks_unevaluated"]], [check for check, read in ur.CHECK_READS if read != ur.OPERATIONS_READ])
+        self.assertTrue(seeded["limitations"].startswith("reads that failed: get-credentials rc=1"), seeded["limitations"])
+        self.assertEqual([(c["check"], c["severity"], c["object"]) for c in seeded["candidates"]], [(ur.CHECK_OPERATION_FAILED, ur.MANIFEST_SEVERITY_MAJOR, obj)])
+        self.assertTrue(manifest["partial"])
+        document = self.document_from(manifest)
+        self.assertIn(SEEDED, [c["name"] for c in document["scope"]["clusters"]])
+        self.audit_report.cross_check_manifest(document, manifest)
+        self.assertIn(ur.guard_id(SEEDED, ur.ENTRY_OPERATION, obj), {g["id"] for g in result["guards"]})
+        unread, _ = self.collect(FakeFleet(operations=ops, broken=["seeded-a"], ops_fail={PROJECT}), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(unread["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual((seeded["outcome"], "candidates" in seeded), (ur.MANIFEST_OUTCOME_UNREACHABLE, False))
+        self.assertEqual([i for i in unread["sections"]["errors"] if i["cluster"] == SEEDED], [])
+
+    def test_a_review_whose_pods_read_failed_files_no_candidate_under_an_unevaluated_check(self):
+        # With the pods read failed the events read still shows FailedScheduling and BackOff rows: they
+        # stay Warnings in the report, but the entry lists the four pod-backed checks as unevaluated and
+        # files no candidate under them, fresh or held; the harness files them once the read answers.
+        result, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]))
+        warnings = [i for i in result["sections"]["warnings"] if i["cluster"] == SEEDED and i["kind"] == ur.INCIDENT_SYMPTOM]
+        self.assertTrue(warnings)
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        unevaluated = {c["check"] for c in seeded["checks_unevaluated"]}
+        self.assertEqual(unevaluated, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
+        self.assertEqual([c for c in seeded["candidates"] if c["check"] in unevaluated], [])
+        self.assertTrue(all(w["check"] in unevaluated for w in warnings), [w["check"] for w in warnings])
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_three_guards_on_one_object_are_one_candidate(self):

@@ -12409,30 +12409,61 @@ class TestDefaultRun(unittest.TestCase):
         self.assertIsInstance(result.stderr, str)
 
 class PrepareKubeconfigTest(unittest.TestCase):
-    """A root hand run over `kubectl exec` must not leave a kubeconfig directory
-    or file the uid-1000 tick cannot open."""
+    """The shared `.kubeconfigs` after a hand run as another uid, in either
+    order: root first, or uid 1000 first."""
 
-    def test_directory_is_world_writable_and_a_stale_kubeconfig_is_replaced(self):
+    def mode(self, path):
+        return path.stat().st_mode & collect.KUBECONFIG_DIR_MODE_MASK
+
+    def test_a_fresh_directory_is_sticky_and_world_writable_whatever_the_umask(self):
         with TemporaryDirectory() as tmp:
-            kc = Path(tmp) / "nested" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
-            # Under a hardened umask the directory is still world-writable.
+            kc = Path(tmp) / "home" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             mask = os.umask(0o077)
             try:
-                collect.prepare_kubeconfig(kc)
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
             finally:
                 os.umask(mask)
-            self.assertEqual(kc.parent.stat().st_mode & 0o777, collect.KUBECONFIG_DIR_MODE)
-            # A kubeconfig this uid cannot write (another uid's 0600 file, as gcloud writes it) is
-            # removed before `get-credentials` would read it; root can write any file and keeps it.
-            kc.write_text("stale")
-            kc.chmod(0o400)
-            collect.prepare_kubeconfig(kc)
-            self.assertEqual(kc.exists(), os.geteuid() == 0)
-            # `fetch_credentials` prepares the path before it runs gcloud.
+            # The leaf is the shared directory, chmodded rather than made through a cleared umask (the
+            # umask is process-wide and would race the worker threads); its missing ancestor keeps the
+            # caller's umask.
+            self.assertEqual((self.mode(kc.parent), self.mode(kc.parent.parent)), (collect.KUBECONFIG_DIR_MODE, 0o700))
+
+    def test_this_uids_directory_at_another_mode_is_widened(self):
+        # uid 1000 first, under the earlier code: a 0755 directory this uid made.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(self.mode(kc.parent), collect.KUBECONFIG_DIR_MODE)
+
+    def test_another_uids_directory_is_moved_aside_and_remade(self):
+        # root first: a 0755 directory a root hand run made, with root's 0600 kubeconfig in it, cannot
+        # hold this uid's files; it is renamed in the parent, which is this uid's, and a fresh one made.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("root's")
+            other = kc.parent.stat().st_uid + 1
+            with patch.object(os, "geteuid", return_value=other):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((self.mode(kc.parent), kc.exists()), (collect.KUBECONFIG_DIR_MODE, False))
+            [aside] = [p for p in Path(tmp).iterdir() if p.name.startswith(".kubeconfigs.unusable-")]
+            self.assertTrue((aside / kc.name).exists())
+            # When the parent refuses the move, the note names the owner instead.
+            with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertIn("could not be moved aside", note)
+            self.assertIn(f"this run is uid {other}", note)
+
+    def test_a_stale_kubeconfig_this_uid_cannot_write_is_removed_before_gcloud(self):
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
             kc.write_text("stale")
             kc.chmod(0o400)
             with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
                 path, _ = collect.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            # Root can write any file and keeps it; any other uid replaces it.
             self.assertEqual((path, kc.exists()), (kc, os.geteuid() == 0))
 
 

@@ -1041,26 +1041,41 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
 class PrepareKubeconfigTest(unittest.TestCase):
-    def test_directory_is_world_writable_and_a_stale_kubeconfig_is_replaced(self):
-        # A root hand run over `kubectl exec` must not leave a kubeconfig directory or file the
-        # uid-1000 agent cannot open: the directory is made with the umask cleared, and a file this
-        # uid cannot write is removed before `get-credentials` reads it (root can write any file and
-        # keeps it).
+    def test_the_default_directory_is_shared_and_a_named_one_keeps_the_umask(self):
+        # The default `$HERMES_HOME/.kubeconfigs` follows the fleet-audit collectors' rule: sticky and
+        # world-writable whatever the umask, widened when this uid made it at another mode, moved aside
+        # and remade when another uid's, a stale kubeconfig this uid cannot write removed (root keeps
+        # it). A directory `--kubeconfig-dir` names is the caller's and keeps the caller's umask.
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root, True)
-        kubeconfig_dir = os.path.join(root, "nested", "kubeconfigs")
-        path = report.kubeconfig_path(kubeconfig_dir, "p1", "seeded-a", "us-central1-a")
-        mask = os.umask(0o077)
-        try:
-            report.prepare_kubeconfig(kubeconfig_dir, path)
-        finally:
-            os.umask(mask)
-        self.assertEqual(os.stat(kubeconfig_dir).st_mode & 0o777, report.KUBECONFIG_DIR_MODE)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("stale")
-        os.chmod(path, 0o400)
-        report.prepare_kubeconfig(kubeconfig_dir, path)
-        self.assertEqual(os.path.exists(path), os.geteuid() == 0)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            os.mkdir(shared, 0o755)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("stale")
+            os.chmod(path, 0o400)
+            mask = os.umask(0o077)
+            try:
+                report.prepare_kubeconfig(shared, path)
+            finally:
+                os.umask(mask)
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
+            self.assertEqual(os.path.exists(path), os.geteuid() == 0)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("root's")
+            with patch.object(os, "geteuid", return_value=os.stat(shared).st_uid + 1):
+                report.prepare_kubeconfig(shared, path)
+            self.assertFalse(os.path.exists(path))
+            self.assertEqual(len([n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]), 1)
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
+            named = os.path.join(root, "nested", "kubeconfigs")
+            mask = os.umask(0o077)
+            try:
+                report.prepare_kubeconfig(named, report.kubeconfig_path(named, "p1", "seeded-a", "us-central1-a"))
+            finally:
+                os.umask(mask)
+            self.assertEqual(os.stat(named).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
