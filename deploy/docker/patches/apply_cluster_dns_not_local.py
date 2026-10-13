@@ -11,7 +11,8 @@ local server. That flag switches every model call's failure handling:
   ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` (900s) instead of the cloud 180s;
 - the stream read timeout is raised to the whole request timeout (1800s);
 - the non-stream stale detector is switched off;
-- Ollama and llama.cpp probes (``/api/show``, ``/v1/props``) run at startup
+- local-server probes (Ollama ``/api/show`` and ``/api/tags``, llama.cpp
+  ``/v1/props``, LM Studio ``/api/v1/models``) run at startup
   and for context-length resolution, and the gateway answers each with a 404;
 - ``/models`` metadata is not disk-cached between processes.
 
