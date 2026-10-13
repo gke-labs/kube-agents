@@ -440,6 +440,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading. No field: whether every post a planted
+    # report produced is that report, exactly, is the whole assertion.
+    "relay_posted_as_written": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
