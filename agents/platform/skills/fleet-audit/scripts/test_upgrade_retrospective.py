@@ -23,7 +23,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from contextlib import suppress as contextlib_suppress
@@ -113,12 +112,18 @@ class FakeFleet:
         # given, as a subprocess does, and answers rc 124 when the hang outlasts it.
         self.stall = stall or {}
         self.timeouts = []
+        # The fake's clock, for a run handed `clock`: a stall advances it by the time the read took
+        # rather than sleeping, so a deadline test decides on this clock and not on a wall-clock second.
+        self.now = 0.0
         # An undeclared install's `gcloud projects list`: its exit code, and the projects it names
         # (the active project alone by default; a list without it is a filtered listing).
         self.projects_list_rc, self.projects_listed = projects_list_rc, projects_listed
         # The active gcloud project (`config get-value project`); "" is a configuration with none set.
         self.active_project = active_project
         self.calls = []
+
+    def clock(self):
+        return self.now
 
     def __call__(self, argv, *, timeout=None, env=None):
         self.calls.append(argv)
@@ -150,7 +155,7 @@ class FakeFleet:
             if (cluster, key) in self.stall:
                 self.timeouts.append((cluster, key, timeout))
                 hang = self.stall[(cluster, key)]
-                time.sleep(min(hang, timeout) if timeout is not None else hang)
+                self.now += min(hang, timeout) if timeout is not None else hang
                 if timeout is not None and hang > timeout:
                     return run_of(ur.TIMEOUT_RC, "", "timed out")
             return run_of(0, json.dumps({"items": READS[cluster][key]}))
@@ -2135,6 +2140,46 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p, _, _ in chowns if not p.is_dir() and p.name != ur.LOCK_FILENAME and not p.name.startswith(".doc.json.")), ["r.md.tmp"])
         self.assertTrue(any(p.name.startswith(".doc.json.") for p, _, _ in chowns))
         self.assertIn(fresh / ur.LOCK_FILENAME, [p for p, _, _ in chowns])
+
+    def test_an_existing_store_directory_is_left_as_found_and_a_denied_store_is_one_line(self):
+        # The report store's rule touches only the directories it makes. A store directory that
+        # already exists root-owned at 0777 (a run under the earlier world-writable rule, or an
+        # operator's chmod to let the tick in) keeps its mode and its owner under a root run, since
+        # tightening it to 0755 without handing it over would lock the uid-1000 tick out of a store
+        # it could write before; a child the root run makes under it is 0755 and that directory's
+        # owner's.
+        opened = self.home / "opened"
+        opened.mkdir()
+        opened.chmod(0o777)
+        chowns = []
+        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "chown", side_effect=lambda p, uid, gid: chowns.append((Path(p), uid, gid))):
+            ur.make_store_dir(opened)
+            self.assertEqual((stat.S_IMODE(opened.stat().st_mode), chowns), (0o777, []))
+            ur.make_store_dir(opened / "reports")
+        owner = opened.stat()
+        self.assertEqual((stat.S_IMODE(opened.stat().st_mode), stat.S_IMODE((opened / "reports").stat().st_mode)), (0o777, ur.STORE_DIR_MODE))
+        self.assertEqual(chowns, [(opened / "reports", owner.st_uid, owner.st_gid)])
+        # A store path this uid cannot write is one stderr line, exit 2, nothing on stdout and no
+        # traceback, the owner named when it is another uid's and the run's projects at the end for
+        # the recovery `finish`; the lock, when it was taken, is released on the way out.
+        denied = PermissionError(errno.EACCES, "Permission denied", str(self.home / "reports" / ".r.md.tmp"))
+        (self.home / "reports").mkdir()
+        uid = self.home.stat().st_uid
+        self.assertEqual(ur.store_denied_line(denied), ur.STORE_DENIED_FORMAT.format(path=denied.filename, error="Permission denied", note=""))
+        with mock.patch.object(os, "geteuid", return_value=uid + 1):
+            self.assertEqual(ur.store_denied_line(denied), ur.STORE_DENIED_FORMAT.format(path=denied.filename, error="Permission denied", note=ur.STORE_OWNER_NOTE_FORMAT.format(where=self.home / "reports", owner=uid, uid=uid + 1)))
+        tail = ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note="")
+        full = ["--full", "--scope-projects", PROJECT, "--no-report"]
+        for target, flags, ending in (("acquire_lock", full, tail), ("collect", full, tail), ("probe_lock", ["--probe-lock"], ""), ("reset_ledger", ["--reset-ledger"], "")):
+            with self.subTest(target=target):
+                with mock.patch.object(ur, target, side_effect=denied), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                    with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                        rc = ur.main(flags)
+                self.assertEqual((rc, out.getvalue(), err.getvalue().splitlines()[-1]), (ur.EXIT_USAGE, "", ur.store_denied_line(denied) + ending))
+                self.assertNotIn("Traceback", err.getvalue())
+        held = ur.acquire_lock(self.home / ur.LOCK_FILENAME, wait=timedelta(0))
+        self.assertIsNotNone(held)
+        held.close()
 
     def test_api_disabled_project_is_empty_for_operations_too(self):
         ops, error = ur.list_operations("no-gke-project", SINCE, run=lambda argv, **kw: run_of(1, "", API_OFF_STDERR.format(project="no-gke-project", api="operations")))
@@ -5230,14 +5275,14 @@ class ManifestTest(unittest.TestCase):
         # the terminal's limit with the manifest written. The cut cluster is a partial review (here
         # nothing answered: the credentials-failed shape, `collected` on the operation check alone,
         # `partial_read` recorded); the next cluster is held for the next run.
+        # The run reads the fake's clock, which the stall advances by the time the read was given
+        # rather than sleeping: the cut is asserted on that clock, not on a second of wall time.
         fleet = FakeFleet(stall={("gemma-gpu-upgraded", "pods"): 30.0})
         manifest_file = str(self.home / "manifest.json")
-        started = time.monotonic()
         with mock.patch.object(ur, "RUN_DEADLINE_S", 1), redirect_stderr(io.StringIO()):
-            result = ur.collect(args(manifest_file=manifest_file), run=fleet, now=NOW, max_workers=1)
-        self.assertLess(time.monotonic() - started, 10.0)
+            result = ur.collect(args(manifest_file=manifest_file), run=fleet, now=NOW, max_workers=1, clock=fleet.clock)
         [(_, _, given)] = fleet.timeouts
-        self.assertLessEqual(given, 1)
+        self.assertEqual((given, fleet.now), (1.0, 1.0))
         self.assertEqual(len([c for c in fleet.calls if c[0] == "kubectl"]), 1)
         gemma = next(r for r in result["reviews"] if r["cluster"] == GEMMA)
         self.assertEqual((gemma["reviewed"], gemma["answered"], gemma["partial"]), (False, [], list(ur.CORE_READS)))
@@ -5259,7 +5304,7 @@ class ManifestTest(unittest.TestCase):
         # the cut review, and the Info line is printed.
         fleet = FakeFleet(clusters=[cluster_doc("gemma-gpu-upgraded")], stall={("gemma-gpu-upgraded", "pods"): 30.0})
         with mock.patch.object(ur, "RUN_DEADLINE_S", 1), redirect_stderr(io.StringIO()):
-            result = ur.collect(args(manifest_file=str(self.home / "manifest.json")), run=fleet, now=NOW, max_workers=1)
+            result = ur.collect(args(manifest_file=str(self.home / "manifest.json")), run=fleet, now=NOW, max_workers=1, clock=fleet.clock)
         self.assertEqual((result["deferred"], result["deferred_rechecks"], result["budget_spent"], result["budget"]["cut"], result["budget"]["cut_rechecks"]), ([], 0, True, 1, 0))
         self.assertIn(ur.INFO_BUDGET_SPENT.format(seconds=1, reviewed=1, rechecked=0, cut=1, cut_rechecks=0, deferred=0, deferred_rechecks=0), ur.render_report(result))
         self.assertTrue(json.loads(Path(result["manifest_path"]).read_text())["partial"])
@@ -5353,10 +5398,16 @@ class MitigationTableTest(unittest.TestCase):
 
 class DefaultRunTest(unittest.TestCase):
     def test_timeout_and_missing_binary(self):
-        result = ur.default_run([sys.executable, "-c", "import sys, time; print('partial', flush=True); time.sleep(5)"], timeout=1)
-        self.assertEqual(result.rc, ur.TIMEOUT_RC)
-        self.assertIsInstance(result.stdout, str)
-        self.assertIn("partial", result.stdout)
+        # A child that outlives its timeout is rc 124 with str output, whatever the interpreter's
+        # start-up costs on the host. The output a timed-out child had flushed is kept and decoded,
+        # asserted on the exception `subprocess.run` raises rather than on a race between the
+        # child's first write and the timeout.
+        result = ur.default_run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=1)
+        self.assertEqual((result.rc, result.stdout), (ur.TIMEOUT_RC, ""))
+        expired = subprocess.TimeoutExpired(["kubectl"], 1, output=b"partial", stderr=b"late")
+        with mock.patch.object(ur.subprocess, "run", side_effect=expired):
+            result = ur.default_run(["kubectl"], timeout=1)
+        self.assertEqual((result.rc, result.stdout, result.stderr), (ur.TIMEOUT_RC, "partial", "late"))
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
 
 

@@ -360,16 +360,24 @@ TEMP_SUFFIX = ".tmp"
 # Mode alone would not do: a hand run over `kubectl exec` lands as root while
 # the tick runs as uid 1000, which can read a root-owned 0755 directory but
 # cannot write the next run into it; a world-writable directory would let any
-# login on the pod replace the store's files instead. The lock is made with
+# login on the pod replace the store's files instead. A directory that already
+# exists is left as found, mode and owner alike, as the report store leaves
+# it: a root run that tightened one an operator had opened for the tick would
+# lock the tick out of a store it could write before. The lock is made with
 # the umask cleared so it is `LOCK_FILE_MODE` whoever creates it; a
 # caller-named output path's directory and ancestors keep the caller's umask
 # (`output_parent`); the kubeconfig directory has its own rule in
 # `collect.prepare_kubeconfig`.
 LOCK_FILE_MODE = 0o644
 STORE_DIR_MODE = 0o755
-STORE_DIR_MODE_MASK = 0o7777
 ROOT_UID = 0
-STORE_DIR_MODE_TEXT = "{path}: not at the store's mode and could not be changed ({error}); a run as another user made it, and the write that follows names it"
+# A store path this uid cannot write ends the run with one line, the owner
+# named when it is another uid's, as the report store's `_ownership_note`
+# names it: the residual a root run from before `_adopt_owner`, or a
+# directory made by hand, leaves, which only an operator can repair.
+STORE_DENIED_FORMAT = "{path}: {error}{note}; the run stops here and nothing more is written"
+STORE_OWNER_NOTE_FORMAT = " ({where} is owned by uid {owner} and this run is uid {uid}; a run as another user made it, and it stays unwritable until its ownership is restored)"
+STORE_DENIED_PATH_UNKNOWN = "the store"
 
 # Project discovery, as `collect.py`'s `discover_fleet`: `--project` (one
 # project, a hand run's override), else the declared scope the SOP handed
@@ -1513,10 +1521,12 @@ def make_store_dir(path: Path) -> None:
     chmod rather than through the umask, which is process-wide and would race
     the worker threads), owned like the nearest directory that already
     existed when this run is root (`_adopt_owner`): the fleet-audit report
-    store's rule, so a root hand run leaves nothing the uid-1000 tick cannot
-    write into. A store directory that exists at another mode is set when
-    this run owns it or is root; another uid's is left with a logged line,
-    and the write that follows names it."""
+    store's rule (`audit_report._make_store_dirs`), which touches only the
+    directories it makes. One that already exists is left as found, mode and
+    owner alike: a root run that tightened a root-owned directory an operator
+    had opened for the tick would lock the tick out of a store it could write
+    before. A store this uid cannot write is met by the write, and is
+    `store_denied_line`'s one line."""
     missing: list[Path] = []
     existing = path
     while not existing.exists():
@@ -1535,11 +1545,22 @@ def make_store_dir(path: Path) -> None:
             directory.chmod(STORE_DIR_MODE)
             if owner is not None:
                 _adopt_owner(directory, owner)
-    try:
-        if (path.stat().st_mode & STORE_DIR_MODE_MASK) != STORE_DIR_MODE:
-            path.chmod(STORE_DIR_MODE)
-    except OSError as exc:
-        log(STORE_DIR_MODE_TEXT.format(path=path, error=exc))
+
+
+def store_denied_line(exc: PermissionError) -> str:
+    """One line for a store path this uid cannot write, with the owner named
+    when it is another uid's, as the report store's `_ownership_note` names
+    it: the residual a root run from before `_adopt_owner`, or a directory
+    made by hand, leaves, which only an operator can repair."""
+    note = ""
+    if exc.filename:
+        with contextlib.suppress(OSError):
+            where = Path(exc.filename)
+            where = where if where.exists() else where.parent
+            owner = where.stat().st_uid
+            if owner != os.geteuid():
+                note = STORE_OWNER_NOTE_FORMAT.format(where=where, owner=owner, uid=os.geteuid())
+    return STORE_DENIED_FORMAT.format(path=exc.filename or STORE_DENIED_PATH_UNKNOWN, error=exc.strerror or exc, note=note)
 
 
 def _under_store(path: Path) -> bool:
@@ -5956,11 +5977,19 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     if args.probe_lock:
-        rc, line = probe_lock(data_dir() / LOCK_FILENAME)
+        try:
+            rc, line = probe_lock(data_dir() / LOCK_FILENAME)
+        except PermissionError as exc:
+            print(store_denied_line(exc), file=sys.stderr)
+            return EXIT_USAGE
         print(line)
         return rc
     if args.reset_ledger:
-        print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
+        try:
+            print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
+        except PermissionError as exc:
+            print(store_denied_line(exc), file=sys.stderr)
+            return EXIT_USAGE
         return 0
     # The projects this run resolves for its route, before the lock: an exit
     # after `start` without a manifest names them, so the SOP's recovery
@@ -5968,19 +5997,24 @@ def main(argv: list[str] | None = None) -> int:
     discovery = discover_fleet(project_override(args) or None, run=default_run, forced=forced_clusters(args))
     exit_tail = exit_projects_text(discovery, forced_clusters(args))
     lock = None
-    if not args.dry_run:
-        lock_path = data_dir() / LOCK_FILENAME
-        lock = acquire_lock(lock_path)
-        if lock is None:
-            print(lock_held_line(lock_path, LOCK_WAIT) + exit_tail)
-            return 0
     try:
+        if not args.dry_run:
+            lock_path = data_dir() / LOCK_FILENAME
+            lock = acquire_lock(lock_path)
+            if lock is None:
+                print(lock_held_line(lock_path, LOCK_WAIT) + exit_tail)
+                return 0
         result = collect(args, discovery=discovery, started=run_started)
     except argparse.ArgumentTypeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     except StateUnreadable as exc:
         print(str(exc) + exit_tail, file=sys.stderr)
+        return EXIT_USAGE
+    except PermissionError as exc:
+        # A store path this uid cannot write, met at the lock or at a write:
+        # one line, with the projects for the recovery `finish`, no traceback.
+        print(store_denied_line(exc) + exit_tail, file=sys.stderr)
         return EXIT_USAGE
     finally:
         if lock is not None:
