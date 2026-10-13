@@ -352,16 +352,23 @@ MESSAGE_EXCERPT_CHARS = 400
 # ancestors keep the caller's umask (`output_parent`).
 STORE_FILE_MODE = 0o644
 TEMP_SUFFIX = ".tmp"
-# The lock is made with the umask cleared and the store's own directories
-# are chmodded to their mode (never a caller-named output path's directory
-# or an ancestor, which keep the caller's umask; the files inside are
-# `STORE_FILE_MODE` wherever they land): a hand run over `kubectl exec`
-# lands as root while the tick runs as uid 1000, and a 0600 root lock or a
-# 0755 root directory would refuse every later run. The kubeconfig directory
-# has its own rule in `collect.prepare_kubeconfig`.
+# The store's directories are 0755 and its files 0644 whatever the writer's
+# umask, and a run as root hands each directory and file it creates to the
+# owner of the nearest directory that already existed: the fleet-audit report
+# store's rule (`audit_report.py`'s `REPORT_DIR_MODE`, `REPORT_FILE_MODE` and
+# `_adopt_owner`), carried here as the sibling collectors carry their copies.
+# Mode alone would not do: a hand run over `kubectl exec` lands as root while
+# the tick runs as uid 1000, which can read a root-owned 0755 directory but
+# cannot write the next run into it; a world-writable directory would let any
+# login on the pod replace the store's files instead. The lock is made with
+# the umask cleared so it is `LOCK_FILE_MODE` whoever creates it; a
+# caller-named output path's directory and ancestors keep the caller's umask
+# (`output_parent`); the kubeconfig directory has its own rule in
+# `collect.prepare_kubeconfig`.
 LOCK_FILE_MODE = 0o644
-STORE_DIR_MODE = 0o777
+STORE_DIR_MODE = 0o755
 STORE_DIR_MODE_MASK = 0o7777
+ROOT_UID = 0
 STORE_DIR_MODE_TEXT = "{path}: not at the store's mode and could not be changed ({error}); a run as another user made it, and the write that follows names it"
 
 # Project discovery, as `collect.py`'s `discover_fleet`: `--project` (one
@@ -1492,16 +1499,42 @@ def empty_guards() -> dict:
     return {"version": GUARDS_VERSION, "updated_at": None, "guards": []}
 
 
+def _adopt_owner(path: Path, owner: os.stat_result) -> None:
+    """Give `path` to `owner`'s uid and gid when this run is root, as
+    `audit_report._adopt_owner` does for the report store: root is the one
+    writer that can hand what it creates to the store's owner, and any other
+    uid creates what it owns."""
+    if os.geteuid() == ROOT_UID:
+        os.chown(path, owner.st_uid, owner.st_gid)
+
+
 def make_store_dir(path: Path) -> None:
-    """A store directory writable by whichever uid runs next (`STORE_DIR_MODE`,
-    set by chmod rather than through the umask, which is process-wide and
-    would race the worker threads): a directory root made under its umask on
-    a hand run would refuse the tick's writes after the fleet was read.
-    Missing ancestors are not the store's and keep the caller's umask. A
-    store directory that exists at another mode is widened when this run
-    owns it or is root; another uid's is left with a logged line, and the
-    write that follows names it."""
-    path.mkdir(parents=True, exist_ok=True)
+    """A store directory and its missing parents at `STORE_DIR_MODE` (set by
+    chmod rather than through the umask, which is process-wide and would race
+    the worker threads), owned like the nearest directory that already
+    existed when this run is root (`_adopt_owner`): the fleet-audit report
+    store's rule, so a root hand run leaves nothing the uid-1000 tick cannot
+    write into. A store directory that exists at another mode is set when
+    this run owns it or is root; another uid's is left with a logged line,
+    and the write that follows names it."""
+    missing: list[Path] = []
+    existing = path
+    while not existing.exists():
+        missing.append(existing)
+        existing = existing.parent
+    try:
+        owner: os.stat_result | None = existing.stat()
+    except OSError:
+        owner = None
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            continue  # a rival run made it, and chose its ownership then
+        with contextlib.suppress(OSError):
+            directory.chmod(STORE_DIR_MODE)
+            if owner is not None:
+                _adopt_owner(directory, owner)
     try:
         if (path.stat().st_mode & STORE_DIR_MODE_MASK) != STORE_DIR_MODE:
             path.chmod(STORE_DIR_MODE)
@@ -1536,6 +1569,7 @@ def write_json_atomically(path: Path, doc: object) -> None:
     output_parent(path)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=TEMP_SUFFIX)
     os.chmod(temporary, STORE_FILE_MODE)
+    _adopt_owner(Path(temporary), path.parent.stat())
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
             json.dump(doc, out, indent=2, sort_keys=True)
@@ -5782,6 +5816,7 @@ def write_report(path: Path, text: str, *, link: bool = True) -> None:
     temporary = path.with_name(path.name + REPORT_TEMP_SUFFIX)
     temporary.write_text(text, encoding="utf-8")
     os.chmod(temporary, STORE_FILE_MODE)
+    _adopt_owner(temporary, path.parent.stat())
     os.replace(temporary, path)
     if not link:
         return
@@ -5829,6 +5864,9 @@ def acquire_lock(path: Path, *, wait: timedelta | None = None, poll: timedelta |
     finally:
         os.umask(mask)
     handle = os.fdopen(descriptor, "r", encoding="utf-8")  # noqa: SIM115 -- held for the run
+    # The lock is the store's too: a root run hands it to the store's owner.
+    with contextlib.suppress(OSError):
+        _adopt_owner(path, path.parent.stat())
     deadline = clock() + wait.total_seconds()
     while True:
         try:

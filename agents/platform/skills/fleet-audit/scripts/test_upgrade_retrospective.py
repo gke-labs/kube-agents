@@ -2081,8 +2081,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
     def test_lock_is_read_only_world_readable_and_only_contention_is_retried(self):
         store = self.home / "nested" / "store"
         lock_path = store / ur.LOCK_FILENAME
-        # Under a hardened umask the lock is still 0644 and the store's directories 0777: a root
-        # hand run must not leave files or directories the uid-1000 tick cannot open or write.
+        # Under a hardened umask the lock is still 0644 and the store's directories 0755, made the
+        # report store's way; a root hand run hands what it creates to the store's owner (below).
         mask = os.umask(0o077)
         try:
             held = ur.acquire_lock(lock_path)
@@ -2090,9 +2090,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
             os.umask(mask)
         self.assertIsNotNone(held)
         self.assertFalse(held.writable())
-        # The store's own directory is 0777; its missing ancestor is not the store's and keeps the
-        # caller's umask.
-        self.assertEqual((stat.S_IMODE(lock_path.stat().st_mode), stat.S_IMODE(store.stat().st_mode), stat.S_IMODE((self.home / "nested").stat().st_mode)), (ur.LOCK_FILE_MODE, ur.STORE_DIR_MODE, ur.STORE_DIR_MODE & ~0o077))
+        # The store's directory and the parents it had to make are the store's, at its mode.
+        self.assertEqual((stat.S_IMODE(lock_path.stat().st_mode), stat.S_IMODE(store.stat().st_mode), stat.S_IMODE((self.home / "nested").stat().st_mode)), (ur.LOCK_FILE_MODE, ur.STORE_DIR_MODE, ur.STORE_DIR_MODE))
+        self.assertEqual((ur.STORE_DIR_MODE, ur.STORE_FILE_MODE), (0o755, 0o644))
         held.close()
         # A lock file left read-only by another uid still opens: flock(2) needs no writable descriptor.
         lock_path.chmod(0o444)
@@ -2118,6 +2118,23 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((store / "deep" / "doc.json").stat().st_mode), ur.STORE_FILE_MODE)
         self.assertEqual(stat.S_IMODE((store / "reports" / "r.md").stat().st_mode), ur.STORE_FILE_MODE)
         self.assertEqual(ur.STORE_FILE_MODE, 0o644)
+        # A run as root hands every directory and file it creates, and the lock, to the owner of the
+        # nearest directory that already existed, as the report store's `_adopt_owner` does, so the
+        # uid-1000 tick writes after a root hand run without a world-writable directory.
+        chowns = []
+        fresh = self.home / "root-run" / "store"
+        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "chown", side_effect=lambda p, uid, gid: chowns.append((Path(p), uid, gid))):
+            ur.make_store_dir(fresh)
+            ur.write_json_atomically(fresh / "doc.json", {"a": 1})
+            ur.write_report(fresh / "r.md", "# r\n", link=False)
+            held = ur.acquire_lock(fresh / ur.LOCK_FILENAME)
+            held.close()
+        owner = self.home.stat()
+        self.assertTrue(chowns and all((uid, gid) == (owner.st_uid, owner.st_gid) for _, uid, gid in chowns), chowns)
+        self.assertEqual({p for p, _, _ in chowns if p.is_dir()}, {self.home / "root-run", fresh})
+        self.assertEqual(sorted(p.name for p, _, _ in chowns if not p.is_dir() and p.name != ur.LOCK_FILENAME and not p.name.startswith(".doc.json.")), ["r.md.tmp"])
+        self.assertTrue(any(p.name.startswith(".doc.json.") for p, _, _ in chowns))
+        self.assertIn(fresh / ur.LOCK_FILENAME, [p for p, _, _ in chowns])
 
     def test_api_disabled_project_is_empty_for_operations_too(self):
         ops, error = ur.list_operations("no-gke-project", SINCE, run=lambda argv, **kw: run_of(1, "", API_OFF_STDERR.format(project="no-gke-project", api="operations")))
