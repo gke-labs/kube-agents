@@ -162,11 +162,6 @@ import fleet_scope_args  # noqa: E402
 
 # The scope this collector was handed, set by main from the two flags.
 declared_scope = fleet_scope_args.DeclaredScope()
-# What joins the values of those flags when this collector hands them on to
-# the readiness reporter: the comma `collector_args` uses
-# (fleet_scope_targets.collector_args); the parsers accept it among
-# fleet_scope_args.SCOPE_ARG_SEPARATORS.
-SCOPE_ARG_JOIN = ","
 
 # `--project` skips discovery, so a scoped run names no other project. Without
 # a row saying so the manifest reads as a fleet of one project, and `finish`
@@ -294,6 +289,10 @@ UNEVALUATED_REPORT_ERROR_FORMAT = "the reporter could not read the cluster: {mes
 UNEVALUATED_BUDGET_SPENT = "the collector's readiness budget ({budget}s across the fleet) was spent before this cluster's reporter run could start"
 UNEVALUATED_TIMED_OUT = "the readiness reporter ran past its budget ({seconds}s) for this cluster and was stopped"
 UNEVALUATED_REPORT_MALFORMED = "the readiness reporter's report was not in the shape this check reads ({error})"
+# The crash fallback's reason: a cluster the 3.11 phase never reached has no
+# reporter run and no report behind it, so the reason names the phase, not a
+# report that does not exist.
+UNEVALUATED_PHASE_CRASHED = "the collector's 3.11 phase crashed before reaching this cluster ({error})"
 UNEVALUATED_REPORT_NOT_NARROWED_FORMAT = "the readiness reporter's report is not marked as narrowed to {spec} (narrowed_to: {found!r}), so its rows are not this cluster's to read"
 UNEVALUATED_STATUS_FORMAT = "status {status!r}{note}"
 UNEVALUATED_REPORT_MESSAGE_CHARS = 200
@@ -1513,29 +1512,27 @@ def _upgrade_blocked_hit(entry: dict, member: dict, report_path: str, due: Due) 
     }
 
 
-def _declared_scope_argv() -> list[str]:
-    """The install's declared scope, handed on to the reporter the way the
-    fleet_scope tool spells it (`collector_args`): `--scope-projects` with the
-    sweep comma-joined, then `--scope-unread` with each unread project as
-    `project=outcome`, when there are any. The reporter is a collector too:
-    on a sandbox whose operator says a scope is declared it refuses a bare
-    `--project` (`fleet_scope_args`), so a run that kept the flags to itself
-    would land every behind cluster's 3.11 in `checks_unevaluated`. Nothing
-    is handed on when no scope was handed to this collector: without a
-    declared scope the reporter reads the project as before, and on a scoped
-    sandbox that handed no flags this collector refused to run before any
-    reporter started."""
+def _declared_scope_argv(project: str) -> list[str]:
+    """The scope flag the reporter needs on an install that declares a scope:
+    `--scope-projects` naming the one project being read. The reporter is a
+    collector too: on a sandbox whose operator says a scope is declared it
+    refuses a bare `--project` (`fleet_scope_args`), so a run that handed on
+    no flag would land every behind cluster's 3.11 in `checks_unevaluated`.
+    With `--project` the reporter reads the scope for one thing, whether that
+    project is inside it (`DeclaredScope.override_error`), and never its
+    unread rows, so the one project is the whole scope it needs -- and it is
+    inside by construction, since this collector reads no project its own
+    scope does not list. The full `collector_args` are not handed on: the
+    same argv is the `commands` entry the agent copies into `checks_run`, and
+    `finish` refuses any command over `MAX_COMMAND_CHARS` (audit_report.py),
+    which a sweep of some fifty to a hundred and fifty project ids would
+    cross on every behind cluster at once. Nothing is handed on when no scope
+    was handed to this collector: without a declared scope the reporter reads
+    the project as before, and on a scoped sandbox that handed no flags this
+    collector refused to run before any reporter started."""
     if not declared_scope.declared or declared_scope.args_missing:
         return []
-    argv: list[str] = []
-    if declared_scope.projects:
-        argv += [fleet_scope_args.SCOPE_PROJECTS_FLAG, SCOPE_ARG_JOIN.join(declared_scope.projects)]
-    if declared_scope.unread:
-        argv += [
-            fleet_scope_args.SCOPE_UNREAD_FLAG,
-            SCOPE_ARG_JOIN.join(f"{project}{fleet_scope_args.SCOPE_UNREAD_OUTCOME_SEPARATOR}{outcome}" for project, outcome in declared_scope.unread),
-        ]
-    return argv
+    return [fleet_scope_args.SCOPE_PROJECTS_FLAG, project]
 
 
 def _read_last_run(state_dir: str, project: str) -> dict[str, str]:
@@ -1629,8 +1626,10 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     # One reporter run per behind cluster, with `--cluster` naming it: the
     # reporter reads nothing else in the project, and the recorded command on
     # the entry is the invocation that graded it (and stays short however many
-    # clusters are behind). Within a project the runs spend the fleet budget
-    # one after another, so a slow read costs the clusters after it time,
+    # clusters are behind and however wide the declared scope is: the scope
+    # flag names this project alone, `_declared_scope_argv`). Within a
+    # project the runs spend the fleet budget one after another, so a slow
+    # read costs the clusters after it time,
     # never a row of their own; they go least recently reported first (a
     # cluster never reported before all of them, the listing order breaking
     # ties), so a spent budget lands on a different tail each week.
@@ -1662,10 +1661,10 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             log(f"{project}/{entry['_bare_name']}: cannot clear {output} ({exc}); upgrade-blocked unavailable there")
             _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=output, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
             continue
-        # The scope flags sit between the project and the cluster, as the SOP's
+        # The scope flag sits between the project and the cluster, as the SOP's
         # 3.11 Command bullet spells the invocation the `commands` entry records.
         argv = [
-            sys.executable, str(READINESS_REPORTER), "--project", project, *_declared_scope_argv(), "--cluster", spec,
+            sys.executable, str(READINESS_REPORTER), "--project", project, *_declared_scope_argv(project), "--cluster", spec,
             "--readiness", "--output", output, "--state-dir", state_dir,
         ]
         result = run(argv, timeout=timeout)
@@ -2003,7 +2002,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 # no cluster is left without the check in any field.
                 for entry in results[index]:
                     if entry.get("outcome") == OUTCOME_COLLECTED and not _has_disposition(entry):
-                        _unevaluated(entry, UNEVALUATED_REPORT_MALFORMED.format(error=type(exc).__name__))
+                        _unevaluated(entry, UNEVALUATED_PHASE_CRASHED.format(error=type(exc).__name__))
 
     entries = [entry for group in results for entry in group]
     attach_fleet_spread(entries)

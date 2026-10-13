@@ -301,12 +301,19 @@ ROLLOUT_FLAG_NEEDS_FULL_READ = "--rollout-in-progress needs a full read: a --clu
 # opposite of what its slash says, and the unmatched-spec line would then name
 # a spec the operator did not type.
 CLUSTER_SPEC_SEPARATOR = "/"
-# Each half of a spec is a GKE name: lowercase letters, digits and hyphens, as
-# GKE spells every location and cluster name. Anything else -- whitespace from a
-# pasted terminal line, an uppercase letter, a stray character -- can match
-# nothing, so the parser refuses it before any read instead of letting the run
-# report a miss that reads as a typo or a deleted cluster.
-CLUSTER_SPEC_HALF_RE = re.compile(r"[a-z0-9-]+")
+# Each half of a spec is a GKE name: lowercase letters, digits and hyphens, never
+# a hyphen first, as GKE spells every location and cluster name. Anything else --
+# whitespace from a pasted terminal line, an uppercase letter, a stray character,
+# a leading hyphen -- can match nothing, so the parser refuses it before any read
+# instead of letting the run report a miss that reads as a typo or a deleted
+# cluster. The grammar is the tree's GKE name component, character for character
+# as `credential_proxy_client._GKE_CONTEXT_COMPONENT` and `scoped_sa_pool._COMPONENT`
+# spell it, without their anchors because every use here is `fullmatch`; this
+# file does not import the broker's client for a regex, and the tests hold the
+# three equal (this half with the broker's component in this skill's suite, the
+# pool's copy with it in `test_scoped_sa_pool.py`), so a drift fails rather than
+# admitting a half the broker refuses.
+CLUSTER_SPEC_HALF_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 INVALID_CLUSTER_SPEC = "--cluster {spec!r} is neither <location>/<name> nor a bare name: each half is a GKE name (lowercase letters, digits and hyphens), a location before the slash and a name after it, or the name alone"
 
 

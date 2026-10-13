@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
+import credential_proxy_client  # noqa: E402 -- on sys.path through the reporter's SHARED_SCRIPT_DIRS
 
 # Every resolver asks the operator's answer when a run passes neither scope flag:
 # the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
@@ -380,17 +381,19 @@ class ProjectFailureTest(unittest.TestCase):
         self.assertNotIn("no cluster matched", out.getvalue())
 
     def test_a_cluster_spec_outside_the_gke_name_grammar_is_a_usage_error_before_any_read(self):
-        """Each half is a GKE name, lowercase letters, digits and hyphens: an
-        empty half, a second slash, whitespace from a pasted line or an
-        uppercase letter can match nothing, and is refused with the spec as
-        typed rather than reported as a miss."""
+        """Each half is a GKE name, lowercase letters, digits and hyphens, never
+        a hyphen first: an empty half, a second slash, whitespace from a pasted
+        line, an uppercase letter or a leading hyphen can match nothing, and is
+        refused with the spec as typed rather than reported as a miss."""
         target = "1.31.0-gke.1"
         fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
-        for spec in ("/prod", "prod/", "", "us-central1/prod/extra", "us-central1/prod ", " prod", "us-central1/Prod", "us central1/prod"):
+        for spec in ("/prod", "prod/", "", "us-central1/prod/extra", "us-central1/prod ", " prod", "us-central1/Prod", "us central1/prod", "us-central1/-a", "-us-central1/prod", "-prod"):
             with self.subTest(spec=spec):
                 err = io.StringIO()
                 with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
-                    rc = report.main(["--project", "p", "--cluster", spec, "--target-version", target])
+                    # One token, `--cluster=<spec>`: argparse reads a separate
+                    # `-prod` as an option and never hands it to the parser.
+                    rc = report.main(["--project", "p", f"--cluster={spec}", "--target-version", target])
                 self.assertEqual(rc, report.EXIT_USAGE)
                 # The line names the spec as typed, slash and all.
                 self.assertIn(f"--cluster {spec!r} is neither", err.getvalue())
@@ -400,6 +403,25 @@ class ProjectFailureTest(unittest.TestCase):
         with patch.object(report, "run_cmd", fake), self.assertRaises(ValueError):
             report.build_report(["p"], target, clusters=["/prod"])
         self.assertEqual(fake.calls, [])
+
+    def test_the_spec_half_grammar_is_the_brokers_gke_name_component(self):
+        """One GKE name grammar in the tree: the broker's context component,
+        the scoped pool's copy of it, and this file's spec half. Held equal
+        character for character, anchors aside (every use here is
+        `fullmatch`), and driven with the same inputs, so an edit to one fails
+        here rather than admitting a half the broker refuses."""
+        broker = credential_proxy_client._GKE_CONTEXT_COMPONENT
+        self.assertEqual(report.CLUSTER_SPEC_HALF_RE.pattern, broker.pattern.removeprefix("^").removesuffix(r"\Z"))
+        for candidate in ("abc", "a", "a-b-c", "us-east4", "0abc", "abc-", "-abc", "ABC", "a_b", "a.b", "a/b", "", "a b", "abc\n", "\nabc", "abc\r\n"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    bool(broker.fullmatch(candidate)),
+                    bool(report.CLUSTER_SPEC_HALF_RE.fullmatch(candidate)),
+                    f"the broker and the reporter disagree about {candidate!r}",
+                )
+        self.assertIsNone(report.parse_cluster_spec("us-central1/-a"))
+        self.assertIsNone(report.parse_cluster_spec("-prod"))
+        self.assertEqual(report.parse_cluster_spec("us-central1/a-1"), ("us-central1", "a-1"))
 
     def test_rollout_in_progress_beside_cluster_is_a_usage_error_before_any_read(self):
         target = "1.31.0-gke.1"
@@ -1079,6 +1101,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
             self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
         self.assertTrue(any("declared scope does not list" in e for e in errors))
+
+    def test_the_one_project_the_audit_collector_hands_on_is_the_whole_scope_the_override_needs(self):
+        """The upgrade audit's collector runs this reporter per behind cluster
+        as `--project <p> --scope-projects <p> --cluster ...`, the one project
+        and never the sweep or the unread rows, so its recorded command does
+        not grow with the fleet. That is enough here: with `--project` the
+        scope is read only to pass the project through `override_error`, so
+        the run proceeds on a scoped sandbox with no error and no note."""
+        errors: list[str] = []
+        report.declared_scope.set("payments-prod", None)
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+        self.assertEqual(errors, [])
 
     def test_a_project_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
         errors: list[str] = []

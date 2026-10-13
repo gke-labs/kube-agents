@@ -2152,7 +2152,10 @@ class UpgradeBlockedTest(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             stamps = json.load(handle)
         self.assertEqual(set(stamps), {"us-central1/a", "us-central1/b", "us-central1/c"})
-        self.assertTrue(all(v > "2026-01-14T00:00:00Z" for v in stamps.values()), stamps)
+        # The stamps come from the host clock, not this suite's `NOW`, so they
+        # are compared with the seeded values and never with a calendar date.
+        self.assertNotEqual(stamps["us-central1/a"], seeded["us-central1/a"])
+        self.assertNotEqual(stamps["us-central1/b"], seeded["us-central1/b"])
 
     def test_a_no_channel_cluster_whose_pool_skew_was_not_judged_is_unevaluated_not_declared(self):
         """The no-channel arm is the third gate that declares 3.11 inapplicable,
@@ -2363,21 +2366,19 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         self.assertIn("not in the shape", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
 
-    def test_a_declared_scope_is_forwarded_to_the_reporter_as_the_tool_spells_it(self):
+    def test_a_declared_scope_reaches_the_reporter_as_the_one_project_being_read(self):
         """The reporter is a collector too: on a scoped install it refuses a
-        bare `--project` (`fleet_scope_args`), so the run hands on the
-        `collector_args` this collector was given, `--scope-projects` with the
-        sweep and `--scope-unread` with each unread project as
-        `project=outcome`, between `--project` and `--cluster`, and the
-        recorded command carries them."""
+        bare `--project` (`fleet_scope_args`), so the run hands on
+        `--scope-projects` naming the one project it is reading, between
+        `--project` and `--cluster`, and the recorded command carries it. The
+        sweep and the unread rows stay with this collector: with `--project`
+        the reporter reads the scope only to pass that project through
+        `override_error`, and the full `collector_args` would make the
+        recorded command grow with the fleet."""
         self.addCleanup(pr.declared_scope.set, None, None)
-        for scope_projects, scope_unread, forwarded in (
-            (
-                "acme,ops-mgmt",
-                "payments-staging=denied,declared-scope=unresolved",
-                ["--scope-projects", "acme,ops-mgmt", "--scope-unread", "payments-staging=denied,declared-scope=unresolved"],
-            ),
-            ("acme", None, ["--scope-projects", "acme"]),
+        for scope_projects, scope_unread in (
+            ("acme,ops-mgmt", "payments-staging=denied,declared-scope=unresolved"),
+            ("acme", None),
         ):
             with self.subTest(scope_projects=scope_projects, scope_unread=scope_unread):
                 pr.declared_scope.set(scope_projects, scope_unread)
@@ -2385,10 +2386,32 @@ class UpgradeBlockedTest(unittest.TestCase):
                 by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
                 self.assertEqual(len(self.calls), 1)
                 argv = self.calls[0]
-                self.assertEqual(argv[argv.index("--project") : argv.index("--cluster") + 2], ["--project", "acme", *forwarded, "--cluster", "us-central1/lag"])
+                self.assertEqual(argv[argv.index("--project") : argv.index("--cluster") + 2], ["--project", "acme", "--scope-projects", "acme", "--cluster", "us-central1/lag"])
+                self.assertNotIn(pr.fleet_scope_args.SCOPE_UNREAD_FLAG, argv)
+                self.assertNotIn("ops-mgmt", " ".join(argv))
                 recorded = next(c for c in by["lag"]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
-                self.assertIn(" ".join(forwarded), recorded)
+                self.assertIn("--scope-projects acme --cluster us-central1/lag", recorded)
+                self.assertNotIn("payments-staging", recorded)
                 self.assertEqual([x["check"] for x in by["lag"]["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.UPGRADE_BLOCKED_CHECK])
+
+    def test_the_recorded_command_does_not_grow_with_the_declared_scope(self):
+        """`finish` refuses a `checks_run` command over
+        `audit_report.MAX_COMMAND_CHARS`, and the agent copies the recorded
+        command verbatim, so the sweep must not be in it: on a folder- or
+        organisation-scoped install the project ids alone run past the limit.
+        A hundred declared projects at the thirty characters a project id can
+        have, with unread rows beside them, leave the command the length it
+        has on a one-project scope, and the validator accepts it."""
+        self.addCleanup(pr.declared_scope.set, None, None)
+        projects = ["acme", *(f"org-unit-{i:03d}-payments-prod-eu1" for i in range(99))]
+        self.assertEqual({len(p) for p in projects[1:]}, {30})
+        pr.declared_scope.set(",".join(projects), ",".join(f"org-unit-{i:03d}-staging=denied" for i in range(20)))
+        self.assertEqual(len(pr.declared_scope.projects), 100)
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
+        recorded = next(c for c in by["lag"]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
+        self.assertLess(len(recorded), audit_report.MAX_COMMAND_CHARS, recorded)
+        self.assertNotIn("org-unit-", recorded)
+        self.assertEqual(audit_report.validate_check_command(recorded, "clusters[0].checks_run[0].command", pr.UPGRADE_BLOCKED_CHECK), recorded)
 
     def test_without_a_declared_scope_the_reporter_gets_a_bare_project(self):
         """No scope handed to this collector, no scope flags handed on: the
@@ -2511,8 +2534,9 @@ class UpgradeBlockedTest(unittest.TestCase):
 
     def test_a_crashed_3_11_phase_leaves_no_cluster_without_the_check_and_overwrites_nothing(self):
         """When a project's 3.11 phase raises, every collected cluster it had
-        not reached is unevaluated with the crash as the reason, once; a
-        declaration it had already made stands."""
+        not reached is unevaluated with the crash as the reason, once, and the
+        reason names the phase, not a report no reporter wrote; a declaration
+        it had already made stands."""
 
         def run(argv, **kwargs):
             joined = " ".join(argv)
@@ -2537,8 +2561,8 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertEqual([x["check"] for x in by["cur"]["checks_not_applicable"]], [pr.UPGRADE_BLOCKED_CHECK])
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(by["cur"]))
         reasons = [u["reason"] for u in by["lag"].get("checks_unevaluated") or [] if u["check"] == pr.UPGRADE_BLOCKED_CHECK]
-        self.assertEqual(len(reasons), 1)
-        self.assertIn("RuntimeError", reasons[0])
+        self.assertEqual(reasons, [pr.UNEVALUATED_REASON_FORMAT.format(why=pr.UNEVALUATED_PHASE_CRASHED.format(error="RuntimeError"))])
+        self.assertNotIn("not in the shape", reasons[0])
 
     def test_an_unknown_row_carries_the_reporters_note(self):
         row = self.member("lag", status="unknown")
