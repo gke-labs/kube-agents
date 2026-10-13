@@ -876,7 +876,7 @@ def pool_cause_text(pool: dict) -> str:
         # keeps the cause once the pool has drained, so the header says "was"
         # over a reading with projects free rather than calling them leased.
         queuing = " and runs are queuing" if pool.get("waiting_now") else ""
-        held = f", {pool['held_by_hand']} held by hand" if pool.get("held_by_hand") else ""
+        held = f", {pool['no_build_id']} with no build ID in the owner" if pool.get("no_build_id") else ""
         free = pool.get("free")
         if isinstance(free, int) and free > 0:
             return (

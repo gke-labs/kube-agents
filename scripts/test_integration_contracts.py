@@ -679,7 +679,7 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "total": doc["pool"]["total"],
                 "lease_failures": doc["recent"]["lease_failures"],
                 "lease_failures_hours": doc["recent"]["hours"],
-                "held_by_hand": sum(doc["held_by_hand"].values()),
+                "no_build_id": sum(doc["no_build_id"].values()),
                 "max_concurrency": doc["max_concurrency"],
             },
             {key: note[key] for key in note if key not in ("since", "measured_at")},

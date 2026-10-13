@@ -335,6 +335,27 @@ class LiveQueueFromDeck(unittest.TestCase):
             {"2108236254767222784", "2108256000000000000"}, queue.all_running_build_ids
         )
 
+    def test_a_job_completed_inside_the_grace_is_releasing_and_an_old_one_is_not(self):
+        now = pp.parse_rfc3339("2026-10-13T14:23:51Z")
+        def item(build, completed):
+            return {"metadata": {"creationTimestamp": "2026-10-13T14:00:00Z"},
+                    "spec": {"job": pp.JOB_NAME},
+                    "status": {"build_id": build, "pendingTime": "2026-10-13T14:01:00Z",
+                               "completionTime": completed, "state": "aborted"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [
+                    item("2110013283170783232", "2026-10-13T14:22:30Z"),  # 81 s ago
+                    item("2110000000000000000", "2026-10-13T12:00:00Z"),  # hours ago
+                    # Deck writes start + 30:00 on an abort, which can sit in
+                    # the future; that is still "finished just now".
+                    item("2110000000000000001", "2026-10-13T14:31:00Z"),
+                ]}, fh)
+            queue = self._queue(tmp, now)
+        self.assertEqual({"2110013283170783232", "2110000000000000001"}, queue.releasing_build_ids)
+        self.assertEqual(set(), queue.all_running_build_ids)
+        self.assertEqual(timedelta(minutes=15), pp.RELEASE_GRACE)
+
     def test_another_tenants_job_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "deck.json"), "w") as fh:
@@ -369,13 +390,28 @@ class PoolStateFields(unittest.TestCase):
                             {pp.BOSKOS_NO_OWNER: 4, "pull-kube-agents-smoke-test-111": 1})
         self.assertEqual(["pull-kube-agents-smoke-test-111"], pool.lease_holders())
 
-    def test_an_owner_without_a_build_id_is_held_by_hand(self):
+    def test_an_owner_without_a_build_id_is_reported_as_such(self):
         pool = pp.PoolState(
             {"busy": 1, "rebuilding": 2},
             {"": 0, "pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
         )
-        self.assertEqual({"hangdng-rebuild": 2}, pool.held_by_hand())
+        self.assertEqual({"hangdng-rebuild": 2}, pool.no_build_id())
         self.assertEqual({}, pool.held_by_job())
+
+    def test_a_build_id_anywhere_in_the_owner_makes_it_a_prow_run(self):
+        """The pull sweep's GitLab pass leases as `<job>-<build>-gitlab`, and a
+        future lane may put anything after the build. The invariant is that a
+        run's owner contains its build ID, not that it ends with it (#2929)."""
+        self.assertEqual("2110017758350544896",
+                         pp.build_of("ci-kube-agents-pull-sweep-2110017758350544896-gitlab"))
+        self.assertEqual("2108236254767222784",
+                         pp.build_of("pull-kube-agents-smoke-test-2108236254767222784"))
+        self.assertIsNone(pp.build_of("hangdng-rebuild"))
+        self.assertIsNone(pp.build_of("fleet-reconcile"))
+        # Twenty digits are not a snowflake with a digit glued on.
+        self.assertIsNone(pp.build_of("x-21100177583505448961"))
+        pool = pp.PoolState({"busy": 1}, {"ci-kube-agents-pull-sweep-2110017758350544896-gitlab": 1})
+        self.assertEqual({}, pool.no_build_id())
 
     def test_a_jobs_fixed_owner_is_held_by_a_job_not_by_hand(self):
         """hack/fleet_reconcile.py leases four projects under `fleet-reconcile`
@@ -383,7 +419,7 @@ class PoolStateFields(unittest.TestCase):
         would be wrong twice a day."""
         pool = pp.PoolState({"busy": 5}, {"fleet-reconcile": 4, "hangdng-rebuild": 1})
         self.assertEqual({"fleet-reconcile": 4}, pool.held_by_job())
-        self.assertEqual({"hangdng-rebuild": 1}, pool.held_by_hand())
+        self.assertEqual({"hangdng-rebuild": 1}, pool.no_build_id())
         self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
 
     def test_a_third_state_is_counted_as_neither_leased_nor_available(self):
@@ -420,6 +456,22 @@ class LeakedLeases(unittest.TestCase):
     def test_a_lease_held_by_a_running_periodic_is_not_a_leak(self):
         pool = pp.PoolState({"busy": 1}, {f"ci-kube-agents-eval-next-{self.TWO}": 1})
         self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), {self.TWO})))
+
+    def test_a_lane_suffix_after_the_build_id_still_matches_the_running_build(self):
+        pool = pp.PoolState({"busy": 1}, {f"ci-kube-agents-pull-sweep-{self.TWO}-gitlab": 1})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), {self.TWO})))
+        self.assertEqual([f"ci-kube-agents-pull-sweep-{self.TWO}-gitlab"],
+                         pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
+
+    def test_a_lease_whose_run_just_finished_is_releasing_not_leaked(self):
+        """Deck marks an aborted job complete at the abort; the pod's teardown
+        runs on and the wrapper releases the project after it. For those
+        minutes the lease is releasing, and calling it leaked sends someone to
+        repair a project that frees itself (#2929)."""
+        pool = pp.PoolState({"busy": 1}, {f"pull-kube-agents-smoke-test-{self.ONE}": 1})
+        queue = pp.LiveQueue([], set(), set(), releasing_build_ids={self.ONE})
+        self.assertEqual([], pp.leaked_leases(pool, queue))
+        self.assertEqual([f"pull-kube-agents-smoke-test-{self.ONE}"], pp.releasing_leases(pool, queue))
 
     def test_a_hand_hold_is_not_a_leak(self):
         """An owner with no build ID was taken by a person, who Deck has never
@@ -495,7 +547,7 @@ class Cause(unittest.TestCase):
         self.assertIn("2 run(s)", joined)
         self.assertIn("3 leased, 0 free, 5 total", joined)
         self.assertIn("out of rotation: rebuilding 2", joined)
-        self.assertIn("held by hand: hangdng-rebuild (2)", joined)
+        self.assertIn("no build ID in the owner: hangdng-rebuild (2)", joined)
         self.assertIn("1 lease(s) leaked", joined)
 
     def test_lease_failures_with_projects_free_now_are_still_capacity(self):
@@ -1122,7 +1174,7 @@ class EndToEnd(unittest.TestCase):
         """The requirement from #2747: runs refused a project on an afternoon
         whose percentiles never moved, and the check said OK. Real artifacts
         of two of them, with a Boskos map built to that afternoon's shape: full,
-        two projects held by hand for a repair, one lease nobody is running."""
+        two projects under a hand owner for a repair, one lease nobody is running."""
         code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertIn("LEASE FAILED: 2 run(s)", out)
@@ -1130,7 +1182,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("CAPACITY", out)
         self.assertIn("out of rotation: rebuilding 2", out)
         self.assertIn("held by a job without a run ID: fleet-reconcile (1)", out)
-        self.assertIn("held by hand: hangdng-rebuild (2)", out)
+        self.assertIn("2 project(s) leased with no build ID in the owner: hangdng-rebuild (2)", out)
         # The refused runs leave the segment medians: the one leased run's
         # acquire, alone, not withheld under a 1-of-3 coverage.
         self.assertIn("9.3 min   (1 of 1)", out)
@@ -1144,7 +1196,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertIn("Individual runs that waited over 5.0 minutes: 1", out)
         self.assertIn("build 2108236254767222784", out.split("Individual runs")[1])
-        leaks = out.split("held by runs Deck does not know about")[1].split("\n\n")[0]
+        leaks = out.split("held by runs Deck does not show running")[1].split("\n\n")[0]
         self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", leaks)
         self.assertNotIn("ci-kube-agents-eval-next", leaks, "a running periodic is not a leak")
         self.assertNotIn("hangdng-rebuild", leaks, "a hand hold is not a leak")
@@ -1181,7 +1233,7 @@ class EndToEnd(unittest.TestCase):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_OK, code)
         self.assertIn("WITHIN THRESHOLD", out)
-        self.assertNotIn("lease(s) held by runs Deck does not know about", out)
+        self.assertNotIn("lease(s) held by runs Deck does not show running", out)
 
     def test_raising_the_thresholds_clears_the_breach(self):
         """Proves the verdict follows the thresholds rather than the fixture."""
@@ -1302,7 +1354,7 @@ class JsonOutput(unittest.TestCase):
         self.assertIn("last 3h", payload["report"])
 
     def test_lease_failures_hand_holds_and_states_reach_the_payload(self):
-        # The health bot reads `held_by_hand` and the recent count; the day
+        # The health bot reads `no_build_id` and the recent count; the day
         # rows carry the failures so the trend keeps them.
         payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
         self.assertEqual(
@@ -1311,8 +1363,9 @@ class JsonOutput(unittest.TestCase):
             [(f["build_id"], f["pull"], f["lease_requested"], f["recent"])
              for f in payload["lease_failures"]],
         )
-        self.assertEqual({"hangdng-rebuild": 2}, payload["held_by_hand"])
+        self.assertEqual({"hangdng-rebuild": 2}, payload["no_build_id"])
         self.assertEqual({"fleet-reconcile": 1}, payload["held_by_job"])
+        self.assertEqual([], payload["releasing_leases"])
         self.assertEqual({"busy": 4, "rebuilding": 2}, payload["states"])
         self.assertEqual(2, payload["recent"]["lease_failures"])
         self.assertEqual(2, payload["trend"]["lease_failures"])
@@ -1332,7 +1385,7 @@ class JsonOutput(unittest.TestCase):
             for name in ("prowjobs", "started", "logs"):
                 os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
             payload = self._payload(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
-        self.assertIsNone(payload["held_by_hand"])
+        self.assertIsNone(payload["no_build_id"])
         self.assertIsNone(payload["held_by_job"])
         self.assertIsNone(payload["states"])
         self.assertEqual(pp.CAUSE_UNKNOWN, payload["cause"])
@@ -1466,7 +1519,7 @@ class JunitOutput(unittest.TestCase):
         rows = self._rows(root)
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
-        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_HELD_BY_HAND]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_NO_BUILD_ID]))
         self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_OUT_OF_ROTATION]))
         self.assertIn("2 run(s)", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
 
@@ -1512,7 +1565,7 @@ class JunitOutput(unittest.TestCase):
         rows = self._rows(root)
         self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
                          "the failures come from the trend, which was read")
-        for name in (pp.JUNIT_ROW_HELD_BY_HAND, pp.JUNIT_ROW_OUT_OF_ROTATION):
+        for name in (pp.JUNIT_ROW_NO_BUILD_ID, pp.JUNIT_ROW_OUT_OF_ROTATION):
             self.assertIsNotNone(rows[name].find("skipped"), name)
             self.assertIsNone(self._value(rows[name]), name)
 
@@ -1825,12 +1878,12 @@ class PublishedInterface(unittest.TestCase):
         self.assertEqual("longest live queue minutes", pp.JUNIT_ROW_QUEUE)
         self.assertEqual("free pool projects", pp.JUNIT_ROW_FREE)
         self.assertEqual("recent lease failures", pp.JUNIT_ROW_LEASE_FAILURES)
-        self.assertEqual("projects held by hand", pp.JUNIT_ROW_HELD_BY_HAND)
+        self.assertEqual("leases with no build ID in the owner", pp.JUNIT_ROW_NO_BUILD_ID)
         self.assertEqual("projects out of rotation", pp.JUNIT_ROW_OUT_OF_ROTATION)
         self.assertEqual(
             ("pool pressure within threshold", "setup p50 minutes", "setup p95 minutes",
              "longest live queue minutes", "free pool projects", "recent lease failures",
-             "projects held by hand", "projects out of rotation"),
+             "leases with no build ID in the owner", "projects out of rotation"),
             pp.JUNIT_ROW_NAMES,
         )
 

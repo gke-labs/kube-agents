@@ -1030,12 +1030,12 @@ it is set.
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
 threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
-held_by_hand, cause, max_concurrency}` when
+no_build_id, cause, max_concurrency}` when
 `verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
 refused a project in the periodic's recent window of `lease_failures_hours`
-hours, and `held_by_hand` how many projects are leased under an owner that is
+hours, and `no_build_id` how many projects are leased under an owner that is
 neither a Prow run nor a known job's fixed owner; `lease_failures` and
-`held_by_hand` are `null` from an
+`no_build_id` are `null` from an
 artifact written before the
 periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue

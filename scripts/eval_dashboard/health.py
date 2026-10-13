@@ -1592,11 +1592,12 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "free": pool.get("free"),
         "total": pool.get("total"),
         # The periodic's third trigger and what it names: runs refused a
-        # project in its recent window, and the projects a person holds. None
-        # from an artifact written before the fields existed.
+        # project in its recent window, and the projects leased under an owner
+        # that names no build (a person's repair, or a job that forgot the
+        # convention). None from an artifact written before the fields existed.
         "lease_failures": _count(recent.get("lease_failures")),
         "lease_failures_hours": _count(recent.get("hours")),
-        "held_by_hand": _held_count(artifact.get("held_by_hand")),
+        "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
         # The cap the newest run in the window ran under. Only the
         # CONCURRENCY_CAP message quotes it, and without it that message
@@ -1611,7 +1612,7 @@ def _count(value) -> int | None:
 
 
 def _held_count(held) -> int | None:
-    """How many projects `held_by_hand` (owner to count) adds up to."""
+    """How many projects `no_build_id` (owner to count) adds up to."""
     if not isinstance(held, dict):
         return None
     counts = [_count(v) for v in held.values()]
@@ -1669,8 +1670,8 @@ def pool_evidence(pool: dict) -> str:
     # the breach that most wants explaining. Say the wait and stop.
     counted = pool["free"] is not None and pool["total"] is not None
     projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
-    if counted and pool.get("held_by_hand"):
-        projects += f", {pool['held_by_hand']} held by hand"
+    if counted and pool.get("no_build_id"):
+        projects += f", {pool['no_build_id']} leased with no build ID in the owner"
     return f"backed-up pool: {pool_measurement(pool)}{projects}"
 
 

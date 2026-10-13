@@ -1457,7 +1457,7 @@ class PoolNote(unittest.TestCase):
                 "total": 30,
                 "lease_failures": None,
                 "lease_failures_hours": None,
-                "held_by_hand": None,
+                "no_build_id": None,
                 "cause": "CAPACITY",
                 "max_concurrency": 30,
             },
@@ -1475,25 +1475,25 @@ class PoolNote(unittest.TestCase):
         recent = {"hours": 3, "runs": 1, "lease_failures": 2, "judged": False,
                   "p50_minutes": None, "p95_minutes": None, "worst_minutes": None}
         result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None,
-                        recent=recent, held_by_hand={"hangdng-rebuild": 2})
+                        recent=recent, no_build_id={"hangdng-rebuild": 2})
         note = result["pool"]
         self.assertEqual((note["lease_failures"], note["lease_failures_hours"]), (2, 3))
-        self.assertEqual(note["held_by_hand"], 2)
+        self.assertEqual(note["no_build_id"], 2)
         self.assertIsNone(note["p50_s"])
         self.assertEqual(
             health.pool_measurement(note), "2 runs refused a project in the last 3h"
         )
         self.assertIn(
             "backed-up pool: 2 runs refused a project in the last 3h;"
-            " 0 of 30 projects free, 2 held by hand",
+            " 0 of 30 projects free, 2 leased with no build ID in the owner",
             result["evidence"],
         )
 
     def test_a_note_from_an_older_artifact_has_no_refusals_or_holds_rather_than_a_crash(self):
         note = pooled(verdict="BREACH", cause="CAPACITY", free=0)["pool"]
         self.assertIsNone(note["lease_failures"])
-        self.assertIsNone(note["held_by_hand"])
-        self.assertNotIn("held by hand", health.pool_evidence(note))
+        self.assertIsNone(note["no_build_id"])
+        self.assertNotIn("no build ID", health.pool_evidence(note))
 
     def test_the_recent_stretch_beats_the_worst_day_when_the_periodic_judged_it(self):
         # The verdict lasts a week, so Monday's row is still the worst day on

@@ -1031,12 +1031,12 @@ class PoolNote(RunHarness):
         # to say. The message names the refusals and the hand holds.
         note = pool_note(waiting_longest_s=0, waiting_now=False, over_threshold=0,
                          window_hours=None, p50_s=None, p95_s=None,
-                         lease_failures=2, lease_failures_hours=3, held_by_hand=2)
+                         lease_failures=2, lease_failures_hours=3, no_build_id=2)
         self.assertTrue(post_health.pool_advisable(note))
         self.assertTrue(post_health.pool_advisable(note, drained=True))
         self.assertEqual(
             post_health.pool_cause_text(note),
-            "*Smoke gate: pool full* — all 30 projects are leased, 2 held by hand."
+            "*Smoke gate: pool full* — all 30 projects are leased, 2 with no build ID in the owner."
             " Consider onboarding a project.",
         )
         # The refusal line rides under every header, the UNKNOWN one included:

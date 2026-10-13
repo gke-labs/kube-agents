@@ -221,10 +221,19 @@ BOSKOS_STATE_FREE = "free"
 # nobody, not a real lease, and including it would make every idle pool look
 # like it had one mystery holder.
 BOSKOS_NO_OWNER = ""
-# A job names its lease `<job name>-<build ID>`, and a Prow build ID is a
+# The one invariant the owner classification rests on: a lease taken by a
+# Prow run, of any job and any lane, carries that run's build ID somewhere in
+# its owner (`<job>-<build>`, `<job>-<build>-gitlab`, ...). A Prow build ID is a
 # snowflake (SNOWFLAKE_* below): 19 digits since 2018 and until the epoch runs
-# out. An owner that does not end in one was taken by a person, for a repair.
-BUILD_ID_SUFFIX = re.compile(r"-(\d{19})$")
+# out, so the first run of exactly 19 digits is the build. Anchored on both
+# sides so twenty digits are not a build with a digit glued on. Nothing here
+# knows job names or lane suffixes; a new job needs nothing from this file.
+BUILD_ID_IN_OWNER = re.compile(r"(?<!\d)(\d{19})(?!\d)")
+# How long after Deck's completionTime a lease may still be held while the
+# pod tears down and the wrapper releases the project. Deck marks an aborted
+# job complete at the abort; the release follows the cleanup, minutes later,
+# and in between the lease is releasing, not leaked.
+RELEASE_GRACE = timedelta(minutes=15)
 # Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
 # defaults of the hack/ scripts that lease through boskos_pool.py, which their
 # Prow jobs do not override (test_integration_contracts.py pins the list to
@@ -365,7 +374,9 @@ JUNIT_ROW_FREE = "free pool projects"
 # percentiles do not move: runs refused a project in the recent window, and
 # the projects that are leased without a run behind them.
 JUNIT_ROW_LEASE_FAILURES = "recent lease failures"
-JUNIT_ROW_HELD_BY_HAND = "projects held by hand"
+# Renamed from "projects held by hand" in #2929, which starts a new TestGrid
+# row: the old name claimed a person behind every owner without a build ID.
+JUNIT_ROW_NO_BUILD_ID = "leases with no build ID in the owner"
 JUNIT_ROW_OUT_OF_ROTATION = "projects out of rotation"
 JUNIT_ROW_NAMES = (
     JUNIT_ROW_VERDICT,
@@ -374,7 +385,7 @@ JUNIT_ROW_NAMES = (
     JUNIT_ROW_QUEUE,
     JUNIT_ROW_FREE,
     JUNIT_ROW_LEASE_FAILURES,
-    JUNIT_ROW_HELD_BY_HAND,
+    JUNIT_ROW_NO_BUILD_ID,
     JUNIT_ROW_OUT_OF_ROTATION,
 )
 # The setup rows are also skipped, not graphed, when the number does not cover
@@ -546,6 +557,8 @@ class LiveQueue:
     tenant's running job, and is what the holders are compared against: the
     nightlies and the next lane lease from the same pool, and against the
     smoke runs alone each of theirs read as leaked (#2747).
+    `releasing_build_ids` is every tenant's job that completed within
+    RELEASE_GRACE: its lease is on its way back, not leaked (#2929).
     """
 
     def __init__(
@@ -553,12 +566,14 @@ class LiveQueue:
         waiting: List[LiveWait],
         running_build_ids: set,
         all_running_build_ids: Optional[set] = None,
+        releasing_build_ids: Optional[set] = None,
     ):
         self.waiting = waiting
         self.running_build_ids = running_build_ids
         self.all_running_build_ids = (
             set(running_build_ids) if all_running_build_ids is None else all_running_build_ids
         )
+        self.releasing_build_ids = set() if releasing_build_ids is None else releasing_build_ids
 
     @property
     def running(self) -> int:
@@ -605,18 +620,19 @@ class PoolState:
             if owner in BOSKOS_JOB_OWNERS
         }
 
-    def held_by_hand(self) -> Dict[str, int]:
-        """Owners that are neither a Prow run nor a known job, with how many
-        projects each holds.
+    def no_build_id(self) -> Dict[str, int]:
+        """Owners that name no build and are not a known job's fixed owner,
+        with how many projects each holds.
 
         A person leasing a project for a repair names the lease however they
-        like, and Deck has never heard of them, so these are reported as held
-        rather than compared against it and called leaked.
+        like, and so does a job that forgot the convention; Deck can vouch for
+        neither, so they are reported by name rather than compared against it
+        and called leaked. Which of the two it is, the name says.
         """
         return {
             owner: self.owners[owner]
             for owner in self.lease_holders()
-            if not BUILD_ID_SUFFIX.search(owner) and owner not in BOSKOS_JOB_OWNERS
+            if build_of(owner) is None and owner not in BOSKOS_JOB_OWNERS
         }
 
 
@@ -696,6 +712,12 @@ def percentile(values: Sequence[float], pct: int) -> float:
     low = int(rank)
     high = min(low + 1, len(ordered) - 1)
     return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
+
+
+def build_of(owner: str) -> Optional[str]:
+    """The build ID a lease owner names, or None when it names none."""
+    match = BUILD_ID_IN_OWNER.search(owner)
+    return match.group(1) if match else None
 
 
 def _pull_of(prowjob: dict) -> str:
@@ -1160,6 +1182,7 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
     waiting: List[LiveWait] = []
     running: set = set()
     all_running: set = set()
+    releasing: set = set()
     for item in document.get("items") or []:
         spec = item.get("spec") or {}
         status = item.get("status") or {}
@@ -1174,7 +1197,14 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
         # 24.1 minutes all read 30.0 here. Aborts are the largest single state
         # in this job's history, so any duration derived from this field is
         # wrong for most of the runs it covers. Durations come from artifacts.
+        # The one thing it is read for: a job that completed inside
+        # RELEASE_GRACE may still hold its lease while the pod tears down. A
+        # stamp in the future (that start + 30:00) is "finished just now" too.
         if status.get("completionTime"):
+            completed = parse_rfc3339(status["completionTime"])
+            build_id = str(status.get("build_id") or "")
+            if build_id and completed is not None and completed >= now - RELEASE_GRACE:
+                releasing.add(build_id)
             continue
         ours = spec.get("job") == JOB_NAME
         if status.get("pendingTime"):
@@ -1193,7 +1223,7 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
             continue
         waiting.append(LiveWait(_pull_of(item), created, now))
     waiting.sort(key=lambda w: w.seconds, reverse=True)
-    return Source(value=LiveQueue(waiting, running, all_running))
+    return Source(value=LiveQueue(waiting, running, all_running, releasing))
 
 
 def _free_port() -> int:
@@ -1431,8 +1461,10 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
 
     Compared against every tenant's running job, not this job's alone: the
     nightlies and the next lane lease from the same pool. A holder with no
-    build ID is a known job's fixed owner or a hand hold, and is reported as
-    held, never as leaked: nothing in Deck can vouch for it either way.
+    build ID anywhere in its name is a known job's fixed owner, a hand hold or
+    a job that forgot the convention, and is reported by name, never as
+    leaked: nothing in Deck can vouch for it either way. A holder whose run
+    completed within RELEASE_GRACE is releasing (below), not leaked.
 
     Needs both sources: with no list of running jobs to compare against, every
     holder looks orphaned.
@@ -1441,10 +1473,22 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
         return []
     orphaned = []
     for holder in pool.lease_holders():
-        match = BUILD_ID_SUFFIX.search(holder)
-        if match and match.group(1) not in queue.all_running_build_ids:
+        build = build_of(holder)
+        if (
+            build
+            and build not in queue.all_running_build_ids
+            and build not in queue.releasing_build_ids
+        ):
             orphaned.append(holder)
     return orphaned
+
+
+def releasing_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List[str]:
+    """Lease holders whose run finished inside RELEASE_GRACE: the wrapper
+    releases the project after the pod's teardown, so these free themselves."""
+    if pool is None or queue is None:
+        return []
+    return [h for h in pool.lease_holders() if build_of(h) in queue.releasing_build_ids]
 
 
 def latest_max_concurrency(waits: List[Wait]) -> Optional[int]:
@@ -1636,8 +1680,9 @@ def summarise(
         # each with its count; None when the pool was not read.
         "states": dict(pool_state.counts) if pool_state else None,
         "held_by_job": pool_state.held_by_job() if pool_state else None,
-        "held_by_hand": pool_state.held_by_hand() if pool_state else None,
+        "no_build_id": pool_state.no_build_id() if pool_state else None,
         "leaked_leases": leaked,
+        "releasing_leases": releasing_leases(pool_state, queue),
         "cause": cause_label,
         "cause_text": cause_text,
         "breached": breached,
@@ -1795,10 +1840,11 @@ def render(summary: dict) -> str:
                 f"  {sum(by_job.values())} project(s) held by a job without a run ID:"
                 f" {_holders_text(by_job)}"
             )
-        held = summary["held_by_hand"]
-        if held:
+        unnamed = summary["no_build_id"]
+        if unnamed:
             out.append(
-                f"  {sum(held.values())} project(s) held by hand: {_holders_text(held)}"
+                f"  {sum(unnamed.values())} project(s) leased with no build ID in the owner:"
+                f" {_holders_text(unnamed)}"
             )
     concurrency = summary["max_concurrency"]
     out.append(
@@ -1813,9 +1859,17 @@ def render(summary: dict) -> str:
             f"{pool['stranded']} project(s) can never be leased."
         )
 
+    releasing = summary["releasing_leases"]
+    if releasing:
+        out.append(
+            f"\n{len(releasing)} lease(s) held by runs that finished in the last"
+            f" {int(RELEASE_GRACE.total_seconds() // SECONDS_PER_MINUTE)} min, still tearing down:"
+        )
+        for holder in releasing:
+            out.append(f"      {holder}")
     orphans = summary["leaked_leases"]
     if orphans:
-        out.append(f"\n[!] {len(orphans)} lease(s) held by runs Deck does not know about.")
+        out.append(f"\n[!] {len(orphans)} lease(s) held by runs Deck does not show running.")
         out.append("    A leaked lease occupies a project exactly as a running test does,")
         out.append("    so the pool reads as full without the demand to justify it.")
         for holder in orphans:
@@ -1894,9 +1948,9 @@ def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
     by_job = pool_state.held_by_job()
     if by_job:
         lines.append(f"  held by a job without a run ID: {_holders_text(by_job)}")
-    held = pool_state.held_by_hand()
-    if held:
-        lines.append(f"  held by hand: {_holders_text(held)}")
+    unnamed = pool_state.no_build_id()
+    if unnamed:
+        lines.append(f"  no build ID in the owner: {_holders_text(unnamed)}")
     if leaked:
         lines.append(f"  {len(leaked)} lease(s) leaked, named under leaked_leases")
     return lines
@@ -2165,9 +2219,9 @@ def junit_report(summary: dict) -> str:
         )
     else:
         add(JUNIT_ROW_LEASE_FAILURES, "properties", _junit_value(recent["lease_failures"]))
-    held = sum((summary["held_by_hand"] or {}).values())
+    unnamed = sum((summary["no_build_id"] or {}).values())
     for name, value in (
-        (JUNIT_ROW_HELD_BY_HAND, held),
+        (JUNIT_ROW_NO_BUILD_ID, unnamed),
         (JUNIT_ROW_OUT_OF_ROTATION, pool["in_transition"]),
     ):
         if pool["read"]:
