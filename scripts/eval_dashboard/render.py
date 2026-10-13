@@ -589,6 +589,13 @@ def normalize_health(raw) -> dict | None:
             "over_threshold": pool.get("over_threshold") if is_count(pool.get("over_threshold")) else None,
             "threshold_p50_s": pool.get("threshold_p50_s") if is_count(pool.get("threshold_p50_s")) else None,
             "threshold_p95_s": pool.get("threshold_p95_s") if is_count(pool.get("threshold_p95_s")) else None,
+            # The periodic's third trigger: runs refused a project in its
+            # recent window, which a breach can rest on alone, with nothing
+            # queued and no stretch to quote. Without these the Brief read
+            # "healthy" under a chat alert saying the pool was full.
+            "lease_failures": pool.get("lease_failures") if is_count(pool.get("lease_failures")) else None,
+            "lease_failures_hours": pool.get("lease_failures_hours") if is_count(pool.get("lease_failures_hours")) else None,
+            "no_build_id": pool.get("no_build_id") if is_count(pool.get("no_build_id")) else None,
         } if pool else None,
         "tick": raw["tick"] if iso_ms(raw.get("tick")) is not None else None,
     }

@@ -962,16 +962,13 @@ def render_pool(health: dict) -> str:
             ]
         )
     # The agent view, not a scoped one: rule 8 rides beside the state and can
-    # start mid-incident, so there is no window to scope to. A breach the
-    # refusals alone carry has no stretch and no queue for the page to show,
-    # and its Brief reads healthy, so that one links the job's history.
-    refusals_only = not pool_span(pool) and not pool.get("over_threshold") and pool.get("lease_failures")
+    # start mid-incident, so there is no window to scope to.
     return "\n".join(
         [
             f"⏳ {pool_cause_text(pool)}",
             *pool_numbers(pool),
             "Runs still pass; /retest makes the queue longer.",
-            POOL_JOB_HISTORY_URL if refusals_only else dashboard_link(DASHBOARD_VIEW_AGENT),
+            dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
 
