@@ -93,7 +93,7 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	now := metav1.Now()
 	full := agentv1alpha1.AgentUsageStatus{
 		SessionsTotal: 3, EventsIngestedTotal: 4, ToolExecutionsTotal: 5,
-		RemediationsProposedTotal: 6, RemediationsAppliedTotal: 7,
+		RemediationsProposedTotal: 6, RemediationsAppliedTotal: 7, RemediationsMergedTotal: 10,
 		ClustersRegistered: ptr.To(int64(8)), ClustersMonitored: ptr.To(int64(9)),
 		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now,
 	}
@@ -107,15 +107,15 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	}
 	for _, key := range []string{
 		"sessionsTotal", "eventsIngestedTotal", "toolExecutionsTotal",
-		"remediationsProposedTotal", "remediationsAppliedTotal", "clustersRegistered", "clustersMonitored",
-		"activeInterfaces", "lastActiveTime",
+		"remediationsProposedTotal", "remediationsAppliedTotal", "remediationsMergedTotal",
+		"clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime",
 	} {
 		if _, ok := decoded[key]; !ok {
 			t.Errorf("serialised form lacks %q: %s", key, got)
 		}
 	}
-	if len(decoded) != 9 {
-		t.Errorf("serialised form has %d keys, want 9: %s", len(decoded), got)
+	if len(decoded) != 10 {
+		t.Errorf("serialised form has %d keys, want 10: %s", len(decoded), got)
 	}
 }
 

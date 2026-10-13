@@ -21,7 +21,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 ## GCP project
 
-- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics and subscriptions, Log Router sinks, KMS keyrings, and IAM service accounts.
+- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics and subscriptions, Log Router sinks, KMS keyrings, and IAM service accounts. An install that will declare other projects in its scope needs, in each of them, the right to set IAM policy, to read the project, to mint its Logging service agent and to create a Log Router sink (`roles/owner` carries all of them) ([Multi-project](/kube-agents/deploy/multi-project/)).
 - Billing enabled on that project.
 - The `Owner` role (`roles/owner`), or `Editor` (`roles/editor`) combined with `Project IAM Admin` (`roles/resourcemanager.projectIamAdmin`) and `Service Account Admin` (`roles/iam.serviceAccountAdmin`), for the user running the installer (or a scoped set covering the resources above). The install provisions project-level IAM role bindings (`google_project_iam_member`) and Workload Identity member bindings (`google_service_account_iam_member` with `roles/iam.workloadIdentityUser`); the basic `Editor` role alone lacks `resourcemanager.projects.setIamPolicy` and `iam.serviceAccounts.setIamPolicy`, so an installer running with `Editor` alone fails during IAM provisioning.
 
@@ -172,7 +172,7 @@ On Autopilot you'll additionally need to patch the deployments to append `--lead
 ## Chat platform
 
 - **Google Chat** (opt-in, but the interactive installer pre-selects it): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
-- **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Follow the [Hermes Slack setup guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). Slack is configured only if you enable it in the installer's chat menu (or set `enable_slack = true` in `terraform.tfvars`).
+- **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Many workspaces need an admin to approve a new app, so arrange that first. [Slack app setup](/kube-agents/install/slack-app/) covers the app, for either mode. Slack is configured only if you enable it in the installer's chat menu or with `--enable-slack` (or set `enable_slack = true` in `terraform.tfvars`).
 
 **A GCP project holds one Chat app.** Google's rule is that "each Google Chat app that you create
 requires its own Google Cloud project with the Chat API enabled" —
