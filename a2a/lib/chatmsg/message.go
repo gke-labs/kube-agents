@@ -161,27 +161,102 @@ func (m Message) MarkOnly() bool {
 		len(m.Choices) == 0 && len(m.Links) == 0 && m.Plan == nil
 }
 
-// Parse decodes one chat message's data object. A mark that does not decode
-// is left nil and reported by Validate, since a bad mark drops alone; any
-// other decode failure is the returned error, and drops the whole message.
+// shape names the keys of one JSON object in the schema, or of each object
+// in a list when list is set; a key with a nil shape is a value kept as is.
+type shape struct {
+	keys map[string]*shape
+	list bool
+}
+
+// leaf is a value Parse keeps as it arrives and the struct decode types.
+var leaf *shape
+
+// messageShape is every key v1 defines, at every depth. encoding/json
+// matches keys case-insensitively, so Parse drops every key not spelled
+// exactly as here before decoding: "Headline" is an unknown field, ignored
+// like any other, not the headline.
+var messageShape = &shape{keys: map[string]*shape{
+	schemaKey: leaf, "headline": leaf, "note": leaf, "detail": leaf, "tone": leaf, "after": leaf,
+	"rows": {list: true, keys: map[string]*shape{"text": leaf, "severity": leaf, "detail": leaf}},
+	"fold": {keys: map[string]*shape{
+		"title": leaf, "text": leaf,
+		"table": {keys: map[string]*shape{"columns": leaf, "rows": leaf}},
+	}},
+	"choices": {list: true, keys: map[string]*shape{"text": leaf, "reply": leaf, "primary": leaf}},
+	"links":   {list: true, keys: map[string]*shape{"text": leaf, "url": leaf, "primary": leaf}},
+	"plan": {keys: map[string]*shape{
+		"title": leaf,
+		"items": {list: true, keys: map[string]*shape{
+			"id": leaf, "title": leaf, "status": leaf, "steps": leaf, "stepCount": leaf, "note": leaf, "result": leaf,
+		}},
+	}},
+	markKey: {keys: map[string]*shape{"ask": leaf, "settle": leaf}},
+}}
+
+// exactKeys is raw with every object key s does not spell exactly dropped,
+// at every depth s describes. A value that is not the object or list s
+// expects is returned as it is, for the struct decode to refuse by type.
+func exactKeys(raw json.RawMessage, s *shape) json.RawMessage {
+	if s == nil {
+		return raw
+	}
+	if s.list {
+		var items []json.RawMessage
+		if json.Unmarshal(raw, &items) != nil {
+			return raw
+		}
+		for i := range items {
+			items[i] = exactKeys(items[i], &shape{keys: s.keys})
+		}
+		out, err := json.Marshal(items)
+		if err != nil {
+			return raw
+		}
+		return out
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return raw
+	}
+	kept := make(map[string]json.RawMessage, len(fields))
+	for key, value := range fields {
+		if sub, ok := s.keys[key]; ok {
+			kept[key] = exactKeys(value, sub)
+		}
+	}
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// Parse decodes one chat message's data object. Keys are matched exactly and
+// an unknown one is ignored, so v1 can grow. A mark that does not decode is
+// left nil and reported by Validate, since a bad mark drops alone; any other
+// decode failure is the returned error, and drops the whole message.
 func Parse(data []byte) (Message, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return Message{}, fmt.Errorf("chat message: not a JSON object: %w", err)
 	}
+	if raw == nil {
+		return Message{}, fmt.Errorf("chat message: null, not a JSON object")
+	}
 	rawMark, hasMark := raw[markKey]
 	delete(raw, markKey)
-	rest, err := json.Marshal(raw)
+	whole, err := json.Marshal(raw)
 	if err != nil {
 		return Message{}, fmt.Errorf("chat message: %w", err)
 	}
+	rest := exactKeys(whole, messageShape)
 	var m Message
 	if err := json.Unmarshal(rest, &m); err != nil {
 		return Message{}, fmt.Errorf("chat message: %w", err)
 	}
 	if hasMark && string(bytes.TrimSpace(rawMark)) != jsonNull {
 		var mark Mark
-		if err := json.Unmarshal(rawMark, &mark); err != nil {
+		if err := json.Unmarshal(exactKeys(rawMark, messageShape.keys[markKey]), &mark); err != nil {
 			m.markErr = &RuleError{Field: markKey, Rule: "not an object of ask and settle: " + err.Error()}
 		} else {
 			m.Mark = &mark
