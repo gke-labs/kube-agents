@@ -167,8 +167,10 @@ since the collector wrote none this run), not the note's two-hour TTL; the
 lock line and the crash-record line end with the projects the run resolved
 for its route (`this run's projects: ...`), which that `finish` lists. The
 run holds its own deadline under the SOP's 600-second budget
-(`RUN_DEADLINE_S`, from the process's start): past it no further cluster is
-read, what was read is written as a partial run, and the clusters not reached
+(`RUN_DEADLINE_S`, from the process's start): every subprocess gets the
+smaller of its own timeout and the time left, one attempted past the deadline
+fails at once with the budget as its error, no further cluster is started,
+what was read is written as a partial run, and the clusters not reached
 are held, `gate-failed` with the budget as the reason, and read first next
 run (reviews run in last-reviewed order), so a fleet whose reads do not fit
 one run is read across runs rather than killed every week with nothing
@@ -275,16 +277,22 @@ PROBE_LOCK_EXCLUSIVE = ("full", "after_upgrade", "cluster", "since", "dry_run", 
 # run; a scoped run of a few clusters, the collision that matters, finishes
 # inside it.
 LOCK_WAIT = timedelta(minutes=2)
-# The run's own deadline for starting a cluster's reads, under the SOP's
-# foreground `timeout: 600` and measured from the process's start, the lock
-# wait included: past it no further cluster is read, the reads in flight
-# finish (each bounded by its own timeout, which the margin covers once), and
-# what was read is written as a partial run; the clusters not reached are
-# held and read first next run, in last-reviewed order, so a fleet whose
-# reads do not fit one run is read across runs rather than killed every week
-# with nothing written. `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` is the
-# same kind of deadline.
+# The run's own deadline under the SOP's foreground `timeout: 600`, measured
+# from the process's start, the lock wait included. Every subprocess the run
+# starts gets the smaller of its own timeout and the time left under it, and
+# one attempted past it fails at once with the budget as its error
+# (`BUDGET_READ_TEXT`), so the reads end by the deadline (worst case, a read
+# started at 479 s runs one second) and the margin to the terminal's limit
+# covers the merge and the writes, not a read; a cluster whose API server
+# hangs costs the run the time left, never a timeout per read. Past the
+# deadline no further cluster is started, what was read is written as a
+# partial run, and the clusters not reached are held and read first next
+# run, in last-reviewed order, so a fleet whose reads do not fit one run is
+# read across runs rather than killed every week with nothing written.
+# `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` bounds only when a project's
+# reads start; this one bounds each read.
 RUN_DEADLINE_S = 480
+BUDGET_READ_TEXT = "the read budget ({seconds} s) was spent before this read"
 BUDGET_SPENT_TEXT = "{cluster}: not read this run; the read budget ({seconds} s) was spent after {count} cluster(s); ledger entry and guards kept unchanged, read first next run"
 BUDGET_SPENT_REASON = "not read this run: the read budget ({seconds} s) was spent; held, read first next run"
 RECHECK_DEFERRED_TEXT = "the read budget ({seconds} s) was spent before its re-check started"
@@ -1107,7 +1115,7 @@ NO_SHAPE_TEXT = "no catalogue shape found; checked: "
 # reserved for an empty Errors or Warnings section.
 UNCLASSIFIED_MITIGATION_TEXT = "no catalogue entry matched this symptom; it is reported for a reader to classify, and the entries' rows above do not apply."
 NO_GUARD_TEXT = "no guard written."
-OPERATION_GUARD_FORMAT = "guard `{id}` first seen {first_seen}; re-checked through the operations listing each run, cleared by a later {type} on {target} that reaches DONE without error."
+OPERATION_GUARD_FORMAT = "guard `{id}` first seen {first_seen}, {reviews} review(s); re-checked through the operations listing each run, cleared by a later {type} on {target} that reaches DONE without error."
 OPERATION_NO_GUARD_TEXT = "no guard written: the cluster is outside the fleet."
 OPERATION_GUARD_RETRIED_FORMAT = "a later {type} on {target} reached DONE without error ({name}, ended {end})"
 OPERATION_GUARD_UNLISTED_FORMAT = "the operations listing no longer returns {name}; GKE's record retention is not a retry, so the guard stands until a later clean operation or --reset-ledger"
@@ -1269,7 +1277,7 @@ def run_json(argv: list[str], *, run: RunFn, timeout: int = GCLOUD_TIMEOUT_S, en
 # --------------------------------------------------------------------------- #
 
 
-def discover_fleet(base_project: str | None, *, run: RunFn) -> tuple[list[str], list[str], str | None]:
+def discover_fleet(base_project: str | None, *, run: RunFn, forced: set[str] | frozenset[str] = frozenset()) -> tuple[list[str], list[str], str | None]:
     """The projects to enumerate, the reads that failed on the way, and, on an
     undeclared install, the note that the listing was incomplete (it failed,
     or did not name the active project, so it is filtered), under which the
@@ -1281,6 +1289,11 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> tuple[list[str], 
     project `gcloud projects list` returns."""
     if base_project:
         return [base_project], [], None
+    if forced:
+        # A hand run that names clusters reads their projects alone, listed
+        # or declared or not: the override's rule, cluster by cluster
+        # (`validate_args` admitted each inside a declared scope).
+        return sorted({key.split(CLUSTER_KEY_SEPARATOR)[0] for key in forced}), [], None
     if declared_scope.declared:
         log(SCOPE_LOG_FORMAT.format(count=len(declared_scope.projects or [])))
         return list(declared_scope.projects or []), [], None
@@ -3137,15 +3150,10 @@ def _last_closing(window: dict, now: datetime) -> tuple[bool, datetime | None]:
             start_t = datetime.strptime(daily.get("startTime") or "00:00", DAILY_WINDOW_TIME_FORMAT).time().replace(tzinfo=timezone.utc)
             length, days = _parse_iso_duration(daily.get("duration") or "") or DEFAULT_DAILY_WINDOW, []
         elif recurring:
-            rule = {k: v for k, v in (part.split("=", 1) for part in (recurring.get("recurrence") or "").split(";") if "=" in part)}
-            start, end = parse_ts((recurring.get("window") or {}).get("startTime")), parse_ts((recurring.get("window") or {}).get("endTime"))
-            freq = rule.get("FREQ")
-            if start is None or freq not in (RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY):
+            _, freq, start, length, days = recurring_window_rule(recurring)
+            if start is None or freq is None:
                 return False, None
-            days = [RRULE_WEEKDAYS[d] for d in (rule.get("BYDAY") or "").split(",") if d in RRULE_WEEKDAYS]
-            if freq == RRULE_FREQ_WEEKLY and not days:
-                days = [start.weekday()]
-            start_t, length = start.timetz(), (end - start) if end else timedelta(0)
+            start_t = start.timetz()
         else:
             return False, None
     except ValueError:
@@ -3907,6 +3915,23 @@ def _parse_iso_duration(text: str) -> timedelta | None:
     return timedelta(hours=hours, minutes=minutes, seconds=seconds)
 
 
+def recurring_window_rule(recurring: dict) -> tuple[dict, str | None, datetime | None, timedelta, list[int]]:
+    """One parse of a `recurringWindow` for the next opening and the last
+    closing alike: the raw rule, the frequency (None when it is one this
+    does not read), the window's start, its length, and the weekdays it
+    repeats on: BYDAY's for either frequency (RFC 5545 lets DAILY carry
+    one), DTSTART's weekday for WEEKLY without BYDAY, every day (an empty
+    list) for DAILY without."""
+    rule = {k: v for k, v in (part.split("=", 1) for part in (recurring.get("recurrence") or "").split(";") if "=" in part)}
+    start, end = parse_ts((recurring.get("window") or {}).get("startTime")), parse_ts((recurring.get("window") or {}).get("endTime"))
+    freq = rule.get("FREQ")
+    days = [RRULE_WEEKDAYS[d] for d in (rule.get("BYDAY") or "").split(",") if d in RRULE_WEEKDAYS]
+    if freq == RRULE_FREQ_WEEKLY and not days and start is not None:
+        days = [start.weekday()]
+    length = (end - start) if (start and end) else timedelta(0)
+    return rule, (freq if freq in (RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY) else None), start, length, days
+
+
 def _next_opening(window: dict, now: datetime) -> tuple[str, datetime | None]:
     """A one-line description of the maintenance window and when it next
     opens; `None` when the rule is one this does not parse."""
@@ -3920,23 +3945,15 @@ def _next_opening(window: dict, now: datetime) -> tuple[str, datetime | None]:
         return f"daily at {daily.get('startTime')} UTC for {int(length.total_seconds() // SECONDS_PER_HOUR)}h", candidate
     recurring = window.get("recurringWindow")
     if recurring:
-        rule = {k: v for k, v in (part.split("=", 1) for part in (recurring.get("recurrence") or "").split(";") if "=" in part)}
-        start = parse_ts((recurring.get("window") or {}).get("startTime"))
-        end = parse_ts((recurring.get("window") or {}).get("endTime"))
+        rule, freq, start, length, days = recurring_window_rule(recurring)
         if start is None:
             return f"recurring {recurring.get('recurrence')}", None
-        length = (end - start) if end else timedelta(0)
-        days = [RRULE_WEEKDAYS[d] for d in (rule.get("BYDAY") or "").split(",") if d in RRULE_WEEKDAYS]
-        freq = rule.get("FREQ")
-        if freq == RRULE_FREQ_WEEKLY and not days:
-            # RFC 5545: a WEEKLY rule without BYDAY repeats on DTSTART's weekday.
-            days = [start.weekday()]
-        text = f"{freq or 'recurring'}{' on ' + rule['BYDAY'] if rule.get('BYDAY') else ''} at {start.strftime(DAILY_WINDOW_TIME_FORMAT)} UTC for {int(length.total_seconds() // SECONDS_PER_HOUR)}h"
-        if freq not in (RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY):
+        text = f"{rule.get('FREQ') or 'recurring'}{' on ' + rule['BYDAY'] if rule.get('BYDAY') else ''} at {start.strftime(DAILY_WINDOW_TIME_FORMAT)} UTC for {int(length.total_seconds() // SECONDS_PER_HOUR)}h"
+        if freq is None:
             return text, None
         for offset in range(NEXT_WINDOW_SEARCH_DAYS):
             candidate = datetime.combine((now + timedelta(days=offset)).date(), start.timetz())
-            if candidate >= now and (freq == RRULE_FREQ_DAILY or not days or candidate.weekday() in days):
+            if candidate >= now and (not days or candidate.weekday() in days):
                 return text, candidate
         return text, None
     return NO_WINDOW_TEXT, None
@@ -4595,7 +4612,7 @@ def _incident_lines(incident: dict) -> list[str]:
             heading = f"entry {guard['entry']}. {guard['title']}" if guard.get("entry") is not None else UNCLASSIFIED
             lines.append(f"{PART_WHAT_FAILED} {heading} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
         lines.append(f"{PART_MITIGATE} the entry's row applies until the cluster is reviewed again.")
-        lines.append(f"{PART_MITIGATION_SET_UP} " + "; ".join(f"guard `{_cell(g['object'])}` entry {_guard_entry_text(g)}, first seen {g['first_seen']}, still live" for g in incident["guards"]) + ".")
+        lines.append(f"{PART_MITIGATION_SET_UP} " + "; ".join(f"guard `{_cell(g['object'])}` entry {_guard_entry_text(g)}, first seen {g['first_seen']}, {int(g.get('reviews') or 1)} review(s), still live" for g in incident["guards"]) + ".")
         return lines + [""]
     lines += _what_happened_lines(incident["what_happened"])
     lines.append("")
@@ -4603,7 +4620,7 @@ def _incident_lines(incident: dict) -> list[str]:
         op = incident["operation"]
         lines.append(f"{PART_WHAT_FAILED} {_cell(op['type'])} on {_cell(op['target'])} ended {_cell(op['status'])}: {_cell(op['error'] or 'no error text')}")
         lines.append(f"{PART_MITIGATE} {OPERATION_MITIGATE_TEXT}")
-        guards_text = "; ".join(OPERATION_GUARD_FORMAT.format(id=_cell(g["id"]), first_seen=g["first_seen"], type=_cell(op["type"]), target=_cell(op["target"])) for g in incident["guards"]) or OPERATION_NO_GUARD_TEXT
+        guards_text = "; ".join(OPERATION_GUARD_FORMAT.format(id=_cell(g["id"]), first_seen=g["first_seen"], reviews=int(g.get("reviews") or 1), type=_cell(op["type"]), target=_cell(op["target"])) for g in incident["guards"]) or OPERATION_NO_GUARD_TEXT
         lines.append(f"{PART_MITIGATION_SET_UP} {guards_text}")
         return lines + [""]
     lines += [PART_WHAT_FAILED, "", "| Symptom | Since | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- | --- |"]
@@ -4626,7 +4643,7 @@ def _incident_lines(incident: dict) -> list[str]:
     if not incident["guards"]:
         lines.append(OUTSIDE_FLEET_GUARD_TEXT if incident.get("outside_fleet") else NO_GUARD_TEXT)
     for g in incident["guards"]:
-        lines.append(f"- guard `{_cell(g['id'])}` {g['kind']} entry {_guard_entry_text(g)} ({g['confidence']}), first seen {g['first_seen']}")
+        lines.append(f"- guard `{_cell(g['id'])}` {g['kind']} entry {_guard_entry_text(g)} ({g['confidence']}), first seen {g['first_seen']}, {int(g.get('reviews') or 1)} review(s)")
     return lines + [""]
 
 
@@ -5286,6 +5303,19 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     def budget_left() -> bool:
         return clock() - run_started < RUN_DEADLINE_S
 
+    base_run = run
+
+    def bounded_run(argv: list[str], *, timeout: int = GCLOUD_TIMEOUT_S, env: dict | None = None) -> Run:
+        # Every subprocess gets the smaller of its own timeout and the time
+        # left under the deadline; one attempted past it fails at once with
+        # the budget as its error, which the failed-read rules then carry.
+        remaining = RUN_DEADLINE_S - (clock() - run_started)
+        if remaining <= 0:
+            return Run(argv, TIMEOUT_RC, "", BUDGET_READ_TEXT.format(seconds=RUN_DEADLINE_S), 0.0)
+        return base_run(argv, timeout=min(timeout, remaining), env=env)
+
+    run = bounded_run
+
     # Refused before any state file is read; `main` refused it before the lock.
     validate_args(args, now)
     since = parse_since(args.since, now)
@@ -5310,7 +5340,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         return {"generated_at": seen_at, "since": fmt_ts(since), "projects": [], "reviews": [], "unchanged": [], "upgrading": [], "failed_reads": [], "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "no_baseline": True, "report": NO_BASELINE_TEXT + "\n", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
 
     failed_reads: list[str] = []
-    projects, failed_reads, listing_note = discovery if discovery is not None else discover_fleet(project_override(args) or None, run=run)
+    projects, failed_reads, listing_note = discovery if discovery is not None else discover_fleet(project_override(args) or None, run=run, forced=forced)
     failed_reads = list(failed_reads)
     projects = sorted(set(projects))
     # The declared projects the install could not read: not swept, their
@@ -5559,6 +5589,11 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         elif guard["id"] in unlisted_operation_ids:
             # Held: its candidate stands as it was, no review having seen it.
             guard["last_seen"] = seen_at
+    # The report's guard lines carry the store's record of each guard (first
+    # seen, reviews), not the fresh dict this run's review built.
+    merged_by_id = {g["id"]: g for g in new_guards["guards"]}
+    for review in reviews:
+        review["guards"] = [merged_by_id.get(g["id"], g) for g in review["guards"]]
     # An unchanged cluster's checks ran as the operations listing that found no
     # upgrade; a re-check that read pods or nodes backs those checks with that read.
     recheck_by_cluster = {r["cluster"]: r for r in rechecks}
@@ -5836,7 +5871,7 @@ def main(argv: list[str] | None = None) -> int:
     # The projects this run resolves for its route, before the lock: an exit
     # after `start` without a manifest names them, so the SOP's recovery
     # `finish` lists their clusters rather than resolving the scope again.
-    discovery = discover_fleet(project_override(args) or None, run=default_run)
+    discovery = discover_fleet(project_override(args) or None, run=default_run, forced=forced_clusters(args))
     exit_tail = exit_projects_text(discovery, forced_clusters(args))
     lock = None
     if not args.dry_run:

@@ -12476,6 +12476,16 @@ class PrepareKubeconfigTest(unittest.TestCase):
             self.assertIn("could not be moved aside", note)
             self.assertIn(f"this run is uid {other}", note)
 
+    def test_a_directory_this_uid_cannot_stat_is_a_note_not_a_raise(self):
+        # A parent this uid cannot search, or a file where the directory should be: the note the
+        # callers log or report, as for every other refusal; the retrospective's boundary would
+        # otherwise catch it, the readiness reporter's copy has none.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            with patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} could not be read ([Errno 13] Permission denied)")
+
     def test_a_stale_kubeconfig_this_uid_cannot_write_is_removed_before_gcloud(self):
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"

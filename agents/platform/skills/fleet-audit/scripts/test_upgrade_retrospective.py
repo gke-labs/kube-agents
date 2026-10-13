@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from contextlib import suppress as contextlib_suppress
@@ -98,7 +99,7 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT, api_off_names=None):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT, api_off_names=None, stall=None):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
         self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
@@ -108,6 +109,10 @@ class FakeFleet:
         # naming the listed project, or `api_off_names` (a quota project with the API off names itself).
         self.api_off = set(api_off)
         self.api_off_names = api_off_names
+        # (cluster, read) -> seconds a read hangs before answering; it honours the timeout it is
+        # given, as a subprocess does, and answers rc 124 when the hang outlasts it.
+        self.stall = stall or {}
+        self.timeouts = []
         # An undeclared install's `gcloud projects list`: its exit code, and the projects it names
         # (the active project alone by default; a list without it is a filtered listing).
         self.projects_list_rc, self.projects_listed = projects_list_rc, projects_listed
@@ -142,6 +147,12 @@ class FakeFleet:
             key = KUBECTL_KINDS.get(kind, kind)
             if cluster is None or (cluster, key) in self.kubectl_fail:
                 return run_of(1, "", "Unable to connect to the server")
+            if (cluster, key) in self.stall:
+                self.timeouts.append((cluster, key, timeout))
+                hang = self.stall[(cluster, key)]
+                time.sleep(min(hang, timeout) if timeout is not None else hang)
+                if timeout is not None and hang > timeout:
+                    return run_of(ur.TIMEOUT_RC, "", "timed out")
             return run_of(0, json.dumps({"items": READS[cluster][key]}))
         if "projects describe" in joined:
             return run_of(0, "123456789\n")
@@ -1799,6 +1810,18 @@ class NextUpgradeTest(unittest.TestCase):
         nu = ur.next_upgrade(cluster, None, NOW)
         self.assertEqual((nu["target"], nu["below_target"], nu["window"], nu["next_opens"]), (None, None, ur.NO_WINDOW_TEXT, None))
 
+    def test_daily_with_byday_opens_and_closes_on_the_named_days_in_both_parsers(self):
+        # RFC 5545 lets FREQ=DAILY carry BYDAY, and one parse serves the next opening and the last
+        # closing: a Monday-to-Friday 03:00-07:00Z window read on a Friday evening next opens on the
+        # Monday, and last closed that Friday at 07:00Z, in both.
+        window = {"recurringWindow": {"recurrence": "FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR", "window": {"startTime": "2026-01-05T03:00:00Z", "endTime": "2026-01-05T07:00:00Z"}}}
+        friday_evening = datetime(2026, 10, 9, 20, 0, tzinfo=timezone.utc)
+        text, opens = ur._next_opening(window, friday_evening)
+        self.assertEqual((text, opens), ("DAILY on MO,TU,WE,TH,FR at 03:00 UTC for 4h", datetime(2026, 10, 12, 3, 0, tzinfo=timezone.utc)))
+        self.assertEqual(ur._last_closing(window, friday_evening), (False, datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)))
+        rule, freq, start, length, days = ur.recurring_window_rule(window["recurringWindow"])
+        self.assertEqual((rule["FREQ"], freq, length, days), ("DAILY", ur.RRULE_FREQ_DAILY, timedelta(hours=4), [0, 1, 2, 3, 4]))
+
     def test_server_config_is_fetched_once_per_location(self):
         fleet = FakeFleet()
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: home, ur.STORE_HOME_ENV: home}), redirect_stderr(io.StringIO()):
@@ -2974,6 +2997,22 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn(ur.STALE_PARTIAL_TEXT.format(failed="pods"), report)
         self.assertNotIn("cluster not read this run", report)
 
+    def test_a_forced_cluster_reads_its_own_project_alone(self):
+        # `--cluster` without `--project` reads the cluster's own project and nothing else: no
+        # `projects list` on an undeclared install, no other declared project's listings, and the
+        # exit line names that project alone.
+        only, fleet = self.collect(FakeFleet(projects_listed=[PROJECT, "other-project"]), scope_projects=None, project=None, cluster=[SEEDED], full=False)
+        self.assertEqual((only["projects"], [r["cluster"] for r in only["reviews"]]), ([PROJECT], [SEEDED]))
+        self.assertFalse(any("projects list" in " ".join(c) or "config get-value" in " ".join(c) or "other-project" in " ".join(c) for c in fleet.calls))
+        declared, fleet = self.collect(scope_projects=f"{PROJECT},other-project", cluster=[SEEDED], full=False, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(declared["projects"], [PROJECT])
+        self.assertFalse(any("other-project" in " ".join(c) for c in fleet.calls))
+        listing = FakeFleet(projects_listed=[PROJECT, "other-project"])
+        with mock.patch.object(ur, "default_run", listing), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.main(["--cluster", SEEDED, "--no-report"]), 0)
+        self.assertFalse(any("projects list" in " ".join(c) or "other-project" in " ".join(c) for c in listing.calls))
+
     def test_a_forced_cluster_names_its_project_under_the_overrides_rule(self):
         # `--cluster` names a project as `--project` does: free on an undeclared install, and on a
         # declared one admitted only inside the readable scope; a cluster of a project outside it, or
@@ -3840,7 +3879,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(op_incident["object"], f"Operation/{bad['name']}")
         report = ur.render_report(result)
         self.assertIn(f"### operation DONE — {SEEDED} — `Operation/{bad['name']}`", report)
-        self.assertIn(ur.OPERATION_GUARD_FORMAT.format(id=ur.guard_id(SEEDED, ur.ENTRY_OPERATION, f"Operation/{bad['name']}"), first_seen="2026-10-08T18:00:00Z", type="UPGRADE_NODES", target="idle-batch-pool"), report)
+        self.assertIn(ur.OPERATION_GUARD_FORMAT.format(id=ur.guard_id(SEEDED, ur.ENTRY_OPERATION, f"Operation/{bad['name']}"), first_seen="2026-10-08T18:00:00Z", reviews=1, type="UPGRADE_NODES", target="idle-batch-pool"), report)
         self.assertIn(f"{ur.PART_WHAT_FAILED} UPGRADE_NODES on idle-batch-pool ended DONE: Instance", report)
         self.assertIn(f"{ur.PART_MITIGATE} {ur.OPERATION_MITIGATE_TEXT}", report)
         # The manifest candidate's impact is the report's sentence; entry 2's repair joins it only
@@ -4276,6 +4315,9 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(self.audit_report.published_id(again), self.audit_report.published_id(identity))
         self.assertIn(web, [i["object"] for i in sunday["sections"]["errors"]])
         self.assertEqual([(g["check"], g["reviews"], g["first_seen"]) for g in sunday["guards"] if g["id"] == guard], [(ur.CHECK_BROKE_WORKLOAD, 2, "2026-10-13T17:30:00Z")])
+        # The report's guard line carries the store's record, not this run's stamp.
+        [line] = [l for l in ur.render_report(sunday).splitlines() if l.startswith(f"- guard `{guard}`")]
+        self.assertTrue(line.endswith("first seen 2026-10-13T17:30:00Z, 2 review(s)"), line)
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_a_regraded_incident_moves_the_finding_identity_once(self):
@@ -5025,15 +5067,23 @@ class ManifestTest(unittest.TestCase):
         # (ledger and guards untouched, `gate-failed` with the budget reason, no stale Warning) and,
         # since reviews run in last-reviewed order, read first next run; a re-check the deadline defers
         # holds its guards with their checks unevaluated. With the budget never spent nothing changes.
-        calls = {"n": 0}
+        # The budget is spent the moment the first review's last read answers: every subprocess
+        # consults the clock, so the flag flips on the fleet's side rather than by counting calls.
+        state = {"spent": False}
+        fleet = FakeFleet()
+
+        def run(argv, **kwargs):
+            result = fleet(argv, **kwargs)
+            if argv[0] == "kubectl" and argv[2] == ur.KUBECTL_READS[-1][1][2]:
+                state["spent"] = True
+            return result
 
         def clock():
-            calls["n"] += 1
-            return 0.0 if calls["n"] <= 2 else float(ur.RUN_DEADLINE_S)
+            return float(ur.RUN_DEADLINE_S) if state["spent"] else 0.0
 
         manifest_file = str(self.home / "manifest.json")
         with redirect_stderr(io.StringIO()):
-            first = ur.collect(args(manifest_file=manifest_file), run=FakeFleet(), now=NOW, max_workers=1, clock=clock)
+            first = ur.collect(args(manifest_file=manifest_file), run=run, now=NOW, max_workers=1, clock=clock)
         self.assertEqual(([r["cluster"] for r in first["reviews"]], first["deferred"], first["budget_spent"], first["deferred_rechecks"]), ([GEMMA], [SEEDED], True, 0))
         self.assertEqual(sorted(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]), [GEMMA])
         self.assertEqual({g["cluster"] for g in first["guards"]}, {GEMMA})
@@ -5049,9 +5099,9 @@ class ManifestTest(unittest.TestCase):
         self.audit_report.cross_check_manifest(document, manifest)
         # The next run reads the held cluster first (never reviewed sorts before GEMMA's last run) and
         # defers GEMMA's re-check: its guards held, their checks unevaluated, the reason on the report.
-        calls["n"] = 0
+        state["spent"] = False
         with redirect_stderr(io.StringIO()):
-            second = ur.collect(args(manifest_file=manifest_file), run=FakeFleet(), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), max_workers=1, clock=clock)
+            second = ur.collect(args(manifest_file=manifest_file), run=run, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), max_workers=1, clock=clock)
         self.assertEqual(([r["cluster"] for r in second["reviews"]], second["deferred"], second["deferred_rechecks"]), ([SEEDED], [], 1))
         self.assertEqual(sorted(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]), [GEMMA, SEEDED])
         self.assertTrue({GEMMA, SEEDED} <= {g["cluster"] for g in second["guards"]})
@@ -5069,6 +5119,36 @@ class ManifestTest(unittest.TestCase):
             third = ur.collect(args(manifest_file=manifest_file), run=FakeFleet(), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), max_workers=1)
         self.assertEqual((third["deferred"], third["deferred_rechecks"], third["budget_spent"]), ([], 0, False))
         self.assertNotIn("Read budget spent", ur.render_report(third))
+
+    def test_a_stalled_read_is_cut_at_the_time_left_and_the_run_ends_under_the_limit(self):
+        # Every subprocess gets the smaller of its own timeout and the time left under the deadline,
+        # and one attempted past it fails at once with the budget as its error: a cluster whose API
+        # server hangs costs the run the time left, never a timeout per read, so the run ends under
+        # the terminal's limit with the manifest written. The cut cluster is a partial review (here
+        # nothing answered: the credentials-failed shape, `collected` on the operation check alone,
+        # `partial_read` recorded); the next cluster is held for the next run.
+        fleet = FakeFleet(stall={("gemma-gpu-upgraded", "pods"): 30.0})
+        manifest_file = str(self.home / "manifest.json")
+        started = time.monotonic()
+        with mock.patch.object(ur, "RUN_DEADLINE_S", 1), redirect_stderr(io.StringIO()):
+            result = ur.collect(args(manifest_file=manifest_file), run=fleet, now=NOW, max_workers=1)
+        self.assertLess(time.monotonic() - started, 10.0)
+        [(_, _, given)] = fleet.timeouts
+        self.assertLessEqual(given, 1)
+        self.assertEqual(len([c for c in fleet.calls if c[0] == "kubectl"]), 1)
+        gemma = next(r for r in result["reviews"] if r["cluster"] == GEMMA)
+        self.assertEqual((gemma["reviewed"], gemma["answered"], gemma["partial"]), (False, [], list(ur.CORE_READS)))
+        self.assertTrue(any(e.startswith("pods: kubectl get pods rc=124: timed out") for e in gemma["read_errors"]), gemma["read_errors"])
+        self.assertTrue(any(e.startswith("nodes: kubectl get nodes rc=124: " + ur.BUDGET_READ_TEXT.format(seconds=1)) for e in gemma["read_errors"]), gemma["read_errors"])
+        self.assertEqual((result["deferred"], result["budget_spent"]), ([SEEDED], True))
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        entry = next(c for c in manifest["clusters"] if c["name"] == GEMMA)
+        self.assertEqual((entry["outcome"], [c["check"] for c in entry["commands"]], len(entry["checks_unevaluated"])), (ur.MANIFEST_OUTCOME_COLLECTED, [ur.CHECK_OPERATION_FAILED], 5))
+        self.assertIn(ur.BUDGET_READ_TEXT.format(seconds=1), entry["limitations"])
+        self.assertEqual(next(c for c in manifest["clusters"] if c["name"] == SEEDED)["outcome"], ur.MANIFEST_OUTCOME_GATE_FAILED)
+        self.assertTrue(manifest["partial"])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["partial_read"], "2026-10-08T18:00:00Z")
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_api_disabled_project_does_not_make_the_run_partial(self):
         # A project whose Kubernetes Engine API is off is an empty project, not a failed read, as the

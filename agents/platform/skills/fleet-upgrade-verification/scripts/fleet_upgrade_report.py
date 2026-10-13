@@ -265,6 +265,7 @@ KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
 KUBECONFIG_MOVED_ASIDE_FORMAT = "{directory}: owned by uid {uid}, moved aside to {aside}; this run makes its own"
 KUBECONFIG_NOT_MOVED_FORMAT = "{directory} is owned by uid {uid} and this run is uid {euid}; it could not be moved aside ({error})"
 KUBECONFIG_NOT_MADE_FORMAT = "{directory} could not be made ({error})"
+KUBECONFIG_NOT_READ_FORMAT = "{directory} could not be read ({error})"
 KUBECONFIG_MODE_NOT_CHANGED_FORMAT = "{directory} is at mode {mode}, not {wanted}, and could not be changed ({error})"
 KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is another uid's and could not be replaced ({error})"
 KUBECONFIG_NOT_PREPARED_FORMAT = "cannot prepare kubeconfig: {note}"
@@ -713,6 +714,10 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
             current = os.stat(kubeconfig_dir)
         except FileNotFoundError:
             current = None
+        except OSError as exc:
+            # A parent this uid cannot search, or a file where the directory
+            # should be: the member's read error, as the old guard made it.
+            return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
         if current is not None and current.st_uid != euid and euid != ROOT_UID:
             aside = os.path.join(os.path.dirname(kubeconfig_dir), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(kubeconfig_dir), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
             try:

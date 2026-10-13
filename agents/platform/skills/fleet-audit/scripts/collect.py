@@ -805,6 +805,10 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
         current = directory.stat()
     except FileNotFoundError:
         current = None
+    except OSError as exc:
+        # A parent this uid cannot search, or a file where the directory
+        # should be: the note, as for every other refusal here.
+        return f"{directory} could not be read ({exc})"
     if current is not None and current.st_uid != euid and euid != ROOT_UID:
         aside = directory.with_name(KUBECONFIG_UNUSABLE_FORMAT.format(name=directory.name, stamp=time.strftime(KUBECONFIG_STAMP_FORMAT, time.gmtime())))
         try:

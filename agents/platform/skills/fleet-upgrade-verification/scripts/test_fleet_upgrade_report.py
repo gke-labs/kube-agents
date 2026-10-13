@@ -1088,6 +1088,18 @@ class PrepareKubeconfigTest(unittest.TestCase):
             with patch.object(report, "prepare_kubeconfig", return_value=note):
                 items, error, kubeconfig = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
             self.assertEqual((items, error, kubeconfig), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), path))
+            # A stat the old guard would have caught: a parent this uid cannot search is a note too,
+            # not a traceback out of the run.
+            real_stat = os.stat
+
+            def refusing(target, *args, **kwargs):
+                if str(target) == shared:
+                    raise PermissionError(13, "Permission denied")
+                return real_stat(target, *args, **kwargs)
+
+            with patch.object(os, "stat", side_effect=refusing):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_NOT_READ_FORMAT.format(directory=shared, error="[Errno 13] Permission denied"))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
