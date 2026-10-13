@@ -62,7 +62,8 @@ that project's gap, not the run's: its entries and guards stay unchanged,
 its known clusters are listed under "Reads that failed", and the run stays
 full. Every other run is *scoped*, whatever its `--project` set: it reviews
 its targets, never adds a project to the fleet (a cluster outside it is
-reported "outside the fleet; not recorded" and gets no ledger entry or
+reported "outside the fleet; not recorded beyond the operations reviewed"
+and gets a ledger entry holding only the operations reviewed, and no
 guard), prunes nothing, reports no stale guard outside its scope, writes
 `reports/<finish-UTC>-scoped.md` and leaves the link alone; `--since` is a
 hand run that widens the window and advances no last-run time.
@@ -85,7 +86,9 @@ server config or the storage, webhook and endpoint-slice reads, which cost
 Info alone (`INFO_ONLY_READS`). A failed upgrade operation is an incident of
 its own kind, `Operation/<name>`, with a `failure` guard re-checked through
 the operations listing until a later operation of the same type on the same
-target reaches DONE without error. The newest fourteen reports of each kind are kept. Each
+target reaches DONE without error, the operation is listed clean, or its
+target pool is gone; an operation the listing no longer returns holds the
+guard, since GKE's record retention is not a retry. The newest fourteen reports of each kind are kept. Each
 symptom carries an onset. The pod's own evidence is every symptom's
 onset: a
 Pending pod's scheduling transition or start; a not-Ready pod's `Ready`
@@ -679,6 +682,8 @@ GUARD_SOURCE_EVENT = CATEGORY_EVENT
 ENTRY_OPERATION = "operation"
 OPERATION_GUARD_TITLE = "An upgrade operation failed"
 OPERATION_GUARD_START_KEY = "operation_start"
+OPERATION_GUARD_TYPE_KEY = "operation_type"
+OPERATION_GUARD_TARGET_KEY = "operation_target"
 RECHECK_EVENT_READS = ("events",)
 RECHECK_HELD_FORMAT = "{count} guard(s) held, a needed read failed"
 STALE_PARTIAL_TEXT = "cluster read partially this run ({failed}); the guard below could not be re-observed and was kept."
@@ -949,11 +954,13 @@ NO_GUARD_TEXT = "no guard written."
 OPERATION_GUARD_FORMAT = "guard `{id}` first seen {first_seen}; re-checked through the operations listing each run, cleared by a later {type} on {target} that reaches DONE without error."
 OPERATION_NO_GUARD_TEXT = "no guard written: the cluster is outside the fleet."
 OPERATION_GUARD_RETRIED_FORMAT = "a later {type} on {target} reached DONE without error ({name}, ended {end})"
-OPERATION_GUARD_UNLISTED_FORMAT = "the operations listing no longer returns {name}"
+OPERATION_GUARD_UNLISTED_FORMAT = "the operations listing no longer returns {name}; GKE's record retention is not a retry, so the guard stands until a later clean operation or --reset-ledger"
 OPERATION_GUARD_CLEAN_FORMAT = "the operations listing returns {name} without an error"
+OPERATION_GUARD_POOL_GONE_FORMAT = "the cluster no longer has a node pool {target}"
 INFO_OPERATION_GUARDS = "Operation guards, re-checked through the operations listing:"
-OPERATION_GUARDS_SUMMARY_FORMAT = "{refreshed} still failing per the listing; {held} held, the listing failed"
+OPERATION_GUARDS_SUMMARY_FORMAT = "{refreshed} still failing per the listing; {held} held, the listing failed; {unlisted} held, the operation no longer listed"
 OPERATION_GUARD_CLEARED_FORMAT = "guard `{id}` cleared: {reason}"
+OPERATION_GUARD_HELD_FORMAT = "guard `{id}` held: {reason}"
 # A failed operation's mitigation: GKE's own error text names the cause; the
 # capacity entry's repair is quoted only when the error is capacity-shaped.
 OPERATION_MITIGATE_TEXT = "GKE's error text names the cause; the catalogue's entry 2 (capacity) and 5 (window) are the usual ones for an operation that did not complete."
@@ -3259,6 +3266,8 @@ def operation_guards_for(key: str, operations: list[dict], seen_at: str) -> list
         guard = _guard(key, GUARD_KIND_FAILURE, ENTRY_OPERATION, OPERATION_GUARD_TITLE, f"{OPERATION_OBJECT_KIND}/{op['name']}", HIGH, f"{op['type']} on {op['target']} ended {op['status'] or '?'}: {op['error'] or 'no error text'}", seen_at, (), check=CHECK_OPERATION_FAILED)
         guard["source"] = OPERATIONS_READ
         guard[OPERATION_GUARD_START_KEY] = op.get("start")
+        guard[OPERATION_GUARD_TYPE_KEY] = op.get("type")
+        guard[OPERATION_GUARD_TARGET_KEY] = op.get("target")
         out.append(guard)
     return out
 
@@ -3780,15 +3789,20 @@ def recheck_reads_needed(cluster_guards: list[dict], refresh: bool) -> set[str]:
     return needed
 
 
-def recheck_operation_guards(guards: list[dict], operations: list[dict], listed: set[str], unread: set[str], seen_at: str, scope: set[str] | None = None) -> dict:
+def recheck_operation_guards(guards: list[dict], operations: list[dict], listed: set[str], unread: set[str], seen_at: str, scope: set[str] | None = None, pools: dict[str, set[str]] | None = None) -> dict:
     """The operation guards against this run's listing, which every run
-    makes for each project: a guard not seen this run is refreshed while the
-    listing returns its operation DONE with an error and no later operation
-    of the same type on the same target reached DONE without one; cleared
-    when such a retry exists, or when a listing that answered no longer
-    returns the name; held when the project's listing failed. A project not
-    listed this run, or a cluster outside a scoped run, is left alone."""
-    result: dict[str, list] = {"refreshed": [], "cleared": [], "held": []}
+    makes for each project. A guard not seen this run is refreshed while
+    the listing returns its operation DONE with an error and no later
+    operation of the same type on the same target reached DONE without one.
+    Three things clear it: that later operation, the retry that succeeded;
+    the operation itself listed without an error; and, for a node-pool
+    operation, a cluster record (`pools`, per enumerated cluster) that no
+    longer names the target pool. A listing that answered without the
+    operation holds it (`unlisted`): GKE retains operation records for a
+    limited time, and a record that aged out is not a retry. A failed
+    listing holds it (`held`); a project not listed this run, or a cluster
+    outside a scoped run, is left alone."""
+    result: dict[str, list] = {"refreshed": [], "cleared": [], "held": [], "unlisted": []}
     for guard in guards:
         if guard.get("kind", GUARD_KIND_FAILURE) != GUARD_KIND_FAILURE or guard.get("entry") != ENTRY_OPERATION or guard.get("last_seen") == seen_at:
             continue
@@ -3803,14 +3817,21 @@ def recheck_operation_guards(guards: list[dict], operations: list[dict], listed:
         name = str(guard.get("object") or "").split("/", 1)[-1]
         ops = [op for op in operations if op.get("project") == project]
         op = next((o for o in ops if o.get("name") == name), None)
-        if op is None:
-            result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_UNLISTED_FORMAT.format(name=name)})
+        summary = operation_summary(op) if op is not None else None
+        op_type = guard.get(OPERATION_GUARD_TYPE_KEY) or (summary["type"] if summary else None)
+        target = guard.get(OPERATION_GUARD_TARGET_KEY) or (summary["target"] if summary else None)
+        started = parse_ts(guard.get(OPERATION_GUARD_START_KEY)) or (parse_ts(op.get("startTime")) if op else None)
+        cluster_pools = (pools or {}).get(str(guard.get("cluster") or ""))
+        if op_type == OP_UPGRADE_NODES and target and target != CONTROL_PLANE_TARGET and cluster_pools is not None and target not in cluster_pools:
+            result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_POOL_GONE_FORMAT.format(target=target)})
             continue
-        retries = [o for o in ops if o is not op and o.get("operationType") == op.get("operationType") and o.get("targetLink") == op.get("targetLink") and (o.get("status") or "") == OPERATION_TERMINAL_STATUS and not o.get("error") and (o.get("startTime") or "") > (op.get("startTime") or "")]
+        retries = [o for o in ops if o.get("name") != name and op_type and o.get("operationType") == op_type and target and operation_summary(o)["target"] == target and (o.get("status") or "") == OPERATION_TERMINAL_STATUS and not o.get("error") and started is not None and (parse_ts(o.get("startTime")) or started) > started]
         if retries:
             retry = operation_summary(sorted(retries, key=lambda o: o.get("startTime") or "")[0])
             result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_RETRIED_FORMAT.format(type=retry["type"], target=retry["target"], name=retry["name"], end=retry["end"] or "?")})
-        elif _operation_failed(operation_summary(op)):
+        elif op is None:
+            result["unlisted"].append({"id": guard["id"], "reason": OPERATION_GUARD_UNLISTED_FORMAT.format(name=name)})
+        elif _operation_failed(summary):
             result["refreshed"].append(guard["id"])
         else:
             result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_CLEAN_FORMAT.format(name=name)})
@@ -4233,7 +4254,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     return {
         "errors": errors,
         "warnings": warnings,
-        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or []), "scoped": scope_reason, "operation_guards": operation_guards or {"refreshed": [], "cleared": [], "held": []}},
+        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or []), "scoped": scope_reason, "operation_guards": operation_guards or {"refreshed": [], "cleared": [], "held": [], "unlisted": []}},
     }
 
 
@@ -4736,9 +4757,11 @@ def render_report(result: dict) -> str:
             lines.append(f"- {_cell(r['cluster'])}: re-checked for {r['guards']} guard(s): {len(r['cleared'])} cleared{held}{refreshed}{errors}")
         lines.append("")
     operation_guards = info.get("operation_guards") or {}
-    if any(operation_guards.get(k) for k in ("refreshed", "cleared", "held")):
+    if any(operation_guards.get(k) for k in ("refreshed", "cleared", "held", "unlisted")):
         lines += [INFO_OPERATION_GUARDS, ""]
-        lines.append("- " + OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=len(operation_guards.get("refreshed") or []), held=len(operation_guards.get("held") or [])))
+        lines.append("- " + OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=len(operation_guards.get("refreshed") or []), held=len(operation_guards.get("held") or []), unlisted=len(operation_guards.get("unlisted") or [])))
+        for item in operation_guards.get("unlisted") or []:
+            lines.append("- " + OPERATION_GUARD_HELD_FORMAT.format(id=_cell(item["id"]), reason=_cell(item["reason"])))
         for item in operation_guards.get("cleared") or []:
             lines.append("- " + OPERATION_GUARD_CLEARED_FORMAT.format(id=_cell(item["id"]), reason=_cell(item["reason"])))
         lines.append("")
@@ -5114,13 +5137,18 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # Operation guards are re-checked through the listing every run makes
     # for their project: no read, and a reviewed cluster's review does not
     # decide them, since its window may no longer reach the operation.
-    operation_guards = recheck_operation_guards(new_guards["guards"], operations, set(operations_commands), operations_unread, seen_at, scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None)
+    cluster_pools = {cluster_key(c["project"], c["location"], c["name"]): {p.get("name", "") for p in c.get("nodePools") or []} for c in clusters}
+    operation_guards = recheck_operation_guards(new_guards["guards"], operations, set(operations_commands), operations_unread, seen_at, scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, pools=cluster_pools)
     cleared_operation_ids = {item["id"] for item in operation_guards["cleared"]}
+    unlisted_operation_ids = {item["id"] for item in operation_guards["unlisted"]}
     new_guards["guards"] = [g for g in new_guards["guards"] if g["id"] not in cleared_operation_ids]
     for guard in new_guards["guards"]:
         if guard["id"] in operation_guards["refreshed"]:
             guard["last_seen"] = seen_at
             guard["reviews"] = int(guard.get("reviews") or 1) + 1
+        elif guard["id"] in unlisted_operation_ids:
+            # Held: its candidate stands as it was, no review having seen it.
+            guard["last_seen"] = seen_at
     # An unchanged cluster's checks ran as the operations listing that found no
     # upgrade; a re-check that read pods or nodes backs those checks with that read.
     recheck_by_cluster = {r["cluster"]: r for r in rechecks}

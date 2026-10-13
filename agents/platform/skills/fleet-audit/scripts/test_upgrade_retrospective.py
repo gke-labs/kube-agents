@@ -2066,6 +2066,15 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertIn("another retrospective run holds", out.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
+            # The same exit on every route: the after-upgrade wake and the forced review print the
+            # lock line, exit 0 and write nothing.
+            for argv in (["--after-upgrade", "--project", PROJECT], ["--cluster", SEEDED, "--project", PROJECT]):
+                with mock.patch.object(ur, "LOCK_WAIT", timedelta(0)), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                    with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                        self.assertEqual(ur.main(argv), 0, argv)
+                self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(0)), argv)
+                self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+                self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
             # A dry run takes no lock and still prints its report.
             with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                 with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
@@ -2584,6 +2593,20 @@ class LedgerAndGuardsTest(unittest.TestCase):
         second, fleet = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=2), full=False, after_upgrade=True, project=["other-project"])
         self.assertTrue(second["quiet"])
         self.assertFalse(any("get-credentials" in " ".join(c) for c in fleet.calls))
+        # The sweep wrote the outside cluster no guard, and its ledger entry holds the operations
+        # reviewed alone; the next full run that names the project adds it to the fleet set and
+        # reviews the cluster in full, its versions recorded and its operations already reviewed.
+        self.assertEqual([g for g in first["guards"] if g["cluster"] == other_key], [])
+        third, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded"), twin]), now=NOW + timedelta(days=7), project=[PROJECT, "other-project"])
+        self.assertIn(other_key, [r["cluster"] for r in third["reviews"]])
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertEqual(ledger[ur.LEDGER_PROJECTS_KEY], [PROJECT, "other-project"])
+        entry = ledger["clusters"][other_key]
+        self.assertEqual((entry["control_plane"], entry["last_run"]), (twin["currentMasterVersion"], ur.fmt_ts(NOW + timedelta(days=7))))
+        review = next(r for r in third["reviews"] if r["cluster"] == other_key)
+        self.assertTrue(review["reviewed"])
+        self.assertEqual({op.get("already_reviewed", {}).get("route") for op in review["what_happened"]["operations"]}, {ur.ROUTE_AFTER_UPGRADE})
+        self.assertTrue(any(g["cluster"] == other_key for g in third["guards"]))
 
     def test_after_upgrade_holds_an_operation_under_fifteen_minutes_old(self):
         self.collect()
@@ -4329,13 +4352,14 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(filed_id, self.audit_report.published_id(identity))
         [record] = [g for g in first["guards"] if g["id"] == guard]
         self.assertEqual((record["kind"], record["entry"], record["source"], record["check"], record["reviews"], record["reads"], record[ur.OPERATION_GUARD_START_KEY]), (ur.GUARD_KIND_FAILURE, ur.ENTRY_OPERATION, ur.OPERATIONS_READ, ur.CHECK_OPERATION_FAILED, 1, [], "2026-10-08T03:46:22Z"))
+        self.assertEqual((record[ur.OPERATION_GUARD_TYPE_KEY], record[ur.OPERATION_GUARD_TARGET_KEY]), ("UPGRADE_NODES", "idle-batch-pool"))
         self.assertTrue(record["evidence"].startswith("UPGRADE_NODES on idle-batch-pool ended DONE: Instance"), record["evidence"])
         self.assertIn(f"### operation DONE — {SEEDED} — `{obj}`", ur.render_report(first))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
         # Sunday 2, the listing unchanged: the cluster is unchanged, the guard is refreshed through the
         # listing and its candidate is held under the same id with the persistence.
         second, _ = self.collect(FakeFleet(operations=ops), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
-        self.assertEqual(second["operation_guards"], {"refreshed": [guard], "cleared": [], "held": []})
+        self.assertEqual(second["operation_guards"], {"refreshed": [guard], "cleared": [], "held": [], "unlisted": []})
         self.assertIn(SEEDED, [u["cluster"] for u in second["unchanged"]])
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         [held] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == obj]
@@ -4345,12 +4369,12 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(self.audit_report.published_id(held), filed_id)
         self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertEqual([(g["reviews"], g["last_seen"]) for g in second["guards"] if g["id"] == guard], [(2, "2026-10-15T18:00:00Z")])
-        self.assertIn(ur.OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=1, held=0), ur.render_report(second))
+        self.assertIn(ur.OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=1, held=0, unlisted=0), ur.render_report(second))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
         # A Sunday whose listing failed: the guard is held as it stands, the operation check is
         # unevaluated, no candidate and no stale Warning for it, the run partial.
         third, _ = self.collect(FakeFleet(operations=ops, ops_fail={PROJECT}), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
-        self.assertEqual(third["operation_guards"], {"refreshed": [], "cleared": [], "held": [guard]})
+        self.assertEqual(third["operation_guards"], {"refreshed": [], "cleared": [], "held": [guard], "unlisted": []})
         self.assertEqual([(g["reviews"], g["last_seen"]) for g in third["guards"] if g["id"] == guard], [(2, "2026-10-15T18:00:00Z")])
         manifest = json.loads(Path(third["manifest_path"]).read_text())
         seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
@@ -4418,6 +4442,96 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(unevaluated, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
         self.assertEqual([c for c in seeded["candidates"] if c["check"] in unevaluated], [])
         self.assertTrue(all(w["check"] in unevaluated for w in warnings), [w["check"] for w in warnings])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_an_operation_guard_is_held_when_unlisted_and_cleared_by_a_retry_or_a_gone_pool(self):
+        # GKE retains operation records for a limited time: a listing that answered without the
+        # guard's operation holds the guard, its candidate standing as it was and an Info line saying
+        # so; a later clean operation of the same type on the same target clears it even then, and so
+        # does a cluster record that no longer names the target pool.
+        ops = copy.deepcopy(OPERATIONS)
+        errored = next(o for o in ops if o.get("error"))
+        bad = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/idle-batch-pool" in o["targetLink"])
+        bad["error"], bad["statusMessage"] = errored["error"], errored["statusMessage"]
+        obj = f"Operation/{bad['name']}"
+        guard = ur.guard_id(SEEDED, ur.ENTRY_OPERATION, obj)
+        self.collect(FakeFleet(operations=ops))
+        without = [o for o in ops if o["name"] != bad["name"]]
+        unlisted, _ = self.collect(FakeFleet(operations=without), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(unlisted["operation_guards"], {"refreshed": [], "cleared": [], "held": [], "unlisted": [{"id": guard, "reason": ur.OPERATION_GUARD_UNLISTED_FORMAT.format(name=bad["name"])}]})
+        self.assertEqual([(g["reviews"], g["last_seen"]) for g in unlisted["guards"] if g["id"] == guard], [(1, "2026-10-15T18:00:00Z")])
+        manifest = json.loads(Path(unlisted["manifest_path"]).read_text())
+        [held] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == obj]
+        self.assertEqual((held["check"], held["severity"], held["persistence"]), (ur.CHECK_OPERATION_FAILED, ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-08T18:00:00Z, 1 review(s)"]))
+        report = ur.render_report(unlisted)
+        self.assertIn(ur.OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=0, held=0, unlisted=1), report)
+        self.assertIn("- " + ur.OPERATION_GUARD_HELD_FORMAT.format(id=guard, reason=ur.OPERATION_GUARD_UNLISTED_FORMAT.format(name=bad["name"])), report)
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # A later clean operation of the same type on the same target clears it, the failed one
+        # still unlisted.
+        retry = {**copy.deepcopy(bad), "name": "operation-retry", "startTime": "2026-10-20T03:00:00Z", "endTime": "2026-10-20T03:12:00Z"}
+        retry.pop("error", None)
+        retry.pop("statusMessage", None)
+        cleared, _ = self.collect(FakeFleet(operations=without + [retry]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual([(item["id"], item["reason"]) for item in cleared["operation_guards"]["cleared"]], [(guard, ur.OPERATION_GUARD_RETRIED_FORMAT.format(type="UPGRADE_NODES", target="idle-batch-pool", name="operation-retry", end="2026-10-20T03:12:00Z"))])
+        self.assertNotIn(guard, {g["id"] for g in cleared["guards"]})
+        manifest = json.loads(Path(cleared["manifest_path"]).read_text())
+        self.assertEqual([c for e in manifest["clusters"] for c in e.get("candidates") or [] if c["object"] == obj], [])
+
+    def test_an_operation_guard_clears_when_its_target_pool_is_gone(self):
+        ops = copy.deepcopy(OPERATIONS)
+        errored = next(o for o in ops if o.get("error"))
+        bad = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/idle-batch-pool" in o["targetLink"])
+        bad["error"], bad["statusMessage"] = errored["error"], errored["statusMessage"]
+        obj = f"Operation/{bad['name']}"
+        guard = ur.guard_id(SEEDED, ur.ENTRY_OPERATION, obj)
+        self.collect(FakeFleet(operations=ops))
+        shrunk = cluster_doc("seeded-a")
+        shrunk["nodePools"] = [p for p in shrunk["nodePools"] if p["name"] != "idle-batch-pool"]
+        gone, _ = self.collect(FakeFleet(clusters=[shrunk, cluster_doc("gemma-gpu-upgraded")], operations=ops), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual([(item["id"], item["reason"]) for item in gone["operation_guards"]["cleared"]], [(guard, ur.OPERATION_GUARD_POOL_GONE_FORMAT.format(target="idle-batch-pool"))])
+        self.assertNotIn(guard, {g["id"] for g in gone["guards"]})
+        manifest = json.loads(Path(gone["manifest_path"]).read_text())
+        self.assertEqual([c for e in manifest["clusters"] for c in e.get("candidates") or [] if c["object"] == obj], [])
+        self.assertIn("- " + ur.OPERATION_GUARD_CLEARED_FORMAT.format(id=guard, reason=ur.OPERATION_GUARD_POOL_GONE_FORMAT.format(target="idle-batch-pool")), ur.render_report(gone))
+
+    def test_a_regraded_guard_is_held_under_its_latest_check(self):
+        # Tuesday's after-upgrade wake files a displaced replica under `upgrade-broke-workload`; Sunday
+        # re-grades it (pinned now to a pool no operation in the window touched: medium, a Warning
+        # under `upgrade-symptom-tentative`), the guard's check moves and the old id leaves
+        # `collector_flagged_ids`; the next Sunday's re-check emits the held candidate under the
+        # guard's latest check with Tuesday's first-seen date and three reviews.
+        self.collect()
+        tuesday_op = copy.deepcopy(next(o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]))
+        tuesday_op.update(name="operation-tuesday", startTime="2026-10-13T16:30:00Z", endTime="2026-10-13T17:00:00Z")
+        displaced = pod("web-5d8f9c7b6-abcde", namespace="seeded-capacity", scheduled_message="0/4 nodes are available: 1 Insufficient cpu, 3 node(s) didn't match Pod's node affinity/selector.", node_selector={"cloud.google.com/gke-nodepool": "pinned-inference-pool"})
+        displaced["metadata"]["creationTimestamp"] = "2026-10-13T16:40:00Z"
+        web = "seeded-capacity/Pod/web-5d8f9c7b6-abcde"
+        guard = ur.guard_id(SEEDED, 2, web)
+        old_identity = {"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-capacity", "object": "Pod/web-5d8f9c7b6-abcde"}
+        new_identity = {**old_identity, "check": ur.CHECK_SYMPTOM_TENTATIVE}
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [displaced]}}):
+            tuesday, _ = self.collect(FakeFleet(operations=OPERATIONS + [tuesday_op]), now=datetime(2026, 10, 13, 17, 30, tzinfo=timezone.utc), full=False, after_upgrade=True)
+        self.assertEqual([(g["check"], g["reviews"], g["first_seen"]) for g in tuesday["guards"] if g["id"] == guard], [(ur.CHECK_BROKE_WORKLOAD, 1, "2026-10-13T17:30:00Z")])
+        repinned = copy.deepcopy(displaced)
+        repinned["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "idle-batch-pool"}
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [repinned]}}):
+            sunday, _ = self.collect(FakeFleet(operations=OPERATIONS + [tuesday_op]), now=datetime(2026, 10, 18, 18, 0, tzinfo=timezone.utc))
+            manifest = json.loads(Path(sunday["manifest_path"]).read_text())
+            [regraded] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == old_identity["object"]]
+            self.assertEqual((regraded["check"], regraded["severity"], regraded["persistence"]), (ur.CHECK_SYMPTOM_TENTATIVE, ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-13T17:30:00Z, 2 review(s)"]))
+            self.assertEqual([(g["check"], g["reviews"]) for g in sunday["guards"] if g["id"] == guard], [(ur.CHECK_SYMPTOM_TENTATIVE, 2)])
+            flagged = self.audit_report.collector_flagged_ids(manifest)
+            self.assertNotIn(self.audit_report.published_id(old_identity), flagged)
+            self.assertIn(self.audit_report.published_id(new_identity), flagged)
+            self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+            next_sunday, _ = self.collect(FakeFleet(operations=OPERATIONS + [tuesday_op]), now=datetime(2026, 10, 25, 18, 0, tzinfo=timezone.utc))
+        self.assertIn(SEEDED, [u["cluster"] for u in next_sunday["unchanged"]])
+        manifest = json.loads(Path(next_sunday["manifest_path"]).read_text())
+        [held] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == old_identity["object"]]
+        self.assertEqual((held["check"], held["severity"], held["persistence"]), (ur.CHECK_SYMPTOM_TENTATIVE, ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-13T17:30:00Z, 3 review(s)"]))
+        self.assertEqual(self.audit_report.published_id(held), self.audit_report.published_id(new_identity))
+        self.assertNotIn(self.audit_report.published_id(old_identity), self.audit_report.collector_flagged_ids(manifest))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_three_guards_on_one_object_are_one_candidate(self):
