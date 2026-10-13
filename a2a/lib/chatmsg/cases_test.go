@@ -24,7 +24,8 @@ type sharedCase struct {
 
 // TestEverySharedCaseIsValid loads every expected chat message in the
 // shared cases and checks it passes Validate for its carrier, mark
-// included: the emitter must never produce what a renderer would drop.
+// included. The cases pin no text fallback, so the rule that a chat message
+// needs one beside it is the emitter's to keep and Read's to enforce.
 func TestEverySharedCaseIsValid(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join(casesDir, "*.json"))
 	if err != nil {

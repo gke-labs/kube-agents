@@ -513,6 +513,14 @@ func TestAssertion27(t *testing.T) {
 		if _, err := Parts(Terminal, "x", full()); err == nil {
 			t.Error("Parts(terminal) accepted: a terminal carries mark alone")
 		}
+		// Part is the encoder both of those call, and an emitter's third
+		// door: on a terminal it refuses layout that would ride unread.
+		if _, err := Part(Terminal, full()); ruleField(err) != "layout" {
+			t.Errorf("Part(terminal, full) = %v, want a layout refusal", err)
+		}
+		if _, err := Part(Terminal, Message{Mark: &Mark{Settle: SettleFailed}}); err != nil {
+			t.Errorf("Part(terminal, mark only) = %v", err)
+		}
 	})
 	t.Run("the renderer refuses a missing fallback", func(t *testing.T) {
 		for _, c := range []Carrier{Result, Turn, Progress, Notice, Question} {
