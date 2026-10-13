@@ -1028,7 +1028,7 @@ class PoolNote(RunHarness):
         # The periodic's third trigger: runs asked Boskos for a project and
         # got none. Every run that would have waited died at the acquire, so
         # Deck shows no backlog -- and the gate must not read that as nothing
-        # to say. The message names the refusals and the hand holds.
+        # to say. The message names the refusals and the leases with no build ID.
         note = pool_note(waiting_longest_s=0, waiting_now=False, over_threshold=0,
                          window_hours=None, p50_s=None, p95_s=None,
                          lease_failures=2, lease_failures_hours=3, no_build_id=2)

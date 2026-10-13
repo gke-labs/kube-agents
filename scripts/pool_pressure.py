@@ -230,16 +230,18 @@ BOSKOS_NO_OWNER = ""
 # knows job names or lane suffixes; a new job needs nothing from this file.
 BUILD_ID_IN_OWNER = re.compile(r"(?<!\d)(\d{19})(?!\d)")
 # How long after Deck's completionTime a lease may still be held while the
-# pod tears down and the wrapper releases the project. Deck marks an aborted
-# job complete at the abort; the release follows the cleanup, minutes later,
-# and in between the lease is releasing, not leaked.
+# pod tears down and the wrapper releases the project; in between the lease
+# is releasing, not leaked. On an abort Deck sets the stamp at the abort but
+# to startTime + 30:00 (see fetch_live_queue), so an early-aborted run reads
+# as releasing for up to 45 minutes after the abort: a real leak from one is
+# named one hourly tick late, which is the price of not naming every abort.
 RELEASE_GRACE = timedelta(minutes=15)
-# Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
-# defaults of the hack/ scripts that lease through boskos_pool.py, which their
-# Prow jobs do not override (test_integration_contracts.py pins the list to
-# those scripts). Deck cannot vouch for a lease with no build ID in it, so
-# these are reported as a job's, apart from the hand holds, and are never
-# compared against it.
+# The fixed owners the hack/ scripts that lease through boskos_pool.py fall
+# back to when nothing names the build (test_integration_contracts.py pins
+# the list to those scripts). In Prow only the fleet reconcile leases this
+# way today; the pull sweep's job passes `<job>-<build>` and `-gitlab` to its
+# two passes. Deck cannot vouch for a lease with no build ID in it, so these
+# are reported as a job's, apart from the rest, and never compared against it.
 BOSKOS_JOB_OWNERS = (
     "fleet-reconcile",
     "ci-kube-agents-compute-sweep",
@@ -1197,9 +1199,9 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
         # 24.1 minutes all read 30.0 here. Aborts are the largest single state
         # in this job's history, so any duration derived from this field is
         # wrong for most of the runs it covers. Durations come from artifacts.
-        # The one thing it is read for: a job that completed inside
+        # The one thing it is read for: a job whose stamp is inside
         # RELEASE_GRACE may still hold its lease while the pod tears down. A
-        # stamp in the future (that start + 30:00) is "finished just now" too.
+        # stamp in the future (that start + 30:00) counts as inside it.
         if status.get("completionTime"):
             completed = parse_rfc3339(status["completionTime"])
             build_id = str(status.get("build_id") or "")
@@ -1577,8 +1579,9 @@ def summarise(
     # anything filtering on the label. What the cap and the pool size are is
     # still reported, under `max_concurrency` and `pool.stranded`.
     leaked = leaked_leases(pool_state, queue)
+    releasing = releasing_leases(pool_state, queue)
     cause_label, cause_text = (
-        cause(pool_state, queue, concurrency, len(recent_failed), leaked, live_backlog)
+        cause(pool_state, queue, concurrency, len(recent_failed), leaked, live_backlog, releasing)
         if breached
         else (None, [])
     )
@@ -1682,7 +1685,7 @@ def summarise(
         "held_by_job": pool_state.held_by_job() if pool_state else None,
         "no_build_id": pool_state.no_build_id() if pool_state else None,
         "leaked_leases": leaked,
-        "releasing_leases": releasing_leases(pool_state, queue),
+        "releasing_leases": releasing,
         "cause": cause_label,
         "cause_text": cause_text,
         "breached": breached,
@@ -1936,7 +1939,9 @@ def _holders_text(held: Dict[str, int]) -> str:
     return ", ".join(f"{owner} ({count})" for owner, count in sorted(held.items()))
 
 
-def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
+def _pool_now_lines(
+    pool_state: PoolState, leaked: Sequence[str], releasing: Sequence[str] = ()
+) -> List[str]:
     """What the projects are doing, for a cause that turns on it."""
     lines = [
         f"Pool now: {pool_state.busy} leased, {pool_state.free} free,"
@@ -1953,6 +1958,8 @@ def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
         lines.append(f"  no build ID in the owner: {_holders_text(unnamed)}")
     if leaked:
         lines.append(f"  {len(leaked)} lease(s) leaked, named under leaked_leases")
+    if releasing:
+        lines.append(f"  {len(releasing)} lease(s) releasing after a run that just finished")
     return lines
 
 
@@ -1995,6 +2002,7 @@ def cause(
     lease_failures: int = 0,
     leaked: Sequence[str] = (),
     live_backlog: bool = False,
+    releasing: Sequence[str] = (),
 ) -> Tuple[str, List[str]]:
     """Why runs are waiting, and therefore what to do about it.
 
@@ -2040,7 +2048,7 @@ def cause(
             "What the projects are doing decides the remedy: a repair ends, a leak is",
             "released, and demand needs the next project, per the pool runbook:",
             "docs/ci-pool-projects.md",
-        ] + _pool_now_lines(pool_state, leaked)
+        ] + _pool_now_lines(pool_state, leaked, releasing)
 
     label, lines = _wait_cause(pool_state, queue, concurrency)
     return label, (refused + [""] + lines) if lease_failures else lines

@@ -546,7 +546,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
 class PoolPressureJobOwnersContractTest(unittest.TestCase):
     """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners the
     hack/ scripts lease under. A rename there and not here would move that
-    job's leases under "held by hand" with nothing red."""
+    job's leases under "no build ID in the owner" with nothing red."""
 
     @staticmethod
     def _script(name):
@@ -566,7 +566,7 @@ class PoolPressureJobOwnersContractTest(unittest.TestCase):
     def test_the_fixed_job_owners_are_the_scripts_defaults(self):
         # Discovered, not enumerated: every hack/ script that leases through
         # boskos_pool and names a default owner is in the tuple, so the next
-        # such script goes red here rather than into "held by hand".
+        # such script goes red here rather than into "no build ID in the owner".
         sys.path.insert(0, str(REPO_SCRIPTS))
         import pool_pressure
 

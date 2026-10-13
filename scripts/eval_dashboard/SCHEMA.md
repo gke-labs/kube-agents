@@ -1035,7 +1035,7 @@ no_build_id, cause, max_concurrency}` when
 refused a project in the periodic's recent window of `lease_failures_hours`
 hours, and `no_build_id` how many projects are leased under an owner that is
 neither a Prow run nor a known job's fixed owner; `lease_failures` and
-`no_build_id` are `null` from an
+`no_build_id` are `null` under these names from an
 artifact written before the
 periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue

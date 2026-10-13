@@ -474,8 +474,9 @@ class LeakedLeases(unittest.TestCase):
         self.assertEqual([f"pull-kube-agents-smoke-test-{self.ONE}"], pp.releasing_leases(pool, queue))
 
     def test_a_hand_hold_is_not_a_leak(self):
-        """An owner with no build ID was taken by a person, who Deck has never
-        heard of; it is reported as held, never as leaked."""
+        """An owner with no build ID is a person's or a job's that forgot the
+        convention; Deck can vouch for neither, so it is reported by name,
+        never as leaked."""
         pool = pp.PoolState({"rebuilding": 2}, {"hangdng-rebuild": 2})
         self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
 
@@ -1228,6 +1229,30 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertIn("CONTROL PLANE, not capacity. 15 project(s) were free", out)
         self.assertIn("2 run(s) in the last 3h asked Boskos", out, "the refusal still leads")
+
+    def test_a_lease_of_a_run_that_just_finished_is_reported_releasing_not_leaked(self):
+        """Deck to report: the saturated day's leaked smoke lease, with a Deck
+        item that says its run completed two minutes before the reading."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs", "boskos.json"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            with open(os.path.join(SATURATED_DIR, "deck.json")) as fh:
+                deck = json.load(fh)
+            completed = (SATURATED_AS_OF - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            deck["items"].append({
+                "metadata": {"creationTimestamp": "2026-10-08T18:00:00Z"},
+                "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 2777}]}},
+                "status": {"build_id": "2108220000000000000", "pendingTime": "2026-10-08T18:01:00Z",
+                           "completionTime": completed, "state": "aborted"},
+            })
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump(deck, fh)
+            code, out = run(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertNotIn("held by runs Deck does not show running", out)
+        self.assertIn("1 lease(s) held by runs that finished in the last 15 min, still tearing down:", out)
+        self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", out.split("tearing down")[1])
+        self.assertIn("1 lease(s) releasing after a run that just finished", out)
 
     def test_a_quiet_day_is_green_and_reports_no_leaks(self):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
