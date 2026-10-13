@@ -424,7 +424,8 @@ class RunRecord:
     #: The agent's final report as devops-bench recorded it (``output``, the
     #: "Actual Output" the judge grades). The gate quotes its first lines
     #: into the build log, and rung 3 reads it only for a case that declares
-    #: ``tool_calls_optional``, where a reply stands in for the trajectory.
+    #: ``tool_calls_optional``, where a reply on a record with no error
+    #: stands in for the trajectory.
     output: str = ""
 
     @property
@@ -1233,8 +1234,8 @@ def classify_rep(
     # artifacts of the outage, and grading them reports it as an agent
     # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
     # tokens billed with no trajectory is an inconsistent record (unless the
-    # case declares tool_calls_optional and carries a reply), and the
-    # harness skeleton (empty trajectory, every token bucket null) never
+    # case declares tool_calls_optional and carries a reply and no error),
+    # and the harness skeleton (empty trajectory, every token bucket null) never
     # billed a model call it can prove -- both stay rung 3 blocks below.
     total_tokens = record.tokens.get("total")
     if (
