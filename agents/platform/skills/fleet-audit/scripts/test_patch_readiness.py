@@ -1747,7 +1747,12 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn(pr.LAG_UNSUPPORTED, hit["impact"])
         self.assertNotIn("release-channel baseline", hit["impact"])
 
-    def test_a_no_target_unknown_row_is_not_applicable_with_the_reason(self):
+    def test_a_no_target_unknown_row_whose_budget_half_applies_is_a_clean_run_not_a_declaration(self):
+        """A static cluster off every roster: both causes apply to the control
+        plane's move. The ceiling has no target to be graded against, but the
+        budget half was graded on a clean read and found nothing, so the check
+        ran on the half that applies and goes to `commands`, not to
+        `checks_not_applicable`."""
         row = self.member("static", status="unknown", gap=None)
         row["channel"] = None
         row["target_version"] = None
@@ -1755,9 +1760,58 @@ class UpgradeBlockedTest(unittest.TestCase):
         c = cluster(name="static", master="1.20.0-gke.1", channel=None)
         by = self.collect([c], [row])
         entry = by["static"]
-        self.assertEqual([x["check"] for x in entry.get("checks_not_applicable") or []], [pr.UPGRADE_BLOCKED_CHECK])
-        self.assertIn("no target version", entry["checks_not_applicable"][0]["reason"])
+        self.assertIn("master-behind", {x["check"] for x in entry["candidates"]})
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_not_applicable", entry)
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
+        self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+
+    def test_a_static_cluster_off_every_roster_keeps_upgrade_blocked_in_commands_when_its_budget_is_removed(self):
+        """Week N a `maxUnavailable: 0` budget holds the drain: `blocked`, a
+        critical candidate, the check in `commands`. Week N+1 the budget is
+        gone: the row is `unknown` (no target), and the check is still in
+        `commands` as a clean run, never declared not applicable, so last
+        week's finding retires against this week's clean read and not against
+        a reason that is false for the cluster."""
+        c = cluster(name="static", master="1.20.0-gke.1", channel=None)
+        held = self.member("static", status="blocked", pdbs=[self.BUDGET], gap=None)
+        held["channel"] = None
+        held["target_version"] = None
+        entry = self.collect([c], [held])["static"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertEqual([x["severity"] for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.CRITICAL])
+        self.assertNotIn("checks_not_applicable", entry)
+        clean = self.member("static", status="unknown", gap=None)
+        clean["channel"] = None
+        clean["target_version"] = None
+        clean["readiness"]["note"] = "no target; exclusion scope and skew not graded"
+        entry = self.collect([c], [clean])["static"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
+        self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+
+    def test_a_static_cluster_with_a_pool_ahead_lag_is_declared_whatever_the_budget_read_found(self):
+        """The one lag the declaration is for: a static cluster whose only lag
+        is a pool ahead of its control plane. The control plane's move is due,
+        no budget can hold it, and the ceiling has no target to be graded
+        against, so nothing that applies could be graded. The declaration
+        reads no budget outcome: a blocking budget and a clean read dispose
+        the row the same way, in `checks_not_applicable`, never in
+        `commands`."""
+        c = cluster(name="static", master=self.CURRENT, channel=None, node_pools=[pool("default-pool", "1.31.0-gke.1")])
+        for row in (self.member("static", status="blocked", pdbs=[self.BUDGET], gap=None), self.member("static", status="unknown", gap=None)):
+            row["channel"] = None
+            row["target_version"] = None
+            with self.subTest(status=row["readiness"]["status"]):
+                entry = self.collect([c], [row])["static"]
+                self.assertIn("pool-skew", {x["check"] for x in entry["candidates"]})
+                self.assertNotIn("master-behind", {x["check"] for x in entry["candidates"]})
+                self.assertEqual([x["check"] for x in entry.get("checks_not_applicable") or []], [pr.UPGRADE_BLOCKED_CHECK])
+                self.assertIn("no target version", entry["checks_not_applicable"][0]["reason"])
+                self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+                self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
+                self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
 
     def test_a_channel_cluster_whose_target_was_not_fetched_is_unevaluated_not_declared(self):
         # The reporter resolves no target when its own get-server-config
@@ -2119,11 +2173,13 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn(pr.UNEVALUATED_VERSION_NOT_JUDGED, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
 
     def test_a_static_cluster_spelled_unspecified_is_not_applicable_too(self):
+        """GKE's other spelling of a static cluster, on the one lag the
+        declaration is for: a pool ahead of its control plane."""
         row = self.member("static", status="unknown", gap=None)
         row["channel"] = "UNSPECIFIED"
         row["target_version"] = None
         row["readiness"]["note"] = "no release channel; pass --target-version"
-        c = cluster(name="static", master="1.20.0-gke.1", channel="UNSPECIFIED")
+        c = cluster(name="static", master=self.CURRENT, channel="UNSPECIFIED", node_pools=[pool("default-pool", "1.31.0-gke.1")])
         by = self.collect([c], [row])
         entry = by["static"]
         self.assertEqual([x["check"] for x in entry.get("checks_not_applicable") or []], [pr.UPGRADE_BLOCKED_CHECK])
@@ -2309,8 +2365,9 @@ class UpgradeBlockedTest(unittest.TestCase):
 
     def test_a_malformed_row_costs_its_own_cluster_only(self):
         # One reporter run per behind cluster: a malformed row for one leaves
-        # the other's declaration where the join put it.
-        static = cluster(name="static", master="1.20.0-gke.1", channel=None)
+        # the other's declaration where the join put it (a static cluster on
+        # the one lag the declaration is for, a pool ahead of its control plane).
+        static = cluster(name="static", master=self.CURRENT, channel=None, node_pools=[pool("default-pool", "1.31.0-gke.1")])
         declared = {"cluster": "static", "location": "us-central1", "channel": None, "target_version": None, "readiness": {"status": "unknown", "note": "no target"}}
         malformed = {"cluster": "lag", "location": "us-central1", "readiness": "blocked"}
         by = self.collect([static, cluster(name="lag", master=self.BEHIND)], [declared, malformed])

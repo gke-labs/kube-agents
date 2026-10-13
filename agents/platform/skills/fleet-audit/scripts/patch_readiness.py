@@ -47,8 +47,10 @@ asks how the upgrade a cluster needs would go, so a cluster with no
 `master-behind` or `pool-skew` candidate -- current, or mid-upgrade with the
 version checks suppressed -- has no upgrade to schedule and gets a
 `checks_not_applicable` entry saying which; so does a behind cluster on no
-release channel, whose reporter row has no target version to grade the
-upgrade against (the SOP's 3.11 lists both). For each cluster that does, the
+release channel whose only lag is a pool ahead of its control plane, where no
+budget can hold the control plane's move and the reporter row has no target
+version to grade the skew ceiling against (the SOP's 3.11 lists both); on any
+other lag that cluster's budget half is graded and the check runs. For each cluster that does, the
 collector runs the fleet-upgrade-verification skill's reporter once, for that
 cluster alone, instead of once per
 project with `--readiness` -- the grade already exists there, with its
@@ -246,7 +248,7 @@ READINESS_TIMEOUT_S = 240
 # reporter that would start with less than the floor left is not started.
 READINESS_FLEET_BUDGET_S = 420
 READINESS_MIN_TIMEOUT_S = 30
-NOT_APPLICABLE_NO_TARGET_REASON = "no release channel, so the readiness grade has no target version to grade the upgrade against; the version finding stands on its own"
+NOT_APPLICABLE_NO_TARGET_REASON = "no release channel, so the readiness grade has no target version to grade the control plane's move against, and no budget can hold that move; the version finding stands on its own"
 UNEVALUATED_REPORTER_FAILED_FORMAT = "the readiness reporter failed (rc {rc}): {stderr}"
 UNEVALUATED_UNREADABLE_FORMAT = "the readiness reporter exited {rc} but left no readable report ({error}); its stderr: {stderr}"
 # The siblings' scratch root (audit_report.py, collect.py, report_status.py):
@@ -1545,9 +1547,12 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     <location>/<name>`), and that cluster is joined to its `members[]` row.
     A row graded `blocked` by a budget or by skew is a candidate; a row graded
     `blocked` by an exclusion alone, or `ready`, is a check that ran and found
-    nothing. A row graded `unknown` on a cluster with no release channel and
-    so no target version is the second `checks_not_applicable` route: the
-    same answer every week, with the reason. Any other `unknown` row, a row
+    nothing. A cluster with no release channel, and so no target version,
+    whose only lag is a pool ahead of its control plane is the second
+    `checks_not_applicable` route: nothing that applies could be graded, so
+    the same answer every week, with the reason, whatever its budget read
+    found; on any other lag its budget half was graded, and a clean `unknown`
+    row there is the check running clean. Any other `unknown` row, a row
     the reporter did not produce, a reporter that wrote no report, or a
     `blocked` whose cause this join does not know, goes into the entry's
     `checks_unevaluated`: the slug stays out of `commands`, and `finish`
@@ -1715,45 +1720,49 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         # applies to it that the gate, this join and the hit all take.
         due = _due(entry)
         skew_blocked = due.skew_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("skew") or {}).get("blocking"))
-        # A static cluster's row: no channel, so no target, so `unknown` with
-        # nothing blocking and a clean read. Whether that is a declaration or
-        # a clean run depends on which upgrade is due, below.
-        no_target_row = (
-            not skew_blocked
-            and not readiness.get("read_error")
-            and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY)
-            and not (member or {}).get("target_version")
-            and (member or {}).get("channel") in NO_CHANNEL_SPELLINGS
-        )
+        # A static cluster's row: no channel, so no target for the ceiling to
+        # be graded against. Read from the row's channel and target alone, a
+        # fact about the cluster; the two arms below decide from it and from
+        # `_due`, never from what this week's budget read found, so the
+        # disposition is the same every week whatever the budget did.
+        no_target = not (member or {}).get("target_version") and (member or {}).get("channel") in NO_CHANNEL_SPELLINGS
         why = None
         if not members:
             why = no_report
         elif member is None:
             why = UNEVALUATED_NO_ROW
-        elif no_target_row and due.skew_applies:
-            # No release channel, no target: the reporter has nothing to grade
-            # the control plane's move against (it graded a budget or an
-            # in-effect NO_UPGRADES exclusion if one blocked, and did not), and
-            # that is true of this cluster every week. It is not applicable
-            # here, with the reason, rather than a limitation that holds the
-            # stream partial for good; the version finding itself stands. The
-            # channel test (both spellings GKE uses for a static cluster) is
-            # what makes it a fact about the cluster: the reporter also
-            # resolves no target when its own `get-server-config` failed or
-            # omitted the channel, and that row is on a channel with a target
-            # nobody fetched this run, which the branch below records as
-            # unevaluated with the reporter's note saying so. The gate already
-            # required both version checks to have judged the cluster, so this
-            # declares nothing on a cluster nobody looked at.
+        elif no_target and not skew_blocked and not due.budget_applies:
+            # No release channel, no target, and the one cause that can block
+            # the upgrade due is the ceiling: a static cluster whose only lag
+            # is a pool ahead of its control plane. The control plane's move
+            # drains no node, so no budget can hold it, and the ceiling has no
+            # target to be graded against; nothing that applies could be
+            # graded, and that is true of this cluster every week. It is not
+            # applicable here, with the reason, rather than a limitation that
+            # holds the stream partial for good; the version finding itself
+            # stands. The channel test (both spellings GKE uses for a static
+            # cluster) is what makes it a fact about the cluster: the reporter
+            # also resolves no target when its own `get-server-config` failed
+            # or omitted the channel, and that row is on a channel with a
+            # target nobody fetched this run, which the branch below records
+            # as unevaluated with the reporter's note saying so. The gate
+            # already required both version checks to have judged the
+            # cluster, so this declares nothing on a cluster nobody looked
+            # at. A budget on this row, blocking or clean, changes nothing
+            # here: the declaration reads no budget outcome, so it cannot
+            # flip with one and retire a finding it did not grade.
             entry.setdefault("checks_not_applicable", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": NOT_APPLICABLE_NO_TARGET_REASON})
             continue
-        elif no_target_row:
-            # The same row on a pool-only lag: the target matters only to the
-            # ceiling, which does not block the pool's move, and the one cause
-            # that can hold that move, a budget, was graded on a clean read and
-            # found nothing. The check ran and found nothing, so it goes to
-            # `commands`; a blocking budget on this row would be a candidate,
-            # and a declaration here would flip with it week to week.
+        elif no_target and not skew_blocked and not readiness.get("read_error") and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY):
+            # The same row on a lag a budget can hold (a behind control plane,
+            # or a pool behind its control plane): the target matters only to
+            # the ceiling, and the budget half, which applies, was graded on
+            # a clean read and found nothing. The check ran on the half that
+            # applies, so it goes to `commands`; a blocking budget on this row
+            # is a candidate, as on any behind cluster, and a failed read is
+            # unevaluated below. The check therefore never flips between
+            # declared and run as budgets come and go, and last week's
+            # finding retires only against a clean read this week.
             pass
         elif not skew_blocked and (readiness.get("read_error") or readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY)):
             # The reporter's own notes say why a row is `unknown`: the grade's

@@ -254,12 +254,18 @@ each is waiting for whoever schedules it.
   from either, has no upgrade whose completion could be blocked; a `RECONCILING` one,
   whose version checks §3 suppresses, is declared in the same case with its own reason (an
   upgrade is in flight; nothing further is due; the next run grades it once it has settled). A behind cluster on no release channel has an
-  upgrade but no target version for the reporter to grade it against, so its row comes back
-  `unknown` every week (the collector still reads its budget grade, and a blocking budget on it
-  is a candidate as on any behind cluster); the version finding stands on its own. The target
-  matters only to the skew ceiling, so when that cluster's only lag is a node pool behind its
-  control plane, the pool's move is what is due and a clean budget read is the check running
-  clean, in `commands`, not a declaration. The collector
+  upgrade but no target version for the reporter to grade the skew ceiling against, so its row
+  comes back `unknown` on a clean read every week; the collector still reads its budget grade,
+  and the version finding stands on its own. Which arm that row takes follows from which cause
+  can block the upgrade that is due, never from what the budget read found. Where a budget can
+  hold that upgrade (a behind control plane, or a pool behind its control plane) the check ran
+  on the half that applies: a clean read is the check running clean, in `commands`, and a
+  blocking budget is a candidate as on any behind cluster, so the check never flips between
+  declared and run as budgets come and go. The declaration is for the one lag where nothing
+  that applies could be graded: a static cluster whose only lag is a pool ahead of its control
+  plane, where the control-plane move drains no node, so no budget can hold it, and the ceiling
+  has no target to be graded against; a budget on that row, blocking or clean, changes nothing.
+  The collector
   writes `upgrade-blocked` into that entry's `checks_not_applicable` with the reason; copy the
   entry into the document's `checks_not_applicable` verbatim, or the ledger stays partial on a
   current fleet. It is the one check in this audit the collector ever declares inapplicable, and
