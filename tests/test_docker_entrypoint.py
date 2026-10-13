@@ -1005,7 +1005,9 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         )
         self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
         self.assertIn("config backfill", proc.stdout)
-        self.assertIn("User-Agent repair", proc.stdout)
+        # The shipped template's remote servers go through the credential proxy,
+        # so the repair syncs their whole argv and says so.
+        self.assertIn("MCP relay repair", proc.stdout)
         self.assertNotIn("WARN", proc.stderr)
 
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):

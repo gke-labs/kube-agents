@@ -329,7 +329,9 @@ def filter_tools_list(server_name: str, body: bytes) -> bytes | None:
     result["tools"] = [
         tool
         for tool in result["tools"]
-        if isinstance(tool, dict) and tool.get("name") in entry.tools
+        if isinstance(tool, dict)
+        and isinstance(tool.get("name"), str)
+        and tool["name"] in entry.tools
     ]
     result.pop("nextCursor", None)
     return json.dumps(reply, separators=(",", ":")).encode("utf-8")

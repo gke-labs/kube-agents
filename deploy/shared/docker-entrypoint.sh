@@ -739,6 +739,7 @@ if not isinstance(template_servers, dict) or not isinstance(live_servers, dict):
     raise SystemExit(0)
 
 repaired = []
+relayed = []
 for name, template_server in template_servers.items():
     live_server = live_servers.get(name)
     if not isinstance(template_server, dict) or not isinstance(live_server, dict):
@@ -757,7 +758,7 @@ for name, template_server in template_servers.items():
         if live_args != template_args or live_env != wanted_env:
             live_server["args"] = list(template_args)
             live_server["env"] = wanted_env
-            repaired.append(name)
+            relayed.append(name)
         continue
     if not isinstance(live_args, list):
         continue
@@ -774,7 +775,7 @@ for name, template_server in template_servers.items():
         live_args[live_slot] = wanted
         repaired.append(name)
 
-if repaired:
+if repaired or relayed:
     # Atomic, for the fill's reason and one more: a torn write of a cluster profile's
     # config.yaml loses `cluster_identity`, and the reconciler then scaffolds a
     # duplicate it can never prune.
@@ -782,7 +783,10 @@ if repaired:
     with open(tmp_path, "w") as fh:
         yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
     os.replace(tmp_path, live_path)
-    print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+    if repaired:
+        print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+    if relayed:
+        print(f"[ENTRYPOINT] MCP relay repair: {live_path} now takes the image's args and proxy token entry on {', '.join(relayed)}")
 UAEOF
 }
 

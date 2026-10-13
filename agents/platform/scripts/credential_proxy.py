@@ -2285,8 +2285,10 @@ class GoogleApiRelay:
     route answers 503 rather than the process refusing to come up.
 
     `AuthorizedSession` is deliberately not used. The upstream request is built
-    by hand in `fetch` so that exactly two headers leave this process and no
-    header the caller sent can ride along.
+    by hand in `fetch` so that the Cloud API relay sends exactly two headers and
+    no header the caller sent can ride along. The MCP relay passes `fetch` the
+    extra headers it chose itself (`_handle_mcp_relay` names them and the shape
+    each caller value must have); nothing is copied from the request wholesale.
 
     `connection` is the seam a test replaces with a plain HTTPConnection to a
     fake upstream; everything above it -- the header set, the deadline, the
@@ -8844,7 +8846,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except ValueError:
             content_length = -1
         if content_length <= 0 or content_length > self.max_request_bytes:
-            drain_request_body(self, self.max_request_bytes)
+            # Nothing to drain: a body over the cap is one drain_request_body
+            # declines, and an empty or unreadable length announces none.
             LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
             self._json(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,

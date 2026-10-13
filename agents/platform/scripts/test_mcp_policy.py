@@ -154,6 +154,12 @@ class FilterToolsListTest(unittest.TestCase):
         self.assertNotIn("nextCursor", filtered["result"])
         self.assertEqual(filtered["id"], 2)
 
+    def test_a_tool_with_an_unhashable_name_is_dropped_not_raised_on(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [
+            {"name": ["get_cluster"]}, {"name": {"x": 1}}, {"name": "get_cluster"}]}}).encode()
+        filtered = json.loads(mcp_policy.filter_tools_list("gke", body))
+        self.assertEqual([tool["name"] for tool in filtered["result"]["tools"]], ["get_cluster"])
+
     def test_an_error_reply_passes_unchanged(self):
         body = b'{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"x"}}'
         self.assertEqual(mcp_policy.filter_tools_list("gke", body), body)
