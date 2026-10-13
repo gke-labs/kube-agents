@@ -4,13 +4,13 @@ description: >-
   Authors Config Connector (KCC) manifests for Google Cloud resource changes
   and hands them to submit-suggestion as a pull request under the GitOps
   repository's clusters/<cluster>/provisioning/ path. Use when a request
-  changes a GKE cluster or node pool (grow, autoscale, adopt), a Cloud SQL
+  creates or changes a GKE cluster or node pool (create, grow, autoscale,
+  adopt), a Cloud SQL
   instance (add a read replica, resize), or a VPC firewall rule on an install
   whose GitOps repository holds Config Connector YAML. Decides create versus
   acquire read-only, validates every field with kubectl explain against the
   customer's CRDs, and never applies. Don't use for Kubernetes workload
-  manifests (use gke-manifest-generation), imperative cluster creation (use
-  gke-cluster-creation), or Terraform HCL.
+  manifests (use gke-manifest-generation) or Terraform HCL.
 ---
 
 # Config Connector (KCC) Authoring
@@ -25,9 +25,11 @@ command policy refuses the verbs that would.
 
 ## When to Use
 
-- **A GKE node pool or cluster change** — grow or shrink a pool, turn on
-  autoscaling, change a release channel or maintenance window, adopt a
-  cluster the repo does not yet describe.
+- **A new GKE cluster or node pool, or a change to one** — create a cluster
+  someone asked for, grow or shrink a pool, turn on autoscaling, change a
+  release channel or maintenance window, adopt a cluster the repo does not
+  yet describe. A new cluster is a create like any other: this skill, not a
+  `gcloud` or `gke` MCP create, is how it reaches the project.
 - **A Cloud SQL change** — add a read replica, change a tier, enable backups
   or high availability.
 - **A VPC firewall rule** — open or close a port, narrow a source range,
@@ -39,8 +41,6 @@ command policy refuses the verbs that would.
 
 - **Kubernetes workloads** (Deployments, Services, NetworkPolicies): the
   `gke-manifest-generation` skill.
-- **Creating a cluster imperatively** with the `gke` MCP tools or `gcloud`:
-  the `gke-cluster-creation` skill.
 - **A repository whose `provisioning/` holds Terraform HCL** rather than KCC
   YAML: say so and stop. This skill authors KRM only.
 - **Kinds outside the families catalogued in `references/`.** Other Config
@@ -219,7 +219,9 @@ kubectl explain containernodepool.spec.autoscaling.totalMaxNodeCount --api-versi
 
 Write the manifest into the workspace at
 `clusters/<cluster>/provisioning/<kind>-<name>.yaml`
-unless the siblings use another convention, and submit it through
+unless the siblings use another convention. A new `ContainerCluster` goes
+where the repository already keeps `ContainerCluster` manifests; if it keeps
+none, ask which path, rather than inventing one. Then submit it through
 **submit-suggestion** with branch `platform-agent/kcc-<kind>-<name>`. Use
 this shape for the `--body-file` document, after the skill's standard header:
 

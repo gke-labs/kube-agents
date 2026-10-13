@@ -1,0 +1,152 @@
+Subject: Route new clusters to a pull request in the repository format instead of `create_cluster` or `gcloud`
+
+Why: in this repository a new cluster reaches a project only as a pull request in the GitOps repository's own format (SOUL.md §3, items 6 and 7). The agent's gke MCP server offers no create tool and the broker refuses `gcloud container clusters create`, so step 6, the confirmation step and the template labels must not present either as the way to create a cluster. The templates stay as references for the manifest's settings.
+Local-Issue: #2937
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; upstream's skill is written for a user who creates clusters directly
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -18,7 +18,7 @@ providing a set of best-practice templates and guiding through mode selection
+ and customization. The **golden path Autopilot** configuration is the default
+ for all new clusters.
+ 
+-> **MCP Tools:** `list_clusters`, `create_cluster`, `get_cluster`,
++> **MCP Tools:** `list_clusters`, `get_cluster`,
+ > `list_operations`, `get_operation`
+ 
+ ## Workflow
+@@ -34,10 +34,17 @@ for all new clusters.
+     vs. Availability, Autopilot vs. Standard node management).
+ 4.  **Configure networking**: auto-create subnet (default) or bring-your-own.
+ 5.  **Review golden path settings**: present the default configuration block
+-    (`gcloud` command or `create_cluster` JSON payload) and confirm with the
+-    user before creation.
+-6.  **Create**: Use MCP `create_cluster` tool or `gcloud` CLI.
+-7.  **Track**: Use `get_operation` to monitor creation progress.
++    (the template's settings) as the configuration the pull request will
++    carry.
++6.  **Propose**: Write the configuration as a pull request in the format the
++    GitOps repository's `provisioning/` path already holds: Config Connector
++    YAML through the `gcp-config-connector` skill. A Terraform repository, an
++    empty `provisioning/` path, or no usable repository is a stated stop
++    (`SOUL.md` §3, items 6 and 7). Never create the cluster directly: the
++    `gke` MCP server offers no create tool, and the broker refuses
++    `gcloud container clusters create`.
++7.  **Track**: Once the pull request merges and the reconciler starts the
++    create, use `get_operation` to monitor its progress.
+ 8.  **Verify**: Use `get_cluster` with `readMask="*"` to confirm golden path
+     settings applied.
+ 
+@@ -107,7 +114,7 @@ practices:
+ This is the default. All settings match
+ `../gke-golden-path/assets/golden-path-autopilot.yaml`.
+ 
+-**Via gcloud:**
++**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
+ 
+ ```bash
+ gcloud container clusters create-auto <CLUSTER_NAME> \
+@@ -124,7 +131,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+   --quiet
+ ```
+ 
+-**Via MCP (`create_cluster`):**
++**Settings as API fields (a reference for the manifest):**
+ 
+ ```json
+ {
+@@ -154,7 +161,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+ Relaxes some golden path defaults for cost savings and easier access in
+ non-production.
+ 
+-**Via gcloud:**
++**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
+ 
+ ```bash
+ gcloud container clusters create-auto <CLUSTER_NAME> \
+@@ -164,7 +171,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+   --quiet
+ ```
+ 
+-**Via MCP (`create_cluster`):**
++**Settings as API fields (a reference for the manifest):**
+ 
+ ```json
+ {
+@@ -185,7 +192,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+ Best when Autopilot cannot be used (e.g., custom kernel tuning, specific node OS
+ requirements). Creates 3 nodes across zones by default.
+ 
+-**Via gcloud:**
++**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
+ 
+ ```bash
+ gcloud container clusters create <CLUSTER_NAME> \
+@@ -205,7 +212,7 @@ gcloud container clusters create <CLUSTER_NAME> \
+   --quiet
+ ```
+ 
+-**Via MCP (`create_cluster`):**
++**Settings as API fields (a reference for the manifest):**
+ 
+ ```json
+ {
+@@ -241,7 +248,7 @@ Best for: AI/ML Inference, small model serving. Can be provisioned via
+ Autopilot + ComputeClass or via Standard node pool with `g2-standard-4`
+ (`nvidia-l4`). *Note: Requires `g2-standard-4` quota.*
+ 
+-**Autopilot ComputeClass / GIQ approach:**
++**Autopilot ComputeClass / GIQ approach (settings as commands, a reference for the manifests, not commands to run):**
+ 
+ ```bash
+ # 1. Create golden path cluster (same as template 1)
+@@ -260,7 +267,7 @@ gcloud container ai profiles manifests create \
+ kubectl apply -f inference.yaml
+ ```
+ 
+-**Standard Node Pool approach via MCP (`create_cluster`):**
++**Standard node pool approach, as API fields (a reference for the manifest):**
+ 
+ ```json
+ {
+@@ -289,7 +296,7 @@ Best for: Large-scale LLM / AI model training and hypercompute inference. *Note:
+ High hourly cost and strict quota requirements (`a3-highgpu-8g` /
+ `nvidia-h100-80gb-hbm3`).*
+ 
+-**Via gcloud:**
++**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
+ 
+ ```bash
+ gcloud container clusters create <CLUSTER_NAME> \
+@@ -305,7 +312,7 @@ gcloud container clusters create <CLUSTER_NAME> \
+   --quiet
+ ```
+ 
+-**Via MCP (`create_cluster`):**
++**Settings as API fields (a reference for the manifest):**
+ 
+ ```json
+ {
+@@ -342,15 +349,13 @@ gcloud container clusters create <CLUSTER_NAME> \
+ -   **EXPLAIN TRADE-OFFS** when presenting templates or mode choices to the user
+     if they haven't specified one (e.g., Autopilot vs Standard, Cost vs
+     Availability).
+--   **PRESENT THE CONFIGURATION** block (`gcloud` command or JSON payload) and
+-    ask for confirmation before calling any creation tool.
++-   **PRESENT THE CONFIGURATION** in the pull request body, setting by
++    setting, so the reviewer approves the shape along with the change.
+ -   **WARN** about Day-0 decisions (networking, private nodes) that are hard to
+     change later.
+ -   **WARN** explicitly about cost and quota requirements when the user selects
+     GPU (`g2-standard-4`, `a3-highgpu-8g`), TPU, or multi-region/regional
+     clusters (`--region` defaults to 3 zones).
+--   When using MCP `create_cluster`, the `cluster.name` parameter should be the
+-    **short name** (e.g., `my-cluster`), not the full resource path
+-    (`projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>`). The
+-    `parent` parameter defines the scope
+-    (`projects/<PROJECT_ID>/locations/<REGION>`).
++-   A cluster's name is the **short name** (e.g., `my-cluster`), not the full
++    resource path
++    (`projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>`).
