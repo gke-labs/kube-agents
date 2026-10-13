@@ -125,42 +125,44 @@
 # established with eval-drift-workload, and no other case's card can produce
 # any of the three names. The namespace name is a prefix of the human
 # change's workload name (eval-drift-payments, eval-drift-payments-api) and
-# the prompt hands the agent the former, which is worth being explicit about:
-# the objective requires the contiguous workload name, which the prompt does
-# not contain and only the card supplies, so the provenance argument below
-# stands unchanged.
+# the prompt hands the agent the former. The prefix is still worth keeping:
+# it is what stops another case's card being mistaken for this one's.
 #
 # WHY THE CHURN IS IN A SECOND NAMESPACE
 #
-# Because the check that carries this case forbids the churned workload names
-# in the reply, and the card is written by an agent with cluster read access
-# that is told to use it. _drift_task_body in session_kv_server.py instructs
-# the Cluster Agent to read the live object before concluding anything, and
-# asks for a `## Why` section saying what that object shows now; an agent doing
-# that well in a namespace holding three Deployments may reasonably note that
-# the other two are unchanged, and the forbidden-phrase check would then red a
-# run in which the filter did its job. Putting the churn on workloads in a
-# namespace the drift card never points at removes the reason a correct report
-# would name them, and weakens nothing the check detects: Classify sorts by
-# principal and never reads a namespace, so the filter under test is the same
-# filter.
+# So the two populations are nameable separately -- the prompt can point the
+# agent at both without the plant having to distinguish them, and a reader of
+# a failing run can tell at a glance which namespace a card belongs to.
+# It buys nothing for the verdict: Classify sorts by principal and never
+# reads a namespace, so collapsing the two would leave the filter under test
+# the same filter.
 #
-# WHY THE FORBIDDEN PHRASES CARRY THE CASE
+# WHY THE AGENT'S REPORT IS NOT GRADED FOR THE NOISE
 #
-# Same hazard as the sibling. Requiring eval-drift-payments-api alone would
-# pass for an agent that ignored "do not diagnose anything yourself", listed
-# both namespaces and reported everything it saw. Forbidding the two churn
-# workloads is what distinguishes a report the pipeline filtered from a
-# report the agent wrote.
+# An earlier revision forbade the two churn workload names in the reply, on
+# the reasoning that a report naming them had been handed them by a card the
+# filter should not have passed. That was wrong, and a live run showed it:
+# the pipeline filtered correctly, the agent called nothing but kanban_list
+# and kanban_show, and the reply still named both -- because the card's own
+# author had cited them. _drift_task_body tells the Cluster Agent to read the
+# live object before concluding anything, and an agent justifying "revert to
+# 256Mi" may reasonably observe that neighbouring Deployments carry the same
+# limit. The check red a run in which everything worked.
 #
-# What makes that sound is that their names do not reach the agent except
-# through a card or a deliberate listing. The churn records are synthetic:
-# nothing writes to those two Deployments, so an agent reading managedFields
-# finds one manager and no drift on either. A report that names them was
-# handed them, and the only thing that hands them over is a card the filter
-# should not have let through. The two namespaces being separate is the
-# other half -- a card about eval-drift-payments-api gives the Cluster Agent
-# writing it no reason to reach into the other namespace.
+# Forbidding the churn PRINCIPALS instead does not rescue it. The three runs
+# on record name no principal at all -- not ada@example.com, and in two of
+# three not even kubectl-edit -- so a principal-based check would almost
+# never fire, which is worse than no check: it reports coverage it does not
+# have.
+#
+# So the noise is graded where it can be observed rather than inferred: the
+# stack reads the daemon's ledger and the detector's log for the churn ids it
+# minted, and fixture-observed-the-filter-held grades that. It is
+# quota-independent, agent-independent, and reds on every repetition a
+# broken filter touches rather than on the ones where the agent happened to
+# quote the card. What is lost is the end-to-end assertion that noise never
+# reached a human reader; whoever takes this case off the shelf should decide
+# whether that is worth a check that can distinguish the two routes.
 #
 # WHY THE VERDICT DOES NOT REST ON THE BOARD
 #
@@ -287,8 +289,7 @@
 # - Deployment eval-drift-payments-api (container name `api`) in
 #   eval-drift-payments; Deployments eval-drift-ledger-worker and
 #   eval-drift-checkout-web in eval-drift-platform. All three carry the
-#   prefix for the reason given above, and the two churned names are what
-#   the forbidden_phrases check keys on.
+#   prefix for the reason given above.
 # - eval-drift-payments-api's declared spec is owned by field manager
 #   argocd-controller, and declares resources.limits.memory 256Mi.
 #   expected_output requires the report to name that manager against the one
@@ -682,37 +683,6 @@ verification_spec:
       # that transcribed a number and named nothing.
       any_of_phrases: ["memory limit", "limits.memory"]
 
-  - name: triage-omits-the-controller-churn
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      # The discrimination CUJ 3 is about, and the only phrase objective an
-      # unfiltered pipeline is certain to fail. It is not what reds the
-      # repetition: the human record is published last, so on a broken filter
-      # its card is the newest and triage-names-the-human-change passes, and
-      # this one reds only if the agent read the board after a churn card
-      # landed. What reds a broken filter on every repetition is the safeguard
-      # below, which grades the stack's own observation rather than the
-      # report. Both workloads are named by this run's automation records and
-      # by nothing else: no write touches them, so the names reach the agent
-      # only through a card the filter let through or a deliberate listing of
-      # the second namespace.
-      #
-      # That second route is why the churn sits in a namespace of its own, and
-      # the header says so at length: a card about eval-drift-payments-api
-      # gives the Cluster Agent that writes it no reason to reach into the other
-      # namespace, so a thorough report cannot name these two by doing its job
-      # properly. In one shared namespace it could, and this check would red a
-      # working filter. The soundness of the check rests on that separation,
-      # so a stack that collapses the two namespaces has to re-found it.
-      #
-      # Whole workload names rather than a word like "autoscaler": a correct
-      # report may well explain that controller churn was excluded, and
-      # forbidding the concept would red the better answer. Naming the objects
-      # is what separates "explained the filter" from "was not given one".
-      forbidden_phrases: ["eval-drift-ledger-worker", "eval-drift-checkout-web"]
-
   - name: triage-delivers-an-actionable-report
     role: objective
     mode: assert
@@ -729,8 +699,9 @@ verification_spec:
       required_phrases: ["What to do"]
       any_of_phrases: ["Option A", "To authorize:"]
 
-  # The quota-independent half of triage-omits-the-controller-churn, read off
-  # the fixture's own observation rather than off the agent's report. The
+  # The whole of the noise grading, read off the fixture's own observation
+  # rather than off the agent's report -- see the header on why the report
+  # cannot carry it. The
   # header's "HOW THE STACK'S OWN OBSERVATIONS REACH THE VERDICT" has the
   # argument; what it comes to is that the stack watches the intercepted_events
   # ledger for a row carrying one of this run's churn insertIds, and that is

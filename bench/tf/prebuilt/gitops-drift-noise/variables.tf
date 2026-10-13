@@ -91,9 +91,10 @@ variable "human_container" {
 
 variable "churn_workloads" {
   description = <<-EOT
-    The Deployments the controllers churn. The forbidden_phrases check keys on
-    these two names: a report that lists either alongside the real change has
-    been handed unfiltered noise, which is the regression this case catches.
+    The Deployments the churn records name. Nothing writes to them -- the
+    records are synthetic and Classify reads the principal, not the object --
+    so they exist to give those records a plausible target and to keep the
+    churn nameable apart from the human change.
   EOT
   type        = list(string)
   default     = ["eval-drift-ledger-worker", "eval-drift-checkout-web"]
