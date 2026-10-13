@@ -358,8 +358,8 @@ suite once at the end: a run that ends red says so and exits non-zero.
 
 ## `chat/` holds data, not tests
 
-Each file in `chat/` pairs an input from a `today` presenter test with the
-`kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
+Each file in `chat/` pairs an input, lifted from a `today` presenter test or
+built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
 spec gives its chat message assertions (27 and 28) this directory as their
 home, but they are wire-format rules rather than security invariants, so
 `run.py` and the self-check never read these files. The Go tests in

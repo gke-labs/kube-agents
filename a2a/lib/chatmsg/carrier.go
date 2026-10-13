@@ -105,7 +105,9 @@ func ReadArtifact(c Carrier, chunks []lib.ArtifactUpdate) Reading {
 	var misplaced bool
 	for _, chunk := range chunks {
 		if !chunk.Append {
-			folded = nil
+			// The chunk replaces the artifact, so what an earlier one
+			// carried, chat message or misplacement, goes with it.
+			folded, chat, misplaced = nil, nil, false
 		}
 		folded = append(folded, chunk.Artifact.Parts...)
 		found := chatParts(chunk.Artifact.Parts)

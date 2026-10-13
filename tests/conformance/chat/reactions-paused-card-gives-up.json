@@ -1,7 +1,7 @@
 {
   "name": "reactions-paused-card-gives-up",
   "source": "deploy/docker/patches/test_slack_ux_reactions.py::DisplayTest.test_a_card_that_finishes_while_paused_takes_the_pause_off_with_the_arrival",
-  "notes": "A card that gives up while paused lifts the pause and the ask together and settles failed.",
+  "notes": "A card that gives up while paused lifts the pause and the ask together and settles failed. Today the arrival is a reaction with no message. On progress the mark rides beside that event's own text, the turn's first progress line: a progress chat message with no text beside it is dropped by the renderer, mark and all, so the emitter sends the mark on the first progress event that has text.",
   "input": {
     "events": [
       {

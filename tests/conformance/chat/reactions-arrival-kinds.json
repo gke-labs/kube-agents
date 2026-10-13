@@ -1,7 +1,7 @@
 {
   "name": "reactions-arrival-kinds",
   "source": "deploy/docker/patches/test_slack_ux_reactions.py::DisplayTest.test_the_arrival_reaction_is_the_asks_kind",
-  "notes": "mark.ask names the kind of ask, the token for today's arrival emoji. Each ask is its own chain.",
+  "notes": "mark.ask names the kind of ask, the token for today's arrival emoji. Each ask is its own chain. Today the arrival is a reaction with no message. On progress the mark rides beside that event's own text, the turn's first progress line: a progress chat message with no text beside it is dropped by the renderer, mark and all, so the emitter sends the mark on the first progress event that has text.",
   "input": {
     "events": [
       {

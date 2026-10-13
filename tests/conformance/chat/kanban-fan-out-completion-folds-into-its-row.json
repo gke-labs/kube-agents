@@ -1,7 +1,7 @@
 {
   "name": "kanban-fan-out-completion-folds-into-its-row",
   "source": "deploy/docker/patches/test_kanban_progress_lines.py::SlackMomentsHookTest.test_a_fanned_out_cards_completion_folds_into_its_row",
-  "notes": "A completed card under an open fan-out posts nothing of its own; its row carries the result. Failures and questions still post.",
+  "notes": "A completed card under an open fan-out posts nothing of its own; its row carries the result. Failures, questions and a PR the card opened still post: the cited test also asserts the PR-opened notice, which is the pr-opened case and not encoded here. The summary is the completed event payload, as the pipeline carries it, where the test passes the text as the message.",
   "input": {
     "rows": [
       {
