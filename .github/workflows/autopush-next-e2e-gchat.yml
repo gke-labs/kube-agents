@@ -10,10 +10,13 @@ name: "Autopush-Next: Google Chat E2E"
 # dispatch-only, targets autopush through repository-scoped secrets, and is
 # named as unguarded-by-design in .agents/rules/github_actions.md.
 #
-# Until autopush-next carries the three variables below, the run posts a
-# notice naming the missing ones and concludes success without touching GCP,
-# the way autopush-next-deploy.yml skipped an unprovisioned environment.
-# tests/e2e/README.md ("Running in GitHub Actions") lists what provisions them.
+# Until autopush-next carries the three variables below, the `ready` job posts
+# a notice naming the missing ones and the E2E job is skipped, so the run shows
+# a skipped test rather than a passing one. tests/e2e/README.md ("Running in
+# GitHub Actions") lists what provisions them. Drop the `ready` job once the
+# environment is provisioned, so an environment that later loses a variable
+# reds the run instead of skipping it, as autopush-next-deploy.yml says of its
+# own skip.
 #
 # Every variable comes from the autopush-next environment, and two settings have
 # a repository-scoped namesake that an environment-bound job still inherits
@@ -41,15 +44,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  e2e-gchat:
-    name: Google Chat E2E (autopush-next)
+  ready:
+    name: Check the E2E prerequisites (autopush-next)
     if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
     environment: autopush-next
-    timeout-minutes: 20
+    timeout-minutes: 5
     permissions:
       contents: read
-      id-token: write
+    outputs:
+      ready: ${{ steps.ready.outputs.ready }}
     steps:
       - name: Check the E2E prerequisites are configured
         id: ready
@@ -68,32 +72,43 @@ jobs:
             echo "ready=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          # A variable is not masked the way a secret is, and the test prints
-          # the space; a DM's id names one person's conversation with the app.
-          echo "::add-mask::${SPACE_ID}"
           echo "ready=true" >> "${GITHUB_OUTPUT}"
 
+  e2e-gchat:
+    name: Google Chat E2E (autopush-next)
+    needs: ready
+    if: github.repository == 'gke-labs/kube-agents' && needs.ready.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    environment: autopush-next
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # A variable is not masked the way a secret is, and the test prints the
+      # space; a DM's id names one person's conversation with the app.
+      - name: Mask the space id
+        env:
+          SPACE_ID: ${{ vars.E2E_CHAT_SPACE_ID }}
+        run: echo "::add-mask::${SPACE_ID}"
+
       - name: Checkout Repository
-        if: steps.ready.outputs.ready == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        if: steps.ready.outputs.ready == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
 
       - name: Install Python Dependencies
-        if: steps.ready.outputs.ready == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r tests/e2e/requirements.txt
 
       - name: Authenticate to Google Cloud
-        if: steps.ready.outputs.ready == 'true'
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ vars.E2E_GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -106,7 +121,6 @@ jobs:
       # GOOGLE_CHAT_ALLOW_ALL_USERS is true. 300s
       # rather than the release gate's 120 covers a cold first turn.
       - name: Execute E2E Test
-        if: steps.ready.outputs.ready == 'true'
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           CHAT_SPACE_ID: ${{ vars.E2E_CHAT_SPACE_ID }}
