@@ -1082,7 +1082,7 @@ MITIGATIONS = {
     4: {
         "title": "Data on the node is gone",
         "before": "Pods keeping state they cannot rebuild on Local SSD or emptyDir.",
-        "read_today": "nothing as an upgrade risk; the fleet waste audit reads `emptyDir` and `hostPath` volumes only as scale-down blockers",
+        "read_today": "the readiness report's data-on-the-node rule (`readiness_rules/node_local_state.py`), on every readiness run, as a risk; the fleet waste audit reads `emptyDir` and `hostPath` volumes only as scale-down blockers",
         "mitigate_before": "State on PersistentVolumes or object storage; node-local disk only for what can be rebuilt.",
         "mitigate_after": "Restore from the source of truth.",
     },
@@ -1138,7 +1138,7 @@ MITIGATIONS = {
     12: {
         "title": "A node label is removed",
         "before": "nodeSelector and affinity terms naming a label the target minor's kubelet or node image stops setting.",
-        "read_today": "nothing",
+        "read_today": "the readiness report's removed-node-label rule (`readiness_rules/removed_node_label.py`), on every readiness run, against the Node list: a drop a pool crosses in this upgrade blocks, an uncarried or deprecated label is a risk",
         "mitigate_before": "Replace deprecated labels in selectors with their GA names (kubernetes.io/arch, topology.kubernetes.io/zone).",
         "mitigate_after": "Patch the selector; the pods schedule.",
     },
@@ -1152,14 +1152,14 @@ MITIGATIONS = {
     14: {
         "title": "cgroup v2 under a runtime that cannot read it",
         "before": "A pool whose effectiveCgroupMode is v2 (or will be migrated at 1.33) running images with a JDK older than 8u372 or 11.0.16 or another runtime that reads cgroup v1 paths.",
-        "read_today": "nothing",
+        "read_today": "the readiness report's cgroup-v2-runtime rule (`readiness_rules/cgroup_v2_runtime.py`), on every readiness run, from the image tag and the pool's `effectiveCgroupMode`; the node's cgroup filesystem and the heap flags stay unread",
         "mitigate_before": "A runtime that reads cgroup v2 or explicit heap flags; until 1.35 a pool can be pinned to cgroup v1 to buy time.",
         "mitigate_after": "The same, plus a temporary limit increase.",
     },
     15: {
         "title": "The OOM killer starts killing the whole container",
         "before": "A kubelet at 1.28 or later on a cgroup v2 node and containers running more than one process.",
-        "read_today": "nothing",
+        "read_today": "the readiness report's group-oom-kill rule (`readiness_rules/group_oom_kill.py`), on every readiness run, as a heuristic on the command and the image; `memory.oom.group` and the process list stay unread",
         "mitigate_before": "Raise the limit for multi-process containers, split workers into their own containers, or set singleProcessOOMKill in the pool's node system config.",
         "mitigate_after": "The same; the container's own logs before the upgrade show which worker used to die.",
     },
@@ -1173,14 +1173,14 @@ MITIGATIONS = {
     17: {
         "title": "A node networking agent fails on the new image",
         "before": "The target node image's known issues; the CNI's dependence on node labels or kernel modules the image changes.",
-        "read_today": "nothing as an upgrade risk; the compliance audit flags an agent's host networking and host-path mount as security findings",
+        "read_today": "the readiness report's node-image-coupled-agent rule (`readiness_rules/node_image_coupled_agent.py`), on every readiness run, as a risk; the node image's release notes stay unread, and the compliance audit flags an agent's host networking and host-path mount as security findings",
         "mitigate_before": "Upgrade a canary pool first and watch Service routing from inside the cluster; surge with maxUnavailable 0.",
         "mitigate_after": "Downgrade the pool to the previous version while it is offered, and fix what the CNI selected on.",
     },
     18: {
         "title": "GPU driver mismatch",
         "before": "The driver the target node image ships against the CUDA version the images need, and whether the images carry forward-compatibility libraries.",
-        "read_today": "nothing reads a workload's CUDA pin; the upgrade plan hands the driver and CUDA compatibility check to the operator after at most a quick search",
+        "read_today": "the readiness report's gpu-driver rule (`readiness_rules/gpu_driver_mismatch.py`), on every readiness run, from the image tag and GKE's driver table; forward-compatibility libraries inside the image stay unread, and the upgrade plan still hands that check to the operator",
         "mitigate_before": "Match the driver to the images before the upgrade (GKE's driver table per version against NVIDIA's minimum-driver matrix); upgrade a canary GPU pool first.",
         "mitigate_after": "Recreate the pool with the driver version the images need.",
     },
@@ -1194,7 +1194,7 @@ MITIGATIONS = {
     20: {
         "title": "Images on a retired registry",
         "before": "Image references on a registry hostname that has stopped publishing (k8s.gcr.io) or that an egress allowlist no longer admits.",
-        "read_today": "nothing as an upgrade risk; the compliance audit reads image references for floating tags, not for retired hosts",
+        "read_today": "the readiness report's retired-registry rule (`readiness_rules/retired_registry.py`), on every readiness run, as a risk for the image references in use, since the hosts still answer a pull; the GitOps repository and the egress allowlists stay unread, and the compliance audit reads image references for floating tags only",
         "mitigate_before": "Mirror every image into a registry you own and keep egress allowlists in step.",
         "mitigate_after": "Retag or redirect the reference; the new nodes pull.",
     },

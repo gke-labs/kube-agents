@@ -369,11 +369,31 @@ note column does. The rules registered today, with the catalogue entry each read
   target, an unparsable pool version or quantity, or Nodes or Pods not read is unknown, and the
   rule can block, so that unknown moves the verdict. GKE's defaults (`maxSurge` 1,
   `maxUnavailable` 0) never trigger it.
+- **Data on the node** (`data-on-the-node`, entry 4). Deployments and StatefulSets are read for
+  state, not scratch: a StatefulSet's `emptyDir` (its identity survives the rebuild, its
+  node-local data does not), a `hostPath` a container mounts writable, a `hostPath` under a
+  Local SSD mount, or a claim (or a StatefulSet's claim template) on a StorageClass whose
+  provisioner is `kubernetes.io/no-provisioner` (how Local SSD becomes a PersistentVolume) is a
+  `risk`, named with the volume; a volume name that suggests state is marked. A Deployment's
+  `emptyDir`, a memory-backed `emptyDir` and a `hostPath` mounted read-only are notes.
 - **Zonal control plane** (`zonal-control-plane`, entry 11). A cluster whose `location` is a zone
   is a risk on every report, never a blocker: the Kubernetes API is unreachable for a short window
   while the single control-plane replica is rebuilt, running pods are unaffected, and the cell
   says what to do about it. A location that is neither a zone nor a region is unknown, and since
   the rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+- **Removed node label** (`removed-node-label`, entry 12). Every `nodeSelector` and required
+  node affinity term that selects nodes carrying a label (`In`, `Exists`) is read against the
+  Node list; `NotIn`, `DoesNotExist`, `Gt`, `Lt` and preferred terms never strand a pod and are
+  not graded. A label or label value in the drop table (`node-role.kubernetes.io/master` from
+  1.24, `cloud.google.com/gke-container-runtime=docker` from 1.24) is `blocking` only when a
+  pool the template can land on crosses the drop in this upgrade (its current minor below the
+  drop, the target at or past it); a drop every such pool passed already is a note, since the
+  pods either run or are already unschedulable and the upgrade changes neither. A label no
+  node in the template's pools carries today is a `risk`, and a deprecated beta label the
+  kubelet still sets (`beta.kubernetes.io/arch`, `failure-domain.beta.kubernetes.io/zone` and
+  their siblings) is a `risk`, named with its GA replacement. The carried question is not
+  asked on Autopilot, nor for a pool that is empty today and scales from zero (a note), and it
+  is `unknown` when the Node read failed.
 - **Container runtime** (`container-runtime`, entry 13). For each pool below the target, the
   containerd major its nodes report (`status.nodeInfo.containerRuntimeVersion`, or the table by the
   pool's minor when the nodes were not read) against the major the target's node image ships
@@ -384,6 +404,21 @@ note column does. The rules registered today, with the catalogue entry each read
   both majors and the clients' owners; a change with no client, and clients with no change, are
   notes; a change on a member whose Pods or DaemonSets were not read is unknown, and since the
   rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+- **cgroup v2 under an old runtime** (`cgroup-v2-runtime`, entry 14). A Java image tag below
+  JDK 8u372, 11.0.16 or 15, or a .NET image tag below 5.0, on a pool the target moves to
+  cgroup v2 (`effectiveCgroupMode` v1 and a target at or past GKE's 1.33 migration, or a pool
+  pinned to v1 and a target at or past the 1.35 removal) is a `risk`; a known runtime whose tag
+  names no version on such a pool, or a pool whose mode the record does not carry, is
+  `unknown`; a pool already on cgroup v2, or staying on v1 at the target, is a note.
+- **Group OOM kill** (`group-oom-kill`, entry 15). A heuristic, marked as one in every finding,
+  because the process count is not readable from the API: a container whose command or args
+  run `supervisord`, `s6-svscan` or `runsvdir`, whose shell `-c` script forks a background job,
+  or whose image is a documented multi-process base, on a pool where the target turns the group
+  kill on (a move to cgroup v2 at 1.28 or later, or a cgroup v2 pool's kubelet crossing 1.28)
+  is a `risk`, never `blocking`. A pool already group-killing, or one whose node config sets
+  `singleProcessOOMKill`, is a note. A `-c` script the rule cannot read (an unterminated
+  quote, heredoc or expansion) is `unknown` on a pool where a fork would have been a risk,
+  never clean.
 - **Network dataplane** (`network-dataplane`, entry 16). A cluster on the legacy dataplane
   (`networkConfig.datapathProvider` absent or `LEGACY_DATAPATH`) whose network policy add-on is off
   and whose namespaces carry NetworkPolicies is a risk naming the namespaces and their counts:
@@ -396,6 +431,27 @@ note column does. The rules registered today, with the catalogue entry each read
   all, so every legacy member states its dataplane and enforcement; a Dataplane V2 member is
   clean; a legacy member whose NetworkPolicies were not read is unknown, which never moves the
   verdict since the rule cannot block.
+- **Node-image-coupled agent** (`node-image-coupled-agent`, entry 17). A DaemonSet with
+  `hostNetwork: true`, outside the system namespaces, that selects on a
+  node-image label (`cloud.google.com/gke-os-distribution`,
+  `cloud.google.com/gke-container-runtime`), mounts the kernel module tree or the network
+  plugin's directories (`/etc/cni/net.d`, `/opt/cni/bin`, `/home/kubernetes/bin`), or runs
+  `modprobe` or `insmod`, is a `risk`; the detail names the pools below the target, whose image
+  this upgrade changes.
+- **GPU driver mismatch** (`gpu-driver`, entry 18). For a template requesting
+  `nvidia.com/gpu`, the CUDA version is read from the image tag or from the `CUDA_VERSION` or
+  `NVIDIA_REQUIRE_CUDA` env value (no other env: a compute-capability list is not a toolkit
+  version), and the driver from the pools carrying the accelerator the template selects: the
+  pool's `imageType` and `gpuDriverVersion` (`DEFAULT` or `LATEST`) pick a branch from GKE's
+  per-minor table at the target's minor. On Autopilot GKE provisions the node itself, on
+  Container-Optimized OS with the driver the template's `cloud.google.com/gke-gpu-driver-version`
+  selector names (`default` when absent), so the same table answers with no pool. A driver
+  below the CUDA major's floor is `blocking`; one below the toolkit's own minimum is a `risk`
+  (minor version compatibility); an image naming no CUDA version, or a Standard template whose
+  accelerator no pool carries, is a `risk`; a target the driver table does not cover (it ends
+  at 1.33 today, as GKE's GPU page does), an operator-installed driver, or a record with no
+  install mode is `unknown`. A pin the driver serves is a note, with the reminder that
+  forward-compatibility packages inside the image are not readable from the tag.
 - **In-tree volumes** (`in-tree-volumes`, entry 19). Every PersistentVolume with an in-tree
   `gcePersistentDisk` source, its claim, and the pods and templates that mount the claim, against
   `addonsConfig.gcePersistentDiskCsiDriverConfig.enabled`. With the add-on off, a volume a workload
@@ -404,6 +460,13 @@ note column does. The rules registered today, with the catalogue entry each read
   depends on the migration shim rather than on the driver. PersistentVolumes not read is unknown
   and, since the rule can block, moves the verdict; Pods not read is unknown too, with the
   templates still graded.
+- **Retired registry** (`retired-registry`, entry 20). A container or init container pulling
+  from `k8s.gcr.io`, `gcr.io/google-containers`, `gcr.io/google_containers` or
+  `gcr.io/kubernetes-helm` is a `risk`, named with the image, the host and what the host does
+  today: a rebuilt node has no image cache and pulls from a host that stopped publishing,
+  which still answers (`k8s.gcr.io` by a redirect to registry.k8s.io) until it does not. The
+  detail names the pools below the target, whose nodes this upgrade rebuilds, or says no pool
+  is below it yet.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read
