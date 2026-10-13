@@ -26,7 +26,9 @@ The trailer makes two rebindings:
   a base bump cannot turn every call into a ``TypeError``.
 - ``_Collector._claim_for_sub`` is wrapped so a claim for the routed platform
   loses its events older than the module's stale cutoff (the cursor still
-  advances past them).
+  advances past them), and a fanned-out child's answer folds into its
+  parent's (``fold_fanout``: held while the parent works, dropped once the
+  parent's answer is in, posted if the parent's never comes).
 
 Ordering. Runs after ``apply_kanban_notify_delivery.py``, which rewrites the
 claim in ``_claim_for_sub`` but leaves the ``active_platforms`` assignment and
@@ -65,6 +67,7 @@ TRAILER = (
     "\n\n# kube-agents patch: see gateway/kanban_chat_notify.py\n"
     "from gateway.kanban_chat_notify import (  # noqa: E402\n"
     "    active_platforms as _kage_chat_notify_active,\n"
+    "    fold_fanout as _kage_chat_notify_fold,\n"
     "    fresh_events as _kage_chat_notify_fresh,\n"
     "    resolve as _kage_chat_notify_resolve,\n"
     ")\n"
@@ -82,7 +85,8 @@ TRAILER = (
     "\n"
     "\n"
     "def _kage_claim_for_sub(self, *args, **kwargs):\n"
-    "    return _kage_chat_notify_fresh(_kage_upstream_claim_for_sub(self, *args, **kwargs))\n"
+    "    conn = args[0] if args else kwargs.get(\"conn\")\n"
+    "    return _kage_chat_notify_fold(conn, _kage_chat_notify_fresh(_kage_upstream_claim_for_sub(self, *args, **kwargs)))\n"
     "\n"
     "\n"
     "_Collector._claim_for_sub = _kage_claim_for_sub\n"

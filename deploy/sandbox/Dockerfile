@@ -455,6 +455,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
+#   fleet_scope_args.py    the two flags (`--scope-projects`, `--scope-unread`) the
+#                          fleet-audit collectors take the install's declared scope
+#                          by. The scope's snapshot sits on the agent pod's data
+#                          volume, which this container does not share, so the agent
+#                          reads it through the platform MCP server's fleet_scope tool
+#                          and passes the flags on; this module parses them
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
@@ -513,6 +519,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \

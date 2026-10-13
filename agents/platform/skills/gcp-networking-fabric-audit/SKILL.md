@@ -11,10 +11,12 @@ Audit Google Cloud VPC subnet IPAM allocation headroom, Cloud NAT port capacity,
 
 ## 1. Open the Run, Then Run the Collector
 
-Open the run first with the `fleet-audit` harness's `start` (SOP §0): `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then run the collector, which resolves the SOP §1 project scope itself and writes the run manifest:
+Open the run first with the `fleet-audit` harness's `start` (SOP §0): `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then call the platform_control `fleet_scope` tool (SOP §1) and run the collector with its `collector_args`, which hand it the install's declared scope; an install that declares none passes nothing and the collector resolves the SOP §1 project scope itself. It writes the run manifest:
+
+Call the platform_control `fleet_scope` tool first (SOP §1) and paste its `collector_args`; on an install that declares a scope the collector refuses a run without them, and a `--project-id` must name a project the tool lists.
 
 ```bash
-python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 ./skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
+python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 ./skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
 ```
 
 `draft` writes the findings document (`findings_gcp-networking-fabric-audit.json`) from the manifest. Write each `recommendation` and `remediation` in it. The manifest is not a findings document.

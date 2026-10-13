@@ -71,6 +71,17 @@ func fleetBody(t *testing.T) (body string, injected int64) {
 	return b.String(), injected
 }
 
+// sample is the one counter a single-counter scrape yielded.
+func (r usageReading) sample() int64 {
+	if len(r.Samples) != 1 {
+		panic(fmt.Sprintf("sample() on a reading with %d counters", len(r.Samples)))
+	}
+	for _, v := range r.Samples {
+		return v
+	}
+	return 0
+}
+
 func serveBody(t *testing.T, status int, body string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -96,12 +107,12 @@ func scrapeKind(t *testing.T, err error) string {
 func TestPodUsageSource_FoldsAFleetSizedBody(t *testing.T) {
 	body, injected := fleetBody(t)
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != injected {
-		t.Errorf("sample = %d, want the injected sum %d", reading.Sample, injected)
+	if reading.sample() != injected {
+		t.Errorf("sample = %d, want the injected sum %d", reading.sample(), injected)
 	}
 	if reading.StartTime == nil || *reading.StartTime != scrapeTestStartTime {
 		t.Errorf("start time = %v, want %v", reading.StartTime, scrapeTestStartTime)
@@ -128,12 +139,12 @@ func TestPodUsageSource_SumsTheBrokersCountedStatuses(t *testing.T) {
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterToolExecutions)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterToolExecutions})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != 47 {
-		t.Errorf("sample = %d, want 47 (success and error only)", reading.Sample)
+	if reading.sample() != 47 {
+		t.Errorf("sample = %d, want 47 (success and error only)", reading.sample())
 	}
 	if reading.StartTime != nil {
 		t.Errorf("a body without the gauge yielded a start time %v", *reading.StartTime)
@@ -158,19 +169,19 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != 7 {
-		t.Errorf("sample = %d, want 7", reading.Sample)
+	if reading.sample() != 7 {
+		t.Errorf("sample = %d, want 7", reading.sample())
 	}
 	if reading.Clusters == nil || reading.Clusters.Registered != 3 || reading.Clusters.Monitored != 2 {
 		t.Fatalf("clusters = %+v, want 3 registered and 2 monitored", reading.Clusters)
 	}
 
 	empty := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_events_injected_total counter\n")
-	reading, err = newPodUsageSource().Scrape(context.Background(), empty, usageCounterEventsIngested)
+	reading, err = newPodUsageSource().Scrape(context.Background(), empty, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape of a watcher body without the gauge: %v", err)
 	}
@@ -179,7 +190,7 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	}
 
 	broker := serveBody(t, http.StatusOK, "# TYPE kubeagents_tool_invocations_total counter\nkubeagents_tool_invocations_total{status=\"success\"} 1\n")
-	reading, err = newPodUsageSource().Scrape(context.Background(), broker, usageCounterToolExecutions)
+	reading, err = newPodUsageSource().Scrape(context.Background(), broker, []string{usageCounterToolExecutions})
 	if err != nil {
 		t.Fatalf("Scrape of the broker: %v", err)
 	}
@@ -188,7 +199,7 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	}
 
 	bad := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_cluster_up gauge\nk8s_event_watcher_cluster_up{cluster=\"a\"} NaN\n")
-	if _, err := newPodUsageSource().Scrape(context.Background(), bad, usageCounterEventsIngested); scrapeKind(t, err) != usageScrapeKindSample {
+	if _, err := newPodUsageSource().Scrape(context.Background(), bad, []string{usageCounterEventsIngested}); scrapeKind(t, err) != usageScrapeKindSample {
 		t.Errorf("a NaN cluster_up sample: %v, want kind %q", err, usageScrapeKindSample)
 	}
 }
@@ -202,14 +213,47 @@ func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
 		fmt.Fprintf(&b, "k8s_event_watcher_cluster_up{cluster=\"c%d\",location=\"l\",project=\"p\"} 1\n", i)
 	}
 	addr := serveBody(t, http.StatusOK, b.String())
-	if _, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested); scrapeKind(t, err) != usageScrapeKindSample {
+	if _, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested}); scrapeKind(t, err) != usageScrapeKindSample {
 		t.Errorf("a body past the gauge ceiling: %v, want kind %q", err, usageScrapeKindSample)
 	}
 	at := strings.TrimSuffix(b.String(), fmt.Sprintf("k8s_event_watcher_cluster_up{cluster=\"c%d\",location=\"l\",project=\"p\"} 1\n", usageClusterGaugeCeiling))
 	addr = serveBody(t, http.StatusOK, at)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil || reading.Clusters == nil || reading.Clusters.Registered != usageClusterGaugeCeiling {
 		t.Fatalf("a body at the ceiling: %+v, %v; want %d registered", reading.Clusters, err, usageClusterGaugeCeiling)
+	}
+}
+
+// One broker body yields every counter the broker feeds: the tool invocations
+// summed over the counted statuses and the proposals opened, which is the
+// version-control counter under verb proposal-create and status success alone.
+func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_tool_invocations_total counter",
+		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 4`,
+		"# TYPE kubeagents_vcs_requests_total counter",
+		`kubeagents_vcs_requests_total{verb="proposal-create",status="success"} 3`,
+		`kubeagents_vcs_requests_total{verb="proposal-create",status="error"} 2`,
+		`kubeagents_vcs_requests_total{verb="proposal-create",status="blocked"} 1`,
+		`kubeagents_vcs_requests_total{verb="proposal-list",status="success"} 9`,
+		`kubeagents_vcs_requests_total{verb="issue-create",status="success"} 5`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterRemediationsProposed] != 3 {
+		t.Fatalf("samples = %v, want 4 tool executions and 3 proposals", reading.Samples)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
+		t.Errorf("start time = %v", reading.StartTime)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("a broker body yielded a cluster reading: %+v", reading.Clusters)
 	}
 }
 
@@ -237,7 +281,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			addr := serveBody(t, tc.status, tc.body)
-			_, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+			_, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 			if err == nil {
 				t.Fatal("Scrape succeeded")
 			}
@@ -249,7 +293,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 	t.Run("a connection that failed", func(t *testing.T) {
 		// Port 1 has no listener, so the connection is refused, and the kind
 		// says so without quoting anything a peer sent.
-		_, err := newPodUsageSource().Scrape(context.Background(), "127.0.0.1:1", usageCounterEventsIngested)
+		_, err := newPodUsageSource().Scrape(context.Background(), "127.0.0.1:1", []string{usageCounterEventsIngested})
 		if err == nil || scrapeKind(t, err) != usageScrapeKindRefused {
 			t.Errorf("a refused connection: %v, want kind %q", err, usageScrapeKindRefused)
 		}
@@ -273,7 +317,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			_, _ = conn.Write([]byte("JUNK SECRET-STATUS-LINE\r\n\r\n"))
 			conn.Close()
 		}()
-		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageCounterEventsIngested)
+		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), []string{usageCounterEventsIngested})
 		if err == nil {
 			t.Fatal("a non-HTTP peer scraped successfully")
 		}
@@ -301,7 +345,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			}
 			conn.Close()
 		}()
-		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageCounterEventsIngested)
+		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), []string{usageCounterEventsIngested})
 		if err == nil {
 			t.Fatal("a peer that answered nothing scraped successfully")
 		}
@@ -324,7 +368,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		defer close(release)
 		source := newPodUsageSource()
 		source.client.Timeout = scrapeTestStallTimeout
-		_, err := source.Scrape(context.Background(), strings.TrimPrefix(srv.URL, "http://"), usageCounterEventsIngested)
+		_, err := source.Scrape(context.Background(), strings.TrimPrefix(srv.URL, "http://"), []string{usageCounterEventsIngested})
 		if err == nil || scrapeKind(t, err) != usageScrapeKindBodyTimeout {
 			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindBodyTimeout)
 		}
@@ -346,12 +390,12 @@ func TestPodUsageSource_SkipsAnOverLongLineOfAnotherFamily(t *testing.T) {
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != 5 {
-		t.Errorf("sample = %d, want 5 (the wanted line after the skipped over-long one)", reading.Sample)
+	if reading.sample() != 5 {
+		t.Errorf("sample = %d, want 5 (the wanted line after the skipped over-long one)", reading.sample())
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1700000000 {
 		t.Errorf("start time = %v, want 1700000000 (the gauge after the skipped over-long line)", reading.StartTime)
@@ -375,12 +419,12 @@ func TestPodUsageSource_SkipsAnOverLongLineWhoseLabelNamesAWantedSeries(t *testi
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape: %v (an over-long line of another family must be skipped, not fail, however its labels read)", err)
 	}
-	if reading.Sample != 5 {
-		t.Errorf("sample = %d, want 5 (the wanted line after the skipped hostile one)", reading.Sample)
+	if reading.sample() != 5 {
+		t.Errorf("sample = %d, want 5 (the wanted line after the skipped hostile one)", reading.sample())
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1700000000 {
 		t.Errorf("start time = %v, want 1700000000", reading.StartTime)
@@ -400,7 +444,7 @@ func TestPodUsageSource_DoesNotFollowRedirects(t *testing.T) {
 		http.Redirect(w, r, target.URL+usageMetricsPath, http.StatusFound)
 	}))
 	t.Cleanup(redirecting.Close)
-	_, err := newPodUsageSource().Scrape(context.Background(), strings.TrimPrefix(redirecting.URL, "http://"), usageCounterEventsIngested)
+	_, err := newPodUsageSource().Scrape(context.Background(), strings.TrimPrefix(redirecting.URL, "http://"), []string{usageCounterEventsIngested})
 	if err == nil || scrapeKind(t, err) != usageScrapeKindStatus {
 		t.Fatalf("redirect: err=%v, want kind %q", err, usageScrapeKindStatus)
 	}
@@ -424,12 +468,12 @@ func TestPodUsageSource_SkipsOtherLinesUnread(t *testing.T) {
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != 25 {
-		t.Errorf("sample = %d, want 25: leading blanks are skipped as expfmt skips them", reading.Sample)
+	if reading.sample() != 25 {
+		t.Errorf("sample = %d, want 25: leading blanks are skipped as expfmt skips them", reading.sample())
 	}
 }
 
@@ -443,12 +487,12 @@ func TestPodUsageSource_CountsAUTF8NamedLine(t *testing.T) {
 		eventsInjectedSeries + " 5",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, []string{usageCounterEventsIngested})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != 14 {
-		t.Errorf("sample = %d, want 14: the UTF-8 named line (9) plus the classic line (5)", reading.Sample)
+	if reading.sample() != 14 {
+		t.Errorf("sample = %d, want 14: the UTF-8 named line (9) plus the classic line (5)", reading.sample())
 	}
 }
 

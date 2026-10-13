@@ -71,7 +71,7 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8320 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 8832 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 23040 * 1024**2
 _DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
@@ -124,7 +124,7 @@ _MILLICORES_PER_CORE = 1000
 # of the one key an install raises (#2324). The preflight merges the override over the
 # entry per key, as the operator does, so only the overridden number moves.
 _PROXY_MEMORY_LIMIT_BYTES = 2 * 1024**3
-_PROXY_MEMORY_REQUEST_BYTES = 512 * 1024**2
+_PROXY_MEMORY_REQUEST_BYTES = 1024**3
 _PROXY_CPU_LIMIT_MILLIS = 1000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 3 * 1024**3
 _PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
@@ -1137,7 +1137,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10368Mi"', res.stderr)
+        self.assertIn('"memory":"10880Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""

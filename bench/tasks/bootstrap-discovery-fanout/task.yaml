@@ -4,8 +4,8 @@
 # the gate's hand-off writes the raw report and files the ranking card. One stack run grades both halves: stack cases run one at a time in the
 # nightly, so a second case for the hand-off would cost a second re-armed sweep.
 #
-# The sweep is not started by a conversation. The `bootstrap-inventory-scan`
-# cron job on the Planning Agent's profile files it once per install, together
+# The sweep is not started by a conversation. The `oobe` cron job's scan stage
+# on the Planning Agent's profile files it once per install, together
 # with one audit card per Cluster Agent. Nothing a chat prompt says reaches that
 # path, so the prompt below only reads the board; the grade comes from the
 # stack and the verifiers.
@@ -32,7 +32,7 @@
 #
 # The stack refuses an install where a person has connected: a fresh sweep
 # there ends in an onboarding report sent to their chat. It also refuses one
-# whose `bootstrap-inventory-scan` job is missing or paused, where nothing
+# whose `oobe` job is missing or paused, where nothing
 # would file the sweep.
 #
 # Isolation class: read-only on the cluster; it re-files the onboarding sweep

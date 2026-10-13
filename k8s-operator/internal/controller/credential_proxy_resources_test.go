@@ -69,7 +69,7 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 	for _, deployment := range []*agentv1alpha1.DeploymentSpec{nil, {}, {CredentialProxy: &agentv1alpha1.CredentialProxySpec{}}} {
 		got := resolveCredentialProxyResources(deployment)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
-		assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
+		assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
 		assertQuantity(t, got.Limits, corev1.ResourceMemory, "2Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
@@ -94,7 +94,7 @@ func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	got := container.Resources
 	assertQuantity(t, got.Limits, corev1.ResourceMemory, "3Gi")
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
-	assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
+	assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
 	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
 }
@@ -260,6 +260,18 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
+	}
+	// GKE Autopilot without bursting sets a container's limits equal to its
+	// requests, so there the broker reads the request as its limit. The
+	// request therefore has to clear the floor on its own, or the budget is
+	// off exactly where a default install runs and the broker admits by slot
+	// alone, with the out-of-memory exposure the budget exists to remove.
+	defaultRequest := resource.MustParse(credentialProxyMemoryRequest)
+	if floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); defaultRequest.Value() < floor {
+		t.Errorf("the default memory request %s is under the budget's %d MiB floor, so on Autopilot without bursting the budget is off", defaultRequest.String(), floor/mib)
+	}
+	if got := credentialProxyAdmittedRequests(defaultRequest.Value(), credentialProxyOutputCapBytes); got < credentialProxyMinimumAdmittedRequests {
+		t.Errorf("at its request the proxy admits %d requests, want at least %d: that is the figure on Autopilot without bursting", got, credentialProxyMinimumAdmittedRequests)
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != credentialProxyMemoryFloorBytesAtDefaultCap {
 		t.Errorf("floor = %d bytes, but credentialProxyMemoryFloorBytesAtDefaultCap declares %d; the declared copy the chart and the broker are compared with has drifted from the function", got, credentialProxyMemoryFloorBytesAtDefaultCap)

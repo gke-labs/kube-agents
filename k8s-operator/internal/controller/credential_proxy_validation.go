@@ -34,9 +34,9 @@ import (
 // vCPU, and raises the smaller request of the pair to reach the band
 // otherwise. The band applies to requests alone; limits Autopilot either sets
 // equal to the requests (no bursting) or keeps as declared (bursting),
-// whatever their ratio. The operator declares the proxy's default requests at
-// the lower edge of the band (500m and 512Mi) so the manifest it writes is the
-// pod Autopilot admits; a requests override that leaves the band is admitted
+// whatever their ratio. The operator declares the proxy's default requests
+// inside the band (500m and 1Gi, 2 GiB per vCPU) so the manifest it writes is
+// the pod Autopilot admits; a requests override that leaves the band is admitted
 // at figures the CR does not show, and the chart's quota preflight, which sums
 // the CR's figures, is short by the difference. A warning rather than a
 // refusal: the pod still runs, and on Standard nothing is resized at all.

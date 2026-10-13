@@ -23,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+import yaml
 from pathlib import Path
 
 from . import _harness as h
@@ -2063,16 +2065,20 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
                         cwd=root, capture_output=True, text=True,
                     )
                     self.assertEqual(accepted, result.returncode == 0, result.stdout + result.stderr)
-        # The step's whole body, so `|| true`, `continue-on-error` or an `if:`
-        # cannot sit beside the command and keep a failed check green.
-        step = re.search(
-            r"^( *)- name: Mirrored skills match their upstream copy and overlay\n"
-            r"((?:\1  .*\n)*)",
-            h.text("validate_workflow"),
-            re.M,
-        )
-        self.assertIsNotNone(step, "validate.yml has no mirrored-skills step")
-        self.assertEqual("run: make skills-check", step.group(2).strip())
+        # The whole step, parsed, so `|| true`, `continue-on-error` or an `if:`
+        # cannot sit beside the command and keep a failed check green. Parsed
+        # rather than matched line by line: YAML keeps a key in the step across
+        # blank lines and comments at any indent, which a line pattern misses.
+        # yaml.safe_load directly, not yaml_documents(), which refuses the
+        # file's `${{ }}` expressions on purpose.
+        step_name = "Mirrored skills match their upstream copy and overlay"
+        workflow = yaml.safe_load(h.text("validate_workflow"))
+        steps = [
+            s for job in workflow["jobs"].values() for s in job.get("steps", [])
+            if s.get("name") == step_name
+        ]
+        self.assertEqual(1, len(steps), "validate.yml needs exactly one mirrored-skills step")
+        self.assertEqual({"name": step_name, "run": "make skills-check"}, steps[0])
         self.assertRegex(
             h.text("makefile"), r"(?m)^skills-check:.*\n\t@?\$\(SKILL_OVERLAY\) check$"
         )

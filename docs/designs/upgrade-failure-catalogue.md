@@ -87,9 +87,10 @@ afterwards, how to prevent or repair it, and whether Google's own advisor for GK
 
 ## Status at a glance
 
-One row per entry, grouped by the reader that covers the entry's own failure on `main` today: a
-scheduled audit, one of the `fleet-upgrade-verification` skill's two scripts, or the assistant
-answering a question. Entry 10 sits in the second group for its node-pool half, and entry 7 for
+One row per entry. The first three tables group the entries by the reader that covers the entry's
+own failure on `main` today: a scheduled audit, one of the `fleet-upgrade-verification` skill's two
+scripts, or the assistant answering a question; the fourth lists all twenty against the two
+scheduled readers in review. Entry 10 sits in the second group for its node-pool half, and entry 7 for
 its webhook rule. Scenario links to the entry's
 section below. Reason says in plain words why the upgrade breaks it. Detection says which reader
 finds it and what a stock install ships for it: the cron jobs in `agents/platform/cron/jobs.json`
@@ -106,9 +107,11 @@ it, and the pull request that carries it when it is in review; the
 record of what is built, and this column adds the case and the in-review item. Every entry has one
 nightly evaluation case, registered where the column names one that grades the entry and planned otherwise, and the
 tables under "How each failure is tested" say row by row whether its fixture exists, so the column
-repeats neither. The
-in-review items are the one part of this section that changes as work merges; the column was last
-reconciled on 2026-10-10.
+repeats neither. Two
+parts of this section change as work merges: the column's in-review items, and the fourth table,
+"Gap to scheduled coverage", whose cells say what the daily readiness watch (#2708, in review) and the
+upgrade retrospective (#2729, in review) would cover before and after an upgrade and what is left to
+build. The column was last reconciled on 2026-10-13, the table on 2026-10-09.
 
 ### A scheduled audit files it, without anyone asking
 
@@ -144,6 +147,53 @@ reconciled on 2026-10-10.
 | [18. GPU driver mismatch](#18-gpu-driver-mismatch)                                                                                         | The new machine image ships a different GPU driver than the one the job's CUDA build needs, so the GPU cannot be opened.                                          | In conversation only; the upgrade plan hands the driver and CUDA check to the operator. Out of the box: no cron job and no script; the `gke-upgrades` skill's prose hands the check to the operator.                                                                                                                                                                                                                                                                                                                                                            | Match the driver to the images before the upgrade, from GKE's driver-per-version table and NVIDIA's minimum-driver matrix; upgrade a canary GPU pool first.            | Shipped: warnings in `agents/platform/skills/gke-upgrades/SKILL.md`.                                                                                                                           |
 | [19. In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path)                                                         | Disks attached the old way only work through a driver add-on; with the add-on off they stop attaching.                                                            | In conversation only; the waste audit reads disks for cost, not for how they are attached. Out of the box: no cron job and no script read attachment; the Monday `fleet-wide-cost-analysis` job's `fleet_waste.py` reads disks for cost only.                                                                                                                                                                                                                                                                                                                   | Enable the PD CSI driver add-on and move StorageClasses to `pd.csi.storage.gke.io`.                                                                                    | Nothing shipped.                                                                                                                                                                               |
 | [20. Images on a retired registry](#20-images-on-a-retired-registry)                                                                       | Old machines had the image cached; new machines must download it from a site that no longer publishes.                                                            | In conversation only; the compliance audit reads image references for floating tags (`image-floating-tag`), not for retired hosts. Out of the box: no cron job and no script read the registry host; the daily `compliance-audit` job's `collect.py` reads image references for floating tags only (`image-floating-tag`).                                                                                                                                                                                                                                      | Mirror every image into a registry you own (`images.json` and `make mirror-images` in this repository); keep egress allowlists in step.                                | Nothing shipped.                                                                                                                                                                               |
+
+### Gap to scheduled coverage
+
+The goal is that every entry is caught without a request. Two scheduled readers do that. The daily
+job `upgrade-readiness-watch` (#2708, in review) runs the readiness report's rules before an
+upgrade. The weekly job `upgrade-retrospective` (collector #2729 and design #2722, in review) runs
+after one; its collector matches symptoms to this list, and it also reads a set of risk shapes on
+every cluster it reviews and writes them as guards for the readiness watch to print. "Rule" means a
+rule in the readiness report, run daily with the target version known; the entry's own section says
+what such a rule reads (its "Before" line), the `fleet-upgrade-verification` skill's `SKILL.md` lists
+the rules built, and the [Scope table](upgrade-readiness-checks.md#scope) credits them. "Signature"
+means a row in the retrospective's symptom table (its design is in review). "Shape" means one of the
+collector's static risk reads. The "To build" column names the reader an entry still lacks, with a
+qualifier where one row needs it; the tables under "How each failure is tested" own which fixtures
+exist.
+
+| Entry | Before: daily readiness watch                                         | After: upgrade retrospective                                             | To build                                                                                                                                                     |
+| ----- | --------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1     | Budget rule shipped; the watch runs it.                               | Signature: a budget with no allowance on a drained node.                 | Nothing once the watch and the collector merge.                                                                                                              |
+| 2     | No rule: surge settings and headroom are not read.                    | Signature: Pending for capacity after a pool operation.                  | Rule (capacity headroom).                                                                                                                                    |
+| 3     | None; the daily obtainability audit files it on its own schedule.     | No signature; the design excludes it today.                              | Signature (a design change).                                                                                                                                 |
+| 4     | No rule.                                                              | No signature; shape: stateful `emptyDir` and local SSD volumes.          | Rule on the collector's shape, with the target known; the watch prints the collector's guard too.                                                            |
+| 5     | Maintenance rule shipped; the watch runs it.                          | No signature; the design excludes it today.                              | Signature (a design change).                                                                                                                                 |
+| 6     | GitOps scan on request only; audit-log stamps read in conversation.   | Signature: `no matches for kind`, a removed API named.                   | Rule (the exception below: no fixture of its own can be standing).                                                                                           |
+| 7     | Webhook rule in review (#2194).                                       | Signature: `failed calling webhook`.                                     | Nothing once #2194, the watch and the collector merge.                                                                                                       |
+| 8     | No rule: nothing reads a namespace's admission pin.                   | No signature.                                                            | Rule (changed defaults at the target minor).                                                                                                                 |
+| 9     | No rule: `k8s.io/deprecated` stamps read in conversation.             | No signature; nothing breaks yet.                                        | Rule (deprecated-API callers).                                                                                                                               |
+| 10    | Pool skew rule shipped; client and add-on skew not read.              | No signature.                                                            | Rule (client and add-on skew).                                                                                                                               |
+| 11    | No rule; the inventory records the location.                          | No signature.                                                            | Rule (zonal control plane, on every readiness report).                                                                                                       |
+| 12    | No rule.                                                              | Signature: a selector miss; shape: deprecated label prefixes.            | Rule (labels the target minor drops).                                                                                                                        |
+| 13    | Monday audit flags a stale image type; the socket client is not read. | No signature; shape: a DaemonSet mounting the container engine socket.   | Rule (container runtime change with socket clients).                                                                                                         |
+| 14    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool; shape: old runtime images.   | Rule (runtimes blind to cgroup v2).                                                                                                                          |
+| 15    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool, reported as 14 or 15.        | Rule (multi-process containers; a heuristic, since the process count is not readable from the API).                                                          |
+| 16    | Monday drift audit compares dataplanes; enforcement not read as risk. | No signature.                                                            | Rule (policies present but not enforced).                                                                                                                    |
+| 17    | No rule; the compliance audit flags host networking as security.      | Signature: nodes `NotReady`; shape: `hostNetwork` DaemonSets.            | Rule (node-image-coupled agents).                                                                                                                            |
+| 18    | No rule; the upgrade plan hands the check to the operator.            | Signature: driver and CUDA errors; shape: CUDA pins on GPU workloads.    | Rule, covering both directions the entry's section describes: a driver too old for the CUDA build, and forward-compatibility libraries under a newer driver. |
+| 19    | No rule.                                                              | Signature: volume affinity, attach and mount errors; shape: in-tree PDs. | Rule (in-tree persistent disks with the CSI add-on off).                                                                                                     |
+| 20    | No rule; the compliance audit reads floating tags, not retired hosts. | Signature: a pull failure on rebuilt nodes only; shape: retired hosts.   | Rule (images on retired registry hosts).                                                                                                                     |
+
+Two things cross every row. The fact tables the rules and the collector's shapes both read (dropped
+labels, runtime floors, retired hosts, driver and CUDA support) go in one module in the
+`fleet-upgrade-verification` skill, built with the first rules. The watch reading the collector's guards is its own change,
+after the collector merges. Every rule lands with unit tests and a nightly case graded on a declared
+line. Entry 6 is the exception: no fixture of its own can be standing (its section says why), so its
+rule is unit-tested on a captured audit-log sample and its live stand-in is entry 9's
+`deprecated-api-caller`. As the work merges, a cell here becomes "Nothing" and the entry's row above moves
+to the reader that files it.
 
 ## The list
 
@@ -613,8 +663,8 @@ misreads its limit.
 A new version can change how NetworkPolicy is enforced, which DNS serves the cluster, or how a
 specific flow is handled.
 
-- Before: dataplane and DNS provider, policy count, the known issues for the target version.
-- Where to look: the GKE API for the dataplane and DNS provider; the Kubernetes API for the policy count; the target version's known-issue notes.
+- Before: dataplane and DNS provider, whether the cluster enforces NetworkPolicy today (`networkPolicy.enabled`, or Dataplane V2, which always enforces), the policies present where nothing enforces them, the known issues for the target version.
+- Where to look: the GKE API for the dataplane, the DNS provider and the enforcement setting; the Kubernetes API for the NetworkPolicy objects per namespace; the target version's known-issue notes.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
 - Mitigate before: rehearse the target version on a staging cluster with the same dataplane, and keep NetworkPolicy explicit rather than relying on defaults.
 - Mitigate after: a completed node pool can be downgraded in place to the previous version while GKE still offers it; the control plane cannot go back.
@@ -819,8 +869,9 @@ test shows the assistant finds it reliably.
 
 ## The order to add checks
 
-The order is by how often each failure appears in the public record and how cheap its signal is to
-read. GKE's recommender comes first, because one call per location returns the deprecation insights
+An entry's own section says what its check reads, and the gap table above says which entries still
+lack a scheduled reader; this section records only the order and why. The order is by how often
+each failure appears in the public record and how cheap its signal is to read. GKE's recommender comes first, because one call per location returns the deprecation insights
 (6) together with the budget (1), webhook (7), skew (10), runtime (13) and network-policy (16)
 insights and the maintenance-window recommendation (5); the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
@@ -828,7 +879,8 @@ the pause the deprecation family puts on automatic upgrades explains. Fail-close
 the unread half of capacity headroom (2), surge settings and headroom against allocatable, come
 next, because both turn a routine drain into an outage and both are a few list calls. Replica
 placement (3) is already read. The node-image entries (12 to 20) follow, which need the target
-version to be known before they mean anything. Post-upgrade detection is one mechanism for every
-entry: watch the operation, then compare Pending and crash-looping pod counts and a live service
-probe against the same measurements taken before the upgrade started, as the readiness requirements'
-[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies.
+version to be known before they mean anything. After an upgrade, two reads divide the work: the readiness requirements'
+[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies the generic one,
+watch the operation and compare Pending and crash-looping pod counts and a live service probe
+against the same measurements taken before the upgrade started, which says that something broke;
+the retrospective's per-entry signatures (the gap table's "After" column) say which entry it was.
