@@ -25,7 +25,6 @@ printed one.
 from __future__ import annotations
 
 import base64
-import repo_ref
 import functools
 import json
 import os
@@ -133,39 +132,25 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 
 @functools.lru_cache(maxsize=1)
 def _registered_urls() -> dict[str, str]:
-    """Bare `owner/name` -> the URL it was registered under, for GitHub entries.
+    """Map each bare `owner/name` to the URL of its GitHub registration.
 
-    The managed and context lists, from the mounted state file, read once per
-    process. Only a GitHub entry registered by URL counts, and only a name no
-    other forge's entry also spells: which forge an ambiguous name means is
-    not this client's to decide. No file, or an unreadable one, answers
-    empty, so every name is sent as written -- the broker's own refusal is
-    then the answer. The URL is the registration's own text: this client
-    composes no forge URL, which is the broker's allowlist to decide.
+    The function reads the managed list and the context list from the
+    mounted state file, one time for each process. It applies
+    `gitops_workspace.sendable_github_slugs`. `get_managed_repos` applies the
+    same rule. Thus the client can send each name that the list keeps bare.
+    If the file is missing or unreadable, the map is empty. Then the client
+    sends every name as written, and the refusal of the broker is the
+    answer. The URL is the text of the registration. This client does not
+    make a forge URL, because the allowlist of the broker controls that.
     """
     import gitops_workspace
 
     # The mounted file only: this runs on every verb, and the kubectl fallback
     # the full readers have would put a subprocess on each one.
-    entries = gitops_workspace.mounted_repo_entries(
-        gitops_workspace.MANAGED_REPOS_KEY
-    ) + gitops_workspace.mounted_repo_entries(gitops_workspace.CONTEXT_REPOS_KEY)
-    github: dict[str, str] = {}
-    other: set[str] = set()
-    for entry in entries:
-        url = str(entry.get("url") or "").strip()
-        if str(entry.get("type") or "") == gitops_workspace.GITHUB_REPO_TYPE:
-            slug = gitops_workspace.extract_github_slug(url)
-            if slug and "://" in url:
-                github.setdefault(slug.lower(), url)
-        else:
-            # The one repository parser, not a split by hand: an scp remote
-            # (`git@host:group/name.git`) has no `/` after the host, and a
-            # hand split read it as `name` and missed the collision.
-            ref = repo_ref.try_parse(url)
-            if ref is not None:
-                other.add("/".join(ref.segments).lower())
-    return {slug: url for slug, url in github.items() if slug not in other}
+    return gitops_workspace.sendable_github_slugs(
+        gitops_workspace.mounted_repo_entries(gitops_workspace.MANAGED_REPOS_KEY)
+        + gitops_workspace.mounted_repo_entries(gitops_workspace.CONTEXT_REPOS_KEY)
+    )
 
 
 def _on_the_wire(repository: object) -> object:

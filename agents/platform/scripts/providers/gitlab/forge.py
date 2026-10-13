@@ -113,8 +113,9 @@ class GitLabForge(Forge):
     # named gap rather than "not a forge this install serves".
     default_hosts = ("gitlab.com",)
     unconfigured = (
-        "no credential is configured for gitlab.com: declare a gitlab forge with "
-        "a credentialsRef on the PlatformAgent",
+        "no credential is configured for gitlab.com: declare a gitlab forge in "
+        "the PlatformAgent's spec.integration.forges, with a credentialsRef "
+        "naming a Secret that holds the access token under the key `token`",
     )
 
     def __init__(

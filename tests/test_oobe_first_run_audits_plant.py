@@ -46,6 +46,52 @@ def render(script: str) -> str:
     """A provisioner's bash as Terraform hands it over, every interpolation a placeholder."""
     return re.sub(r"(?<!\$)\$\{[^}]*\}", "X", script).replace("$${", "${")
 
+
+def run_script_in_process(path: pathlib.Path, args: list[str], env: dict, extra_path: str | None = None) -> subprocess.CompletedProcess:
+    """Run a script the way `python3 - <args> < script` does, in this process so coverage sees it.
+
+    Its argv, environment and stdout/stderr are its own for the call, and a ``cron`` stub on
+    ``extra_path`` is imported fresh. SystemExit becomes the return code, as the CLI's would be.
+    """
+    import contextlib
+    import io
+    import runpy
+
+    saved_argv, saved_env, saved_path = sys.argv, dict(os.environ), list(sys.path)
+    saved_mods = {name: mod for name, mod in sys.modules.items() if name == "cron" or name.startswith("cron.")}
+    for name in saved_mods:
+        del sys.modules[name]
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    try:
+        sys.argv = ["-", *args]
+        os.environ.clear()
+        os.environ.update(env)
+        if extra_path:
+            sys.path.insert(0, extra_path)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                runpy.run_path(str(path), run_name="__main__")
+            except SystemExit as exc:
+                if isinstance(exc.code, str):
+                    err.write(exc.code + "\n")
+                    code = 1
+                else:
+                    code = exc.code or 0
+            except Exception:  # noqa: BLE001 - the interpreter would print it and exit 1
+                import traceback
+
+                traceback.print_exc(file=err)
+                code = 1
+    finally:
+        sys.argv = saved_argv
+        os.environ.clear()
+        os.environ.update(saved_env)
+        sys.path[:] = saved_path
+        for name in [n for n in sys.modules if n == "cron" or n.startswith("cron.")]:
+            del sys.modules[name]
+        sys.modules.update(saved_mods)
+    return subprocess.CompletedProcess(["-", *args], code, out.getvalue(), err.getvalue())
+
 CRON_JOBS_STUB = textwrap.dedent(
     """
     import contextlib, json, os
@@ -119,11 +165,7 @@ class PlantScriptsTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _run(self, script: str, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [sys.executable, "-", *args],
-            input=(STACK / script).read_text(),
-            capture_output=True, text=True, env=self.env, check=False,
-        )
+        return run_script_in_process(STACK / script, list(args), self.env, str(self.stubs))
 
     def _arm(self, shipped: pathlib.Path | None = None) -> subprocess.CompletedProcess:
         return self._run("arm.py", str(self.home), str(self.hermes), "20261006200000", str(shipped or self.shipped))
@@ -159,6 +201,9 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual([a[2] for a in archives], state["cards"])
         marker = (self.home / ".bootstrap_scan_filed").read_text()
         self.assertTrue(marker.startswith(f"task_id={state['cards'][0]}\nfiled_at="))
+        # The hand-off's record of the stand-in ranking card, which is all the stage reads it from.
+        handoff = (self.home / ".bootstrap_handoff_filed").read_text()
+        self.assertTrue(handoff.startswith(f"sweep={state['cards'][0]}\ntask_id={state['cards'][1]}\nfiled_at="))
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
         self.assertEqual(state["scan_marker"], "task_id=t_real\nfiled_at=1\n")
         self.assertEqual(state["audits_marker"], '{"done": true}\n')
@@ -205,12 +250,14 @@ class PlantScriptsTest(unittest.TestCase):
 
     # --- disarm -----------------------------------------------------------------
 
-    def test_disarm_restores_both_markers_and_removes_the_job_it_added(self):
+    def test_disarm_restores_the_markers_and_removes_the_job_it_added(self):
         (self.home / ".bootstrap_scan_filed").write_text("task_id=t_real\nfiled_at=1\n")
+        (self.home / ".bootstrap_handoff_filed").write_text("sweep=t_real\ntask_id=t_rank\nfiled_at=2\n")
         self.assertEqual(self._arm().returncode, 0)
         done = self._run("disarm.py", str(self.home), str(self.hermes))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual((self.home / ".bootstrap_scan_filed").read_text(), "task_id=t_real\nfiled_at=1\n")
+        self.assertEqual((self.home / ".bootstrap_handoff_filed").read_text(), "sweep=t_real\ntask_id=t_rank\nfiled_at=2\n")
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
         self.assertNotIn("oobe", self._jobs())
         self.assertFalse((self.home / ".bench-oobe.json").exists())
@@ -220,7 +267,18 @@ class PlantScriptsTest(unittest.TestCase):
         (self.home / ".oobe_audits_fired").write_text('{"done": true}\n')
         self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
         self.assertFalse((self.home / ".bootstrap_scan_filed").exists())
+        self.assertFalse((self.home / ".bootstrap_handoff_filed").exists())
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
+
+    def test_disarm_of_an_arm_that_predates_the_hand_off_record_leaves_it(self):
+        # A state file written before arm.py recorded the hand-off marker: nothing to put back.
+        self.assertEqual(self._arm().returncode, 0)
+        state = self._state()
+        del state["handoff_marker"]
+        (self.home / ".bench-oobe.json").write_text(json.dumps(state))
+        (self.home / ".bootstrap_handoff_filed").write_text("sweep=t_real\ntask_id=t_rank\n")
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
+        self.assertEqual((self.home / ".bootstrap_handoff_filed").read_text(), "sweep=t_real\ntask_id=t_rank\n")
 
     def test_disarm_keeps_a_job_it_did_not_add(self):
         self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))

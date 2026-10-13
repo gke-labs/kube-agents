@@ -12,7 +12,8 @@ terraform {
       source  = "hashicorp/google-beta"
       version = ">= 5.30, < 8.0"
     }
-    # time_sleep, for the destroy-time wait between deleting the sink and
+    # time_sleep, twice: the apply-time wait for the Logging service agent to
+    # become bindable, and the destroy-time wait between deleting the sink and
     # deleting the topic it exports to.
     time = {
       source  = "hashicorp/time"

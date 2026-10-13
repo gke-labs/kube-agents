@@ -48,7 +48,7 @@ func authMapTestAgent() *agentv1alpha1.PlatformAgent {
 
 func TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne(t *testing.T) {
 	agent := authMapTestAgent()
-	cm, version, err := buildA2AAuthMapConfigMap(agent)
+	cm, version, err := buildA2AAuthMapConfigMap(agent, nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
 	}
@@ -89,11 +89,11 @@ func TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne(t *testing.T)
 // moves. A version that churns makes BusCredentialsReady flap; one that does
 // not move on a real change makes it lie.
 func TestTheMapVersionNamesTheContent(t *testing.T) {
-	first, err := renderA2AAuthMap(authMapTestAgent())
+	first, err := renderA2AAuthMap(authMapTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("renderA2AAuthMap: %v", err)
 	}
-	second, err := renderA2AAuthMap(authMapTestAgent())
+	second, err := renderA2AAuthMap(authMapTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("renderA2AAuthMap: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestTheMapVersionNamesTheContent(t *testing.T) {
 	// a real change to who the map authenticates.
 	other := authMapTestAgent()
 	other.Namespace = "somewhere-else"
-	moved, err := renderA2AAuthMap(other)
+	moved, err := renderA2AAuthMap(other, nil)
 	if err != nil {
 		t.Fatalf("renderA2AAuthMap: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestTheMapKeysOnTheServiceAccountTheProvisionJobRunsAs(t *testing.T) {
 	}
 	want := "system:serviceaccount:" + agent.Namespace + ":" + sa
 
-	doc, err := renderA2AAuthMap(agent)
+	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("renderA2AAuthMap: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestTheMapKeysOnTheServiceAccountTheProvisionJobRunsAs(t *testing.T) {
 // silently undoes it. Every subject list here is full of > wildcards and the
 // escaped form is what an operator would be reading at 3 AM.
 func TestTheRenderedMapIsReadable(t *testing.T) {
-	cm, _, err := buildA2AAuthMapConfigMap(authMapTestAgent())
+	cm, _, err := buildA2AAuthMapConfigMap(authMapTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestTheRenderedMapIsReadable(t *testing.T) {
 // its own test suite, with unknown fields refused, so a field renamed here
 // without being renamed there fails on the other side of the repo.
 func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
-	cm, _, err := buildA2AAuthMapConfigMap(authMapTestAgent())
+	cm, _, err := buildA2AAuthMapConfigMap(authMapTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
 	}
@@ -274,7 +274,7 @@ func a2aNormaliseKeyLine(conf, prefix, keyPrefix string) string {
 // rendered. The operator reports it is serving a map that was rejected, and
 // goes on reporting it until someone reads the callout's own /status.
 func TestTheRenderedMapSatisfiesTheCalloutsOwnRules(t *testing.T) {
-	doc, err := renderA2AAuthMap(authMapTestAgent())
+	doc, err := renderA2AAuthMap(authMapTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("the map this operator renders today does not satisfy the callout's rules: %v", err)
 	}
@@ -384,6 +384,7 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 var a2aIdentityMapSchemaKeys = map[string][]string{
 	"1": {"account", "grants", "identities", "publish", "serviceAccount", "subscribe", "user", "version"},
 	"2": {"account", "grants", "identities", "narrowing", "publish", "serviceAccount", "subscribe", "user", "version"},
+	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -412,7 +413,13 @@ func a2aJSONKeys(v any, into map[string]bool) {
 func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
 	agent := a2aTestAgent()
 
-	cm, _, err := buildA2AAuthMapConfigMap(agent)
+	// With a profile that has topics, so every key the renderer can emit is
+	// emitted: a map rendered with no profiles would pass on the old schema
+	// and roll nothing.
+	cm, _, err := buildA2AAuthMapConfigMap(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Bus.PublishTopics = []string{"agent.auditor.findings"}
+		p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint"}
+	})})
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}

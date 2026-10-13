@@ -205,15 +205,18 @@ error (exit 2).
 ```bash
 ./skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py \
   --versions /opt/data/scratch/fleet_versions.json --target-version <version> \
-  [--repo <owner/name>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
+  [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
 ```
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
   enter into it. `--current-version <version>` replaces the file when there is none.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
-- Without `--repo` the script scans every GitHub repository under `managed_repos`, the same
-  list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
+- Without `--repo` the script scans every repository under `managed_repos`, on every forge, the
+  same list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
+  A repository on another forge than GitHub is named `host/path`, as the list names it, and is read
+  through the content workspace only: on a broker not armed for content-passing it is listed under
+  errors, because the leased checkout reaches GitHub alone.
   `--manifests-dir` scans a local tree instead of, or as well as, repositories.
 - It reads each repository the way `inspect-repository` does: through the credential broker's
   content workspaces as a shallow read-only clone, or, on an install whose broker is not armed

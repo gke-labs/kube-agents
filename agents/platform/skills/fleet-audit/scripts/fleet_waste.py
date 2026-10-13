@@ -99,10 +99,11 @@ TIMEOUT_RC = 124
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
-# reads -- so this drops back to the 8 every other collector in the stream
-# uses, which also keeps the shared Monitoring session inside urllib3's
-# default connection pool.
-MAX_WORKERS = 8
+# reads -- so this is the figure every other collector in the stream uses,
+# the credential proxy's admitted count at the operator's default limit
+# (collect.py's MAX_WORKERS comment has the reasoning), which also keeps the
+# shared Monitoring session inside urllib3's default connection pool.
+MAX_WORKERS = 4
 
 # What the manifest calls a target. A GKE name is unique only inside one
 # project and location, so every cluster is `<project>/<location>/<name>`, and

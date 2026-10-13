@@ -52,7 +52,8 @@
 # `.bootstrap_completed` and put back either job the delivery removed, from
 # those records; `state_file` existing is what says this stack armed it. An
 # apply that finds `state_file` left by an earlier run finishes that teardown
-# before its own checks.
+# before its own checks. The teardown and the exit trap also resolve the
+# planted findings the worker registered in the findings queue (`resolve_py`).
 
 terraform {
   required_version = ">= 1.5.0"
@@ -70,39 +71,38 @@ locals {
   python   = "/opt/hermes/.venv/bin/python3"
   key_like = "bootstrap-inventory-%"
   raw_file = "${local.home}/INVENTORY.raw.md"
+  # bootstrap_handoff.py's LIMITS_PATH, the pacing limits `inventory_findings.py
+  # select` reads.
+  limits_file = "${local.home}/INVENTORY.limits.json"
+  # Where the agent pod keeps the hand-off and the findings scripts.
+  scripts = "${local.home}/scripts"
   # Every file this plant, the prioritization stage and delivery write, on
   # either pod.
   inventory = join(" ", [for name in [
     "INVENTORY.raw.md",
     "INVENTORY.raw.md.tmp",
+    "INVENTORY.limits.json",
+    "INVENTORY.limits.json.tmp",
     "INVENTORY.md",
     "INVENTORY.md.tmp",
     "INVENTORY.items.json",
     "INVENTORY.scores.json",
+    "INVENTORY.shown.json",
+    "INVENTORY.shown.json.tmp",
     "INVENTORY.delivered.md",
+    "INVENTORY.shown.delivered.json",
   ] : "${local.home}/${name}"])
-  # Base64, so the report and the card body cross two shells and kubectl
-  # untouched.
+  # Base64, so the report crosses two shells and kubectl untouched.
   raw_b64 = base64encode(file("${path.module}/inventory-raw.txt"))
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and
   # the card agents/chat/scripts/bootstrap_handoff.py files: this plant stands
-  # in for the hand-off.
+  # in for the hand-off. The body is the install's own `_prioritize_body()`,
+  # read when the card is filed, so the worker gets the hand-off's words.
   card_key      = "bootstrap-inventory-prioritize"
   card_assignee = "platform"
   card_title    = "Prioritize the onboarding inventory report"
-  card_body_b64 = base64encode(<<-EOB
-    Rank the onboarding discovery sweep's findings into the report the user receives.
-
-    Follow the prioritization SOP, reading whichever of these exists:
-      - /opt/data/profiles/platform/governance/inventory_prioritize_sop.md
-      - /opt/platform-template/governance/inventory_prioritize_sop.md
-
-    Read /opt/data/INVENTORY.raw.md as your only input, and write the ranked report to
-    /opt/data/INVENTORY.md.
-  EOB
-  )
-  run_wait = 900
-  poll     = 15
+  run_wait      = 900
+  poll          = 15
   # deploy/docker/patches/kanban_guardrail_exit.py: RATE_LIMIT_REASON_PREFIX,
   # the start of the summary on a run the rate-limit guardrail blocked.
   rate_limit_block = "provider rate limit: API retries exhausted"
@@ -156,7 +156,45 @@ locals {
     open("${local.home}/.user_aligned", "x").close()
     print("armed")
   EOP
-  disarm_py   = <<-EOP
+  # Resolves every finding in the raw report's block that the worker or the
+  # delivery job registered, so the findings nudge does not bring the planted
+  # ones to chat after the case and the next run registers them as new. A
+  # finding the queue does not hold (404) was never registered, as when the
+  # run ended before delivery. The delivery's marks count the report's items
+  # against that UTC day's critical allowance, which this does not give back.
+  # Runs in the agent pod, which serves the queue.
+  resolve_py = <<-EOP
+    import base64, json, os, sys, urllib.error, urllib.parse, urllib.request
+    sys.path.insert(0, "${local.scripts}")
+    import findings_queue, inventory_findings
+
+    NOT_REGISTERED = 404
+    TIMEOUT_SECONDS = 10
+    endpoint = os.environ.get("FINDINGS_ENDPOINT", inventory_findings.DEFAULT_ENDPOINT)
+    headers = {"Content-Type": "application/json"}
+    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    body = json.dumps({"outcome": "resolved", "observed": "bench teardown of a planted finding"}).encode()
+    resolved, failed = 0, []
+    for item in inventory_findings.parse_block(base64.b64decode(sys.argv[1]).decode()):
+        fid = findings_queue.derive_finding_id(
+            item["check"], item["project"], item["cluster"], item.get("namespace", ""), item["object"]
+        )
+        url = "%s/v1/findings/%s/verified" % (endpoint, urllib.parse.quote(fid, safe=""))
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers), timeout=TIMEOUT_SECONDS).close()
+            resolved += 1
+        except urllib.error.HTTPError as exc:
+            if exc.code != NOT_REGISTERED:
+                failed.append("%s (HTTP %d)" % (fid, exc.code))
+        except OSError as exc:
+            failed.append("%s (%s)" % (fid, exc))
+    print("resolved %d planted finding(s) in the findings queue" % resolved)
+    if failed:
+        sys.exit("could not resolve: " + ", ".join(failed))
+  EOP
+  disarm_py  = <<-EOP
     import json, os, sqlite3, sys, time
     from cron.jobs import _jobs_lock, compute_next_run, load_jobs, save_jobs
 
@@ -235,6 +273,8 @@ resource "null_resource" "ranking" {
     key_like          = local.key_like
     inventory         = local.inventory
     disarm_b64        = base64encode(local.disarm_py)
+    resolve_b64       = base64encode(local.resolve_py)
+    raw_b64           = local.raw_b64
   }
 
   provisioner "local-exec" {
@@ -275,8 +315,9 @@ resource "null_resource" "ranking" {
           done
           clear_inventory || failed="$failed, remove the INVENTORY files"
           disarm >&2 || failed="$failed, disarm the delivery job"
+          resolve >&2 || failed="$failed, resolve the planted findings"
           if [ -n "$failed" ]; then
-            echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery." >&2
+            echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery, and its teardown resolves the findings." >&2
           fi
         fi
         rm -rf "$kubeconfig_dir"
@@ -334,6 +375,15 @@ resource "null_resource" "ranking" {
       disarm() {
         printf '%s' '${base64encode(local.disarm_py)}' | base64 -d | agent_py
       }
+      resolve() {
+        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py "${local.raw_b64}"
+      }
+      # Writes base64 $1 to the sandbox path $2 aside and renames it, owned as
+      # the data volume is: the user the card's terminal and file tools run as.
+      plant() {
+        printf '%s' "$1" | kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" -- \
+          sh -c 'base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$2")" "$1.tmp" && mv -f "$1.tmp" "$1"' sh "$2" "${local.home}"
+      }
 
       # ---- 1. Refuse an install where the report would reach a person -----
       # One read that has to answer `clear`, so a failed exec refuses rather
@@ -369,6 +419,13 @@ resource "null_resource" "ranking" {
         echo "An earlier run left delivery armed (${local.state_file}); finishing its teardown." >&2
         if ! clear_inventory || ! disarm >&2; then
           echo "ERROR: could not finish the teardown an earlier run left on ${var.host_cluster_name}; nothing was planted, and the next run tries again." >&2
+          exit 1
+        fi
+        # `disarm` removed the state file, so the next run will not come back
+        # here; the planted ids it registers again are the ones its own
+        # teardown resolves.
+        if ! resolve >&2; then
+          echo "ERROR: could not finish the teardown an earlier run left on ${var.host_cluster_name}: delivery is disarmed, but its planted findings are still open on the queue. Nothing was planted; the next run's teardown resolves them." >&2
           exit 1
         fi
         state="$(read_state)"
@@ -426,14 +483,29 @@ resource "null_resource" "ranking" {
       clear_inventory
 
       # ---- 3. Plant the raw report on the sandbox ------------------------
-      printf '%s' '${local.raw_b64}' | kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" -- \
-        sh -c 'base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$2")" "$1.tmp" && mv -f "$1.tmp" "$1"' sh "${local.raw_file}" "${local.home}"
+      plant '${local.raw_b64}' "${local.raw_file}"
       echo "Planted ${local.raw_file} on $sandbox_pod."
+      # Beside it, the pacing limits the hand-off writes from the agent's
+      # environment. A hand-off without limits_text writes none.
+      limits_b64="$(agent_py <<'PY'
+      import base64, sys
+      sys.path.insert(0, "${local.scripts}")
+      import bootstrap_handoff
+      limits = getattr(bootstrap_handoff, "limits_text", None)
+      print(base64.b64encode(limits().encode()).decode() if limits else "")
+      PY
+      )"
+      if [ -n "$limits_b64" ]; then
+        plant "$limits_b64" "${local.limits_file}"
+        echo "Planted ${local.limits_file} on $sandbox_pod."
+      fi
 
       # ---- 4. File the prioritization card -------------------------------
-      card="$(agent_py "${local.card_body_b64}" <<'PY'
-      import base64, json, subprocess, sys
-      body = base64.b64decode(sys.argv[1]).decode()
+      card="$(agent_py <<'PY'
+      import json, subprocess, sys
+      sys.path.insert(0, "${local.scripts}")
+      from bootstrap_handoff import _prioritize_body
+      body = _prioritize_body()
       out = subprocess.run(
           ["${local.hermes}", "kanban", "create", "--json", "--assignee", "${local.card_assignee}",
            "--idempotency-key", "${local.card_key}", "--body", body, "${local.card_title}"],
@@ -561,8 +633,11 @@ resource "null_resource" "ranking" {
       printf '%s' '${self.triggers.disarm_b64}' | base64 -d | \
         kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
         ${self.triggers.python} - || failed="$failed, disarm the delivery job"
+      printf '%s' '${self.triggers.resolve_b64}' | base64 -d | \
+        kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+        ${self.triggers.python} - "${self.triggers.raw_b64}" || failed="$failed, resolve the planted findings"
       if [ -n "$failed" ]; then
-        echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery." >&2
+        echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery, and its teardown resolves the findings." >&2
         exit 1
       fi
     EOT

@@ -65,6 +65,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import sandbox_exec
+import chat_notify
 from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     HERMES_BIN,
@@ -79,6 +80,9 @@ from cluster_agent_profile import (
 )
 
 DESCRIBE_TIMEOUT_SECONDS = 30
+# The reconcile notice's kill timeout for `hermes send`; a routed send gets
+# at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+NOTIFY_SEND_TIMEOUT_SECONDS = 30
 _MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
 EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") if c}
 
@@ -160,14 +164,16 @@ _api_disabled_this_run: set[str] = set()
 # with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
 # hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
 # settle time after it. Creates still run in the fixed order.
-# Every lookup is a gcloud process the credential proxy runs, and the proxy admits four
-# requests at once under its child memory budget at the operator's default limit
+# Every lookup is a gcloud process the credential proxy runs. The pool was sized to the
+# four requests the proxy admitted under its child memory budget at the old 1Gi default
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's
 # children budget, 704 MiB of the 1 GiB limit after BROKER_RESIDENT_RESERVE_BYTES and
 # CONTENT_WORKSPACE_RESERVE_BYTES, over one request's cost, 176 MiB
 # (REQUEST_CHILD_MEMORY_RESERVE_BYTES plus OUTPUT_COPIES_PER_COMMAND of the 8 MiB output
-# cap). A wider pool only queues the rest at the proxy, where a lookup still waiting at its
-# 60s admission bound is refused busy and reads unlisted for the tick.
+# cap). At the 2Gi default the proxy's slot cap of eight binds, and it is shared: while
+# this pool lists, kanban workers' commands have four slots, and none if stall_watch.py's
+# four-wide pool is listing at the same time. Past the admitted count a lookup queues at the proxy, and one
+# still waiting at its 60s admission bound is refused busy and reads unlisted for the tick.
 LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
@@ -2049,9 +2055,16 @@ def _notify(message: str) -> None:
     for platform in enabled_chat_platforms():
         try:
             subprocess.run(
-                [HERMES_BIN, "send", "--to", platform, message],
-                capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+                chat_notify.command(platform, message, json_output=False, hermes_bin=HERMES_BIN),
+                capture_output=True, text=True, check=True, env=_run_env(),
+                timeout=chat_notify.subprocess_timeout(platform, NOTIFY_SEND_TIMEOUT_SECONDS),
+                stdin=subprocess.DEVNULL,
             )
+        except subprocess.CalledProcessError as e:
+            if chat_notify.outcome_unknown(e.returncode):
+                log(f"Reconcile notification to {platform} got no answer in time; it may have posted")
+                continue
+            log(f"Failed to post reconcile notification to {platform}: {e}")
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
             log(f"Failed to post reconcile notification to {platform}: {e}")
 

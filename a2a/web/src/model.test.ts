@@ -287,6 +287,15 @@ describe("artifact-update", () => {
     expect(state.chat).toHaveLength(1); // just the ask
     expect(state.tasks.get("task-1")?.artifacts.size).toBe(2);
   });
+
+  it("renders each turn answer as its own answer entry, then the result", () => {
+    let state = submission();
+    state = artifact(state, "turn", "fleet: 3 clusters green");
+    state = artifact(state, "result", "prod: green");
+    const answers = state.chat.filter((c) => c.kind === "answer");
+    expect(answers.map((a) => a.text)).toEqual(["fleet: 3 clusters green", "prod: green"]);
+    expect(state.tasks.get("task-1")?.artifacts.get("result")?.text).toBe("prod: green");
+  });
 });
 
 describe("directory and topics", () => {

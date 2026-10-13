@@ -78,7 +78,7 @@ func TestTheCalloutRoleAuthorizesTheInformerItIsPairedWith(t *testing.T) {
 		buildA2ACalloutServiceAccount(agent), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("serviceaccount: %v", err)
 	}
-	authMap, _, err := buildA2AAuthMapConfigMap(agent)
+	authMap, _, err := buildA2AAuthMapConfigMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the identity map: %v", err)
 	}

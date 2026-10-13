@@ -5255,6 +5255,553 @@ class ScopedSaPoolPersistsThroughInstallEnvTest(unittest.TestCase):
             self.assertLess(exported, bootstrap)
 
 
+class PlatformAgentModeTest(unittest.TestCase):
+    """--mode on a first install, PLATFORM_AGENT_MODE in install.env after it.
+
+    The first run records the mode it installed, the default included; a later
+    run without the flag seeds it back from the file; and a --mode that
+    disagrees with what the file resolves to is refused rather than applied for
+    one run, because the run after it (and every upgrade.sh, which takes no
+    --mode) would read the file and switch the install back. --mode is held to
+    the file by the chat flags' mechanism (note_install_env_flag,
+    check_flags_against_install_env, record_flags_into_install_env), as one
+    more flag in it and not a chat key.
+    """
+
+    # validate_platform_agent_mode then the shared check, as main runs them.
+    _CHECK = (
+        'rc=0; validate_platform_agent_mode && check_flags_against_install_env || rc=$?; '
+        'echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+    )
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        env.pop("PLATFORM_AGENT_MODE", None)
+        env.update(overrides)
+        return env
+
+    def _run(self, body, install_env=None, extra_env=None):
+        """Source install.sh against install_env (a path that may not exist,
+        which is a first install) and installer_common.sh, then run body."""
+        env = {"KUBE_AGENTS_INSTALL_ENV": str(install_env)} if install_env else {}
+        env.update(extra_env or {})
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "source scripts/installer/installer_common.sh\n"
+            f"{body}\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=self._env(env), cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
+        )
+
+    def _file(self, tmp, content):
+        path = pathlib.Path(tmp) / "install.env"
+        path.write_text(content)
+        path.chmod(0o600)
+        return path
+
+    def test_the_flag_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(
+                'parse_args --mode=next; echo "MODE=[$PARAM_PLATFORM_AGENT_MODE] PASSED=[$PARAM_PLATFORM_AGENT_MODE_PASSED]"',
+                install_env=self._file(tmp, ""),
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODE=[next] PASSED=[true]", proc.stdout)
+
+    def test_an_empty_flag_is_refused_rather_than_read_as_the_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run('parse_args --mode=; echo "PARSED"', install_env=self._file(tmp, "PLATFORM_AGENT_MODE=next\n"))
+        self.assertNotIn("PARSED", proc.stdout)
+        self.assertIn("--mode= was given an empty value", proc.stdout + proc.stderr)
+        self.assertIn("omit the flag", proc.stdout + proc.stderr)
+
+    def test_a_first_install_takes_the_flag(self):
+        # No install.env yet: nothing recorded to disagree with.
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in ("today", "next"):
+                with self.subTest(mode=mode):
+                    absent = pathlib.Path(tmp) / "absent.install.env"
+                    proc = self._run(
+                        f'INSTALL_ENV_FILE="{absent}"; parse_args --mode={mode}; {self._CHECK}',
+                        install_env=self._file(tmp, ""),
+                    )
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertFalse(absent.exists())
+
+    def test_a_value_outside_the_crd_enum_is_refused_naming_its_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for body, file_content, message in (
+                ("parse_args --mode=Next", "", "--mode must be today or next, got 'Next'"),
+                ("parse_args --mode=later", "", "--mode must be today or next, got 'later'"),
+                (":", "PLATFORM_AGENT_MODE=nxt\n", "PLATFORM_AGENT_MODE='nxt' is not one of today, next. Fix it in "),
+            ):
+                with self.subTest(body=body, file_content=file_content):
+                    proc = self._run(
+                        f'{body}; rc=0; validate_platform_agent_mode || rc=$?; echo "rc=$rc"',
+                        install_env=self._file(tmp, file_content),
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(message, proc.stdout + proc.stderr)
+
+    def test_a_rerun_without_the_flag_keeps_the_recorded_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(
+                'validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}]"',
+                install_env=self._file(tmp, "PLATFORM_AGENT_MODE=next\n"),
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODE=[next]", proc.stdout)
+
+    def test_a_flag_that_agrees_with_the_file_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flag in (
+                ("PLATFORM_AGENT_MODE=next\n", "next"),
+                ("PLATFORM_AGENT_MODE=today\n", "today"),
+                # Set empty resolves to the default, so --mode=today agrees.
+                ("PLATFORM_AGENT_MODE=\n", "today"),
+            ):
+                with self.subTest(content=content, flag=flag):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args --mode={flag}; {self._CHECK}", install_env=path)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_a_flag_that_disagrees_with_the_file_is_refused_and_says_how_to_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flag, recorded, says in (
+                ("PLATFORM_AGENT_MODE=today\n", "next", "today", "records PLATFORM_AGENT_MODE=today"),
+                ("PLATFORM_AGENT_MODE=next\n", "today", "next", "records PLATFORM_AGENT_MODE=next"),
+                # A key set empty resolves to the default, and so does the next
+                # run from it: a one-run switch all the same. (A file with no
+                # key at all takes the flag: test_the_flag_fills_in_a_missing_key.)
+                ("PLATFORM_AGENT_MODE=\n", "next", "today", "records PLATFORM_AGENT_MODE empty, which is today"),
+            ):
+                with self.subTest(content=content, flag=flag):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args --mode={flag}; {self._CHECK}; record_flags_into_install_env", install_env=path)
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(
+                        f"--mode={flag} disagrees with the install configuration, so it would hold for this run only: "
+                        f"{path} {says}.",
+                        out,
+                    )
+                    self.assertIn("renders from the file and goes back to it", out)
+                    self.assertIn("install.sh records --mode only where install.env assigns no PLATFORM_AGENT_MODE", out)
+                    self.assertIn(
+                        f"Set PLATFORM_AGENT_MODE={flag} in {path}, and re-run without --mode. "
+                        "On a running install that is a mode switch: docs/designs/spec-mode-switch.md.",
+                        out,
+                    )
+                    # Not a key the Day-2 menu saves, so the menu is not offered.
+                    self.assertNotIn("--menu", out)
+                    self.assertNotIn("Recorded ", out)
+                    self.assertEqual(path.read_text(), content, "the file is never rewritten")
+
+    def test_a_misspelt_flag_is_refused_as_one_before_the_file_is_consulted(self):
+        # validate_platform_agent_mode runs first, so a typo is not told to
+        # "Set PLATFORM_AGENT_MODE=Next" in the file.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PLATFORM_AGENT_MODE=today\n")
+            proc = self._run(f"parse_args --mode=Next; {self._CHECK}", install_env=path)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn("--mode must be today or next, got 'Next'", out)
+        self.assertNotIn("disagrees", out)
+
+    def test_the_flag_fills_in_a_missing_key(self):
+        # A hand-written install.env, or one copied from install.env.example
+        # with the line still commented out, sets no mode: --mode is appended
+        # rather than refused, nothing else in the file changes, and the next
+        # run reads it back. The check only queues it; the record is made
+        # when main commits (record_flags_into_install_env), from the
+        # PLATFORM_AGENT_MODE main exported.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, mode in (
+                ("PROJECT_ID=p\n# PLATFORM_AGENT_MODE=today\n", "next"),
+                ("PROJECT_ID=p", "next"),  # no trailing newline
+                ("PROJECT_ID=p\n", "today"),
+            ):
+                with self.subTest(content=content, mode=mode):
+                    path = self._file(tmp, content)
+                    checked = self._run(f"parse_args --mode={mode}; {self._CHECK}", install_env=path)
+                    self.assertIn("rc=0 QUEUED=[PLATFORM_AGENT_MODE]", checked.stdout, checked.stderr)
+                    self.assertEqual(path.read_text(), content, "the check alone writes nothing")
+                    proc = self._run(
+                        f"parse_args --mode={mode}; {self._CHECK}; "
+                        f"export PLATFORM_AGENT_MODE={mode}; record_flags_into_install_env",
+                        install_env=path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0", proc.stdout, out)
+                    self.assertIn(
+                        f"Recorded PLATFORM_AGENT_MODE={mode} in {path}, which assigned no PLATFORM_AGENT_MODE, "
+                        "so later runs and upgrade.sh render it.",
+                        out,
+                    )
+                    expected = content if content.endswith("\n") else content + "\n"
+                    self.assertEqual(path.read_text(), expected + f"PLATFORM_AGENT_MODE={mode}\n")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                    again = self._run('echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"', install_env=path)
+                    self.assertIn(f"MODE=[{mode}]", again.stdout, again.stderr)
+
+    # main's step-11 confirmation, run as it stands in main with the prompt
+    # and the container preflight stubbed, then the record; the source-order
+    # test below holds the record after it on both routes.
+    _CONFIRM_START = '  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then\n    local confirm_choice=""\n'
+    _CONFIRM_END = "\n    esac\n  fi\n"
+    # One call per route: the generate-only one inside its branch, the apply
+    # one at main's top level.
+    _RECORD_HANDOFF = "\n    record_flags_into_install_env\n"
+    _RECORD_APPLY = "\n  record_flags_into_install_env\n"
+
+    def test_the_mode_is_not_a_chat_key_and_brings_no_companions(self):
+        # Queued beside a chat toggle, the mode brings nothing; the toggle's
+        # companions follow the toggle's place in the queue, and the toggle is
+        # written last.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, exports, expected in (
+                ("--mode=next", "PLATFORM_AGENT_MODE=next", "PLATFORM_AGENT_MODE=next\n"),
+                ("--mode=next --enable-slack=false", "PLATFORM_AGENT_MODE=next SLACK_ENABLED=false",
+                 "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\n"),
+                ("--enable-slack --mode=next", "PLATFORM_AGENT_MODE=next SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1",
+                 "SLACK_ALLOWED_USERS=U1\nSLACK_HOME_CHANNEL=''\n"
+                 "SLACK_HOME_CHANNEL_NAME=''\nPLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\n"),
+            ):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {exports}; record_flags_into_install_env",
+                        install_env=path,
+                        extra_env={"SLACK_ENABLED": "", "SLACK_ALLOWED_USERS": "", "SLACK_HOME_CHANNEL": "", "SLACK_HOME_CHANNEL_NAME": ""},
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertEqual(path.read_text(), "PROJECT_ID=p\n" + expected)
+
+    def test_a_file_it_cannot_write_is_refused_up_front(self):
+        if os.geteuid() == 0:
+            self.skipTest("root writes a read-only file")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            path.chmod(0o400)
+            try:
+                proc = self._run(f"parse_args --mode=next; {self._CHECK}", install_env=path)
+            finally:
+                path.chmod(0o600)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn(f"{path} assigns no PLATFORM_AGENT_MODE, which this run would record there, and it is not writable.", out)
+
+    def test_the_step_10_line_names_the_mode_it_will_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, says in (("--mode=next", True), ("--mode=next --dry-run", False)):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}\nPARAM_NON_INTERACTIVE=true\n"
+                        f'bootstrap_install_env_file "{path}" ""',
+                        install_env=path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    line = (
+                        f"{path} assigns no PLATFORM_AGENT_MODE: the values this run applies to them are "
+                        "recorded there if it goes on to the apply or the handoff."
+                    )
+                    if says:
+                        self.assertIn(line, out)
+                    else:
+                        self.assertNotIn("are recorded there", out)
+                    self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    def _confirm_block(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CONFIRM_START, main_start)
+        end = text.index(self._CONFIRM_END, start) + len(self._CONFIRM_END)
+        block = text[start:end]
+        # The slice is the prompt and its three arms, nothing else: a
+        # reshaped main fails here rather than testing a fragment.
+        self.assertIn("Provisioning paused by user", block)
+        self.assertIn("check_scope_container_access || exit 1", block)
+        self.assertLess(len(block.splitlines()), 40, block)
+        return block + "  record_flags_into_install_env\n"
+
+    def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
+        block = self._confirm_block()
+        stubs = (
+            'prompt_read() { printf -v "$2" "%s" "$ANSWER"; }\n'
+            'check_scope_container_access() { [ "${1:-}" = "warn" ] || return "${SCOPE_RC:-0}"; }\n'
+            "write_json_report() { :; }\n"
+            f"_confirm() {{\n{block}}}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, answer, scope_rc, records in (
+                # Declined at the prompt: nothing recorded, the line named.
+                ("--mode=next", "n", 0, False),
+                ("--mode=next", "y", 1, False),  # refused after the confirmation
+                ("--mode=next", "y", 0, True),
+                ("--mode=next", "g", 0, True),
+                ("--mode=next -y", "", 1, True),  # -y: refused above the summary, not here
+                ("--mode=next --generate-only", "", 0, True),
+            ):
+                with self.subTest(flags=flags, answer=answer, scope_rc=scope_rc):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"{stubs}parse_args {flags}; validate_platform_agent_mode || exit 1\n"
+                        "check_flags_against_install_env || exit 1\n"
+                        "export PLATFORM_AGENT_MODE=next\n"
+                        f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
+                        install_env=path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    if records:
+                        self.assertIn("went on", proc.stdout, out)
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\nPLATFORM_AGENT_MODE=next\n")
+                    else:
+                        self.assertNotIn("went on", proc.stdout, out)
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+                    if answer == "n":
+                        self.assertEqual(proc.returncode, 0, out)
+                        self.assertNotIn("Recorded ", out)
+                        warning = out.index(
+                            f"{path} assigns no PLATFORM_AGENT_MODE, and pausing here did not record them"
+                        )
+                        self.assertIn(f"first add these lines to {path}, so a later upgrade.sh renders what you applied:\n"
+                                      "    PLATFORM_AGENT_MODE=next\n", out)
+                        self.assertLess(warning, out.index("Provisioning paused by user"))
+                    else:
+                        self.assertNotIn("pausing here did not record", out)
+
+    def test_the_record_follows_every_refusal_and_precedes_the_apply(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        self.assertEqual(text.count(self._RECORD_HANDOFF), 1)
+        self.assertEqual(text.count(self._RECORD_APPLY), 1)
+        handoff_record = text.index(self._RECORD_HANDOFF, main_start)
+        apply_record = text.index(self._RECORD_APPLY, main_start)
+        # Shared by both routes: everything above the generate-only branch
+        # that can stop the run.
+        for gate in (
+            "validate_platform_agent_mode || exit 1",
+            "check_flags_against_install_env || exit 1",
+            "check_service_account_ownership || exit 1",
+            'refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n',
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"',
+            'write_json_report "DRY_RUN_SUCCESS"',
+            'check_existing_cluster_node_pools_preflight "$project_id"',
+            'check_existing_cluster_network_policy_preflight "$project_id"',
+            'write_json_report "PAUSED"',
+            "check_scope_container_access || exit 1",
+        ):
+            for record in (handoff_record, apply_record):
+                with self.subTest(gate=gate, record=record):
+                    self.assertLess(text.index(gate, main_start), record)
+        # Generate-only: the org check (which exits 1 on a user account or a
+        # missing org) is the one gate inside the branch; the record follows
+        # it and nothing but the handoff follows the record.
+        generate_only = text.index('  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n    print_info "Generate-only:', main_start)
+        org_check = 'check_github_org_is_organization "${GITOPS_ORG:-}"'
+        self.assertLess(generate_only, text.index(org_check, generate_only))
+        self.assertLess(text.index(org_check, generate_only), handoff_record)
+        self.assertTrue(
+            text[handoff_record + len(self._RECORD_HANDOFF) :].startswith('    print_generate_only_handoff "$repo_dir"'),
+            text[handoff_record : handoff_record + 200],
+        )
+        # Apply: every step from step 12 to the apply exits the run on failure
+        # under set -e; the ones that can refuse or fail are listed, and the
+        # record must follow each and sit directly above the apply.
+        step_12 = text.index('print_step "12. Applying the Install', main_start)
+        for gate in (
+            org_check,
+            'enable_scope_selector_apis "$project_id"',
+            'ensure_existing_cluster_network_policy "$project_id"',
+            'ensure_existing_cluster_workload_identity "$project_id"',
+            'ensure_existing_cluster_cmek "$project_id"',
+            'import_github_pem "$project_id" "$region" || exit 1',
+            'minter_enabled_version="$(kms_key_enabled_version',
+            "or unset GITHUB_APP_ID to install without the minter.\"\n    exit 1\n",
+            'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
+            'apply_crd_upgrades "$repo_dir"',
+        ):
+            with self.subTest(apply_gate=gate):
+                self.assertLess(step_12, text.index(gate, step_12))
+                self.assertLess(text.index(gate, step_12), apply_record)
+        self.assertTrue(
+            text[apply_record + len(self._RECORD_APPLY) :].startswith('  run_lifecycle_apply "$repo_dir" "$provisioning_log"'),
+            text[apply_record : apply_record + 200],
+        )
+
+    def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(f"parse_args --dry-run --mode=next; {self._CHECK}", install_env=path)
+            out = proc.stdout + proc.stderr
+            self.assertIn("rc=0", proc.stdout, out)
+            self.assertIn(
+                f"{path} assigns no PLATFORM_AGENT_MODE; a run without --dry-run records the PLATFORM_AGENT_MODE "
+                "it applies there, from --mode.",
+                out,
+            )
+            # Not a chat toggle: no companions are promised.
+            self.assertNotIn("it also records", out)
+            self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    def test_a_shell_export_reaches_a_first_install_and_not_a_recorded_one(self):
+        # A first install keeps the environment and records it; once the file
+        # exists it is the only way in, as for the scope keys.
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._run_from_fallback(tmp, 'echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"', {"PLATFORM_AGENT_MODE": "next"})
+            later = self._run(
+                'echo "MODE=[$PARAM_PLATFORM_AGENT_MODE]"',
+                install_env=self._file(tmp, "PROJECT_ID=p\n"),
+                extra_env={"PLATFORM_AGENT_MODE": "next"},
+            )
+        self.assertIn("MODE=[next]", first.stdout, first.stderr)
+        self.assertIn("MODE=[]", later.stdout, later.stderr)
+
+    def _run_from_fallback(self, tmp, body, extra_env):
+        """Source a copy of install.sh with KUBE_AGENTS_INSTALL_ENV unset, from
+        a directory that is not a checkout and under a HOME of its own, so
+        every location the fallback tries (beside the script, the working
+        directory, the HOME clone) is inside tmp and empty. Sourcing the
+        checkout's install.sh would land on <repo>/install.env, the file a
+        developer who installs from this clone has."""
+        bare = pathlib.Path(tmp) / "bare"
+        home = pathlib.Path(tmp) / "home"
+        bare.mkdir()
+        home.mkdir()
+        shutil.copy(_INSTALL_SH, bare / "install.sh")
+        env = self._env({"HOME": str(home), **extra_env})
+        env.pop("KUBE_AGENTS_INSTALL_ENV", None)
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{bare / "install.sh"}"\n'
+            'echo "ENV=[$INSTALL_ENV_FILE]"\n'
+            f"{body}\n"
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=env, cwd=str(bare), stdin=subprocess.DEVNULL,
+        )
+        self.assertIn(f"ENV=[{home}/kube-agents/install.env]", proc.stdout, proc.stderr)
+        return proc
+
+    def test_the_first_run_records_the_mode_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export PLATFORM_AGENT_MODE="next"')
+            self.assertIn("PLATFORM_AGENT_MODE=next\n", dest.read_text())
+            out = self._read_back(
+                dest,
+                'echo "PARAM=[$PARAM_PLATFORM_AGENT_MODE]"; '
+                "bash -c 'echo \"EXPORTED=[$PLATFORM_AGENT_MODE]\"'",
+            )
+            self.assertIn("PARAM=[next]", out)
+            self.assertIn("EXPORTED=[next]", out)
+
+    def test_an_unset_mode_is_recorded_as_the_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            self.assertIn("PLATFORM_AGENT_MODE=today\n", dest.read_text())
+
+    def test_the_menu_refuses_the_flag_it_would_drop(self):
+        # --menu applies the mode install.env records; a --mode there would be
+        # parsed and then never applied or announced.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(
+                'run_menu_system() { echo "MENU RAN"; }; print_banner() { :; }; main --menu --mode=next',
+                install_env=self._file(tmp, "PLATFORM_AGENT_MODE=today\n"),
+            )
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("MENU RAN", out)
+        self.assertIn("--menu takes no --mode", out)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_the_summary_names_the_mode_and_warns_for_next(self):
+        text = _INSTALL_SH.read_text()
+        summary = text.index('print_step "11. Pre-Flight Configuration Summary"')
+        block = text[summary : text.index('print_step "12.', summary)]
+        self.assertIn('if [ "$platform_agent_mode" = "next" ]; then', block)
+        self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack", block)
+        self.assertIn("Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}", block)
+
+    def test_a_mirrored_next_install_is_told_the_bus_images_are_not_mirrored(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        exported = text.index('export PLATFORM_AGENT_MODE="$platform_agent_mode"', main_start)
+        warning = text.index('if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then', main_start)
+        self.assertLess(text.index('local third_party_registry_prefix=', main_start), warning)
+        self.assertLess(exported, warning)
+        self.assertIn("A2A_NATS_IMAGE and A2A_PROVISION_IMAGE", text[warning : warning + 900])
+
+    def test_a_bad_value_from_the_shell_on_a_first_install_names_the_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = pathlib.Path(tmp) / "absent.install.env"
+            proc = self._run(
+                f'INSTALL_ENV_FILE="{absent}"; PARAM_PLATFORM_AGENT_MODE=NEXT; rc=0; validate_platform_agent_mode || rc=$?; echo "rc=$rc"',
+                install_env=self._file(tmp, ""),
+            )
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn("Fix the PLATFORM_AGENT_MODE this shell exports.", out)
+        self.assertNotIn("Fix it in", out)
+
+    def test_next_with_google_chat_does_not_warn_that_nothing_answers(self):
+        """The operator renders the hermes-bridge under next (#2603), so Chat is
+        answered there and the installer must not say it goes unanswered."""
+        text = _INSTALL_SH.read_text()
+        self.assertNotIn("nothing answers it until a hermes-bridge sidecar", text)
+        self.assertNotIn('if [ "$platform_agent_mode" = "next" ] && is_truthy "$google_chat_enabled"; then', text)
+
+    def test_main_validates_exports_and_announces_in_order(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        validate = text.index("validate_platform_agent_mode || exit 1", main_start)
+        check = text.index("\n  check_flags_against_install_env || exit 1\n", main_start)
+        gitops_step = text.index('print_step "8. GitOps Infrastructure Repository Setup"', main_start)
+        exported = text.index('export PLATFORM_AGENT_MODE="$platform_agent_mode"', main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', main_start)
+        scope_check = text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n', main_start)
+        summary = text.index('print_step "11. Pre-Flight Configuration Summary"', main_start)
+        announce = text.index(
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"',
+            main_start,
+        )
+        # Refused before the rest of the interview; exported before the two
+        # readers; announced once the context the scope check fetched exists.
+        self.assertLess(validate, check)
+        self.assertLess(validate, gitops_step)
+        self.assertLess(validate, exported)
+        self.assertLess(exported, generator)
+        self.assertLess(exported, bootstrap)
+        self.assertLess(scope_check, announce)
+        self.assertLess(announce, summary)
+
+    def test_the_notice_is_ungated_where_no_confirmation_follows(self):
+        """-y applies without the step-11 prompt and the menu's apply has none,
+        so their notices do not offer "run again"; --dry-run, --generate-only
+        and an interactive run keep the default clause."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        announce = text.index('"$platform_agent_mode" "$mode_notice_route"', main_start)
+        block = text[text.rindex('local mode_notice_route=""', main_start, announce) : announce]
+        self.assertIn(
+            'if [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then\n'
+            '    mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"',
+            block,
+        )
+        self.assertIn(
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
+            "        check_scope_container_access || exit 1\n",
+            text[:main_start],
+        )
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""

@@ -11,12 +11,12 @@ name: Release & Publish (GA)
 # on a commit that is not the candidate's stamped child — from being a red run
 # nobody reads.
 #
-# `scripts/release/README.md`, "The weekly GA release", is canonical for the cron
+# `scripts/release/README.md`, "The daily GA release", is canonical for the cron
 # value and the reasoning behind it — do not restate either here.
 
 on:
   # No `schedule:` on this workflow: scheduled execution is owned by
-  # release-scheduler.yml via the decoupled trigger pattern, so a weekly tick
+  # release-scheduler.yml via the decoupled trigger pattern, so a daily tick
   # with nothing to publish produces no pipeline run at all. Explicit overrides
   # and manual dispatches remain supported here via workflow_dispatch.
   #checkov:skip=CKV_GHA_7:GA release publish workflow requires explicit version override, target commit, emergency bypass and schedule-gate parameters
@@ -194,7 +194,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
         if: steps.verify-eligibility.outputs.skip_release != 'true'

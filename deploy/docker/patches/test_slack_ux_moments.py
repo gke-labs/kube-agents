@@ -138,8 +138,10 @@ def _run(coro):
 
 
 class EnabledTest(unittest.TestCase):
-    def test_off_unless_the_flag_is_set(self):
+    def test_on_unless_the_flag_is_set_off(self):
         with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(runtime.enabled())
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "false"}):
             self.assertFalse(runtime.enabled())
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
             self.assertTrue(runtime.enabled())

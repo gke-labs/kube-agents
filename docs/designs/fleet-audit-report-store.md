@@ -48,7 +48,8 @@ ledger, and two directories for it would each trust a memory the other had moved
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
-`ledger_held_open`), the collector keys the JSON line carried, the delta as id lists (`new_ids`,
+`ledger_held_open`), the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
+the JSON line carried, the delta as id lists (`new_ids`,
 `resolved_ids`, `current_ids`, `id_scheme`), `ledger_body` — the body this run left on the issue —
 and `document`, this run's validated findings document, whole rather than clipped to the body's
 budget. The body's redaction backstop is applied to every string on the way in, so the envelope

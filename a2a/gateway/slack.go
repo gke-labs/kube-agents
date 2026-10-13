@@ -956,9 +956,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
 			// nothing, and decoded first it normalizes to "stop" and is a
 			// hard task cancel. Matching what the user typed beats matching
-			// Slack's entity mangling, so this is the right way round. The
-			// same shift makes normalized text shorter, so an ask that
-			// decodes can newly fall under isStatusQuery's wideMatchLenCap.
+			// Slack's entity mangling, so this is the right way round.
 			Text: slackUnescaper.Replace(text),
 		}, true
 	}

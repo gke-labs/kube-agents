@@ -39,6 +39,10 @@ const defaultDelegationDepthMax = 3
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 
+// envGchatHomeChannel carries the Chat home space the chat.notify route posts
+// to (notify.go); the operator renders it from googleChat.homeChannel.
+const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -68,6 +72,9 @@ const (
 	metricsPortMin = 1
 	metricsPortMax = 65535
 )
+
+// busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
+const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
 
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
@@ -129,6 +136,10 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// GchatHomeChannel is the install's Chat home space ("spaces/AAA"), where
+	// a chat.notify proactive post lands (notify.go). Empty leaves the route
+	// serving conversation requests only.
+	GchatHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -211,6 +222,19 @@ type Config struct {
 	// Empty makes the card advertise the address it was fetched from.
 	A2ADoorPublicURL string
 
+	// A2ADoorGoogleClientID arms the door's developer identity class
+	// (A2A_DOOR_GOOGLE_CLIENT_ID): a bearer that is not A2ADoorToken is
+	// checked with Google as an access token issued for this OAuth client,
+	// the install's one pre-registered client. Empty leaves the class off.
+	// It needs the door: set without A2A_DOOR_LISTEN it is refused.
+	A2ADoorGoogleClientID string
+	// A2ADoorAllowedUsers is the developer class's allowlist
+	// (A2A_DOOR_ALLOWED_USERS, comma-separated emails): the door refuses a
+	// verified email off it (403) before it holds any state for the caller,
+	// and the gateway checks the same list again. Empty admits nobody. There is no allow-all, unlike Chat's legacy
+	// posture: a door any Google account can sign in to is not a default
+	// anyone should get by leaving a list blank.
+	A2ADoorAllowedUsers []string
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
@@ -432,6 +456,22 @@ type Config struct {
 	// it: 0 would be "delegation off", which is a different switch
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
+
+	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
+	// turn before the gateway marks the turn's status line queued
+	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
+	// work, read from session-state (fixedRouteBacklog in busy.go); at or
+	// above this number the turn's task is still submitted, and its status
+	// line is edited to a queued state that says how many are ahead
+	// (showBusy). Nothing is refused or dropped.
+	//
+	// Zero means 10, the rendered bridge's default BRIDGE_CONCURRENCY. The
+	// operator renders the bridge's worker count here, so a turn is told it
+	// is waiting exactly when every worker is taken; raising it past the
+	// worker count makes the notice rarer and later, lowering it under the
+	// count tells people about a wait that is not there. FromEnv refuses a
+	// value under 1.
+	BusyNoticeAt int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
@@ -502,6 +542,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for
@@ -528,6 +569,12 @@ func FromEnv() (*Config, error) {
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
+	cfg.A2ADoorGoogleClientID = strings.TrimSpace(os.Getenv("A2A_DOOR_GOOGLE_CLIENT_ID"))
+	for _, u := range strings.Split(os.Getenv("A2A_DOOR_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
+		}
+	}
 	metricsPort, err := metricsPortFromEnv(cfg)
 	if err != nil {
 		return nil, err
@@ -598,6 +645,9 @@ func FromEnv() (*Config, error) {
 	if cfg.InjectListen != "" && cfg.InjectToken == "" {
 		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
 	}
+	if cfg.A2ADoorGoogleClientID != "" && cfg.A2ADoorListen == "" {
+		return nil, fmt.Errorf("A2A_DOOR_GOOGLE_CLIENT_ID is set but A2A_DOOR_LISTEN is not: the Google sign-in class is part of the A2A door and has nothing to arm without it")
+	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
 		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
 	}
@@ -637,6 +687,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
 	}
 	cfg.DelegationDepthMax = dm
+	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
+	ba, err := strconv.Atoi(busyAt)
+	if err != nil || ba < 1 {
+		return nil, fmt.Errorf("%s %q: need an integer >= 1", busyNoticeAtEnv, busyAt)
+	}
+	cfg.BusyNoticeAt = ba
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {

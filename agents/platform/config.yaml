@@ -68,6 +68,13 @@ mcp_servers:
       # container (platformagent_manifests.go), so only the allowlist was
       # missing. test_mcp_env_contract.py is what catches this class of gap.
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
+      # Under next send_notification posts through the A2A gateway with
+      # `a2a notify` (chat_notify.py) instead of `hermes send`: the platform it
+      # routes, and the bus address and identity the CLI connects with. The
+      # bus token is a file mount, not environment, so nothing else is needed.
+      A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
+      NATS_URL: "${NATS_URL}"
+      A2A_BUS_USER: "${A2A_BUS_USER}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       # The bearer token for the loopback Session KV server on 8699. The
       # allowlist above is the whole environment this subprocess gets, so

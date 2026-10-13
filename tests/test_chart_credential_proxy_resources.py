@@ -205,8 +205,8 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr)["limits"]["memory"], "704643072000m")
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
-        err = self._render_error([f"{_VALUE_PATH}.requests.memory=2Gi"])
-        self.assertIn(f"{_VALUE_PATH}.requests.memory (2Gi) exceeds the operator's default limits.memory (1Gi)", err)
+        err = self._render_error([f"{_VALUE_PATH}.requests.memory=3Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the operator's default limits.memory (2Gi)", err)
         self.assertIn("set limits.memory as well", err)
 
     def test_a_limit_below_the_default_request_fails_naming_the_pair(self):
@@ -226,8 +226,8 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
             ([f"{_VALUE_PATH}.requests.cpu=1.0004"], "requests.cpu (1.0004) exceeds the operator's default limits.cpu (1)"),
             ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
              "requests.cpu (100000000000001m) exceeds limits.cpu (100000000000000m)"),
-            ([f"{_VALUE_PATH}.requests.memory=1073741824.5"],
-             "requests.memory (1073741824.5) exceeds the operator's default limits.memory (1Gi)"),
+            ([f"{_VALUE_PATH}.requests.memory=2147483648.5"],
+             "requests.memory (2147483648.5) exceeds the operator's default limits.memory (2Gi)"),
             ([f"{_VALUE_PATH}.limits.cpu=499.5m"], "limits.cpu (499.5m) is below the operator's default requests.cpu (500m)"),
             ([f"{_VALUE_PATH}.requests.cpu=1999u", f"{_VALUE_PATH}.limits.cpu=1001u"],
              "requests.cpu (1999u) exceeds limits.cpu (1001u)"),
@@ -305,10 +305,10 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_more_than_fifteen_significant_digits_fail_naming_the_key(self):
         # float64 holds 15 significant digits exactly; with a 16th, each of these reads
-        # as its bound (1Gi, the floor, 2^53) and would render while the operator,
+        # as its bound (the 2Gi default limit, the floor, 2^53) and would render while the operator,
         # comparing exactly, refuses it.
         cases = (
-            ([f"{_VALUE_PATH}.requests.memory=1073741824.00000001"], "requests.memory", "1073741824.00000001"),
+            ([f"{_VALUE_PATH}.requests.memory=2147483648.00000001"], "requests.memory", "2147483648.00000001"),
             ([f"{_VALUE_PATH}.limits.memory=704643071.99999999"], "limits.memory", "704643071.99999999"),
             ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=9007199254740992"],
              "limits.memory", "9007199254740992"),

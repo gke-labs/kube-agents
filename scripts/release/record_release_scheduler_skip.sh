@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Records a quiet weekly tick in the GA release scheduler's job summary.
+# Records a quiet daily tick in the GA release scheduler's job summary.
 #
 # The whole point of release-scheduler.yml is that a tick with nothing to release
 # leaves no pipeline run behind to be mistaken for a passing one. That makes this

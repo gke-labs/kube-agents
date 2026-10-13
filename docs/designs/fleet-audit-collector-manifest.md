@@ -1,13 +1,15 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, five collectors ship.**
+> **STATUS — design of record; the `finish` side is implemented, and these collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
 > `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`,
 > `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
-> `fleet_waste.py` one for `fleet-wide-cost-analysis`, and `fleet_stockout.py` one for
-> `stockout-prevention`;
-> each stream's SOP runs its collector and passes the flag, and every other stream
+> `fleet_waste.py` one for `fleet-wide-cost-analysis`, `fleet_stockout.py` one for
+> `stockout-prevention`, `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
+> `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
+> `gcp-networking-fabric-audit`;
+> each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
 **Scope:** the machine boundary between a per-stream collector script and the fleet-audit harness.
@@ -33,7 +35,8 @@ multi-field document whose per-command record is mechanically checkable against 
 ## 2. Shape
 
 One JSON object per run. `finish` reads only the keys marked **read**; the rest are carried for the
-status surface and the collectors' own bookkeeping, and `finish` ignores them today.
+status surface and the collectors' own bookkeeping, and `finish` ignores them today. The one exception
+is `started_at`: `finish` reads it only to give the `collect_s` timer, and no decision uses it.
 
 ```json
 {
@@ -99,8 +102,8 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                                                         |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context.                                                                                                       |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                                                                                                                           |
-| `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.                                                                                                             |
-| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. Reserved for a run-over-run comparison and the timing view that a later change adds; `finish` does not read them today.                                                                                                                                                                                                                                                                                           |
+| `finished_at`                              | **read**         | When the collector stopped. Compared against the run's `started_at`, which the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.                                                                                                |
+| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. `finish` subtracts `started_at` from `finished_at` to give `collect_s`, a report timer that no decision uses. The other two are reserved for a run-over-run comparison; `finish` does not read them today.                                                                                                                                                                                                        |
 | `clusters[].autopilot`, `.project`, …      | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive. `clusters[].limitations` is here too: the collector's own sentence saying what it read but did not compare on that target, which the SOP copies into the document where it becomes a coverage gap. `single_compute_class` on `candidates[]` is carried here too: fleet fact resolved during enumeration, for SOP §3.24 to copy rather than re-derive into targeted manifest remediation. |
 | `error` (top level)                        | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                                                                                                                                            |
 
@@ -457,7 +460,9 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 `<project>/<region>/<subnet>` path, or a bare cluster name). A stream declares the partition in
 `AuditSpec.scopes`; an empty `scopes` measures every target against the whole roster, and a kind
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
-and stockout streams declare a `cluster` and a `project` kind. A fleet that holds no cluster is not
+and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
+are all projects, declares `project` alone; the networking stream declares a `subnet` kind for
+`subnet-ip-exhaustion` and a `project` kind for its other five checks. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs

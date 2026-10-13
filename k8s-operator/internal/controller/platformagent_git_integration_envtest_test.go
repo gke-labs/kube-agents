@@ -81,6 +81,15 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 				{Forge: "github", Repository: "infra", Role: "gitops"},
 				{Forge: "github", Repository: "infra2", Role: "gitops"}},
 		}, "at most one repository may have role gitops"},
+		// The API server's own rules on credentialsRef, which hold with the
+		// webhook off -- the chart ships it off.
+		"gitlab-no-secret": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme"}},
+		}, "a gitlab forge needs credentialsRef.name"},
+		"bad-secret-name": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "Bad_Name"}}},
+		}, "credentialsRef.name"},
 	}
 	// baseBranch is held to the branch names the broker's
 	// providers/validate.validate_branch accepts: the pattern and the length
@@ -139,6 +148,8 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			{Forge: "github", Repository: "apps", Role: "managed"},
 			{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"}}},
 		"forge-only": {Forges: gh},
+		"gitlab": {Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
+			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"}}}},
 		"alias":      {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
 		"base":       {Forges: gh, Repositories: gitops("release/2026")},
 		"base-max":   {Forges: gh, Repositories: gitops(strings.Repeat("a", 200))},

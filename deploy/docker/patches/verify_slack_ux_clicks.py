@@ -45,6 +45,8 @@ from pathlib import Path
 ADAPTER = "plugins/platforms/slack/adapter.py"
 RUNTIME = "gateway/slack_ux_clicks.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 METHOD = "_register_bolt_handlers"
 PLUGIN_WIRING = "_register_plugin_action_handlers"
@@ -448,9 +450,12 @@ def _click():
 
 
 async def _drive(module) -> None:
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     if module.enabled():
-        raise _fail(f"enabled() is true with {FLAG_ENV} unset")
+        raise _fail(f"enabled() is true with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
     try:
         adapter = _StubAdapter(authorized=True)

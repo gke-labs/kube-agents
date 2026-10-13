@@ -8,7 +8,7 @@
 # emergency path included.
 #
 # The two remaining modes make the unattended verdict reachable on demand, which
-# is the only way to see what the cron will decide without waiting a week for it
+# is the only way to see what the cron will decide without waiting a day for it
 # to decide it:
 #
 #   bypass    (default) A human decided. Publishes.
@@ -17,7 +17,7 @@
 #   evaluate  Run the resolver and honour it. Exactly a cron tick, on demand.
 #
 # Defense-in-depth: in kube-agents, release-publish.yml is dispatch-only and the
-# weekly cron lives decoupled on release-scheduler.yml. If a `schedule` event
+# daily cron lives decoupled on release-scheduler.yml. If a `schedule` event
 # were ever configured directly here, the mode is forced to `evaluate` whatever
 # the input says — ensuring an edited default cannot turn a cron tick into a dry run.
 set -euo pipefail

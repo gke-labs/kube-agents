@@ -176,6 +176,10 @@ test models, counted for the slots in use now rather than for the cap, so a brok
 requests in flight is not charged for eight. A request is admitted when a slot is free and the
 sum of live reservations plus its own fits `children_budget` with its slot counted.
 
+(The default limit is now 2Gi, raised when the kanban slot default rose to six: 1728 MiB after the reserves admits nine,
+and the slot cap of eight binds. The figures below are the 1Gi limit this design was written
+against.)
+
 At the operator's defaults (1Gi limit, 8 MiB output cap) a request costs 128 MiB plus 48 MiB of
 output allowance, 176 MiB, against 704 MiB after the two fixed reserves: four requests that run
 commands are in flight at once (4 × 176 = 704), whatever order they arrive in, where the slot cap
@@ -197,7 +201,11 @@ lets the budget admit more, up to the slot cap, and lowering it cannot OOM while
 such a limit at reconcile, and the webhook refuses it at apply where it is enabled. The output term is
 the worst case, a request holding its full capped output, which a listing never does; charging
 captured bytes instead of the cap would roughly double the concurrency and is the refinement to
-measure first if four proves tight.
+measure first if four proves tight. One install in this repository does raise it: the smoke
+pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose lanes of Platform
+Agents fanning Cluster Agents out over the seeded fleet queued behind four slots to median
+waits of 8 to 22 s and a longest wait inside the refusal bound, so it runs the proxy at 2Gi,
+where the budget admits nine and the slot cap binds again.
 
 ### 2.3 Waiting, refusing, and the degenerate case
 
@@ -207,6 +215,10 @@ slot freed, polled every `COMMAND_SLOT_POLL_SECONDS` with the same check that a 
 hung up while queued is dropped before anything starts, and bounded by the same
 `COMMAND_SLOT_WAIT_SECONDS` (60). A request still queued at the bound raises
 `CommandSlotUnavailable` with a message that names the memory budget rather than the slot count.
+Both the wait and the refusal are measured on the broker's metrics listener: every admission
+is observed in a histogram by the bound that held it, every busy answer counted by bound, and
+the slots and bytes in use are gauges beside their caps, with the budget gauge absent while the
+budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
 and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
@@ -271,7 +283,7 @@ The resident reserve assumes the layout this operator deploys, the `broker` role
 container holds the broker and Envoy alone. The image's default role is `combined`, which also
 runs the event watcher and drift detector, and it is the compatibility arrangement for an image
 paired with an older operator, the pairing the cgroup fallback serves. There the reserve omits
-the watcher's informer caches, so the budget is generous by that amount: a budget that is too
+the watcher's memos and initial lists, so the budget is generous by that amount: a budget that is too
 large by a known term for one transitional pairing, where before this change there was none.
 
 The operator reserves the variable's name in `mergeCredentialProxyEnv` by setting it in the base
@@ -292,9 +304,11 @@ phase still parallelises at all:
 resident_reserve + workspace_reserve + 2 * (copies * output_cap + request_reserve) <= limit
 ```
 
-At the defaults that is 192 + 128 + 2 × 176 = 672 MiB against 1024. The test derives the count
-the rule admits from the rendered values, `floor((limit − reserves) / (copies × cap + reserve))`,
-four at the defaults, names it in its failure message, and fails below two, so a future reduction of the
+At the defaults that is 192 + 128 + 2 × 176 = 672 MiB against 2048 (1024 when this design was
+written). The test derives the count the rule admits from the rendered values,
+`floor((limit − reserves) / (copies × cap + reserve))`, nine at the 2Gi default (192 + 128 + 9 × 176
+= 1904 MiB against 2048; four at the original 1Gi), held to eight by the slot cap, names it in its
+failure message, and fails below two, so a future reduction of the
 limit or a raise of either cap has to argue with the number it prints. The slot cap does not
 enter the rule except as an upper bound, and the test says so where a reader would otherwise
 expect it to. The broker holds the six output copies as `OUTPUT_COPIES_PER_COMMAND` beside
@@ -311,12 +325,15 @@ the broker budgeting against a stale number.
 The slot cap and output cap, their values and their reservation. The sandbox shim
 (`credential_proxy_client.py`): a 503 is still printed and exit 1 returned; with four heavy
 requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
-retry is added here. The proxy container's requests and limits, and so the
+retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
+the slot cap of eight binds.) The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
 The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap
-was raised; it is now four, the count §2.2 admits, at every cap, and its listing budget doubles to
+was raised; it is now four at every cap, the count §2.2 admitted at the original 1Gi limit (the 2Gi
+default admits nine, held to eight by the slot cap, so the four-wide pools now leave slots for
+other callers), and its listing budget doubles to
 300 seconds at the default cap to keep the 12 seconds per listing the 150-second budget gave at
 eight wide, growing by that per default cap's worth of projects. The bootstrap gate's floor
 follows the budget, from 240 to 390 seconds. The stall watch's pool goes from eight to four and

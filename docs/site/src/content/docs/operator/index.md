@@ -28,6 +28,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`.
+- **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -82,7 +83,7 @@ spec:
 proxy only bootstraps a kubectl context when it has the complete triple; leave any one out and every
 `kubectl` call the agent makes resolves to `localhost:8080` instead of a cluster.
 
-Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) and [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/).
+Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/), [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) and [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 
 ## Admission webhooks
 

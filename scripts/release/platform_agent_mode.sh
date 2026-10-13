@@ -87,7 +87,8 @@ platform_agent_mode_resolve() {
   esac
 }
 
-# Refuses `next` on a long-lived environment (autopush, staging). The patch
+# Refuses `next` on a long-lived environment (autopush, autopush-next,
+# staging). The patch
 # outlives the run there: the chart renders no spec.mode and the installer
 # does not read the key, so no later upgrade or reconcile puts it back, drift
 # detection plans nothing for it, and Google Chat stays moved off the legacy

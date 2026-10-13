@@ -18,8 +18,9 @@ Usage: python3 - <home> <hermes> <run-suffix> [<shipped jobs.json>] < arm.py
 
 Puts the install where a fresh one is when its inventory scan settles, as far as
 `agents/chat/scripts/oobe.py` reads it: an archived stand-in sweep card, an archived
-ranking card filed after it, `.bootstrap_scan_filed` naming the sweep, and no
-`.oobe_audits_fired`. Then puts back the `oobe` job if the deployed image ships one
+ranking card filed after it, `.bootstrap_scan_filed` naming the sweep, the hand-off's
+`.bootstrap_handoff_filed` naming that ranking card, as `bootstrap_handoff._record` writes
+it, and no `.oobe_audits_fired`. Then puts back the `oobe` job if the deployed image ships one
 and the install retired it. On an image that ships none, nothing is put back and
 nothing starts the audits, which is the case's red.
 
@@ -39,10 +40,11 @@ home, hermes, run = sys.argv[1:4]
 STATE = os.path.join(home, ".bench-oobe.json")
 SCAN_MARKER = os.path.join(home, ".bootstrap_scan_filed")
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
+HANDOFF_MARKER = os.path.join(home, ".bootstrap_handoff_filed")
 # The roster the image ships; the tests pass their own.
 SHIPPED_JOBS = sys.argv[4] if len(sys.argv) > 4 else "/opt/defaults/cron/jobs.json"
 JOB_ID = "oobe"
-# oobe.py counts a ranking card by this key or the key plus a suffix.
+# Its own key, so the board never answers the real hand-off's create with this card.
 RANKING_KEY = "bootstrap-inventory-prioritize-oobe-eval-" + run
 SWEEP_KEY = "oobe-eval-sweep-" + run
 TMP_SUFFIX = ".tmp"
@@ -101,6 +103,7 @@ state = {
     "applied_at": datetime.now(timezone.utc).isoformat(),
     "scan_marker": read(SCAN_MARKER),
     "audits_marker": read(AUDITS_MARKER),
+    "handoff_marker": read(HANDOFF_MARKER),
     "job_added": False,
     # A job already in the store at arm time: the stage will remove it once it has fired, and the
     # disarm puts this record back.
@@ -112,7 +115,9 @@ save(state)
 sweep = archived_card(state, SWEEP_KEY, "oobe eval: stand-in onboarding sweep")
 ranking = archived_card(state, RANKING_KEY, "oobe eval: stand-in onboarding ranking card")
 
-write(SCAN_MARKER, f"task_id={sweep}\nfiled_at={int(datetime.now(timezone.utc).timestamp())}\n")
+filed_at = int(datetime.now(timezone.utc).timestamp())
+write(SCAN_MARKER, f"task_id={sweep}\nfiled_at={filed_at}\n")
+write(HANDOFF_MARKER, f"sweep={sweep}\ntask_id={ranking}\nfiled_at={filed_at}\n")
 try:
     os.remove(AUDITS_MARKER)
 except FileNotFoundError:

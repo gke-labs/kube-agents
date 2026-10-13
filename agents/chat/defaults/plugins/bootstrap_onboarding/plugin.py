@@ -4,7 +4,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 try:
     from gateway.session_context import get_session_env
@@ -14,6 +14,18 @@ except ImportError:
     update_job = None  # type: ignore[assignment]
     trigger_job = None  # type: ignore[assignment]
 
+# Apart from the imports above, so a Hermes without these names still binds the
+# delivery job and greets.
+try:
+    from gateway.config import HomeChannel, Platform, load_gateway_config, persist_home_channel
+    from hermes_cli.config import save_env_value
+except ImportError:
+    HomeChannel = None  # type: ignore[assignment,misc]
+    Platform = None  # type: ignore[assignment,misc]
+    load_gateway_config = None  # type: ignore[assignment]
+    persist_home_channel = None  # type: ignore[assignment]
+    save_env_value = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
@@ -21,6 +33,15 @@ DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
 DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
+# The legacy home-channel env var /sethome mirrors. Hermes names both durable
+# platforms' by this pattern; the thread id's is the same name plus a suffix.
+HOME_CHANNEL_ENV_FORMAT = "{}_HOME_CHANNEL"
+HOME_THREAD_ENV_SUFFIX = "_THREAD_ID"
+SESSION_PLATFORM_ENV = "HERMES_SESSION_PLATFORM"
+SESSION_CHAT_ID_ENV = "HERMES_SESSION_CHAT_ID"
+SESSION_CHAT_NAME_ENV = "HERMES_SESSION_CHAT_NAME"
+SESSION_USER_ID_ENV = "HERMES_SESSION_USER_ID"
+SESSION_SCOPE_ID_ENV = "HERMES_SESSION_SCOPE_ID"
 
 # Written once the opening turn has been primed. Onboarding is a ONE-TIME
 # event, but ``.bootstrap_completed`` only appears at the very end of the
@@ -49,11 +70,14 @@ GREETED_MARKER = ".bootstrap_greeted"
 # request. A request more than EVAL_REQUEST_MAX_AGE_SECONDS from its
 # written_at (epoch seconds, stamped at apply) is refused with a warning, so
 # one a failed destroy leaves behind disarms on its own.
-# JSON: {"phrase": str, "variant": str, "written_at": number}.
+# JSON: {"phrase": str, "variant": str, "written_at": number,
+# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION)}.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
 EVAL_KEY_WRITTEN_AT = "written_at"
+# True tells the plugin to greet as if this turn made the chat the home channel.
+EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
@@ -63,6 +87,16 @@ EVAL_REQUEST_MAX_AGE_SECONDS = 3600
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
+
+# Added to the greeting instructions only when this turn made the chat the home
+# channel. The sentence names no command, because the command to move the home
+# channel is different on each platform.
+HOME_CHANNEL_INSTRUCTION = (
+    "This turn made this chat the home channel, so scheduled reports also come here. "
+    "After the point about where the results appear, add one short sentence that says this, "
+    "for example: \"Scheduled reports come here too.\" "
+    "Name no command. Stay inside the word limit."
+)
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
@@ -132,11 +166,59 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
         return False
 
 
-def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
+def _set_home_channel_if_unset(**kwargs: Any) -> bool:
+    """Make this chat the platform's home channel when none is configured.
+
+    Returns True only when this call wrote the home channel.
+
+    ``deliver: chat`` jobs and the chat relay post to the home channel, and a
+    fresh install has none until someone runs ``/sethome``, so every scheduled
+    report is dropped until then. A configured channel is left alone, whether
+    ``/sethome`` or the CR's ``homeChannel`` (a home-channel env var) set it.
+    The write goes through ``persist_home_channel``, as ``/sethome``'s does: a
+    ``home_channel`` block without ``platform`` or ``chat_id`` raises out of
+    ``load_gateway_config`` and stops cron delivery for every platform.
+    """
+    if None in (get_session_env, HomeChannel, Platform, load_gateway_config, persist_home_channel):
+        return False
+    try:
+        platform = Platform(get_session_env(SESSION_PLATFORM_ENV) or str(kwargs.get("platform") or ""))
+        chat_id = str(get_session_env(SESSION_CHAT_ID_ENV) or "")
+        if not chat_id or load_gateway_config().get_home_channel(platform) is not None:
+            return False
+        # No thread_id: a home channel pinned to the opening message's thread would
+        # put every scheduled report into that one thread.
+        persist_home_channel(
+            HomeChannel(
+                platform=platform,
+                chat_id=chat_id,
+                name=get_session_env(SESSION_CHAT_NAME_ENV) or chat_id,
+                user_id=get_session_env(SESSION_USER_ID_ENV) or None,
+                scope_id=get_session_env(SESSION_SCOPE_ID_ENV) or None,
+            )
+        )
+        logger.info("Set the %s home channel to %s.", platform.value, chat_id)
+    except Exception as e:
+        logger.warning("Could not set the home channel: %s", e)
+        return False
+    # The legacy env mirror /sethome also writes, for consumers that read it.
+    if save_env_value is None:
+        return True
+    env_var = HOME_CHANNEL_ENV_FORMAT.format(platform.value.upper())
+    try:
+        save_env_value(env_var, chat_id)
+        save_env_value(env_var + HOME_THREAD_ENV_SUFFIX, "")
+    except Exception as e:
+        logger.warning("Home channel saved but %s was not: %s", env_var, e)
+    return True
+
+
+def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, bool]]:
     """The eval seam's request whose phrase is in this turn's message, if any.
 
-    Returns None when no request names this turn, else whether the greeting
-    should be the completed variant. The file is left for the stack's destroy
+    Returns None when no request names this turn. Else it returns two values:
+    whether the greeting is the completed variant, and whether to greet as if
+    this turn set the home channel. The file stays for the stack's destroy
     step, so a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
@@ -145,6 +227,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
             phrase = str(request.get(EVAL_KEY_PHRASE) or "").strip()
             variant = str(request.get(EVAL_KEY_VARIANT) or "")
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
+            home_channel_set = request.get(EVAL_KEY_HOME_CHANNEL_SET) is True
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError, RecursionError) as e:
@@ -173,12 +256,12 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
                 EVAL_REQUEST_MAX_AGE_SECONDS,
             )
             continue
-        logger.info("Matched %s (variant=%s).", marker, variant)
-        return variant == EVAL_VARIANT_COMPLETED
+        logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
+        return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
 
 
-def _greeting(data_dir: Path, completed: bool) -> Dict[str, str]:
+def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
     if completed:
         instructions = _load_instructions(data_dir, "scan_completed.md", _FALLBACK_COMPLETED)
         tag = "SCAN COMPLETED"
@@ -186,7 +269,9 @@ def _greeting(data_dir: Path, completed: bool) -> Dict[str, str]:
         instructions = _load_instructions(data_dir, "scan_in_progress.md", _FALLBACK_IN_PROGRESS)
         tag = "SCAN IN PROGRESS"
 
-    logger.info("Injecting onboarding greeting instructions (%s).", tag)
+    if home_channel_set:
+        instructions = f"{instructions}\n\n{HOME_CHANNEL_INSTRUCTION}"
+    logger.info("Injecting onboarding greeting instructions (%s, home_channel_set=%s).", tag, home_channel_set)
     return {"context": f"\n\n[SYSTEM ONBOARDING INSTRUCTIONS — {tag}]\n{instructions}\n"}
 
 
@@ -198,7 +283,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     turn that primes it, this:
       1. binds the delivery job to this chat and, only if that succeeded,
          marks ``.user_aligned`` so the delivery job may fire against a valid
-         target;
+         target, and makes this chat the home channel if none is configured;
       2. triggers the delivery job so the report arrives promptly;
       3. injects a short greeting instruction — never the inventory itself. The
          report is delivered by the ``no_agent`` delivery job, verbatim, or
@@ -222,9 +307,9 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # first turn and must still greet (see EVAL_GREET_MARKER).
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     if platform_name == EVAL_PLATFORM:
-        eval_completed = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
-        if eval_completed is not None:
-            return _greeting(data_dir, eval_completed)
+        eval_request = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
+        if eval_request is not None:
+            return _greeting(data_dir, *eval_request)
 
     if not kwargs.get("is_first_turn", False):
         return None
@@ -252,6 +337,8 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         logger.info("No deliverable chat origin on this turn; leaving onboarding unprimed.")
         return None
 
+    home_channel_set = _set_home_channel_if_unset(**kwargs)
+
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)
         logger.info("Marked %s (human connected).", data_dir / ".user_aligned")
@@ -271,7 +358,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch %s: %s", GREETED_MARKER, e)
 
-    return _greeting(data_dir, (data_dir / "INVENTORY.md").exists())
+    return _greeting(data_dir, (data_dir / "INVENTORY.md").exists(), home_channel_set)
 
 
 def register(ctx: Any) -> None:

@@ -1,6 +1,6 @@
 streamlit>=1.64.0,<2
 plotly>=7.1.0,<8
-fastapi>=0.141.1,<1
+fastapi>=0.142.2,<1
 httpx>=0.28.1,<1
 pydantic>=2.13.5,<3
 uvicorn>=0.54.0,<1

@@ -1,5 +1,5 @@
 pytest>=9.1.1
-google-api-python-client>=2.200.0
-google-auth>=2.58.0
-google-auth-httplib2>=0.4.2
+google-api-python-client>=2.201.0
+google-auth>=2.59.1
+google-auth-httplib2>=0.4.3
 pyyaml>=6.0.3

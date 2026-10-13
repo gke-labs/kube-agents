@@ -482,10 +482,13 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
-#                          is stdlib parsing and runs here. `register` and
-#                          `ranked` call the queue on the agent pod's loopback,
-#                          which this container cannot reach, so they exit 13
-#                          and the SOP writes the report from its own scores
+#                          and `select` are stdlib and run here; `select`
+#                          chooses the report's items from the scores file.
+#                          `register` calls the queue on the agent pod's
+#                          loopback, which this container cannot reach, so it
+#                          exits 13, the SOP goes on to `select`, and
+#                          bootstrap_delivery.py registers the batch from the
+#                          agent pod
 #   findings_queue.py      imported by inventory_findings for the finding
 #                          schema it validates against. Its sqlite3 functions
 #                          take a connection the caller opens, and nothing here

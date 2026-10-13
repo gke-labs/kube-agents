@@ -1117,7 +1117,10 @@ class GitHardeningTest(unittest.TestCase):
         self.append_repository_config(
             repository, "\n[help]\n\tautocorrect = immediate\n"
         )
-        self.assertIsNone(git_argument_violation(["git", "bisct", "run", "x"]))
+        # Under the subcommand allowlist, `bisct` is refused at the argument gate
+        # as unsupported. Even if reached by an executor, autocorrection is pinned
+        # to 0 so the command fails rather than executing.
+        self.assertIsNotNone(git_argument_violation(["git", "bisct", "run", "x"]))
         result = executor.execute(
             ["git", "bisct", "run", str(self.payload)], cwd=str(repository)
         )
@@ -1433,8 +1436,157 @@ class GitHardeningTest(unittest.TestCase):
             git_argument_violation(["git", "config", "user.email", "a@b.invalid"])
         )
         self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name", "bot"])
+        )
+        self.assertIsNone(
             git_argument_violation(["git", "config", "--get", "remote.origin.url"])
         )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "-l"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--show-origin", "--get", "remote.origin.url"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--add", "user.name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--unset", "user.email"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name"])
+        )
+        # Writing unapproved keys repo-locally is also refused.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "core.pager", "sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "alias.foo", "bar"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--unset", "core.pager"])
+        )
+        # Trailing query flags after positional arguments do not bypass write restrictions.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "diff.external", "payload", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--show-origin", "core.pager", "sh"])
+        )
+        # Subcommand-slot anchoring: `--namespace config` cannot spoof the config start,
+        # and a pathspec or `-C` directory named `config` is not mistaken for `git config`.
+        self.assertIsNotNone(
+            git_argument_violation(
+                ["git", "--namespace", "config", "--namespace", "user.name", "config", "alias.zz", "!sh"]
+            )
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "add", "--", "config", "a.yaml", "b.yaml"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "-C", "config", "config", "user.name", "bot"])
+        )
+        # git >= 2.46 subverbs, case-insensitive keys, -t / --blob options, and abbreviated write flags.
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "get", "user.name"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "set", "user.name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "unset", "user.email"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "User.Name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "-t", "int", "core.packedGitLimit"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--blob", "HEAD:.gitmodules", "--list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "get", "--url", "https://h", "http.sslVerify"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "set", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "unset", "core.pager"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--unset-a", "core.pager"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--remove-s", "remote.origin"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--rename-s", "user", "other"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--edit"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "-e"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--expiry-date", "alias.zz", "now"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--expiry-date", "user.name"])
+        )
+        # --attr-source is skipped by _git_plan and refused by git_argument_violation.
+        self.assertEqual(
+            ("difftool", []),
+            credential_proxy._git_plan(["git", "--attr-source", "status", "difftool"]),
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "difftool"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "config", "alias.zz", "!sh"])
+        )
+
+    def test_unsupported_git_subcommands_are_refused(self):
+        for argv in (
+            ["git", "foobar"],
+            ["git", "custom-verb"],
+            ["git", "x"],
+            ["git", "gc"],
+            ["git", "archive"],
+            ["git", "-C", "/tmp", "not-a-subcommand"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_supported_git_subcommands_are_allowed(self):
+        for argv in (
+            ["git", "status"],
+            ["git", "diff"],
+            ["git", "log"],
+            ["git", "branch"],
+            ["git", "cat-file", "-t", "HEAD"],
+            ["git", "describe", "--tags"],
+            ["git", "rev-list", "-n", "1", "--all"],
+            ["git", "rev-parse", "HEAD"],
+            ["git", "version"],
+            ["git", "--version"],
+            ["git", "-v"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
 
     def test_alias_configuration_and_repo_local_execution_are_refused(self):
         # Configuring aliases via git config is refused by git_argument_violation (#1498).
@@ -2071,6 +2223,17 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
         self.assertEqual("git.argument.refused", body["rule"])
+
+    def test_an_unallowlisted_builtin_subcommand_comes_back_as_a_policy_block(self):
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {"argv": ["git", "gc"], "cwd": str(workspace)}
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("blocked", body["status"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.argument.refused", body["rule"])
+        self.assertIn("subcommand is not supported by the credential proxy", body["message"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
@@ -4879,6 +5042,22 @@ class CommandExecutorTest(unittest.TestCase):
             self.assertNotIn(name, environment)
             self.assertNotIn(value, environment.values())
 
+    def test_git_environment_excludes_unrelated_credentials(self):
+        executor = self.executor(max_output_bytes=1 << 16)
+        environment = self.git_environment(executor)
+        self.assertNotIn("KUBECONFIG", environment)
+        self.assertNotIn("CLOUDSDK_CONFIG", environment)
+
+    def test_kubectl_environment_excludes_gh_config_dir(self):
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=1 << 16), body="env"
+        )
+        environment = self.dumped_environment(
+            executor.execute(["kubectl", "get", "pods"])
+        )
+        self.assertNotIn("GH_CONFIG_DIR", environment)
+        self.assertIn("KUBECONFIG", environment)
+
     def test_bootstrap_prepares_profile_for_later_commands(self):
         import os
 
@@ -6493,9 +6672,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         reservations = []
         real_reserve = executor.reserve_child_memory
 
-        def spy_reserve(caller=None, yield_when=None, deadline=None):
-            reservations.append({"yield_when": yield_when, "deadline": deadline})
-            return real_reserve(caller=caller, yield_when=yield_when, deadline=deadline)
+        def spy_reserve(caller=None, yield_when=None, deadline=None, queued_at=None):
+            reservations.append({"yield_when": yield_when, "deadline": deadline, "queued_at": queued_at})
+            return real_reserve(
+                caller=caller, yield_when=yield_when, deadline=deadline, queued_at=queued_at
+            )
 
         yield_deadlines = []
         real_await = executor._await_covered_refreshers
@@ -6516,6 +6697,11 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(yield_deadlines))
         self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
         self.assertIsNotNone(reservations[1]["yield_when"])
+        # The second leg is handed the first's arrival, so the one admission
+        # is observed from it; the first measures its own.
+        self.assertIsNone(reservations[0]["queued_at"])
+        self.assertIsNotNone(reservations[1]["queued_at"])
+        self.assertLessEqual(reservations[1]["queued_at"], reservations[1]["deadline"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
         # Reworded for the leg it ran on: stepped aside, with the budget's
         # figures, never `_admit`'s text naming the full wait bound.
@@ -7231,6 +7417,27 @@ class SlackRelayTest(unittest.TestCase):
         """
         relay = self.relay()
         for method in ("chat.delete", "conversations.kick", "conversations.archive", "files.remove"):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call("T123", method, {})
+
+    def test_removing_the_bots_own_reaction_is_the_one_remove_that_passes(self):
+        """`reactions.remove` takes off only the token's own reaction.
+
+        The exemption is the exact method name. Every other `*.remove` and
+        `*.delete` is still refused, and so is a case variant of the exempt
+        name: the verb rule case-folds, the exemption does not.
+        """
+        relay = self.relay()
+        self.assertTrue(relay.api_call("T123", "reactions.remove", {})["ok"])
+        for method in (
+            "chat.delete",
+            "bookmarks.remove",
+            "pins.remove",
+            "Reactions.Remove",
+            "reactions.REMOVE",
+            " reactions.remove",
+        ):
             with self.subTest(method=method):
                 with self.assertRaises(ValueError):
                     relay.api_call("T123", method, {})
@@ -9236,6 +9443,27 @@ class TwoForgeInstallTest(unittest.TestCase):
             two = credential_proxy.providers.Registry()
         with mock.patch.object(credential_proxy, "forge_registry", return_value=two):
             self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "gitlab"))
+
+    def test_a_pin_is_one_repository_on_one_forge_however_the_paths_coincide(self):
+        # The pinned base names its host: on a broker serving GitHub and GitLab,
+        # `acme/infra` on each is a different repository with its own base, a
+        # nested GitLab path pins as the forge reads it, and `www.gitlab.com`
+        # is gitlab.com.
+        pins = credential_proxy.parse_pinned_bases(json.dumps([
+            {"repository": "https://github.com/acme/infra", "branch": "release"},
+            {"repository": "https://gitlab.com/acme/infra", "branch": "main"},
+            {"repository": "https://www.gitlab.com/acme/platform/fleet", "branch": "stable"},
+        ]))
+        self.assertEqual({
+            ("github.com", "acme/infra"): "release",
+            ("gitlab.com", "acme/infra"): "main",
+            ("gitlab.com", "acme/platform/fleet"): "stable",
+        }, pins)
+        pinned = credential_proxy.providers.pinned_base
+        self.assertEqual("release", pinned(pins, "github.com", "acme/infra"))
+        self.assertEqual("main", pinned(pins, "gitlab.com", "acme/infra"))
+        self.assertEqual("stable", pinned(pins, "gitlab.com", "acme/platform/fleet"))
+        self.assertIsNone(pinned(pins, "github.com", "acme/platform/fleet"))
 
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()

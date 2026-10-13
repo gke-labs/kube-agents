@@ -1,0 +1,190 @@
+# A question about the agent's own observability: whether the event watcher's
+# Prometheus metrics are scraped on this install, how the scrape is configured
+# and what proves it is working. The answer comes from the kube-agents
+# observability skill. The skill used to send the agent to the gateway
+# Deployment for scrape annotations the operator has never rendered, and an
+# operator reported the agent answering "not scraped" on an install the managed
+# collector scraped every 30s through the chart's `<name>-gateway-monitoring`
+# PodMonitoring. On the live-test install the delegated worker found the
+# PodMonitoring without the skill's help, so this case did not go red against
+# the old skill; it guards the answer instead: the mechanism, the listener (the
+# `agent-api-auth` container's `event-metrics` port, 9095), one of the proving
+# series (`up{job="<name>-gateway-monitoring"}` or `k8s_event_watcher_cluster_up`),
+# and the worker's own read of the PodMonitoring.
+#
+# Graded on the route and the answer. The worker has to have read the
+# PodMonitoring off the install (a `kubectl get podmonitoring` in its terminal
+# log), because the required phrases are the skill's own vocabulary and an
+# answer composed from the skill without a read would otherwise pass on them;
+# and the final answer has to name the mechanism, the port and one of the two
+# proving series, which an answer built on the Deployment's annotations does
+# not. The install under test has to carry the gateway PodMonitoring
+# for the question to have the answer the skill gives; the chart renders it
+# where the cluster serves the PodMonitoring API, and a kustomize install
+# needs it applied by hand before the run.
+# No `fixtures:`: the case reads the agent's own install, not the seeded
+# fleet. No `domains.yaml` row covers the agent's own observability, which is
+# why the case is a reviewed KNOWN_NO_DOMAIN entry in
+# scripts/validate_bench_cases.py rather than a slug.
+#
+# Expected cost bracket: ~100-300s, one delegation round trip and a handful of
+# reads of the agent's own namespace.
+id: observability-watcher-scrape-state
+name: The event watcher's metrics are scraped through the PodMonitoring
+prompt: >-
+  Are the event watcher's Prometheus metrics being scraped on this install?
+  Tell me how the scrape is configured, where the watcher's listener is, and
+  which series in Cloud Monitoring prove that the collector is scraping it.
+  Begin your reply with a single line -- `Scraped: yes` or `Scraped: no` --
+  then explain.
+expected_output: >-
+  Scraped: yes. The scrape is configured by the PodMonitoring named after the
+  agent with the gateway-monitoring suffix, which targets the event watcher's
+  listener on the gateway pod's agent-api-auth container, port 9095
+  (event-metrics); the proof that the collector is scraping it is in Cloud
+  Monitoring, as up for that job and k8s_event_watcher_cluster_up for each
+  watched cluster, with the watcher's own cluster and location labels arriving
+  as exported_cluster and exported_location. The answer does not rest on scrape
+  annotations on the gateway Deployment, which the operator does not render.
+infrastructure:
+  deployer: noop
+validated: false
+owner: bradhoekstra
+verification_spec:
+  # The route: some delegated worker command both invokes kubectl and names the
+  # PodMonitoring. This check is deliberately loose -- two lookaheads,
+  # `(?=.*kubectl)(?=.*podmonitoring)`, confirm only that `kubectl` and
+  # `podmonitoring` co-occur in one command, in either order, nothing more. A
+  # precise regex that insists `podmonitoring` be the resource argument of a
+  # `get`/`describe` re-implements shell grammar and leaked in both directions
+  # across many review rounds: it refused real reads wrapped in `sh -c`, env
+  # assignments, `xargs` or `$(...)`, and admitted a CRD read, a `can-i` probe, or
+  # the kind in a filename. Order-free co-occurrence has no false-reds -- every
+  # real read matches however it is wrapped, and (unlike an ordered
+  # `kubectl.*podmonitoring`, which reads forward from `kubectl` only) a read whose
+  # kind precedes the verb, as in `for r in podmonitoring; do kubectl get $r; done`,
+  # still matches. Its false-greens (a `can-i` probe, a CRD read, the kind in an
+  # output filename or selector value, or the command quoted inside a
+  # `grep`/`echo`) are accepted, and the answer objectives below do NOT close them:
+  # the required phrases are the skill's own vocabulary (see the header), so an
+  # answer composed from the skill without a read passes objectives 3 and 4 too.
+  # What this route check adds is the real read as the expected path -- every
+  # recorded run took it -- and a refusal of the one shape that names no
+  # PodMonitoring at all: the regression this case guards, the old skill's
+  # Deployment-annotation path (`kubectl get deployment ... -o yaml`).
+  # worker_commands sees terminal commands only, so a read through an MCP tool is
+  # invisible to it; the skill's step spells the kubectl command and every recorded
+  # run used it. It also fails closed on no delegation at all: the front door holds
+  # no infrastructure tools, so worker_commands reads the delegated worker's
+  # terminal log and returns an error -- which blocks the repetition -- not a pass,
+  # when nothing was delegated, so an undelegated run reds here without a separate
+  # delegation objective. The corpus is pinned in
+  # bench/tests/test_observability_watcher_scrape_patterns.py.
+  - name: the-worker-read-the-podmonitoring
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        - '(?i)(?=.*\bkubectl\b)(?=.*\bpodmonitoring)'
+  # The final answer names the mechanism, the port and one of the two proving
+  # series. `mode: assert` because the final message is immutable once the run
+  # ends; polling a failed phrase would only wait out the timeout. The required
+  # phrases are the skill's own vocabulary, so the any_of series raises the bar:
+  # a worker cites up{job=...} or k8s_event_watcher_cluster_up only after it has
+  # queried Cloud Monitoring for them. This objective carries no polarity on its
+  # own: a thorough negative that queried the series and found it empty
+  # ("up{job=...} returned nothing, 9095 is not scraped") names all three and
+  # passes it, so a green here means the worker read the PodMonitoring and queried
+  # the series. The conclusion -- that the watcher IS scraped -- is graded by the
+  # next objective. The skill regression this case is built around -- step 1
+  # reading scrape annotations off the Deployment -- is guarded model-free by
+  # tests/test_observability_skill_scrape_step.py.
+  - name: the-answer-names-the-podmonitoring-the-listener-and-the-proof
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        - "PodMonitoring"
+        - "gateway-monitoring"
+        - "9095"
+      any_of_phrases:
+        - "up{job="
+        - "k8s_event_watcher_cluster_up"
+  # The conclusion's polarity, which the objective above does not carry: the
+  # answer must affirm the watcher is scraped, not merely name the mechanism and
+  # series while concluding it is not. Polarity is graded as a verdict token the
+  # prompt asks the worker to emit -- a first line `Scraped: yes` or
+  # `Scraped: no` -- not by reading it out of free prose. A substring or regex
+  # over the prose cannot carry English negation: "is scraping" sits inside
+  # "whether GMP is scraping it: it is not", "is scraped" survives a negated
+  # subject ("nothing is scraping it"), and an enumerated-negation regex here
+  # leaked on contractions, perfect tense, active voice, bulleted negations and
+  # "unscraped" -- negation is not finitely enumerable, so each round patched one
+  # shape and missed the next. Both tokens are graded by one grammar, so the two
+  # halves agree on what a verdict line is, against the verifier's
+  # `_normalize_lines(raw, fold_decoration=True)`: `fold_decoration` folds each
+  # line's lead decoration before the patterns run, so the grammar describes the
+  # verdict once rather than enumerating the markers a verdict line can wear. The
+  # affirmative is an any_of_patterns regex `scraped:\s*["'“‘(]?(?:[✅✔✓]\s*)?yes\b`,
+  # so `Scraped:yes` with the space dropped, `Scraped : yes` with one added, a
+  # quoted `Scraped: "yes"` and a checked `Scraped: ✅ yes` all affirm where a
+  # literal `Scraped: yes` substring would red a compliant answer: the fold
+  # settles the spacing and unwraps a quote that ends its line, and the gap admits
+  # what the fold leaves between the colon and the token when prose follows on
+  # the same line -- an opening quote or bracket, and the check marks the fold's
+  # own `_TRAIL_CLOSERS` treat as affirming (`✅ ✔ ✓`). The gap is that list and
+  # not the complement of a word character, for the reason the trail fold gives:
+  # a mark that negates the token must stay in front of it, so a struck-through
+  # `Scraped: ~~yes~~ no` or a `Scraped: ❌ yes` does not affirm (and, carrying no
+  # `no` verdict line either, fails the any_of -- red, as a negative or an
+  # unreadable verdict should). The negative is a forbidden_patterns regex
+  # `(?m)\A(?:(?!scraped:\s*["'“‘(]?(?:[✅✔✓]\s*)?yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b`:
+  # the `^scraped:\s*[^\w\n]*no\b` tail matches a line whose verdict is
+  # `Scraped: no` however the value is quoted or marked (`Scraped: ❌ no` reds; the
+  # wide gap is safe on this side, where a mark can only make a `no` more so),
+  # and the `\A...*?` prefix lets that match land only where no `Scraped: yes` --
+  # by the affirmative's own grammar -- precedes it: the first verdict decides. The fold is what the tail rests on: the lead of a `-`/`+`
+  # bullet, a `#` heading, a `>` quote, a `|` table cell, a `- [ ]` checkbox, a
+  # leading emoji, an ordered `1.`/`1)`/`(1)`, a lettered `a)`, a roman `ii.`, a
+  # `#1` or a keycap `1️⃣` all come off, so `^scraped: no` anchors on the verdict
+  # under any of them -- the shapes a hand-rolled `[^\w\n]*(?:\d+[.)]\s*)?` prefix
+  # enumerated and missed one at a time (it cleared the punctuation bullets but not
+  # the lettered, roman, keycap or `#`-number markers). The first-verdict prefix is
+  # what spares a per-component negative under an affirmative headline, in any
+  # layout: once a `Scraped: yes` is seen the lookahead blocks the match from
+  # reaching a later `scraped: no`, so a `Broker: scraped: no` label line, a bare
+  # `- scraped: no` bullet, or a nested `  - scraped: no` all survive beneath a
+  # `Scraped: yes` -- the nuance expected_output invites, where a correct answer
+  # may note the credential-proxy PodMonitoring is unscraped while the watcher is.
+  # It still does not fire on `scraped: nothing`/`not yet`/`none` (the word
+  # boundary) nor on an affirmative that mentions "scraped: no" mid-sentence or in
+  # a later clause (the line's first word is not `scraped`): `the credential-proxy
+  # is scraped: no` does not match. Three residuals stand, pinned in
+  # bench/tests/test_observability_watcher_scrape_patterns.py: (1) a negative that
+  # omits the verdict line but carries the substring "scraped: yes" inline; (2) a
+  # negative whose verdict sits behind a `word:` label (`Verdict: Scraped: no`, a
+  # `| Verdict | Scraped: no |` table row), its `scraped: no` behind a word the
+  # lead fold stops at, never at a line start; and (3) a negative that echoes the
+  # `Scraped: yes` option before its own
+  # `Scraped: no` verdict line, which first-verdict-decides reads as the verdict,
+  # sparing the real one. The echo need not be the worker's own choice: the harness
+  # puts the front door's acknowledgement first in `final_message` (bench's
+  # parsing.py appends later output after it), and an ack that names the asked
+  # `Scraped: yes`/`Scraped: no` format back carries the token on its first line --
+  # so a red install can green here whenever its transcript opens with that ack, not
+  # only when the worker restates the option. (2) and (3) each pair with a stray
+  # "scraped: yes" that satisfies the affirmative; (3) is the price of the
+  # first-verdict prefix that spares a component negative under an affirmative
+  # headline.
+  - name: the-answer-affirms-the-watcher-is-scraped
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      any_of_patterns:
+        - 'scraped:\s*["''“‘(]?(?:[✅✔✓]\s*)?yes\b'
+      forbidden_patterns:
+        - '(?m)\A(?:(?!scraped:\s*["''“‘(]?(?:[✅✔✓]\s*)?yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b'

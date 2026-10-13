@@ -48,6 +48,15 @@ const (
 	// drifted would leave a pod with the token and the shims but no Bash,
 	// and nothing would say so.
 	EnvClusterView = "A2A_CLUSTER_VIEW"
+	// EnvProfileExecutor marks a pod the dispatcher spawned for an
+	// AgentProfile (the A2A profile resource, not a Hermes profile
+	// directory). Literal "true" is on. Such a pod has no A2A_SESSION: it
+	// publishes as its profile and names its consumers for its pod, which is
+	// what the callout's profile narrowing grants. The worker refuses an
+	// empty A2A_SESSION under a bus token unless this says otherwise, so a
+	// session pod whose spawner dropped its session name still fails at
+	// startup rather than publishing as its profile.
+	EnvProfileExecutor = "A2A_PROFILE_EXECUTOR"
 )
 
 const (

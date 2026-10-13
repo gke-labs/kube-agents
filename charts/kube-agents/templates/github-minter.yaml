@@ -18,11 +18,11 @@ the module README, which links the upstream guide for doing it by hand).
   declares no forge at all still renders the minter, which is what every
   existing values file relies on.
 
-  With `github` the only registered provider, kube-agents.forgeProviders
-  refuses anything else before this can fire. This guard is what keeps that
-  true when the registry widens, which is the same change that gives a
-  non-GitHub forge a credential path of its own -- see
-  docs/designs/version-control-support.md §6.
+  A GitLab-only declaration is the case this fires for: GitLab's credential
+  is an access token an administrator stores in the Secret its
+  credentialsRef names, which the operator mounts into the credential broker,
+  and nothing about it involves the minter -- see
+  docs/designs/version-control-support.md §7.
 */}}
 {{- $providers := include "kube-agents.forgeProviders" . }}
 {{- if and $providers (not (has "github" (splitList "," $providers))) }}

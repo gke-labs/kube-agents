@@ -162,6 +162,16 @@ func (s *stubUsageSource) set(addr string, sample int64, start *float64) {
 	s.readings[addr] = usageReading{Sample: sample, StartTime: start}
 }
 
+// setClusters gives addr's reading the watcher's cluster gauge; set clears it,
+// as a broker's body would.
+func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Clusters = &usageClusterGauges{Registered: registered, Monitored: monitored}
+	s.readings[addr] = reading
+}
+
 func (s *stubUsageSource) fail(addr string, kind string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,6 +201,22 @@ func (s *stubUsageSource) scraped(addr string) bool {
 	return false
 }
 
+// gaugeValue reads a gauge field as a test compares it: -1 for absent.
+func gaugeValue(v *int64) int64 {
+	if v == nil {
+		return -1
+	}
+	return *v
+}
+
+// expireGaugeRecordForTest ages the CR's gauge pruning record past the reprobe
+// interval, as the clock would.
+func (p *UsageCounterPoller) expireGaugeRecordForTest(agent *agentv1alpha1.PlatformAgent) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.prunedGauges[usagePollKey(agent)] = p.now().Add(-2 * usageStatusReprobeInterval)
+}
+
 // usageHarness is a poller over a fake client, with the writes it makes
 // counted.
 type usageHarness struct {
@@ -213,6 +239,9 @@ type usageHarness struct {
 	// pruning makes the fake behave like a served CRD without status.usage:
 	// the echo of a status patch comes back with the field empty.
 	pruning bool
+	// pruningGauges makes the fake behave like a served CRD at the previous
+	// schema: status.usage with the counters, without the two cluster gauges.
+	pruningGauges bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -222,8 +251,24 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 		SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 			h.patches++
 			err := c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
-			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && h.pruning {
+			// A pruning CRD drops the fields from what is stored as well as from
+			// the echo, so the store is stripped with a second patch the poller
+			// never sees, and the echo the poller reads is stripped the same way.
+			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
+			if err == nil && isAgent && (h.pruning || h.pruningGauges) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null}}}`
+				if h.pruning {
+					strip = `{"status":{"usage":null}}`
+				}
+				stored := pa.DeepCopy()
+				err = c.SubResource(subResourceName).Patch(ctx, stored, client.RawPatch(types.MergePatchType, []byte(strip)))
+			}
+			if isAgent && h.pruning {
 				pa.Status.Usage = agentv1alpha1.AgentUsageStatus{}
+			}
+			if isAgent && h.pruningGauges {
+				pa.Status.Usage.ClustersRegistered = nil
+				pa.Status.Usage.ClustersMonitored = nil
 			}
 			return err
 		},
@@ -883,6 +928,258 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 	}
 	if doc := h.document(); !doc.Pods["gw-b"].Marker.Time.Equal(usageClock(10)) {
 		t.Fatalf("the reset replica did not take the sibling's marker: %+v", doc.Pods["gw-b"])
+	}
+}
+
+// The two cluster gauges are the latest poll's reading, not a fold: they are
+// written on the first poll, fall when the watcher's reading falls, stay put
+// when the listener cannot be read, and move lastActiveTime never.
+func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	// The watcher starting: its fleet built, no informer synced yet. A zero
+	// monitored is a reading and is written as one, not left absent.
+	h.stub.setClusters(gatewayAddr(), 3, 0)
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+
+	h.poll(3)
+	status := h.status()
+	if h.patches != 1 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 0 {
+		t.Fatalf("the starting watcher: %d patches, status %+v; want one patch writing 3/0", h.patches, status)
+	}
+
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.poll(5)
+	status = h.status()
+	if h.patches != 2 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 3 {
+		t.Fatalf("first synced poll: %d patches, status %+v; want 3/3", h.patches, status)
+	}
+	if status.LastActiveTime != nil || status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("the gauges moved a counter or lastActiveTime: %+v", status)
+	}
+
+	// A cluster's informer is held: monitored falls, registered does not.
+	h.stub.setClusters(gatewayAddr(), 3, 2)
+	h.poll(10)
+	if status := h.status(); h.patches != 3 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 2 {
+		t.Fatalf("after a fall: %d patches, status %+v; want 3/2", h.patches, status)
+	}
+	if status := h.status(); status.LastActiveTime != nil {
+		t.Fatalf("a gauge change moved lastActiveTime: %v", status.LastActiveTime)
+	}
+
+	// Unchanged: no write.
+	h.poll(15)
+	if h.patches != 3 {
+		t.Fatalf("an unchanged reading wrote the status: %d patches", h.patches)
+	}
+
+	// The listener cannot be read once: the fields keep their last reading.
+	h.stub.fail(gatewayAddr(), usageScrapeKindRefused)
+	h.poll(20)
+	if status := h.status(); h.patches != 3 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 2 {
+		t.Fatalf("a failed scrape changed the gauges: %d patches, status %+v", h.patches, status)
+	}
+	// A second poll in a row with no gateway reading: the operator has no
+	// current reading, so both are cleared rather than held.
+	h.poll(25)
+	if status := h.status(); h.patches != 4 || status.ClustersRegistered != nil || status.ClustersMonitored != nil {
+		t.Fatalf("a standing watcher failure left the gauges: %d patches, status %+v", h.patches, status)
+	}
+
+	// The watcher is back, with a cluster gone from its fleet.
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.setClusters(gatewayAddr(), 2, 2)
+	h.poll(30)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 2 || gaugeValue(status.ClustersMonitored) != 2 {
+		t.Fatalf("after the watcher came back: %+v, want 2/2", status)
+	}
+}
+
+// Across gateway replicas the gauges take the largest reading: every replica's
+// watcher builds the same fleet, so a replica mid-startup reports fewer, not
+// others.
+func TestUsagePoller_ClusterGaugesTakeTheLargestReplica(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), b)...)
+	bAddr := usageTestGatewayB + ":9095"
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.setClusters(gatewayAddr(), 4, 1)
+	h.stub.set(bAddr, 100, ptr.To(1.0))
+	h.stub.setClusters(bAddr, 4, 4)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 4 || gaugeValue(status.ClustersMonitored) != 4 {
+		t.Fatalf("two replicas: %+v, want 4/4", status)
+	}
+}
+
+// One replica read is a reading: a sibling failing for any number of polls
+// neither clears the gauges nor lowers them, and a broker failing for the
+// streak has nothing to do with them.
+func TestUsagePoller_ClusterGaugesHoldWhileAnyReplicaIsRead(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), b)...)
+	bAddr := usageTestGatewayB + ":9095"
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.setClusters(gatewayAddr(), 4, 4)
+	h.stub.fail(bAddr, usageScrapeKindRefused)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	for _, minute := range []int{5, 10, 15} {
+		h.poll(minute)
+	}
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 4 || gaugeValue(status.ClustersMonitored) != 4 {
+		t.Fatalf("a failing sibling or broker touched the gauges: %+v, want 4/4", status)
+	}
+}
+
+// A gateway pod that is live but never a target, Pending or without a pod IP,
+// is the same absence of a reading as a failing listener: the gauges clear at
+// the streak, and come back once a replica is read.
+func TestUsagePoller_ClusterGaugesClearWhenNoGatewayIsReadable(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 3 {
+		t.Fatalf("first poll: %+v", status)
+	}
+	// The gateway pod loses its IP (evicted and Pending again under the same
+	// UID is the same shape): live, not a target, no scrape, no streak.
+	pod := &corev1.Pod{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: "agent-gateway-aaa"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.PodIP = ""
+	if err := h.cl.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	h.poll(10)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 3 {
+		t.Fatalf("one poll without a readable gateway changed the gauges: %+v", status)
+	}
+	h.poll(15)
+	if status := h.status(); status.ClustersRegistered != nil || status.ClustersMonitored != nil {
+		t.Fatalf("two polls without a readable gateway left the gauges: %+v", status)
+	}
+	pod.Status.PodIP = usageTestGatewayIP
+	if err := h.cl.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	h.poll(20)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 3 {
+		t.Fatalf("the reading did not come back: %+v", status)
+	}
+}
+
+// With the watcher switched off there is no fleet being watched: the gauges
+// are cleared rather than left at the last reading.
+func TestUsagePoller_ClusterGaugesClearWhenTheWatcherIsOff(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)}
+	agent.Status.Usage.ClustersRegistered = ptr.To(int64(3))
+	agent.Status.Usage.ClustersMonitored = ptr.To(int64(3))
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.stub.set(brokerAddr(), 70, nil)
+	h.poll(5)
+	if status := h.status(); h.patches != 1 || status.ClustersRegistered != nil || status.ClustersMonitored != nil {
+		t.Fatalf("watcher off: %d patches, status %+v; want one patch clearing both", h.patches, status)
+	}
+	h.poll(10)
+	if h.patches != 1 {
+		t.Fatalf("a second poll with the watcher off wrote again: %d patches", h.patches)
+	}
+}
+
+// A served CRD without status.usage prunes a gauge-only patch too: the gauges
+// get their own pruning record, so the poller does not re-patch them every
+// poll, and the counters' shared record, which the Ready writer reads, is not
+// touched by a probe that wrote no counter.
+func TestUsagePoller_GaugeOnlyProbeUnderAPruningCRD(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruning = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	if h.patches != 1 {
+		t.Fatalf("%d patches on the first poll, want 1 (the probe)", h.patches)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("a probe that wrote no counter recorded the counters' shared pruning record")
+	}
+	// A poll inside the reprobe interval (a sweep a budget cut spread out, say)
+	// probes again neither the gauges nor, through them, the whole status.
+	h.poll(8)
+	if h.patches != 1 {
+		t.Fatalf("%d patches while the gauge record is fresh, want 1", h.patches)
+	}
+	// The record expires and the CRD now serves the fields: the next poll lands them.
+	h.p.expireGaugeRecordForTest(agent)
+	h.pruning = false
+	h.poll(13)
+	if status := h.status(); h.patches != 2 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 3 {
+		t.Fatalf("after the record expired: %d patches, status %+v; want 2 and 3/3", h.patches, status)
+	}
+}
+
+// A served CRD at the previous schema prunes the gauges and keeps the counters:
+// the counters keep landing every poll they move, and the shared record stays
+// clear, because the gauges' absence is their own condition.
+func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningGauges = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.poll(5)
+	h.stub.set(brokerAddr(), 15, nil)
+	h.poll(10)
+	h.stub.set(brokerAddr(), 20, nil)
+	h.poll(15)
+	if status := h.status(); status.ToolExecutionsTotal != 10 || status.ClustersRegistered != nil {
+		t.Fatalf("status after three polls: %+v, want 10 tool executions and no gauges", status)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the gauges' absence was recorded as the counters' pruning")
+	}
+	if h.patches != 3 {
+		t.Fatalf("%d patches, want 3: the gauge probe on the first poll and one per counter movement", h.patches)
+	}
+	// Each counter write re-probed the gauges and found them absent again, so
+	// the record is still fresh, re-stamped rather than re-created.
+	if !h.p.gaugesPruned(agent) {
+		t.Fatal("the gauge record did not survive the counter writes that re-probed it")
+	}
+}
+
+// A completed sweep drops the gauge records of CRs it did not reach, the
+// deleted ones, and keeps the records of the CRs it did.
+func TestUsagePoller_ForgetsTheGaugeRecordsOfDepartedCRs(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.clock = usageClock(5)
+	departed := usageTestAgent(created)
+	departed.Name = "departed"
+	h.p.noteGaugeEcho(context.Background(), agent, false)
+	h.p.noteGaugeEcho(context.Background(), departed, false)
+	h.p.forgetDepartedGaugeRecords(map[string]bool{usagePollKey(agent): true})
+	if !h.p.gaugesPruned(agent) {
+		t.Error("a live CR's record was dropped by the sweep")
+	}
+	if h.p.gaugesPruned(departed) {
+		t.Error("a departed CR's record survived the sweep")
 	}
 }
 

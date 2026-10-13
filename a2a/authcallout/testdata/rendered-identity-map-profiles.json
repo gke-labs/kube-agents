@@ -1,0 +1,134 @@
+{
+  "version": "5ca003ff28bd2c5c",
+  "identities": [
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
+      "user": "provision",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "$JS.API.INFO",
+          "$JS.API.STREAM.NAMES",
+          "$JS.API.STREAM.LIST",
+          "$JS.API.STREAM.CREATE.TASKS",
+          "$JS.API.STREAM.CREATE.DIRECTORY",
+          "$JS.API.STREAM.CREATE.TOPICS-STATE",
+          "$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+          "$JS.API.STREAM.CREATE.KV_runtime-state",
+          "$JS.API.STREAM.CREATE.KV_session-state",
+          "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.INFO.TASKS",
+          "$JS.API.STREAM.INFO.DIRECTORY",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.STREAM.INFO.KV_runtime-state",
+          "$JS.API.STREAM.INFO.KV_session-state",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "_INBOX.provision.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "_INBOX.provision.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-session",
+      "user": "session",
+      "account": "APP",
+      "grants": {
+        "publish": null,
+        "subscribe": null
+      },
+      "narrowing": "pod"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
+      "user": "agent",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.DIRECT.GET.TOPICS-STATE.>",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
+          "chat.notify.gchat",
+          "_INBOX.agent.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "chat.notify.reply.agent.>",
+          "_INBOX.agent.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
+      "user": "verifier",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.cap.reply.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.DIRECT.GET.KV_cap",
+          "$JS.API.STREAM.MSG.GET.KV_cap",
+          "_INBOX.verifier.>"
+        ],
+        "subscribe": [
+          "a2a.cap.verify.*",
+          "_INBOX.verifier.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-operator:kubeagents-controller-manager",
+      "user": "operator",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.agents.*",
+          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*"
+        ],
+        "subscribe": [
+          "_INBOX.operator.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agentprofile-auditor",
+      "user": "profile-auditor",
+      "account": "APP",
+      "grants": {
+        "publish": null,
+        "subscribe": null
+      },
+      "narrowing": "profile",
+      "profile": "auditor",
+      "topics": {
+        "publish": [
+          "agent.auditor.findings"
+        ],
+        "subscribe": [
+          "shared.blueprint"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agentprofile-cluster-a",
+      "user": "profile-cluster-a",
+      "account": "APP",
+      "grants": {
+        "publish": null,
+        "subscribe": null
+      },
+      "narrowing": "profile",
+      "profile": "cluster-a"
+    }
+  ]
+}

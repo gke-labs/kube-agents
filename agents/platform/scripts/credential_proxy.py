@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
@@ -394,6 +394,39 @@ PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 TOOL_DURATION_METRIC = "kubeagents_tool_execution_duration_seconds"
 PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
+# The queue the child memory budget created, made visible (#2639): how long a
+# request waited to be admitted and which bound held it, how many waited out
+# the bound and were refused, and what is in use against each cap. `bound` is
+# a closed vocabulary: the slot cap, the child memory budget, the forge
+# refresh lock, or the session role's own limit; anything else counts as
+# `other`, so no message text ever opens a series.
+ADMISSION_WAIT_METRIC = "kubeagents_credential_proxy_admission_wait_seconds"
+ADMISSION_REFUSALS_METRIC = "kubeagents_credential_proxy_admission_refusals_total"
+SLOTS_IN_USE_METRIC = "kubeagents_credential_proxy_slots_in_use"
+CHILD_MEMORY_RESERVED_METRIC = "kubeagents_credential_proxy_child_memory_reserved_bytes"
+SLOT_CAP_METRIC = "kubeagents_credential_proxy_slot_cap"
+CHILD_MEMORY_BUDGET_METRIC = "kubeagents_credential_proxy_child_memory_budget_bytes"
+ADMISSION_BOUND_LABEL = "bound"
+ADMISSION_BOUND_SLOT = "slot"
+ADMISSION_BOUND_BUDGET = "budget"
+ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
+ADMISSION_BOUND_SESSION = "session"
+ADMISSION_BOUND_OTHER = "other"
+#: The histogram's label for a request admitted without a wait: nothing held
+#: it, so neither bound is blamed, and the label does not flip with the memory
+#: limit. Never a refusal's bound.
+ADMISSION_BOUND_NONE = "none"
+ADMISSION_BOUNDS = frozenset(
+    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION, ADMISSION_BOUND_NONE}
+)
+# Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
+# (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
+# cap in the tree, so "how often did a wait outlast a caller's cap" is a
+# bucket ratio; the last edge is the broker's own refusal bound, which no
+# observation crosses, because a request refused at it was never admitted
+# and is counted by ADMISSION_REFUSALS_METRIC instead. The top bucket holds
+# the waits that were answered just under it.
+ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -439,7 +472,9 @@ GCLOUD_EXTRA_SURFACES = frozenset({"components", "iam", "init", "resource-manage
 # content_workspace.WORKSPACE_GIT_SUBCOMMANDS, and the git vocabulary is the
 # union of those two, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's
 # list is labelled by name without a second edit here.
-GIT_READ_SUBCOMMANDS = frozenset({"blame", "describe", "log", "ls-files", "show", "status"})
+GIT_READ_SUBCOMMANDS = frozenset(
+    {"blame", "cat-file", "describe", "log", "ls-files", "rev-list", "show", "status", "version"}
+)
 FORGE_CLI_SUBCOMMANDS = frozenset(
     {
         "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -1383,6 +1418,20 @@ DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"
 # list naming it.
 DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
+# The one Slack method the verb rule above would refuse that the relay forwards.
+# Slack's `reactions.remove` takes off only the calling token's own reaction --
+# the bot's, never a person's -- and adding it again undoes it, so it is not in
+# the class the denylist exists for. The agent takes its arrival reaction off
+# when its answer posts. Matched exactly, before case-folding: `Reactions.Remove`
+# is not this method and stays refused, as every other `*.remove` does.
+SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
+
+# The shape a Slack method name must have before the verb rule reads it: dotted
+# words of letters and digits (`oauth.v2.access` carries one). The verb rule
+# reads only the text after the last dot, so without this `chat.delete#x`,
+# `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
+# string into the URL, where the fragment is dropped and the query ignored.
+SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -1464,6 +1513,9 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
 class CommandSlotUnavailable(RuntimeError):
     """A request waited out its admission bound without being admitted.
 
+    `bound` names what held it, from ADMISSION_BOUNDS, for the refusal counter;
+    the message names it for the caller.
+
     Admission covers the slot cap and the child memory budget alike, and the
     message names whichever held the request. Admission goes in arrival order,
     so this is the request that has waited longest, whether the slots or the
@@ -1472,6 +1524,20 @@ class CommandSlotUnavailable(RuntimeError):
     would take the container over its memory limit, and an OOM kill fails every
     request in flight for every caller, not just this one.
     """
+
+    def __init__(self, message: str, bound: str = ADMISSION_BOUND_OTHER) -> None:
+        super().__init__(message)
+        self.bound = bound
+
+
+class AdmissionSnapshot(NamedTuple):
+    """What the executor holds against each cap, for the gauges: read under
+    its lock by `admission_snapshot`, rendered by `ProxyMetrics`."""
+
+    slots_in_use: int
+    slot_cap: int
+    reserved_bytes: int
+    budget_bytes: int | None
 
 
 def session_slot_limit_from_env() -> int:
@@ -1520,7 +1586,8 @@ class SessionSlots:
             if self._in_flight >= self.limit:
                 raise CommandSlotUnavailable(
                     f"the session role is limited to {self.limit} concurrent command(s) through the "
-                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes"
+                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes",
+                    bound=ADMISSION_BOUND_SESSION,
                 )
             self._in_flight += 1
         try:
@@ -1544,8 +1611,14 @@ class AdmissionYielded(Exception):
 
     Raised only to a caller that asked to be woken when that happens
     (`_admit`'s `yield_when`), before it was admitted; never answered to a
-    client.
+    client. `queued_at` is the monotonic time the request joined the queue,
+    for the caller to hand back when it re-enters, so the one admission is
+    observed once, from arrival.
     """
+
+    def __init__(self, message: str, queued_at: float) -> None:
+        super().__init__(message)
+        self.queued_at = queued_at
 
 
 @dataclass(frozen=True)
@@ -2664,7 +2737,14 @@ class SlackRelay:
     ) -> dict[str, Any]:
         if not method or method.startswith("_"):
             raise ValueError("Slack API method is not available through the relay")
-        if method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS:
+        if not SLACK_METHOD_SHAPE.fullmatch(method):
+            raise ValueError(
+                f"the Slack method {method!r} is not available through the relay"
+            )
+        if (
+            method not in SLACK_REMOVE_ALLOWLIST
+            and method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS
+        ):
             raise ValueError(
                 f"the Slack method {method!r} is not available through the relay"
             )
@@ -3079,6 +3159,55 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
     }
 )
 
+# Keys permitted to be written via repository-local `git config`. Only committer
+# identity configuration is needed by GitOps workspace setup; writing aliases,
+# filters, or execution hooks is refused.
+ALLOWED_GIT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
+
+# Actions that make a `git config` invocation a read-only query.
+# Must appear in option position (before the first positional argument).
+GIT_CONFIG_QUERY_ACTIONS = frozenset(
+    {
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--list",
+        "-l",
+        "--get-color",
+        "--get-colorbool",
+    }
+)
+
+# Mutation actions that write or unset configuration keys.
+GIT_CONFIG_WRITE_ACTIONS = frozenset(
+    {
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+        "--edit",
+        "-e",
+    }
+)
+
+# Options that take a separate argument before positional parameters.
+GIT_CONFIG_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--default",
+        "--type",
+        "-t",
+        "--blob",
+        "--comment",
+        "--value",
+        "--url",
+        "--file",
+        "-f",
+    }
+)
+
 # git's own global options, split by whether they consume the next argument.
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
 # audit_report issues) without mistaking a flag for a verb. Includes options
@@ -3088,14 +3217,14 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {
         "-C",
         "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--exec-path",
-        "--super-prefix",
         "--attr-source",
         "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
         "--shallow-file",
+        "--super-prefix",
+        "--work-tree",
     }
 )
 
@@ -3179,6 +3308,29 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "update-ref",
     }
 )
+
+
+def _allowed_git_subcommands() -> frozenset[str]:
+    from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
+
+    return (
+        GIT_MUTATING_SUBCOMMANDS
+        | GIT_READ_SUBCOMMANDS
+        | VCS_GIT_SUBCOMMANDS
+        | WORKSPACE_GIT_SUBCOMMANDS
+        | frozenset({"config"})
+    )
+
+
+# The closed set of subcommands the product and its skills issue: the union of
+# the four git verb sets this module already tracks (`GIT_MUTATING_SUBCOMMANDS`,
+# `GIT_READ_SUBCOMMANDS`, `VCS_GIT_SUBCOMMANDS`, and `WORKSPACE_GIT_SUBCOMMANDS`)
+# plus `config` (whose own `_git_config_violation` gate restricts writes to
+# `ALLOWED_GIT_CONFIG_KEYS`). A verb outside this union is refused. On the
+# `/v1/exec` path the check runs after `resolve_git_command` has expanded a
+# repository-local alias, so an alias is judged by what it expands to rather
+# than refused for being one.
+ALLOWED_GIT_SUBCOMMANDS = _allowed_git_subcommands()
 
 # Where a credential refresh helper is staged. A forge's helper is found by its
 # own name under this directory, which is how the generic route reaches a
@@ -3318,6 +3470,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--attr-source": "reads gitattributes from a tree-ish which can select caller-named filters or diff drivers",
     "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
@@ -3441,16 +3594,14 @@ _GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
 # executes <payload> in the credential container, as do
 # `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
 #
-# **This is a denylist over a set that is not closed, and it is the weakest
-# thing in this file.** git keeps a command in configuration for `difftool`,
-# `mergetool`, `web--browse`, `instaweb`, `help`, and the `p4`/`svn`
-# bridges, and a new one can arrive in any release. The structurally correct
-# fix is to allowlist the ~20 subcommands the product actually issues and fail
-# closed on the rest, which is a change to the denylist-not-allowlist decision
-# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
-# unknown *read* verb failing closed against a concurrency race, and was not
-# weighing it against arbitrary code execution. Revisit it with that evidence
-# rather than treating this list as sufficient.
+# **Named-reason denylist paired with `ALLOWED_GIT_SUBCOMMANDS`.** git keeps a
+# command in configuration for `difftool`, `mergetool`, `web--browse`,
+# `instaweb`, `help`, and the `p4`/`svn` bridges, and a new one can arrive in
+# any release. `ALLOWED_GIT_SUBCOMMANDS` fails closed on the subcommand slot
+# resolved by `_git_plan` for any verb outside the product's four verb sets plus
+# `config`, while this table scans every token in `argv` so these dangerous
+# built-ins are refused with their specific explanation even if a future git
+# release adds a value-taking global option not yet in `_GIT_GLOBAL_WITH_VALUE`.
 _GIT_REFUSED_SUBCOMMANDS = {
     "bisect": "runs a command the caller names (`bisect run`)",
     "difftool": "runs a command the caller names (`--extcmd`)",
@@ -3488,14 +3639,11 @@ _GIT_REFUSED_SUBCOMMANDS = {
     # containing a bare `help` (checked across `agents/`, `k8s-operator/` and
     # `scripts/`), and the refusal is loud and names the rule.
     #
-    # Matching the subcommand *slot* instead would remove the collision and was
-    # considered. It is not done, and the reason is measurable: git has
-    # value-taking global options this file does not know about, so resolving
-    # the slot is a guess about git's parser. `git --attr-source HEAD help -m
-    # git` executes the payload, while `_git_plan` reports the subcommand as
-    # `HEAD` — a position-aware check would allow it. Scanning every token
-    # cannot disagree with git about where the subcommand is, and over-refusing
-    # a commit message is the direction this is meant to fail in.
+    # Kept as an whole-argv token check alongside `ALLOWED_GIT_SUBCOMMANDS`
+    # (which checks the subcommand slot resolved by `_git_plan`, with
+    # `--attr-source` in `_GIT_GLOBAL_WITH_VALUE` and refused outright) so a
+    # future value-taking global option not yet listed in `_GIT_GLOBAL_WITH_VALUE`
+    # cannot hide `help` behind its argument value.
     "help": "runs a caller-named viewer command (`help -m`, `help -w`)",
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
@@ -3828,19 +3976,16 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
     return None
 
 
-def git_argument_violation(argv: list[str]) -> str | None:
+def git_argument_violation(argv: list[str], *, check_subcommand: bool = True) -> str | None:
     """Why this git argv may not run, or None if it may.
 
-    Matched across the whole argv rather than only the global-option region
-    before the subcommand, which is the only place git honours these. That is
-    deliberate: a check that has to agree with git about where the options end
-    is a *guess* about git's parser, and every serious defect found in this
-    policy layer so far was a checker and an executor parsing the same input
-    differently. Scanning everything cannot disagree with git about scope.
-
-    The cost is refusing a git command with a literal `-c` somewhere in its
-    arguments — a commit message, a pathspec. Nothing shipped does that, and
-    refusing something harmless is the direction this is meant to fail in.
+    Refused flags and `_GIT_REFUSED_SUBCOMMANDS` are matched across the whole
+    argv rather than only the global-option region before the subcommand, so a
+    flag or refused verb cannot slip past a parser disagreement about where the
+    options end. `_git_plan` then resolves the subcommand slot (after skipping
+    `_GIT_GLOBAL_WITH_VALUE`) and enforces `ALLOWED_GIT_SUBCOMMANDS` (when
+    `check_subcommand` is True) and `_git_config_violation` (when the subcommand
+    is `config`).
     """
     if not argv or Path(argv[0]).name != "git":
         return None
@@ -3879,20 +4024,116 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
-    if "config" in rest:
-        for argument in rest:
-            clean = argument.split("=", 1)[0].strip().lower()
-            if (
-                clean.startswith("alias.")
-                or clean == "alias"
-                or clean.startswith("include.")
-                or clean.startswith("includeif.")
-                or clean == "include"
-            ):
-                return (
-                    "`git config` configuring an alias or config include is refused: "
-                    "git aliases and includes cannot be configured through the credential proxy."
-                )
+    subcommand, _ = _git_plan(argv)
+    if check_subcommand and subcommand is not None and subcommand not in ALLOWED_GIT_SUBCOMMANDS:
+        return f"`git {subcommand}` is refused: subcommand is not supported by the credential proxy."
+    if subcommand == "config":
+        config_violation = _git_config_violation(argv)
+        if config_violation is not None:
+            return config_violation
+    return None
+
+
+def _git_config_option_positionals(args: list[str]) -> tuple[set[str], list[str]]:
+    """Walk `git config` options using PARSE_OPT_STOP_AT_NON_OPTION and prefix resolution."""
+    actions: set[str] = set()
+    positionals: list[str] = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if not arg.startswith("-") or arg == "--":
+            if arg == "--":
+                idx += 1
+            positionals = args[idx:]
+            break
+        name = arg.split("=", 1)[0]
+        is_long_prefix = name.startswith("--") and len(name) > 2
+        matched_writes = {
+            w for w in GIT_CONFIG_WRITE_ACTIONS
+            if w == name or (is_long_prefix and w.startswith(name))
+        }
+        matched_queries = {
+            q for q in GIT_CONFIG_QUERY_ACTIONS
+            if q == name or (is_long_prefix and q.startswith(name))
+        }
+        if matched_writes:
+            actions.update(matched_writes)
+        elif matched_queries:
+            actions.update(matched_queries)
+        consumes_value = name in GIT_CONFIG_OPTIONS_WITH_VALUE or (
+            is_long_prefix
+            and any(o.startswith(name) for o in GIT_CONFIG_OPTIONS_WITH_VALUE if o.startswith("--"))
+        )
+        if consumes_value and "=" not in arg:
+            idx += 1
+        idx += 1
+    return actions, positionals
+
+
+def _git_config_violation(argv: list[str]) -> str | None:
+    """Why this git config argv may not run, or None if it may.
+
+    Git parses `git config` options using PARSE_OPT_STOP_AT_NON_OPTION: options
+    must precede the first positional argument.
+
+    Query actions (--get, --list, get, list, etc.) are non-mutating reads and are
+    allowed. Configuration writes (implicit set with >= 2 positionals, git >= 2.46
+    set/unset subcommands, or write actions like --add, --replace-all, --unset and
+    their parse-options abbreviations) are restricted to case-insensitive author
+    identity keys (user.name, user.email). Any attempt to write or unset other keys
+    is refused.
+    """
+    config_index = _find_subcommand_index(argv)
+    if config_index is None or argv[config_index] != "config":
+        return None
+
+    actions, positionals = _git_config_option_positionals(argv[config_index + 1:])
+    if not actions and positionals and positionals[0] in {
+        "list", "get", "set", "unset", "rename-section", "remove-section", "edit"
+    }:
+        subverb = positionals[0]
+        _, sub_positionals = _git_config_option_positionals(positionals[1:])
+        if subverb == "list":
+            if not sub_positionals:
+                return None
+            return "`git config list` with extra arguments is refused."
+        if subverb == "get":
+            if len(sub_positionals) == 1:
+                return None
+            return "`git config get` requires exactly one configuration key."
+        if subverb in {"rename-section", "remove-section", "edit"}:
+            return (
+                f"`git config {subverb}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
+        actions = {"--add" if subverb == "set" else "--unset"}
+        positionals = sub_positionals
+
+    if actions & {"--rename-section", "--remove-section"}:
+        return (
+            "`git config` section mutation is refused: only author identity configuration "
+            "(user.name, user.email) and query options are permitted."
+        )
+
+    if actions & {"--edit", "-e"}:
+        return (
+            "`git config --edit` is refused: only author identity configuration "
+            "(user.name, user.email) and query options are permitted."
+        )
+
+    if actions and not (actions & GIT_CONFIG_WRITE_ACTIONS) and (actions & GIT_CONFIG_QUERY_ACTIONS):
+        return None
+
+    is_write = bool(actions & GIT_CONFIG_WRITE_ACTIONS) or len(positionals) >= 2
+    if is_write:
+        if not positionals:
+            return "`git config` write is refused: missing configuration key."
+        target_key = positionals[0]
+        if target_key.lower() not in ALLOWED_GIT_CONFIG_KEYS:
+            return (
+                f"`git config {target_key}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
     return None
 
 
@@ -4541,9 +4782,12 @@ class CommandExecutor:
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
+        metrics: "ProxyMetrics | None" = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
+        # Where admission waits are observed; None in a test that wants none.
+        self.metrics = metrics
         self.max_output_bytes = max_output_bytes
         # See DEFAULT_MAX_CONCURRENT_COMMANDS; `parse_args` reads the operator's
         # value from the environment, the way it does the other bounds.
@@ -4893,6 +5137,33 @@ class CommandExecutor:
         with self._slot_condition:
             return len(self._slot_queue)
 
+    def admission_snapshot(self) -> "AdmissionSnapshot":
+        """What is in use against each cap, read under the lock at scrape time:
+        the slots held and the cap, the child memory reserved and the budget
+        (None when the budget is off, which the gauge then leaves absent)."""
+        with self._slot_condition:
+            return AdmissionSnapshot(
+                slots_in_use=self._slots_in_use,
+                slot_cap=self.max_concurrent_commands,
+                reserved_bytes=self._reserved_bytes,
+                budget_bytes=self.children_budget_bytes,
+            )
+
+    def _held_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
+        """Which bound held a request through its wait: the one rule behind
+        the wait log, the histogram label, the hang-up text, the refusal's
+        bound and the refusal's text, so none of them can split from another.
+        A slot-taker that ever found the slot cap full (`saw_slots_full`), or
+        that waits with the budget off, was held by the slot cap; any other
+        wait, a slot-taker's behind a budget-held queue or a slot-less
+        reserver's, was held by the budget. The instant's state is not asked:
+        a slot freed in a refusal's wake reads as a free slot, and a budget
+        sized to admit exactly the cap reads as full, while the request spent
+        its wait behind the cap either way."""
+        if takes_slot and (saw_slots_full or self.children_budget_bytes is None):
+            return ADMISSION_BOUND_SLOT
+        return ADMISSION_BOUND_BUDGET
+
     @contextlib.contextmanager
     def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
         """Hold one concurrency slot for the whole of a request.
@@ -4942,6 +5213,7 @@ class CommandExecutor:
         caller: socket.socket | None = None,
         yield_when: Callable[[], bool] | None = None,
         deadline: float | None = None,
+        queued_at: float | None = None,
     ) -> Iterator[None]:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
@@ -4949,10 +5221,14 @@ class CommandExecutor:
         budget is on, except that it is admitted past slot-takers the full
         slot cap holds (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
-        reservation; `caller`, `yield_when` and `deadline` are then unused.
-        `yield_when` and `deadline` are passed to `_admit`."""
+        reservation; `caller`, `yield_when`, `deadline` and `queued_at` are
+        then unused. All three are passed to `_admit`."""
         with self._admit(
-            takes_slot=False, caller=caller, yield_when=yield_when, deadline=deadline
+            takes_slot=False,
+            caller=caller,
+            yield_when=yield_when,
+            deadline=deadline,
+            queued_at=queued_at,
         ):
             yield
 
@@ -4992,45 +5268,46 @@ class CommandExecutor:
             return True
         return False
 
-    def _refusal_text(self, takes_slot: bool) -> str:
-        """Why a request still queued at the bound is refused, named for what
-        holds it now. Called under `_slot_condition`.
+    def _refusal_text(self, takes_slot: bool, bound: str) -> str:
+        """Why a request still queued at the bound is refused, worded for the
+        bound `_held_bound` named, so the text and the refusals counter agree
+        by construction. Called under `_slot_condition`.
 
-        The budget when this request does not fit it; the slot cap when it
-        takes a slot and none is free. Otherwise this request fits and is
-        clear of the slot cap, and only the queue ahead of it holds it. With
-        the budget on, that queue is held by the budget: a slot-taker here has
-        a free slot, so what is ahead of it lacks only budget, and a slot-less
-        reserver is admitted past tickets the slot cap alone holds (`_admit`).
-        The text says so, and never that this request waited without fitting.
-        """
-        slots_full = self._slots_in_use >= self.max_concurrent_commands
+        Under the slot cap: the cap is full now, or slots have freed and gone
+        to earlier arrivals and the queue ahead holds this request. Under the
+        budget: this request does not fit it now, or it fits and the queue
+        ahead, held by the budget, holds it (a slot-less reserver is admitted
+        past tickets the slot cap alone holds, `_admit`). The text never says
+        a request waited without fitting when it fits."""
+        if bound == ADMISSION_BOUND_SLOT:
+            if self._slots_in_use >= self.max_concurrent_commands:
+                # Worded for the queue: slots may well have freed in the
+                # meantime and gone to earlier arrivals, so "none finished"
+                # would be false for a request that was overtaken rather
+                # than starved.
+                return (
+                    f"the credential proxy is at its limit of "
+                    f"{self.max_concurrent_commands} concurrent commands and this "
+                    f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                    f"free slot; retry shortly"
+                )
+            return (
+                f"the credential proxy's admission queue is held by requests waiting on its "
+                f"limit of {self.max_concurrent_commands} concurrent commands and this "
+                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
+            )
         # With nothing admitted `_fits_budget` would take its degenerate
         # branch and log; this request fits trivially then anyway.
         nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
-        fits = nothing_admitted or self._fits_budget(takes_slot)
-        if not fits:
+        if not (nothing_admitted or self._fits_budget(takes_slot)):
             return (
                 f"the credential proxy is at its child memory budget "
                 f"({self._budget_in_use_text()}) and this request "
                 f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
             )
-        if takes_slot and slots_full:
-            # Worded for the queue: slots may well have freed in the meantime
-            # and gone to earlier arrivals, so "none finished" would be false
-            # for a request that was overtaken rather than starved.
-            return (
-                f"the credential proxy is at its limit of "
-                f"{self.max_concurrent_commands} concurrent commands and this "
-                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
-                f"free slot; retry shortly"
-            )
-        if self.children_budget_bytes is not None:
-            holder = f"waiting for its child memory budget ({self._budget_in_use_text()})"
-        else:
-            holder = f"waiting on its limit of {self.max_concurrent_commands} concurrent commands"
         return (
-            f"the credential proxy's admission queue is held by requests {holder} and this "
+            f"the credential proxy's admission queue is held by requests waiting for its "
+            f"child memory budget ({self._budget_in_use_text()}) and this "
             f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
         )
 
@@ -5069,6 +5346,7 @@ class CommandExecutor:
         caller: socket.socket | None,
         yield_when: Callable[[], bool] | None = None,
         deadline: float | None = None,
+        queued_at: float | None = None,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
@@ -5082,7 +5360,11 @@ class CommandExecutor:
 
         `yield_when`, if given, is called under `_slot_condition` each time the
         wait wakes; when it returns true the request leaves the queue
-        unadmitted with AdmissionYielded, before anything is reserved.
+        unadmitted with AdmissionYielded, before anything is reserved and
+        before its wait is observed; the exception carries the arrival, and a
+        caller that re-enters passes it back as `queued_at` so the wait the
+        histogram and the log record runs from the first arrival, not from
+        the re-entry.
         `deadline`, if given, is the monotonic time the wait is refused at, in
         place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
         same here, and the one caller that passes it, a route refresher's
@@ -5095,7 +5377,12 @@ class CommandExecutor:
             finally:
                 self._request_budget.reserved = previously_reserved
             return
-        queued_at = time.monotonic()
+        # Whether this request waited at all: it went round the loop, or it is
+        # the second leg of an admission that yielded (`queued_at` handed in).
+        # An admission that never waited is observed under no bound.
+        waited = queued_at is not None
+        if queued_at is None:
+            queued_at = time.monotonic()
         if deadline is None:
             deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         ticket = _AdmissionTicket(takes_slot)
@@ -5118,18 +5405,18 @@ class CommandExecutor:
                         saw_slots_full = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise CommandSlotUnavailable(self._refusal_text(takes_slot))
+                        bound = self._held_bound(takes_slot, saw_slots_full)
+                        raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound), bound=bound)
+                    waited = True
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        held_by_slots = takes_slot and (
-                            saw_slots_full or self.children_budget_bytes is None
-                        )
+                        held_by_slots = self._held_bound(takes_slot, saw_slots_full) == ADMISSION_BOUND_SLOT
                         raise CallerHungUp(
                             "the caller disconnected while queued for "
                             + ("a slot" if held_by_slots else "the memory budget")
                         )
                     if yield_when is not None and yield_when():
-                        raise AdmissionYielded("another caller needs to go first")
+                        raise AdmissionYielded("another caller needs to go first", queued_at)
                 if takes_slot:
                     self._slots_in_use += 1
                 reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
@@ -5144,9 +5431,17 @@ class CommandExecutor:
             if takes_slot:
                 self._request_budget.deadline = time.monotonic() + self.timeout_seconds
             self._request_budget.reserved = True
-            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
+            waited_seconds = time.monotonic() - queued_at
+            waited_ms = int(waited_seconds * MILLISECONDS_PER_SECOND)
+            # Observed on every admission: under the bound the log names when
+            # it writes a line, or under `none` for a request admitted at once,
+            # so an idle broker's observations are a measured zero that blames
+            # neither bound, and the label does not flip with the memory limit.
+            held = self._held_bound(takes_slot, saw_slots_full) if waited else ADMISSION_BOUND_NONE
+            if self.metrics is not None:
+                self.metrics.observe_admission_wait(held, waited_seconds)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                if self.children_budget_bytes is not None and not saw_slots_full:
+                if held == ADMISSION_BOUND_BUDGET:
                     with self._slot_condition:
                         in_use = self._budget_in_use_text()
                     LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
@@ -5638,10 +5933,11 @@ class CommandExecutor:
         self._acquire_refresh_lock(provider, queued_at + COMMAND_SLOT_WAIT_SECONDS, caller)
         holding = True
         try:
-            if self._refresh_under_lock(
+            yielded_at = self._refresh_under_lock(
                 provider, helper, repository, clean_repo, failure_key, queued_at,
                 reserve=budget_on, caller=caller,
-            ):
+            )
+            if yielded_at is not None:
                 # A vcs verb, admitted and covered, needs the lock: it runs the
                 # helper under its own reservation. Hand it the lock, wait until
                 # it holds it, and queue behind it to coalesce on its result,
@@ -5669,6 +5965,7 @@ class CommandExecutor:
                     provider, helper, repository, clean_repo, failure_key, queued_at,
                     reserve=budget_on, caller=caller,
                     deadline=yield_deadline, allow_yield=False,
+                    admission_queued_at=yielded_at,
                 )
         finally:
             if holding:
@@ -5695,7 +5992,9 @@ class CommandExecutor:
             if caller is not None and _caller_has_gone(caller):
                 raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
             if time.monotonic() >= deadline:
-                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider, yielded_since))
+                raise CommandSlotUnavailable(
+                    self._refresh_lock_wait_text(provider, yielded_since), bound=ADMISSION_BOUND_REFRESH_LOCK
+                )
 
     @staticmethod
     def _refresh_lock_wait_text(
@@ -5737,7 +6036,8 @@ class CommandExecutor:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CommandSlotUnavailable(
-                        self._refresh_lock_wait_text(provider, yielded_since)
+                        self._refresh_lock_wait_text(provider, yielded_since),
+                        bound=ADMISSION_BOUND_REFRESH_LOCK,
                     )
                 self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
 
@@ -5769,26 +6069,31 @@ class CommandExecutor:
         caller: socket.socket | None = None,
         deadline: float | None = None,
         allow_yield: bool = True,
-    ) -> bool:
+        admission_queued_at: float | None = None,
+    ) -> float | None:
         """The serialised part of `refresh_forge_credential`, called with
         `_refresh_lock` held: re-check the coalesce cache, honour the failure
         memo, and run the helper -- under a child memory reservation taken
         here, after both checks, when `reserve` is set, refused at `deadline`
         when given.
 
-        True when the reservation wait yielded to a vcs verb waiting for the
-        lock and the helper did not run; the caller hands that verb the lock.
-        With `allow_yield` false -- the reservation after the one yield -- a
-        verb counting itself ends the attempt instead: CommandSlotUnavailable,
-        the stepped-aside text, so the lock is never held across a budget
-        wait against a verb that holds the budget. False otherwise.
+        The time the reservation joined the admission queue when its wait
+        yielded to a vcs verb waiting for the lock and the helper did not run;
+        the caller hands that verb the lock, and hands the time back as
+        `admission_queued_at` on its second reservation, so the two legs are
+        observed as the one wait they are, from the first arrival. With
+        `allow_yield` false -- that second reservation -- a verb counting
+        itself ends the attempt instead: CommandSlotUnavailable, the
+        stepped-aside text, so the lock is never held across a budget wait
+        against a verb that holds the budget. None when the helper ran or
+        the cache answered.
 
         With `deadline` given -- the reservation after a yield -- a refusal
         says the caller stepped aside, with the seconds since `queued_at` and
         the budget's figures, rather than `_admit`'s text, which names
         COMMAND_SLOT_WAIT_SECONDS: the wait on this leg was shorter."""
         if self._refresh_is_current(provider, clean_repo):
-            return False
+            return None
         failure = self._refresh_failure_cache.get(failure_key)
         if failure is not None:
             failed_at, exc = failure
@@ -5802,13 +6107,14 @@ class CommandExecutor:
                             caller=caller,
                             yield_when=lambda: self._covered_refresh_waiters > 0,
                             deadline=deadline,
+                            queued_at=admission_queued_at,
                         )
                     )
                 except AdmissionYielded as exc:
                     # Raised only by `_admit`, before it admits, so this
                     # catches the entry and nothing the helper raises.
                     if allow_yield:
-                        return True
+                        return exc.queued_at
                     # After the one yield: a vcs verb that holds the budget
                     # this wait needs is waiting on the lock this caller
                     # holds. Holding it to the deadline would be the knot the
@@ -5817,12 +6123,15 @@ class CommandExecutor:
                     # the helper under its own reservation, and the client is
                     # told busy and retries, coalescing if the verb's token
                     # was its own.
+                    # Counted under the budget: what the caller stepped aside
+                    # from, for good, is a vcs verb holding the budget it needs.
                     raise CommandSlotUnavailable(
                         self._refresh_lock_wait_text(
                             provider,
                             yielded_since=queued_at,
                             budget_in_use=self._budget_in_use_text_locked(),
-                        )
+                        ),
+                        bound=ADMISSION_BOUND_BUDGET,
                     ) from exc
                 except CommandSlotUnavailable as exc:
                     if deadline is None:
@@ -5832,7 +6141,8 @@ class CommandExecutor:
                             provider,
                             yielded_since=queued_at,
                             budget_in_use=self._budget_in_use_text_locked(),
-                        )
+                        ),
+                        bound=getattr(exc, "bound", ADMISSION_BOUND_OTHER),
                     ) from exc
             try:
                 result = self._run_forge_helper(
@@ -5855,7 +6165,7 @@ class CommandExecutor:
             if not scoped:
                 scoped = frozenset([clean_repo])
             self._refresh_cache[provider] = (time.monotonic(), scoped)
-        return False
+        return None
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
@@ -6428,7 +6738,11 @@ class CommandExecutor:
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
+            command_environment.pop("KUBECONFIG", None)
+            command_environment.pop("CLOUDSDK_CONFIG", None)
             command_environment.update(self.git_identity)
+        elif argv and Path(argv[0]).name == "kubectl":
+            command_environment.pop("GH_CONFIG_DIR", None)
         if extra_config:
             # Rebuilt rather than appended to, because the count and the keys
             # have to move together. The caller's pairs go first so the forced
@@ -7037,7 +7351,10 @@ def _escape_label_value(value: str) -> str:
 
 
 class ProxyMetrics:
-    """Two counters and a latency histogram, in the Prometheus text exposition.
+    """The broker's series in the Prometheus text exposition: the tool
+    invocations counter and their latency histogram, the request counter, the
+    admission wait histogram and refusals counter by bound, and the slot and
+    child-memory gauges beside their caps when an executor is wired.
 
     Hand-rolled: prometheus_client is not in the image, and what is needed is
     small enough that adding a dependency to the one container holding every
@@ -7056,6 +7373,67 @@ class ProxyMetrics:
         self._duration_buckets: dict[str, list[int]] = {}
         self._duration_sum: dict[str, float] = {}
         self._duration_count: dict[str, int] = {}
+        # Admission waits per bound: cumulative buckets, sum and count, as above.
+        self._admission_buckets: dict[str, list[int]] = {}
+        self._admission_sum: dict[str, float] = {}
+        self._admission_count: dict[str, int] = {}
+        self._refusals: dict[str, int] = {}
+        # The executor's `admission_snapshot`, read at render time; None until
+        # serve() wires one, and the gauges are absent until then.
+        self._admission_gauges: Callable[[], AdmissionSnapshot] | None = None
+
+    @staticmethod
+    def _observe(
+        buckets: dict[str, list[int]],
+        sums: dict[str, float],
+        counts: dict[str, int],
+        edges: tuple[float, ...],
+        key: str,
+        value: float,
+    ) -> None:
+        """One observation into a histogram family: the cumulative bucket
+        counts, the sum and the count, under the caller's lock."""
+        cumulative = buckets.setdefault(key, [0] * len(edges))
+        for index, edge in enumerate(edges):
+            if value <= edge:
+                cumulative[index] += 1
+        sums[key] = sums.get(key, 0.0) + value
+        counts[key] = counts.get(key, 0) + 1
+
+    @staticmethod
+    def _render_histogram(
+        lines: list[str],
+        name: str,
+        label: str,
+        edges: tuple[float, ...],
+        families: dict[str, tuple[list[int], float, int]],
+    ) -> None:
+        """One histogram family in the text exposition, one series set per
+        label value, in the order the caller sorted them."""
+        for value, (buckets, total, count) in families.items():
+            escaped = _escape_label_value(value)
+            for edge, cumulative in zip(edges, buckets):
+                lines.append(f'{name}_bucket{{{label}="{escaped}",le="{edge}"}} {cumulative}')
+            lines.append(f'{name}_bucket{{{label}="{escaped}",le="+Inf"}} {count}')
+            lines.append(f'{name}_sum{{{label}="{escaped}"}} {total:.6f}')
+            lines.append(f'{name}_count{{{label}="{escaped}"}} {count}')
+
+    def observe_admission_wait(self, bound: str, seconds: float) -> None:
+        bound = bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER
+        with self._lock:
+            self._observe(
+                self._admission_buckets, self._admission_sum, self._admission_count,
+                ADMISSION_WAIT_BUCKETS, bound, seconds,
+            )
+
+    def record_refusal(self, bound: str) -> None:
+        bound = bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER
+        with self._lock:
+            self._refusals[bound] = self._refusals.get(bound, 0) + 1
+
+    def set_admission_gauges(self, snapshot: Callable[[], AdmissionSnapshot] | None) -> None:
+        with self._lock:
+            self._admission_gauges = snapshot
 
     def record_tool(self, tool: str, subcommand: str, status: str) -> None:
         key = (tool, subcommand, status)
@@ -7064,12 +7442,10 @@ class ProxyMetrics:
 
     def observe_duration(self, tool: str, seconds: float) -> None:
         with self._lock:
-            buckets = self._duration_buckets.setdefault(tool, [0] * len(TOOL_DURATION_BUCKETS))
-            for index, bound in enumerate(TOOL_DURATION_BUCKETS):
-                if seconds <= bound:
-                    buckets[index] += 1
-            self._duration_sum[tool] = self._duration_sum.get(tool, 0.0) + seconds
-            self._duration_count[tool] = self._duration_count.get(tool, 0) + 1
+            self._observe(
+                self._duration_buckets, self._duration_sum, self._duration_count,
+                TOOL_DURATION_BUCKETS, tool, seconds,
+            )
 
     def record_request(self, endpoint: str, status_code: str) -> None:
         key = (endpoint, status_code)
@@ -7084,6 +7460,14 @@ class ProxyMetrics:
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
             }
+            admissions = {
+                bound: (list(self._admission_buckets[bound]), self._admission_sum[bound], self._admission_count[bound])
+                for bound in sorted(self._admission_buckets)
+            }
+            refusals = sorted(self._refusals.items())
+            gauges = self._admission_gauges
+        # The snapshot takes the executor's lock, so it is read outside this one.
+        snapshot = gauges() if gauges is not None else None
         lines = [
             f"# HELP {TOOL_INVOCATIONS_METRIC} CLI tool executions brokered, by tool, subcommand and outcome.",
             f"# TYPE {TOOL_INVOCATIONS_METRIC} counter",
@@ -7097,13 +7481,7 @@ class ProxyMetrics:
             f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool.",
             f"# TYPE {TOOL_DURATION_METRIC} histogram",
         ]
-        for tool, (buckets, total, count) in durations.items():
-            label = _escape_label_value(tool)
-            for bound, cumulative in zip(TOOL_DURATION_BUCKETS, buckets):
-                lines.append(f'{TOOL_DURATION_METRIC}_bucket{{tool="{label}",le="{bound}"}} {cumulative}')
-            lines.append(f'{TOOL_DURATION_METRIC}_bucket{{tool="{label}",le="+Inf"}} {count}')
-            lines.append(f'{TOOL_DURATION_METRIC}_sum{{tool="{label}"}} {total:.6f}')
-            lines.append(f'{TOOL_DURATION_METRIC}_count{{tool="{label}"}} {count}')
+        self._render_histogram(lines, TOOL_DURATION_METRIC, "tool", TOOL_DURATION_BUCKETS, durations)
         lines += [
             f"# HELP {PROXY_REQUESTS_METRIC} HTTP requests answered on the credentialed listener, by route family and status code.",
             f"# TYPE {PROXY_REQUESTS_METRIC} counter",
@@ -7113,6 +7491,35 @@ class ProxyMetrics:
                 f'{PROXY_REQUESTS_METRIC}{{endpoint="{_escape_label_value(endpoint)}",'
                 f'status_code="{_escape_label_value(status_code)}"}} {count}'
             )
+        lines += [
+            f"# HELP {ADMISSION_WAIT_METRIC} Seconds a request waited to be admitted, by the bound that held it (slot cap or child memory budget), or none for a request admitted without a wait.",
+            f"# TYPE {ADMISSION_WAIT_METRIC} histogram",
+        ]
+        self._render_histogram(lines, ADMISSION_WAIT_METRIC, ADMISSION_BOUND_LABEL, ADMISSION_WAIT_BUCKETS, admissions)
+        lines += [
+            f"# HELP {ADMISSION_REFUSALS_METRIC} Requests answered with the busy 503, by the bound that refused them.",
+            f"# TYPE {ADMISSION_REFUSALS_METRIC} counter",
+        ]
+        for bound, count in refusals:
+            lines.append(f'{ADMISSION_REFUSALS_METRIC}{{{ADMISSION_BOUND_LABEL}="{_escape_label_value(bound)}"}} {count}')
+        if snapshot is not None:
+            lines += [
+                f"# HELP {SLOTS_IN_USE_METRIC} Command slots held right now.",
+                f"# TYPE {SLOTS_IN_USE_METRIC} gauge",
+                f"{SLOTS_IN_USE_METRIC} {snapshot.slots_in_use}",
+                f"# HELP {SLOT_CAP_METRIC} Command slots the broker admits at once.",
+                f"# TYPE {SLOT_CAP_METRIC} gauge",
+                f"{SLOT_CAP_METRIC} {snapshot.slot_cap}",
+                f"# HELP {CHILD_MEMORY_RESERVED_METRIC} Child memory reserved by admitted requests right now, in bytes.",
+                f"# TYPE {CHILD_MEMORY_RESERVED_METRIC} gauge",
+                f"{CHILD_MEMORY_RESERVED_METRIC} {snapshot.reserved_bytes}",
+            ]
+            if snapshot.budget_bytes is not None:
+                lines += [
+                    f"# HELP {CHILD_MEMORY_BUDGET_METRIC} Child memory the budget admits reservations against, in bytes; absent while the budget is off.",
+                    f"# TYPE {CHILD_MEMORY_BUDGET_METRIC} gauge",
+                    f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
+                ]
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -7677,7 +8084,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # over anything argv can say; this refuses the flags that would
         # otherwise re-enable git's hook execution, and it refuses them before
         # the lease check because it does not depend on the working directory.
-        violation = git_argument_violation(argv)
+        has_resolver = hasattr(self.executor, "resolve_git_command")
+        violation = git_argument_violation(argv, check_subcommand=not has_resolver)
         if violation is not None:
             LOGGER.warning(
                 "git argument refused request_id=%s", request_id,
@@ -7704,7 +8112,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # request ends with a response and the trail with a terminal
             # record rather than an exception out of the handler.
             try:
-                if hasattr(self.executor, "resolve_git_command"):
+                if has_resolver:
                     violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
                 else:
                     violation = self.executor.git_lease_violation(argv, cwd)
@@ -7733,6 +8141,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+
+            if has_resolver:
+                arg_violation = git_argument_violation(exec_argv)
+                if arg_violation is not None:
+                    LOGGER.warning(
+                        "git argument refused request_id=%s", request_id,
+                        extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
+                    )
+                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "status": "blocked",
+                            "code": "SECURITY_POLICY_BLOCKED",
+                            "rule": RULE_GIT_ARGUMENT_REFUSED,
+                            "message": arg_violation,
+                        },
+                    )
+                    return
 
             # Runs after the credential denylist above, so rules like
             # `kubernetes.token-disclosure` keep their own ids and messages rather
@@ -8807,8 +9234,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
-        failure.
+        failure. Counted here, once per route that answers it, under the bound
+        the exception carries.
         """
+        self.metrics.record_refusal(getattr(exc, "bound", ADMISSION_BOUND_OTHER))
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
             {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
@@ -9035,7 +9464,9 @@ def serve(args: argparse.Namespace) -> None:
         # The container's limit, through the operator's Downward API variable
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
+        metrics=CredentialProxyHandler.metrics,
     )
+    CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())

@@ -153,12 +153,20 @@ def main() -> None:
     #    The two feedback-prompt knobs take the same route: rendered by the
     #    operator's allowlist, then through this scrub to `feedback_prompt.py`.
     #    Scrubbed, `FEEDBACK_PROMPT_ENABLED=false` on the CR would still render
-    #    and the prompt would post on an install that turned it off.
+    #    and the prompt would post on an install that turned it off. The
+    #    findings queue's pacing limits take it to `findings_nudge.py` and to
+    #    `bootstrap_handoff.py`, which hands them to the first inventory
+    #    report's selection; a scrubbed one would silently fall back to its
+    #    default.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",
         "FEEDBACK_PROMPT_ENABLED",
         "FEEDBACK_PROMPT_DELAY",
+        "FINDINGS_FIRST_REPORT_CRITICALS",
+        "FINDINGS_DAILY_CRITICALS",
+        "FINDINGS_NONCRITICAL_MAX",
+        "FINDINGS_NONCRITICAL_AFTER_HOUR",
     ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(

@@ -1284,12 +1284,13 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
 
 
 def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
-    """A 500 is the endpoint answering, so it keeps the old behaviour.
+    """A persistent 500 is the endpoint answering, so it remains a graded agent error.
 
     The INFRA class is for turns where transport died or provider capacity
     blocked the opening turn. Widening it to every failed request would take
-    real agent faults off the gate: they are not retried, they are not marked,
-    and their text still reaches the judge.
+    real agent faults off the gate: a non-retryable 5xx is retried once on the
+    opening turn to clear transient races (#2430), but a recurring 500 is not
+    marked infra, is not retried beyond the limit, and still reaches the judge.
     """
     stub_agent.fail_with = 500
 
@@ -1298,7 +1299,35 @@ def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> No
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 500" in result.errors[0]
-    # Still in front of the judge, as before.
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 2
+
+
+def test_an_opening_turn_transient_500_clears_on_retry(
+    stub_agent: _StubAgentServer, recorded_pf_resets: list[int]
+) -> None:
+    """A transient 500 on the opening turn clears on bounded retry without tunnel respawn (#2430)."""
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert len(stub_agent.requests) == 2
+    # An endpoint response is not a transport drop: no tunnel reset.
+    assert recorded_pf_resets == []
+
+
+def test_an_opening_turn_client_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
+    """A client error (non-429 4xx) on the opening turn is not retried and reaches the judge."""
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 400" in result.errors[0]
     assert result.errors[0] in result.output
     assert len(stub_agent.requests) == 1
 
@@ -3432,7 +3461,7 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
     assert result.has_errors()
-    assert len(stub_agent.requests) == 1
+    assert len(stub_agent.requests) == 2
     assert _archived(scripts)
     assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
     assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
@@ -3474,6 +3503,41 @@ def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
     assert "HTTP 500" in result.errors[0]
     assert len(stub_agent.requests) == 2
     assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_card_wake_turn_502_with_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on the wake turn is classified as infrastructure."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)
+
+
+def test_a_card_wake_turn_transient_500_clears_on_retry(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A transient 500 on the wake turn clears on bounded retry without losing the run (#2430)."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert len(stub_agent.requests) == 3
     assert _archived(scripts)
 
 

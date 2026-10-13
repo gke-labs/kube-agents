@@ -1,9 +1,11 @@
 ---
-# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+# Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
 paths:
   - "**/*.go"
   - "**/*.py"
   - "**/*.sh"
+trigger: model_decision
+description: "Core engineering rules for Go, Python, and Bash code: no magic constants and credential-aware identifier naming for CodeQL."
 ---
 
 # Core engineering rules

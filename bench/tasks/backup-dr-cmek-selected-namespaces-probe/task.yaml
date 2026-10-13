@@ -1,0 +1,93 @@
+# Skill-guidance probe for gke-backup-dr: a CMEK-encrypted backup plan for two
+# namespaces. The skill copy on main before the google/skills sync gave flags
+# gcloud does not have: `clusters update --enable-gke-backup`,
+# `backup-plans create --retention-days`, `--included-namespaces` and
+# `--backup-encryption-key`. The synced copy enables the add-on with
+# `--update-addons=BackupRestore=ENABLED` and creates the plan with
+# `--selected-namespaces`, `--backup-retain-days` and `--encryption-key`. The
+# prompt asks the agent to answer from the skill first, so main's flags reach
+# the answer unless it searches past them.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: backup-dr-cmek-selected-namespaces-probe
+name: A CMEK backup plan for two namespaces uses the real Backup for GKE flags
+
+owner: GinnyJI
+domain: reliability
+
+prompt: >-
+  Give me the exact gcloud commands to turn on Backup for GKE for cluster
+  prod-1 in us-central1 (project my-project) and create a backup plan that
+  backs up only the namespaces payments and ledger every day at 02:00, keeps
+  each backup for 30 days, and encrypts backups with the CMEK key
+  projects/my-project/locations/us-central1/keyRings/backup/cryptoKeys/gke.
+  Load the relevant installed gke-* skill and answer from it before searching
+  documentation. Do not apply anything.
+expected_output: >-
+  gcloud container clusters update prod-1
+  --update-addons=BackupRestore=ENABLED --location=us-central1, then gcloud
+  beta container backup-restore backup-plans create with
+  --cluster=projects/my-project/locations/us-central1/clusters/prod-1,
+  --selected-namespaces=payments,ledger, --include-volume-data,
+  --include-secrets, --backup-retain-days=30, --cron-schedule="0 2 * * *" and
+  --encryption-key=projects/my-project/locations/us-central1/keyRings/backup/cryptoKeys/gke.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-plan-uses-the-real-flags
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        [
+          "BackupRestore=ENABLED",
+          "--selected-namespaces",
+          "--backup-retain-days",
+        ]
+      # --encryption-key, not as the tail of --backup-encryption-key.
+      any_of_patterns: ["(?<![\\w-])--encryption-key"]
+      # The flags main's skill gave, which gcloud rejects, used in a command:
+      # after `gcloud [beta|alpha] container` on the same line, or on a line
+      # continued from one ending in a backslash. What makes a line a command,
+      # not what it starts with, so a prompted or prose-led one-liner and a
+      # flag second on a continuation line count, and a bullet, table cell,
+      # sentence that opens with "gcloud" or with the flag, or a flag listed
+      # without continuations does not, nor does --enable-gke-backup-plan.
+      # bench/tests/test_backup_dr_cmek_forbidden_patterns.py pins both sides.
+      forbidden_patterns:
+        [
+          "(?m)(?:\\\\\\s*\\n|gcloud\\s(?:beta\\s|alpha\\s)?container\\s)[^\\n]*?(?<![\\w-])--enable-gke-backup(?![\\w-])",
+          "(?m)(?:\\\\\\s*\\n|gcloud\\s(?:beta\\s|alpha\\s)?container\\s)[^\\n]*?(?<![\\w-])--retention-days(?![\\w-])",
+          "(?m)(?:\\\\\\s*\\n|gcloud\\s(?:beta\\s|alpha\\s)?container\\s)[^\\n]*?(?<![\\w-])--included-namespaces(?![\\w-])",
+          "(?m)(?:\\\\\\s*\\n|gcloud\\s(?:beta\\s|alpha\\s)?container\\s)[^\\n]*?(?<![\\w-])--backup-encryption-key(?![\\w-])",
+        ]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

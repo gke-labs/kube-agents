@@ -492,20 +492,88 @@ class MainTest(unittest.TestCase):
         self.assertIn("not scanned", out)
 
     def test_no_managed_repos_is_a_clean_empty_report(self):
-        with patch.object(scan.gitops_workspace, "get_managed_github_repos", return_value=[]), patch.object(scan, "content_mode_available", return_value=False):
+        with patch.object(scan.gitops_workspace, "get_managed_repos", return_value=[]), patch.object(scan, "content_mode_available", return_value=False):
             rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
         self.assertIn(scan.NO_REPOS_HEADING, out)
 
     def test_managed_repos_go_through_the_broker_when_armed(self):
         fake = FakeWorkspace({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
-        with patch.object(scan.gitops_workspace, "get_managed_github_repos", return_value=["acme/infra"]), patch.object(
+        with patch.object(scan.gitops_workspace, "get_managed_repos", return_value=["acme/infra"]), patch.object(
             scan, "content_mode_available", return_value=True
         ), patch.object(scan.credential_proxy_client.Workspace, "open", return_value=fake), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
             rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
         self.assertIn("## acme/infra — repo manifests as of 0123abc", out)
         self.assertIn("| apps/pdb.yaml | PodDisruptionBudget |", out)
+
+    def test_a_gitlab_repository_in_the_managed_list_is_scanned_too(self):
+        # Review (#2437): the default read GitHub's entries alone, so a GitLab
+        # repository was skipped with a log line and the report showed no
+        # removals for manifests it never read.
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/infra"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/platform/fleet"},
+        ]
+        opened = []
+
+        def open_workspace(endpoint, repo, **kwargs):
+            opened.append(repo)
+            return FakeWorkspace({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
+
+        with patch.object(scan.gitops_workspace, "get_managed_repo_entries", return_value=entries), patch.object(
+            scan, "content_mode_available", return_value=True
+        ), patch.object(scan.credential_proxy_client.Workspace, "open", side_effect=open_workspace), patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}
+        ):
+            rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
+        self.assertEqual(rc, scan.EXIT_OK)
+        self.assertEqual(["acme/infra", "gitlab.com/acme/platform/fleet"], opened)
+        self.assertIn("## gitlab.com/acme/platform/fleet — repo manifests as of 0123abc", out)
+
+    def test_a_gitlab_repository_without_content_mode_is_an_error_not_a_silent_skip(self):
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/infra"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/fleet"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, {"pdb.yaml": PDB_V1BETA1})
+
+            def runner(cmd, *, cwd=None, check=True):
+                class Result:
+                    returncode = 0
+                    stdout = "d00d\n"
+
+                return Result()
+
+            real_ensure = scan.gitops_workspace.ensure_workspace
+
+            def ensure(repo, runner, **kwargs):
+                if repo == "gitlab.com/acme/fleet":
+                    return real_ensure(repo, runner, **kwargs)
+                return Path(tmp)
+
+            with patch.object(scan.gitops_workspace, "get_managed_repo_entries", return_value=entries), patch.object(
+                scan, "content_mode_available", return_value=False
+            ), patch.object(scan, "_runner", runner), patch.object(
+                scan.gitops_workspace, "ensure_workspace", side_effect=ensure
+            ), patch.dict(os.environ, {"HERMES_SESSION_ID": "session-7", "HERMES_KANBAN_TASK": ""}):
+                rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
+        self.assertEqual(rc, scan.EXIT_PARTIAL)
+        self.assertIn("## acme/infra — repo manifests as of d00d", out)
+        self.assertIn("gitlab.com/acme/fleet", out)
+        self.assertIn("reaches GitHub only", out)
+
+    def test_a_host_qualified_repo_flag_is_accepted(self):
+        fake = FakeWorkspace({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
+        with patch.object(scan, "content_mode_available", return_value=True), patch.object(
+            scan.credential_proxy_client.Workspace, "open", return_value=fake
+        ), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
+            rc, out, err = self.run_main(
+                ["--repo", "gitlab.com/acme/fleet", "--current-version", "1.24", "--target-version", "1.27"]
+            )
+        self.assertEqual(rc, scan.EXIT_OK, err)
+        self.assertIn("## gitlab.com/acme/fleet — repo manifests as of 0123abc", out)
 
     def test_named_repo_falls_back_to_a_leased_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:

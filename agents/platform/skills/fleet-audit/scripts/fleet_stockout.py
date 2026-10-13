@@ -106,7 +106,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
-MAX_WORKERS = 8
+# The credential proxy's admitted count at the operator's default limit;
+# collect.py's MAX_WORKERS comment has the reasoning.
+MAX_WORKERS = 4
 
 GEN2_FAMILIES = {"n2", "n2d", "c2"}
 GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3"}  # §3.5's list, exactly -- §3.6 lists a different, wider set for its own check

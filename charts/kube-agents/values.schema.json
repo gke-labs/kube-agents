@@ -486,6 +486,9 @@
         "name": {
           "type": "string"
         },
+        "mode": {
+          "enum": [null, "", "today", "next"]
+        },
         "annotations": {
           "type": "object"
         },
@@ -578,6 +581,11 @@
                 "maxInProgress": {
                   "type": "integer"
                 },
+                "maxSessions": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000
+                },
                 "default": {
                   "type": "object"
                 },
@@ -630,6 +638,15 @@
               }
             },
             "credentialProxy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
+              }
+            },
+            "agentAPIAuth": {
               "type": "object",
               "additionalProperties": false,
               "properties": {

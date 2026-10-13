@@ -2,8 +2,10 @@
  * The transcript list, shared by the chat pane and the session view.
  *
  * Entries render by kind: `user` is the ask the gateway echoed onto the bus,
- * `steer` a follow-up into a running task, `answer` the result artifact
- * streaming in, `progress`/`status`/`topic`/`cancel` the quieter lines,
+ * `steer` a follow-up into a running task, `answer` a `result` or `turn`
+ * artifact streaming in (a finished turn's answer ahead of a follow-up's,
+ * or the task's deliverable), `progress`/`status`/`topic`/`cancel` the
+ * quieter lines,
  * `pending` a console turn not yet seen on the bus, `sent` a console turn
  * the gateway never makes a task of (a stop word, a bare `/session`), so it
  * settles at send, `notice` a gateway line

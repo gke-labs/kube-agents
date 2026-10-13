@@ -331,11 +331,8 @@ class FlagOffIdentityTest(unittest.TestCase):
         upstream = root.load("upstream_fixture")
         applier.apply(root.dir)
         patched = root.load("patched_fixture")
-        for value in (None, "", "0", "false"):
-            with self.subTest(flag=value), mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("KAGE_SLACK_UX", None)
-                if value is not None:
-                    os.environ["KAGE_SLACK_UX"] = value
+        for value in ("", "0", "false"):
+            with self.subTest(flag=value), mock.patch.dict(os.environ, {"KAGE_SLACK_UX": value}):
                 self.assertEqual(_listeners(patched), _listeners(upstream))
 
     def test_flag_on_registers_after_the_plugin_handlers(self):

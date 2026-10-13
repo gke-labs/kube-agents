@@ -189,8 +189,9 @@ type a2aSkill struct {
 }
 
 type a2aScheme struct {
-	Type   string `json:"type"`
-	Scheme string `json:"scheme,omitempty"`
+	Type             string `json:"type"`
+	Scheme           string `json:"scheme,omitempty"`
+	OpenIDConnectURL string `json:"openIdConnectUrl,omitempty"`
 }
 
 // textOf joins the text parts of a message, which is all the gateway routes

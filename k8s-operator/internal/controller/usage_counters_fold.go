@@ -129,6 +129,9 @@ type usageScrapedPod struct {
 	Sample  int64
 	// StartTime is nil when the body carried no process_start_time_seconds.
 	StartTime *float64
+	// Clusters is the watcher's cluster gauges, nil for any pod but a gateway's.
+	// Not folded: the poll projects the largest reading as it stands.
+	Clusters *usageClusterGauges
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

@@ -29,7 +29,7 @@
 #      ConfigMap key profile-default.overlay.yaml), merged INTO the PVC copy by
 #      entrypoint step 2.7 at startup. It carries the operator settings that stay
 #      mutable afterwards — an untargeted AgentPlugin's enablement and its
-#      non-gateway config, and spec.harness.tuning;
+#      non-gateway config, and spec.harness.tuning's default limits;
 #   4. the operator's render (k8s-operator renderConfigYAML), mounted read-only
 #      at /etc/hermes/config.yaml as Hermes' MANAGED SCOPE and overlaid, per leaf
 #      key, on top of 1+2+3 at every load.
@@ -48,11 +48,14 @@
 # /etc/hermes is MACHINE-GLOBAL — one file
 # for every profile in the pod, not just this one — so it carries only what is
 # identical for every profile AND beyond the agent's own repair: `model`,
-# `platforms`, `approvals.cron_mode`, `display.platforms`. Everything
-# profile-shaped below — toolsets, plugins.enabled, mcp_servers, kanban, memory —
-# is this file's alone. Do not add any of it to renderConfigYAML: the merge is
-# per leaf key and lists REPLACE rather than union, so a list pinned there would
-# hand the platform specialist the front door's tools and vice versa.
+# `platforms`, `approvals.cron_mode`, `display.platforms`, and
+# `kanban.max_in_progress`, the board's worker cap (the board is shared by every
+# profile; spec.harness.tuning.maxInProgress, else defaultKanbanMaxInProgress).
+# Everything profile-shaped below — toolsets, plugins.enabled, mcp_servers,
+# memory, and every `kanban` key except max_in_progress — is this file's alone.
+# Do not add any of that to renderConfigYAML: the merge is per leaf key and lists
+# REPLACE rather than union, so a list pinned there would hand the platform
+# specialist the front door's tools and vice versa.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
@@ -205,13 +208,26 @@ kanban:
   # of cards spawns processes until the cgroup OOM killer takes them, which kills a
   # child rather than the container and so produces no restart and no event.
   #
-  # This line is the default on every install. The operator does not pin it: its
-  # managed scope is machine-global and this is a front-door setting. An operator
-  # that wants a different cap sets spec.harness.tuning.maxInProgress, which the
-  # operator writes into profile-default.overlay.yaml and the entrypoint merges
-  # over this key at startup — so keep this value in step with
-  # defaultKanbanMaxInProgress in platformagent_manifests.go.
-  max_in_progress: 2
+  # On an operator install this line is NOT what applies. The operator pins
+  # kanban.max_in_progress in its managed scope (/etc/hermes), which Hermes
+  # overlays on this file at every load: spec.harness.tuning.maxInProgress, or
+  # defaultKanbanMaxInProgress in platformagent_manifests.go when the CR does not
+  # set it. The CR field is the knob. Editing this line, or the value the agent's
+  # own config.yaml holds, changes nothing there. This line applies only to an
+  # install that runs the image without the operator, so keep it in step with
+  # defaultKanbanMaxInProgress (TestChatConfigCapsTheBoardAndWakesOnFailuresOnly).
+  #
+  # One slot is guaranteed to each class of card: background work (event
+  # triage, cron report relays) may hold every slot but one, and so may user
+  # cards, so a chat question always has a slot and so do alerts; the four
+  # between go to whoever is first (deploy/docker/patches/kanban_priority.py).
+  # A worker measured about 430 MiB, so six are about 2.6 GiB over the
+  # gateway's 1.8 GiB idle set, under its 8Gi limit; coordinators waiting on
+  # their own children stay resident on top. The credential proxy's default
+  # 2Gi admits 9 brokered commands (8 with its slot cap), shared with the
+  # stall watch's and reconcile's four-wide listings. Model rate limits are
+  # per install and unmeasured: if worker logs show 429s, lower this.
+  max_in_progress: 6
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation
