@@ -94,7 +94,23 @@ const (
 	kubeAPIAccessMountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 	agentCredentialProxyTokenVolume = "agent-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
+	// mcpRelayURLEnvVar names the broker's remote MCP relay for the agent
+	// container. The agent configs interpolate it into each mcp-remote
+	// server's URL (`${KUBE_AGENTS_MCP_RELAY_URL}/gke`), so every
+	// `mcp__gke__*` call reaches Google through the broker's tool allowlist
+	// rather than on the gateway's own credential.
+	mcpRelayURLEnvVar = "KUBE_AGENTS_MCP_RELAY_URL"
+	// mcpRelayPath is the relay's route on the broker, without the trailing
+	// slash the server name follows. credential_proxy.py takes the prefix from
+	// mcp_policy.MCP_RELAY_PREFIX; tests/conformance holds the two equal.
+	mcpRelayPath = "/v1/mcp"
 )
+
+// mcpRelayURL is the value of mcpRelayURLEnvVar.
+func mcpRelayURL(agent *agentv1alpha1.PlatformAgent) string {
+	return credentialProxyBaseURL(agent) + mcpRelayPath
+}
 
 // credentialBrokerName is the name of the broker's Deployment and Service.
 func credentialBrokerName(agent *agentv1alpha1.PlatformAgent) string {

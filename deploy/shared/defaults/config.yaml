@@ -55,6 +55,19 @@ mcp_servers:
   # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
   # time and carries the full analysis; this bounds the damage if it ever stops
   # applying. Healthy calls to these endpoints measure 0.47-0.48s.
+  #
+  # Neither server is reached directly. `${KUBE_AGENTS_MCP_RELAY_URL}/<server>`
+  # is the credential proxy's `/v1/mcp/<server>` route (the operator sets the
+  # variable on the agent container), which checks every call against
+  # agents/platform/scripts/mcp_policy.py and forwards it on the proxy's own
+  # credential; the agent container holds none for these servers to use.
+  # mcp-remote presents the gateway's projected token from the file
+  # MCP_REMOTE_BEARER_FILE names (deploy/docker/patches/
+  # apply_mcp_remote_bearer_file.py). `--allow-http` because the proxy is a
+  # cluster Service; `--transport http-only` because the relay answers GET with
+  # 405, so an SSE fallback could only fail more slowly. This is the canonical
+  # explanation; agents/platform/config.yaml and agents/cluster/config.yaml
+  # carry the same entries and point back here.
   # `lazy: true`: register tools from the per-profile schema cache without
   # spawning the node proxy; the child starts on first actual tool call. Kanban
   # workers are fresh processes per card, and the eager spawns were ~2-4s of
@@ -98,7 +111,8 @@ mcp_servers:
   #     for an interactive tool, which nothing here is.
   #   - One string, byte-identical at every call site. It names the product,
   #     the build and the mode and nothing else; the customer project is
-  #     already on the wire as X-Goog-User-Project. Keep it that way — the API
+  #     already on the wire as X-Goog-User-Project, which the credential proxy
+  #     sets from its own credential. The proxy forwards this header unchanged. Keep it that way — the API
   #     teams key dashboards on this value, and a variation added in one file
   #     splits that key.
   developer_knowledge:
@@ -107,7 +121,12 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://developerknowledge.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/developer_knowledge"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
@@ -117,7 +136,12 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60

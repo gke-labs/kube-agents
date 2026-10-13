@@ -107,6 +107,10 @@ mcp_servers:
   # time and carries the full analysis; this bounds the damage if it ever stops
   # applying. Healthy calls to this endpoint measure 0.47-0.48s.
   #
+  # The server is reached through the credential proxy's MCP relay, which
+  # enforces the tool allowlist; deploy/shared/defaults/config.yaml explains
+  # the URL, the flags and the `env` block.
+  #
   # The whole entry is redundant with the shared defaults — the build-time merge
   # unions the two — but repeating it here keeps this file from reading as if
   # gke were the one server without these settings.
@@ -129,7 +133,12 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60

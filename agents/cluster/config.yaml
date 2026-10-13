@@ -41,13 +41,22 @@ mcp_servers:
   # execution mode, so the API team serving the endpoint can attribute the traffic;
   # deploy/shared/defaults/config.yaml carries the full rationale. The string is
   # the same one the Platform Agent sends, character for character.
+  #
+  # Both servers are reached through the credential proxy's MCP relay, which
+  # enforces the tool allowlist; deploy/shared/defaults/config.yaml explains
+  # the URL, the flags and the `env` block.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://developerknowledge.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/developer_knowledge"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
@@ -57,7 +66,12 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60

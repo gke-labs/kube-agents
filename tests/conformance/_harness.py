@@ -57,6 +57,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # invisible precondition that turns into a skipped test later.
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
+import mcp_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -121,6 +122,28 @@ SOURCES: dict[str, Source] = {
             "SLACK_METHOD_SHAPE",
         ),
     ),
+    # B1 imports this module: the per-tool allowlist the broker applies to
+    # every remote MCP call.
+    "mcp_policy": Source(
+        "agents/platform/scripts/mcp_policy.py",
+        ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
+    # --- the agent's MCP servers ------------------------------------------
+    # B1 reads where each profile's remote MCP servers point. The Platform
+    # Agent's config is the shared defaults merged with its overlay, and the
+    # Cluster Agent's template is copied as it is, so all three are read.
+    "shared_defaults_config": Source(
+        "deploy/shared/defaults/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "platform_config": Source(
+        "agents/platform/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "cluster_config": Source(
+        "agents/cluster/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
         ("/sessions/{session_id}/inject", "trigger_agent_troubleshooter", "_gateway_api_token"),
@@ -159,7 +182,7 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews"),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
