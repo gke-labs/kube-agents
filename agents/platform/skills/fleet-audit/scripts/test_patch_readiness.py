@@ -1837,6 +1837,35 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
         self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
 
+    def test_a_static_cluster_frozen_by_an_exclusion_alone_is_the_check_running_clean_as_on_a_channel_cluster(self):
+        """A static cluster behind every roster under a `NO_UPGRADES` exclusion:
+        the reporter grades the exclusion as blocking before it looks for a
+        target, so the row is `blocked` with a clean budget read and every
+        pool's skew ungraded. The exclusion is 3.8's subject; the budget half,
+        the only half graded on a no-target row, answered clean, so the check
+        ran clean, as the same row does on a channel cluster. A blocking budget
+        on that row is still a candidate, and a block of a cause this check
+        does not know is still a gap."""
+        c = cluster(name="static", master="1.20.0-gke.1", channel=None)
+
+        def static_row(**kwargs):
+            row = self.member("static", status="blocked", gap=None, **kwargs)
+            row["channel"] = None
+            row["target_version"] = None
+            row["readiness"]["skew"]["unknown"] = ["default-pool"]
+            return row
+
+        entry = self.collect([c], [static_row(exclusions=["freeze"])])["static"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertEqual([x for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+        entry = self.collect([c], [static_row(exclusions=["freeze"], pdbs=[self.BUDGET])])["static"]
+        self.assertEqual([x["severity"] for x in entry["candidates"] if x["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.CRITICAL])
+        entry = self.collect([c], [static_row()])["static"]
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertIn(pr.UNEVALUATED_UNRECOGNISED_BLOCK, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+
     def test_a_static_cluster_with_a_pool_ahead_lag_is_declared_whatever_the_budget_read_found(self):
         """The one lag the declaration is for: a static cluster whose only lag
         is a pool ahead of its control plane. The control plane's move is due,

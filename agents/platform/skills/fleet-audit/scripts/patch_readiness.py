@@ -1867,22 +1867,38 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         ceiling_ungraded = due.skew_applies and (not (member or {}).get("target_version") or bool((readiness.get("skew") or {}).get("unknown")))
         budget_blocked = due.budget_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("pdbs") or {}).get("blocking"))
         budget_ungraded = due.budget_applies and bool(readiness.get("read_error"))
+        # `blocked` for something that is neither a budget, skew, nor an
+        # exclusion: a cause the reporter learned after this join was written.
+        # Recording it as run-and-clean would publish an all-clear over an
+        # upgrade the reporter says is blocked; it is ungraded until this check
+        # knows the cause, on every row, the no-target one included.
+        unrecognised_block = readiness.get("status") == READINESS_BLOCKED and _readiness_cause(readiness) is None and not (readiness.get("maintenance") or {}).get("blocking_exclusions")
         why = None
         if not members:
             why = no_report
         elif member is None:
             why = UNEVALUATED_NO_ROW
-        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY):
+        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and not unrecognised_block:
             # That row on a lag a budget can hold (a behind control plane,
             # or a pool behind its control plane): the target matters only to
-            # the ceiling, and the budget half, which applies, was graded on
-            # a clean read and found nothing. The check ran on the half that
-            # applies, so it goes to `commands`; a blocking budget on this row
-            # is a candidate, as on any behind cluster, and a failed read is
-            # unevaluated below. The check therefore never flips between
-            # declared and run as budgets come and go, and last week's
-            # finding retires only against a clean read this week.
+            # the ceiling, so the budget half is all that is graded there, and
+            # the budget read answered. The check ran on the half that
+            # applies, so it goes to `commands`, whatever the summary status
+            # says: a clean read is the check running clean; a block resting
+            # on an exclusion alone is 3.8's subject and the check running
+            # clean, as on any cluster (the reporter grades a `NO_UPGRADES`
+            # exclusion as blocking before it looks for a target); a blocking
+            # budget is a candidate below, as on any behind cluster; and a
+            # failed read is unevaluated below. The ungraded ceiling is no gap
+            # on this row: nothing it could grade applies without a target.
+            # The check therefore never flips between declared, run and
+            # unevaluated as budgets and exclusions come and go, and last
+            # week's finding retires only against a clean read this week.
             pass
+        elif unrecognised_block:
+            # Before the gap arms: a block of unknown cause is the fact to
+            # publish, whatever else on the row went ungraded.
+            why = UNEVALUATED_UNRECOGNISED_BLOCK
         elif not skew_blocked and not budget_blocked and (budget_ungraded or ceiling_ungraded):
             # The reporter's own notes say why a row is `unknown`: the grade's
             # note (no target, so skew and exclusion scope ungraded) and the
@@ -1895,13 +1911,6 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # gap; a pool-ahead row with a failed read and an ungraded ceiling
             # names the ceiling's note, not a read whose answer is discarded.
             why = str((readiness.get("read_error") if budget_ungraded else None) or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
-        elif readiness.get("status") == READINESS_BLOCKED and _readiness_cause(readiness) is None and not (readiness.get("maintenance") or {}).get("blocking_exclusions"):
-            # `blocked` for something that is neither a budget, skew, nor an
-            # exclusion: a cause the reporter learned after this join was
-            # written. Recording it as run-and-clean would publish an
-            # all-clear over an upgrade the reporter says is blocked;
-            # it is ungraded until this check knows the cause.
-            why = UNEVALUATED_UNRECOGNISED_BLOCK
         if why is not None:
             log(f"{project}/{entry['_bare_name']}: readiness not graded ({why}); upgrade-blocked unevaluated there")
             _unevaluated(entry, why)

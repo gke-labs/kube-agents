@@ -259,7 +259,7 @@ each is waiting for whoever schedules it.
   and the version finding stands on its own. Which arm that row takes follows from which cause
   can block the upgrade that is due, never from what the budget read found. Where a budget can
   hold that upgrade (a behind control plane, or a pool behind its control plane) the check ran
-  on the half that applies: a clean read is the check running clean, in `commands`, and a
+  on the half that applies: a clean read is the check running clean, in `commands` (an exclusion the reporter grades as blocking on that row is 3.8's subject and leaves it clean, as on any cluster; the ungraded ceiling is no gap there), and a
   blocking budget is a candidate as on any behind cluster, so the check never flips between
   declared and run as budgets come and go. The declaration is for the one lag where nothing
   that applies could be graded: a static cluster whose only lag is a pool ahead of its control
