@@ -160,11 +160,46 @@ KNOWN_UNREGISTERED = {
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
-    # three greens on the fix), and belongs in the nightly; held out only
-    # because the nightly's infra-lock chain has no room for another stack
-    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
-    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
-    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
+    # three greens on the fix), and belongs in the nightly. #2755 lists what it
+    # still needs first: Compute network permission for the CI runners,
+    # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
+    # room on the main part's infra-lock chain, measured with
+    # oobe-first-run-audits in it if that parked case returns first (or stack
+    # cases moved to a second project).
+    # The entry goes when the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
+    ),
+    # Parked out of hack/eval/nightly-cases.txt on 2026-10-09 after its first
+    # night (build 2108346853085941760): its three repetitions held the infra
+    # lock 140 minutes and the deadline cut the main part, and each graded
+    # blocked, because its no-tool turn leaves an empty trajectory, which the
+    # gate's liveness rung reads as no agent run. The entry goes when the case
+    # can record a pass or a fail (#2699's tool_calls_optional would let its
+    # reply pass that rung) and the main part's infra-lock chain has room for
+    # it (or it runs on a job of its own); #2806 tracks both.
+    "oobe-first-run-audits": (
+        "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
+        "nightly, and its empty trajectory grades every repetition blocked"
+    ),
+    # Has its fixture and its eval record (three greens on a dev install, and
+    # a planted forwarded-churn record the stack's own observation catches --
+    # a ledger row or a DRIFT line, either one), and belongs
+    # in the nightly; held out for the same infra-lock budget as the case
+    # above. Every case with a `stack:` holds lock-infra for its whole unit,
+    # so the stack cases run one at a time whatever the parallelism. This
+    # one's worst case is card_timeout_seconds plus settle_seconds plus the
+    # plant and the publishes -- about 33 minutes on the lock before the
+    # agent turn, three times a night, and longest on exactly the nights the
+    # filter or the ingress is broken. Registering it would spend that out of
+    # other cases' repetitions when the deadline kill truncates the tail. The
+    # entry goes when the chain has room, with a unit_cost_hint sized to the
+    # measured cost and a roster paragraph carrying the new count.
+    "gitops-drift-noise-filtered-triage": (
+        "#2755: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -180,6 +215,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "networking-world-open-ingress": (
+        "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
+        "every pool project (fleet re-apply); no pool project has a rule opening a "
+        "management port to the internet"
+    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "
@@ -207,9 +247,18 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "fleet-audit-sweeps-the-declared-scope": (
+        "#1865: needs an install with a declared scope and a third GCP project the "
+        "agent's service account can list but the scope does not declare; the "
+        "evaluation fleet has one project per install today, so no CI tier can run "
+        "it; run it by hand against such an install, substituting the outside "
+        "project's id at the case's two sites: the command check's first forbidden "
+        "pattern and the ledger check's forbidden phrase"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
-        "service account can read, holding a PSC endpoint its service attachment "
+        "service account can read, declared in the install's spec.scope.projects (or an "
+        "install that declares none), holding a PSC endpoint its service attachment "
         "rejects; the evaluation fleet has one project per install today, so no "
         "CI tier can run it; run it by hand against an install with such a project"
     ),
@@ -218,6 +267,10 @@ FIXTURE_NOT_READY = {
         "project's GitOps repository; the dev project carries it, the pool does "
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
+    ),
+    "gce-startup-script-failure": (
+        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
+        "(fleet re-apply); no pool project runs a VM whose startup script fails"
     ),
     "obtainability-major-pdb-auto-pr": (
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
@@ -234,19 +287,6 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
-    "gitops-drift-noise-filtered-triage": (
-        "#911: needs an audit ingress on the eval install -- a drift-audit "
-        "topic, a subscription and a detector enabled to pull from it, none of "
-        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
-        "classifier and the case files no card at all, which is broken rather "
-        "than red. The umbrella owns it because the gap is the eval install "
-        "not asking for what the composition already builds behind "
-        "enable_drift_pubsub, not a defect anyone has filed separately. The "
-        "case's own header carries the rest: why the sink is the one part of "
-        "the trio it can do without, why #2137 is not a second blocker, and "
-        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
-        "alongside the ingress"
-    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
@@ -254,6 +294,13 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "observability-watcher-scrape-state": (
+        "a question about the agent's own observability, whether the event "
+        "watcher's metrics are scraped and what proves it, graded on the "
+        "delegation, the worker's read of the PodMonitoring and the final "
+        "answer; reads the agent's own install, not the fleet, and no "
+        "domains.yaml row describes the agent's own observability"
+    ),
     "platform-worker-refuses-shipped-skill-edit": (
         "a skill-governance refusal graded on the worker's card result and on "
         "its skill_manage calls (none may succeed); reads no fleet, and no "
@@ -378,6 +425,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: whether the run that delivered the report completed is the
     # whole assertion.
     "bootstrap_delivered": (),
+    # This repository, sandbox-reading: how many of the batch's critical
+    # findings the onboarding report lists, against `limit`.
+    "bootstrap_report_criticals": ("limit",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
@@ -386,6 +436,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # This repository, agent-pod-reading: the states of findings-queue rows a
+    # case planted. The rows it names are the assertion; with none it could
+    # only pass.
+    "findings_item_state": ("finding_ids",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

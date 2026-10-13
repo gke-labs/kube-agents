@@ -1,0 +1,132 @@
+[
+  {
+    "source": "inventory",
+    "check": "probes-readiness",
+    "project": "bench-findings-demo",
+    "cluster": "bench-shop-east",
+    "namespace": "shop",
+    "object": "cart",
+    "title": "Deployment cart has no readiness probe",
+    "detail": "No container in shop/cart declares a readinessProbe, so the Service routes traffic to pods that are still starting.",
+    "rubric": { "B": 3, "L": 4, "detect": 2, "recover": 2, "C": 0.9 },
+    "recommendation": {
+      "action": "Add an HTTP readiness probe on the service port.",
+      "rationale": "Traffic reaches a pod only once it can serve.",
+      "risk": "A wrong path keeps every pod out of the Service."
+    },
+    "remediation": {
+      "kind": "manifest",
+      "path": "apps/shop/cart/deployment.yaml",
+      "note": "Add readinessProbe to the cart container."
+    },
+    "verification": {
+      "kind": "kubectl",
+      "command": "kubectl -n shop get deploy cart -o jsonpath='{.spec.template.spec.containers[*].readinessProbe}'",
+      "still_failing_when": "the output is empty"
+    }
+  },
+  {
+    "source": "inventory",
+    "check": "probes-readiness",
+    "project": "bench-findings-demo",
+    "cluster": "bench-shop-east",
+    "namespace": "shop",
+    "object": "checkout",
+    "title": "Deployment checkout has no readiness probe",
+    "detail": "No container in shop/checkout declares a readinessProbe, so the Service routes traffic to pods that are still starting.",
+    "rubric": { "B": 3, "L": 4, "detect": 2, "recover": 2, "C": 0.9 },
+    "recommendation": {
+      "action": "Add an HTTP readiness probe on the service port.",
+      "rationale": "Traffic reaches a pod only once it can serve.",
+      "risk": "A wrong path keeps every pod out of the Service."
+    },
+    "remediation": {
+      "kind": "manifest",
+      "path": "apps/shop/checkout/deployment.yaml",
+      "note": "Add readinessProbe to the checkout container."
+    },
+    "verification": {
+      "kind": "kubectl",
+      "command": "kubectl -n shop get deploy checkout -o jsonpath='{.spec.template.spec.containers[*].readinessProbe}'",
+      "still_failing_when": "the output is empty"
+    }
+  },
+  {
+    "source": "inventory",
+    "check": "probes-readiness",
+    "project": "bench-findings-demo",
+    "cluster": "bench-shop-east",
+    "namespace": "shop",
+    "object": "frontend",
+    "title": "Deployment frontend has no readiness probe",
+    "detail": "No container in shop/frontend declares a readinessProbe, so the Service routes traffic to pods that are still starting.",
+    "rubric": { "B": 3, "L": 4, "detect": 2, "recover": 2, "C": 0.9 },
+    "recommendation": {
+      "action": "Add an HTTP readiness probe on the service port.",
+      "rationale": "Traffic reaches a pod only once it can serve.",
+      "risk": "A wrong path keeps every pod out of the Service."
+    },
+    "remediation": {
+      "kind": "manifest",
+      "path": "apps/shop/frontend/deployment.yaml",
+      "note": "Add readinessProbe to the frontend container."
+    },
+    "verification": {
+      "kind": "kubectl",
+      "command": "kubectl -n shop get deploy frontend -o jsonpath='{.spec.template.spec.containers[*].readinessProbe}'",
+      "still_failing_when": "the output is empty"
+    }
+  },
+  {
+    "source": "inventory",
+    "check": "probes-readiness",
+    "project": "bench-findings-demo",
+    "cluster": "bench-shop-west",
+    "namespace": "shop",
+    "object": "cart",
+    "title": "Deployment cart has no readiness probe",
+    "detail": "No container in shop/cart declares a readinessProbe, so the Service routes traffic to pods that are still starting.",
+    "rubric": { "B": 3, "L": 4, "detect": 2, "recover": 2, "C": 0.9 },
+    "recommendation": {
+      "action": "Add an HTTP readiness probe on the service port.",
+      "rationale": "Traffic reaches a pod only once it can serve.",
+      "risk": "A wrong path keeps every pod out of the Service."
+    },
+    "remediation": {
+      "kind": "manifest",
+      "path": "apps/shop/cart/deployment.yaml",
+      "note": "Add readinessProbe to the cart container."
+    },
+    "verification": {
+      "kind": "kubectl",
+      "command": "kubectl -n shop get deploy cart -o jsonpath='{.spec.template.spec.containers[*].readinessProbe}'",
+      "still_failing_when": "the output is empty"
+    }
+  },
+  {
+    "source": "inventory",
+    "check": "no-memory-limit",
+    "project": "bench-findings-demo",
+    "cluster": "bench-shop-east",
+    "namespace": "shop",
+    "object": "orders-db",
+    "title": "StatefulSet orders-db sets no memory limit",
+    "detail": "The orders-db container in shop/orders-db has no memory limit, so a leak can take memory from every pod on its node.",
+    "rubric": { "B": 3, "L": 4, "detect": 2, "recover": 2, "C": 0.9 },
+    "recommendation": {
+      "action": "Set a memory limit near the container's observed peak.",
+      "rationale": "A leak then restarts one pod instead of starving the node.",
+      "risk": "A limit below the working set restarts the database under load."
+    },
+    "remediation": {
+      "kind": "manifest",
+      "path": "apps/shop/orders-db/statefulset.yaml",
+      "note": "Add resources.limits.memory to the orders-db container."
+    },
+    "verification": {
+      "kind": "kubectl",
+      "command": "kubectl -n shop get sts orders-db -o jsonpath='{.spec.template.spec.containers[*].resources.limits.memory}'",
+      "still_failing_when": "the output is empty"
+    }
+  }
+]

@@ -679,6 +679,122 @@ resource "google_compute_disk" "orphan_pd" {
   labels = local.fleet_labels
 }
 
+# Defect (networking): an etcd port open to the whole internet on a VM with an
+# external IP. The networking audit's §2.6 (`firewall-world-open-ingress`)
+# flags an enabled INGRESS rule opening a management port to 0.0.0.0/0 that
+# reaches at least one instance holding an external IP. Port 2379 because
+# nothing on this VM listens on it: the rule is a real finding with no service
+# behind it. No service account, project SSH keys blocked, OS Login on. The
+# `world_open_deny_remote` rule below blocks tcp:22 and tcp:3389.
+# The external IP is the fixture: the check fires only on an instance with one.
+#trivy:ignore:AVD-GCP-0031
+resource "google_compute_instance" "world_open" {
+  name         = "world-open-${var.cluster_prefix}"
+  machine_type = "e2-micro"
+  zone         = var.zone
+  tags         = ["${var.cluster_prefix}-world-open"]
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {}
+  }
+
+  metadata = {
+    block-project-ssh-keys = "true"
+    enable-oslogin         = "TRUE"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+
+  labels = local.fleet_labels
+}
+
+# The name leads with `world-open-2379-` so the case can grade
+# `FirewallRule/world-open-2379-`, which only the finding's object carries.
+# The world-open allow is the fixture: nothing listens on tcp:2379.
+#trivy:ignore:AVD-GCP-0027
+resource "google_compute_firewall" "world_open" {
+  name          = "world-open-2379-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["2379"]
+  }
+}
+
+# A project often keeps the stock `default-allow-ssh` and `default-allow-rdp`
+# rules, which open tcp:22 and tcp:3389 to the internet on every instance.
+# This rule blocks those two ports on the world-open VM, so its sshd is not
+# open to the internet. The collector does not let a target-scoped deny hide
+# other rules, so this rule does not change the finding the case grades.
+resource "google_compute_firewall" "world_open_deny_remote" {
+  name          = "world-open-deny-remote-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  priority      = 900
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  deny {
+    protocol = "tcp"
+    ports    = ["22", "3389"]
+  }
+}
+
+# Defect (compute): a standalone VM whose startup script fails. The GCE
+# compute audit's §2.1 reads the serial console of every RUNNING instance that
+# runs a startup script and flags the guest agent's failure line, which on
+# current images is `Script "startup-script" failed with error: exit status 1`.
+# The script exits 1 on every boot, so the line is on the console from the
+# first boot onward, with no age gate. The audit reads the project, not a
+# cluster, so this needs no cluster slot. No external IP and no service
+# account: the VM does nothing but fail. The name leads with `startup-fail-`
+# so the case can grade `/startup-fail-`, which only the finding's object path
+# (`ComputeInstance/<zone>/<name>`) carries; a command names it after a space.
+resource "google_compute_instance" "startup_fail" {
+  name         = "startup-fail-${var.cluster_prefix}"
+  machine_type = "e2-micro"
+  zone         = var.zone
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    network = "default"
+  }
+
+  metadata = {
+    block-project-ssh-keys = "true"
+    enable-oslogin         = "TRUE"
+    startup-script         = "#!/bin/bash\necho 'eval fixture: planted startup-script failure'\nexit 1\n"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+
+  labels = local.fleet_labels
+}
+
 # ---------------------------------------------------------------------------
 # seeded-d: the multi-zonal cluster, and the only one whose SHAPE is the
 # fixture. The anomaly-detection checks have to tell one cause of zonal skew

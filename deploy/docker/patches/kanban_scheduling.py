@@ -406,8 +406,10 @@ Part 4: a coordinator waiting on its children must not hold their slot
 ``dispatch_once`` caps concurrency by counting ``status='running'`` cards, and a
 card waiting on the work it fanned out is still ``running``. So the coordinator
 holds a slot for its whole wait and its own children compete for what is left.
-At the shipped ``max_in_progress`` of 2 (``agents/chat/config.yaml``, matching
-``defaultKanbanMaxInProgress``) two waiters wedge the board outright.
+At the ``max_in_progress`` of 2 this install first shipped, two waiters wedged
+the board outright. The shipped default is now 6 (``agents/chat/config.yaml``,
+matching ``defaultKanbanMaxInProgress``), so it takes six waiters to wedge it,
+and any fewer still crowd out the children they wait for.
 
 Neither exit from ``running`` is open. ``kanban_complete`` is refused while
 recorded children are unsettled (``tools/kanban_children_settled.py``, #1010) and
@@ -908,8 +910,8 @@ CHILDREN_TABLE = "kanban_worker_children"
 CHILD_SETTLED_STATUSES = ("done", "archived")
 CHILD_COLUMNS = ("child_id", "creator_id")
 
-_WAITING_ON_CHILDREN_SQL = (
-    "SELECT COUNT(*) FROM tasks t"
+_WAITING_ON_CHILDREN_FROM = (
+    " FROM tasks t"
     " WHERE t.status = 'running'"
     "   AND EXISTS ("
     f"        SELECT 1 FROM {CHILDREN_TABLE} c"
@@ -923,15 +925,24 @@ _WAITING_ON_CHILDREN_SQL = (
     "           )"
     "   )"
 )
+_WAITING_ON_CHILDREN_SQL = "SELECT COUNT(*)" + _WAITING_ON_CHILDREN_FROM
+# The same predicate, naming the cards: kanban_priority's saturation warning
+# lists the cards that hold slots, so it leaves these out.
+_WAITING_ON_CHILDREN_IDS_SQL = "SELECT t.id" + _WAITING_ON_CHILDREN_FROM
 
 
-def count_waiting_on_children(conn) -> int:
+def count_waiting_on_children(conn, below_priority: Optional[int] = None) -> int:
     """``running`` cards that are only waiting for work they fanned out.
 
     Subtracted from ``count_running_tasks`` so a waiter does not hold the slot
     its children need. Waiting means holding an unsettled recorded child that is
     not gated behind this card — ``kanban_children_settled``'s test, so the two
     never disagree about whether a card is done waiting.
+
+    ``below_priority`` narrows the count to cards whose ``priority`` is below
+    it. ``kanban_priority`` passes its ``USER_PRIORITY`` to discount waiting
+    background coordinators from the background share, the same discount this
+    function gives the host-wide count.
 
     Fails open to 0, including for a board whose attribution table was never
     written. Zero is upstream's count, so an error here narrows dispatch rather
@@ -942,9 +953,15 @@ def count_waiting_on_children(conn) -> int:
     and recurs every tick until the writer installs, so it stays at debug.
     """
     try:
-        row = conn.execute(
-            _WAITING_ON_CHILDREN_SQL, CHILD_SETTLED_STATUSES
-        ).fetchone()
+        if below_priority is None:
+            row = conn.execute(
+                _WAITING_ON_CHILDREN_SQL, CHILD_SETTLED_STATUSES
+            ).fetchone()
+        else:
+            row = conn.execute(
+                _WAITING_ON_CHILDREN_SQL + " AND t.priority < ?",
+                (*CHILD_SETTLED_STATUSES, int(below_priority)),
+            ).fetchone()
         return int(row[0]) if row else 0
     except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
         # Matched on the message rather than the type because the table is
@@ -961,3 +978,20 @@ def count_waiting_on_children(conn) -> int:
                 exc,
             )
         return 0
+
+
+def waiting_on_children_ids(conn) -> set:
+    """The ids :func:`count_waiting_on_children` counts, on one board.
+
+    Fails open to an empty set, quietly: the one caller only labels a log line,
+    and :func:`count_waiting_on_children` already reports the same failure.
+    """
+    try:
+        return {
+            row[0]
+            for row in conn.execute(
+                _WAITING_ON_CHILDREN_IDS_SQL, CHILD_SETTLED_STATUSES
+            ).fetchall()
+        }
+    except Exception:  # noqa: BLE001 — never break the dispatch tick
+        return set()

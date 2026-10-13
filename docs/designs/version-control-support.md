@@ -14,8 +14,7 @@
 > repositories this install does not manage and does it with a shallow clone —
 > neither of which the verbs offer, the second on purpose
 > ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
-> and `spec.integration.repositories` with only `github` registered, so a GitLab
-> forge is not yet declared through the CR.
+> and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
 
@@ -146,8 +145,9 @@ The coupling runs through five layers, each with a different owner and a differe
    network policy that decides where the pod may reach at all.
 4. **The declarative surface.** The CRD declares forges and repositories in
    `spec.integration.forges` and `spec.integration.repositories` and labels each state-ConfigMap
-   entry with its forge's provider, but the chart, installer and Terraform
-   composition all carry GitHub App inputs, and GitHub is the only provider registered.
+   entry with its forge's provider. Each surface that writes a declaration — the CRD, the chart,
+   the installer and the Terraform composition — has to take a forge's provider, host and
+   credential from the administrator rather than assume the GitHub App.
 5. **The prompts.** Four `SKILL.md` files instructed the model in `gh` spellings; seven governance
    SOPs name `gh` to forbid it and call the artefact a pull request throughout. Three of the four
    are on the verbs; `fleet-audit/SKILL.md` and the seven SOPs are `audit_report.py`'s prose and
@@ -237,11 +237,23 @@ repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry there
 reconciliation intact and reaches the agent.
 
 There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
-pr-conversation, submit-suggestion and the scan gate. It names each entry the way the verbs take it.
-A GitHub entry is its bare `owner/name` while GitHub is the only forge the list names; any other
+pr-conversation, submit-suggestion, the scan gate and the pre-upgrade API-removal scan. It names
+each entry the way the verbs take it. A GitHub entry is its bare `owner/name` however many forges
+the list names, so a repository's name does not change when a second forge is added and the names
+already written into lease records, run records and cron `--repo` arguments stay valid. Any other
 forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
-canonical host to leave off; and once the list names a second forge, GitHub's entries are
-`github.com/owner/name` too, because the broker refuses a hostless name then. An entry of a type no
+canonical host to leave off. The broker refuses a hostless name when it serves more than one forge,
+and the sandbox client answers that, not the list: it sends a bare name the install registered as
+GitHub as the URL it was registered by. The list and the client use one rule to decide which names
+the client can send this way. Thus they cannot disagree. Sometimes the client cannot send a GitHub
+entry this way. Then the list spells it `github.com/owner/name`, if the managed list or the context
+list holds an entry of another forge. This occurs in two cases. In the first case, an entry of
+another forge in one of the two lists spells the same path. That entry counts even if the list skips
+it, because the client does not select between forges. The usual example is a GitLab context
+repository with the same path as a managed GitHub repository, such as the upstream of a mirror. In
+the second case, an administrator registered the entry by hand without a URL, and the client does
+not make a URL. `gitops_workspace.qualify` turns a name in
+either spelling into the one the list uses, so a gate compares like with like. An entry of a type no
 forge in the image serves, or one that names no host, is logged and skipped, so a repository an
 administrator registered is visible as unsupported instead of indistinguishable from one that was
 never registered. `get_managed_github_repos()` remains for the callers that are GitHub's alone, such
@@ -408,10 +420,11 @@ in Go alike, at the points where GitHub is the provider. The difference is that 
 refusal is a provider's, and states a reason, instead of being an invariant of the whole stack
 expressed in four dialects.
 
-A GitLab remote in any spelling is refused at admission, by the GitHub provider's host check,
-because GitHub is the only provider registered. That inverts the obvious reading: admitting a
-GitLab forge in `spec.integration.forges` is **relaxing an existing host check under provider dispatch**,
-not adding a host check where a host-blind shape check stood.
+A GitLab remote in any spelling is refused at admission on a GitHub forge, by the GitHub
+provider's host check. That inverts the obvious reading: admitting a GitLab forge in
+`spec.integration.forges` **relaxed an existing host check under provider dispatch** — the GitLab
+provider admits what GitHub's refuses, on its own forges only — rather than adding a host check
+where a host-blind shape check stood.
 
 **What remains.** The Python side has one parser and one set of rules, and the host survives the
 parse instead of being discarded before the slashes are counted. What it does not yet have is
@@ -575,7 +588,8 @@ A `gitops` or `managed` repository entry names it in `baseBranch`
 the base of every accepted repository that sets one into the broker container's
 environment as one variable, `CREDENTIAL_PROXY_PINNED_BASES`: a JSON array of
 `{"repository": "https://<host>/<path>", "branch": "<base>"}`, the host being
-the forge's canonical one. `spec.deployment.env` can never set it, and the
+the forge's canonical one and the path as that forge reads it, nested groups
+included on GitLab. `spec.deployment.env` can never set it, and the
 broker refuses to start on a value it cannot read. Nothing reaches the agent
 container or the sandbox, and the sandbox's environment is never consulted: the
 skills ask the broker for the base, so a branch name an agent exports changes
@@ -583,8 +597,8 @@ nothing. A `CREDENTIAL_PROXY_BASE_BRANCH` in `spec.deployment.env`, or failing
 that a `GITOPS_BASE_BRANCH`, still reaches the broker and joins the protected
 branches above, but pins no target, because nothing names its repository. A
 repository is its host and path, compared without regard to case; a request
-that names no host is on its forge's canonical host, so the same `owner/name`
-on another host is another repository and is not pinned. For a pinned
+that names no host is on its forge's canonical host, so the same path on
+another host, or on another forge, is another repository and is not pinned. For a pinned
 repository every door that chooses a target holds it to the base and compares
 branch names exactly: the base is accepted as `<base>` or `refs/heads/<base>`,
 and `heads/<base>` is another branch.
@@ -846,29 +860,38 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
-| Verb                                 | Request                                                              | Response                                                                 |
-| ------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing, baseBranch}`   |
-| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`        |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                        |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                             |
-| `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                          |
-| `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                             |
-| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}` |
-| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                         | `{comment}`                                                              |
-| `issue-create`                       | `{repository, title, body?, labels?}`                                | `{issue}`                                                                |
-| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                      |
-| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                      |
-| `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                            |
-| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                         |
-| `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                |
-| `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                 |
-| `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                     |
-| `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                    |
+| Verb                                 | Request                                                              | Response                                                                         |
+| ------------------------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing, baseBranch, fileUrl?}` |
+| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                                     |
+| `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                  |
+| `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                     |
+| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`         |
+| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                         | `{comment}`                                                                      |
+| `issue-create`                       | `{repository, title, body?, labels?}`                                | `{issue}`                                                                        |
+| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                              |
+| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                              |
+| `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                                    |
+| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                                 |
+| `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                        |
+| `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                         |
+| `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                             |
+| `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                            |
 
 `baseBranch` is the repository's configured base, or null when it has none.
 Where it is set, `proposal-create`'s `target`, and a first-round `publish`'s,
 must name it; [The shape](#the-shape) has the rule and the doors that hold it.
+
+`capabilities` also answers `fileUrl`: the web address of a file in the
+repository, with `{ref}` and `{path}` for the caller to fill. It is
+`https://github.com/<owner>/<name>/blob/{ref}/{path}` on GitHub, and
+`https://<host>/<group>/.../<project>/-/blob/{ref}/{path}` on GitLab. The forge
+composes it from the repository and its own host, so the sandbox builds no
+forge URL. A link in an issue or a proposal uses it, because a bare relative
+path resolves against the page and opens nothing. A forge that this install
+does not serve answers no `fileUrl`.
 
 The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
@@ -949,7 +972,7 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
-`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED`, `FORGE_TLS_UNTRUSTED` and
 `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
@@ -967,7 +990,11 @@ ones, an unthrottled 403 is `FORGE_FORBIDDEN` and says retrying will not change
 the answer, 404 `FORGE_NOT_FOUND` says that a private repository this install
 cannot see answers the same way so absence is not proven, 422 `FORGE_REJECTED`
 says to fix a field rather than repeat the call, and 5xx is 503
-`FORGE_UNAVAILABLE` and says to retry the same call unchanged. Everything
+`FORGE_UNAVAILABLE` and says to retry the same call unchanged. A TLS
+certificate that does not verify is 502 `FORGE_TLS_UNTRUSTED` and says that no
+retry fixes it; its text names the cause (an untrusted chain, an expired
+certificate, a wrong name, or a CA bundle that is not mounted or not
+loadable). Everything
 unrecognised is still 502 `FORGE_CALL_FAILED`.
 
 The table above is shared, and keying it on the status alone is _nearly_
@@ -2014,14 +2041,57 @@ spelling's `namespace` is a plain string and the grammar lives with the provider
 `credentialsRef` names a Secret in the agent's namespace for a provider whose credential is a
 token an administrator holds. GitHub's is not: its tokens are minted per call from the GitHub
 App, so on a `github` forge the field is ignored, and admission says so with a warning rather
-than an error, so a values file can carry it ahead of the provider that reads it.
+than an error, so a values file can carry it ahead of the provider that reads it. GitLab's is,
+so on a `gitlab` forge the field is required: without it the broker has no token to call the
+forge with, and the forge and every repository on it are refused rather than seeded into a list
+the broker would then refuse on every call.
+
+The operator hands a credentialed forge to the broker and to nothing else. The Secret's `token`
+key is projected into the broker's pod alone — never the agent's, never the sandbox's — as
+`/var/run/kube-agents/forge-credentials/<forge>/token`, optional so a Secret created after the
+CR does not keep the broker, and with it GitHub and chat, from starting. Beside it the operator
+renders the forge configuration the broker builds its forges from (`VCS_FORGES_CONFIG`) into
+the broker's policy ConfigMap, whose hash already rolls the broker when it changes. GitHub is
+always its first entry, because a configuration is the broker's whole answer and an install that
+declares a GitLab forge still has its GitHub App; and a GitHub-only declaration renders no
+configuration at all, so its broker is unchanged. Each GitLab entry's `allowedPaths` is the
+forge's `namespace` together with the group of every repository accepted on it — the narrowing
+a GitLab token gets nowhere else — and a forge with neither is left out, since an entry with no
+`allowedPaths` is one the broker refuses to build. The broker holds one credential per host, so a second
+credentialed forge at a host already declared is refused at its `host`, naming the first. A
+forge claims its host only when it is valid and serves something, and the same rule decides
+which forges the broker is given, so a forge the status refuses is never one whose token is
+mounted.
+
+**A mixed install still takes a registered bare GitHub name.** When a forge beside GitHub is
+declared, the broker serves more than one forge. The broker then refuses a bare `owner/name`,
+because the name does not tell which forge it is on ([Forge neutrality](#forge-neutrality)). This
+refusal is intentional: a guess can send the name of a GitLab group to GitHub. The sandbox client
+prevents the refusal for a GitHub repository that the install registered by URL: it sends the
+bare name as the URL of the registration. Thus a cron, a skill invocation or a `--repo` that names
+such a repository does not change when an administrator adds GitLab. Use `https://<host>/<path>`
+or `<host>/<path>` for a repository on another forge. Also use it for a GitHub repository in
+these cases:
+
+- The install did not register the repository.
+- An administrator registered the repository without a URL.
+- A repository on another forge has the same path.
+
+A missing Secret, or one without a `token` key, does not stop the broker: the projection is
+optional, so GitHub and chat keep working, and each call to that forge answers
+`FORGE_CREDENTIAL_UNAVAILABLE` naming the host until the Secret exists. The operator does not
+read the Secret to report it in the status, so that answer is where an administrator sees it.
 
 Validation dispatches on each repository's forge. Its provider parses the repository with its
 host kept, refuses a host that is neither the forge's declared one nor one of its own, and asserts
 its own namespace grammar and path depth; the admission webhook, the reconciler's status and the
 operator's warning all ask the same question through one call, and every refusal names the list
-entry at fault. GitHub is the only provider registered, so a GitLab URL is refused at admission —
-by GitHub's host check, which accepting GitLab relaxes under dispatch rather than removes.
+entry at fault. A GitLab URL on a `github` forge is refused by GitHub's host check, and a GitHub
+URL on a `gitlab` forge by GitLab's. GitLab is also self-managed: its forge may declare a host
+of its operator's choosing, never one another provider serves, and a repository on that forge
+must name that host or none. The declared host never replaces one the repository names, so
+`https://gitlab.com/g/p` on a forge at `gitlab.example.com` is refused rather than moved onto
+the other server.
 
 The operator writes each repository into the state ConfigMap as a `ManagedRepoEntry` whose `type`
 is its forge's provider, which is how the discriminator reaches the agent: written down by the
@@ -2041,6 +2111,10 @@ GitHub App inputs as `github_app_id`, `enable_github_minter` and `github_minter_
 chart spells the same settings `githubMinter.appId`, `githubMinter.enabled` and
 `githubMinter.kms.*`. All of them are provider-conditional: an install that declares no GitHub
 forge provisions no KMS key and no minter.
+A provider whose credential is a token an administrator holds takes it as
+a Secret in the agent's namespace: the installer reads the token from a no-echo prompt or a file
+and pipes it into that Secret, and the Terraform composition, the chart values and the CR carry
+only the Secret's name, so the token is never in Terraform state, a values file or `install.env`.
 
 **What the surface does not carry is a switch for the abstraction itself.** An
 install declares _which_ forge it uses, never _whether_ the abstraction is in
@@ -2260,6 +2334,12 @@ starts with its own host, and the spelling is what someone writes who means the
 whole host, which is `[]`. Whitespace anywhere is refused rather than stripped. A GitHub entry refuses `allowedPaths` outright: the App
 installation's repository selection is what scopes that token, and the same key
 accepted there and ignored would read as narrowing it.
+The operator derives the list rather than asking for it: the forge's declared
+`namespace` and the group of every repository accepted on the forge ([The
+declarative surface](#6-the-declarative-surface)). A forge with neither has
+nothing to serve, and the operator hands the broker no entry for it rather than
+`[]` — so the whole host is only ever a choice made in a hand-written
+configuration, never something a CR implies.
 
 Prefix matching is on **path segments, not string prefix**. `acme/infra-secret`
 starts with the string `acme/infra` and is a different project.
@@ -2340,6 +2420,11 @@ Four endpoints need naming because they are not a rename of GitHub's:
   raw diff as too large or too slow, which would fetch the same diff again; and
   it stops, saying so, once the assembled diff passes the broker's default
   response ceiling, since each page being under it does not bound ten of them.
+  On GitLab 16.11, `/diffs` answers 500 to a request that sets `per_page`. When
+  the first page answers 5xx, the fallback asks once more without `per_page`.
+  GitLab then chooses the page size, so the fallback stops at an empty page, a
+  page shorter than the first, or a page that repeats the previous one, and it
+  reads no more pages than before.
 - **Proposal creation** posts `source_branch`, `target_branch`, `title`,
   `description` to `/merge_requests`. The `draft` field is accepted and ignored
   on creation; a `Draft:` title prefix is what GitLab reads, so a draft proposal
@@ -2358,6 +2443,76 @@ Four endpoints need naming because they are not a rename of GitHub's:
 
 All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
+
+### A self-managed instance behind a private CA
+
+A self-managed instance often has a TLS certificate that a private CA signed.
+The broker's two clients do not trust that CA by default:
+
+- The client for the forge API uses Python's default trust store, which is the
+  image's system bundle.
+- git in the broker is built on GnuTLS. It ignores `SSL_CERT_FILE`, so a process
+  variable cannot give it the CA.
+
+The forge declaration therefore names the CA: `caBundleRef`, a Secret key in the
+agent's namespace. A CA certificate is public, but its integrity matters: whoever
+can change it chooses which servers the broker presents the forge's token to,
+and the broker relaxes strict X.509 for that host. In a Secret, changing the CA
+needs the same rights as changing the token Secret beside it. A ConfigMap would
+make the token's trust boundary the wider of the two, because many clusters
+grant ConfigMap write more widely than Secret write. The agent's own
+ServiceAccounts can only read ConfigMaps, so this is about people and
+automation, not the agent. The operator mounts the key into the broker's pod
+only, as it mounts the token, and the
+forge's entry in the broker configuration names the file (`caFile`). The
+agent's pod and the shell sandbox get nothing.
+
+A private CA must never vouch for github.com or gitlab.com, so a forge at the
+provider's public host (gitlab.com, or an empty host) refuses `caBundleRef`.
+For the other forges, the broker trusts the CA for that forge's host and for no
+other host:
+
+- The API client builds one TLS context for the forge: the system bundle plus the
+  CA file. Other forges keep the default context.
+- git gets `http.https://<host>/.sslCAInfo=<caFile>` in the configuration layer
+  that the broker forces on every git it runs. git matches the key's URL against
+  the remote's URL, so the CA applies to that host only. The pin is in the forced
+  layer, not in the credential's configuration, because a context repository on
+  such a forge is cloned with no credential and still needs the CA. With the
+  broker image's git (libcurl with GnuTLS), the file is trusted beside the
+  system bundle, as the API client's context is, not in place of it.
+- git also gets `http.https://<host>/.followRedirects=false`. curl keeps the CA
+  file across a redirect, so a redirect would carry the CA to another host.
+  GitLab answers a moved project in the git protocol itself, and its clone URLs
+  end in `.git`, so its git traffic needs no redirect.
+
+Python 3.13 turns on strict X.509 checks in its default context. These checks
+refuse a CA certificate with no Key Usage extension, and a server certificate
+with no Authority Key Identifier. Many private CAs issue such certificates. The
+context for a forge that names its own CA turns the strict checks off, and logs
+this once. The chain and the hostname are still verified, and every other host
+keeps the strict checks. The administrator chose to trust this CA for this host,
+and a refusal of a common CA profile would only make the feature fail.
+
+The mount is optional, as the token's is: a missing Secret does not stop the
+broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, from both
+clients, and the detail names what to create: "the Secret <name> or its key
+<key> is missing". A wrong key looks the same as a missing Secret, so the
+detail names both. The forge's broker entry carries the two names for this.
+
+A Secret key that holds no usable PEM certificate gets its own answer from
+both clients: the CA file could not be loaded (not PEM, or no certificate in
+it). git words a missing CA file and a malformed one alike, so the broker tells
+the two apart by whether the forge's file exists. A file with no certificate
+in it at all loads as an empty CA list in git, and git then reports an
+untrusted chain.
+
+The broker reads the file on each call, so an update of the Secret reaches
+the broker with no restart.
+
+Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
+CA bundle, so it refuses the field: a CA that nothing reads would hide a
+certificate problem from the administrator who set it.
 
 ### GitLab in the content workspace
 
@@ -2407,22 +2562,29 @@ whose fields it validated and refused — is not. Two specifics:
   answers 404, so this does not prove the thing does not exist" — which is the
   clearest evidence that keeping the table forge-neutral was worth it: GitLab
   needs two overrides, for 401 and 400, and not this one.
+- **A certificate that does not verify is not a forge error.** Both clients
+  answer it with `FORGE_TLS_UNTRUSTED` (502), which names the host and the
+  verifier's reason. The shared fallback, `FORGE_CALL_FAILED`, says that one
+  retry is reasonable, and no retry fixes a certificate. The text names the
+  cause, because each one needs a different action: a chain that does not reach
+  a trusted CA (`caBundleRef` for a self-managed forge; for a public host, a
+  TLS-inspecting proxy), an expired or not yet valid certificate (renew it), a
+  certificate for another name (fix the certificate or the host), a CA bundle
+  that is not mounted (create the Secret), and a CA bundle that is not PEM
+  or holds no certificate (correct the Secret). One code serves all five,
+  because the caller does the same in each case: it stops and reports. Lines
+  that git prints from the server (`remote: ...`) are never read as a verdict.
 
 ### What GitLab does not include
 
 Deliberately, and each of these should be a named refusal rather than a
 surprise:
 
-- **Self-managed instances behind a private CA.** The token and the API are the
-  same; what differs is trust of the TLS chain. `HttpTransport` uses the
-  container's CA bundle and nothing mounts a custom one, so a self-signed
-  instance fails to connect — and that failure is the design behaving as
-  specified rather than a gap. Any instance this is exercised against has to
-  carry a certificate the sandbox image already trusts, or have TLS terminated
-  by something that does. The refusal names itself — "the forge's TLS
-  certificate failed verification by this image", followed by the verifier's
-  own reason, such as an unknown issuer, a hostname mismatch or an expired
-  certificate — rather than reading as a call to retry.
+- **A private CA for gitlab.com.** gitlab.com presents a certificate that the
+  public CAs sign, and a private CA must never vouch for it, so its forge
+  refuses `caBundleRef`. A self-managed instance behind a private CA is
+  supported: see
+  [A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca).
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.
@@ -2683,7 +2845,7 @@ been added to it, so until they are, an install approaching its token quota is
 visible in the broker's logs and, by status code alone, as `429`s under
 `endpoint="/v1/vcs"` in `kubeagents_credential_proxy_requests_total`, the route
 family every forge verb travels (`/v1/forge` reaches only the credential
-refresh, which spends no quota). The refusal is also thinner than it could
+refresh, which spends no quota). The per-verb `kubeagents_vcs_requests_total{verb,status}` names the failing verb, not the cause: a `429` lands as `status="error"` under its verb. The refusal is also thinner than it could
 be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
 telling it when, and the `Retry-After` and `RateLimit-*` values both forges
 return are read to classify the failure and then dropped rather than carried

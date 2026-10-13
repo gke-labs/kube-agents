@@ -835,8 +835,8 @@ def ensure_stockout_plugin_installed(
         budget_deadline,
     )
     # Pre-test cleanup: clear any stale kanban tasks from previous runs so concurrency slots
-    # (max_in_progress = 2) are not starved. Non-fatal so a board race or alert arrival during
-    # fixture setup does not error the entire test session.
+    # (the board's max_in_progress) are not starved. Non-fatal so a board race or alert
+    # arrival during fixture setup does not error the entire test session.
     _clean_stale_kanban_tasks(
         pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
     )

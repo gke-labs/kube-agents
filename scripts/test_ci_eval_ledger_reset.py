@@ -45,13 +45,14 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The ten ledger-writing cases and the audit id each grades under; a case
+# The eleven ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
     "compliance-rbac-overgrant": "compliance-audit",
     "consistency-drift-outlier": "fleet-consistency-drift",
     "consistency-no-environment-label": "fleet-consistency-drift",
+    "fleet-audit-unchanged-finding-keeps-wording": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
     "obtainability-planted-pdb": "obtainability-audit",
     "obtainability-planted-orphan-service": "obtainability-audit",
@@ -627,9 +628,12 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(wait, unit.index('lock_acquire "${STATE_DIR}/lock-infra"'))
         # A failed acquisition gives back the streams already held.
         self.assertIn('release_streams "${held}"', unit)
-        # Released on the infra-lock, mint-failure and repository-reset paths
-        # as well as after the run.
-        self.assertEqual(unit.count('release_streams "${streams}"'), 4)
+        # Released on the infra-lock path and after the run here, and on the
+        # mint-failure and repository-reset paths through skip_unit, which
+        # both hand it the streams.
+        self.assertEqual(unit.count('release_streams "${streams}"'), 2)
+        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 2)
+        self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
         infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
@@ -654,7 +658,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertIn("lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))", unit[stack_term:task_lock])
 
     def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
-        # Against the real task files: the two consistency cases share
+        # Against the real task files: the three consistency cases share
         # fleet-consistency-drift, the two patch cases share
         # security-patch-orchestrator, every other stream has one case, and a
         # case that writes no ledger (or an empty id) keeps the single-unit
@@ -674,7 +678,7 @@ class CallSiteTest(unittest.TestCase):
         )
         result = run_bash(body)
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(got, {"drift": "2", "compliance": "1", "patch": "2", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(got, {"drift": "3", "compliance": "1", "patch": "2", "none": "1", "unknown": "1"}, result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_a_stream_deadline_covers_its_stack_bearing_cases_infra_queue(self):

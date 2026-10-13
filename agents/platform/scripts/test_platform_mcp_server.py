@@ -686,7 +686,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -711,7 +711,7 @@ class TestSendNotification(unittest.TestCase):
         # Verify hermes was called with explicit threaded path target
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "slack:space123:thread123", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -733,7 +733,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -754,7 +754,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to slack", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "slack:C12345", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -774,7 +774,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -796,11 +796,11 @@ class TestSendNotification(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 2)
         mock_run.assert_any_call(
             ["hermes", "send", "--to", "slack:C12345", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
         mock_run.assert_any_call(
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
 
 
@@ -1226,6 +1226,13 @@ class TestFindingsQueueTools(unittest.TestCase):
             ],
         )
 
+    def test_marking_surfaced_never_claims_to_be_a_paced_publisher(self):
+        # Only a paced publisher may mark a finding shown; a model naming one in
+        # answer to a pull must not spend a day's budget or stop additions.
+        platform_mcp_server.mark_finding_surfaced("f-1", "spaces/AAA", "spaces/AAA/threads/T")
+        _, _, body = self.captured[-1]
+        self.assertEqual(body, {"chat_id": "spaces/AAA", "thread_id": "spaces/AAA/threads/T"})
+
     def test_update_sends_only_the_fields_the_caller_set(self):
         platform_mcp_server.update_finding("f-1", pr_state="merged")
         self.assertEqual(self.captured[-1][2], {"pr_state": "merged"})
@@ -1460,6 +1467,70 @@ class TestClusterAgentRoster(unittest.TestCase):
 
     def test_list_is_empty_without_a_profiles_tree(self):
         self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))
+
+
+
+class FleetScopeToolTest(unittest.TestCase):
+    """fleet_scope: the declared scope's resolved projects and the collector
+    arguments, read from the snapshot at the data volume's root; `declared:
+    false` with no scope or no snapshot."""
+
+    SNAPSHOT = {
+        "resolvedAt": "2026-10-09T12:00:00Z",
+        "declared": {"projects": ["payments-prod", "payments-staging"], "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {}},
+        "projects": [
+            {"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-prod", "via": ["explicit"], "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-staging", "via": ["explicit"], "outcome": "denied", "state": "in-scope"},
+        ],
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _call(self, snapshot):
+        # None is "no snapshot": remove what an earlier call in the test wrote.
+        if snapshot is not None:
+            (Path(self.tmp.name) / "fleet_scope.json").write_text(json.dumps(snapshot), encoding="utf-8")
+        else:
+            (Path(self.tmp.name) / "fleet_scope.json").unlink(missing_ok=True)
+        # The worker's HERMES_HOME is the profile home; the snapshot is at the root.
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name, "HERMES_HOME": str(Path(self.tmp.name) / "profiles" / "platform")}):
+            # No render from the shell running the tests: the tool would answer from it.
+            os.environ.pop("KUBEAGENTS_SCOPE_FILE", None)
+            return json.loads(platform_mcp_server.fleet_scope())
+
+    def test_the_render_reaches_the_tool_through_the_env_block(self):
+        # Hermes hands this stdio child only the keys config.yaml's env block
+        # names; without this line the render fallback never runs in the agent
+        # pod and a fresh install's first audits list every visible project.
+        config = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(encoding="utf-8")
+        self.assertRegex(config, r'(?m)^\s+KUBEAGENTS_SCOPE_FILE: "\$\{KUBEAGENTS_SCOPE_FILE\}"\s*$', "platform_control's env block must forward KUBEAGENTS_SCOPE_FILE for fleet_scope's render fallback")
+        for name in platform_mcp_server.fleet_scope_targets.MANAGEMENT_PROJECT_ENVS[:1]:
+            self.assertRegex(config, rf'(?m)^\s+{name}: "\$\{{{name}\}}"\s*$')
+
+    def test_an_unreadable_render_is_an_error_answer_not_no_scope(self):
+        # The SOPs' declared: false branch lists every visible project; an
+        # install whose render the tool cannot read must not be sent there.
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name, "KUBEAGENTS_SCOPE_FILE": str(Path(self.tmp.name) / "absent-render.json")}):
+            answer = platform_mcp_server.fleet_scope()
+        self.assertTrue(answer.startswith("ERROR:"), answer)
+        self.assertIn("do not enumerate projects", answer)
+
+    def test_a_declared_scope_is_reported_with_the_collector_arguments(self):
+        out = self._call(self.SNAPSHOT)
+        self.assertTrue(out["declared"])
+        self.assertEqual(out["projects"], ["ops-mgmt", "payments-prod"])
+        self.assertEqual(out["unread"], [{"project": "payments-staging", "outcome": "denied"}])
+        self.assertEqual(out["collector_args"], "--scope-projects ops-mgmt,payments-prod --scope-unread payments-staging=denied")
+        self.assertEqual(out["resolved_at"], "2026-10-09T12:00:00Z")
+
+    def test_no_declared_scope_and_no_snapshot_both_report_undeclared(self):
+        undeclared = dict(self.SNAPSHOT, declared={k: [] for k in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")})
+        self.assertFalse(self._call(undeclared)["declared"])
+        self.assertEqual(self._call(undeclared)["collector_args"], "")
+        self.assertFalse(self._call(None)["declared"])
 
 
 if __name__ == '__main__':

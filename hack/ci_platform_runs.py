@@ -51,8 +51,9 @@ STAGE_AUDITS = "FIRST_RUN_AUDITS"
 PAUSED_STATE = "paused"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 IN_FLIGHT = ("claimed", "running")
-# Several times the longest audit run (9-15 minutes, #985), so a live run always counts.
-STALE_SECONDS = 60 * 60
+# The stage's RUN_LIMIT_SECONDS (agents/chat/scripts/oobe.py): a run the chain still waits on is
+# one a unit waits on too. Single audit runs on CI have reached 2739 s.
+STALE_SECONDS = 2 * 60 * 60
 UNREADABLE = "unreadable"
 
 

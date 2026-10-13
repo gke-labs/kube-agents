@@ -397,20 +397,23 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # word away -- `instances create`, `delete`, `reset`, `add-metadata` --
         # stay refused, including the `instances reset` the stream emits as a
         # *proposed* remediation, and the tests assert it.
-        # `instances describe` is the SOP's 2.3 read (ops-agent-guest-health)
-        # and the object-scoped counterpart of the `disks describe` and
-        # `forwarding-rules describe` already in this set. Refusing it while
-        # the project-wide `instances list` beside it returns the same fields
-        # for every instance at once forces the broader read, not the narrower
+        # `instances describe` is the object-scoped counterpart of the
+        # `disks describe` and `forwarding-rules describe` already in this set,
+        # and the read behind the judgment SOP 2.1 hands back: a candidate
+        # tagged `needs_triage: gke-managed-node` asks whether one instance is
+        # a Google-managed node or an operator-owned VM, a question about that
+        # instance's metadata keys and labels. Refusing it while the
+        # project-wide `instances list` beside it returns the same fields for
+        # every instance at once forces the broader read, not the narrower
         # one. Pure read; the mutations one word away stay refused and the
         # tests assert it.
         ("compute", "instances", "describe"),
         ("compute", "instances", "get-serial-port-output"),
         ("compute", "instances", "list"),
-        # The same SOP's other reads. 2.2 (mig-autoscaler-flapping) spells
-        # `instance-groups managed describe $MIG`, whose `currentActions`
-        # counters are the whole condition; `list` is how the MIG names get
-        # bound in the first place. 2.4 (sole-tenant-headroom) spells
+        # The same SOP's other reads. 2.2 (mig-convergence-stalled) reads
+        # `instance-groups managed list`, whose `currentActions` counters are
+        # the whole condition; `describe` is the one-group read behind its
+        # `needs_triage: gke-managed-mig` judgment. 2.4 (sole-tenant-headroom) spells
         # `sole-tenancy node-groups list`, and `list-nodes` is the only surface
         # carrying the per-node `totalResources`/`consumedResources` a headroom
         # ratio needs. Reads, all four; the resizes and deletes one word away
@@ -432,7 +435,8 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # alongside every leaf read that needs one; `networks describe` and
         # `routers describe` are the detail reads behind the two lists.
         # `compute project-info describe` is the stockout SOP's quota
-        # remediation read. The writes one word away (networks create,
+        # remediation read and the GCE compute collector's §2.1 read of the
+        # project's common metadata. The writes one word away (networks create,
         # routers create, firewall-rules create, security-policies create,
         # project-info add-metadata) stay refused, and the tests assert it.
         ("compute", "networks", "describe"),
@@ -556,6 +560,11 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # other advice entries, but with none of its flags listed here every
         # spelling the skill emits was refused -- the --max-run-duration trap
         # again. --machine-type and --region were already present above.
+        # The networking collector reads `routers get-nat-mapping-info` once
+        # per gateway, scoped with --nat-name: unscoped, the read returns every
+        # VM behind every gateway on the router. The verb was allowlisted, but
+        # without this entry the only spelling the collector emits was refused.
+        "--nat-name",
         "--tpu-version", "--chip-count", "--workload-type", "--vm-count",
         "--local-ssd", "--duration-range", "--start-time-range",
         "--end-time-range", "--location-policy",

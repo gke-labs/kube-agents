@@ -70,7 +70,7 @@ for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 """
 
 
-FUNCTIONS = ("_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION)
+FUNCTIONS = ("_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION, "collect_a2a_component_logs")
 
 
 def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = None) -> str:
@@ -79,6 +79,12 @@ def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = Non
     constants = re.findall(r"^readonly AGENT_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
     if len(constants) != 13:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"expected thirteen AGENT_DIAG_ constants in {ENV_SCRIPT}, found {constants}")
+    # The A2A component logs the collector ends with; their own suite is
+    # tests/test_ci_a2a_component_logs.py.
+    a2a_constants = re.findall(r"^readonly A2A_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
+    if len(a2a_constants) != 7:  # pragma: no cover
+        raise AssertionError(f"expected seven A2A_DIAG_ constants in {ENV_SCRIPT}, found {a2a_constants}")
+    constants += a2a_constants
     if restart_seconds is not None:
         constants = [re.sub(r"(WATCH_RESTART_SECONDS=).*", rf"\g<1>{restart_seconds}", c) for c in constants]
     if healthy_seconds is not None:

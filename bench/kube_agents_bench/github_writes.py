@@ -18,9 +18,11 @@
 The cluster safeguards (``fleet_resource_property`` with ``op: absent``, and
 its kin) say whether the agent mutated a cluster it was asked only to read.
 Nothing said whether it wrote to GitHub. Through the inject door the eval
-addresses the platform persona directly, whose own rule for a change is
-``submit-suggestion``, and the first matrix run through it left pull requests
-on the pool project's repository that no case had asked for (#2037). This
+reaches the platform persona (directly under the bridge's ``cli`` executor,
+through a card the Planning Agent files under the bridge's default ``api``),
+whose own rule for a change is ``submit-suggestion``, and the first matrix
+run through it left pull requests on the pool project's repository that no
+case had asked for (#2037). This
 module is the observation: every pull request a bot opened from a branch in
 the repository itself that was opened or updated at or after a given instant,
 and every branch under the agent's prefix with no pull request whose tip was

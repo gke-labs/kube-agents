@@ -65,6 +65,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import sandbox_exec
+import chat_notify
 from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     HERMES_BIN,
@@ -79,6 +80,9 @@ from cluster_agent_profile import (
 )
 
 DESCRIBE_TIMEOUT_SECONDS = 30
+# The reconcile notice's kill timeout for `hermes send`; a routed send gets
+# at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+NOTIFY_SEND_TIMEOUT_SECONDS = 30
 _MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
 EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") if c}
 
@@ -88,6 +92,16 @@ EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") i
 SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
 # The rendered file says whether the CR carries a scope block at all (see _load_scope).
 SCOPE_PRESENT_KEY = "present"
+# Whether a declaration is in force this run: the block was read, or the render
+# could not be read and the last run that could had one. An install that never
+# declared a scope carries nothing on an unreadable tick, and a readable render
+# with no block clears it. The audits' reader keys on this one bit.
+SCOPE_BOUNDARY_KEY = "boundary"
+# The explicit projects an exclude entry dropped this run, by id or by the number
+# a Metrics Scope named them by. The audits' reader skips them rather than
+# carrying them as unresolved: the reconcile is the one place the by-number
+# match can be made, so the reader does not re-implement it.
+SCOPE_EXCLUDED_KEY = "excludedProjects"
 # The resolved membership, rewritten by every run but --dry-run beside the profiles (design §5). The
 # previous run's copy is an input: a project in the resolved set last time and absent now
 # is marked `retiring`, and only a project the previous copy marked `retiring` is pruned,
@@ -160,14 +174,16 @@ _api_disabled_this_run: set[str] = set()
 # with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
 # hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
 # settle time after it. Creates still run in the fixed order.
-# Every lookup is a gcloud process the credential proxy runs, and the proxy admits four
-# requests at once under its child memory budget at the operator's default limit
+# Every lookup is a gcloud process the credential proxy runs. The pool was sized to the
+# four requests the proxy admitted under its child memory budget at the old 1Gi default
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's
 # children budget, 704 MiB of the 1 GiB limit after BROKER_RESIDENT_RESERVE_BYTES and
 # CONTENT_WORKSPACE_RESERVE_BYTES, over one request's cost, 176 MiB
 # (REQUEST_CHILD_MEMORY_RESERVE_BYTES plus OUTPUT_COPIES_PER_COMMAND of the 8 MiB output
-# cap). A wider pool only queues the rest at the proxy, where a lookup still waiting at its
-# 60s admission bound is refused busy and reads unlisted for the tick.
+# cap). At the 2Gi default the proxy's slot cap of eight binds, and it is shared: while
+# this pool lists, kanban workers' commands have four slots, and none if stall_watch.py's
+# four-wide pool is listing at the same time. Past the admitted count a lookup queues at the proxy, and one
+# still waiting at its 60s admission bound is refused busy and reads unlisted for the tick.
 LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
@@ -502,6 +518,19 @@ def _normalize_scope(parsed: dict) -> dict:
     return scope
 
 
+def _previous_boundary(previous: dict | None) -> bool:
+    """Whether the last run had a declaration in force: its `boundary` key, else
+    (a snapshot from a reconcile that shipped before the key) whether its
+    declaration named anything. An install that never declared a scope reads
+    False on both forms, so an unreadable tick carries nothing for it."""
+    if not isinstance(previous, dict):
+        return False
+    if isinstance(previous.get(SCOPE_BOUNDARY_KEY), bool):
+        return previous[SCOPE_BOUNDARY_KEY]
+    last = _previous_declaration(previous)
+    return bool(last) and any(last.get(kind) for kind in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes"))
+
+
 def _previous_declaration(previous: dict | None) -> dict | None:
     """The declaration the last run read, from the snapshot's `declared`, or None.
 
@@ -834,10 +863,11 @@ def _resolve_projects(management: str | None, scope: dict,
                       searches: dict[str, tuple[dict | None, str]] | None = None,
                       previous: dict | None = None,
                       selections: dict[str, tuple[dict | None, str]] | None = None,
-                      cap: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+                      cap: int | None = None) -> tuple[list[dict], list[dict], list[dict], list[str]]:
     """Turn the declaration into the ordered resolved set (design §3).
 
-    Returns (entries, ignored_excludes, containers). Each entry is {id, via, outcome},
+    Returns (entries, ignored_excludes, containers, dropped_excludes), the last the
+    explicit projects an exclude entry dropped, by id or by number. Each entry is {id, via, outcome},
     where outcome is None for a project still to be listed, `ok` for a container member
     whose clusters Asset Inventory already named (kept under `clusters`), a container's or
     selector's own outcome for a member carried forward under the freeze rule, the naming
@@ -884,6 +914,7 @@ def _resolve_projects(management: str | None, scope: dict,
         return sum(1 for e in entries if e["outcome"] != OUTCOME_OVER_CAP and not e.get("uncounted"))
 
     ignored: list[dict] = []
+    dropped: list[str] = []
     seen: set[str] = set()
     if management:
         # By ID, or by the number a Metrics Scope named it by: an entry an operator wrote to
@@ -910,6 +941,7 @@ def _resolve_projects(management: str | None, scope: dict,
             continue
         seen.add(project)
         if excluded(project, number_of(project)):
+            dropped.append(project)
             continue
         outcome = OUTCOME_OVER_CAP if listed_count() >= cap else None
         if outcome:
@@ -1078,7 +1110,7 @@ def _resolve_projects(management: str | None, scope: dict,
     for entry in entries:
         entry.pop("frozen", None)
         entry.pop("uncounted", None)
-    return entries, ignored, containers
+    return entries, ignored, containers, sorted(dropped)
 
 
 def _snapshot_path() -> Path:
@@ -1409,6 +1441,10 @@ def reconcile(dry_run: bool = False) -> dict:
     # such tick reads the same exclusions, and a project it named stays carried in scope
     # rather than retiring: removing the whole block retires nothing.
     declared = scope
+    # A previous snapshot from before the keys is read by its lists: a declaration
+    # with any project, folder, organisation or selector named was a boundary.
+    previous_boundary = _previous_boundary(previous)
+    scope_boundary = scope_present or (not scope_readable and previous_boundary)
     if not scope_present:
         last = _previous_declaration(previous)
         if last:
@@ -1469,7 +1505,11 @@ def reconcile(dry_run: bool = False) -> dict:
         # a day as an index lag rather than retired as the declaration asks.
         return numbers_named.get(project) or _previous_number(previous, project)
 
-    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections, cap)
+    entries, ignored_excludes, containers, dropped_excludes = _resolve_projects(management or carried_management, scope, searches, previous, selections, cap)
+    if not scope_present and isinstance(previous, dict):
+        # A carried tick resolves no explicit project, so it drops none; the
+        # last readable tick's list stands with the declaration it carried.
+        dropped_excludes = [p for p in (previous.get(SCOPE_EXCLUDED_KEY) or []) if isinstance(p, str)]
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
         for entry in entries:
@@ -1956,6 +1996,15 @@ def reconcile(dry_run: bool = False) -> dict:
         _write_snapshot({
             "resolvedAt": datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FORMAT),
             "declared": declared,
+            # `boundary` is the reconcile's answer to whether a declaration is in
+            # force, and what the audits' fleet_scope tool keys on. `present` is
+            # whether the CR carried a spec.scope block this run: a present block
+            # with empty lists is the host-only boundary (the operator's own
+            # definition of an empty present block), which a reader cannot tell
+            # from an absent one by `declared` alone, and a carried tick (present
+            # false, boundary true) is one whose containers were not resolved.
+            SCOPE_PRESENT_KEY: scope_present,
+            SCOPE_BOUNDARY_KEY: scope_boundary,
             SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
             "containers": sorted(containers, key=lambda c: c["id"]),
@@ -1972,6 +2021,7 @@ def reconcile(dry_run: bool = False) -> dict:
             "projects": snapshot_projects,
             "unmanaged": sorted(unmanaged, key=lambda u: u["profile"]),
             "ignoredExcludes": ignored_excludes,
+            SCOPE_EXCLUDED_KEY: dropped_excludes,
             NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named,
                                        scope_readable and scope_present and selectors_known, exclude_patterns),
         })
@@ -2049,9 +2099,16 @@ def _notify(message: str) -> None:
     for platform in enabled_chat_platforms():
         try:
             subprocess.run(
-                [HERMES_BIN, "send", "--to", platform, message],
-                capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+                chat_notify.command(platform, message, json_output=False, hermes_bin=HERMES_BIN),
+                capture_output=True, text=True, check=True, env=_run_env(),
+                timeout=chat_notify.subprocess_timeout(platform, NOTIFY_SEND_TIMEOUT_SECONDS),
+                stdin=subprocess.DEVNULL,
             )
+        except subprocess.CalledProcessError as e:
+            if chat_notify.outcome_unknown(e.returncode):
+                log(f"Reconcile notification to {platform} got no answer in time; it may have posted")
+                continue
+            log(f"Failed to post reconcile notification to {platform}: {e}")
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
             log(f"Failed to post reconcile notification to {platform}: {e}")
 

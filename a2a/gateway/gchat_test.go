@@ -28,7 +28,8 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 		want                  string
 		wantSpace, wantThread string
 	}{
-		{"dm binds the space", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
+		{"top-level dm binds the space", "spaces/AAA", "", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
+		{"dm side thread binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"threaded space binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "group", "gchat:spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"unthreaded space binds the space", "spaces/CCC", "", "group", "gchat:space/spaces/CCC", "spaces/CCC", ""},
 	}
@@ -43,7 +44,8 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 			t.Errorf("%s: gchatSpaceThread(%q) = %q,%q,%v want %q,%q,true", c.name, got, space, thread, ok, c.wantSpace, c.wantThread)
 		}
 	}
-	for _, bad := range []string{"discord:1/2", "slack:C1/1.0", "gchat:", "gchat:dm/", "gchat:space/", "gchat:threads/BBB", "gchat:spaces/AAA", "gchat:spaces/AAA/messages/M"} {
+	for _, bad := range []string{"discord:1/2", "slack:C1/1.0", "gchat:", "gchat:dm/", "gchat:space/", "gchat:threads/BBB", "gchat:spaces/AAA", "gchat:spaces/AAA/messages/M",
+		"gchat:dm/spaces/AAA/threads/", "gchat:dm/spaces/AAA/threads/B/C", "gchat:dm/spaces/AAA/messages/M", "gchat:dm/threads/BBB", "gchat:space/spaces/AAA/threads/BBB"} {
 		if _, _, ok := gchatSpaceThread(bad); ok {
 			t.Errorf("gchatSpaceThread(%q) parsed; must refuse", bad)
 		}
@@ -103,6 +105,16 @@ func TestGchatInboundNormalization(t *testing.T) {
 	}{
 		{"dm delivers on the space", gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "spaces/D1/threads/T1", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN"),
 			true, "gchat:dm/spaces/D1", "dm", "hi"},
+		{"dm thread reply binds its thread", func() *gchatEvent {
+			ev := gchatMsg("spaces/D3", "DIRECT_MESSAGE", "THREADED_MESSAGES", "spaces/D3/threads/T3", "spaces/D3/messages/M11", "and the pods?", "", "u1@example.com", "HUMAN")
+			ev.Message.ThreadReply = true
+			return ev
+		}(), true, "gchat:dm/spaces/D3/threads/T3", "dm", "and the pods?"},
+		{"thread reply in a threaded space binds the thread as before", func() *gchatEvent {
+			ev := gchatMsg("spaces/S4", "SPACE", "THREADED_MESSAGES", "spaces/S4/threads/T4", "spaces/S4/messages/M12", "@Kage more", " more", "u2@example.com", "HUMAN")
+			ev.Message.ThreadReply = true
+			return ev
+		}(), true, "gchat:spaces/S4/threads/T4", "group", "more"},
 		{"legacy DM type field delivers", func() *gchatEvent {
 			ev := gchatMsg("spaces/D2", "", "", "", "spaces/D2/messages/M2", "hi", "", "u1@example.com", "HUMAN")
 			ev.Space.Type = "DM"
@@ -335,6 +347,15 @@ func TestGchatPostThreadsAndTranslates(t *testing.T) {
 	}
 	if _, hasOpt := dm.arguments["messageReplyOption"]; hasOpt {
 		t.Error("DM posts must not set messageReplyOption")
+	}
+
+	if _, err := a.Post("gchat:dm/spaces/D1/threads/T2", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	side := f.call(2)
+	if side.arguments["parent"] != "spaces/D1" || side.arguments["body"].(map[string]any)["thread"].(map[string]any)["name"] != "spaces/D1/threads/T2" ||
+		side.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("a DM side-thread post must reply in its thread: %+v", side.arguments)
 	}
 
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
@@ -1017,21 +1038,23 @@ func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 // adapter read only the legacy layout and acked every one of these away
 // without a log line — the test exists so that cannot recur.
 func TestGchatRealAddonPayloads(t *testing.T) {
+	const dm = "gchat:dm/spaces/_c2fixtureAA"
 	cases := []struct {
 		file    string
 		text    string
 		msgName string
+		conv    string
 	}{
-		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c"},
+		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c", dm},
 		// In a DM a typed "@app" is plain text to Chat: argumentText equals
 		// text, nothing is stripped and no mention annotation is attached,
 		// so it is delivered verbatim rather than treated as a bare mention.
-		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU"},
-		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA"},
-		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U"},
+		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU", dm},
+		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA", dm},
+		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U", dm},
 		// A reply inside a DM thread: threadReply true, the parent's thread
-		// name. A DM binds the whole space, so it lands in the same session.
-		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0"},
+		// name. It is a side thread, its own conversation.
+		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0", dm + "/threads/jhqZwM-35cA"},
 	}
 	for _, c := range cases {
 		t.Run(c.file, func(t *testing.T) {
@@ -1048,7 +1071,7 @@ func TestGchatRealAddonPayloads(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("dropped: %s", reason)
 			}
-			if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" ||
+			if msg.Conversation != c.conv || msg.Kind != "dm" ||
 				msg.AuthorID != "sender@example.com" || msg.MessageID != c.msgName || msg.Text != c.text {
 				t.Errorf("normalized = %+v", msg)
 			}
@@ -1127,40 +1150,160 @@ func TestGchatRunDeliversBothWireShapes(t *testing.T) {
 	}
 }
 
-// A DM space is threaded, and a reply belongs in the thread the ask was made
-// in — measured live: an answer to a question asked inside a DM thread landed
-// top-level. The session stays the whole space (the key carries no thread);
-// only where the reply renders follows the latest inbound message.
-func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
-	f := newFakeChatRelay(t)
-	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/R1"}
-	a := newTestGchatAdapterWithRelay(t, f)
-
-	// Nothing seen yet: a DM post is top-level.
-	if _, err := a.Post("gchat:dm/spaces/_c2fixtureAA", "hello"); err != nil {
-		t.Fatal(err)
+// gchatFixtureEvent decodes one captured payload from testdata/gchat,
+// optionally rewritten first (a second message in the same thread is the
+// captured reply under a new message name).
+func gchatFixtureEvent(t *testing.T, name string, rewrite func(string) string) *gchatEvent {
+	t.Helper()
+	raw, _ := realGchatFixture(t, name)
+	text := string(raw)
+	if rewrite != nil {
+		text = rewrite(text)
 	}
-	if body := f.call(0).arguments["body"].(map[string]any); body["thread"] != nil {
-		t.Errorf("first post threaded with nothing seen: %+v", body)
-	}
-
-	_, b64 := realGchatFixture(t, "addon-dm-thread-reply.json")
-	ev, err := decodeGchatEvent(b64)
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString([]byte(text)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	msg, reason := a.classify(ev)
-	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" {
-		t.Fatalf("classify: %+v %q", msg, reason)
+	return ev
+}
+
+// A Chat DM matches today's Hermes adapter (main flow versus side thread):
+// top-level messages share the space's one conversation and are answered
+// top-level, even though Chat attaches the thread it auto-created for each;
+// a message typed inside an existing thread (threadReply) is its own
+// conversation, answered in that thread, and later replies there join it.
+// Every event is real captured traffic: the top-level ask whose auto thread
+// is jhqZwM-35cA, and the reply typed in that thread.
+func TestGchatDMSideThreadsMatchToday(t *testing.T) {
+	const (
+		space    = "spaces/_c2fixtureAA"
+		thread   = space + "/threads/jhqZwM-35cA"
+		mainFlow = "gchat:dm/" + space
+		sideKey  = "gchat:dm/" + thread
+	)
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": space + "/messages/R1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	calls := 0
+	postTo := func(conv string) relayCall {
+		t.Helper()
+		if _, err := a.Post(conv, "answer"); err != nil {
+			t.Fatal(err)
+		}
+		calls++
+		return f.call(calls - 1)
 	}
-	if _, err := a.Post(msg.Conversation, "answer"); err != nil {
-		t.Fatal(err)
+	threadOf := func(c relayCall) any {
+		body := c.arguments["body"].(map[string]any)
+		if th, ok := body["thread"].(map[string]any); ok {
+			return th["name"]
+		}
+		return nil
 	}
-	c := f.call(1)
-	body := c.arguments["body"].(map[string]any)
-	thread, _ := body["thread"].(map[string]any)
-	if thread["name"] != "spaces/_c2fixtureAA/threads/jhqZwM-35cA" || c.arguments["messageReplyOption"] != gchatReplyOption {
-		t.Errorf("reply must follow the ask's thread: %+v", c.arguments)
+	classify := func(ev *gchatEvent) InboundMessage {
+		t.Helper()
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			t.Fatalf("dropped: %s", reason)
+		}
+		return msg
+	}
+
+	top := classify(gchatFixtureEvent(t, "addon-dm-mention-with-text.json", nil))
+	if top.Conversation != mainFlow {
+		t.Fatalf("top-level DM = %q, want the space's conversation %q", top.Conversation, mainFlow)
+	}
+	if c := postTo(top.Conversation); threadOf(c) != nil || c.arguments["messageReplyOption"] != nil {
+		t.Errorf("a top-level DM must be answered top-level, not in its auto-created thread: %+v", c.arguments)
+	}
+
+	reply := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	if reply.Conversation != sideKey || reply.Kind != "dm" {
+		t.Fatalf("in-thread DM reply = %+v, want its own conversation %q", reply, sideKey)
+	}
+	if c := postTo(reply.Conversation); threadOf(c) != thread || c.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("a side thread must be answered in its thread: %+v", c.arguments)
+	}
+
+	second := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", func(s string) string {
+		return strings.ReplaceAll(s, "jhqZwM-35cA.iuosuA3Wo-0", "jhqZwM-35cA.secondRepl0")
+	}))
+	if second.Conversation != sideKey {
+		t.Errorf("a second reply in the same thread = %q, want it to join %q", second.Conversation, sideKey)
+	}
+
+	// Back at the top level after a side thread: the main flow, answered
+	// top-level — nothing about the side thread sticks to the space.
+	again := classify(gchatFixtureEvent(t, "addon-dm-hello.json", nil))
+	if again.Conversation != mainFlow {
+		t.Errorf("top-level DM after a side thread = %q, want %q", again.Conversation, mainFlow)
+	}
+	if c := postTo(again.Conversation); threadOf(c) != nil {
+		t.Errorf("the main flow must stay top-level after a side thread: %+v", c.arguments)
+	}
+}
+
+// The same rule through the gateway: a side thread is a separate session,
+// not a steer of the main flow's running task, and a second reply in the
+// thread steers the side thread's own task.
+func TestGchatDMSideThreadIsItsOwnSession(t *testing.T) {
+	r := startGchatRig(t, nil, true)
+	a := newTestGchatAdapter(t)
+	classify := func(ev *gchatEvent) InboundMessage {
+		t.Helper()
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			t.Fatalf("dropped: %s", reason)
+		}
+		return msg
+	}
+	ctx := context.Background()
+	activeTask := func(conv string) string {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		if rec == nil || rec.ActiveTask == nil {
+			return ""
+		}
+		return rec.ActiveTask.TaskID
+	}
+	// submissions is every message the gateway put on the platform's in
+	// subjects, oldest first: a new task or a steer, told apart by taskId.
+	submissions := func(n int) []*lib.Envelope {
+		t.Helper()
+		var envs []*lib.Envelope
+		waitFor(t, fmt.Sprintf("%d submissions", n), func() bool {
+			envs = envs[:0]
+			for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+				if e.Kind == lib.KindMessage {
+					envs = append(envs, e)
+				}
+			}
+			return len(envs) >= n
+		})
+		return envs
+	}
+
+	top := classify(gchatFixtureEvent(t, "addon-dm-mention-with-text.json", nil))
+	r.adapter.inbox <- top
+	mainTask := submissions(1)[0].TaskID
+	waitFor(t, "main-flow task on the record", func() bool { return activeTask(top.Conversation) == mainTask })
+
+	reply := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	r.adapter.inbox <- reply
+	sideTask := submissions(2)[1].TaskID
+	if sideTask == mainTask {
+		t.Fatalf("the in-thread reply steered the main flow's task %q; a side thread is its own session", mainTask)
+	}
+	waitFor(t, "side-thread task on its own record", func() bool { return activeTask(reply.Conversation) == sideTask })
+
+	second := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", func(s string) string {
+		return strings.ReplaceAll(s, "jhqZwM-35cA.iuosuA3Wo-0", "jhqZwM-35cA.secondRepl0")
+	}))
+	r.adapter.inbox <- second
+	if got := submissions(3)[2].TaskID; got != sideTask {
+		t.Errorf("a second reply in the thread went to task %q, want a steer on the side thread's %q", got, sideTask)
+	}
+	if got := activeTask(top.Conversation); got != mainTask {
+		t.Errorf("main flow's active task = %q, want %q untouched", got, mainTask)
 	}
 }
 

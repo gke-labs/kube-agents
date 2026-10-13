@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - requirements-test always carries mcp
 
 EXPECTED_TOOLS = {
     "verify_gke_cluster",
+    "fleet_scope",
     "list_cluster_profiles",
     "get_cluster_profile_name",
     "list_cc_healthchecks",

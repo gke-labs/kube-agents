@@ -218,16 +218,16 @@ env:
   # state check together (a healthy project takes ~20 s; the ceiling is for
   # a hung API server), and the ceiling for the whole scan. The scan ceiling
   # must cover every wave of the mapped pool at the per-project ceiling plus
-  # the 60 s token mint that precedes it (ceil(35 / 7) = 5 waves of 360 s,
+  # the 60 s token mint that precedes it (ceil(40 / 8) = 5 waves of 360 s,
   # 1800 s, plus a margin; a test pins it against hack/ci-deploy.sh's
   # mapping), or a pool-wide stall kills the step and publishes nothing
   # instead of "not checked" entries.
-  FIXTURE_STATE_WORKERS: "7"
+  FIXTURE_STATE_WORKERS: "8"
   FIXTURE_STATE_PROJECT_TIMEOUT_S: "300"
   FIXTURE_STATE_TIMEOUT_S: "1920"
   # The pool-state scan's knobs (scripts/eval_dashboard/pool_state.py), the
   # same arithmetic without the mint (5 waves of 300 s, plus a margin).
-  POOL_STATE_WORKERS: "7"
+  POOL_STATE_WORKERS: "8"
   POOL_STATE_PROJECT_TIMEOUT_S: "300"
   POOL_STATE_TIMEOUT_S: "1620"
 
@@ -425,7 +425,7 @@ jobs:
           fi
 
       # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
-      # the pull sweep and the two seeded-fleet reconciles): their latest
+      # the pull sweep, the daily seeded-fleet reconcile and its on-merge run): their latest
       # finished build each, for the note health.py carries and the poster
       # sends once when one fails or stops running. Best-effort like the
       # read above: a job that has never run writes nothing, a denied read

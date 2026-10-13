@@ -4,10 +4,10 @@
 Run by ``deploy/docker/Dockerfile`` against the patched ``/opt/hermes`` tree,
 right after ``apply_slack_agent_view.py``.
 Drives the real ``slack_manifest_command`` and the adapter's real
-``_assistant_suggested_prompts``, once with ``KAGE_SLACK_UX`` unset and once
-with it on, and asserts on what they return:
+``_assistant_suggested_prompts`` with ``KAGE_SLACK_UX`` off, unset and on,
+and asserts on what they return:
 
-* flag off: the default manifest is upstream's ``assistant`` experience, and an
+* flag off (``false``): the default manifest is upstream's ``assistant`` experience, and an
   unset ``suggested_prompts`` yields none;
 * flag on: the default and ``--no-assistant`` manifests equal the flag-off ones
   (agent view is one-way in Slack, so only ``--agent-view`` picks it);
@@ -15,6 +15,7 @@ with it on, and asserts on what they return:
   ``agent_session_stopped``, which would offer a Stop nothing handles; and an
   unset ``suggested_prompts`` yields the three kube-agents prompts while a
   configured one still wins;
+* flag unset: the prompts are flag on's, since unset is on;
 * either way: the emitted bot scopes include ``reactions:write``,
   ``users:read`` and ``files:write``, the scopes the Slack UX work spends.
 
@@ -41,6 +42,7 @@ ADAPTER_MODULE = "plugins.platforms.slack.adapter"
 
 REQUIRED_SCOPES = ("reactions:write", "users:read", "files:write")
 FLAG_ON = "true"
+FLAG_OFF = "false"
 APP_NAME = "kube-agents"
 AGENT_DESCRIPTION = f"Chat with {APP_NAME} in Slack Messages."
 STOP_EVENT = "agent_session_stopped"
@@ -98,6 +100,11 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     adapter_cls = _import(root, ADAPTER_MODULE).SlackAdapter
 
     with _flag(None):
+        unset = [row["message"] for row in _prompts(adapter_cls, {})]
+        if unset != list(SUGGESTED_PROMPTS):
+            raise _fail(f"flag unset, which is on, default prompts are {unset}")
+
+    with _flag(FLAG_OFF):
         off = _manifest(manifest_module)
         if "agent_view" in off["features"] or "assistant_view" not in off["features"]:
             raise _fail(f"flag off, default features are {sorted(off['features'])}")

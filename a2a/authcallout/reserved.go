@@ -2,6 +2,7 @@ package authcallout
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -101,11 +102,16 @@ const (
 	reservedStatic    reservedKind = "a static principal"
 	reservedMapUser   reservedKind = "an identity-map user"
 	reservedAddressee reservedKind = "an addressee"
+	// reservedProfile is an AgentProfile's addressee: a session pod's task
+	// subjects are its pod name, so a session-ServiceAccount pod named after
+	// a profile would be minted that profile's events and input. Read from
+	// the served map's profile entries, so it follows a reload.
+	reservedProfile reservedKind = "an AgentProfile's addressee"
 )
 
 // copied completes the refusal: what the pod would have been handed.
 func (k reservedKind) copied() string {
-	if k == reservedAddressee {
+	if k == reservedAddressee || k == reservedProfile {
 		return "its task subjects are that addressee's"
 	}
 	return "its inbox is that principal's"
@@ -150,6 +156,9 @@ func (s *Service) reservedAs(m *IdentityMap, user string) (reservedKind, bool) {
 	}
 	if m.servesUser(user) {
 		return reservedMapUser, true
+	}
+	if slices.Contains(m.Profiles(), user) {
+		return reservedProfile, true
 	}
 	return "", false
 }

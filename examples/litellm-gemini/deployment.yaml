@@ -27,9 +27,11 @@ spec:
     spec:
       containers:
         - name: litellm-container
-          image: ghcr.io/berriai/litellm:v1.100.1
+          image: ghcr.io/berriai/litellm:v1.104.0
           args: ["--config", "/app/config.yaml", "--port", "8080"]
           env:
+            - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
+              value: "true"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:

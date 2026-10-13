@@ -19,7 +19,7 @@ Three expressions carry it, and each fails quietly if it is dropped:
     publish job, and the release goes out at a commit nothing gated.
 
 The cron trigger is decoupled: release-publish.yml is strictly dispatch-only so that quiet
-ticks with nothing to release produce no workflow run at all. The weekly cron ("17 6 * * 5")
+ticks with nothing to release produce no workflow run at all. The daily cron ("17 6 * * *")
 lives on .github/workflows/release-scheduler.yml, which evaluates candidate eligibility
 and dispatches release-publish.yml only when work is required.
 """
@@ -58,13 +58,14 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         self.assertEqual(gate_input["default"], "bypass")
         self.assertEqual(sorted(gate_input["options"]), ["bypass", "dry-run", "evaluate"])
 
-    def test_release_scheduler_cron_is_weekly_rather_than_daily(self):
+    def test_release_scheduler_cron_is_daily_after_the_nightly_promotion(self):
         """The cron is the cadence — there is no rate limiter inside the resolver.
 
         Nothing in resolve_scheduled_release.sh rations releases by elapsed time,
-        which is deliberate: the design chose a weekly cron over a daily attempt
-        capped by weekday arithmetic. The cron on release-scheduler.yml must fire
-        weekly rather than daily, while release-publish.yml has no schedule trigger.
+        which is deliberate: the cron on release-scheduler.yml is the only thing
+        that encodes how often a staging-promoted commit ships. It fires every
+        day, after the nightly staging promotion has had time to push its tag,
+        while release-publish.yml has no schedule trigger.
         """
         self.assertNotIn("schedule", self.triggers, "release-publish.yml must remain dispatch-only")
         scheduler_path = _REPO_ROOT / ".github" / "workflows" / "release-scheduler.yml"
@@ -74,9 +75,11 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         self.assertTrue(schedules, "release-scheduler.yml must declare a schedule")
         for entry in schedules:
             minute, hour, dom, month, dow = entry["cron"].split()
-            self.assertNotEqual(dow, "*", f"'{entry['cron']}' fires daily; the cadence must be weekly")
-            self.assertEqual(dom, "*", f"'{entry['cron']}' pins a day of month rather than a weekday")
-            del minute, hour, month
+            self.assertEqual(dow, "*", f"'{entry['cron']}' pins a weekday; the cadence is daily")
+            self.assertEqual(dom, "*", f"'{entry['cron']}' pins a day of month; the cadence is daily")
+            self.assertEqual(month, "*", f"'{entry['cron']}' pins a month; the cadence is daily")
+            # The exact time is test_release_scheduler_wiring.py's _RELEASE_CRON.
+            del minute, hour
 
     def test_the_emergency_bypass_names_the_gate_it_bypasses(self):
         """`skip_rc_validation` names the RC suite, which is no longer the gate."""

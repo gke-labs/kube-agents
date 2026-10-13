@@ -71,6 +71,12 @@ the investigation already happened and the turn only presents. The three pieces
 that make an alert answerable — a thread, a session bound to it, and the report
 stored against that thread — are reused unchanged.
 
+Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
+than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
+"Proactive posts: the chat.notify route"). The report still lands in a thread, but a
+reply typed into it reaches the gateway, which has no binding to the report, so the
+`incident_context` step above does not apply there.
+
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
 headline in place of the composed message (`slack_audit_report.py`, called from
 `relay_cron_report`), provided the Chat Agent composed it, a chat id or a Slack
@@ -358,9 +364,12 @@ exactly as before, and the index only runs where the hook previously did nothing
 
 ## The first reply into a report's thread (Google Chat DMs only)
 
-Google Chat opens a thread around every top-level message, so an inbound payload
-cannot say whether the user posted at top level or replied inside a real thread.
-Its adapter settles that by counting inbound messages per thread: a thread it has
+Google Chat opens a thread around every top-level message, so the thread name on
+an inbound payload cannot say whether the user posted at top level or replied
+inside a real thread. Chat's `message.threadReply` flag does say (it is true only
+for a reply in a thread; the `mode: next` gateway reads it, per
+`spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
+the question by counting inbound messages per thread: a thread it has
 never seen one in is read as main flow, and the bot answers in the space rather
 than in the thread. Both writers of that counter live in the gateway process. A
 relayed report is posted by `hermes send` from the Session KV server, which is a

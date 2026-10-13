@@ -400,7 +400,7 @@ func TestRun_InitialListMarksAreRecordedBeforeTheListIsDelivered(t *testing.T) {
 		return true, fw, nil
 	})
 	rec := &orderDispatcher{}
-	w := newWatcher(client, rec, targetCluster{Name: "restarted"}, 0)
+	w := newWatcher(client, rec, targetCluster{Name: "restarted"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -478,7 +478,7 @@ func TestRun_RelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testing.T) {
 		return true, fw, nil
 	})
 	rec := &orderDispatcher{}
-	w := newWatcher(client, rec, targetCluster{Name: "relisted"}, 0)
+	w := newWatcher(client, rec, targetCluster{Name: "relisted"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -530,7 +530,7 @@ func TestRun_RelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testing.T) {
 func TestRun_ForbiddenListIsHeldForTheInterval(t *testing.T) {
 	logs := captureLog(t)
 	client, attempts := listFailingClient(forbiddenListErr)
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "held"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "held"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -569,7 +569,7 @@ func TestRun_ForbiddenListIsHeldForTheInterval(t *testing.T) {
 func TestRun_OtherListErrorsKeepTheDefaultBackoff(t *testing.T) {
 	logs := captureLog(t)
 	client, attempts := listFailingClient(apierrors.NewInternalError(errors.New("etcd unavailable")))
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "flapping"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "flapping"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -600,7 +600,7 @@ func TestRun_OtherListErrorsKeepTheDefaultBackoff(t *testing.T) {
 // delayed by a cluster that is being held.
 func TestHandleWatchError_CancelledContextEndsTheHold(t *testing.T) {
 	captureLog(t)
-	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "held"}, 0)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "held"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -616,7 +616,7 @@ func TestHandleWatchError_CancelledContextEndsTheHold(t *testing.T) {
 // to be recognised through that wrapping or the hold never applies in practice.
 func TestHandleWatchError_RecognisesForbiddenThroughWrapping(t *testing.T) {
 	logs := captureLog(t)
-	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "held"}, 0)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "held"})
 	w.forbiddenHold = time.Millisecond
 
 	w.handleWatchError(context.Background(), nil, fmt.Errorf("failed to list *v1.Event: %w", forbiddenListErr))
@@ -698,7 +698,7 @@ func TestRun_ForbiddenWatchAfterSyncIsHeld(t *testing.T) {
 		watchAttempts.Add(1)
 		return true, nil, forbiddenWatchErr
 	})
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -752,7 +752,7 @@ func TestRun_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T) {
 		openWatch.Store(fw)
 		return true, fw, nil
 	})
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "revoked"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "revoked"})
 	w.forbiddenHold = 200 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -797,7 +797,7 @@ func TestRun_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T) {
 // is not reported again, and the next successful watch call reports true.
 func TestHandleWatchError_ForbiddenAfterSyncIsHeld(t *testing.T) {
 	logs := captureLog(t)
-	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "synced"}, 0)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "synced"})
 	w.forbiddenHold = 300 * time.Millisecond
 	rec := &transitionRecorder{}
 	var reportedAt atomic.Pointer[time.Time]
@@ -844,7 +844,7 @@ func TestHandleWatchError_ForbiddenAfterSyncIsHeld(t *testing.T) {
 // false for the hold, and true again only when a watch succeeds.
 func TestHandleWatchError_ForbiddenBeforeRunSeesTheSyncIsReportedAtTheSync(t *testing.T) {
 	captureLog(t)
-	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "early"}, 0)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "early"})
 	w.forbiddenHold = time.Hour
 	rec := &transitionRecorder{}
 	w.onWatching = rec.record
@@ -873,7 +873,7 @@ func TestHandleWatchError_ForbiddenBeforeRunSeesTheSyncIsReportedAtTheSync(t *te
 // watch call, whichever of Run and the reflector sees the list complete first.
 func TestWatcher_SuccessfulListEndsTheHoldWithoutReporting(t *testing.T) {
 	captureLog(t)
-	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "granted"}, 0)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "granted"})
 	w.forbiddenHold = time.Hour
 	rec := &transitionRecorder{}
 	w.onWatching = rec.record
@@ -957,7 +957,7 @@ func TestRun_WatchListMode_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T
 		openWatch.Store(fw)
 		return true, fw, nil
 	})
-	w := newWatcher(watchListCapableClient{underlying}, nopDispatcher{}, targetCluster{Name: "streamed"}, 0)
+	w := newWatcher(watchListCapableClient{underlying}, nopDispatcher{}, targetCluster{Name: "streamed"})
 	w.forbiddenHold = 200 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1037,7 +1037,7 @@ func TestWhoAmI(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := fake.NewClientset()
 			stubIdentity(client, tc.username, tc.err)
-			w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "c", Profile: tc.profile}, 0)
+			w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "c", Profile: tc.profile})
 			if got := w.whoAmI(context.Background()); got != tc.want {
 				t.Errorf("whoAmI() = %q; want %q", got, tc.want)
 			}
@@ -1056,7 +1056,7 @@ func TestRun_PreflightDeniedListBuildsNoInformer(t *testing.T) {
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "list", `requires one of ["container.events.list"] permission(s)`, nil)
 	stubIdentity(client, "kubeagents-platform-agent@proj.iam.gserviceaccount.com", nil)
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "denied", Profile: "gke_proj_us-central1_denied"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "denied", Profile: "gke_proj_us-central1_denied"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1107,7 +1107,7 @@ func TestRun_PreflightDeniedWatchBuildsNoInformer(t *testing.T) {
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "watch", "", nil)
 	stubIdentity(client, "", apierrors.NewNotFound(schema.GroupResource{Group: "authentication.k8s.io", Resource: "selfsubjectreviews"}, ""))
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only", Profile: "direct"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only", Profile: "direct"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1150,7 +1150,7 @@ func TestRun_PreflightGrantDuringHoldStartsTheInformer(t *testing.T) {
 	logs := captureLog(t)
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "list", "", nil)
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "granted"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "granted"})
 	w.forbiddenHold = 200 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1194,7 +1194,7 @@ func TestRun_PreflightErrorFallsThroughToTheInformer(t *testing.T) {
 	logs := captureLog(t)
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "", "", apierrors.NewInternalError(errors.New("authorization webhook unavailable")))
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "unsure"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "unsure"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1239,7 +1239,7 @@ func TestRun_PreflightEvaluationErrorIsInconclusive(t *testing.T) {
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "list", "", nil)
 	stub.evaluationError = "webhook authorizer: connection refused"
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "undecided"}, 0)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "undecided"})
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1342,7 +1342,7 @@ func assertMarkRecordedFirst(t *testing.T, got []string, batch ...string) {
 // TestRun_WatchListStreamMarksAreRecordedBeforeTheStreamIsDelivered pins the
 // restart case in the reflector mode a real client runs in: the initial state
 // arrives through the watch call as a stream, with no List, and the reflector
-// hands it to the informer's store only at the bookmark that ends it. The
+// hands it to the reflector's queue only at the bookmark that ends it. The
 // stream serves the FailedScheduling ahead of the TriggeredScaleUp; the mark
 // must be on record before either is dispatched, and a live event after the
 // bookmark is dispatched as it comes.
@@ -1365,7 +1365,7 @@ func TestRun_WatchListStreamMarksAreRecordedBeforeTheStreamIsDelivered(t *testin
 		return true, fw, nil
 	})
 	rec := &orderDispatcher{}
-	w := newWatcher(watchListCapableClient{underlying}, rec, targetCluster{Name: "streamed"}, 0)
+	w := newWatcher(watchListCapableClient{underlying}, rec, targetCluster{Name: "streamed"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1438,7 +1438,7 @@ func TestRun_WatchListRelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testin
 		return true, fw, nil
 	})
 	rec := &orderDispatcher{}
-	w := newWatcher(watchListCapableClient{underlying}, rec, targetCluster{Name: "restreamed"}, 0)
+	w := newWatcher(watchListCapableClient{underlying}, rec, targetCluster{Name: "restreamed"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -131,6 +131,12 @@ const (
 	annoAddr    = "a2a.kubeagents.dev/addressee"
 	annoConvo   = "a2a.kubeagents.dev/session-key"
 	annoPrimer  = "a2a.kubeagents.dev/rehydration-primer"
+
+	// primerVolume, primerMountPath and primerFileName place the primer
+	// annotation in the worker container as a file.
+	primerVolume    = "rehydration-primer"
+	primerMountPath = "/etc/a2a-primer"
+	primerFileName  = "primer"
 )
 
 // sessionNameAnimals seeds minted session names. W5 owns the canonical
@@ -299,9 +305,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				annoCorr:    activeCorrelation(rec),
 				annoAddr:    rec.Addressee,
 				annoConvo:   rec.Key,
-				// The rehydration primer rides the pod until W4's adapter
-				// grows a first-input path for it; bounded well under the
-				// object annotation budget.
+				// The rehydration primer, mounted for the worker as a file
+				// (primerVolume); bounded well under the object annotation
+				// budget.
 				annoPrimer: truncateRunes(primer, primerCap),
 			},
 		},
@@ -344,6 +350,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
+					{Name: lib.EnvPrimerFile, Value: primerMountPath + "/" + primerFileName},
 					// The pod's own name, from the kubelet rather than from
 					// us. It equals A2A_SESSION by construction above, and
 					// the adapter checks that rather than trusting either:
@@ -403,6 +410,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "scratch", MountPath: "/scratch"},
 					{Name: "bus-token", MountPath: path.Dir(lib.BusTokenPath), ReadOnly: true},
+					{Name: primerVolume, MountPath: primerMountPath, ReadOnly: true},
 				},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: ptr.To(false),
@@ -414,6 +422,19 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				{
 					Name:         "scratch",
 					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				},
+				// The transcript primer, read by the worker before its
+				// first turn (lib.EnvPrimerFile). The annotation is the
+				// pod's own, so the file is written once at start and the
+				// kubelet needs no API access to produce it.
+				{
+					Name: primerVolume,
+					VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
+						Items: []corev1.DownwardAPIVolumeFile{{
+							Path:     primerFileName,
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['" + annoPrimer + "']"},
+						}},
+					}},
 				},
 				// The bus credential, as a pod-bound token rather than a
 				// shared password.
@@ -587,7 +608,10 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	if rec.PodName != "" {
 		return
 	}
-	primer := g.buildRehydrationPrimer(ctx, rec)
+	primer, authors, unknown, since := g.buildRehydrationPrimer(ctx, rec, taskID)
+	// The pod reads the earlier turns, so their people count for a
+	// delegation from it, as the delegating turn's own do.
+	rec.seedSessionAuthors(authors, unknown, since)
 	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer, originSeq)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)

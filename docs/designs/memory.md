@@ -492,7 +492,11 @@ It adds exactly two workloads to `kubeagents-system`.
   there was measured against a live install and the retain still returned 400,
   because LiteLLM honours it in a model entry's `litellm_params` rather than
   globally. Per-model it would work, at the price of editing a config every
-  agent request passes through in order to accommodate one caller.
+  agent request passes through in order to accommodate one caller. The chart
+  has since paid that price for every caller on a Claude model: it renders
+  per-model `additional_drop_params` for `temperature`, `top_p` and `top_k`
+  ([inference gateway](../site/src/content/docs/concepts/inference-gateway.md#setting-the-default-model)).
+  The `none` stays, for a model outside that test that refuses temperature.
 - Requests 250m CPU/1Gi, limits 4 CPU/4Gi. The request covers steady state, reported at
   about 9m on a live install when the request came down from 2 CPU; the install and the
   sampling window were not recorded, so read it as an order of magnitude. The limit is

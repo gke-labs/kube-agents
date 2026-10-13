@@ -520,7 +520,7 @@ func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
 			"reaches the map and this test measures nothing", agentSA, want)
 	}
 
-	if _, _, err := buildA2AAuthMapConfigMap(agent); err == nil {
+	if _, _, err := buildA2AAuthMapConfigMap(agent, nil); err == nil {
 		t.Error("an override colliding with the session pod's ServiceAccount rendered a map: the callout " +
 			"serves one entry per account, so one workload would run on the other's grants")
 	} else if !strings.Contains(err.Error(), "duplicate serviceAccount") {

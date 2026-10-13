@@ -13,10 +13,12 @@ from unittest import mock
 
 import verify_ssh_shared_master as verify
 from apply_ssh_shared_master import (
-    MARKER, RESULT_ANCHOR, RESULT_RELATIVE, SSH_CLEANUP_ANCHOR, SSH_INIT_ANCHOR, SSH_RELATIVE, apply,
+    MARKER, RESULT_ANCHOR, RESULT_RELATIVE, SSH_ARGV_ANCHOR, SSH_CLEANUP_ANCHOR, SSH_INIT_ANCHOR, SSH_RELATIVE,
+    apply,
 )
 
-# tools/environments/ssh.py at v2026.9.14: the two anchored regions, nothing else of the class.
+# tools/environments/ssh.py at v2026.9.14: the three anchored regions, plus the two helpers
+# _build_ssh_command needs so the verifier can call it; nothing else of the class.
 SSH_STUB = (
     "import contextlib\n"
     "import hashlib\n"
@@ -25,6 +27,7 @@ SSH_STUB = (
     "from pathlib import Path\n"
     "\n"
     "logger = logging.getLogger(__name__)\n"
+    "_SSH_MULTIPLEX = True\n"
     "\n"
     "\n"
     "class SSHEnvironment:\n"
@@ -41,6 +44,26 @@ SSH_STUB = (
     "        plain = Path(self.control_socket)\n"
     '        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []\n'
     "        return [plain, *(s for s in siblings if s != plain)]\n"
+    "\n"
+    "    def _control_socket_for(self, send_env):\n"
+    "        return Path(self.control_socket)\n"
+    "\n"
+    "    def _target_flags(self, port_flag):\n"
+    "        flags = [port_flag, str(self.port)] if self.port != 22 else []\n"
+    '        return flags + (["-i", self.key_path] if self.key_path else [])\n'
+    "\n"
+    "    def _build_ssh_command(self, extra_args=None, send_env=()):\n"
+    "        send_env = tuple(sorted(send_env))\n"
+    '        cmd = ["ssh"]\n'
+    "        if _SSH_MULTIPLEX:\n"
+    '            cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",\n'
+    '                        "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])\n'
+    + SSH_ARGV_ANCHOR +
+    '        cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))\n'
+    '        cmd.extend(self._target_flags("-p"))\n'
+    "        cmd.extend(extra_args or [])\n"
+    '        cmd.append(f"{self.user}@{self.host}")\n'
+    "        return cmd\n"
     "\n"
     + SSH_CLEANUP_ANCHOR
 )
@@ -81,10 +104,21 @@ def stage(ssh=SSH_STUB, result=RESULT_STUB):
     return root
 
 
+# The gate judges the argv by what `ssh -G` resolves, and a stripped option falls back to the
+# machine's config (OpenSSH's own default for the count is the wanted 3). The tests pin that
+# fallback with a config of their own, which `-F` also uses to shut out the developer's
+# ~/.ssh/config: an intact argv still resolves 15/3 because the command line wins, a stripped
+# one resolves 7 and reds the gate on every machine.
+FALLBACK_CONFIG = "ServerAliveInterval 7\nServerAliveCountMax 7\n"
+
+
 def run_verifier(root):
     import sys
+    cfg = root / "fallback_ssh_config"
+    cfg.write_text(FALLBACK_CONFIG)
     with mock.patch.object(verify, "HERMES", root), mock.patch.object(verify, "FAILURES", []), \
-            mock.patch.object(sys, "path", list(sys.path)):
+            mock.patch.object(sys, "path", list(sys.path)), \
+            mock.patch.object(verify, "_HOSTNAME_PIN", [*verify._HOSTNAME_PIN, "-F", str(cfg)]):
         rc = verify.main()
         return rc, list(verify.FAILURES)
 
@@ -96,6 +130,7 @@ class ApplierTest(unittest.TestCase):
         ssh = (root / SSH_RELATIVE).read_text()
         self.assertIn("self._shared_master = not probe_only", ssh)
         self.assertIn("def close_master(self):", ssh)
+        self.assertIn('cmd.extend(["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"])', ssh)
         self.assertNotIn(SSH_CLEANUP_ANCHOR, ssh)
         self.assertIn('returncode == 255 and failure_hint is None and not (result or {}).get("cwd_observed")',
                       (root / RESULT_RELATIVE).read_text())
@@ -118,7 +153,11 @@ class ApplierTest(unittest.TestCase):
             self.assertNotIn(MARKER, (root / rel).read_text(), rel)
 
 
+needs_ssh = unittest.skipUnless(verify._ssh_client(), "the verifier resolves the argv with ssh -G")
+
+
 class VerifierTest(unittest.TestCase):
+    @needs_ssh
     def test_patched_stubs_pass(self):
         root = stage()
         apply(root)
@@ -132,6 +171,56 @@ class VerifierTest(unittest.TestCase):
         self.assertIn("does not carry the patch marker", joined)
         self.assertIn("no close_master()", joined)
         self.assertIn("carries no hint", joined)
+
+    @needs_ssh
+    def test_a_stripped_interval_falls_back_and_fails(self):
+        root = stage()
+        apply(root)
+        path = root / SSH_RELATIVE
+        path.write_text(path.read_text().replace('"-o", "ServerAliveInterval=15", ', ""))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("ssh resolves serveraliveinterval to 7, expected 15", "\n".join(failures))
+
+    @needs_ssh
+    def test_a_stripped_count_falls_back_and_fails(self):
+        root = stage()
+        apply(root)
+        path = root / SSH_RELATIVE
+        path.write_text(path.read_text().replace(', "-o", "ServerAliveCountMax=3"', ""))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("ssh resolves serveralivecountmax to 7, expected 3", "\n".join(failures))
+
+    @needs_ssh
+    def test_an_earlier_copy_of_the_interval_fails(self):
+        # An upstream `-o ServerAliveInterval=N` placed before the anchor is earlier in argv and
+        # wins under first-value-wins, so the gate reds on an earlier copy with another value (a
+        # same-valued one changes nothing ssh does and passes).
+        root = stage(ssh=SSH_STUB.replace(
+            '        cmd = ["ssh"]\n', '        cmd = ["ssh", "-o", "ServerAliveInterval=5"]\n'))
+        apply(root)
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("ssh resolves serveraliveinterval to 5, expected 15", "\n".join(failures))
+
+    @needs_ssh
+    def test_every_spelling_of_an_earlier_copy_fails(self):
+        # ssh also takes the option glued to -o, after `-o=`, bundled behind other short flags, with
+        # the keyword in any case, and with a space instead of `=`; the gate asks ssh -G what it
+        # resolved, so each spelling lands as the earlier, winning value.
+        for spelling, expect in (('"-oServerAliveInterval=0"', "serveraliveinterval to 0"),
+                                 ('"-o=ServerAliveInterval=5"', "serveraliveinterval to 5"),
+                                 ('"-To", "ServerAliveInterval=5"', "serveraliveinterval to 5"),
+                                 ('"-o", "serveraliveinterval=5"', "serveraliveinterval to 5"),
+                                 ('"-o", "ServerAliveInterval 5"', "serveraliveinterval to 5"),
+                                 ('"-4oserveralivecountmax=9"', "serveralivecountmax to 9")):
+            with self.subTest(spelling=spelling):
+                root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', f'        cmd = ["ssh", {spelling}]\n'))
+                apply(root)
+                rc, failures = run_verifier(root)
+                self.assertEqual(rc, 1, spelling)
+                self.assertIn(f"ssh resolves {expect}, expected", "\n".join(failures), spelling)
 
     def test_a_renamed_probe_only_parameter_fails_the_gate(self):
         # The applier's __init__ anchor is the _socket_id line, which an upstream rename of

@@ -2,8 +2,9 @@
 
 The recap reports the informational events the severity gate held back from chat, grouped by
 workload and reason, and nothing else. Critical and Warning events are counted in the headline and
-never listed — chat received them as they happened. That holds even for an alert that never reached
-chat: a ceiling drop and a failed delivery are counted, so neither can be printed over with an
+never listed — chat received them as they happened (or, on a headless install with no chat platform
+enabled, the read-only activity feed did). That holds even for an alert that never reached
+chat on a chat-enabled install: a ceiling drop and a failed delivery are counted, so neither can be printed over with an
 all-clear, but neither is named.
 [What this recap does not report](#what-this-recap-does-not-report) is canonical for that contract
 and for the gap it leaves.
@@ -79,7 +80,8 @@ in UTC so it agrees with the clock the scheduler ticked on.
 Every number comes from one table: `intercepted_events` in `session_kv.db`
 (`/var/lib/kube-agents/session/session_kv.db`), written by the `session_kv_server.py` REST bridge on
 port 8699. It holds one row per event the watcher forwarded, with `notified` recording whether that
-event was announced in chat. It has other writers — the drift detector's `gitops-drift` injects
+event was announced in chat (`1`), held back or failed (`0`), or dispatched headlessly on an install
+with no chat platform enabled (`2`, `NOTIFIED_HEADLESS`). It has other writers — the drift detector's `gitops-drift` injects
 land in the same table under `reason = 'OutOfBandChange'`, and `controller-stall` injects (see
 [stall-watch-inject.md](stall-watch-inject.md)) under `reason = 'ControllerStall'` — and the
 generator excludes those rows before it counts
@@ -97,7 +99,9 @@ from the ledger: the watcher discards duplicates before the bridge hears about t
 (`dispatcher.Dispatch` returns on `dedupDuplicate`) and hardcodes `count` to `1` on the payload it
 does send, so a ratio over these rows would measure how many distinct incidents shared a key — 400
 duplicate `CrashLoopBackOff` events collapsing into three injects would report zero. The real figure
-is the `eventsDedupSuppress` Prometheus counter.
+is the watcher's `k8s_event_watcher_events_deduped_total` series;
+[Concepts → Observability](../site/src/content/docs/concepts/observability.md) is canonical for where it
+is scraped and the labels it arrives under.
 
 ### Which clusters a recap covers
 
@@ -128,7 +132,7 @@ A missing database, a volume old enough to have the database but not the table, 
 enough to be missing its `cluster` column, all yield zero rows — indistinguishable from a quiet
 fleet. The third is the nastiest, and is not a stale-reader problem: `record_intercepted_event`
 names `cluster` in its INSERT, so on that shape every write fails and the ledger stays permanently
-empty. See ["A pre-release table, and no migration"](../../agents/platform/docs/session_management.md) for the
+empty. See ["Which columns are migrated, and which are not"](../../agents/platform/docs/session_management.md) for the
 `DROP TABLE` that fixes it. Per
 ["I found nothing" and "I could not look" must not arrive as the same silence](../site/src/content/docs/concepts/autonomous-watchdogs.md),
 the header turns 🔴, the body names each path and why it failed, and the telemetry counts, the
@@ -205,7 +209,7 @@ Three properties of the listing follow from what a suppressed event is:
 
 ## What this recap does not report
 
-Two classes of event are graded `Critical` or `Warning` and never reached chat. Neither is **named**
+On a chat-enabled install, two classes of event are graded `Critical` or `Warning` and never reached chat. Neither is **named**
 here — no workload, no reason, no message — because the listing has one subject and that subject is
 informational churn. Each is **counted**, on its own line above the body:
 
@@ -222,8 +226,17 @@ informational churn. Each is **counted**, on its own line above the body:
   ledger column are its only trace anywhere — which is why it is counted here rather than left to a
   metric that does not exist.
 
-Both lines are printed only when the ledger was readable; an unreadable one reports as 🔴 and the
-counts would be meaningless. Beyond counting, both totals veto the ✅ all-clear and the 🟢 header:
+A third class exists on a headless install (`platforms.google_chat.enabled: false` and
+`platforms.slack.enabled: false` with no `A2A_NOTIFY_PLATFORM` route): **alerts dispatched without
+a chat platform** (`notified = 2`, `NOTIFIED_HEADLESS`). `trigger_agent_troubleshooter` stamps `2`
+via `mark_delivery_headless` and starts the triage turn without attempting a chat post, and
+`filter_and_aggregate_events` tallies those rows in `dispatched_headless` rather than
+`alerts_posted` or `delivery_failed`. Because no chat post was attempted or refused and the
+read-only activity feed (`/v1/intercepted-events`, `/v1/tasks`) is the intended consumer,
+`dispatched_headless` neither prints a `⚠️` failure line nor vetoes the ✅ all-clear / 🟢 header.
+
+Both `⚠️` lines are printed only when the ledger was readable; an unreadable one reports as 🔴 and the
+counts would be meaningless. Beyond counting, `cap_dropped` and `delivery_failed` veto the ✅ all-clear and the 🟢 header:
 "Nothing was held back from chat today" printed over a day the ceiling ate thirty `Critical` alerts
 is not silence about the drops, it is a denial of them. So such a day reports as 📊, with a count of
 what went wrong and no all-clear over it.
@@ -232,11 +245,11 @@ The line between naming and counting is the contract. A count tells the reader t
 name would make this report the second place the incident is described, which is the duplication the
 recap exists to avoid.
 
-Such a day also prints "counts cover every severity; only informational events are listed" under the
+Such a day — or a day with `dispatched_headless` rows — also prints "counts cover every severity; only informational events are listed" under the
 headline. The headline totals are the whole ledger, the listing below them is `Info` alone, and on a
-day with a ceiling drop or a failed delivery those two disagree by exactly the events this section
+day with a ceiling drop, a failed delivery, or a headless dispatch those two disagree by exactly the events this section
 says are not reported. The line is what stops the gap reading as an arithmetic error. It is gated on
-those two counts rather than printed always: a delivered alert also sits in the totals and not in
+those three counts (`cap_dropped`, `delivery_failed`, `dispatched_headless`) rather than printed always: a delivered alert also sits in the totals and not in
 the listing, but "_N alerts_ went to chat" in the sentence above already accounts for it, and a note
 printed every day is read on none of them.
 

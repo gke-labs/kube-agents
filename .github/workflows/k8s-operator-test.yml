@@ -33,6 +33,11 @@ on:
     branches: [main]
     paths:
       - "k8s-operator/**"
+      # The operator's fixture tests read these rendered fixtures through a
+      # relative path (agentprofile_test.go and the other *MatchesThe*Fixture
+      # tests), so a change to them must run this job too, or a stale fixture
+      # reds main while every PR that touches only it skips the check.
+      - "a2a/authcallout/testdata/**"
       - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
 
@@ -65,6 +70,7 @@ jobs:
           filters: |
             operator:
               - "k8s-operator/**"
+              - "a2a/authcallout/testdata/**"
               - ".github/workflows/k8s-operator-test.yml"
 
       - name: Set up Go

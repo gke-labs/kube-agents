@@ -55,20 +55,23 @@ var statusQueries = map[string]bool{
 	"how is it going":    true,
 }
 
+// wideMatchLenCap bounds the wide interrogative match: past this length a
+// message is a composed instruction, not a status poke, however it starts.
+const wideMatchLenCap = 48
+
 // isStatusQuery reports whether a mid-task message asks what the task is
 // doing rather than telling it something. Deterministic by design - the
 // gateway holds no model - so this is a phrase set plus a narrow
 // interrogative rule, not understanding. The interrogative rule is the wide
 // half and it misfires ("any update to the config should be reverted" is a
-// steer), so it only applies when wide is true. The caller sets wide by
-// executor: a fixed-route executor (Hermes) refuses steers, so a stolen
-// false positive costs nothing; a session worker absorbs steers, so a
-// stolen one is a dropped correction and only the exact phrases match -
-// a status-shaped steer there is a question the worker can answer itself.
-// wideMatchLenCap bounds the wide interrogative match: past this length a
-// message is a composed instruction, not a status poke, however it starts.
-const wideMatchLenCap = 48
-
+// steer), so it applies only when wide is true. The caller sets wide by
+// what the executor does with a steer: one that runs follow-ups (the
+// bridge's api executor, a session worker) gets the exact phrases only,
+// because a stolen steer there is a lost correction and a status-shaped
+// steer is a question the agent can answer itself; one that refuses them
+// (the bridge's cli executor, which refuses each no-resume) gets the wide
+// rule, because a stolen false positive there costs nothing and the
+// alternative is an ack followed by a refusal.
 func isStatusQuery(text string, wide bool) bool {
 	n := normalize(text)
 	if statusQueries[n] {

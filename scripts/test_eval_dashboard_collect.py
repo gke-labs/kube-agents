@@ -2383,6 +2383,30 @@ class TestGitLabLane(_MergeBase):
         data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gsutil=gsutil)
         self.assertIn("warning: gsutil ls failed for", stderr)
 
+    def test_the_cold_path_lists_the_lanes_index_not_the_archive_wide_glob(self):
+        """With no lane run on record the archive-wide glob walks every pull
+        request's directory on every tick (bnaylor measured 2 min 15 s over
+        962 of them, read-only, against about 1 s for the index), and past
+        the listing timeout that is the refusal line, indefinitely for an
+        on-demand lane. The index answers "nothing yet" as a note, and lists
+        the first build when it lands."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the lane's index, cold")
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "never the archive-wide glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The first lane build lands: read through the index, no watermark yet.
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertEqual({r["build_id"]: r["tier"] for r in data["runs"]}, {BUILD_998_FULL: "presubmit", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text())
+
     def test_a_known_but_empty_lane_index_is_a_note_and_a_denied_one_the_warning(self):
         """The nightly's rule: once a lane run is on record its index is
         listed, and an index that matched no objects (purged or moved while

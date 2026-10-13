@@ -6,9 +6,11 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import hashlib
 import re
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -18,12 +20,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from pathlib import Path
 
 import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import chat_notify
 import findings_queue
+import gitops_workspace
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
@@ -73,6 +78,48 @@ LEDGER_MAX_ROWS = int(os.getenv("SESSION_KV_LEDGER_MAX_ROWS", "200000"))
 # reader shows.
 LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", "512"))
 
+# The read-only activity feed: `GET /v1/intercepted-events`, `GET /v1/tasks`,
+# `GET /v1/tasks/{id}` and `GET /v1/sessions/{id}/tasks`. It exists for an
+# install with no chat platform, where the triage report otherwise lives only
+# in the kanban board and the ledger has no reader but the daily recap.
+#
+# The active board is resolved via `gitops_workspace.board_path()` — asking
+# Hermes' `hermes_cli.kanban_db.kanban_db_path()` first (which respects
+# `HERMES_KANBAN_DB` and `kanban/current`) and falling back to
+# `<agent_home>/kanban.db`. `KANBAN_DB_PATH` is a test hook (`None` in
+# production) so unit tests can point the routes at a temporary SQLite file.
+KANBAN_DB_PATH: Optional[str] = None
+FEED_DB_BUSY_TIMEOUT_SECONDS = 5.0
+SQLITE_INT64_MAX = (1 << 63) - 1
+# Page sizes. The defaults suit a page that polls; the ceilings stop one
+# request from serialising the whole ledger (LEDGER_MAX_ROWS rows) or every
+# task's full report in one response.
+FEED_EVENTS_DEFAULT_LIMIT = 50
+FEED_EVENTS_MAX_LIMIT = 500
+FEED_TASKS_DEFAULT_LIMIT = 50
+FEED_TASKS_MAX_LIMIT = 200
+# Per-task child rows `GET /v1/tasks/{id}` returns, the same ceilings the admin
+# console's `task_detail` applies to the same tables.
+TASK_DETAIL_MAX_RUNS = 100
+TASK_DETAIL_MAX_EVENTS = 500
+TASK_DETAIL_MAX_COMMENTS = 200
+# The `status` a feed row reports, derived from what the ledger stored. The
+# first three are the inject route's own answers. `undelivered` is the fourth
+# outcome the ledger can hold on an install with chat enabled: injected, then
+# the chat post failed and `mark_delivery_failed` reset `notified` and wrote
+# `delivery_error`.
+FEED_STATUS_INJECTED = "injected"
+FEED_STATUS_FILTERED = "filtered"
+FEED_STATUS_SUPPRESSED = "suppressed"
+FEED_STATUS_UNDELIVERED = "undelivered"
+# The severity the inject route filters out of chat (see `inject_message`).
+FEED_FILTERED_SEVERITY = "Info"
+# `notified` value stamped on a ledger row when the alert was admitted and
+# dispatched on a headless install (`_chat_platforms_disabled() == True`), so
+# `_feed_status` reports `injected` while `eod_report_generator` does not count
+# the row under "went to chat as it happened".
+NOTIFIED_HEADLESS = 2
+
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
 # authenticate nothing. See docs/credential-isolation-design.md.
@@ -88,6 +135,32 @@ SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 # sentinel after all — see _gateway_api_token — but the name is resolved rather
 # than read, because which file answers it is the whole of issue #786.
 GATEWAY_AUTH_ENV = "API_SERVER_KEY"
+
+# A route the hermes-bridge records for a gateway conversation's Hermes
+# session (PUT /v1/sessions/{id}/route): only the bridge's session ids, which
+# all start with this, so the route cannot re-address an alert or cron session.
+CONVERSATION_SESSION_PREFIX = "a2a-"
+# How the hermes-bridge names a conversation's session from its context id
+# (a2a/hermes-bridge/api.go, apiSessionID): the context id verbatim when it is
+# path-safe and short enough, else a truncated SHA-256 under "h-". A route is
+# recorded only for the session its own context id names, so one session's
+# cards cannot be re-addressed to another conversation's context.
+CONVERSATION_SAFE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+CONVERSATION_CONTEXT_MAX_CHARS = 128
+CONVERSATION_HASHED_PREFIX = "h-"
+CONVERSATION_HASHED_HEX_CHARS = 32
+# The conversation key's prefix for each platform the A2A gateway can hold, as
+# the gateway spells its session-record keys (gchatConversationID,
+# slackConversationID); a key for another backend is refused.
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:"}
+# The metadata key the route is kept under. Its own key, not the row's
+# platform/chat_id/thread_id: those are a chat thread's address, which other
+# readers (send_notification, the delegation headers) use as one, and a
+# gateway conversation is not addressed that way.
+CONVERSATION_ROUTE_KEY = "conversation_route"
+# Bounds on what a route carries: a gateway conversation key and context id
+# are short, and anything longer is not one.
+CONVERSATION_FIELD_MAX_CHARS = 512
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -601,6 +674,9 @@ STALL_TITLE_MAX_CHARS = 200
 STALL_TRUNCATION_MARKER = "..."
 
 
+_SQLITE_DUPLICATE_COLUMN_SUBSTR = "duplicate column"
+
+
 def init_db() -> None:
     db_dir = os.path.dirname(SESSION_KV_DB_PATH)
     if db_dir:
@@ -650,24 +726,37 @@ def init_db() -> None:
                     occurrences INTEGER NOT NULL DEFAULT 1,
                     notified    INTEGER NOT NULL DEFAULT 0,
                     delivery_error TEXT NOT NULL DEFAULT '',
+                    session_id  TEXT NOT NULL DEFAULT '',
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
-            # No ALTER TABLE migration accompanies the `cluster` and
-            # `delivery_error` columns: this table has never been in a release,
-            # so the only databases carrying an older shape are pre-release dev
-            # installs. `DROP TABLE intercepted_events` on one of those is the
-            # fix, and it is mandatory rather than a tidy-up. Skipping it is
-            # silent in both directions and worst on `cluster`, which
-            # `record_intercepted_event` names in every INSERT: each write
-            # raises `no such column`, the blanket except below the call
-            # swallows it, and the table stays empty forever. The recap reads
-            # that shape as a read failure rather than a quiet day, which is
-            # the only warning the condition produces. A missing
-            # `delivery_error` costs only the write-back, leaving an
+            # `session_id` arrived after `intercepted_events` first shipped in
+            # 0.2.0, so released databases lack it and `init_db` adds it with
+            # `ALTER TABLE` to preserve existing ledger rows (additive and
+            # defaulted, so earlier rows read back with '').
+            ledger_columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
+            if "session_id" not in ledger_columns:
+                try:
+                    conn.execute("ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+                except sqlite3.OperationalError as exc:
+                    if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
+                        raise
+            # By contrast, no ALTER TABLE migration accompanies `cluster`,
+            # `object_uid`, or `delivery_error`: those columns were added
+            # before the table first shipped in 0.2.0, so the only databases
+            # missing them are pre-0.2.0 dev installs that ran an intermediate
+            # commit of #426. `DROP TABLE intercepted_events` on one of those
+            # pre-release dev installs is the fix, and it is mandatory rather
+            # than a tidy-up. Skipping it is silent in both directions and
+            # worst on `cluster`, which `record_intercepted_event` names in
+            # every INSERT: each write raises `no such column`, the blanket
+            # except below the call swallows it, and the table stays empty
+            # forever. The recap reads that shape as a read failure rather than
+            # a quiet day, which is the only warning the condition produces. A
+            # missing `delivery_error` costs only the write-back, leaving an
             # undelivered alert recorded as delivered.
-            # `session_management.md`, "A pre-release table, and no migration",
+            # `session_management.md`, "Which columns are migrated, and which are not",
             # is the operator-facing version.
             #
             # The recap queries one day at a time; without this it is a full
@@ -752,8 +841,15 @@ def record_intercepted_event(
     severity: str,
     occurrences: int,
     notified: bool,
+    session_id: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
+
+    `session_id` is the session the inject arrived on, which is also the id
+    `trigger_agent_troubleshooter` opens the gateway session under, so the
+    triage card the front door files carries it as `tasks.session_id`. It is
+    what joins a ledger row to its report on `GET /v1/sessions/{id}/tasks`.
+    Defaulted for callers that have none; a row without one is still counted.
 
     `cluster` is recorded because this server is shared: one session KV
     database backs every cluster profile in the pod, which is the same reason
@@ -790,8 +886,9 @@ def record_intercepted_event(
             with conn:
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
-                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                    "occurrences, notified, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -803,6 +900,7 @@ def record_intercepted_event(
                         severity,
                         int(occurrences),
                         1 if notified else 0,
+                        session_id,
                     ),
                 )
                 return cursor.lastrowid
@@ -835,6 +933,27 @@ def mark_delivery_failed(event_row_id: Optional[int], detail: str) -> None:
                 )
     except Exception as exc:
         logger.error(f"Failed to record delivery failure for ledger row {event_row_id}: {exc}")
+
+
+def mark_delivery_headless(event_row_id: Optional[int]) -> None:
+    """Stamp a ledger row dispatched on a headless install (`notified = NOTIFIED_HEADLESS`).
+
+    Separates "admitted and dispatched with no chat platform enabled" from
+    `notified = 1` ("went to chat as it happened"), so `_feed_status` still
+    reports `injected` while `eod_report_generator` does not count the row under
+    `alerts_posted`.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET notified = ? WHERE id = ?",
+                    (NOTIFIED_HEADLESS, int(event_row_id)),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to record headless delivery for ledger row {event_row_id}: {exc}")
 
 
 @app.get("/healthz")
@@ -1087,6 +1206,13 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
+    One thing outranks all three: the platform the operator names in
+    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    managed scope says that platform's Hermes consumer is off because the A2A
+    gateway holds the backend, and posts to it go through the gateway instead,
+    so it is still a platform this install posts to. The operator renders the
+    variable only then, and it is reserved against every other source.
+
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
 
@@ -1119,15 +1245,37 @@ def enabled_chat_platforms() -> list[str]:
     here). What remains between them is which callers they serve, not what they
     answer.
     """
+    resolved, _ = _resolve_chat_platforms()
+    return resolved or [DEFAULT_CHAT_PLATFORM]
+
+
+def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
+    """Return `(resolved_platforms, explicit_config_choices)` across all sources.
+
+    Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
+    the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
+    while routing notifications through `A2A_NOTIFY_PLATFORM` resolve that
+    platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
+    """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
     from_profile = _platforms_enabled_in(CONFIG_PATH)
 
-    resolved = []
+    resolved: list[str] = []
+    explicit: Dict[str, bool] = {}
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+            explicit[name] = True
+        elif name in from_managed:
             enabled = from_managed[name]
+            explicit[name] = enabled
         elif name in from_profile:
             enabled = from_profile[name]
+            explicit[name] = enabled
         else:
             enabled = any(
                 os.environ.get(var, "").strip()
@@ -1135,7 +1283,23 @@ def enabled_chat_platforms() -> list[str]:
             )
         if enabled:
             resolved.append(name)
-    return resolved or [DEFAULT_CHAT_PLATFORM]
+    return resolved, explicit
+
+
+def _chat_platforms_disabled() -> bool:
+    """True when config files explicitly disable all configured chat platforms.
+
+    On a chat-less install (`install.sh` chat choice "None", or a CR with
+    `googleChat.enabled: false` and `slack.enabled: false` and no routed
+    `A2A_NOTIFY_PLATFORM`), `renderConfigYAML` emits `enabled: false` for both
+    platforms in `/etc/hermes/config.yaml`. `enabled_chat_platforms` falls back
+    to `DEFAULT_CHAT_PLATFORM` when nothing resolves so legacy callers never
+    address an empty string; this helper uses the same `_resolve_chat_platforms`
+    walk without that fallback so `trigger_agent_troubleshooter` stamps headless
+    rows with `NOTIFIED_HEADLESS` instead of marking them as failed chat posts.
+    """
+    resolved, explicit = _resolve_chat_platforms()
+    return not resolved and bool(explicit) and not any(explicit.values())
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -1168,8 +1332,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
     return platforms[0]
 
 
-#: Returned by :func:`_post_initial_alert` when `hermes send` reported success
-#: but no message id could be read out of its `--json` stdout. Distinct from
+#: Returned by :func:`_post_initial_alert` when the send (`hermes send`, or
+#: `a2a notify` under next) reported success but no message id could be read
+#: out of its JSON stdout, or when `a2a notify` reported that the gateway took
+#: the request and did not answer in time. Distinct from
 #: `None`, which means the send itself failed. The caller must not try the next
 #: platform on this one: the alert IS in the first platform's channel, and
 #: falling through would post it a second time somewhere else. Deliberately not
@@ -1177,31 +1343,47 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
-def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
-    """Send initial warning alert via hermes CLI and return the thread/message ID.
+def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+    """Run the alert's send, waiting out a gateway route that is briefly not there.
 
-    Three outcomes, not two: a thread id, `None` when the send failed, and
-    :data:`ALERT_SENT_WITHOUT_THREAD` when it succeeded and the id could not be
-    parsed. The route's own docstring names that third case as one that has
+    The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
+    roll, or its bind retry) is retried on chat_notify's schedule rather than
+    dropping the alert; every other outcome is the caller's to read.
+    """
+    delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
+    for delay in (*delays, None):
+        try:
+            return subprocess.run(
+                chat_notify.command(active_platform, alert_msg),
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                env=_run_env()
+            )
+        except subprocess.CalledProcessError as exc:
+            if delay is None or not chat_notify.route_unavailable(exc.returncode):
+                raise
+            logger.warning(f"Alert to '{active_platform}': the gateway's route is not there; retrying in {delay}s")
+            time.sleep(delay)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+    """Send the initial warning alert and return the thread/message ID.
+
+    Posts with `hermes send`, or with `a2a notify` for the platform the A2A
+    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
+    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = subprocess.run(
-            ["hermes", "send", "--json", "--to", active_platform, alert_msg],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=_run_env()
-        )
+        res = _run_alert_send(active_platform, alert_msg)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
-            # Google Chat message IDs contain space and message parts; we extract the thread key.
-            if active_platform == "google_chat" and "/messages/" in msg_id:
-                space_part, msg_part = msg_id.split("/messages/", 1)
-                thread_key = msg_part.split(".")[0]
-                return f"{space_part}/threads/{thread_key}"
-            return msg_id
+            return chat_notify.thread_from_response(active_platform, resp)
         # Sent, but unaddressable. Say which, so the caller does not re-send.
         logger.error(
             f"Alert posted to '{active_platform}' but its response carried no message id; "
@@ -1209,6 +1391,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
         )
         return ALERT_SENT_WITHOUT_THREAD
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # The gateway took the request and did not answer in time: the
+            # alert may well be in the channel, so it must not be sent again.
+            logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
+            return ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -2226,59 +2413,63 @@ def trigger_agent_troubleshooter(
     #    refused, so on an install whose first leg accepts, nothing would say
     #    the second was skipped.
     platforms = enabled_chat_platforms()
-    active_platform = get_active_platform(platforms)
-    thread_id = None
-    for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
-        thread_id = _post_initial_alert(
-            candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
-        )
-        if thread_id == ALERT_SENT_WITHOUT_THREAD:
-            # Delivered, and unthreadable. Stop: the reader has the alert, and
-            # trying the next platform would post it to a second channel to
-            # chase a thread id. Fall into the `else` below, which records the
-            # delivery as unconfirmed rather than lost — the honest reading.
-            active_platform, thread_id = candidate, None
-            break
+    if platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled():
+        mark_delivery_headless(event_row_id)
+    else:
+        active_platform = get_active_platform(platforms)
+        thread_id = None
+        for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
+            thread_id = _post_initial_alert(
+                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
+            )
+            if thread_id == ALERT_SENT_WITHOUT_THREAD:
+                # Delivered, and unthreadable. Stop: the reader has the alert, and
+                # trying the next platform would post it to a second channel to
+                # chase a thread id. Fall into the `else` below, which records the
+                # delivery as unconfirmed rather than lost — the honest reading.
+                active_platform, thread_id = candidate, None
+                break
+            if thread_id:
+                active_platform = candidate
+                break
+            if len(platforms) > 1:
+                logger.warning(
+                    f"Alert for session {session_id} was not accepted by '{candidate}'"
+                    + (f"; trying the next enabled platform" if candidate != platforms[-1] else "")
+                )
+
+        # 2. Register thread-to-session mappings for two-way chat routing. This has
+        #    to happen before the turn in step 5: the card that turn files reads
+        #    this row to address its completion back to the alert's thread (see
+        #    deploy/docker/patches/kanban_event_routing.py).
         if thread_id:
-            active_platform = candidate
-            break
-        if len(platforms) > 1:
-            logger.warning(
-                f"Alert for session {session_id} was not accepted by '{candidate}'"
-                + (f"; trying the next enabled platform" if candidate != platforms[-1] else "")
+            _register_session_routing(session_id, active_platform, thread_id)
+            if alert_title and active_platform == SLACK_PLATFORM:
+                _record_alert_title(session_id, alert_title)
+        else:
+            # The ledger row already says this alert was announced; it was written
+            # before the post was attempted. Correct it now, or the daily recap
+            # counts a message nobody received into "went to chat as it happened"
+            # and drops the workload from the body.
+            #
+            # Only this branch. A failure further down means chat *did* get the
+            # alert and the triage turn did not start, which is a different defect
+            # and leaves `notified` correctly set: the reader saw the alert, just
+            # never the follow-up. `_post_initial_alert` also lands here when the
+            # send succeeded but returned no parseable `message_id`, so the record
+            # says the delivery is unconfirmed rather than certainly lost — the
+            # honest reading, and the safe direction for a report whose failure
+            # mode is false reassurance.
+            mark_delivery_failed(
+                event_row_id,
+                f"no message id from {' or '.join(repr(p) for p in platforms)}; "
+                "see the session server log",
+            )
+            logger.error(
+                f"Alert for session {session_id} was not delivered to any enabled platform "
+                f"({', '.join(platforms)}); the daily recap will report it as undelivered"
             )
 
-    # 2. Register thread-to-session mappings for two-way chat routing. This has
-    #    to happen before the turn in step 5: the card that turn files reads
-    #    this row to address its completion back to the alert's thread (see
-    #    deploy/docker/patches/kanban_event_routing.py).
-    if thread_id:
-        _register_session_routing(session_id, active_platform, thread_id)
-        if alert_title and active_platform == SLACK_PLATFORM:
-            _record_alert_title(session_id, alert_title)
-    else:
-        # The ledger row already says this alert was announced; it was written
-        # before the post was attempted. Correct it now, or the daily recap
-        # counts a message nobody received into "went to chat as it happened"
-        # and drops the workload from the body.
-        #
-        # Only this branch. A failure further down means chat *did* get the
-        # alert and the triage turn did not start, which is a different defect
-        # and leaves `notified` correctly set: the reader saw the alert, just
-        # never the follow-up. `_post_initial_alert` also lands here when the
-        # send succeeded but returned no parseable `message_id`, so the record
-        # says the delivery is unconfirmed rather than certainly lost — the
-        # honest reading, and the safe direction for a report whose failure
-        # mode is false reassurance.
-        mark_delivery_failed(
-            event_row_id,
-            f"no message id from {' or '.join(repr(p) for p in platforms)}; "
-            "see the session server log",
-        )
-        logger.error(
-            f"Alert for session {session_id} was not delivered to any enabled platform "
-            f"({', '.join(platforms)}); the daily recap will report it as undelivered"
-        )
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -2620,8 +2811,9 @@ def _send_to_chat(
 ) -> str | None:
     """Post `message`, into an existing thread when one is known, within `timeout` seconds if given.
 
-    Returns the thread id to route replies to, or None if the send failed.
-    Generalises _post_initial_alert's target handling: `hermes send --to` takes
+    Returns the thread id to route replies to, None if the send failed, or
+    :data:`ALERT_SENT_WITHOUT_THREAD` when a fresh post succeeded (or, exit 3,
+    may have) with no thread to read. Generalises _post_initial_alert's target handling: `hermes send --to` takes
     `<platform>:<chat>:<thread>` for a threaded reply, which is the same target
     shape send_notification builds in platform_mcp_server.py.
     """
@@ -2630,15 +2822,26 @@ def _send_to_chat(
     if threaded:
         target = f"{active_platform}:{chat_id}:{thread_id}"
     try:
+        # A deadline shorter than the CLI's own wait is passed down to it, so it
+        # answers (exit 3) before this kills it.
+        wait = None
+        if timeout is not None and chat_notify.routes(active_platform):
+            wait = max(1, timeout - chat_notify.NOTIFY_CONNECT_SECONDS)
         res = subprocess.run(
-            ["hermes", "send", "--json", "--to", target, message],
+            chat_notify.command(target, message, wait_seconds=wait),
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
             env=_run_env(),
             timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # May have posted. A reply into a known thread keeps that thread,
+            # as a success does; a fresh post has no thread to register.
+            logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
+            return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -2650,16 +2853,15 @@ def _send_to_chat(
     if threaded:
         return thread_id
     try:
-        msg_id = (json.loads(res.stdout) or {}).get("message_id", "")
+        resp = json.loads(res.stdout) or {}
     except Exception as exc:
-        logger.error(f"Failed to parse message_id from hermes send: {exc}")
+        logger.error(f"Failed to parse message_id from the send: {exc}")
         return None
-    if not msg_id:
+    if not isinstance(resp, dict) or not resp.get("message_id"):
+        # A send that printed something other than an object landed nowhere
+        # this caller can address; it must not raise into the relay loop.
         return None
-    if active_platform == "google_chat" and "/messages/" in msg_id:
-        space_part, msg_part = msg_id.split("/messages/", 1)
-        return f"{space_part}/threads/{msg_part.split('.')[0]}"
-    return msg_id
+    return chat_notify.thread_from_response(active_platform, resp) or None
 
 
 # Tokens that end a turn or open a role in a chat template. None of them has a
@@ -2924,7 +3126,8 @@ def _post_audit_blocks(
     missing report. An ok answer with no ts posted:
     ``thread_id`` is then empty and the caller counts the leg as delivered.
     """
-    if headline.issue is None or not slack_blocks_post.configured():
+    routed = chat_notify.routes(SLACK_PLATFORM)
+    if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     threaded = bool(chat_id and thread_id)
     built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
@@ -2935,6 +3138,10 @@ def _post_audit_blocks(
     if left < AUDIT_BLOCKS_MIN_POST_S:
         logger.warning(f"Relay for {profile}/{job_id}: no time left for the report blocks, posting text")
         return None
+    if routed:
+        return _post_audit_blocks_via_gateway(
+            profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
+        )
     try:
         ts = slack_blocks_post.post(
             chat_id or _slack_home_channel(),
@@ -2953,6 +3160,94 @@ def _post_audit_blocks(
         logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
         return None
     return AuditPost(thread_id if threaded else ts)
+
+
+# The A2A gateway answers no Slack interaction (it acks only Events API
+# envelopes), so a button posted through it is one a user clicks into a
+# timeout. Interactive elements are taken off the card on that path; a URL
+# button becomes a plain mrkdwn link so the ledger link survives.
+GATEWAY_INTERACTIVE_BLOCK = "actions"
+GATEWAY_BUTTON = "button"
+# How much sooner the CLI gives up than the subprocess bound, so the CLI's
+# own outcome-unknown exit is what a slow post ends in.
+GATEWAY_BLOCKS_TIMEOUT_MARGIN_S = 3
+
+
+def _without_interaction(blocks: list[dict]) -> list[dict]:
+    """The card without anything a user could click: no actions blocks and no
+    interactive accessories. The URLs of any link buttons come back as one
+    context block of mrkdwn links, so the card keeps where it points."""
+    kept: list[dict] = []
+    links: list[str] = []
+
+    def collect(element: dict) -> None:
+        if element.get("type") == GATEWAY_BUTTON and element.get("url"):
+            label = ((element.get("text") or {}).get("text") or element["url"]).replace("|", " ")
+            links.append(f"<{element['url']}|{label}>")
+
+    for block in blocks:
+        if block.get("type") == GATEWAY_INTERACTIVE_BLOCK:
+            for element in block.get("elements") or []:
+                collect(element)
+            continue
+        accessory = block.get("accessory")
+        if isinstance(accessory, dict) and accessory.get("type") not in ("image", None):
+            collect(accessory)
+            block = {key: value for key, value in block.items() if key != "accessory"}
+        kept.append(block)
+    if links:
+        kept.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(links)}]})
+    return kept
+
+
+def _post_audit_blocks_via_gateway(
+    profile: str, job_id: str, blocks: list[dict], text: str, thread_id: str, timeout: float
+) -> AuditPost | None:
+    """Post the audit report's blocks through the gateway's Slack chat.notify route.
+
+    The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
+    the broker's Slack relay is gone and the gateway holds Slack, so the blocks
+    go as ``a2a notify --blocks-file`` into the home channel (chat_notify.py).
+    Same outcomes as the relay path: None, to post text instead, after a
+    refusal, a failure to send, or a post that may have landed.
+    """
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(_without_interaction(blocks), handle)
+            path = handle.name
+        res = subprocess.run(
+            chat_notify.blocks_command(
+                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_BLOCKS_TIMEOUT_MARGIN_S, 1)
+            ),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env(),
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    if res.returncode != 0:
+        if chat_notify.outcome_unknown(res.returncode):
+            logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {res.stderr.strip()}")
+        else:
+            logger.warning(f"Relay for {profile}/{job_id}: report blocks not posted, posting text: {res.stderr.strip()}")
+        return None
+    try:
+        resp = json.loads(res.stdout) or {}
+    except ValueError:
+        resp = {}
+    if thread_id:
+        return AuditPost(thread_id)
+    return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
 
 
 def relay_cron_report(
@@ -3157,6 +3452,10 @@ def relay_cron_report(
         else:
             leg_message = truncation_notice + headline.text if headline else message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
+            if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
+                # Posted (or may have): delivered, with no thread to register.
+                unthreaded.append(platform)
+                new_thread_id = None
         # Nothing is posted under the headline: every headline links the ledger
         # issue, and the incident row stored below keeps the full report for a
         # reply in the thread.
@@ -3168,6 +3467,11 @@ def relay_cron_report(
                 f"so replies are not routed"
             )
             unthreaded.append(platform)
+        elif platform in unthreaded:
+            logger.warning(
+                f"Relay for {profile}/{job_id}: report to {platform} got no answer in time; "
+                f"treated as delivered, with no thread to register"
+            )
         else:
             logger.error(
                 f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"
@@ -3385,6 +3689,7 @@ def _inject_drift(
         # two entries with two insert ids.
         occurrences=1,
         notified=allowed,
+        session_id=session_id,
     )
 
     if not allowed:
@@ -3455,6 +3760,7 @@ def _inject_stall(
         severity=STALL_SEVERITY_LABEL,
         occurrences=len(names),
         notified=True,
+        session_id=session_id,
     )
 
     alert_msg = (
@@ -3538,7 +3844,7 @@ def inject_message(
     # The ledger row below is written either way, so the daily recap can report
     # what was held back; dropping these at the source would make them
     # invisible to it. See the "Suppressed" line in eod_report_generator.py.
-    suppressed = severity_label == "Info"
+    suppressed = severity_label == FEED_FILTERED_SEVERITY
 
     # The daily ceiling is enforced here rather than at /sessions because
     # severity is not known until the payload arrives, and here is the single
@@ -3581,6 +3887,7 @@ def inject_message(
         severity=severity_label,
         occurrences=count,
         notified=not (suppressed or quota_denied),
+        session_id=session_id,
     )
 
     if suppressed:
@@ -3659,6 +3966,77 @@ def inject_message(
     )
 
     return {"status": "injected"}
+
+
+def _conversation_session_id(context_id: str) -> str:
+    """The hermes-bridge's session id for a context id (apiSessionID in a2a/hermes-bridge/api.go)."""
+    if len(context_id) <= CONVERSATION_CONTEXT_MAX_CHARS and CONVERSATION_SAFE_CONTEXT_RE.match(context_id):
+        return CONVERSATION_SESSION_PREFIX + context_id
+    digest = hashlib.sha256(context_id.encode()).hexdigest()[:CONVERSATION_HASHED_HEX_CHARS]
+    return CONVERSATION_SESSION_PREFIX + CONVERSATION_HASHED_PREFIX + digest
+
+
+@app.put("/v1/sessions/{session_id}/route", dependencies=[Depends(verify_api_key)])
+def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record the gateway conversation a bridge session answers, so its cards report back there.
+
+    The hermes-bridge calls this before each turn of an `a2a-*` session (the
+    api executor's Hermes session for one gateway conversation). A kanban card
+    the turn files subscribes to `api_server` and this session id, and
+    `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
+    `conversation_route` (`platform`, `conversation`, the gateway's key, and
+    `context_id`) and addresses the subscription to the conversation. The
+    kanban notifier then posts the card's report with `a2a notify
+    --conversation`, and the gateway posts it only if the conversation's
+    session record carries that context id.
+
+    The row is upserted, keeping any other keys on it; the route stays out of
+    the row's platform/chat_id/thread_id, which address a chat thread.
+    """
+    if not session_id.startswith(CONVERSATION_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail=f"a route is recorded only for {CONVERSATION_SESSION_PREFIX}* sessions")
+    platform = str(request_data.get("platform") or "").strip()
+    conversation = str(request_data.get("conversation") or "").strip()
+    context_id = str(request_data.get("context_id") or "").strip()
+    prefix = CONVERSATION_KEY_PREFIXES.get(platform)
+    if prefix is None:
+        raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
+    if not conversation.startswith(prefix) or len(conversation) == len(prefix):
+        raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    if not context_id:
+        raise HTTPException(status_code=400, detail="context_id is required")
+    if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="conversation or context_id is too long")
+    if session_id != _conversation_session_id(context_id):
+        raise HTTPException(status_code=400, detail="context_id is not this session's")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            meta: Dict[str, Any] = {}
+            if row:
+                try:
+                    loaded = json.loads(row[0])
+                    meta = loaded if isinstance(loaded, dict) else {}
+                except ValueError:
+                    meta = {}
+            meta[CONVERSATION_ROUTE_KEY] = {
+                "platform": platform,
+                "conversation": conversation,
+                "context_id": context_id,
+            }
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",
+                (session_id, json.dumps(meta)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return {"status": "recorded"}
 
 
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])
@@ -3837,6 +4215,266 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# The activity feed: what the agent saw and what it did, read-only.
+#
+# For an install with no chat platform — a demo page, a first-run install —
+# these routes are the only way to read a triage report without a shell in the
+# pod. The admin console reads the same rows today by exec'ing SQLite inside
+# the pod (docs/designs/admin-console.md); these are the authenticated reads
+# that path can move onto.
+#
+# Every connection here opens with `mode=ro`, so a bug in a query cannot write
+# to either database. Task rows are returned column by column rather than as
+# `t.*`: Hermes' `tasks` table also carries the claim lock, worker pid and
+# workspace path, which are dispatcher state rather than activity, and a new
+# column upstream does not reach a caller until it is named here. Text fields
+# (`body`, `result`, run summaries, comments, event payloads) are returned as
+# the board holds them; they are model-written and can quote cluster objects,
+# so a caller that renders them treats them as untrusted text.
+# --------------------------------------------------------------------------
+
+
+def _read_only(path: str) -> sqlite3.Connection:
+    """Open `path` read-only. Raises sqlite3.OperationalError if it is absent."""
+    conn = sqlite3.connect(
+        f"{Path(path).absolute().as_uri()}?mode=ro",
+        uri=True,
+        timeout=FEED_DB_BUSY_TIMEOUT_SECONDS,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _kanban_db_path() -> str:
+    """The active kanban board path, resolved via `gitops_workspace.board_path`
+    unless tests override `KANBAN_DB_PATH`."""
+    return KANBAN_DB_PATH or str(gitops_workspace.board_path())
+
+
+def _clamp_limit(limit: int, maximum: int) -> int:
+    return max(1, min(int(limit), maximum))
+
+
+def _validate_non_negative_int64(value: int, name: str) -> int:
+    if value < 0 or value > SQLITE_INT64_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be between 0 and {SQLITE_INT64_MAX}",
+        )
+    return value
+
+
+def _feed_status(notified: int, severity: str, delivery_error: str) -> str:
+    """What became of a ledger row, in the inject route's own words.
+
+    Derived rather than stored, from the three columns that already decide it:
+    `notified` is non-zero (`1` when posted to chat, or `NOTIFIED_HEADLESS = 2`
+    when dispatched on a headless install where `_chat_platforms_disabled`
+    skips chat delivery) only for an alert admitted past the severity gate and
+    daily quota, an Info row is the one the severity gate filters, and
+    `delivery_error` is written only when a chat post was attempted and failed.
+    """
+    if notified:
+        return FEED_STATUS_INJECTED
+    if delivery_error:
+        return FEED_STATUS_UNDELIVERED
+    if severity == FEED_FILTERED_SEVERITY:
+        return FEED_STATUS_FILTERED
+    return FEED_STATUS_SUPPRESSED
+
+
+@app.get("/v1/intercepted-events", dependencies=[Depends(verify_api_key)])
+def list_intercepted_events(
+    since_id: Optional[int] = None,
+    limit: int = FEED_EVENTS_DEFAULT_LIMIT,
+) -> Dict[str, Any]:
+    """The event ledger, one row per event a producer forwarded.
+
+    Without `since_id`, the newest `limit` rows, newest first — what a page
+    shows on load. With `since_id` (including `since_id=0` after an empty
+    initial poll), the rows after that id, oldest first, so a poller passes
+    back `next_since_id` and sees each row once, in order. `truncated` says
+    more rows matched than were returned.
+    """
+    if since_id is not None:
+        since_id = _validate_non_negative_int64(since_id, "since_id")
+    limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
+    columns = (
+        "id, session_id, created_at, cluster, namespace, object_kind, workload, "
+        "reason, severity, notified, delivery_error, message"
+    )
+    with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+        if since_id is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (since_id, limit + 1),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events ORDER BY id DESC LIMIT ?",
+                (limit + 1,),
+            ).fetchall()
+    events = [
+        {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "timestamp": row["created_at"],
+            "cluster": row["cluster"],
+            "namespace": row["namespace"],
+            "kind": row["object_kind"],
+            "name": row["workload"],
+            "reason": row["reason"],
+            "severity": row["severity"],
+            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"]),
+            "message": row["message"],
+        }
+        for row in rows[:limit]
+    ]
+    cursor_floor = since_id if since_id is not None else 0
+    return {
+        "events": events,
+        "truncated": len(rows) > limit,
+        "next_since_id": max([cursor_floor] + [event["id"] for event in events]),
+    }
+
+
+# The task columns every feed route returns. `updated_at` is the admin
+# console's definition: the most recent of the lifecycle timestamps the row has.
+# `summary` is the latest run's, which is where `kanban_complete(summary=...)`
+# lands; `result` is the task's full report. `{extra}` is where the detail
+# route adds `body`, which the listings leave out to keep a page of them small.
+_TASK_FEED_SELECT = """
+    SELECT t.id, t.title, t.assignee, t.status, t.priority, t.session_id,{extra}
+           t.created_at, t.started_at, t.completed_at,
+           COALESCE(t.completed_at, t.last_heartbeat_at, t.started_at, t.created_at) AS updated_at,
+           (SELECT r.summary FROM task_runs r WHERE r.task_id = t.id ORDER BY r.id DESC LIMIT 1) AS summary,
+           t.result,
+           COALESCE(
+               (SELECT r.error FROM task_runs r WHERE r.task_id = t.id ORDER BY r.id DESC LIMIT 1),
+               t.last_failure_error
+           ) AS error
+    FROM tasks t
+"""
+
+
+def _read_kanban(read) -> Any:
+    """Run `read(conn)` against the board, mapping its absence to an answer.
+
+    Returns None when kanban.db does not exist yet — the board is created on
+    first use, so a fresh install has none, and that is an empty feed rather
+    than an error. A board that exists but cannot be read (locked past the
+    timeout, or a Hermes too old to have a column named here) is a 503.
+    """
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return None
+    try:
+        with closing(_read_only(board)) as conn:
+            return read(conn)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+
+
+def _task_rows(conn: sqlite3.Connection, where: str, params: Sequence[Any], order: str, limit: int) -> Dict[str, Any]:
+    rows = [dict(row) for row in conn.execute(f"{_TASK_FEED_SELECT.format(extra='')} {where} ORDER BY {order} LIMIT ?", (*params, limit + 1))]
+    return {"tasks": rows[:limit], "truncated": len(rows) > limit}
+
+
+def _empty_task_feed() -> Dict[str, Any]:
+    return {"tasks": [], "truncated": False, "board": False}
+
+
+@app.get("/v1/sessions/{session_id}/tasks", dependencies=[Depends(verify_api_key)])
+def list_session_tasks(session_id: str, limit: int = FEED_TASKS_DEFAULT_LIMIT) -> Dict[str, Any]:
+    """The kanban cards filed from one session, oldest first.
+
+    For an event, `session_id` is the ledger row's, and the first card is the
+    triage the front door filed; later ones are whatever that work spawned
+    under the same session.
+    """
+    limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
+    result = _read_kanban(
+        lambda conn: _task_rows(conn, "WHERE t.session_id = ?", (session_id,), "t.created_at, t.id", limit)
+    )
+    return {**result, "board": True} if result is not None else _empty_task_feed()
+
+
+@app.get("/v1/tasks", dependencies=[Depends(verify_api_key)])
+def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: str = "") -> Dict[str, Any]:
+    """Recently active cards, most recently updated first.
+
+    `since` is a Unix time in seconds, the unit the board stores, compared
+    against `updated_at`. `assignee` is an exact profile name, for example the
+    platform agent's, to find the card that applied a fix or opened a pull
+    request.
+    """
+    since = _validate_non_negative_int64(since, "since")
+    limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
+    clauses = ["COALESCE(t.completed_at, t.last_heartbeat_at, t.started_at, t.created_at) >= ?"]
+    params: list[Any] = [since]
+    if assignee:
+        clauses.append("t.assignee = ?")
+        params.append(assignee)
+    result = _read_kanban(
+        lambda conn: _task_rows(conn, "WHERE " + " AND ".join(clauses), params, "updated_at DESC, t.id", limit)
+    )
+    return {**result, "board": True} if result is not None else _empty_task_feed()
+
+
+@app.get("/v1/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
+def get_task(task_id: str) -> Dict[str, Any]:
+    """One card with its body, report, runs, events and comments.
+
+    Mirrors the admin console's `task_detail`, less two of its parts: chat
+    delivery rows (`kanban_notify_subs` holds chat and user ids) and
+    attachments. Each child list keeps its newest rows under its ceiling, and
+    its `*_truncated` flag says when older ones were cut.
+    """
+
+    def read(conn: sqlite3.Connection) -> Dict[str, Any]:
+        task = conn.execute(
+            f"{_TASK_FEED_SELECT.format(extra=' t.body,')} WHERE t.id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise HTTPException(status_code=404, detail="no such task")
+
+        def newest(query: str, ceiling: int) -> tuple[list[Dict[str, Any]], bool]:
+            rows = [dict(row) for row in conn.execute(query, (task_id, ceiling + 1))]
+            truncated = len(rows) > ceiling
+            rows = rows[:ceiling]
+            rows.reverse()
+            return rows, truncated
+
+        runs, runs_truncated = newest(
+            "SELECT id, profile, status, started_at, ended_at, outcome, summary, error "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            TASK_DETAIL_MAX_RUNS,
+        )
+        events, events_truncated = newest(
+            "SELECT id, run_id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            TASK_DETAIL_MAX_EVENTS,
+        )
+        comments, comments_truncated = newest(
+            "SELECT id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            TASK_DETAIL_MAX_COMMENTS,
+        )
+        return {
+            "task": dict(task),
+            "runs": runs,
+            "runs_truncated": runs_truncated,
+            "events": events,
+            "events_truncated": events_truncated,
+            "comments": comments,
+            "comments_truncated": comments_truncated,
+        }
+
+    result = _read_kanban(read)
+    if result is None:
+        raise HTTPException(status_code=404, detail="no kanban board on this install yet")
+    return result
+
+
+# --------------------------------------------------------------------------
 # The findings queue: docs/designs/inventory-findings-queue.md §6.1.
 #
 # HTTP rather than MCP tools alone because the event watcher is a first-class
@@ -3905,13 +4543,32 @@ def get_findings(
 
 @app.post("/v1/findings/{finding_id}/surfaced", dependencies=[Depends(verify_api_key)])
 def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """After the send. `publisher`, `added_class` and `run` are sent by a paced publisher alone (§7.2).
+
+    The MCP tool sends none of them, so a finding a model names in answer to a pull
+    is counted as named but never as shown.
+    """
     body = body or {}
     return _findings_write(
         findings_queue.mark_surfaced,
         finding_id,
         str(body.get("chat_id") or ""),
         str(body.get("thread_id") or ""),
+        str(body.get("publisher") or ""),
+        str(body.get("added_class") or ""),
+        str(body.get("run") or ""),
     )
+
+
+@app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
+def get_finding_additions(day: str = "") -> Dict[str, Any]:
+    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    day = day or datetime.now(timezone.utc).date().isoformat()
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            return findings_queue.additions_on(conn, day)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])

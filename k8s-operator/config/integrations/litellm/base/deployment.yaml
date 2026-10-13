@@ -88,6 +88,12 @@ spec:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
               value: /tmp
+            # LiteLLM v1.104.0+ refuses to boot without a master key unless permitted.
+            # In kube-agents, LiteLLM is an in-cluster gateway on a private Service
+            # protected by NetworkPolicy, and internal callers authenticate at the
+            # transport boundary rather than via LiteLLM's user-auth layer.
+            - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
+              value: "true"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -147,6 +153,10 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            # Beside config.yaml, where LiteLLM resolves a custom callback module.
+            - name: config-volume
+              mountPath: /app/litellm_thinking_replay_callback.py
+              subPath: litellm_thinking_replay_callback.py
             - name: tmp
               mountPath: /tmp
       volumes:

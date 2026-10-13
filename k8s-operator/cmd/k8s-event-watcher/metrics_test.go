@@ -192,7 +192,7 @@ func TestRun_AnEventReachingTheInformerIsCountedAsSeen(t *testing.T) {
 		t.Fatal(err)
 	}
 	disp, m, _, _ := newCountingDispatcher(t, filterThresholds{})
-	w := newWatcher(client, disp, targetCluster{Name: "seen", ProjectID: "p", Location: "us-central1"}, 0)
+	w := newWatcher(client, disp, targetCluster{Name: "seen", ProjectID: "p", Location: "us-central1"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

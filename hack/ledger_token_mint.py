@@ -12,7 +12,8 @@ caller-specific arrives through the environment, never argv:
   EVAL_LEDGER_INSTALLATION_ID  its installation; defaults likewise
 
 The one argument is the exit code to use for a failure another attempt could
-survive (a 5xx, a 429, an unreachable api.github.com); any other failure exits
+survive (a 5xx, a 429, a 403 GitHub marks as its rate limit, an unreachable
+api.github.com); any other failure exits
 1. Passed in rather than duplicated so the two halves of the contract cannot
 drift: the shell decides what it retries, this decides what is retryable.
 
@@ -42,6 +43,16 @@ JWT_BACKDATE_SECONDS = 60
 JWT_LIFETIME_SECONDS = 540
 # How much of openssl's stderr a signing failure quotes.
 OPENSSL_STDERR_LIMIT = 300
+# A 403 is GitHub's secondary rate limit, not a refusal, when it carries one of
+# these marks. The same discriminator as hack/ci_sweep_agent_pulls.py's
+# is_rate_limited, copied rather than imported so the mint loads nothing else
+# from hack/; tests/test_ci_eval_ledger_mint.py holds the two copies together.
+FORBIDDEN_CODE = 403
+RETRY_AFTER_HEADER = "Retry-After"
+RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
+RATE_LIMIT_BODY_MARKERS = ("rate limit", "abuse detection")
+# How much of a refusal's body is read for the marks.
+ERROR_BODY_CHARS = 300
 
 retryable = int(sys.argv[1])
 
@@ -68,6 +79,24 @@ if not mint_body:
         "receives the installation's whole grant, and every caller names what it asks for"
         % app_id
     )
+
+
+def rate_limited_403(exc):
+    """A 403 GitHub marks as its rate limit: a Retry-After, no requests
+    remaining, or a body naming a limit. An unmarked 403 is a refusal."""
+    if exc.code != FORBIDDEN_CODE:
+        return False
+    headers = exc.headers or {}
+    if headers.get(RETRY_AFTER_HEADER) is not None:
+        return True
+    if str(headers.get(RATELIMIT_REMAINING_HEADER, "")).strip() == "0":
+        return True
+    try:
+        text = exc.read(ERROR_BODY_CHARS).decode("utf-8", "replace").lower()
+    except Exception:
+        # A body cut short reads as no marks: the status stays a refusal.
+        text = ""
+    return any(marker in text for marker in RATE_LIMIT_BODY_MARKERS)
 
 
 def b64(raw):
@@ -115,9 +144,10 @@ except urllib.error.HTTPError as exc:
     # 401: the PEM is not App app_id's. 404: the installation id is wrong, or
     # the App was uninstalled from the org. Neither survives another attempt,
     # and a caller holding two locks should hear about them on the first.
-    # 403 stays terminal with them: on this endpoint it is a suspended
-    # installation as often as a secondary rate limit, and the two read alike
-    # from here. 422 is terminal too: with a body it means the installation
+    # A 403 is either: a suspended installation is terminal with them, but
+    # GitHub's secondary rate limit -- one installation minting for every unit
+    # of concurrent runs -- is a 403 too, and it says so (rate_limited_403),
+    # so that one is retried like a 429. 422 is terminal too: with a body it means the installation
     # does not hold a permission or repository the body asked for, which is
     # an organisation-settings change, not something a retry reaches.
     message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
@@ -126,7 +156,7 @@ except urllib.error.HTTPError as exc:
         app_id,
         installation_id,
     )
-    if exc.code >= 500 or exc.code == 429:
+    if exc.code >= 500 or exc.code == 429 or rate_limited_403(exc):
         temporary(message)
     sys.exit(message)
 except Exception as exc:

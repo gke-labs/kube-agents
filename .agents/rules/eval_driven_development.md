@@ -1,3 +1,9 @@
+---
+# Claude Code loads a rule without `paths` unconditionally; Antigravity uses `trigger` and `description`.
+trigger: model_decision
+description: "Eval-driven development workflow: running the red-to-green devops-bench eval loop and registering bench cases when changing agent behaviour."
+---
+
 # Eval-driven development
 
 [`AGENTS.md`](../../AGENTS.md) owns the rule: a change to what an agent does starts from a

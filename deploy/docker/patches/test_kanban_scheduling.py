@@ -58,6 +58,7 @@ from pathlib import Path
 
 from apply_kanban_scheduling import (
     BUILD_MARKER,
+    CAPPED_ANCHOR,
     CHARGE_ANCHOR,
     CHARGE_PATCHED,
     DB_RELATIVE,
@@ -66,6 +67,12 @@ from apply_kanban_scheduling import (
     DISPATCH_RELATIVE,
     EDITS,
     FENCE_ANCHOR,
+    RESERVE_HEAD_ANCHOR,
+    RESERVE_SPAWN_ANCHOR,
+    RESERVED_BUILD_MARKER,
+    RESULT_FIELDS_ANCHOR,
+    RESULT_FIELDS_PATCHED,
+    SATURATION_ANCHOR,
     SWEEP_FIELD_ANCHOR,
     SWEEP_FIELD_PATCHED,
     TRIP_ANCHOR,
@@ -1392,10 +1399,15 @@ class ChildrenTableAgreementTest(unittest.TestCase):
         text = dockerfile.read_text()
         self.assertIn(BUILD_MARKER, text)
         self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, text)
+        self.assertIn(RESERVED_BUILD_MARKER, text)
 
     def test_the_edit_count_matches_what_the_prose_claims(self):
-        """Six is written into the docstrings and asserted nowhere else."""
-        self.assertEqual(len(apply_kanban_scheduling.EDITS), 6)
+        """"Ten edits (eleven anchors)" is written into the docstring and
+        asserted nowhere else; edit 10 is the one with two anchors."""
+        self.assertEqual(len(apply_kanban_scheduling.EDITS), 11)
+        self.assertIn(
+            "Ten edits (eleven anchors)", apply_kanban_scheduling.__doc__
+        )
 
     def test_the_unmutated_applier_succeeds(self):
         """The control. Without it the three refusals below prove nothing: an
@@ -1567,6 +1579,71 @@ def count_running_tasks(conn):
 '''
 
 
+# ``DispatchResult`` at v2026.9.14, reduced to one upstream field ahead of the
+# last one, which edit 7 appends after.
+DISPATCH_RESULT_PREAMBLE = (
+    "@dataclass\n"
+    "class DispatchResult:\n"
+    "    spawned: list[tuple[str, str, str]] = field(default_factory=list)\n"
+)
+
+# ``_tick_spawn_budget`` at v2026.9.14, around edit 8: the ``max_spawn`` branch
+# returns the same ``False, None``, which is why the anchor carries the
+# ``total_running`` line above its ``if``.
+TICK_BUDGET_PREAMBLE = (
+    "\n\ndef _tick_spawn_budget(conn, result, *, max_spawn, max_in_progress, board):\n"
+    "    running_count = count_running_tasks(conn)\n"
+    "    spawn_budget = None\n"
+    "    if max_spawn is not None:\n"
+    "        if running_count >= max_spawn:\n"
+    "            return False, None\n"
+    "        spawn_budget = max_spawn - running_count\n"
+    "    if max_in_progress is not None:\n"
+)
+TICK_BUDGET_EPILOGUE = (
+    "        remaining = max_in_progress - total_running\n"
+    "        if spawn_budget is None or spawn_budget > remaining:\n"
+    "            spawn_budget = remaining\n"
+    "    return True, spawn_budget\n"
+)
+
+# ``_dispatch_once_locked`` at v2026.9.14 around edits 9 and 10: the early
+# return, the ready loop with its default-assignee branch, and the review loop.
+DISPATCH_LOCKED_PREAMBLE = (
+    "\n\ndef _dispatch_once_locked(conn, *, spawn_fn=None, dry_run=False,\n"
+    "                          max_spawn=None, max_in_progress=None, board=None,\n"
+    "                          default_assignee=None):\n"
+    "    result = DispatchResult()\n"
+)
+DISPATCH_LOCKED_MIDDLE = (
+    '    ready_rows = _lane_rows(conn, "ready")\n'
+    "    review_rows = []\n"
+    "    ready_budget = spawn_budget\n"
+    "    lane_kwargs = dict(dry_run=dry_run, board=board, spawn_fn=spawn_fn)\n"
+    "    default_assignee = _resolve_default_assignee(default_assignee)\n"
+)
+DISPATCH_LOCKED_LOOP_BODY = (
+    '        row_assignee = row["assignee"]\n'
+    "        if not row_assignee:\n"
+    "            if not default_assignee or not _apply_default_assignee(\n"
+    '                conn, row["id"], default_assignee, dry_run=dry_run,\n'
+    "            ):\n"
+    '                result.skipped_unassigned.append(row["id"])\n'
+    "                continue\n"
+    "            row_assignee = default_assignee\n"
+    '            result.auto_assigned_default.append(row["id"])\n'
+)
+DISPATCH_LOCKED_EPILOGUE = (
+    "\n"
+    "    for row in review_rows:\n"
+    "        if spawn_budget is not None and spawned >= spawn_budget:\n"
+    "            break\n"
+    '        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):\n'
+    "            spawned += 1\n"
+    "    return result\n"
+)
+
+
 def pristine_db():
     """A fake ``kanban_db.py`` carrying exactly the one anchor expected there."""
     return BLOCK_TASK_PREAMBLE + DEPENDENCY_ANCHOR + BLOCK_TASK_EPILOGUE
@@ -1592,6 +1669,19 @@ def pristine_dispatch():
         + WAITING_ANCHOR
         + "\n\n"
         + UPSTREAM_FINGERPRINT_SOURCE
+        + "\n\n"
+        + DISPATCH_RESULT_PREAMBLE
+        + RESULT_FIELDS_ANCHOR
+        + TICK_BUDGET_PREAMBLE
+        + SATURATION_ANCHOR
+        + TICK_BUDGET_EPILOGUE
+        + DISPATCH_LOCKED_PREAMBLE
+        + CAPPED_ANCHOR
+        + DISPATCH_LOCKED_MIDDLE
+        + RESERVE_HEAD_ANCHOR
+        + DISPATCH_LOCKED_LOOP_BODY
+        + RESERVE_SPAWN_ANCHOR
+        + DISPATCH_LOCKED_EPILOGUE
     )
 
 
@@ -1631,7 +1721,7 @@ class ApplierTest(unittest.TestCase):
     def test_every_edit_names_a_file_the_applier_opens(self):
         self.assertEqual({file for file, _, _, _ in EDITS}, set(PRISTINE))
 
-    def test_all_six_edits_land_and_both_results_parse(self):
+    def test_all_edits_land_and_both_results_parse(self):
         out = self._applied()
         db, dispatch = out[DB_RELATIVE], out[DISPATCH_RELATIVE]
         self.assertIn("_kanban_repair_inverted_deps(conn, task_id, reason)", db)
@@ -1671,6 +1761,113 @@ class ApplierTest(unittest.TestCase):
                 self.assertIn(f"as {name},", dispatch)
                 self.assertNotIn(name, db)
         self.assertNotIn("_kanban_repair_inverted_deps", dispatch)
+        # Edits 7-10 import from their own module, once, into the dispatcher only.
+        self.assertEqual(dispatch.count("from hermes_cli.kanban_priority import"), 1)
+        self.assertNotIn("kanban_priority", db)
+        for name in (
+            "_kanban_note_waiting",
+            "_kanban_record_saturation",
+            "_kanban_reserved_slot",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(f"as {name},", dispatch)
+
+    def _function(self, source, name):
+        tree = ast.parse(source)
+        return next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+
+    def test_the_new_result_fields_carry_defaults(self):
+        """A dataclass field without a default after defaulted ones is a
+        TypeError at import, so each new field must keep one."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertIn(RESULT_FIELDS_PATCHED, dispatch)
+        cls = next(
+            node for node in ast.parse(dispatch).body
+            if isinstance(node, ast.ClassDef) and node.name == "DispatchResult"
+        )
+        fields = {
+            node.target.id: node.value
+            for node in cls.body
+            if isinstance(node, ast.AnnAssign)
+        }
+        for name in ("skipped_reserved", "saturation", "ready_left", "queued_noticed"):
+            with self.subTest(field=name):
+                self.assertIsNotNone(fields.get(name, None), f"{name} has no default")
+
+    def test_saturation_is_recorded_on_the_cap_branch_only(self):
+        """Before the max_in_progress return, and not on the max_spawn one."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        fn = self._function(dispatch, "_tick_spawn_budget")
+        branches = [
+            node for node in ast.walk(fn)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "total_running >= max_in_progress"
+        ]
+        self.assertEqual(len(branches), 1)
+        body = [ast.unparse(stmt) for stmt in branches[0].body]
+        self.assertTrue(body[0].startswith("_kanban_record_saturation("), body)
+        self.assertIn("conn, result, total_running, max_in_progress, board", body[0])
+        self.assertEqual(body[-1], "return (False, None)")
+        self.assertEqual(ast.unparse(fn).count("_kanban_record_saturation("), 1)
+
+    def test_a_capped_tick_notes_waiting_cards_before_returning(self):
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        fn = self._function(dispatch, "_dispatch_once_locked")
+        branch = next(
+            node for node in ast.walk(fn)
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "not may_spawn"
+        )
+        body = [ast.unparse(stmt) for stmt in branch.body]
+        self.assertTrue(body[0].startswith("_kanban_note_waiting(conn, result"), body)
+        self.assertIn("dry_run=dry_run", body[0])
+        self.assertEqual(body[-1], "return result")
+
+    def test_the_reservation_sits_inside_the_ready_loop_after_assignee_routing(self):
+        """The share is read before the loop, checked after the default
+        assignee is applied (so an unassigned row is still reported as
+        unassigned), charged on a spawn, and settled after the loop and before
+        the review lane."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        fn = self._function(dispatch, "_dispatch_once_locked")
+        body = fn.body
+        loops = [
+            (i, node) for i, node in enumerate(body)
+            if isinstance(node, ast.For) and ast.unparse(node.iter) == "ready_rows"
+        ]
+        self.assertEqual(len(loops), 1)
+        at, loop = loops[0]
+        self.assertEqual(
+            ast.unparse(body[at - 1]),
+            "_kanban_slot = _kanban_reserved_slot(conn, max_in_progress, board)",
+        )
+        self.assertEqual(
+            ast.unparse(body[at + 1]), "_kanban_slot.finish(result, dry_run=dry_run)"
+        )
+        review = next(
+            i for i, node in enumerate(body)
+            if isinstance(node, ast.For) and ast.unparse(node.iter) == "review_rows"
+        )
+        self.assertLess(at + 1, review)
+        statements = [ast.unparse(stmt) for stmt in loop.body]
+        check = next(
+            i for i, text in enumerate(statements)
+            if text.startswith("if _kanban_slot.holds_back(row, result):")
+        )
+        unassigned = next(
+            i for i, text in enumerate(statements) if text.startswith("if not row_assignee:")
+        )
+        spawn = next(
+            i for i, text in enumerate(statements) if text.startswith("if _dispatch_lane_task(")
+        )
+        self.assertLess(unassigned, check)
+        self.assertEqual(check + 1, spawn)
+        self.assertEqual(
+            [ast.unparse(stmt) for stmt in loop.body[spawn].body],
+            ["spawned += 1", "_kanban_slot.took(row)"],
+        )
 
     def test_the_sweeps_verdict_rides_the_dataclass_out_of_the_transaction(self):
         """``_reclaim_dead_workers`` returns a ``_CrashSweep``; the charge loop
@@ -1804,7 +2001,7 @@ class ApplierTest(unittest.TestCase):
         self.assertLess(use_line, fn.end_lineno + 1)
 
     def test_every_anchor_is_load_bearing(self):
-        """Remove any one of the six from its file and the build must stop."""
+        """Remove any one of the anchors from its file and the build must stop."""
         for relative, label, anchor, _ in EDITS:
             with self.subTest(anchor=label):
                 body = PRISTINE[relative]().replace(anchor, "", 1)
@@ -1898,7 +2095,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
 
     Its three ``kanban_db.py`` anchors sit in ``create_task``,
     ``complete_task`` and ``unblock_task`` — functions the one edit here in
-    that file (``block_task``) does not touch, and the other five edits are in
+    that file (``block_task``) does not touch, and the other ten edits are in
     ``kanban_db_dispatch.py``, which it never opens. The coupling is invisible
     from either applier alone, so it is asserted rather than left to
     inspection: a future edit that widens an anchor into one of those functions

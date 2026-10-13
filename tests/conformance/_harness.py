@@ -62,6 +62,7 @@ import credential_proxy  # noqa: E402
 # imports it by path. Distinct from the callback's own registration name so
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+SKILL_OVERLAY_MODULE_NAME = "kube_agents_skill_overlay"
 
 # The same, for the Slack click handler imported by path.
 SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
@@ -115,6 +116,9 @@ SOURCES: dict[str, Source] = {
             "def _sanitize_for_logging(",
             "def blocked_by(",
             "os.umask(0o177)",
+            "DESTRUCTIVE_SLACK_VERBS",
+            "SLACK_REMOVE_ALLOWLIST",
+            "SLACK_METHOD_SHAPE",
         ),
     ),
     "session_kv_server": Source(
@@ -306,6 +310,25 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
     ),
+    # The A2A door's developer class: the verifier, the gateway's resolver
+    # for what it verified, the eval-caller grammar the class's prefix is
+    # disjoint from, and the roster arm that keeps it off the chat map.
+    "a2a_door_google": Source(
+        "a2a/gateway/a2adoor_google.go",
+        ("func (v *googleTokenVerifier) check", "a2aGoogleCallerPrefix =", ") identify("),
+    ),
+    "a2a_door_google_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2AGooglePrincipal", "a2aGoogleCallerPrefix"),
+    ),
+    "a2a_door_callers": Source(
+        "a2a/gateway/a2adoor.go",
+        ("func callerOf(",),
+    ),
+    "a2a_door_roster": Source(
+        "a2a/gateway/gateway.go",
+        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend"),
+    ),
     # The gateway's Slack identity rule: the allowlist gates, the map
     # overrides, and the member id is the principal otherwise.
     "a2a_slack_ingress": Source(
@@ -423,7 +446,13 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "lib.TaskEventsSubject(pod,"),
+        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+    ),
+    # The other narrowing that starts from executorGrants: an AgentProfile's
+    # pods (the A2A profile resource, not a Hermes profile directory).
+    "a2a_profile_grants": Source(
+        "a2a/authcallout/profile_narrowing.go",
+        ("func profileGrants", "executorGrants(profile, pod)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what
@@ -559,9 +588,23 @@ SOURCES: dict[str, Source] = {
         ),
     ),
     # --- supply chain -----------------------------------------------------
+    # The tool that keeps the mirrored gke-* skills, and the CI step that runs
+    # its offline check. C4 reads the pin and the checksum from the first and
+    # that they are enforced from the second.
     "skill_sync": Source(
-        "scripts/sync-upstream-skills.py",
-        ("UPSTREAM_REPO", "--depth"),
+        "scripts/skill_overlay.py",
+        ("def cmd_check(", "def verify_copy(", "def tree_sha256("),
+    ),
+    "validate_workflow": Source(
+        ".github/workflows/validate.yml",
+        ("Mirrored skills match their upstream copy and overlay",),
+    ),
+    "makefile": Source("Makefile", ("skills-check:", "SKILL_OVERLAY :=")),
+    # One member of the mirrored-skill set C4 walks, so the self-check names
+    # the set when the skills or their overlays move.
+    "skill_lock_gke_basics": Source(
+        "agents/platform/skill-overlays/gke-basics/upstream.lock",
+        ("commit:", "sha256:"),
     ),
     "tags_env": Source("tags.env", ("HERMES_AGENT_TAG",)),
     # `repository:` is C4's read. The platformAgent block is D2's: it is
@@ -748,6 +791,16 @@ def gateway_redactor_module():
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
     sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def skill_overlay_module():
+    """The mirrored-skill tool, imported by path for its pure helpers (tree_sha256)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SKILL_OVERLAY_MODULE_NAME, path_of("skill_sync"))
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 

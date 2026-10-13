@@ -316,6 +316,8 @@ data:
           long_running_notifications: true
           memory_notifications: "off"
           tool_progress: "off"
+    kanban:
+      max_in_progress: 6
     model:
       api_key: none
       api_mode: chat_completions
@@ -654,6 +656,8 @@ spec:
               value: us-central1-a
             - name: KUBE_CONTEXT_NAME
               value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBEAGENTS_SCOPE_DECLARED
+              value: "false"
             - name: SANDBOX_IMAGE_TREES
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
@@ -1087,10 +1091,10 @@ spec:
             limits:
               cpu: "1"
               ephemeral-storage: 2Gi
-              memory: 1Gi
+              memory: 2Gi
             requests:
               cpu: 500m
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

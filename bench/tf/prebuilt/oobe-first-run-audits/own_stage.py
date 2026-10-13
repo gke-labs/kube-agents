@@ -16,21 +16,36 @@
 
 Usage: python3 - <home> < own_stage.py
 
-A fresh install has the `oobe` job until its scan has settled, its own chain has started the
-last audit, and the tick after that has removed the job. Arming over that would point the job at
-the stand-in cards, start the audits beside the real scan or chain, and use up the install's own
-first run; arming in the minute between `done` and the removal would record the job as present
-while its own tick takes it away, leaving nothing to run the stand-in chain. So this waits for
-the job itself to be gone. Prints `pending` or `clear`.
+A fresh install has the `oobe` job until onboarding is over: its first-run audits stage is done
+and its report was claimed a few minutes ago, after which a tick removes the job. On an install
+nobody has spoken to, the report is never claimed and the job stays.
+
+Pending while the audits stage is not done: arming over it would point the job at the stand-in
+cards, start the audits beside the real scan or chain, and use up the install's own first run.
+Pending, too, while the stage is done and the report claimed (`.bootstrap_completed`) but the job
+is still there: a tick is about to remove it, and an arm in that minute would record the job as
+present while that tick takes it away, leaving nothing to run the stand-in chain. Otherwise clear.
+Prints `pending` or `clear`.
 """
 
+import json
+import os
 import sys
 
 from cron.jobs import is_job_runnable, load_jobs
 
 home = sys.argv[1]
 JOB_ID = "oobe"
+AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
+COMPLETED_MARKER = os.path.join(home, ".bootstrap_completed")
+DONE_KEY = "done"
 
 # A disabled or paused job never runs, so it never finishes: nothing to wait for.
 present = any(job.get("id") == JOB_ID and is_job_runnable(job) for job in load_jobs())
-print("pending" if present else "clear")
+try:
+    with open(AUDITS_MARKER, encoding="utf-8") as fh:
+        done = bool(json.load(fh).get(DONE_KEY))
+except (OSError, ValueError, AttributeError):
+    done = False
+retiring = done and os.path.exists(COMPLETED_MARKER)
+print("pending" if present and (not done or retiring) else "clear")

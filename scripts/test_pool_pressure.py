@@ -26,6 +26,11 @@ QUIET_DIR = os.path.join(TESTDATA, "quiet")
 # with --as-of set to the following midnight so the window covers exactly it.
 BREACH_AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
 QUIET_AS_OF = datetime(2026, 8, 28, tzinfo=timezone.utc)
+# saturated is the afternoon of 2026-10-08, when the pool had nothing free and
+# runs failed at the Boskos acquire; read at a moment that puts the failures
+# inside the recent window (#2747).
+SATURATED_DIR = os.path.join(TESTDATA, "saturated")
+SATURATED_AS_OF = datetime(2026, 10, 8, 18, 30, tzinfo=timezone.utc)
 
 
 def run(**kwargs):
@@ -103,11 +108,12 @@ class Percentile(unittest.TestCase):
 
 
 class Banners(unittest.TestCase):
-    """The one thing this check reads out of another repository.
+    """The two things this check reads out of other repositories.
 
     kube-agents-presubmits.yaml prints these lines and nobody editing it knows
     they are parsed here, so the grammar is what is pinned and the wording is
-    not.
+    not. The refusal is boskosctl's own last line, and that one is pinned by
+    wording: it is the only sign the acquire gave up.
     """
 
     LOG = "\n".join((
@@ -144,6 +150,36 @@ class Banners(unittest.TestCase):
         requested, acquired = pp.lease_window(head)
         self.assertIsNotNone(requested)
         self.assertIsNone(acquired)
+
+    FAILED = "\n".join((
+        "=== [2026-10-08T17:34:26Z] Leasing GCP Project from Boskos ===",
+        "failed to acquire a resource: resources not found",
+    ))
+
+    def test_a_failed_acquire_is_recognised_by_boskosctls_last_line(self):
+        """Nothing follows the failure line, so without this the run has no
+        lease segment and scores as a fast one (#2747)."""
+        self.assertTrue(pp.lease_failed(self.FAILED))
+        self.assertEqual(
+            (pp.parse_rfc3339("2026-10-08T17:34:26Z"), None), pp.lease_window(self.FAILED)
+        )
+
+    def test_a_log_that_stops_at_the_lease_is_not_a_failed_acquire(self):
+        """A run killed inside the acquire has the same no-successor shape, so
+        silence stays unmeasured rather than becoming a failure."""
+        self.assertFalse(pp.lease_failed("\n".join(self.LOG.split("\n")[:2])))
+
+    def test_the_failure_line_counts_only_between_the_lease_banner_and_the_next(self):
+        self.assertFalse(pp.lease_failed(self.LOG + "\n" + self.FAILED.split("\n")[1]))
+        self.assertFalse(pp.lease_failed(self.FAILED.split("\n")[1] + "\n" + self.LOG))
+
+    def test_an_acquire_that_could_not_reach_boskos_is_not_a_refusal(self):
+        """boskosctl's prefix is the same; only the not-found tail says the
+        pool was empty. A dial error is an acquire nobody could read."""
+        down = self.FAILED.split("\n")[0] + (
+            '\nfailed to acquire a resource: Post "http://boskos/acquire": dial tcp: connection refused'
+        )
+        self.assertFalse(pp.lease_failed(down))
 
     def test_rewording_that_keeps_the_keyword_still_matches(self):
         log = "\n".join((
@@ -242,6 +278,19 @@ class WaitFromProwjob(unittest.TestCase):
         self.assertEqual({"queue", "pod", "setup", "lease"}, set(wait.segments))
         self.assertEqual(1800.0, wait.total_seconds)
 
+    def test_a_failed_acquire_is_flagged_and_measures_no_lease(self):
+        source = pp._collect_waits_from_dir(
+            SATURATED_DIR, SATURATED_AS_OF - timedelta(days=1), SATURATED_AS_OF
+        )
+        by_build = {w.build_id: w for w in source.value.waits}
+        failed = by_build[2108249555685347328]
+        self.assertTrue(failed.lease_failed)
+        self.assertIsNone(failed.lease_seconds)
+        self.assertEqual(pp.parse_rfc3339("2026-10-08T17:34:26Z"), failed.lease_requested)
+        slow = by_build[2108236254767222784]
+        self.assertFalse(slow.lease_failed)
+        self.assertAlmostEqual(559.0, slow.lease_seconds)
+
     def test_every_captured_fixture_parses(self):
         root = os.path.join(BREACH_DIR, "prowjobs")
         for name in os.listdir(root):
@@ -275,6 +324,16 @@ class LiveQueueFromDeck(unittest.TestCase):
         minutes = [w.minutes for w in queue.waiting]
         self.assertEqual(sorted(minutes, reverse=True), minutes)
         self.assertEqual(4, len(minutes))
+
+    def test_every_running_job_is_collected_for_the_leak_cross_reference(self):
+        """Every job in the pool leases, so a periodic's lease compared against
+        the smoke runs alone reads as leaked (#2747). The smoke set stays for
+        the cap confirmation."""
+        queue = self._queue(SATURATED_DIR, SATURATED_AS_OF)
+        self.assertEqual({"2108236254767222784"}, queue.running_build_ids)
+        self.assertEqual(
+            {"2108236254767222784", "2108256000000000000"}, queue.all_running_build_ids
+        )
 
     def test_another_tenants_job_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -310,6 +369,23 @@ class PoolStateFields(unittest.TestCase):
                             {pp.BOSKOS_NO_OWNER: 4, "pull-kube-agents-smoke-test-111": 1})
         self.assertEqual(["pull-kube-agents-smoke-test-111"], pool.lease_holders())
 
+    def test_an_owner_without_a_build_id_is_held_by_hand(self):
+        pool = pp.PoolState(
+            {"busy": 1, "rebuilding": 2},
+            {"": 0, "pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
+        )
+        self.assertEqual({"hangdng-rebuild": 2}, pool.held_by_hand())
+        self.assertEqual({}, pool.held_by_job())
+
+    def test_a_jobs_fixed_owner_is_held_by_a_job_not_by_hand(self):
+        """hack/fleet_reconcile.py leases four projects under `fleet-reconcile`
+        on every merge and every morning; a row that calls those a person's
+        would be wrong twice a day."""
+        pool = pp.PoolState({"busy": 5}, {"fleet-reconcile": 4, "hangdng-rebuild": 1})
+        self.assertEqual({"fleet-reconcile": 4}, pool.held_by_job())
+        self.assertEqual({"hangdng-rebuild": 1}, pool.held_by_hand())
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
+
     def test_a_third_state_is_counted_as_neither_leased_nor_available(self):
         """`cleaning` and `dirty` are projects nothing can lease right now. Read
         as free they make a pool that is out of projects look like it has some.
@@ -327,16 +403,29 @@ class LeakedLeases(unittest.TestCase):
         return pp.PoolState({"busy": len(holders)},
                             {f"pull-kube-agents-smoke-test-{b}": 1 for b in holders})
 
+    ONE = "2108236254767222784"
+    TWO = "2108256000000000000"
+
     def test_a_lease_held_by_a_running_job_is_not_a_leak(self):
-        queue = pp.LiveQueue([], {"111", "222"})
-        self.assertEqual([], pp.leaked_leases(self._pool(["111", "222"]), queue))
+        queue = pp.LiveQueue([], {self.ONE, self.TWO})
+        self.assertEqual([], pp.leaked_leases(self._pool([self.ONE, self.TWO]), queue))
 
     def test_a_lease_no_running_job_accounts_for_is_reported(self):
-        queue = pp.LiveQueue([], {"111"})
+        queue = pp.LiveQueue([], {self.ONE})
         self.assertEqual(
-            ["pull-kube-agents-smoke-test-222"],
-            pp.leaked_leases(self._pool(["111", "222"]), queue),
+            [f"pull-kube-agents-smoke-test-{self.TWO}"],
+            pp.leaked_leases(self._pool([self.ONE, self.TWO]), queue),
         )
+
+    def test_a_lease_held_by_a_running_periodic_is_not_a_leak(self):
+        pool = pp.PoolState({"busy": 1}, {f"ci-kube-agents-eval-next-{self.TWO}": 1})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), {self.TWO})))
+
+    def test_a_hand_hold_is_not_a_leak(self):
+        """An owner with no build ID was taken by a person, who Deck has never
+        heard of; it is reported as held, never as leaked."""
+        pool = pp.PoolState({"rebuilding": 2}, {"hangdng-rebuild": 2})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
 
     def test_the_unowned_placeholder_is_not_a_leak(self):
         """Boskos files free resources under the empty-string owner.
@@ -344,13 +433,15 @@ class LeakedLeases(unittest.TestCase):
         It is a count of nobody. Treated as a holder it would make every idle
         pool report a mystery lease.
         """
-        pool = pp.PoolState({"busy": 1, "free": 4}, {"": 4, "pull-kube-agents-smoke-test-111": 1})
-        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], {"111"})))
+        pool = pp.PoolState(
+            {"busy": 1, "free": 4}, {"": 4, f"pull-kube-agents-smoke-test-{self.ONE}": 1}
+        )
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], {self.ONE})))
 
     def test_nothing_is_reported_when_either_source_is_missing(self):
         """With no list of running jobs, every holder looks orphaned."""
-        self.assertEqual([], pp.leaked_leases(self._pool(["111"]), None))
-        self.assertEqual([], pp.leaked_leases(None, pp.LiveQueue([], {"111"})))
+        self.assertEqual([], pp.leaked_leases(self._pool([self.ONE]), None))
+        self.assertEqual([], pp.leaked_leases(None, pp.LiveQueue([], {self.ONE})))
 
 
 class LatestMaxConcurrency(unittest.TestCase):
@@ -386,6 +477,46 @@ class Cause(unittest.TestCase):
         label, text = pp.cause(self._pool(15, 0), pp.LiveQueue([], set()), 15)
         self.assertEqual(pp.CAUSE_CAPACITY, label)
         self.assertIn("Onboard the next project", " ".join(text))
+
+    def test_lease_failures_are_capacity_and_name_what_holds_the_pool(self):
+        """A refusal is Boskos saying nothing was free for the whole acquire,
+        so the label is CAPACITY; the text says what the projects are doing,
+        because the remedy differs when two of them are a repair or a leak."""
+        pool = pp.PoolState(
+            {"busy": 3, "rebuilding": 2},
+            {"pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
+        )
+        label, text = pp.cause(
+            pool, pp.LiveQueue([], set()), 35, lease_failures=2,
+            leaked=["pull-kube-agents-smoke-test-2108220000000000000"],
+        )
+        self.assertEqual(pp.CAUSE_CAPACITY, label)
+        joined = "\n".join(text)
+        self.assertIn("2 run(s)", joined)
+        self.assertIn("3 leased, 0 free, 5 total", joined)
+        self.assertIn("out of rotation: rebuilding 2", joined)
+        self.assertIn("held by hand: hangdng-rebuild (2)", joined)
+        self.assertIn("1 lease(s) leaked", joined)
+
+    def test_lease_failures_with_projects_free_now_are_still_capacity(self):
+        label, text = pp.cause(self._pool(30, 5), pp.LiveQueue([], set()), 35, lease_failures=1)
+        self.assertEqual(pp.CAUSE_CAPACITY, label)
+        self.assertIn("30 leased, 5 free, 35 total", "\n".join(text))
+
+    def test_a_live_backlog_over_free_projects_outranks_a_stale_refusal(self):
+        """A refusal is evidence about the moment of the ask. A run queued past
+        the limit while projects sit free is the #2666 shape right now, and
+        that diagnosis must not wait three hours for the refusal to age out."""
+        label, text = pp.cause(
+            self._pool(18, 12), pp.LiveQueue([], set()), None, lease_failures=1, live_backlog=True
+        )
+        self.assertEqual(pp.CAUSE_CONTROL_PLANE, label)
+        self.assertIn("1 run(s) in the last 3h", text[0], "the refusal still leads the text")
+
+    def test_lease_failures_with_an_unreadable_pool_stay_unknown(self):
+        label, text = pp.cause(None, None, None, lease_failures=1)
+        self.assertEqual(pp.CAUSE_UNKNOWN, label)
+        self.assertIn("1 run(s)", "\n".join(text))
 
     def test_free_projects_below_the_cap_is_the_cap(self):
         label, text = pp.cause(
@@ -471,6 +602,17 @@ class DailyRows(unittest.TestCase):
         self.assertFalse(row.breached(15, 45))
         self.assertEqual(600.0, row.worst)
 
+    def test_a_failed_acquire_is_counted_but_not_measured(self):
+        """Its wait is a lower bound on a run that never got a project, and it
+        would pull the day's percentiles down (#2747)."""
+        created = pp.parse_rfc3339("2026-10-08T12:00:00Z")
+        failed = pp.Wait(9, "1", created, created + timedelta(minutes=1), 35,
+                         lease_requested=created + timedelta(minutes=2), lease_failed=True)
+        row = pp.DayRow("2026-10-08", self._waits("2026-10-08", [20, 21, 22, 23, 24]) + [failed])
+        self.assertEqual((5, 1), (row.count, row.lease_failures))
+        self.assertEqual(22.0, row.p50)
+        self.assertEqual(24.0, row.worst)
+
     def test_the_highest_cap_seen_that_day_is_reported(self):
         created = pp.parse_rfc3339("2026-08-27T12:00:00Z")
         waits = [pp.Wait(1, "1", created, created, 6), pp.Wait(2, "2", created, created, 10)]
@@ -479,8 +621,9 @@ class DailyRows(unittest.TestCase):
 
 class RecentRow(unittest.TestCase):
     """The stretch the chat alert quotes, so its numbers and its remedy share
-    a clock. Evidence only: `breached` stays on the daily rows and the live
-    queue, so TestGrid's row does not move with it."""
+    a clock. Its percentiles are evidence only -- `breached` stays on the daily
+    rows, the live queue and the refusal count, so TestGrid's row does not
+    move with them; its `lease_failures` is that third trigger."""
 
     END = pp.parse_rfc3339("2026-08-27T12:00:00Z")
 
@@ -497,6 +640,27 @@ class RecentRow(unittest.TestCase):
         self.assertTrue(row["judged"])
         self.assertEqual(row["p50_minutes"], 20.0)
         self.assertEqual(row["window_start"], "2026-08-27T09:00:00Z")
+
+    def test_failed_acquires_are_counted_by_when_they_asked_and_left_out_of_the_percentiles(self):
+        """A run can queue an hour before it asks, so the ask dates the failure."""
+        def failed(n, created_back, asked_back):
+            return pp.Wait(n, "1", self.END - timedelta(minutes=created_back),
+                           self.END - timedelta(minutes=created_back - 1), 35,
+                           lease_requested=self.END - timedelta(minutes=asked_back),
+                           lease_failed=True)
+        inside = failed(8, created_back=200, asked_back=100)
+        outside = failed(9, created_back=400, asked_back=300)
+        # Created inside the window too: the one that reaches the
+        # `not w.lease_failed` filter rather than the creation filter.
+        fresh = failed(10, created_back=100, asked_back=50)
+        # Created before a replay's instant, asked after it: not yet refused.
+        later = failed(11, created_back=5, asked_back=-4)
+        row = pp.recent_row(
+            self._waits([30, 60, 90, 120, 150]) + [inside, outside, fresh, later], self.END
+        )
+        self.assertEqual(row["runs"], 5, "a refused run is not a sample, whenever it was created")
+        self.assertEqual(row["lease_failures"], 2)
+        self.assertEqual(row["p50_minutes"], 20.0)
 
     def test_a_stretch_under_the_sample_floor_withholds_its_percentiles(self):
         # Two samples put any number at p95, the same reason a day's row is
@@ -516,9 +680,9 @@ class RecentRow(unittest.TestCase):
         self.assertIsNone(row["p50_minutes"])
 
     def test_a_terrible_recent_stretch_does_not_breach_on_its_own(self):
-        # Evidence, not a verdict. `breached` is breached_days or the live
-        # queue; wiring this block into it would move TestGrid's row and the
-        # JUnit exit code with a three-hour reading. Six 200-minute waits
+        # Evidence, not a verdict. `breached` is breached_days, the live queue
+        # or a refusal; wiring these percentiles into it would move TestGrid's
+        # row and the JUnit exit code with a three-hour reading. Six 200-minute waits
         # straddling midnight: enough to judge the stretch, three a side and so
         # too few to judge either day.
         end = pp.parse_rfc3339("2026-08-27T01:00:00Z")
@@ -690,6 +854,22 @@ class SweepDeadline(unittest.TestCase):
         self.assertTrue(summary["trend"]["truncated"])
         self.assertEqual("2026-08-27", summary["trend"]["window_start"][:10])
         self.assertIn("ran out of time", pp.render(summary))
+
+
+class IndexCopy(unittest.TestCase):
+    def test_only_build_files_are_copied_from_the_index(self):
+        """`latest-build.txt` sits under the same prefix, and Prow rewrites it
+        at every smoke start. A bulk copy that includes it can 404 mid-copy and
+        turn the hour UNMEASURED, so the pattern is pinned as a literal."""
+        with unittest.mock.patch.object(pp, "run_cmd", return_value=(0, "", "")) as cmd, \
+                tempfile.TemporaryDirectory() as tmp:
+            pp._index_entries_from_gcs(tmp)
+        argv = cmd.call_args.args[0]
+        self.assertEqual(["gcloud", "storage", "cp"], argv[:3])
+        self.assertEqual(
+            "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
+            argv[3],
+        )
 
 
 class LogHead(unittest.TestCase):
@@ -938,6 +1118,65 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("queue 175.2", out)
         self.assertIn("CAPACITY", out)
 
+    def test_a_failed_acquire_in_the_last_three_hours_breaches_on_its_own(self):
+        """The requirement from #2747: runs refused a project on an afternoon
+        whose percentiles never moved, and the check said OK. Real artifacts
+        of two of them, with a Boskos map built to that afternoon's shape: full,
+        two projects held by hand for a repair, one lease nobody is running."""
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("LEASE FAILED: 2 run(s)", out)
+        self.assertIn("PR 2703    build 2108249555685347328", out)
+        self.assertIn("CAPACITY", out)
+        self.assertIn("out of rotation: rebuilding 2", out)
+        self.assertIn("held by a job without a run ID: fleet-reconcile (1)", out)
+        self.assertIn("held by hand: hangdng-rebuild (2)", out)
+        # The refused runs leave the segment medians: the one leased run's
+        # acquire, alone, not withheld under a 1-of-3 coverage.
+        self.assertIn("9.3 min   (1 of 1)", out)
+
+    def test_refused_runs_are_not_outliers_and_not_in_the_window_percentiles(self):
+        """The two refused runs waited about seven minutes from creation to
+        the ask; over a five-minute line they would be outliers, and in the
+        window percentiles they would halve the median."""
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1,
+                        outlier_limit=5)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("Individual runs that waited over 5.0 minutes: 1", out)
+        self.assertIn("build 2108236254767222784", out.split("Individual runs")[1])
+        leaks = out.split("held by runs Deck does not know about")[1].split("\n\n")[0]
+        self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", leaks)
+        self.assertNotIn("ci-kube-agents-eval-next", leaks, "a running periodic is not a leak")
+        self.assertNotIn("hangdng-rebuild", leaks, "a hand hold is not a leak")
+
+    def test_a_failed_acquire_older_than_three_hours_is_history_not_a_breach(self):
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF + timedelta(hours=3),
+                        window_days=1)
+        self.assertEqual(pp.EXIT_OK, code)
+        self.assertIn("WITHIN THRESHOLD", out)
+        self.assertNotIn("LEASE FAILED", out)
+
+    def test_a_run_queued_past_p50_over_free_projects_outranks_a_refusal(self):
+        """The round-trip of the override: a refusal in the window, the pool
+        drained, and a run queued twenty minutes with projects free is the
+        control-plane shape, at the p50 bar the chat bot calls a backlog."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            created = SATURATED_AS_OF - timedelta(minutes=20)
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [{
+                    "metadata": {"creationTimestamp": created.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                    "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 2700}]}},
+                    "status": {"state": "triggered"},
+                }]}, fh)
+            with open(os.path.join(tmp, "boskos.json"), "w") as fh:
+                json.dump({"current": {"busy": 20, "free": 15}, "owner": {}}, fh)
+            code, out = run(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("CONTROL PLANE, not capacity. 15 project(s) were free", out)
+        self.assertIn("2 run(s) in the last 3h asked Boskos", out, "the refusal still leads")
+
     def test_a_quiet_day_is_green_and_reports_no_leaks(self):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_OK, code)
@@ -1055,11 +1294,48 @@ class JsonOutput(unittest.TestCase):
         payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         self.assertEqual(
             set(payload["recent"]),
-            {"hours", "window_start", "runs", "judged", "p50_minutes", "p95_minutes", "worst_minutes"},
+            {"hours", "window_start", "runs", "lease_failures", "judged",
+             "p50_minutes", "p95_minutes", "worst_minutes"},
         )
         self.assertEqual(payload["recent"]["hours"], pp.RECENT_WINDOW_HOURS)
         self.assertFalse(payload["recent"]["judged"], "nothing ran in the fixture's last three hours")
         self.assertIn("last 3h", payload["report"])
+
+    def test_lease_failures_hand_holds_and_states_reach_the_payload(self):
+        # The health bot reads `held_by_hand` and the recent count; the day
+        # rows carry the failures so the trend keeps them.
+        payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(
+            [("2108249555685347328", "2703", "2026-10-08T17:34:26Z", True),
+             ("2108248670569762816", "2712", "2026-10-08T17:30:56Z", True)],
+            [(f["build_id"], f["pull"], f["lease_requested"], f["recent"])
+             for f in payload["lease_failures"]],
+        )
+        self.assertEqual({"hangdng-rebuild": 2}, payload["held_by_hand"])
+        self.assertEqual({"fleet-reconcile": 1}, payload["held_by_job"])
+        self.assertEqual({"busy": 4, "rebuilding": 2}, payload["states"])
+        self.assertEqual(2, payload["recent"]["lease_failures"])
+        self.assertEqual(2, payload["trend"]["lease_failures"])
+        # The window percentiles are the one leased run's, not pulled down by
+        # the two refused runs' one-minute waits.
+        self.assertEqual((1, 22.6, 22.6), (payload["trend"]["runs"],
+                                            payload["trend"]["p50_minutes"],
+                                            payload["trend"]["p95_minutes"]))
+        self.assertEqual((1, 2), (payload["trend"]["days"][0]["runs"],
+                                  payload["trend"]["days"][0]["lease_failures"]))
+        self.assertEqual(["pull-kube-agents-smoke-test-2108220000000000000"],
+                         payload["leaked_leases"])
+        self.assertEqual(pp.CAUSE_CAPACITY, payload["cause"])
+
+    def test_an_unread_pool_leaves_the_holds_and_states_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            payload = self._payload(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertIsNone(payload["held_by_hand"])
+        self.assertIsNone(payload["held_by_job"])
+        self.assertIsNone(payload["states"])
+        self.assertEqual(pp.CAUSE_UNKNOWN, payload["cause"])
 
     def test_a_quiet_payload_says_so_without_a_cause_of_capacity(self):
         payload = self._payload(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
@@ -1177,13 +1453,68 @@ class JunitOutput(unittest.TestCase):
         prop = case.find(f"properties/property[@name='{pp.JUNIT_METRIC_PROPERTY}']")
         return None if prop is None else prop.get("value")
 
-    def test_the_file_is_a_testsuite_of_the_five_rows_in_order(self):
+    def test_the_file_is_a_testsuite_of_the_eight_rows_in_order(self):
         _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         self.assertEqual("testsuite", root.tag)
         self.assertEqual(pp.JUNIT_SUITE_NAME, root.get("name"))
         self.assertEqual(list(pp.JUNIT_ROW_NAMES),
                          [case.get("name") for case in root.findall("testcase")])
-        self.assertEqual("5", root.get("tests"))
+        self.assertEqual("8", root.get("tests"))
+
+    def test_the_lease_failure_hold_and_rotation_rows_carry_their_counts(self):
+        code, root = self._junit(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_HELD_BY_HAND]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_OUT_OF_ROTATION]))
+        self.assertIn("2 run(s)", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
+
+    def test_a_window_where_every_run_was_refused_says_so_on_the_setup_rows(self):
+        """Runs were created; none leased. "No runs were created" beside a
+        lease-failures row that may read 0 (the refusals older than three
+        hours) would make a refused morning look like a quiet one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("prowjobs", "started", "logs"):
+                os.mkdir(os.path.join(tmp, sub))
+                for name in os.listdir(os.path.join(SATURATED_DIR, sub)):
+                    if name.startswith("lease-failed"):
+                        os.symlink(os.path.join(SATURATED_DIR, sub, name), os.path.join(tmp, sub, name))
+            _, root = self._junit(from_dir=tmp, as_of=SATURATED_AS_OF + timedelta(hours=4),
+                                  window_days=1)
+        rows = self._rows(root)
+        for name in (pp.JUNIT_ROW_P50, pp.JUNIT_ROW_P95):
+            self.assertEqual("every run in the window was refused a project",
+                             rows[name].find("skipped").get("message"), name)
+        self.assertEqual("0", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
+                         "the refusals are older than the recent window")
+
+    def test_the_lease_failures_row_is_skipped_when_the_cut_fell_inside_its_window(self):
+        """Between 00:00 and 03:00 UTC a truncated sweep can start after the
+        recent window does; a count over the remainder would graph as zero."""
+        payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        payload["trend"]["truncated"] = True
+        payload["trend"]["window_start"] = "2026-10-08T17:00:00Z"  # after 15:30Z
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        skipped = rows[pp.JUNIT_ROW_LEASE_FAILURES].find("skipped")
+        self.assertIsNotNone(skipped)
+        self.assertIn("ran out of time", skipped.get("message"))
+        # A cut before the window leaves the count whole.
+        payload["trend"]["window_start"] = "2026-10-08T00:00:00Z"
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
+
+    def test_the_two_pool_rows_are_skipped_when_boskos_was_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            _, root = self._junit(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
+                         "the failures come from the trend, which was read")
+        for name in (pp.JUNIT_ROW_HELD_BY_HAND, pp.JUNIT_ROW_OUT_OF_ROTATION):
+            self.assertIsNotNone(rows[name].find("skipped"), name)
+            self.assertIsNone(self._value(rows[name]), name)
 
     def test_a_breach_fails_the_verdict_row_and_carries_the_numbers(self):
         code, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
@@ -1261,7 +1592,7 @@ class JunitOutput(unittest.TestCase):
         self.assertIn("boskos.json", pool_skip.get("message"))
         self.assertIsNone(self._value(rows[pp.JUNIT_ROW_QUEUE]))
         self.assertIsNone(self._value(rows[pp.JUNIT_ROW_FREE]))
-        self.assertEqual("2", root.get("skipped"))
+        self.assertEqual("4", root.get("skipped"), "the queue row and the three pool rows")
         self.assertEqual("BREACH (UNKNOWN)",
                          rows[pp.JUNIT_ROW_VERDICT].find("failure").get("message"))
 
@@ -1493,9 +1824,13 @@ class PublishedInterface(unittest.TestCase):
         self.assertEqual("setup p95 minutes", pp.JUNIT_ROW_P95)
         self.assertEqual("longest live queue minutes", pp.JUNIT_ROW_QUEUE)
         self.assertEqual("free pool projects", pp.JUNIT_ROW_FREE)
+        self.assertEqual("recent lease failures", pp.JUNIT_ROW_LEASE_FAILURES)
+        self.assertEqual("projects held by hand", pp.JUNIT_ROW_HELD_BY_HAND)
+        self.assertEqual("projects out of rotation", pp.JUNIT_ROW_OUT_OF_ROTATION)
         self.assertEqual(
             ("pool pressure within threshold", "setup p50 minutes", "setup p95 minutes",
-             "longest live queue minutes", "free pool projects"),
+             "longest live queue minutes", "free pool projects", "recent lease failures",
+             "projects held by hand", "projects out of rotation"),
             pp.JUNIT_ROW_NAMES,
         )
 

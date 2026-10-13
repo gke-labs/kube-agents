@@ -23,8 +23,10 @@ discovery, which deletes ``.bootstrap_scan_filed`` but may not know this marker,
 still gets its own hand-off.
 """
 
+import dataclasses
 import hashlib
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -39,6 +41,9 @@ PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 ASSIGNEE = "platform"
 RAW_PATH = "/opt/data/INVENTORY.raw.md"
 REPORT_PATH = "/opt/data/INVENTORY.md"
+# inventory_findings.py's DEFAULT_LIMITS_PATH, which its `select` reads;
+# test_bootstrap_handoff.py holds the two copies equal.
+LIMITS_PATH = "/opt/data/INVENTORY.limits.json"
 PRIORITIZE_INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory_prioritize_sop.md",
     "/opt/platform-template/governance/inventory_prioritize_sop.md",
@@ -151,6 +156,30 @@ def _read_marker(path: Path) -> dict[str, str]:
         if match and match.group(2):
             fields.setdefault(match.group(1), match.group(2))
     return fields
+
+
+def read_scan_marker(marker: Path, now: float | None = None) -> tuple[str, float] | None:
+    """The sweep card's id and when it was filed, from the gate's marker; None without an id.
+
+    The one reader of this marker, for the hand-off and the oobe stage alike. A ``filed_at`` that
+    is missing, hand-written, truncated or not epoch seconds (milliseconds, nan, inf) would stop
+    every clock that counts from it, so the marker's own age stands in.
+    """
+    fields = _read_marker(marker)
+    sweep_id = fields.get("task_id", "")
+    if not sweep_id:
+        return None
+    now = time.time() if now is None else now
+    try:
+        filed_at = float(fields.get("filed_at", ""))
+    except ValueError:
+        filed_at = float("nan")
+    if not 0 < filed_at <= now:
+        try:
+            filed_at = marker.stat().st_mtime
+        except OSError:
+            return None
+    return sweep_id, filed_at
 
 
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
@@ -627,6 +656,19 @@ def write_raw(data_dir: Path, text: str, path: str = RAW_PATH) -> bool:
     return True
 
 
+def limits_text() -> str:
+    """The findings pacing limits as this pod's environment sets them, as JSON.
+
+    The ranking card's terminal is the shell sandbox, which gets none of this
+    pod's environment, so ``inventory_findings.py select`` reads how many
+    criticals the first report lists from this file. Not from the card body:
+    the body is the card's identity, and a changed limit would archive a live card.
+    """
+    import findings_queue  # beside this script in the pod
+
+    return json.dumps(dataclasses.asdict(findings_queue.pacing_limits(os.environ))) + "\n"
+
+
 def _prioritize_body() -> str:
     paths = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     return (
@@ -739,11 +781,11 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     filed here, once per sweep.
     """
     now = time.time() if now is None else now
-    filed = _read_marker(scan_marker)
-    sweep_id = filed.get("task_id", "")
-    if not sweep_id:
+    filed = read_scan_marker(scan_marker, now)
+    if filed is None:
         _log(f"{scan_marker} names no task_id; nothing to hand off")
         return None
+    sweep_id, filed_at = filed
     marker = data_dir / HANDOFF_MARKER
     done = _read_marker(marker)
     if done.get("sweep") == sweep_id:
@@ -765,12 +807,6 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         # The cards just filed have not run; nothing is settled this tick.
         return None
     state["unfiled"] = unfiled
-    try:
-        filed_at = float(filed["filed_at"])
-    except (KeyError, ValueError):
-        # A marker written by hand may carry only the card id; its own
-        # timestamp is when the sweep was filed, near enough.
-        filed_at = scan_marker.stat().st_mtime
     ready = settled(state) and not unfiled
     timed_out = not ready and now - filed_at >= deadline(state)
     if not ready and not timed_out:
@@ -797,6 +833,8 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         except OSError as e:
             _log(f"wrote {REPORT_PATH} but could not write {marker}: {e}")
         _log(f"no cluster was audited for sweep {sweep_id}; wrote {REPORT_PATH} without ranking")
+        return None
+    if not write_raw(data_dir, limits_text(), LIMITS_PATH):
         return None
     task_id = file_prioritize(parse_task_id, state.get("stale_keys"))
     if not task_id:

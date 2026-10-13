@@ -1,8 +1,11 @@
 import importlib.util
+import io
 import json
 import sqlite3
 import sys
 import unittest
+import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -875,6 +878,753 @@ def _table_after(text: str, marker: str) -> list[list[str]]:
     return rows
 
 
+UTC = timezone.utc
+CRITICAL_RUBRIC = {"B": 8, "L": 6, "detect": 3, "recover": 2, "C": 1.0}  # 240
+
+
+def at(day: int, hour: int, minute: int = 0) -> datetime:
+    """A moment in October 2026, UTC."""
+    return datetime(2026, 10, day, hour, minute, tzinfo=UTC)
+
+
+def stamp(moment: datetime) -> str:
+    """As SQLite's datetime('now') writes it: naive UTC."""
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def row(rid, severity="critical", check=None, state="queued", shown=None, C=1.0, score=None, absent=None, **extra) -> dict:
+    """A ranked row, as `/ranked` returns it, without a database."""
+    out = {
+        "id": rid,
+        "check_slug": check or rid,
+        "project": "acme",
+        "cluster": "prod",
+        "namespace": "payments",
+        "object": rid,
+        "title": f"title {rid}",
+        "severity": severity,
+        "rank_score": score if score is not None else {"critical": 240, "major": 90, "minor": 2}[severity],
+        "rubric": {"C": C},
+        "state": state,
+        "first_shown_at": stamp(shown) if shown else None,
+        "absent_since": stamp(absent) if absent else None,
+        "provider_managed": False,
+        "actionable": True,
+    }
+    out.update(extra)
+    return out
+
+
+NONE_ADDED = {"critical": 0, "noncritical": 0}
+
+
+def ids(items) -> list[list[str]]:
+    return [[member["id"] for member in item.members] for item in items]
+
+
+class TestPacingSchema(unittest.TestCase):
+    def _released_table(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        released = (
+            fq.FINDINGS_SCHEMA.replace("    first_shown_at    TIMESTAMP,\n", "")
+            .replace("    added_class       TEXT,\n", "")
+            .replace("    absent_since      TIMESTAMP,\n", "")
+        )
+        self.assertNotIn("first_shown_at", released)
+        self.assertNotIn("absent_since", released)
+        conn.execute(released)
+        columns = "id, source, check_slug, project, cluster, object, title, severity, rank_score, rubric, recommendation, remediation, verification, state, surfaced_at, surface_count"
+        # The old nudge named the top two criticals each morning. A model
+        # answering a pull marked "pulled-critical" through the same route.
+        for rid, severity, score, state, surfaced_at, count in (
+            ("named-critical", "critical", 250, "surfaced", "2026-10-05 12:00:01", 3),
+            ("named-critical-2", "critical", 240, "surfaced", "2026-10-05 12:00:01", 3),
+            ("pulled-critical", "critical", 200, "surfaced", "2026-10-05 09:00:00", 1),
+            ("pulled-major", "major", 100, "surfaced", "2026-10-05 09:00:00", 1),
+            ("never-named", "critical", 100, "queued", None, 0),
+        ):
+            conn.execute(
+                f"INSERT INTO findings ({columns}) VALUES (?, 'inventory', ?, 'acme', 'prod', 'o', 't', ?, ?, "
+                "'{\"B\": 8, \"L\": 6, \"detect\": 3, \"recover\": 2, \"C\": 100}', '{}', '{}', '{}', ?, ?, ?)",
+                (rid, rid, severity, score, state, surfaced_at, count),
+            )
+        return conn
+
+    def test_a_released_table_gains_the_columns_and_keeps_its_rows(self):
+        conn = self._released_table()
+
+        fq.init_findings_schema(conn)
+
+        rows = {f["id"]: f for f in fq.ranked_findings(conn)}
+        self.assertEqual(
+            set(rows), {"named-critical", "named-critical-2", "pulled-critical", "pulled-major", "never-named"}
+        )
+        # The old nudge named these criticals, so they are shown and keep being
+        # reminded, but they are no addition: no day's budget is spent on them.
+        for rid in ("named-critical", "named-critical-2"):
+            self.assertEqual(rows[rid]["first_shown_at"], "2026-10-05 12:00:01")
+            self.assertIsNone(rows[rid]["added_class"])
+        # Below the old nudge's top two, so a pull marked it: shown here, it
+        # would be pending without ever being added.
+        self.assertIsNone(rows["pulled-critical"]["first_shown_at"])
+        # The old nudge never marked a non-critical, so whoever did was not a
+        # paced publisher: shown here, it would stop every addition.
+        self.assertIsNone(rows["pulled-major"]["first_shown_at"])
+        self.assertIsNone(rows["never-named"]["first_shown_at"])
+        decision = fq.pace(fq.ranked_findings(conn), at(6, 12), fq.PacingLimits(), NONE_ADDED)
+        self.assertEqual(ids(decision.add), [["pulled-critical"], ["never-named"]])
+        self.assertEqual(ids(decision.remind), [["named-critical"], ["named-critical-2"]])
+        self.assertEqual(fq.additions_on(conn, "2026-10-05"), {"day": "2026-10-05", "critical": 0, "noncritical": 0})
+        self.assertEqual(fq.register_findings(conn, [sample()])["results"][0]["outcome"], "created")
+
+    def test_a_table_with_the_pacing_columns_gains_absent_since_and_reads_as_still_reported(self):
+        # A table an earlier build of the pacing change wrote: `first_shown_at`
+        # and `added_class` exist, `absent_since` does not. A shown critical at
+        # C = 0.6 may have been downgraded for absence or registered as
+        # inferred; nothing tells them apart, so it stays pending and reminded.
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute(fq.FINDINGS_SCHEMA.replace("    absent_since      TIMESTAMP,\n", ""))
+        conn.execute(
+            "INSERT INTO findings (id, source, check_slug, project, cluster, object, title, severity, rank_score, "
+            "rubric, recommendation, remediation, verification, state, first_shown_at) VALUES ('inferred', "
+            "'inventory', 'wi-off', 'acme', 'prod', 'prod', 't', 'critical', 173, "
+            "'{\"B\": 8, \"L\": 6, \"detect\": 3, \"recover\": 3, \"C\": 60}', '{}', '{}', '{}', 'surfaced', "
+            "'2026-10-01 12:00:00')"
+        )
+
+        fq.init_findings_schema(conn)
+
+        rows = fq.ranked_findings(conn)
+        self.assertIsNone(rows[0]["absent_since"])
+        self.assertEqual(rows[0]["first_shown_at"], "2026-10-01 12:00:00")
+        self.assertEqual(ids(fq.pace(rows, at(6, 12), fq.PacingLimits(), NONE_ADDED).remind), [["inferred"]])
+
+    def test_the_backfill_runs_once(self):
+        conn = self._released_table()
+        fq.init_findings_schema(conn)
+        conn.execute("UPDATE findings SET first_shown_at = NULL WHERE id = 'named-critical'")
+
+        fq.init_findings_schema(conn)
+
+        self.assertIsNone(fq.get_finding(conn, "named-critical")["first_shown_at"])
+
+
+class TestShownMarker(QueueTestCase):
+    def setUp(self):
+        super().setUp()
+        self.register(sample())
+        self.fid = self.ids()[0]
+
+    def test_a_pull_names_without_showing(self):
+        # The MCP tool sends no publisher: a model answering "show me the list"
+        # must not spend a day's budget or create a pending item.
+        row = fq.mark_surfaced(self.conn, self.fid, "spaces/AAA")
+        self.assertEqual(row["surface_count"], 1)
+        self.assertEqual(row["state"], "surfaced")
+        self.assertIsNone(row["first_shown_at"])
+        self.assertIsNone(row["added_class"])
+
+    def test_a_paced_publisher_shows_once_and_records_the_class_once(self):
+        first = fq.mark_surfaced(self.conn, self.fid, publisher="nudge", added_class="noncritical")
+        self.assertIsNotNone(first["first_shown_at"])
+        self.assertEqual(first["added_class"], "noncritical")
+        self.conn.execute("UPDATE findings SET first_shown_at = '2026-10-01 12:00:00' WHERE id = ?", (self.fid,))
+
+        again = fq.mark_surfaced(self.conn, self.fid, publisher="nudge", added_class="critical")
+
+        self.assertEqual(again["first_shown_at"], "2026-10-01 12:00:00")
+        self.assertEqual(again["added_class"], "noncritical")
+        self.assertEqual(again["surface_count"], 2)
+
+    def test_a_row_joining_a_shown_item_is_shown_without_a_class(self):
+        row = fq.mark_surfaced(self.conn, self.fid, publisher="nudge")
+        self.assertIsNotNone(row["first_shown_at"])
+        self.assertIsNone(row["added_class"])
+
+    def test_only_a_paced_publisher_may_show(self):
+        with self.assertRaises(fq.FindingError):
+            fq.mark_surfaced(self.conn, self.fid, publisher="backlog")
+        with self.assertRaises(fq.FindingError):
+            fq.mark_surfaced(self.conn, self.fid, added_class="critical")
+        with self.assertRaises(fq.FindingError):
+            fq.mark_surfaced(self.conn, self.fid, publisher="nudge", added_class="major")
+        self.assertIsNone(fq.get_finding(self.conn, self.fid)["first_shown_at"])
+
+    def test_a_paced_publisher_may_not_show_a_decided_row(self):
+        # A re-armed first report can name a finding the user dismissed earlier.
+        for state, patch in (
+            ("dismissed", {"state": "dismissed"}),
+            ("accepted", {"state": "accepted"}),
+            ("snoozed", {"state": "snoozed", "snoozed_until": "2099-01-01T00:00:00Z"}),
+        ):
+            with self.subTest(state=state):
+                fq.patch_finding(self.conn, self.fid, patch)
+                for publisher in fq.PACED_PUBLISHERS:
+                    with self.assertRaises(fq.FindingError):
+                        fq.mark_surfaced(self.conn, self.fid, publisher=publisher, added_class="critical", run="r1")
+                row = fq.get_finding(self.conn, self.fid)
+                self.assertEqual((row["state"], row["surface_count"]), (state, 0))
+                self.assertIsNone(row["first_shown_at"])
+                self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM findings_additions").fetchone()[0], 0)
+        # A pull still names it.
+        self.assertEqual(fq.mark_surfaced(self.conn, self.fid)["surface_count"], 1)
+
+    def test_a_recurrence_is_new_again(self):
+        fq.mark_surfaced(self.conn, self.fid, publisher="nudge", added_class="noncritical")
+        fq.record_verification(self.conn, self.fid, "resolved")
+
+        self.register(sample())
+
+        row = fq.get_finding(self.conn, self.fid)
+        self.assertIsNone(row["first_shown_at"])
+        self.assertIsNone(row["added_class"])
+
+
+class TestAdditions(QueueTestCase):
+    # mark_surfaced stamps each addition with SQLite's date('now'), the real
+    # UTC day, so the tests compare against today's UTC date.
+    def setUp(self):
+        super().setUp()
+        self.DAY = datetime.now(UTC).date().isoformat()
+
+    def add(self, finding, added_class="critical", when=at(6, 12)):
+        # `when` only names the run: two calls with the same `when` are one run.
+        fid = fq.validate_finding(finding)["id"]
+        fq.mark_surfaced(self.conn, fid, publisher="nudge", added_class=added_class, run=when.isoformat())
+        return fid
+
+    def test_dismissing_or_snoozing_refunds_nothing(self):
+        first = sample(check="a", rubric=CRITICAL_RUBRIC)
+        second = sample(check="b", rubric=CRITICAL_RUBRIC)
+        self.register(first, second)
+        dismissed, snoozed = self.add(first), self.add(second)
+        fq.patch_finding(self.conn, dismissed, {"state": "dismissed"})
+        fq.patch_finding(self.conn, snoozed, {"state": "snoozed", "snoozed_until": "2026-12-01"})
+
+        self.assertEqual(fq.ranked_findings(self.conn), [])
+        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 2, "noncritical": 0})
+
+    def test_a_gathered_line_is_one_addition(self):
+        members = [sample(object=f"Deployment/d{i}") for i in range(3)]
+        self.register(*members)
+        for member in members:
+            self.add(member, "noncritical")
+        self.assertEqual(fq.additions_on(self.conn, self.DAY)["noncritical"], 1)
+
+    def test_a_line_added_again_later_the_same_day_counts_again(self):
+        # x0 is added and dismissed; a new object on the same line is a new
+        # item, and adding it is a second message, so a second addition.
+        first, second = sample(object="Deployment/x0"), sample(object="Deployment/a0")
+        self.register(first)
+        fq.patch_finding(self.conn, self.add(first, when=at(6, 12)), {"state": "dismissed"})
+        self.register(second)
+        self.add(second, when=at(6, 13))
+        self.assertEqual(fq.additions_on(self.conn, self.DAY)["critical"], 2)
+
+    def test_a_recurrence_refunds_nothing(self):
+        first, second = sample(check="a", rubric=CRITICAL_RUBRIC), sample(check="b", rubric=CRITICAL_RUBRIC)
+        self.register(first, second)
+        added = [self.add(first), self.add(second)]
+        for fid in added:
+            fq.record_verification(self.conn, fid, "resolved")
+        self.register(first, second)
+
+        self.assertIsNone(fq.get_finding(self.conn, added[0])["first_shown_at"])
+        self.assertEqual(fq.additions_on(self.conn, self.DAY)["critical"], 2)
+
+    def test_the_day_is_the_utc_date(self):
+        self.register(sample())
+        self.add(sample())
+        self.assertEqual(fq.additions_on(self.conn, self.DAY)["critical"], 1)
+
+    def test_pulls_and_joins_are_not_additions(self):
+        pulled, joined = sample(check="a"), sample(check="b")
+        self.register(pulled, joined)
+        fq.mark_surfaced(self.conn, fq.validate_finding(pulled)["id"])
+        fq.mark_surfaced(self.conn, fq.validate_finding(joined)["id"], publisher="nudge")
+        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 0, "noncritical": 0})
+
+    def test_the_first_report_is_a_paced_publisher(self):
+        # bootstrap_delivery.py marks each row of the report's items with one run.
+        members = [sample(object=f"Deployment/d{i}", rubric=CRITICAL_RUBRIC) for i in range(2)]
+        self.register(*members)
+        for member in members:
+            fid = fq.validate_finding(member)["id"]
+            fq.mark_surfaced(self.conn, fid, publisher="first_report", added_class="critical", run="2026-10-07T09:00:00Z")
+            self.assertIsNotNone(fq.get_finding(self.conn, fid)["first_shown_at"])
+        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 1, "noncritical": 0})
+
+    def test_a_day_must_be_a_date(self):
+        for day in ("", "yesterday", "2026-10-06T00:00:00", None, "2026-99-99", "2026-02-30", "20261006", "٢٠٢٦-١٠-٠٦"):
+            with self.assertRaises(fq.FindingError):
+                fq.additions_on(self.conn, day)
+
+
+class TestDecisionCoversItem(QueueTestCase):
+    def setUp(self):
+        super().setUp()
+        self.members = [sample(object=f"Deployment/d{i}") for i in range(3)]
+        self.other = sample(check="limits-missing")
+        self.register(*self.members, self.other)
+        self.member_ids = [fq.validate_finding(m)["id"] for m in self.members]
+        for fid in self.member_ids[:2]:
+            fq.mark_surfaced(self.conn, fid, publisher="nudge")
+
+    def test_a_decision_on_one_id_decides_the_line(self):
+        result = fq.patch_finding(self.conn, self.member_ids[0], {"state": "snoozed", "snoozed_until": "2026-12-01"})
+        self.assertEqual(sorted(result["item_rows_decided"]), sorted(self.member_ids[1:]))
+        for fid in self.member_ids:
+            row = fq.get_finding(self.conn, fid)
+            self.assertEqual(row["state"], "snoozed")
+            self.assertIsNotNone(row["snoozed_until"])
+        self.assertEqual(fq.get_finding(self.conn, fq.validate_finding(self.other)["id"])["state"], "queued")
+
+    def test_deciding_the_named_id_clears_stop_add(self):
+        rows = fq.ranked_findings(self.conn)
+        for r in rows:
+            r["first_shown_at"] = stamp(at(5, 16)) if r["first_shown_at"] else None
+        self.assertEqual(len(fq.pace(rows, at(6, 12), fq.PacingLimits(), NONE_ADDED).blocking), 1)
+
+        fq.patch_finding(self.conn, self.member_ids[0], {"state": "dismissed"})
+
+        rows = fq.ranked_findings(self.conn)
+        self.assertEqual(fq.pace(rows, at(6, 12), fq.PacingLimits(), NONE_ADDED).blocking, [])
+
+    def test_decided_rows_and_other_transitions_stay_per_row(self):
+        # A never-shown member of the line is in the item too.
+        accepted = fq.patch_finding(self.conn, self.member_ids[2], {"state": "accepted"})
+        self.assertEqual(sorted(accepted["item_rows_decided"]), sorted(self.member_ids[:2]))
+        # Rows already decided keep their decision.
+        result = fq.patch_finding(self.conn, self.member_ids[0], {"state": "dismissed"})
+        self.assertEqual(result["item_rows_decided"], [])
+        self.assertEqual(fq.get_finding(self.conn, self.member_ids[1])["state"], "accepted")
+
+        result = fq.patch_finding(self.conn, self.member_ids[1], {"state": "surfaced"})
+        self.assertNotIn("item_rows_decided", result)
+        self.assertEqual(fq.get_finding(self.conn, self.member_ids[2])["state"], "accepted")
+
+
+class TestAbsenceMarker(QueueTestCase):
+    """`absent_since` is what takes a shown row out of pending, not C = 0.6 (§5.2, §7.2)."""
+
+    SCOPE = {"project": "acme-prod", "cluster": "prod-eu", "complete": True}
+    # 8 * 6 * (3 + 3) * 0.6 = 173: critical at the "inferred" confidence.
+    INFERRED_CRITICAL = {"B": 8, "L": 6, "detect": 3, "recover": 3, "C": 0.6}
+
+    def setUp(self):
+        super().setUp()
+        self.inferred = sample(check="workload-identity-off", namespace="", object="prod-eu", rubric=self.INFERRED_CRITICAL)
+        self.major = sample(check="limits-missing", rubric={"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0})
+        self.other = sample(check="probes-liveness", rubric=CRITICAL_RUBRIC)
+        self.register(self.inferred, self.major, self.other)
+        self.inferred_id = fq.validate_finding(self.inferred)["id"]
+        self.major_id = fq.validate_finding(self.major)["id"]
+        for fid in (self.inferred_id, self.major_id):
+            fq.mark_surfaced(self.conn, fid, publisher="nudge")
+            self.conn.execute("UPDATE findings SET first_shown_at = ? WHERE id = ?", (stamp(at(4, 12)), fid))
+
+    def plan(self):
+        return fq.pace(fq.ranked_findings(self.conn), at(6, 12), fq.PacingLimits(), NONE_ADDED)
+
+    def test_a_critical_registered_as_inferred_stays_pending_and_is_reminded(self):
+        self.register(self.inferred, self.major, self.other, scope=self.SCOPE)
+        row = fq.get_finding(self.conn, self.inferred_id)
+        self.assertEqual((row["severity"], row["rubric"]["C"], row["absent_since"]), ("critical", 0.6, None))
+        plan = self.plan()
+        self.assertEqual(ids(plan.remind), [[self.inferred_id]])
+        self.assertEqual(ids(plan.blocking), [[self.major_id]])
+
+    def test_rows_a_complete_sweep_missed_are_neither_pending_nor_reminded(self):
+        result = self.register(self.other, scope=self.SCOPE)
+        # The major was re-ranked; the inferred critical was already at 0.6,
+        # so it is marked without a re-rank and not counted.
+        self.assertEqual(result["downgraded"], 1)
+        for fid in (self.inferred_id, self.major_id):
+            self.assertIsNotNone(fq.get_finding(self.conn, fid)["absent_since"])
+        self.assertEqual(fq.get_finding(self.conn, self.inferred_id)["rank_score"], 173)
+        plan = self.plan()
+        self.assertEqual((plan.remind, plan.blocking), ([], []))
+        # Nothing pending holds back the new critical.
+        self.assertEqual(ids(plan.add), [[fq.validate_finding(self.other)["id"]]])
+
+    def test_a_later_miss_keeps_the_first(self):
+        self.register(self.other, scope=self.SCOPE)
+        self.conn.execute("UPDATE findings SET absent_since = '2026-10-01 00:00:00' WHERE id = ?", (self.major_id,))
+        self.register(self.other, scope=self.SCOPE)
+        self.assertEqual(fq.get_finding(self.conn, self.major_id)["absent_since"], "2026-10-01 00:00:00")
+
+    def test_a_missed_row_reported_again_is_pending_again(self):
+        self.register(self.other, scope=self.SCOPE)
+        self.register(self.inferred, self.major)
+        for fid in (self.inferred_id, self.major_id):
+            self.assertIsNone(fq.get_finding(self.conn, fid)["absent_since"])
+        self.assertEqual(fq.get_finding(self.conn, self.major_id)["rubric"]["C"], 1.0)
+        plan = self.plan()
+        self.assertEqual(ids(plan.remind), [[self.inferred_id]])
+        self.assertEqual(ids(plan.blocking), [[self.major_id]])
+
+    def test_verification_that_it_still_fails_clears_the_marker(self):
+        self.register(self.other, scope=self.SCOPE)
+        fq.record_verification(self.conn, self.major_id, "unverifiable", "Forbidden")
+        self.assertIsNotNone(fq.get_finding(self.conn, self.major_id)["absent_since"])
+        fq.record_verification(self.conn, self.major_id, "still_failing", "no limits")
+        self.assertIsNone(fq.get_finding(self.conn, self.major_id)["absent_since"])
+
+    def test_a_recurrence_and_a_suppressed_report_clear_the_marker(self):
+        self.register(self.other, scope=self.SCOPE)
+        fq.record_verification(self.conn, self.major_id, "resolved")
+        fq.patch_finding(self.conn, self.inferred_id, {"state": "dismissed"})
+        self.register(self.inferred, self.major)
+        self.assertIsNone(fq.get_finding(self.conn, self.major_id)["absent_since"])
+        self.assertIsNone(fq.get_finding(self.conn, self.inferred_id)["absent_since"])
+
+
+class TestPacingLimits(unittest.TestCase):
+    def limits(self, env):
+        err = io.StringIO()
+        with unittest.mock.patch.object(sys, "stderr", err):
+            return fq.pacing_limits(env), err.getvalue()
+
+    def test_the_defaults(self):
+        limits, err = self.limits({})
+        self.assertEqual(limits, fq.PacingLimits(2, 2, 3, 16))
+        self.assertEqual(err, "")
+
+    def test_overrides_including_zero(self):
+        limits, err = self.limits(
+            {
+                "FINDINGS_FIRST_REPORT_CRITICALS": "0",
+                "FINDINGS_DAILY_CRITICALS": " 5 ",
+                "FINDINGS_NONCRITICAL_MAX": "0",
+                "FINDINGS_NONCRITICAL_AFTER_HOUR": "0",
+            }
+        )
+        self.assertEqual(limits, fq.PacingLimits(0, 5, 0, 0))
+        self.assertEqual(err, "")
+
+    def test_a_bad_value_falls_back_to_its_default_and_says_so(self):
+        for variable, raw in (
+            ("FINDINGS_DAILY_CRITICALS", "two"),
+            ("FINDINGS_DAILY_CRITICALS", "2.5"),
+            ("FINDINGS_NONCRITICAL_MAX", "-1"),
+            ("FINDINGS_NONCRITICAL_AFTER_HOUR", "24"),
+            ("FINDINGS_NONCRITICAL_AFTER_HOUR", "-3"),
+        ):
+            with self.subTest(variable=variable, raw=raw):
+                limits, err = self.limits({variable: raw})
+                self.assertEqual(limits, fq.PacingLimits())
+                self.assertIn(variable, err)
+                self.assertIn("using the default", err)
+
+    def test_the_last_hour_of_the_day_is_an_hour(self):
+        limits, _ = self.limits({"FINDINGS_NONCRITICAL_AFTER_HOUR": "23"})
+        self.assertEqual(limits.noncritical_after_hour, 23)
+
+
+class TestPace(QueueTestCase):
+    LIMITS = fq.PacingLimits()
+
+    def pace(self, rows, now, added=NONE_ADDED, limits=None, may_add=True):
+        return fq.pace(rows, now, limits or self.LIMITS, added, may_add)
+
+    def test_six_criticals_add_the_top_two_at_noon(self):
+        rows = [row(f"c{i}", score=300 - i) for i in range(6)]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(ids(plan.add), [["c0"], ["c1"]])
+        self.assertEqual(len(plan.waiting), 4)
+        self.assertEqual(plan.remind, [])
+        self.assertEqual(plan.blocking, [])
+
+    def test_two_added_today_means_none_more_today(self):
+        rows = [row("c0", state="surfaced", shown=at(6, 12)), row("c1", state="surfaced", shown=at(6, 12))]
+        rows += [row(f"c{i}") for i in range(2, 6)]
+        plan = self.pace(rows, at(6, 20), {"critical": 2, "noncritical": 0})
+        self.assertEqual(plan.add, [])
+        # Shown today, so not reminded today either.
+        self.assertEqual(plan.remind, [])
+
+    def test_the_next_day_adds_two_more_and_reminds_the_two_pending(self):
+        rows = [row("c0", state="surfaced", shown=at(6, 12)), row("c1", state="surfaced", shown=at(6, 12))]
+        rows += [row(f"c{i}") for i in range(2, 6)]
+        plan = self.pace(rows, at(7, 12))
+        self.assertEqual(ids(plan.add), [["c2"], ["c3"]])
+        self.assertEqual(ids(plan.remind), [["c0"], ["c1"]])
+
+    def test_the_day_rolls_over_at_midnight_but_criticals_wait_for_noon(self):
+        rows = [row("c0", state="surfaced", shown=at(6, 23, 30)), row("c1")]
+        self.assertEqual(self.pace(rows, at(7, 0)).add, [])
+        self.assertEqual(self.pace(rows, at(7, 11, 59)).add, [])
+        self.assertEqual(ids(self.pace(rows, at(7, 12)).add), [["c1"]])
+
+    def test_zero_criticals_wait_for_the_noncritical_hour_then_add_three(self):
+        rows = [row(f"m{i}", "major", score=100 - i) for i in range(5)]
+        self.assertEqual(self.pace(rows, at(6, 12)).add, [])
+        self.assertEqual(self.pace(rows, at(6, 15, 59)).add, [])
+        plan = self.pace(rows, at(6, 16))
+        self.assertEqual(ids(plan.add), [["m0"], ["m1"], ["m2"]])
+        self.assertEqual(len(plan.waiting), 2)
+
+    def test_the_noncritical_cap_is_per_day(self):
+        rows = [row(f"m{i}", "major") for i in range(5)]
+        self.assertEqual(self.pace(rows, at(6, 18), {"critical": 0, "noncritical": 3}).add, [])
+        self.assertEqual(ids(self.pace(rows, at(6, 18), {"critical": 0, "noncritical": 1}).add), [["m0"], ["m1"]])
+
+    def test_an_announced_but_unrecorded_item_counts_against_its_class_budget(self):
+        rows = [row("c-new", score=400), row("c0", score=300), row("c1", score=290), row("m0", "major")]
+        announced = [fq.item_key(r) for r in rows[1:3]]
+        plan = fq.pace(rows, at(6, 13), self.LIMITS, NONE_ADDED, announced=announced)
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["c-new"], ["m0"]])
+        # With one of the two announced, one slot is left, and an unrecorded
+        # critical still holds the major back.
+        plan = fq.pace(rows, at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
+        self.assertEqual(ids(plan.add), [["c-new"]])
+        plan = fq.pace(rows[1:2] + rows[3:], at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
+        self.assertEqual(plan.add, [])
+
+    def test_an_announced_but_unrecorded_noncritical_stops_every_addition(self):
+        rows = [row("c-new", score=400), row("m0", "major")]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, NONE_ADDED, announced=[fq.item_key(rows[1])])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(plan.blocking, [])
+        self.assertEqual(ids(plan.waiting), [["c-new"]])
+        # As when its mark succeeded and it is pending.
+        rows[1] = row("m0", "major", state="surfaced", shown=at(6, 16))
+        self.assertEqual(fq.pace(rows, at(6, 17), self.LIMITS, NONE_ADDED).add, [])
+
+    def test_a_pending_critical_holds_back_noncriticals(self):
+        rows = [row("c0", state="surfaced", shown=at(5, 12)), row("m0", "major")]
+        plan = self.pace(rows, at(6, 16))
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.remind), [["c0"]])
+
+    def test_a_critical_waiting_for_budget_holds_back_noncriticals(self):
+        # Today's two criticals were dismissed (so not in /ranked), a third is
+        # waiting for tomorrow: adding majors now would block it behind stop-add.
+        rows = [row("c2"), row("m0", "major")]
+        plan = self.pace(rows, at(6, 16), {"critical": 2, "noncritical": 0})
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["c2"], ["m0"]])
+
+    def test_a_critical_waiting_for_noon_holds_back_noncriticals_on_an_early_hour(self):
+        limits = fq.PacingLimits(noncritical_after_hour=8)
+        rows = [row("c0"), row("m0", "major")]
+        self.assertEqual(self.pace(rows, at(6, 9), limits=limits).add, [])
+
+    def test_a_pending_noncritical_stops_every_addition(self):
+        rows = [
+            row("c-old", state="surfaced", shown=at(4, 12)),
+            row("m0", "major", state="surfaced", shown=at(5, 16)),
+            row("c-new"),
+        ]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.blocking), [["m0"]])
+        self.assertEqual(ids(plan.waiting), [["c-new"]])
+        # Reminders are not additions, so stop-add does not silence them.
+        self.assertEqual(ids(plan.remind), [["c-old"]])
+
+    def test_dismissed_snoozed_and_accepted_rows_are_not_pending(self):
+        # Dismissed and snoozed rows are not in /ranked at all; accepted ones are.
+        rows = [row("m0", "major", state="accepted", shown=at(5, 16)), row("c0")]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(plan.blocking, [])
+        self.assertEqual(ids(plan.add), [["c0"]])
+
+    def test_a_lapsed_snooze_of_a_shown_row_is_pending_again(self):
+        major, critical = sample(check="m0"), sample(check="c0", rubric=CRITICAL_RUBRIC)
+        self.register(major, critical)
+        major_id, critical_id = (fq.validate_finding(f)["id"] for f in (major, critical))
+        fq.mark_surfaced(self.conn, major_id, publisher="nudge", added_class="noncritical")
+        fq.patch_finding(self.conn, major_id, {"state": "snoozed", "snoozed_until": "2000-01-01"})
+        # While snoozed it is not in /ranked, so nothing stops the critical.
+        self.assertEqual(ids(self.pace(fq.ranked_findings(self.conn), at(6, 12)).add), [[critical_id]])
+
+        self.assertEqual(fq.expire_snoozes(self.conn), 1)
+
+        plan = self.pace(fq.ranked_findings(self.conn), at(6, 12))
+        self.assertEqual(ids(plan.blocking), [[major_id]])
+        self.assertEqual(plan.add, [])
+
+    def test_a_pull_marked_row_is_new_not_pending(self):
+        rows = [row("m0", "major", state="surfaced"), row("c0")]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(plan.blocking, [])
+        self.assertEqual(ids(plan.add), [["c0"]])
+
+    def test_a_row_the_sweep_stopped_reporting_is_not_pending(self):
+        # The fix the user made drops C to 0.6, which can re-score a critical
+        # as major. That must not turn on stop-add, nor be reminded forever.
+        rows = [
+            row("fixed-major", "major", state="surfaced", shown=at(4, 12), C=0.6, absent=at(5, 3)),
+            row("fixed-critical", state="surfaced", shown=at(4, 12), C=0.6, absent=at(5, 3)),
+            row("c0"),
+        ]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(plan.blocking, [])
+        self.assertEqual(plan.remind, [])
+        self.assertEqual(ids(plan.add), [["c0"]])
+
+    def test_a_row_registered_as_inferred_is_pending_like_any_other(self):
+        # C = 0.6 is also what a source registers for "inferred". Only the
+        # absence rule's marker takes a shown row out of pending.
+        rows = [
+            row("wi-off", state="surfaced", shown=at(4, 12), C=0.6, score=173),
+            row("m0", "major", state="surfaced", shown=at(4, 16), C=0.6, score=54),
+            row("c0"),
+        ]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(ids(plan.remind), [["wi-off"]])
+        self.assertEqual(ids(plan.blocking), [["m0"]])
+        self.assertEqual(plan.add, [])
+
+    def test_a_never_shown_row_the_sweep_stopped_reporting_is_still_added(self):
+        # Absence lowers confidence and does not resolve (§5.2), and the old
+        # nudge named such rows. Once shown, it is neither pending nor reminded.
+        rows = [row("gone", C=0.6, score=173, absent=at(5, 3))]
+        self.assertEqual(ids(self.pace(rows, at(6, 12)).add), [["gone"]])
+        rows = [row("gone", state="surfaced", shown=at(6, 12), C=0.6, score=173, absent=at(5, 3))]
+        plan = self.pace(rows, at(7, 12))
+        self.assertEqual((plan.add, plan.remind, plan.blocking), ([], [], []))
+
+    def test_an_item_covers_every_undecided_row_of_its_line(self):
+        # Pending p0, never-shown p1, two shown rows the sweep stopped
+        # reporting (in no item, still undecided), an accepted row (decided).
+        rows = [
+            row("p0", check="probes", state="surfaced", shown=at(5, 12)),
+            row("p1", check="probes"),
+            row("p2", check="probes", state="surfaced", shown=at(5, 12), C=0.6, absent=at(5, 20)),
+            row("p3", check="probes", state="surfaced", shown=at(5, 12), C=0.6, absent=at(5, 20)),
+            row("p4", check="probes", state="accepted", shown=at(5, 12)),
+            row("obs", check="probes", provider_managed=True, actionable=False),
+        ]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(ids(plan.remind), [["p0", "p1"]])
+        self.assertEqual(plan.remind[0].covers, 4)
+
+    def test_a_gathered_line_is_one_item_named_whole(self):
+        rows = [
+            row("probe-a", check="probes"),
+            row("other", score=200),
+            row("probe-b", "major", check="probes"),
+            row("probe-c", "minor", check="probes"),
+        ]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(ids(plan.add), [["probe-a", "probe-b", "probe-c"], ["other"]])
+        self.assertEqual(plan.add[0].item_class, "critical")
+
+    def test_a_gathered_line_whose_critical_resolved_is_a_pending_noncritical(self):
+        # A sweep resolved the critical member, so /ranked no longer has it.
+        # Verification changes only its own row, so the major shown with it
+        # still waits for a decision.
+        rows = [row("probe-b", "major", check="probes", state="surfaced", shown=at(5, 12)), row("c0")]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(ids(plan.blocking), [["probe-b"]])
+        self.assertEqual(plan.blocking[0].severity, "major")
+        self.assertEqual(plan.add, [])
+
+    def test_a_member_that_joins_a_shown_line_rides_along(self):
+        rows = [
+            row("probe-a", check="probes", state="surfaced", shown=at(5, 12)),
+            row("probe-b", check="probes"),
+        ]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.remind), [["probe-a", "probe-b"]])
+
+    def test_a_member_left_behind_by_an_accepted_line_is_new(self):
+        rows = [
+            row("probe-a", check="probes", state="accepted", shown=at(5, 12)),
+            row("probe-b", check="probes"),
+        ]
+        self.assertEqual(ids(self.pace(rows, at(6, 12)).add), [["probe-b"]])
+
+    def test_the_line_is_check_project_and_cluster(self):
+        rows = [row("a", check="probes"), row("b", check="probes", cluster="staging"), row("c", check="Probes")]
+        self.assertEqual(ids(self.pace(rows, at(6, 12), limits=fq.PacingLimits(daily_criticals=5)).add), [["a", "c"], ["b"]])
+
+    def test_provider_managed_observations_are_never_items(self):
+        rows = [row("obs", provider_managed=True, actionable=False), row("fault", provider_managed=True)]
+        plan = self.pace(rows, at(6, 12))
+        self.assertEqual(ids(plan.add), [["fault"]])
+        self.assertEqual(plan.rolled_up, 1)
+
+    def test_provider_managed_observations_are_counted_by_line(self):
+        observation = {"provider_managed": True, "actionable": False}
+        rows = [row(f"dns{i}", check="dns", **observation) for i in range(3)]
+        rows += [row("dns-staging", check="dns", cluster="staging", **observation), row("c0")]
+        self.assertEqual(self.pace(rows, at(6, 12)).rolled_up, 2)
+
+    def test_a_daily_limit_of_zero_adds_and_reminds_no_criticals(self):
+        limits = fq.PacingLimits(daily_criticals=0)
+        rows = [row("c-old", state="surfaced", shown=at(4, 12)), row("c0"), row("m0", "major")]
+        plan = self.pace(rows, at(6, 16), limits=limits)
+        self.assertEqual(plan.remind, [])
+        # Nothing is added, and with a pending critical no non-critical either.
+        self.assertEqual(plan.add, [])
+        plan = self.pace(rows[1:], at(6, 16), limits=limits)
+        self.assertEqual(ids(plan.add), [["m0"]])
+
+    def test_a_noncritical_limit_of_zero_adds_none(self):
+        rows = [row("m0", "major")]
+        self.assertEqual(self.pace(rows, at(6, 20), limits=fq.PacingLimits(noncritical_max=0)).add, [])
+
+    def test_reminders_are_the_top_daily_criticals(self):
+        rows = [row(f"c{i}", state="surfaced", shown=at(1, 12), score=300 - i) for i in range(4)]
+        self.assertEqual(ids(self.pace(rows, at(6, 12)).remind), [["c0"], ["c1"]])
+
+    def test_nothing_is_added_before_the_first_report(self):
+        rows = [row("c0"), row("m0", "major")]
+        self.assertEqual(self.pace(rows, at(6, 20), may_add=False).add, [])
+
+    def test_a_naive_now_is_utc(self):
+        rows = [row("c0")]
+        self.assertEqual(ids(self.pace(rows, datetime(2026, 10, 6, 12)).add), [["c0"]])
+
+    def test_from_the_database_the_covered_count_is_what_a_decision_decides(self):
+        conn = self.conn
+        members = [sample(object=f"Deployment/d{i}", rubric=CRITICAL_RUBRIC) for i in range(5)]
+        self.register(*members)
+        member_ids = [fq.validate_finding(m)["id"] for m in members]
+        for fid in member_ids:
+            fq.mark_surfaced(conn, fid, publisher="nudge", added_class="critical")
+        # A complete sweep reports two of the five; the other three are no
+        # longer pending, but a decision on the line still reaches them.
+        self.register(*members[:2], scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+        # Set directly: a decision through the route would decide the line.
+        conn.execute("UPDATE findings SET state = 'accepted' WHERE id = ?", (member_ids[4],))
+        rows = fq.ranked_findings(conn)
+        for r in rows:
+            r["first_shown_at"] = stamp(at(5, 12))
+
+        item = fq.pace(rows, at(6, 12), self.LIMITS, NONE_ADDED).remind[0]
+        self.assertEqual(len(item.members), 2)
+
+        decided = fq.patch_finding(conn, item.members[0]["id"], {"state": "dismissed"})["item_rows_decided"]
+        self.assertEqual(item.covers, 1 + len(decided))
+        self.assertEqual(item.covers, 4)
+
+    def test_from_the_database_dismissing_refunds_nothing(self):
+        conn = self.conn
+        findings = [sample(check=f"c{i}", rubric=CRITICAL_RUBRIC) for i in range(3)]
+        self.register(*findings)
+        plan = fq.pace(fq.ranked_findings(conn), at(6, 12), self.LIMITS, fq.additions_on(conn, "2026-10-06"))
+        self.assertEqual(len(plan.add), 2)
+        for item in plan.add:
+            for member in item.members:
+                fq.mark_surfaced(conn, member["id"], publisher="nudge", added_class=item.item_class)
+                conn.execute("UPDATE findings SET first_shown_at = ? WHERE id = ?", (stamp(at(6, 12)), member["id"]))
+                fq.patch_finding(conn, member["id"], {"state": "dismissed"})
+        conn.execute("UPDATE findings_additions SET day = '2026-10-06'")
+
+        plan = fq.pace(fq.ranked_findings(conn), at(6, 13), self.LIMITS, fq.additions_on(conn, "2026-10-06"))
+
+        self.assertEqual(plan.add, [])
+        self.assertEqual(len(plan.waiting), 1)
+
+
 class SopRubricParityTests(unittest.TestCase):
     """The SOP is where a model reads the rubric from; this is where it stops drifting.
 
@@ -944,7 +1694,7 @@ class SopRubricParityTests(unittest.TestCase):
     def test_the_sop_names_the_commands_and_enum_values_it_tells_the_worker_to_send(self):
         self.assertIn("inventory_findings.py extract", self.text)
         self.assertIn("inventory_findings.py register", self.text)
-        self.assertIn("inventory_findings.py ranked", self.text)
+        self.assertIn("inventory_findings.py select", self.text)
         for kind in fq.REMEDIATION_KINDS:
             self.assertIn(f"`{kind}`", self.text)
         for kind in fq.VERIFICATION_KINDS:

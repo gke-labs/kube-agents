@@ -1890,7 +1890,7 @@ source "{_COMMON_SH}"
         A branch sharing a GA tag's name makes `git log 0.1.0..HEAD` succeed and
         warn about the ambiguous refname. Captured with `2>&1` that warning
         becomes the subject list, so an empty range reads as "there are commits
-        to ship" — and the scheduled gate publishes a release for a week with
+        to ship" — and the scheduled gate publishes a release for a day with
         nothing in it.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,9 +18,17 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-// slackDMPrefix marks a DM conversation key. The whole DM is the session,
-// like Discord's — "a DM, or a thread in a group space" (gateway design).
+// slackDMPrefix marks a DM conversation key. A Slack DM is threaded like a
+// channel, and each thread in it is its own session: a top-level DM starts
+// one keyed by its own ts, slack:dm/{channel}/{ts}, and a reply inside that
+// thread is the same conversation. The thread-less form, slack:dm/{channel},
+// is what this adapter keyed every DM as before it threaded them; it still
+// parses, and posts top-level, so a record minted under it relays its
+// terminal where its ask was.
 const slackDMPrefix = "slack:dm/"
+
+// slackKeyPrefix begins every Slack conversation key.
+const slackKeyPrefix = "slack:"
 
 // slackSeenCap bounds the at-least-once dedupe ring: Socket Mode redelivers
 // unacked envelopes, so delivered (channel, ts) pairs are remembered and
@@ -113,6 +122,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
+	// the prefix letter and at least two characters after it.
+	slackMinChannelIDLen = 3
 )
 
 // Slack token prefixes, checked at construction so a swapped pair fails at
@@ -214,19 +226,36 @@ var slackLinkRE = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://(?:[^()\s|]|\([^
 // not a session; a thread in it is — and Slack threads are implicit
 // (replying with thread_ts creates one), so a channel mention binds the
 // session to the mention message's own ts as thread root, with no
-// thread-creation failure mode to handle.
+// thread-creation failure mode to handle. A DM is keyed the same way under
+// its own prefix, slack:dm/{channel}/{thread_ts}, so a top-level DM roots a
+// thread on its own ts exactly as a channel mention does; an empty threadTS
+// gives the thread-less DM key, which posts top-level (OpenDirect, and
+// records from before DMs threaded).
 func slackConversationID(channelType, channel, threadTS string) string {
-	if channelType == "im" {
-		return slackDMPrefix + channel
+	if channelType == slackChannelTypeIM {
+		if threadTS == "" {
+			return slackDMPrefix + channel
+		}
+		return slackDMPrefix + channel + "/" + threadTS
 	}
 	return "slack:" + channel + "/" + threadTS
 }
 
+// slackIsDM reports a DM conversation key, threaded or not.
+func slackIsDM(conversation string) bool {
+	return strings.HasPrefix(conversation, slackDMPrefix)
+}
+
 // slackChannelThread inverts slackConversationID for the adapter's own use;
-// threadTS is "" for DMs.
+// threadTS is "" for the thread-less DM key, the one form that posts
+// top-level.
 func slackChannelThread(conversation string) (channel, threadTS string, ok bool) {
 	if dm, found := strings.CutPrefix(conversation, slackDMPrefix); found {
-		return dm, "", dm != ""
+		channel, threadTS, threaded := strings.Cut(dm, "/")
+		if channel == "" || (threaded && (threadTS == "" || strings.Contains(threadTS, "/"))) {
+			return "", "", false
+		}
+		return channel, threadTS, true
 	}
 	rest, found := strings.CutPrefix(conversation, "slack:")
 	if !found {
@@ -280,12 +309,13 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // it is the only word: a channel ask's own thread becomes a session thread
 // here when the gateway starts the task, the same as a thread someone else
 // rooted, and a mention on its own -- a channel mention from an unverified
-// sender, a bare "<@bot>" from anyone -- records nothing. A DM is the whole
-// session and needs no record. Called on the conversation's inbox worker
-// under the session lock (TaskObserver): record and return.
+// sender, a bare "<@bot>" from anyone -- records nothing. A DM needs no
+// record, threaded or not: a DM carries every message, so its threads never
+// consult the cache. Called on the conversation's inbox worker under the
+// session lock (TaskObserver): record and return.
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
 	channel, threadTS, ok := slackChannelThread(conversation)
-	if !ok || threadTS == "" {
+	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
 	}
 	s.markSessionThread(channel+"/"+threadTS, true)
@@ -316,7 +346,7 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // and return.
 func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
 	channel, threadTS, ok := slackChannelThread(conversation)
-	if !ok || threadTS == "" {
+	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
 	}
 	s.expireMark(channel + "/" + threadTS)
@@ -452,11 +482,16 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// slash_commands and interactive carry a real, non-empty one
 				// that this continue throws away.
 				//
-				// Which is fine only because the app subscribes to neither,
-				// so neither ever arrives. Turning on slash commands or
-				// interactivity means acking them here first: Slack wants the
-				// envelope acked inside three seconds, and an unacked one
-				// redelivers and shows the user a timeout.
+				// The same app serves the legacy consumer under today, which
+				// does answer interactions, so an install may well have
+				// interactivity on and these envelopes do arrive. Nothing the
+				// gateway posts carries an interactive element - the agent
+				// sends the audit card through the notify route with its
+				// buttons removed - so the only clicks that land here are on
+				// messages posted under today. Answering interactions means
+				// acking them here first: Slack wants the envelope acked
+				// inside three seconds, and an unacked one redelivers and
+				// shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -563,8 +598,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	return s.sm.RunContext(ctx)
 }
 
-// Post writes into the conversation — threaded for sessions rooted in a
-// channel, plain for DMs — and returns the message ts the rolling line edits.
+// Post writes into the conversation — into its thread for a channel session
+// and a DM session alike, top-level for the thread-less DM key — and returns
+// the message ts the rolling line edits.
 func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok {
@@ -576,6 +612,93 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
 	return ts, err
+}
+
+// PostNotify writes text into channel, top-level when thread is empty or as a
+// reply on thread (a thread root's ts), and returns the posted message's ts
+// and the thread it landed in: the given one, or the new message's own ts,
+// which is the root a later notify replies on. It is Post for a caller with
+// no conversation key (the chat.notify route, notify.go); it refuses a channel
+// that is not a C/G channel id, and the Notifier is what keeps it to home.
+func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	// No link or media previews: an alert's console links would each unfurl
+	// into a card (Post makes the same choice, #2820).
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// PostNotifyBlocks is PostNotify for a Block Kit message: blocks as given,
+// text as the notification and fallback. The blocks are decoded into
+// slack-go's types to be sent; one it does not know travels as Slack wrote
+// it, and Slack's own refusal (invalid_blocks) comes back as the error.
+func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	var blocks slack.Blocks
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", "", fmt.Errorf("slack: blocks: %w", err)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false), slack.MsgOptionBlocks(blocks.BlockSet...),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// slackIsHomeChannelID reports a public ("C...") or private ("G...")
+// channel id: a prefix letter and upper-case letters or digits after it. A
+// DM ("D...") is not a home channel.
+func slackIsHomeChannelID(id string) bool {
+	if len(id) < slackMinChannelIDLen || (id[0] != 'C' && id[0] != 'G') {
+		return false
+	}
+	for _, r := range id[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// slackIsTS reports a Slack message ts: digits, one dot, digits.
+func slackIsTS(ts string) bool {
+	secs, frac, ok := strings.Cut(ts, ".")
+	return ok && allDigits(secs) && allDigits(frac)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Edit replaces a previously posted message — the rolling progress line.
@@ -608,7 +731,10 @@ func (s *SlackAdapter) Roster(conversation string) ([]string, bool, error) {
 
 // OpenDirect returns the DM conversation for a user — the DM-switch
 // primitive. Shipped, unused: everything posts to the room it came from
-// until the classifier exists.
+// until the classifier exists. The key is the thread-less DM form, so a
+// post to it is a new top-level message, which is what a message the user
+// did not ask for should be; a reply the user types under it roots its own
+// conversation.
 func (s *SlackAdapter) OpenDirect(userID string) (string, error) {
 	ch, _, _, err := s.api.OpenConversation(&slack.OpenConversationParameters{
 		Users: []string{userID}, ReturnIM: true,
@@ -909,7 +1035,9 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 }
 
 // inbound normalizes one message event, or reports it not-a-turn. The
-// affordance rule, deterministic: DMs carry every message; a channel
+// affordance rule, deterministic: DMs carry every message, a top-level one
+// rooting its own thread and a reply in a thread being that thread's
+// conversation; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
 // it mentions the bot or the thread is already a session thread — one the
@@ -940,25 +1068,34 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 	if mentioned {
 		text = stripSlackMention(text, s.botUserID)
 	}
-	if m.ChannelType == "im" {
+	if m.ChannelType == slackChannelTypeIM {
 		if text == "" {
 			// A bare mention has nothing to run, in a DM as in a channel.
 			return InboundMessage{}, false
 		}
+		// Each DM question is its own conversation, answered in its own
+		// thread, and a reply inside that thread stays in it: the thread
+		// root's ts is the key either way, the message's own ts when it is
+		// top-level (Slack threads are implicit, as for a channel ask).
+		// No session-thread rule here, unlike a channel thread: a DM
+		// carries every message, in a thread or not.
+		threadTS := m.ThreadTimeStamp
+		if threadTS == "" {
+			threadTS = m.TimeStamp
+		}
 		return InboundMessage{
-			Conversation: slackConversationID(m.ChannelType, m.Channel, ""),
+			Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 			Kind:         "dm",
 			AuthorID:     m.User,
 			MessageID:    m.TimeStamp,
+			TopLevel:     m.ThreadTimeStamp == "",
 			// Decoding also changes what the affordance matchers see. That is
 			// intended, and it is not obvious: normalize (text.go) strips
 			// every non-alphanumeric, so a typed "<stop>" — on the wire as
 			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
 			// nothing, and decoded first it normalizes to "stop" and is a
 			// hard task cancel. Matching what the user typed beats matching
-			// Slack's entity mangling, so this is the right way round. The
-			// same shift makes normalized text shorter, so an ask that
-			// decodes can newly fall under isStatusQuery's wideMatchLenCap.
+			// Slack's entity mangling, so this is the right way round.
 			Text: slackUnescaper.Replace(text),
 		}, true
 	}

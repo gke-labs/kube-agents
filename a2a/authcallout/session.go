@@ -29,8 +29,14 @@ import (
 
 const (
 	// NarrowingPod marks an entry whose grants derive from the attested
-	// pod name. It is the only narrowing this callout knows.
+	// pod name: the gateway's session pods.
 	NarrowingPod = "pod"
+
+	// NarrowingProfile marks an entry for an A2A AgentProfile's pods: the
+	// task subjects derive from the profile the entry names, and the
+	// consumer names and inbox from the attested pod name. See
+	// profile_narrowing.go.
+	NarrowingProfile = "profile"
 
 	// The Extra keys the API server writes onto a TokenReview of a
 	// pod-bound token. Written by the authenticator from the token's own
@@ -80,29 +86,8 @@ const (
 // pins that when it routes a session (gateway.go, the SessionRouted branch,
 // which retires the previous incarnation and re-mints rec.BusSession).
 func sessionGrants(pod string) (Grants, error) {
+	g := executorGrants(pod, pod)
 	inbox := "_INBOX." + pod + ".>"
-	g := Grants{
-		Publish: []string{
-			lib.TaskEventsSubject(pod, "*"),
-		},
-		Subscribe: []string{inbox},
-	}
-	consumerAPI := func(op, name string) string {
-		return fmt.Sprintf("$JS.API.CONSUMER.%s.%s.%s", op, lib.TasksStream, name)
-	}
-	for _, role := range lib.SessionConsumerRoles {
-		name := lib.SessionConsumerName(pod, role)
-		filter := lib.TaskInSubject(pod, "*")
-		if role == lib.SessionConsumerEvents {
-			filter = lib.TaskEventsSubject(pod, "*")
-		}
-		g.Publish = append(g.Publish,
-			consumerAPI("CREATE", name)+"."+filter,
-			consumerAPI("INFO", name),
-			consumerAPI("MSG.NEXT", name),
-			consumerAPI("DELETE", name),
-		)
-	}
 	// The capability path: ask, and be answered. Two subjects, and the shape
 	// of both is the mechanism rather than a convention.
 	//
@@ -150,6 +135,45 @@ func sessionGrants(pod string) (Grants, error) {
 
 	g.Publish = append(g.Publish, inbox)
 	return g, nil
+}
+
+// executorGrants is the task-plane half every executor holds, whichever
+// narrowing derived it: publish on its addressee's events subjects, and three
+// exactly-named consumers on TASKS over its addressee's own subjects. The
+// addressee (subject token) and the consumer stem (consumer names and inbox)
+// are separate arguments because they are separate things for a profile pod:
+// every pod of one profile publishes as the profile, but two of them running at
+// once must not share a consumer name or an inbox. A session pod passes its
+// pod name for both. The stem is always the attested pod name, so the
+// exactness argument in sessionGrants' comment holds for both shapes.
+//
+// The executor's own inbox is not in the publish list here; callers append it
+// last, after anything narrowing-specific, so the order of a minted grant set
+// stays stable for the tests that read it.
+func executorGrants(addressee, stem string) Grants {
+	g := Grants{
+		Publish: []string{
+			lib.TaskEventsSubject(addressee, "*"),
+		},
+		Subscribe: []string{"_INBOX." + stem + ".>"},
+	}
+	consumerAPI := func(op, name string) string {
+		return fmt.Sprintf("$JS.API.CONSUMER.%s.%s.%s", op, lib.TasksStream, name)
+	}
+	for _, role := range lib.SessionConsumerRoles {
+		name := lib.SessionConsumerName(stem, role)
+		filter := lib.TaskInSubject(addressee, "*")
+		if role == lib.SessionConsumerEvents {
+			filter = lib.TaskEventsSubject(addressee, "*")
+		}
+		g.Publish = append(g.Publish,
+			consumerAPI("CREATE", name)+"."+filter,
+			consumerAPI("INFO", name),
+			consumerAPI("MSG.NEXT", name),
+			consumerAPI("DELETE", name),
+		)
+	}
+	return g
 }
 
 // validSessionName is the check the whole derivation stands on: the pod name

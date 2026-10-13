@@ -18,9 +18,10 @@
 scan settles, by marking each due on that profile's roster. A started audit leaves a
 row in the profile's ``cron/executions.db``. The case's stack
 (``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
-state file, and the stage records when it marked each audit; this passes when every audit
-has a run of its own claimed at or after its mark that got going: running, completed, or
-ended after it started.
+state file, and the stage records when it marked each audit; this passes when every audit it
+marked has a run of its own claimed at or after its mark that got going (running, completed, or
+ended after it started), and every other audit is one it adopted (a run completed since the
+sweep).
 
 Its own module rather than a section of ``verifiers.py``, registered through the same
 ``devops_bench.verifiers`` entry-point group.
@@ -68,7 +69,7 @@ from datetime import datetime
 state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 SQLITE_BUSY_TIMEOUT = 10
 SKIPPED = "skipped"
-out = {"applied_at": None, "marked": [], "runs": {}, "error": None, "held": {}, "gave_up": [], "skipped": None}
+out = {"applied_at": None, "marked": [], "adopted": [], "runs": {}, "error": None, "held": {}, "gave_up": [], "skipped": None}
 marks = {}
 try:
     out["applied_at"] = json.load(open(state))["applied_at"]
@@ -78,7 +79,8 @@ except (OSError, ValueError, KeyError, TypeError) as exc:
     out["error"] = "%s: %s" % (state, exc)
 try:
     recorded = json.load(open(marker))
-    out["marked"] = [a for a in recorded.get("fired", []) if isinstance(a, str)]
+    out["adopted"] = [a for a in recorded.get("adopted", []) if isinstance(a, str)]
+    out["marked"] = [a for a in recorded.get("fired", []) if isinstance(a, str) and a not in out["adopted"]]
     out["held"] = recorded.get("held") or {}
     out["gave_up"] = recorded.get("gave_up") or []
     out["skipped"] = recorded.get("reason") if recorded.get("skipped") else None
@@ -137,10 +139,10 @@ def read_starts(shell: Callable[[str, float], str], timeout: float) -> dict[str,
     return parsed
 
 
-def _overlaps(runs: dict[str, dict[str, Any]]) -> list[str]:
-    """Each audit that started before the one before it in the chain had ended."""
+def _overlaps(runs: dict[str, dict[str, Any]], chain: list[str]) -> list[str]:
+    """Each audit in ``chain`` that started before the one before it had ended."""
     found = []
-    for earlier, later in zip(FIRST_RUN_AUDITS, FIRST_RUN_AUDITS[1:]):
+    for earlier, later in zip(chain, chain[1:]):
         ended = runs[earlier].get("finished_at")
         began = runs[later]["claimed_at"]
         if not ended or datetime.fromisoformat(began) < datetime.fromisoformat(ended):
@@ -152,7 +154,8 @@ def _overlaps(runs: dict[str, dict[str, Any]]) -> list[str]:
 class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
     """Passes once the stage marked every first-run audit due, each has a run since its mark that
     got going (running, completed, or ended after its start), and each started only after the one
-    before it in the chain ended.
+    before it in the chain ended. An audit the stage adopted (a run completed since the sweep, not
+    marked) counts as had and is left out of that order; at least one must be the stage's own.
 
     A row with no start time does not count: a run cut off at its start leaves exactly that. Nor does a run the stage did not mark: a scheduled run that falls in the window is
     not the stage's. Past running, the outcome is the audit's own, graded by the audit
@@ -173,6 +176,9 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
             return "error", f"there is no {STATE_FILE}: the stack did not arm the stage", read
         armed = datetime.fromisoformat(read["applied_at"]).isoformat()
         runs, marked = read["runs"], set(read.get("marked") or [])
+        # An audit the stage passed over because it had completed a run since the sweep (a
+        # scheduled one): already had, so not required to be the stage's, and outside the chain.
+        adopted = [a for a in FIRST_RUN_AUDITS if a in set(read.get("adopted") or [])]
         # A run that got going and then failed, or was cut off by a restart, still started: how it
         # ended is the audit cases' to grade. A row with no start time ran nothing.
         running = [
@@ -180,14 +186,15 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
             if runs.get(a, {}).get("status") in STARTED_STATUSES or runs.get(a, {}).get("started_at")
         ]
         started = [a for a in running if a in marked]
-        if len(started) == len(FIRST_RUN_AUDITS):
-            overlaps = _overlaps(runs)
+        if started and len(started) + len(adopted) == len(FIRST_RUN_AUDITS):
+            overlaps = _overlaps(runs, started)
             if overlaps:
                 return "fail", f"the first-run audits overlapped instead of running one after another: {'; '.join(overlaps)}", read
-            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits were marked due by the stage and ran one after another since {armed}", read
-        stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in running]
-        missing = [a for a in FIRST_RUN_AUDITS if a not in runs]
-        unmarked = [a for a in running if a not in marked]
+            also = f"; {', '.join(adopted)} had already completed a run since the sweep and was not run again" if adopted else ""
+            return "pass", f"{len(started)} first-run audits were marked due by the stage and ran one after another since {armed}{also}", read
+        stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in running and a not in adopted]
+        missing = [a for a in FIRST_RUN_AUDITS if a not in runs and a not in adopted]
+        unmarked = [a for a in running if a not in marked and a not in adopted]
         parts = []
         if missing:
             parts.append(f"no run claimed since {armed} and its mark for {', '.join(missing)}")

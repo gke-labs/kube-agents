@@ -480,3 +480,54 @@ func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T)
 		})
 	}
 }
+
+// The worker reads the conversation so far from a file (lib.EnvPrimerFile),
+// so the pod has to carry the primer annotation, mount it through the
+// downward API at the path the env names, and mount it read-only. A primer
+// left on the annotation alone reaches nobody, and every turn starts cold.
+func TestSpawnMountsTheTranscriptPrimerForTheWorker(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session", TaskDeadline: time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-prim", Addressee: "chat-otter-prim"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "User: hi\n\nYou: hello\n", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-prim", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pod.Annotations[annoPrimer]; got != "User: hi\n\nYou: hello\n" {
+		t.Errorf("primer annotation = %q", got)
+	}
+
+	var envPath string
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == lib.EnvPrimerFile {
+			envPath = e.Value
+		}
+	}
+	var mountPath string
+	for _, m := range pod.Spec.Containers[0].VolumeMounts {
+		if m.Name == primerVolume {
+			if !m.ReadOnly {
+				t.Error("the primer is mounted writable")
+			}
+			mountPath = m.MountPath
+		}
+	}
+	var fileOK bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name != primerVolume || v.DownwardAPI == nil {
+			continue
+		}
+		for _, item := range v.DownwardAPI.Items {
+			if item.FieldRef != nil && item.FieldRef.FieldPath == "metadata.annotations['"+annoPrimer+"']" && mountPath+"/"+item.Path == envPath {
+				fileOK = true
+			}
+		}
+	}
+	if envPath == "" || mountPath == "" || !fileOK {
+		t.Errorf("primer not wired: env %s=%q, mount %q, downward-API file at the env's path %v", lib.EnvPrimerFile, envPath, mountPath, fileOK)
+	}
+}

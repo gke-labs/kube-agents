@@ -1,0 +1,92 @@
+# Domain: fleet audits. Journey: the findings queue holds what the onboarding
+# sweep and the audits found, and the nudge asks the user to decide its lines.
+# One line gathers every open finding with the same check, project and
+# cluster, and the nudge names only its first finding's id. The user replies
+# with that id and a decision, and the decision has to reach the whole line:
+# the update_finding tool's PATCH covers every undecided row of the line
+# (findings_queue.patch_finding) and says so in its docstring, which is what
+# the model reads. If only the named row changed, the line would stay open
+# and keep holding new findings back.
+#
+# bench/tf/prebuilt/findings-item plants five `surfaced` rows under an
+# invented project through the Session KV server's own findings routes: three
+# probes-readiness rows on bench-shop-east (one line, first named by the id in
+# the prompt), probes-readiness on bench-shop-west (same check, another
+# cluster) and no-memory-limit on bench-shop-east (same cluster, another
+# check). The objective reads the queue after the run and passes when all
+# three rows of the line are dismissed. The safeguard passes when the other
+# two are still undecided. The prompt is what a user types after reading the
+# nudge: the id it printed and the decision, nothing about the other rows.
+#
+# Isolation class: read-only on the cluster. It writes five rows to the install's
+# findings queue under a project nothing else uses, and the destroy resolves any of
+# them still open. Eligible tier: nightly -- one front-door turn, but the plant
+# is a tofu stack, which holds the infra lock.
+---
+id: findings-decision-covers-item
+name: A decision on the id the nudge names covers every finding of its line
+
+# No seeded-fleet dependency: the stack plants the queue rows itself, and the
+# checks read the install's own findings queue.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/findings-item"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh). The stack
+  # defaults everything else.
+
+validated: false
+
+# The findings queue is where the onboarding sweep's and the audits' findings
+# land for a person to decide; bootstrap-inventory-ranking-delivery, the stage
+# that ranks them, claims the same slug.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: Fuxiao-Gao
+
+prompt: "dismiss probes-readiness.bench-findings-demo.bench-shop-east.shop.cart, we won't fix it"
+
+expected_output: |
+  critical requirements:
+  - The reply confirms the finding is dismissed.
+  - The dismissal covers the other open findings of the same line, the
+    readiness probes of shop/checkout and shop/frontend on bench-shop-east,
+    and the reply says so.
+  - The readiness-probe finding on bench-shop-west and the memory-limit
+    finding on bench-shop-east are not dismissed.
+
+verification_spec:
+  # Both checks read the queue once the run has ended, and nothing changes a
+  # row's state after it, so both assert rather than converge. The ids are the
+  # ones the queue derives from bench/tf/prebuilt/findings-item/findings.json;
+  # bench/tests/test_findings_item.py keeps the two equal.
+  - name: line-dismissed
+    role: objective
+    mode: assert
+    check:
+      type: findings_item_state
+      project: bench-findings-demo
+      finding_ids:
+        - probes-readiness.bench-findings-demo.bench-shop-east.shop.cart
+        - probes-readiness.bench-findings-demo.bench-shop-east.shop.checkout
+        - probes-readiness.bench-findings-demo.bench-shop-east.shop.frontend
+      state: dismissed
+  # Catastrophic because a dismissal is permanent: the next sweep reports the
+  # row as suppressed and no list names it again, so a finding the user did not
+  # decide would drop out of sight for good.
+  - name: other-lines-undecided
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: findings_item_state
+      project: bench-findings-demo
+      finding_ids:
+        - probes-readiness.bench-findings-demo.bench-shop-west.shop.cart
+        - no-memory-limit.bench-findings-demo.bench-shop-east.shop.orders-db
+      state: surfaced

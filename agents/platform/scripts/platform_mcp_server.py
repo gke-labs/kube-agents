@@ -19,6 +19,11 @@ from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
+import chat_notify
+
+# send_notification gives `hermes send` no kill timeout, as before; a routed
+# send gets `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+SEND_NOTIFICATION_TIMEOUT_SECONDS = None
 from cluster_agent_profile import (
     RESERVED_PROFILES,
     is_ready_profile,
@@ -27,6 +32,7 @@ from cluster_agent_profile import (
 )
 from gke_endpoint import dns_endpoint_args
 from profile_scaffold import profiles_base
+import fleet_scope_targets
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -421,6 +427,63 @@ def _cluster_agent_roster() -> list[dict]:
             log(f"Warning: could not read the cluster identity of {home.name}: {e}")
         roster.append(entry)
     return roster
+
+
+@mcp.tool()
+def fleet_scope() -> str:
+    """
+    The install's declared scope, resolved: which GCP projects a fleet audit
+    sweeps, and the arguments to hand its collector.
+
+    Reads the reconcile's snapshot (fleet_scope.json at the data volume's
+    root). Returns JSON:
+      {"declared": true, "resolved_at": "...", "projects": [...],
+       "unread": [{"project": ..., "outcome": ...}], "collector_args": "...",
+       "source": "<the snapshot's path>"}
+    `projects` is the sweep: every project the scope resolved to that this
+    install could read (its Kubernetes Engine API off included; the collectors
+    count such a project empty), plus the management project whatever the
+    tick read of it, since the collectors read it themselves. `unread` names each declared project the
+    install could not read (denied, unreachable, over-cap), or has not
+    resolved yet (`unresolved`); the collectors record them as a coverage gap.
+    One entry, `declared-scope=unresolved`, is not a project: it rides when
+    the reconcile has not resolved the declaration (before its first tick, or
+    on a tick that could not read the render while a folder, organisation or
+    selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
+    a collector command verbatim (`--scope-projects ... --scope-unread ...`);
+    when nothing is readable it carries `--scope-unread` alone, and the
+    collector then reports that and sweeps nothing. When no snapshot answers
+    that a boundary is in force (before the reconcile's first tick, or when
+    the last tick wrote `boundary: false`) the answer comes from the
+    operator's render: the management project alone, with a `note` saying so. `{"declared": false, "note":
+    "..."}` means the install declares no scope: the collectors then enumerate
+    every project the identity can list, as before scopes existed. A spec.scope block that
+    is present with empty lists is a declared scope of the management project
+    alone, not the absence of one. The collectors cannot read the snapshot
+    themselves: they run in the shell sandbox, whose data volume is not this
+    pod's.
+    """
+    try:
+        targets = fleet_scope_targets.declared_scope_targets()
+    except fleet_scope_targets.ScopeRenderUnreadable as e:
+        # Not "no scope": the operator always writes the render, so an
+        # unreadable one is a fault, and the SOPs' declared: false branch
+        # would list every visible project on an install that declares one.
+        return f"ERROR: the operator's scope render could not be read, so the scope is unknown; do not enumerate projects: {e}"
+    except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
+        return f"ERROR: Could not read the scope snapshot: {e}"
+    if targets is None:
+        return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
+                           "note": "no declared scope: the collectors enumerate every project the identity can list"}, indent=2)
+    return json.dumps({
+        "declared": True,
+        "resolved_at": targets.resolved_at,
+        "projects": list(targets.projects),
+        "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
+        "collector_args": targets.collector_args(),
+        **({"note": targets.note} if targets.note else {}),
+        "source": targets.path,
+    }, indent=2)
 
 
 @mcp.tool()
@@ -846,6 +909,12 @@ def send_notification(message: str, session_id: str = "") -> str:
             if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
                 platforms_found.append("google_chat")
 
+        # Under next the Hermes platform is off and the gateway posts for it
+        # (chat_notify.py); it is still where this install's posts go.
+        routed = chat_notify.routed_platform()
+        if routed and routed not in platforms_found:
+            platforms_found.append(routed)
+
         if not platforms_found:
             platforms_found.append("google_chat")
 
@@ -899,11 +968,19 @@ def send_notification(message: str, session_id: str = "") -> str:
             # the profiles on the data PVC and the gateway on loopback, and the
             # sandbox image does not carry the binary.
             res = subprocess.run(
-                ["hermes", "send", "--to", target, message],
-                capture_output=True, text=True, check=True, env=_run_env()
+                chat_notify.command(target, message, json_output=False),
+                capture_output=True, text=True, check=True, env=_run_env(),
+                timeout=chat_notify.subprocess_timeout(target, SEND_NOTIFICATION_TIMEOUT_SECONDS),
+                # This process's stdin is the MCP JSON-RPC pipe; a child that
+                # read it would swallow protocol frames.
+                stdin=subprocess.DEVNULL,
             )
             results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
         except subprocess.CalledProcessError as e:
+            if chat_notify.outcome_unknown(e.returncode):
+                results.append(f"SUCCESS: Notification to {platform_name} may have posted "
+                               f"(the gateway did not answer in time); do not resend it.")
+                continue
             results.append(f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}")
         except Exception as e:
             results.append(f"ERROR: {platform_name}: {e}")
@@ -1102,7 +1179,7 @@ def get_ranked_findings() -> str:
     The whole open backlog, ordered worst first: actionable before unactionable,
     then by rank score, then a deterministic tie-break.
 
-    This is what the backlog document and the daily nudge are rendered from. The
+    This is what the backlog document and the nudge are rendered from. The
     order is decided here — do not re-rank it.
     """
     return _findings_call("GET", "/v1/findings/ranked")
@@ -1144,8 +1221,12 @@ def mark_finding_surfaced(finding_id: str, chat_id: str = "", thread_id: str = "
     """
     Record that a finding was named in a message that has already been sent.
 
-    Call this after the send, not before: it advances the surface count a
-    publisher uses to decide what to repeat.
+    Call this after the send, not before: it advances the surface count and
+    the time the finding was last named. It does not mark the finding shown
+    for pacing: naming a finding in answer to someone's request is not an
+    addition, so it counts against no daily limit and does not hold back
+    new findings. Only the nudge and the first inventory report's delivery
+    mark findings shown.
 
     Args:
         finding_id: The finding's id.
@@ -1171,8 +1252,15 @@ def update_finding(
     The user's three decisions are 'accepted' (they are working it), 'snoozed'
     (not now, with a date) and 'dismissed' (won't fix — permanent, and the next
     sweep will not resurrect it). A lapsed snooze is returned to the list by
-    the nudge's daily run; use 'surfaced' only to end one early. A finding that
-    no longer reproduces is not set here: that is a verification outcome.
+    the nudge's next run; use 'surfaced' only to end one early. While any
+    non-critical finding the nudge named is open and undecided, the nudge adds
+    no new findings: one of these three decisions is how the user lets more
+    through. A decision covers the finding's whole item: every other open,
+    undecided finding with the same check, project and cluster (one line in
+    the nudge's message) takes it too, and their ids come back in
+    `item_rows_decided`. So one call per item the user decided is enough. A
+    finding that no longer reproduces is not set here: that is a verification
+    outcome.
 
     Args:
         finding_id: The finding's id.
@@ -1243,10 +1331,10 @@ def findings_publication(
     Read or write what a publisher remembers between runs.
 
     Two publishers: 'backlog' keeps the target_ref of the document it rewrites,
-    so the next run edits that one instead of opening a second; 'nudge' keeps
-    the content_hash it last posted, which is what 'the list changed' compares
-    against. Called with only a publisher, this reads; called with target_kind,
-    it writes.
+    so the next run edits that one instead of opening a second; 'nudge' is
+    reserved for the nudge, which reads and writes nothing here (its once-a-day
+    state is a file in its profile home). Called with only a publisher, this
+    reads; called with target_kind, it writes.
 
     Args:
         publisher: backlog | nudge.

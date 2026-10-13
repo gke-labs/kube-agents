@@ -1,0 +1,19 @@
+Subject: Drop the pod securityContext claim from the description
+
+Why: upstream's description claims pod securityContext coverage the body does not carry; container security contexts are gke-manifest-generation's, and the description is what the agent routes on.
+Local-Issue: none (#2357)
+Upstream-Issue: none filed yet
+Retire-When: upstream's description matches the body
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -5,7 +5,7 @@ description: >-
+   Kubernetes Engine (GKE) applications and namespaces. Covers running security
+   audits (`audit_cluster.sh`), enforcing Network Policies (default-deny and Dataplane
+   V2 logging), isolating high-risk pods inside GKE Sandbox (`gVisor`), enforcing Pod
+-  Security Standards (`restricted` labeling) and pod securityContext, and mounting Secret Manager secrets via
++  Security Standards (`restricted` labeling), and mounting Secret Manager secrets via
+   CSI (`SecretProviderClass`). Use when auditing workload security posture, isolating
+   namespaces, applying pod security standards, or
+   configuring network policies and secret volume mounts. Don't use for Workload Identity (use gke-workload-identity), cluster-wide

@@ -922,6 +922,9 @@ main() {
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
   export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""
+  # The mode, likewise: the generator refuses a value outside the CRD's enum,
+  # and the destroy removes the release whichever mode it renders.
+  export PLATFORM_AGENT_MODE=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

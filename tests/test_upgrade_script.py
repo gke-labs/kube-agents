@@ -17,6 +17,8 @@ import tempfile
 import time
 import unittest
 
+import yaml
+
 from tests.testing.common import (
     INVALID_IMMUTABLE_REFS,
     UPGRADER_HELP_BANNER,
@@ -562,6 +564,83 @@ class UpgradeRunContractTest(unittest.TestCase):
                 self.assertNotIn("ENABLE_DRIFT_DETECTOR", line)
                 self.assertNotIn("TF_VAR_enable_drift", line)
 
+    def test_the_mode_is_announced_on_a_full_upgrade_and_noted_on_a_retag(self):
+        """A full apply carries PLATFORM_AGENT_MODE from install.env and says when
+        that switches the install, right after the scope check whose reads it
+        takes; a retag reuses the release record and says, from the values
+        retag_values just read, when a full upgrade would move the mode. Both
+        before their arm raises the apply gate."""
+        source = _UPGRADE_SH.read_text()
+        key = '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"'
+        dispatch = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
+        self.assertNotIn("platform_agent_mode_for", source[source.index('exit "$plan_status"'):dispatch])
+        for mode, after, call in (
+            # Nothing asks between the notice and the apply, so it is the ungated one.
+            ("full", 'refuse_apply_over_undeclared_scope "$target_namespace" || exit 1\n',
+             f'announce_platform_agent_mode_for_apply "$target_namespace" {key} "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'),
+            ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
+             f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
+            ("harness", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
+             f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
+        ):
+            with self.subTest(mode=mode):
+                arm_at = source.index(f"\n    {mode})\n", dispatch)
+                arm = source[arm_at : source.index("\n      ;;\n", arm_at)]
+                self.assertIn(call, arm)
+                self.assertLess(arm.index(after), arm.index(call))
+                self.assertLess(arm.index(call), arm.index('UPGRADE_APPLY_STARTED="true"'))
+        # The plan says it too, after the scope check whose reads it takes: it
+        # is the preview of the same full apply.
+        plan = source.index('print_step "4. Planning (read-only)"')
+        block = source[plan : plan + 1600]
+        self.assertLess(
+            block.index('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"'),
+            block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
+        )
+
+    def test_the_mode_calls_skip_an_older_installer_common(self):
+        """installer_common.sh is the target tree's: piped, or with --image-tag
+        onto a release before spec.mode support, it defines neither notice nor
+        DEFAULT_PLATFORM_AGENT_MODE. Each mode call site in the plan, the full
+        arm and both retag arms, lifted as written (with its guard when it has
+        one), runs under the script's strict shell against a stub
+        installer_common.sh lacking them, and must neither abort nor print
+        "command not found"."""
+        lines = _UPGRADE_SH.read_text().splitlines()
+        blocks = []
+        for index, line in enumerate(lines):
+            for fn in ("announce_platform_agent_mode_for_apply", "note_platform_agent_mode_for_retag"):
+                if line.strip().startswith(f'{fn} "$target_namespace"'):
+                    block = [line]
+                    if lines[index - 1].strip() == f"if declare -F {fn} >/dev/null; then":
+                        block = [lines[index - 1], line, lines[index + 1]]
+                    blocks.append("\n".join(b.strip() for b in block))
+        self.assertEqual(len(blocks), 4, blocks)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / "installer_common.sh"
+            stub.write_text("# An installer_common.sh from before spec.mode support.\nload_install_env() { :; }\n")
+            for block in blocks:
+                with self.subTest(block=block.splitlines()[0]):
+                    script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+source {shlex.quote(str(stub))}
+set -Eeuo pipefail
+trap 'echo "ABORT BANNER" >&2' ERR
+unset PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_NOTICE_UNGATED
+target_namespace=kubeagents-system PARAM_UPGRADE_MODE=harness RETAG_VALUES_JSON='{{}}'
+{block}
+echo "reached the end"
+"""
+                    proc = subprocess.run(
+                        ["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env()
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 0, out)
+                    self.assertIn("reached the end", proc.stdout, out)
+                    self.assertNotIn("command not found", out)
+                    self.assertNotIn("unbound variable", out)
+                    self.assertNotIn("ABORT BANNER", out)
+
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.
 
@@ -625,6 +704,17 @@ class UpgradeRunContractTest(unittest.TestCase):
             "applies, and --plan renders the same tfvars, so none of them may fall "
             "through to multiuser_memory when the cluster could not be asked",
         )
+
+    def test_the_full_arm_refuses_a_dropped_next_before_its_notice(self):
+        """The refusal runs whatever the target's helpers are: after the scope
+        check, ahead of the guarded notice an older target cannot print."""
+        source = _UPGRADE_SH.read_text()
+        arm_at = source.index("\n    full)\n", source.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
+        arm = source[arm_at : source.index("\n      ;;\n", arm_at)]
+        refusal = '\n      refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1\n'
+        self.assertEqual(arm.count(refusal), 1)
+        self.assertLess(arm.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1'), arm.index(refusal))
+        self.assertLess(arm.index(refusal), arm.index("declare -F announce_platform_agent_mode_for_apply"))
 
     def test_the_apply_gate_sits_after_every_refusal_in_its_arm(self):
         """UPGRADE_APPLY_STARTED is what keeps cleanup() from putting an adopted
@@ -1584,6 +1674,92 @@ helm_retag operator.image.tag
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
         self.assertEqual(json.loads(self._rendered(proc, "notes")), notes)
         self.assertEqual(json.loads(self._rendered(proc, "keys")), keys)
+
+    def test_a_harness_retag_keeps_the_recorded_mode(self):
+        """The retag modes carry platformAgent.mode on the release's own record:
+        the schema declares the key, so the filter keeps it, and the chart
+        renders it back onto the CR."""
+        recorded = json.loads(json.dumps(self._RECORDED))
+        recorded["platformAgent"]["mode"] = "next"
+        proc = self._retag(recorded, _REPO_ROOT)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
+        crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
+        self.assertEqual([cr["spec"].get("mode") for cr in crs], ["next"])
+
+    def _modeless_chart(self):
+        """This repository's chart less `platformAgent.mode`: a rollback to a release that predates #2524."""
+        repo = self.base / "modeless-repo"
+        chart = repo / "charts" / "kube-agents"
+        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
+        schema_path = chart / "values.schema.json"
+        schema = json.loads(schema_path.read_text())
+        del schema["properties"]["platformAgent"]["properties"]["mode"]
+        schema_path.write_text(json.dumps(schema))
+        return repo
+
+    def _recorded_with_mode(self, mode):
+        recorded = json.loads(json.dumps(self._RECORDED))
+        recorded["platformAgent"]["mode"] = mode
+        return recorded
+
+    def test_a_retag_onto_a_chart_without_mode_refuses_to_drop_next(self):
+        """Dropping a recorded `next` would render no mode, and Helm would take
+        spec.mode off the CR: a switch to today on a retag. Refused, with or
+        without --drop-undeclared-values, before helm upgrade runs."""
+        repo = self._modeless_chart()
+        for drop in (True, False):
+            with self.subTest(drop=drop):
+                proc = self._retag(self._recorded_with_mode("next"), repo, drop=drop)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
+                self.assertIn("records platformAgent.mode: next", proc.stdout)
+                self.assertIn("predates spec.mode support", proc.stdout)
+                self.assertIn("--upgrade-mode=full", proc.stdout)
+                self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
+                self.assertNotIn("ci-cluster", proc.stdout)
+
+    def _full_refusal(self, repo, mode):
+        schema = repo / "charts" / "kube-agents" / "values.schema.json"
+        assignment = "" if mode is None else f"PLATFORM_AGENT_MODE={shlex.quote(mode)}\n"
+        script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+{assignment}refuse_full_apply_dropping_next {shlex.quote(str(schema))}
+"""
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
+            env=get_isolated_test_env(),
+        )
+
+    def test_a_full_apply_onto_a_chart_without_mode_refuses_next(self):
+        """The full arm's half of the retag refusal: a chart that predates
+        platformAgent.mode renders no mode, so install.env's next would come
+        off the CR. Refused, naming both ways out."""
+        proc = self._full_refusal(self._modeless_chart(), "next")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("sets PLATFORM_AGENT_MODE=next", proc.stdout)
+        self.assertIn("predates spec.mode support", proc.stdout)
+        self.assertIn("PLATFORM_AGENT_MODE=today", proc.stdout)
+
+    def test_a_full_apply_refuses_only_next_onto_a_chart_without_mode(self):
+        """today or no key renders what an absent mode means, and a chart that
+        declares the key keeps next, so none of these refuse."""
+        modeless = self._modeless_chart()
+        for repo, mode in ((modeless, "today"), (modeless, None), (_REPO_ROOT, "next"), (_REPO_ROOT, "today")):
+            with self.subTest(repo=repo.name, mode=mode):
+                proc = self._full_refusal(repo, mode)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("predates spec.mode support", proc.stdout)
+
+    def test_a_retag_onto_a_chart_without_mode_drops_a_recorded_today(self):
+        """`today` is what an absent mode means, so dropping it switches nothing."""
+        proc = self._retag(self._recorded_with_mode("today"), self._modeless_chart())
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertIn("Dropping 'platformAgent.mode'", proc.stdout)
+        crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
+        self.assertEqual([cr["spec"].get("mode") for cr in crs], [None])
 
     def test_values_of_a_length_helm_reads_in_whole_buffers_arrive(self):
         """Helm 4 drops an unterminated last line of stdin whose length is a multiple of 4096 bytes."""

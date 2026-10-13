@@ -1,9 +1,16 @@
 name: Auto Request Review
 
 # A human reviewer is requested once kube-agents-bot's `AI Review` check goes
-# green -- not when the pull request opens. Before this, the reviewer was pinged
-# minutes ahead of the bot's read and re-read a diff the author was about to
-# change.
+# green, or once the bot has reviewed three commits of the pull request and the
+# check is still grey -- not when the pull request opens. Before the green
+# rule, the reviewer was pinged minutes ahead of the bot's read and re-read a
+# diff the author was about to change; before the third-round rule, an agent
+# author answered every grey check with another fix and another `/review`, and
+# the human who ends that loop arrived a median eleven hours and two rounds
+# later (gke-labs/kube-agents-bot#191). The first request on a pull request
+# leaves one hand-off comment, whichever path made it; later requests add
+# none, and the marker in that comment is what keeps the grey-check request
+# from firing again.
 #
 # Neither trigger can be a `pull_request` one. Every pull request here comes
 # from a fork, and on a fork pull request `pull_request` and
@@ -44,7 +51,7 @@ jobs:
     permissions:
       contents: read # check out the default branch: the script and its config
       pull-requests: write # request the reviewer
-      issues: write # 👀 (requested) or 😕 (declined) on the /request-review comment that asked for it
+      issues: write # the hand-off comment, and 👀 (requested) or 😕 (declined) on the /request-review comment that asked for it
     # Two entry points, and nothing else gets a runner:
     #   - the bot's own `AI Review` check finishing (app id 4437198 -- the name
     #     alone is not an identity, any App can post a check run called
@@ -81,7 +88,7 @@ jobs:
       # empty for fork pull requests. The script reads the check run back from
       # the API for the commit and the verdict, then finds the pull request that
       # commit belongs to.
-      - name: Request a reviewer now the AI review has passed
+      - name: Request a reviewer on the AI review's verdict
         if: github.event_name == 'check_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -23,10 +23,10 @@
 # following run takes the same branch and GA releases stop until somebody publishes
 # by hand — so it fails the job with an error annotation. During pre-1.0 development
 # (0.y.z), breaking changes bump minor under SemVer 2.0 Clause 4 and release unattended.
-# A skip means "nothing to do this week"; red means "something needs you".
+# A skip means "nothing to do today"; red means "something needs you".
 #
 # Why this gate is worth having when the publishing path already skips a quiet
-# week on its own is `scripts/release/README.md`, "The weekly GA release". It is
+# day on its own is `scripts/release/README.md`, "The daily GA release". It is
 # canonical for the reasoning; do not restate it here.
 #
 # There is deliberately no weekday or elapsed-time check in here. The cron is
@@ -209,11 +209,11 @@ if [ -z "${RELEASE_RANGE_SUBJECTS}" ]; then
   # exists for is the emergency leftover: a GA tag sitting on a commit that is not
   # this candidate's stamped child, which makes verify_release_eligibility.sh
   # report "tag already exists on a different commit" and exit 1 — a red run with
-  # nothing wrong, every week, until somebody releases by hand.
+  # nothing wrong, every day, until somebody releases by hand.
   #
-  # The ordinary quiet week reaches here too and does not need it; that path is
+  # The ordinary quiet day reaches here too and does not need it; that path is
   # already green without this. What the skip is and is not worth on that path is
-  # `scripts/release/README.md`, "The weekly GA release", which is canonical.
+  # `scripts/release/README.md`, "The daily GA release", which is canonical.
   SKIP_REASON="No commits between ${LATEST_GA_TAG} and the gate-passing commit ${RELEASE_COMMIT:0:7}."
   emit_and_exit
 fi

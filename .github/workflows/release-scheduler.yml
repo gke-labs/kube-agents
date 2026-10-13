@@ -1,6 +1,6 @@
 name: "Release: Scheduler"
 
-# Holds the GA release pipeline's cron one level up, so a weekly tick with
+# Holds the GA release pipeline's cron one level up, so a daily tick with
 # nothing to release produces no pipeline run at all.
 #
 # Following the decoupled trigger pattern established by rc-scheduler.yml,
@@ -9,7 +9,7 @@ name: "Release: Scheduler"
 # work is required, quietly recording skips to Job Summary when no candidate
 # exists or when no commits have merged since the last release.
 #
-# Every Friday, the scheduler ships whatever has merged on main since the last GA
+# Every day, the scheduler ships whatever has merged on main since the last GA
 # release cut from main (a patch cut on a release line does not move that base).
 # In pre-1.0 initial development (0.y.z), breaking changes bump minor under SemVer 2.0
 # Clause 4 and release unattended. Once 1.0.0 has been cut, resolve_scheduled_release.sh
@@ -21,9 +21,9 @@ permissions:
 
 on:
   schedule:
-    - cron: "17 6 * * 5"
+    - cron: "17 6 * * *"
   # Dispatchable so the evaluation can be exercised by hand without waiting for
-  # Friday 06:17 UTC. It takes no inputs: the whole job is "work out whether
+  # 06:17 UTC. It takes no inputs: the whole job is "work out whether
   # there is anything to release", and a manual run that overrode that would be
   # testing something else. To force a specific release through, dispatch
   # release-publish.yml directly with schedule_gate=bypass.

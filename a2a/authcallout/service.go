@@ -350,6 +350,25 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 				return "", nil, "", fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
 			}
 			grants, user = g, att.PodName
+		case NarrowingProfile:
+			// The same pod attestation a session needs, for the same
+			// reason: the pod name becomes the consumer names and the
+			// inbox, so it has to be one the API server vouched for.
+			if err := validSessionName(att.PodName); err != nil {
+				return "", nil, "", fmt.Errorf("%s narrows on its profile's pod, but %w", att.ServiceAccount, err)
+			}
+			if att.PodUID == "" {
+				return "", nil, "", fmt.Errorf("%s narrows on its profile's pod, but the token attests no pod UID", att.ServiceAccount)
+			}
+			var topics TopicGrants
+			if id.Topics != nil {
+				topics = *id.Topics
+			}
+			g, err := profileGrants(id.Profile, att.PodName, topics)
+			if err != nil {
+				return "", nil, "", fmt.Errorf("%s narrows on profile %q, but %w", att.ServiceAccount, id.Profile, err)
+			}
+			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
 		}

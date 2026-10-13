@@ -54,8 +54,11 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shutil
 import sys
+import tempfile
 
 FAILURES: list[str] = []
 
@@ -70,6 +73,7 @@ def check(label: str, condition: object, detail: str = "") -> None:
 
 import gateway.kanban_watchers as watchers  # noqa: E402
 import gateway.kanban_watchers_notifier as notifier  # noqa: E402
+import gateway.kanban_progress_lines as progress_lines  # noqa: E402
 from gateway.kanban_progress_lines import (  # noqa: E402
     DEFAULT_NOTE_LIMIT,
     FINISHED,
@@ -699,8 +703,8 @@ check(
 # --- 8. What rolls and what does not -------------------------------------------
 print("routing:")
 check(
-    "the rolling kinds are the two non-terminal ones",
-    ROLLING_KINDS == ("heartbeat", "status"),
+    "the rolling kinds are the three non-terminal ones",
+    ROLLING_KINDS == ("heartbeat", "status", "queued"),
     f"got {ROLLING_KINDS!r}",
 )
 check(
@@ -733,6 +737,90 @@ check(
     "a runaway note is clipped to the progress budget",
     len(progress_note({"note": "word " * 500})) <= DEFAULT_NOTE_LIMIT,
 )
+
+# --- The fold reads a real board ----------------------------------------------
+# With KAGE_SLACK_UX on, a card's completion folds into its plan row when its
+# nearest ancestor that created more than one card is still open on the same
+# thread. A schema drift under
+# FANNED_OUT_ANCESTOR_SQL raises inside _folds, which posts the report instead, so the
+# fold would quietly stop and every fanned-out card post its own line again.
+# The read itself runs here, against boards built with hermes_cli.
+print()
+print("fold board read:")
+KANBAN_HOME_ENV = "HERMES_KANBAN_HOME"
+KANBAN_UNSET_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK")
+FOLD_CHANNEL = "C0VERIFYFOLD"
+FOLD_THREAD = "1790000000.000100"
+_saved_env = {name: os.environ.get(name) for name in (KANBAN_HOME_ENV, *KANBAN_UNSET_ENV)}
+_fold_home = tempfile.mkdtemp()
+os.environ[KANBAN_HOME_ENV] = _fold_home
+for _name in KANBAN_UNSET_ENV:
+    os.environ.pop(_name, None)
+try:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kc
+    from hermes_cli import kanban_db_notify as kn
+
+    _conn = kc.connect(board=kb.DEFAULT_BOARD)
+    try:
+        _creator = kb.create_task(_conn, title="check every cluster", assignee="platform")
+        kn.add_notify_sub(_conn, task_id=_creator, platform="slack", chat_id=FOLD_CHANNEL, thread_id=FOLD_THREAD)
+        _child = kb.create_task(_conn, title="seeded-a", assignee="platform", creator_task_id=_creator)
+        _orphan = kb.create_task(_conn, title="seeded-b", assignee="platform")
+    finally:
+        _conn.close()
+    _fold_sub = {"task_id": _child, "platform": "slack", "chat_id": FOLD_CHANNEL, "thread_id": FOLD_THREAD}
+    check(
+        "a creator's only child does not fold",
+        not progress_lines._fan_out_open(_fold_sub, kb.DEFAULT_BOARD),
+        "a single-cluster delegation would lose the Cluster Agent's report",
+    )
+    _conn = kc.connect(board=kb.DEFAULT_BOARD)
+    try:
+        kb.create_task(_conn, title="seeded-c", assignee="platform", creator_task_id=_creator)
+    finally:
+        _conn.close()
+    check(
+        "a card whose creator is open on the thread folds",
+        progress_lines._fan_out_open(_fold_sub, kb.DEFAULT_BOARD),
+        "the creator read found nothing for a card a still-open card created",
+    )
+    _conn = kc.connect(board=kb.DEFAULT_BOARD)
+    try:
+        _grandchild = kb.create_task(
+            _conn, title="seeded-a pods", assignee="cluster-seeded-a", creator_task_id=_child,
+        )
+    finally:
+        _conn.close()
+    check(
+        "a card a fanned-out card filed folds",
+        progress_lines._fan_out_open({**_fold_sub, "task_id": _grandchild}, kb.DEFAULT_BOARD),
+        "the Cluster Agent's report beneath a per-cluster card would post on its own",
+    )
+    check(
+        "a card no card created, or one on another thread, does not fold",
+        not progress_lines._fan_out_open({**_fold_sub, "task_id": _orphan}, kb.DEFAULT_BOARD)
+        and not progress_lines._fan_out_open({**_fold_sub, "thread_id": "1790000000.000200"}, kb.DEFAULT_BOARD),
+    )
+    _conn = kc.connect(board=kb.DEFAULT_BOARD)
+    try:
+        kb.complete_task(_conn, _creator, result="verified")
+    finally:
+        _conn.close()
+    check(
+        "a card whose creator is done does not fold",
+        not progress_lines._fan_out_open(_fold_sub, kb.DEFAULT_BOARD),
+        "a follow-up filed by a finished card would lose its report",
+    )
+except Exception as exc:  # noqa: BLE001 — a drift is the failure this section exists to report
+    check("the creator read runs against a real board", False, f"{type(exc).__name__}: {exc}")
+finally:
+    for _name, _value in _saved_env.items():
+        if _value is None:
+            os.environ.pop(_name, None)
+        else:
+            os.environ[_name] = _value
+    shutil.rmtree(_fold_home, ignore_errors=True)
 
 print()
 if FAILURES:

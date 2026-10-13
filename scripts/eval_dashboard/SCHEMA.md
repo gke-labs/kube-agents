@@ -545,20 +545,29 @@ what the renderer does with them.
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
 - `--gitlab-pr-glob <gs glob>` (repeatable) — the GitLab lane's build-dir
-  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read as `--pr-glob` is
-  (the job's directory index above its own watermark, the glob without
-  one), every run tagged `tier: "gitlab"` and its unfinished builds tagged
-  the same on `pending_builds`. The presubmit's watermark ignores the
-  lane's ids and the lane's ignores the presubmit's, as the nightly's does.
-  An explicit `--index-prefix` is the presubmit's; the lane's index is
-  always derived from its own glob. The lane, like the nightly, must never
+  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read through the job's
+  directory index derived from it, above the lane's own watermark when a
+  lane run is on record and whole (under `--since-days`) when none is; the
+  glob itself is listed only when no index is derivable from it, or
+  `--index-prefix ""` disabled the index. Every run is tagged
+  `tier: "gitlab"` and its unfinished builds the same on `pending_builds`.
+  The presubmit's watermark ignores the lane's ids and the lane's ignores
+  the presubmit's, as the nightly's does. An explicit `--index-prefix` is
+  the presubmit's; the lane's index is always derived from its own glob.
+  The lane takes its index on the cold path too, unlike the presubmit,
+  because the archive-wide glob walks every pull request's directory on
+  every tick until the lane's first run is on record (minutes, and past
+  the listing timeout as the archive grows), while the index answers
+  "nothing yet" in one flat listing. The lane, like the nightly, must never
   stop the gate's dashboard publishing, so it follows the nightly's rule:
-  with no lane run on record any listing that fails is a `note: glob ...
-did not list` line and nothing from it (the job may not exist yet); with
-  one, a listing that matched no objects (the index purged or moved, the
-  job renamed, while a run from before sits on record) is a `note:
-directory index ... did not list` line, and any other failure is the
-  refusal line, as it is for the presubmit.
+  with no lane run on record any listing that fails is a
+  `note: directory index ... did not list` line (`note: glob ...` on the
+  glob fallback) and nothing from it (the job may not exist yet); with
+  one, a listing that matched no objects (the
+  index purged or moved, the job renamed, while a run from before sits on
+  record) is the same note, and any other failure is the refusal line, as
+  it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
+  the refusal line either way, as for the nightly.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -1020,15 +1029,22 @@ it is set.
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
-threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
-`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
+held_by_hand, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
+refused a project in the periodic's recent window of `lease_failures_hours`
+hours, and `held_by_hand` how many projects are leased under an owner that is
+neither a Prow run nor a known job's fixed owner; `lease_failures` and
+`held_by_hand` are `null` from an
+artifact written before the
+periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue
 and `null` when Deck was not read; `over_threshold` is the count already past
 the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
 live backlog — and `null` when Deck was unread or no limit was given. A verdict
 lasts a week, so every present-tense reader asks it: the alert is withheld on
-`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
-Brief go past tense on either. `waiting_since` dates the backlog from its
+`false` unless `lease_failures` is non-zero, `CONTROL_PLANE` drops its
+diagnosis on `null`, and the digest and Brief go past tense on either. `waiting_since` dates the backlog from its
 oldest queued run, and is `null` when there is none; the Brief's present-tense
 sentence prefers it to `since`, which can be days older.
 `breach_seen` says whether the open episode has ever measured a breach, and
@@ -1036,15 +1052,17 @@ sentence prefers it to `since`, which can be days older.
 a stretch that only ever said the queue could not be read. `metrics` carries
 both across a tick that read no artifact, as `pool_since` and
 `pool_breach_seen`. The two
-figures are never the seven-day window's — the periodic breaches on a day's row
-or on runs queued past p95 right now, and the window sits back inside its own
-limit after one bad day. Exactly one of `window_hours` and `day` says which
+figures are never the seven-day window's — the periodic breaches on a day's row,
+on runs queued past p95 right now, or on a run refused a project in its recent
+window, and the seven-day window sits back inside its own limit after one bad
+day. Exactly one of `window_hours` and `day` says which
 stretch they cover: the periodic's recent window when it had the runs to judge
 it and went over a limit, the worst breached day otherwise. A verdict lasts a
 week, so the recent window comes first — a Thursday incident evidenced by
 Monday reads as a contradiction — but a compliant stretch is the same
-contradiction, only newer. Both are `null` when only the live queue breached;
-`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+contradiction, only newer. Both are `null` when only the live queue or only a
+refusal breached; `over_threshold` counts the queued runs and `lease_failures`
+the refused ones. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
 `measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
@@ -1097,7 +1115,9 @@ finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
 {outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
-when its plan was read; `main_check_error` is set when the moved-check could
+when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them);
+`main_check_error` is set when the moved-check could
 not read main; outcomes are applied, converged, unchanged, planned, busy,
 refused, failed, interrupted, not_reached); the sweep's,
 `pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
