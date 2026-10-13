@@ -117,10 +117,21 @@ def main() -> int:
     events = controller.after_call("terminal", {"command": "kubectl get events -n tenant"}, EVENTS)
     if events.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):
         return fail(f"a successful read quoting a denial decided {events!r}")
+    report = controller.after_call(
+        "terminal",
+        {"command": "cat <<'EOF' | tee /tmp/pr.md\nkubectl scale deploy x --replicas=3 was refused\nEOF"},
+        _result("kubectl scale deploy x --replicas=3 was refused: " + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: kubernetes.read-only", 0),
+    )
+    if report.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE) or controller.halt_decision is not None:
+        return fail(f"a report quoting the refusal decided {report!r}")
+    render = controller.after_call("terminal", {"command": "kubectl create deployment x --image=y --dry-run=client -o yaml"}, REFUSAL)
+    if (render.action, render.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
+        return fail(f"a local render decided {render!r}")
     for command, result in (
         ("kubectl \\\n  -n kube-system \\\n  scale deploy x --replicas=3", REFUSAL),
         ("kubectl get deploy x  # current state\nkubectl scale deploy x --replicas=3", REFUSAL),
         ("if ! kubectl scale deploy x --replicas=3; then echo refused; fi", REFUSAL),
+        ("sudo -u root kubectl scale deploy x --replicas=3", REFUSAL),
         ("kubectl scale deploy x --replicas=3; kubectl get deploy x", REFUSAL.replace('"exit_code": 77', '"exit_code": 0')),
         ("kubectl scale deploy x --replicas=3", REFUSAL.replace('"exit_code": 77', '"exit_code": 126')),
     ):

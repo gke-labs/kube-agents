@@ -108,14 +108,24 @@ _MUTATING_SUBVERBS = {
     "auth": frozenset({"reconcile"}),
     "certificate": frozenset({"approve", "deny"}),
 }
-#: kubectl global flags that take the next token as their value.
-_KUBECTL_VALUE_FLAGS = frozenset({
-    "-n", "--namespace", "--context", "--kubeconfig", "-s", "--server", "--as", "--as-group",
-    "--as-uid", "--token", "--user", "--cluster", "-v", "--v", "--request-timeout", "--cache-dir",
-    "--certificate-authority", "--client-certificate", "--client-key", "--tls-server-name",
-    "--profile", "--profile-output", "--password", "--username", "--vmodule",
-})
+#: kubectl global flags that take the next token as their value: the policy's
+#: own table when the image carries it (``tools/command_policy.py``), else a copy.
+try:
+    from tools.command_policy import _KUBECTL_FLAGS_WITH_VALUE as _KUBECTL_VALUE_FLAGS
+except Exception:  # outside the image (unit tests)
+    _KUBECTL_VALUE_FLAGS = frozenset({
+        "-n", "--namespace", "--context", "--cluster", "--kubeconfig", "-s", "--server", "--user",
+        "--token", "--request-timeout", "--cache-dir", "--certificate-authority",
+        "--client-certificate", "--client-key", "--tls-server-name", "--username", "--password",
+        "--kuberc", "--profile", "--profile-output", "--log-flush-frequency", "-v", "--v",
+        "--vmodule", "--as", "--as-group", "--as-uid",
+    })
 _HELP_FLAGS = frozenset({"-h", "--help"})
+#: Spellings that render or read a manifest without touching the cluster; the
+#: policy refuses them too, but they are not the attempted change.
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list"})
+_LOCAL_RENDER_PREFIX = "--dry-run"
+_LOCAL_RENDER_SUBVERB = "view-last-applied"
 #: Words a shell command may carry before the command word, and the shell's
 #: own keywords and group openers that may stand in command position.
 _WRAPPERS = frozenset({
@@ -123,6 +133,20 @@ _WRAPPERS = frozenset({
     "timeout", "watch", "xargs",
 })
 _WRAPPERS_WITH_OPERAND = frozenset({"timeout"})
+#: Per wrapper, the options that take the next token (``sudo -u root``, ``nice -n 5``,
+#: ``timeout -k 5``); ``sudo -E`` and ``sudo -i`` take none, ``xargs -E eof`` does.
+_WRAPPER_VALUE_OPTIONS = {
+    "sudo": frozenset({"-u", "-g", "-p", "-C", "-D", "-R", "-T", "-U", "-h", "--user", "--group"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+    "ionice": frozenset({"-c", "-n", "-p"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+    "env": frozenset({"-u", "-C", "-S"}),
+    "xargs": frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--replace"}),
+    "watch": frozenset({"-n", "-d", "--interval"}),
+}
+_WRITERS = frozenset({"echo", "printf"})
+_WRITER_OPTIONS = frozenset({"-e", "-E", "-n", "-v", "-ne", "-en"})
 _XARGS_PLACEHOLDER = "{}"
 _KEYWORDS = frozenset({"if", "!", "then", "else", "elif", "do", "while", "until", "{", "}", "(", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
@@ -134,8 +158,14 @@ _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _CONTINUATION_RE = re.compile(r"\\\n")
 #: ``$(…)`` and backticks: the command inside runs too.
 _SUBSTITUTION_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
-#: Python list punctuation, dropped so ``["kubectl", "scale"]`` reads as words.
+#: ``$(which kubectl)`` and its spellings stand for the word itself.
+_WHICH_SUBST_RE = re.compile(r"\$\((?:which|command\s+-v|type\s+-p)\s+(\S+?)\)")
+#: A heredoc opener (not a ``<<<`` here-string) and its tag.
+_HEREDOC_OPENER_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([\w.-]+))")
+#: Python list punctuation, dropped so ``["kubectl", "scale"]`` reads as words,
+#: and the string prefixes shlex would glue to a quoted string.
 _PYTHON_PUNCTUATION_RE = re.compile(r"[\[\](),]")
+_PYTHON_PREFIX_RE = re.compile(r"(?<![\w])[fFbBrRuU]{1,2}(?=[\"'])")
 _MAX_DEPTH = 6
 #: A kubectl word, then within the same simple command one of the verbs above, as
 #: a word of its own (``patch.yaml`` and ``--replicas=3`` are not verbs). The
@@ -199,6 +229,34 @@ def _tokens(text: str, *, loose: bool) -> list[str]:
         return text.split()
 
 
+def _split_heredocs(text: str) -> tuple[str, list[tuple[str, bool]]]:
+    """The text without heredoc bodies, and each body that an interpreter on its opener line runs
+    (``(body, loose)``, ``loose`` for python); a body nothing runs is content and is dropped."""
+    lines = text.split("\n")
+    kept: list[str] = []
+    bodies: list[tuple[str, bool]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        m = _HEREDOC_OPENER_RE.search(line)
+        i += 1
+        if not m:
+            continue
+        tag = m.group(1) or m.group(2) or m.group(3)
+        body: list[str] = []
+        while i < len(lines) and lines[i].strip() != tag:
+            body.append(lines[i])
+            i += 1
+        i += 1  # the terminator
+        words = [w.rsplit("/", 1)[-1] for w in line.split()]
+        if any(_PYTHON_RE.match(w) for w in words):
+            bodies.append(("\n".join(body), True))
+        elif any(w in _SHELLS for w in words):
+            bodies.append(("\n".join(body), False))
+    return "\n".join(kept), bodies
+
+
 def _simple_commands(tokens: list[str]) -> list[list[str]]:
     out: list[list[str]] = [[]]
     for token in tokens:
@@ -228,10 +286,12 @@ def _operands(tokens: list[str]) -> list[str]:
 def _kubectl_is_mutating(args: list[str], depth: int) -> bool:
     """``args`` are the tokens after a ``kubectl`` word."""
     own = args[: args.index(_PASSTHROUGH)] if _PASSTHROUGH in args else args
-    if any(t in _HELP_FLAGS for t in own):
+    if any(t in _HELP_FLAGS or t in _LOCAL_RENDER_FLAGS or t.startswith(_LOCAL_RENDER_PREFIX) for t in own):
         return False
     operands = _operands(own)
     if not operands or operands[0] == "help":
+        return False
+    if len(operands) > 1 and operands[1] == _LOCAL_RENDER_SUBVERB:
         return False
     verb = operands[0]
     rest = args[args.index(verb) + 1 :] if verb in args else []
@@ -250,13 +310,20 @@ def _command_is_mutating(words: list[str], depth: int) -> bool:
     if depth > _MAX_DEPTH:
         return False
     i = 0
-    in_wrapper_options = False
+    wrapper = None
+    pending_operand = False
     while i < len(words):
         token = words[i]
         if token in _KEYWORDS or _ASSIGNMENT_RE.match(token) or token in _WRAPPERS:
-            in_wrapper_options = token in _WRAPPERS
-            i += 2 if token in _WRAPPERS_WITH_OPERAND else 1
-        elif in_wrapper_options and (token.startswith("-") or token == _XARGS_PLACEHOLDER):
+            wrapper = token if token in _WRAPPERS else None
+            pending_operand = token in _WRAPPERS_WITH_OPERAND
+            i += 1
+        elif wrapper and token in _WRAPPER_VALUE_OPTIONS.get(wrapper, ()):
+            i += 2
+        elif wrapper and (token.startswith("-") or token == _XARGS_PLACEHOLDER):
+            i += 1
+        elif pending_operand:  # ``timeout``'s duration, after its options
+            pending_operand = False
             i += 1
         else:
             break
@@ -265,13 +332,48 @@ def _command_is_mutating(words: list[str], depth: int) -> bool:
     word, args = words[i].rsplit("/", 1)[-1], words[i + 1 :]
     if word == "kubectl":
         return _kubectl_is_mutating(args, depth)
-    if (word in _SHELLS or _PYTHON_RE.match(word)) and "-c" in args:
-        script = args[args.index("-c") + 1 :]
-        if script and script[0] == _PASSTHROUGH:
-            script = script[1:]
-        return bool(script) and _text_is_mutating(script[0], depth + 1, loose=word not in _SHELLS)
+    is_python = bool(_PYTHON_RE.match(word))
+    if word in _SHELLS or is_python:
+        script = _dash_c_operand(args, cluster=not is_python)
+        return script is not None and _text_is_mutating(script, depth + 1, loose=is_python)
     if word == "eval":
         return _text_is_mutating(" ".join(args), depth + 1, loose=False)
+    return False
+
+
+def _dash_c_operand(args: list[str], *, cluster: bool) -> str | None:
+    """The string after ``-c`` (a shell also accepts it inside a cluster, ``-lc``), skipping a ``--``."""
+    for k, token in enumerate(args):
+        hit = token == "-c" or (cluster and token.startswith("-") and not token.startswith("--") and "c" in token[1:])
+        if hit:
+            rest = args[k + 1 :]
+            if rest and rest[0] == _PASSTHROUGH:
+                rest = rest[1:]
+            return rest[0] if rest else None
+    return None
+
+
+def _written_text_is_mutating(commands: list[list[str]], depth: int) -> bool:
+    """What ``echo``/``printf`` print when a shell in the same call runs a file or a substitution."""
+    runs_a_file = any(
+        words and words[0].rsplit("/", 1)[-1] in _SHELLS and _dash_c_operand(words[1:], cluster=True) is None
+        for words in commands
+    )
+    if not runs_a_file:
+        return False
+    for words in commands:
+        if not words or words[0].rsplit("/", 1)[-1] not in _WRITERS:
+            continue
+        args = []
+        for w in words[1:]:
+            if w.startswith((">", "1>", "2>", "&>")):
+                break
+            if w not in _WRITER_OPTIONS:
+                args.append(w)
+        if words[0].rsplit("/", 1)[-1] == "printf" and len(args) > 1:
+            args = args[1:]
+        if args and _text_is_mutating(" ".join(args), depth + 1, loose=False):
+            return True
     return False
 
 
@@ -279,12 +381,21 @@ def _text_is_mutating(text: str, depth: int, *, loose: bool) -> bool:
     if depth > _MAX_DEPTH or not text:
         return False
     if loose:
-        text = _PYTHON_PUNCTUATION_RE.sub(" ", text)
+        text = _PYTHON_PREFIX_RE.sub("", _PYTHON_PUNCTUATION_RE.sub(" ", text))
+    else:
+        text, bodies = _split_heredocs(text)
+        for body, body_loose in bodies:
+            if _text_is_mutating(body, depth + 1, loose=body_loose):
+                return True
+    text = _WHICH_SUBST_RE.sub(r"\1", text)
     for inner in _SUBSTITUTION_RE.findall(text):
         if _text_is_mutating(inner[0] or inner[1], depth + 1, loose=False):
             return True
     tokens = _tokens(text, loose=loose)
-    for words in _simple_commands(tokens):
+    commands = _simple_commands(tokens)
+    if not loose and _written_text_is_mutating(commands, depth):
+        return True
+    for words in commands:
         if _command_is_mutating(words, depth):
             return True
         if loose:
@@ -345,15 +456,17 @@ def observe_refusal(controller, tool_name, args, result, signature, *, stock, fa
     ``args`` are the call's arguments (the command is read from them);
     ``stock`` is what the unpatched ``after_call`` decided, which guidance
     never overrides when it is a block or a halt; ``failed`` is the call's
-    failure classification, which an API denial must carry (a successful read
-    whose output quotes someone else's 403 is not one); ``decide`` is the
+    failure classification, which both guidance kinds must carry (a successful
+    read, or a board read, whose output quotes a denial or the notice is
+    neither); a definitive refusal does not need it, since a refused write
+    chained before a read exits 0; ``decide`` is the
     controller's ``_decide`` (which records a halt as the turn's halt
     decision); ``decision_cls`` is ``ToolGuardrailDecision``. The last two are
     injected so this module never imports Hermes.
     """
     command, loose = command_text(args)
     kind = classify_refusal(command, result, loose=loose)
-    if kind is None or (kind == "api" and not failed):
+    if kind is None or (kind != "policy" and not failed):
         return None
     if kind != "policy":
         if getattr(stock, "action", "allow") not in ("allow", "warn"):

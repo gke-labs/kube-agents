@@ -1227,6 +1227,9 @@ _MAX_NAMED_COMMANDS = 5
 _SHOWN_COMMAND_CHARS = 120
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
+#: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
+_CODE_TOOLS = frozenset({_TERMINAL_TOOL, "execute_code"})
+_CODE_ARG = "code"
 _COMMAND_ARG = "command"
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
@@ -1234,7 +1237,7 @@ _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
 
 
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
-    """``(card, at, command, result, failed)`` per tagged ``terminal`` call, in call-time order.
+    """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -1252,7 +1255,7 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     """
     calls: list[tuple[str, float | None, str, str, bool]] = []
     for entry in trajectory:
-        if not isinstance(entry, dict) or not entry.get("agent") or entry.get("name") != _TERMINAL_TOOL:
+        if not isinstance(entry, dict) or not entry.get("agent") or entry.get("name") not in _CODE_TOOLS:
             continue
         args = entry.get("args")
         if not isinstance(args, dict):
@@ -1268,6 +1271,9 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
                     except ValueError:
                         args = {_COMMAND_ARG: head.group(1)}
         command = args.get(_COMMAND_ARG)
+        if entry.get("name") != _TERMINAL_TOOL:
+            # ``execute_code``: the program text is the command, read as one segment.
+            command = args.get(_CODE_ARG)
         if not isinstance(command, str):
             continue
         at = entry.get("at")
@@ -1385,7 +1391,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     required command, may be in the part it did not read.
 
     Limits, stated so a case is not written against them: only terminal
-    commands are visible, not MCP tool calls; only delegated workers'
+    commands and ``execute_code`` program text (one segment, the floating
+    patterns' territory) are visible, not MCP tool calls; only delegated workers'
     commands are read (their logs, or their tagged ``terminal`` calls),
     never the router's; a command the shell resolved through an alias
     appears as typed; and a result is clipped in the pod at

@@ -129,6 +129,19 @@ class ClassifyTests(unittest.TestCase):
             "kubectl get deploy kube-dns -n kube-system  # current state\nkubectl scale deploy kube-dns -n kube-system --replicas=3",
             "# bump kube-dns\nkubectl scale deploy kube-dns -n kube-system --replicas=3",
             "exec kubectl scale deploy kube-dns --replicas=3",
+            "sudo -u root kubectl scale deploy kube-dns --replicas=3",
+            "nice -n 5 kubectl scale deploy x --replicas=3",
+            "timeout -k 5 30 kubectl scale deploy x --replicas=3",
+            "bash -lc 'kubectl scale deploy x --replicas=3'",
+            "sh -ec 'kubectl scale deploy x --replicas=3'",
+            "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"kubectl\", \"scale\", \"deploy/kube-dns\", \"--replicas=3\"])\nEOF",
+            "bash <<'EOF'\nkubectl scale deploy x --replicas=3\nEOF",
+            "$(which kubectl) scale deploy x --replicas=3",
+            "bash <(echo 'kubectl scale deploy x --replicas=3')",
+            "echo 'kubectl scale deploy x --replicas=3' > /tmp/run.sh && bash /tmp/run.sh",
+            "printf 'kubectl scale deploy x --replicas=3\\n' > /tmp/run && bash -o pipefail /tmp/run",
+            "kubectl --log-flush-frequency 5s scale deploy x --replicas=3",
+            "kubectl apply -f - <<EOF\nkind: ConfigMap\nEOF",
         ):
             self.assertEqual(stop.classify_refusal(command, REFUSAL), "policy", command)
 
@@ -138,6 +151,7 @@ class ClassifyTests(unittest.TestCase):
             'subprocess.run([\n    "kubectl",\n    "scale",\n    "deploy/kube-dns",\n])',
             'os.system("kubectl patch deploy x -p y")',
             '# scale it\nsubprocess.run(["kubectl", "scale", "deploy/kube-dns", "--replicas=3"])',
+            'subprocess.run(f"kubectl scale deploy {name} --replicas=3", shell=True)',
         ):
             self.assertEqual(stop.classify_refusal(text, REFUSAL, loose=True), "policy", text)
         self.assertEqual(stop.classify_refusal('subprocess.run(["kubectl", "get", "pods"])', REFUSAL, loose=True), "advisory")
@@ -163,6 +177,15 @@ class ClassifyTests(unittest.TestCase):
             "grep -r 'kubectl scale deploy kube-dns' /opt/data/kanban/logs",
             "grep -r kubectl scale /opt/data/kanban/logs",
             "echo kubectl scale deploy x --replicas=3",
+            # A report that quotes the refused command and the notice in a content heredoc.
+            "cat <<'EOF' | tee /tmp/pr-body.md\n```\nkubectl scale deployment kube-dns -n kube-system --replicas=3\n```\nrefused however it is attempted; policy rule: kubernetes.read-only\nEOF",
+            "tee /tmp/notes <<'EOF'\n`kubectl scale deploy kube-dns --replicas=3` was refused\nEOF",
+            # Local renders: the policy refuses them, nothing was attempted against the cluster.
+            "kubectl create deployment kube-dns-proposal --image=x --dry-run=client -o yaml > manifest.yaml",
+            "kubectl patch --local -f manifest.yaml -p '{\"spec\":{\"replicas\":3}}' -o yaml",
+            "kubectl set image --local -f manifest.yaml app=img -o yaml",
+            "kubectl label pod x --list",
+            "kubectl apply view-last-applied deploy/kube-dns",
             "",
         ):
             self.assertEqual(stop.classify_refusal(command, REFUSAL), "advisory", command)
@@ -272,6 +295,11 @@ class ObserveTests(unittest.TestCase):
         events = _result('LAST SEEN  MESSAGE\n2m  Error creating: pods "x" is forbidden: exceeded quota', exit_code=0)
         self.assertIsNone(observe(controller, events, args={"command": "kubectl get events -n tenant"}, failed=False))
         self.assertEqual(observe(controller, K8S_403, failed=True).code, stop.API_WARN_CODE)
+        # Nor is a successful read, or a board read, whose text quotes the policy's notice an advisory refusal.
+        echoed = _result(REFUSAL, exit_code=0)
+        self.assertIsNone(observe(controller, echoed, args={"command": "kubectl logs deploy/app"}, failed=False))
+        self.assertIsNone(observe(controller, '{"task": {"result": ' + json.dumps(REFUSAL) + '}}', tool="kanban_show", args={"task_id": "t_1"}, failed=False))
+        self.assertEqual(observe(controller, REFUSAL, args={"command": "kubectl config view"}, failed=True).code, stop.ADVISORY_WARN_CODE)
         # A definitive refusal does not need the failure flag: a write chained before a read exits 0.
         self.assertEqual(observe(controller, REFUSAL, args={"command": "kubectl scale deploy x --replicas=3; kubectl get deploy x"}, failed=False).action, "halt")
 

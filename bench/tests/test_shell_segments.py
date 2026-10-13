@@ -268,9 +268,7 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "kubectl scale deploy x --replicas=3"
     )
     # Process substitution runs what the inner command prints.
-    assert segments("bash <(echo 'kubectl scale deploy x --replicas=3')")[0] == (
-        "echo 'kubectl scale deploy x --replicas=3'"
-    )
+    assert "kubectl scale deploy x --replicas=3" in segments("bash <(echo 'kubectl scale deploy x --replicas=3')")
     assert segments("diff <(kubectl get deploy a -o yaml) <(kubectl get deploy b -o yaml)")[:2] == [
         "kubectl get deploy a -o yaml",
         "kubectl get deploy b -o yaml",
@@ -292,6 +290,18 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "kubectl scale deploy x --replicas=3"
     )
     assert segments("while read -r d; do echo $d; done <<< \"$list\"\nkubectl scale deploy x --replicas=3")[-1] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    # A runner's option values are not the script; a redirect may follow a closing quote.
+    assert segments("echo 'kubectl scale deploy x --replicas=3' > /tmp/run && bash -o pipefail /tmp/run")[0] == (
+        "kubectl scale deploy x --replicas=3"
+    )
+    assert segments("echo 'kubectl scale deploy x --replicas=3' > /tmp/s && python3 -W ignore /tmp/s") == [
+        "kubectl scale deploy x --replicas=3",
+        "echo 'kubectl scale deploy x --replicas=3' > /tmp/s",
+        "python3 -W ignore /tmp/s",
+    ]
+    assert segments("echo 'kubectl scale deploy x --replicas=3'>/tmp/run.sh && bash /tmp/run.sh")[0] == (
         "kubectl scale deploy x --replicas=3"
     )
     # A chmod that does not add execute does not make the file a script.

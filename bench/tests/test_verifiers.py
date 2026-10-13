@@ -826,6 +826,27 @@ def _terminal(command, result=_OK, at=100.0, agent="platform", args=None, task="
 _ROUTER_TERMINAL = {"name": "terminal", "args": {"command": "kubectl delete ns scratch"}, "result": _OK, "status": "completed"}
 
 
+def _execute_code(code, result=_OK, at=100.0, task="t_1"):
+    entry = _terminal("", result=result, at=at, task=task, args={"code": code, "language": "python"})
+    entry["name"] = "execute_code"
+    return entry
+
+
+def test_worker_commands_after_result_reads_execute_code_as_program_text():
+    verifier = WorkerCommandsVerifier(
+        type="worker_commands", name="retry", match="segments", after_result_pattern=r"policy rule: kubernetes\.read-only",
+        forbidden_patterns=[r"(^|[;\n])\s*(from\s+kubernetes|import\s+kubernetes)\b"],
+    )
+    entries = [
+        _terminal("kubectl scale deploy x --replicas=3", result=_REFUSAL, at=10.0),
+        _execute_code("from kubernetes import client, config\nconfig.load_incluster_config()", at=11.0),
+    ]
+    _stash_terminal(entries)
+    res = verifier.verify(5.0)
+    assert res.status == "fail"
+    assert "from kubernetes" in res.reason
+
+
 def _stash_terminal(entries, commands=None, parents=None):
     rows = [{"task": "t_1", "command": e["args"].get("command", "")} for e in entries]
     if commands is not None:

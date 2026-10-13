@@ -95,7 +95,8 @@ _WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-p)\s+(\S+)$")
 # ``<<`` or ``<<-``, then a tag: quoted, backslashed, or bare; a bare tag is a
 # shell word, and only a bare tag's body is expanded.
 _HEREDOC_RE = re.compile(r"<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|(\\)?([^\s;&|<>()'\"\\]+))")
-_REDIRECT_TARGET_RE = re.compile(r"(?:^|\s)>{1,2}\s*(\S+)")
+_REDIRECT_TARGET_RE = re.compile(r"(?:^|[\s'\"])>{1,2}\s*(\S+)")
+_ATTACHED_REDIRECT_RE = re.compile(r"^('[^']*'|\"[^\"]*\")>")
 _DD_TARGET_RE = re.compile(r"(?:^|\s)of=(\S+)")
 # Nesting beyond this is not shell a worker writes; it bounds a pathological
 # input rather than any real one.
@@ -231,6 +232,10 @@ def _writer_scripts(piece: str) -> list[str]:
     words: list[str] = []
     for _, _, token in _tokens(piece):
         if token.startswith((">", "1>", "2>", "&>")):
+            break
+        attached = _ATTACHED_REDIRECT_RE.match(token)
+        if attached:  # ``'text'>file``: the redirect follows the closing quote
+            words.append(attached.group(1))
             break
         words.append(token)
     # Everything after the writer's word and its options; printf's first word is the format.
@@ -580,7 +585,9 @@ def _executed_paths(pieces: list[str]) -> dict[str, str]:
             continue
         word, args = found
         base = word.rsplit("/", 1)[-1]
-        positional = [a for a in args if not a.startswith("-")]
+        positional = _interpreter_operands(args)
+        if word == "chmod":
+            positional = [a for a in args if not a.startswith("-")]  # the mode is the first operand
         if base in _SHELL_RUNNERS and positional:
             paths.setdefault(positional[0], _KIND_SHELL)
         elif _PYTHONS.match(base) and positional:
@@ -592,6 +599,23 @@ def _executed_paths(pieces: list[str]) -> dict[str, str]:
             paths.setdefault(word, _KIND_SHELL)
             paths.setdefault(word[2:] if word.startswith("./") else word, _KIND_SHELL)
     return paths
+
+
+def _interpreter_operands(args: list[str]) -> list[str]:
+    """An interpreter's operands: option words and their values (``-o pipefail``, ``--rcfile f``,
+    ``-W ignore``, attached ``-Werror``) are neither."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token in _INTERPRETER_VALUE_OPTIONS or token in _INTERPRETER_LONG_VALUE_OPTIONS:
+            i += 2
+        elif token.startswith(("-", "+")) and len(token) > 1:
+            i += 2 if ("-" + token[-1]) in _INTERPRETER_VALUE_OPTIONS and token[:2] not in _INTERPRETER_VALUE_OPTIONS else 1
+        else:
+            out.append(token)
+            i += 1
+    return out
 
 
 def _heredoc_target(opener_pieces: list[str]) -> str:
