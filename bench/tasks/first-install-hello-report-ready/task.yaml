@@ -38,9 +38,7 @@ infrastructure:
 
 validated: false
 
-# A greeting needs no tool call. With gke-labs/kube-agents#2699 the liveness
-# rung then reads the reply instead of the trajectory; until it merges, the key
-# is ignored and a run with no tool call grades blocked.
+# A greeting needs no tool call.
 tool_calls_optional: true
 
 domain: chat-and-routing
