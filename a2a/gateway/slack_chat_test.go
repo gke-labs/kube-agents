@@ -167,6 +167,29 @@ func TestSlackChatFoldTooLarge(t *testing.T) {
 	}
 }
 
+// Slack refuses a container in an attachment, so with a fold the bar starts
+// after it: the fold and what is above it stay top-level.
+func TestSlackChatSideBarStartsAfterTheFold(t *testing.T) {
+	m := chatmsg.Message{Schema: chatmsg.Schema, Headline: "h", Detail: "d", Tone: chatmsg.ToneCritical,
+		Fold:    &chatmsg.Fold{Text: "why"},
+		Choices: []chatmsg.Choice{{Text: "go"}}}
+	layout, err := renderSlackChat(&m, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Blocks) != 3 || layout.Blocks[2]["type"] != "container" {
+		t.Fatalf("top-level blocks = %v, want headline, detail, fold", layout.Blocks)
+	}
+	if len(layout.Attachments) != 1 || layout.Attachments[0]["color"] != "#E01E5A" {
+		t.Fatalf("attachments = %v, want the buttons in a red bar", layout.Attachments)
+	}
+	noButtons := m
+	noButtons.Choices = nil
+	if layout, err := renderSlackChat(&noButtons, "t"); err != nil || len(layout.Attachments) != 0 {
+		t.Fatalf("layout = %+v err = %v, want no bar when nothing follows the fold", layout, err)
+	}
+}
+
 // The side bar needs something under the headline; a lone block keeps no
 // colour, as with_side_bar keeps none.
 func TestSlackChatSideBarOnlyWithBlocksBelowTheHeadline(t *testing.T) {

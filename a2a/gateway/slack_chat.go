@@ -120,11 +120,13 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 	if after := slackChatAfter(m.After); after != nil {
 		blocks = append(blocks, after)
 	}
+	foldAt := -1
 	if m.Fold != nil {
 		fold, err := slackChatFold(m.Fold)
 		if err != nil {
 			return slackChatLayout{}, err
 		}
+		foldAt = len(blocks)
 		blocks = append(blocks, fold)
 	}
 	blocks = append(blocks, slackChatActions(m.Choices, m.Links)...)
@@ -135,12 +137,20 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 		return slackChatLayout{}, err
 	}
 	layout := slackChatLayout{Blocks: blocks, Attachments: []map[string]any{}}
-	if color, ok := slackChatColors[m.Tone]; ok && len(blocks) > slackChatSideBarFrom {
-		layout.Blocks = blocks[:slackChatSideBarFrom]
+	barFrom := slackChatSideBarFrom
+	if foldAt >= 0 {
+		// Slack refuses a container inside an attachment (invalid_attachments,
+		// seen live), and an attachment draws after every top-level block, so
+		// the fold and everything above it stay top-level and the bar holds
+		// what follows it.
+		barFrom = max(barFrom, foldAt+1)
+	}
+	if color, ok := slackChatColors[m.Tone]; ok && len(blocks) > barFrom {
+		layout.Blocks = blocks[:barFrom]
 		layout.Attachments = []map[string]any{{
 			"color":    color,
 			"fallback": text,
-			"blocks":   blocks[slackChatSideBarFrom:],
+			"blocks":   blocks[barFrom:],
 		}}
 	}
 	return layout, nil
