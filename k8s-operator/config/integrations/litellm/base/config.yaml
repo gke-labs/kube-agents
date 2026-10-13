@@ -14,7 +14,7 @@ litellm_settings:
     - prometheus
     - litellm_thinking_replay_callback.proxy_handler_instance
 # No prompt-caching breakpoints here: on Gemini, LiteLLM turns them into Vertex
-# explicit context caching (a cachedContents list and create before every
-# generate call), and a create Vertex holds past its request credential's life
+# explicit context caching (a cachedContents list before every call, and a
+# create whenever the cached prefix is new), and a create Vertex holds past its request credential's life
 # fails the turn. Gemini's implicit caching needs no markers. The breakpoints
 # are in overlays/anthropic, for the Anthropic-family provider only.

@@ -2,8 +2,8 @@
 
 LiteLLM turns `cache_control_injection_points` into Anthropic cache markers on
 a Claude route, which is what they are for. On a Gemini route it turns the same
-markers into Vertex explicit context caching: a cachedContents list and create
-before every generate call, and a create Vertex holds past its request
+markers into Vertex explicit context caching: a cachedContents list before
+every call and a create whenever the cached prefix is new, and a create Vertex holds past its request
 credential's life fails the turn. So the chart renders the breakpoints under
 the same Claude test as `additional_drop_params`, and the kustomize base keeps
 them in an anthropic overlay that the anthropic provider selects. The render
@@ -99,12 +99,35 @@ class TestKustomize(unittest.TestCase):
         self.assertEqual(generator["behavior"], "merge")
         self.assertEqual(generator["files"], ["config.yaml"])
 
+    @unittest.skipUnless(shutil.which("kubectl"), "kubectl is not installed")
+    def test_the_built_anthropic_overlay_keeps_the_base_keys_and_mount(self) -> None:
+        proc = subprocess.run(
+            ["kubectl", "kustomize", str(_LITELLM / "overlays" / "anthropic")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        documents = [d for d in yaml.safe_load_all(proc.stdout) if d]
+        configmap = next(d for d in documents if d["kind"] == "ConfigMap")
+        self.assertEqual(sorted(configmap["data"]), ["config.yaml", "litellm_thinking_replay_callback.py"])
+        self.assertIn("router_settings", yaml.safe_load(configmap["data"]["config.yaml"]))
+        deployment = next(d for d in documents if d["kind"] == "Deployment")
+        volumes = {v["name"]: v for v in deployment["spec"]["template"]["spec"]["volumes"]}
+        self.assertEqual(volumes["config-volume"]["configMap"]["name"], configmap["metadata"]["name"])
+
     def test_only_the_anthropic_provider_selects_it(self) -> None:
         providers = json.loads((_LITELLM / "providers.json").read_text())["providers"]
         overlays = {p["id"]: p["overlay"] for p in providers}
         self.assertEqual(overlays["anthropic"], "anthropic")
         self.assertEqual([p for p, o in overlays.items() if o == "anthropic"], ["anthropic"])
-        self.assertIn('"$$MODEL_PROVIDER" = "anthropic"', (_REPO_ROOT / "k8s-operator" / "Makefile").read_text())
+        makefile = (_REPO_ROOT / "k8s-operator" / "Makefile").read_text()
+        branches = [line for line in makefile.splitlines() if '"$$MODEL_PROVIDER" = "anthropic"' in line]
+        self.assertEqual(len(branches), 2)
+        for line in makefile.splitlines():
+            if "litellm/overlays/anthropic" in line:
+                self.assertIn("$(KUSTOMIZE) build", line)
+        self.assertEqual(makefile.count("config/integrations/litellm/overlays/anthropic"), 2)
 
 
 if __name__ == "__main__":

@@ -530,9 +530,10 @@ litellm_settings:
 {{- /*
   Prompt caching, for Anthropic-family models only: the same $claude gate as
   additional_drop_params above. On Gemini, LiteLLM turns these markers into
-  Vertex explicit context caching, a cachedContents list and create before
-  every generate call. A create that Vertex holds past its request credential's
-  life fails the whole turn (a 401 after a ten-minute stall), and Gemini's
+  Vertex explicit context caching: a cachedContents list before every call,
+  and a create whenever the cached prefix is new. A create that Vertex holds
+  past its request credential's life fails the whole turn (a 401 after a
+  ten-minute stall in the incident that found this), and Gemini's
   implicit caching needs no markers. The kustomize base carries the same block
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
