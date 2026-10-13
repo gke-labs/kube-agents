@@ -79,6 +79,10 @@ def ops_for(name, types=ur.UPGRADE_OPERATION_TYPES):
     return [o for o in OPERATIONS if f"/clusters/{name}" in o["targetLink"] and o["operationType"] in types]
 
 
+def fleet_scope_env():
+    return ur.fleet_scope_args.SCOPE_DECLARED_ENV
+
+
 def run_of(rc=0, stdout="", stderr=""):
     return ur.Run(["x"], rc, stdout, stderr, 0.01)
 
@@ -136,9 +140,9 @@ class FakeFleet:
 def args(**overrides):
     """The scheduled run's arguments: `--full` unless the test narrows the run
     with --cluster or --since, or says otherwise."""
-    base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "probe_lock": False, "manifest_file": None, "after_upgrade": False}
+    base = {"project": None, "scope_projects": PROJECT, "scope_unread": None, "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "probe_lock": False, "manifest_file": None, "after_upgrade": False}
     base.update(overrides)
-    base.setdefault("full", base["cluster"] is None and base["since"] is None and bool(base["project"]))
+    base.setdefault("full", base["cluster"] is None and base["since"] is None and bool(base["scope_projects"]))
     if "full" in overrides:
         base["full"] = overrides["full"]
     return mock.Mock(**base)
@@ -1929,23 +1933,23 @@ class LedgerAndGuardsTest(unittest.TestCase):
         (self.home / ur.GUARDS_FILENAME).write_text("{not json")
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
+                rc = ur.main(["--full", "--scope-projects", PROJECT, "--no-report"])
         self.assertEqual(rc, ur.EXIT_USAGE)
         self.assertIn("crash record, not a re-baseline", err.getvalue())
         self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
         # The crash record blocks a fresh start until it is archived.
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
                 # The broken guards file is met next: set aside, and its record blocks like the ledger's.
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertTrue(list(self.home.glob(ur.GUARDS_RECORD_GLOB)))
                 with redirect_stderr(io.StringIO()) as err2:
-                    self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                    self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertIn("guards.json.unreadable-", err2.getvalue())
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
-                rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
+                rc = ur.main(["--full", "--scope-projects", PROJECT, "--no-report"])
         self.assertEqual(rc, 0)
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["version"], ur.LEDGER_VERSION)
 
@@ -1986,7 +1990,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             with mock.patch.object(ur, "LOCK_WAIT", timedelta(seconds=0.05)), mock.patch.object(ur, "LOCK_POLL_INTERVAL", timedelta(seconds=0.01)):
                 with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                     with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
-                        rc = ur.main(["--full", "--project", PROJECT])
+                        rc = ur.main(["--full", "--scope-projects", PROJECT])
                 self.assertEqual(rc, 0)
                 self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(seconds=0.05)))
                 self.assertIn("waited 0 min for it; nothing written", out.getvalue())
@@ -1996,7 +2000,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 with mock.patch.object(ur, "LOCK_WAIT", timedelta(seconds=5)):
                     with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                         with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
-                            rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
+                            rc = ur.main(["--full", "--scope-projects", PROJECT, "--no-report"])
                 self.assertEqual(rc, 0)
                 self.assertIn(ur.SECTION_ERRORS, out.getvalue())
                 self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
@@ -2048,7 +2052,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
     def test_api_disabled_project_is_empty_for_operations_too(self):
         ops, error = ur.list_operations("no-gke-project", SINCE, run=lambda argv, **kw: run_of(1, "", API_OFF_STDERR.format(project="no-gke-project", api="operations")))
         self.assertEqual((ops, error), ([], None))
-        result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), project=[PROJECT, "no-gke-project"])
+        result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), scope_projects=f"{PROJECT},no-gke-project")
         self.assertEqual((result["failed_reads"], result["operations_unread"], result["projects"]), ([], [], [PROJECT, "no-gke-project"]))
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})[ur.LEDGER_PROJECTS_KEY], [PROJECT, "no-gke-project"])
         self.assertNotIn(ur.INFO_FAILED_READS, ur.render_report(result))
@@ -2092,7 +2096,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ur.main(["--probe-lock"]), 0)
         self.assertEqual(out.getvalue().strip(), ur.LOCK_PROBE_FREE_TEXT.format(path=lock_path))
-        for argv in (["--probe-lock", "--full", "--project", PROJECT], ["--probe-lock", "--after-upgrade"], ["--probe-lock", "--dry-run"], ["--probe-lock", "--reset-ledger"], ["--probe-lock", "--cluster", SEEDED]):
+        for argv in (["--probe-lock", "--full", "--scope-projects", PROJECT], ["--probe-lock", "--after-upgrade"], ["--probe-lock", "--dry-run"], ["--probe-lock", "--reset-ledger"], ["--probe-lock", "--cluster", SEEDED]):
             with self.subTest(argv=argv):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                     self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
@@ -2105,7 +2109,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         try:
             with mock.patch.object(ur, "LOCK_WAIT", timedelta(0)), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                 with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
-                    rc = ur.main(["--full", "--project", PROJECT])
+                    rc = ur.main(["--full", "--scope-projects", PROJECT])
             self.assertEqual(rc, 0)
             self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(0)))
             self.assertIn("another retrospective run holds", out.getvalue())
@@ -2130,7 +2134,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             held.close()
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), 0)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
         self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
 
     def test_in_flight_operation_holds_the_cluster_back(self):
@@ -2478,7 +2482,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(first["fleet"], [PROJECT])
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})[ur.LEDGER_PROJECTS_KEY], [PROJECT])
         # A project joins: the fleet grows; its listing is empty here.
-        grown, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), project=[PROJECT, "other-project"])
+        grown, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), scope_projects=f"{PROJECT},other-project")
         self.assertEqual(grown["fleet"], [PROJECT, "other-project"])
         # A project leaves: its clusters and guards go with it.
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
@@ -2510,7 +2514,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         twin = cluster_doc("seeded-a")
         twin["project"] = "other-project"
         other_key = f"other-project/{LOCATION}/seeded-a"
-        scoped, _ = self.collect(FakeFleet(clusters=[twin]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), project=["other-project"], cluster=[other_key])
+        scoped, _ = self.collect(FakeFleet(clusters=[twin]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), scope_projects=None, project="other-project", cluster=[other_key])
         self.assertEqual(scoped["outside_fleet"], [other_key])
         self.assertNotIn(other_key, {g["cluster"] for g in scoped["guards"]})
         self.assertEqual(set(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][other_key]), {ur.LEDGER_OPERATIONS_KEY})
@@ -2630,19 +2634,19 @@ class LedgerAndGuardsTest(unittest.TestCase):
         twin = cluster_doc("seeded-a")
         twin["project"] = "other-project"
         other_key = f"other-project/{LOCATION}/seeded-a"
-        first, _ = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=1), full=False, after_upgrade=True, project=["other-project"])
+        first, _ = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=1), full=False, after_upgrade=True, scope_projects="other-project")
         self.assertEqual(([r["cluster"] for r in first["reviews"]], first["outside_fleet"]), ([other_key], [other_key]))
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertEqual((ledger[ur.LEDGER_PROJECTS_KEY], set(ledger["clusters"][other_key])), ([PROJECT], {ur.LEDGER_OPERATIONS_KEY}))
         self.assertEqual([o["route"] for o in ledger["clusters"][other_key][ur.LEDGER_OPERATIONS_KEY]], [ur.ROUTE_AFTER_UPGRADE] * 4)
-        second, fleet = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=2), full=False, after_upgrade=True, project=["other-project"])
+        second, fleet = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=2), full=False, after_upgrade=True, scope_projects="other-project")
         self.assertTrue(second["quiet"])
         self.assertFalse(any("get-credentials" in " ".join(c) for c in fleet.calls))
         # The sweep wrote the outside cluster no guard, and its ledger entry holds the operations
         # reviewed alone; the next full run that names the project adds it to the fleet set and
         # reviews the cluster in full, its versions recorded and its operations already reviewed.
         self.assertEqual([g for g in first["guards"] if g["cluster"] == other_key], [])
-        third, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded"), twin]), now=NOW + timedelta(days=7), project=[PROJECT, "other-project"])
+        third, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded"), twin]), now=NOW + timedelta(days=7), scope_projects=f"{PROJECT},other-project")
         self.assertIn(other_key, [r["cluster"] for r in third["reviews"]])
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertEqual(ledger[ur.LEDGER_PROJECTS_KEY], [PROJECT, "other-project"])
@@ -2699,10 +2703,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         # run that was never going to proceed.
         (self.home / ur.LEDGER_FILENAME).write_text("{not json")
         refused = (
-            (["--full", "--project", PROJECT, "--cluster", SEEDED], ur.FULL_WITH_CLUSTER_TEXT),
-            (["--full"], ur.FULL_WITHOUT_PROJECT_TEXT),
-            (["--full", "--project", PROJECT, "--since", "7"], ur.FULL_WITH_SINCE_TEXT),
-            (["--after-upgrade", "--full", "--project", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT),
+            (["--full", "--scope-projects", PROJECT, "--cluster", SEEDED], ur.FULL_WITH_CLUSTER_TEXT),
+            (["--full", "--project", PROJECT], ur.FULL_WITH_PROJECT_TEXT),
+            (["--full", "--scope-projects", PROJECT, "--since", "7"], ur.FULL_WITH_SINCE_TEXT),
+            (["--after-upgrade", "--full", "--scope-projects", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT),
             (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT),
             (["--project", PROJECT, "--report", str(self.home / ur.LATEST_REPORT_LINK)], ur.REPORT_IS_LINK_TEXT.format(name=ur.LATEST_REPORT_LINK)),
             (["--project", PROJECT, "--since", "yesterday"], "--since takes"),
@@ -2843,12 +2847,74 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertTrue(out.exists() and manifest.exists() and report.exists())
             self.assertEqual(stat.S_IMODE((self.home / ur.REPORTS_SUBDIR).stat().st_mode), ur.STORE_DIR_MODE)
 
+    def test_the_declared_scope_is_swept_exactly_and_nothing_is_listed(self):
+        # The fleet is the fleet_scope tool's resolved set: swept as handed, no listing, recorded as
+        # the fleet; a project the next scope no longer names is pruned with its clusters and guards.
+        result, fleet = self.collect(scope_projects=f"{PROJECT},other-project")
+        self.assertEqual((result["projects"], result["fleet"]), ([PROJECT, "other-project"], [PROJECT, "other-project"]))
+        self.assertFalse(any("projects list" in " ".join(c) or "config get-value" in " ".join(c) for c in fleet.calls))
+        self.assertNotIn("limitations", json.loads(Path(result["manifest_path"]).read_text()) if result.get("manifest_path") else {})
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        other = "other-project/us-central1-a/elsewhere"
+        ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        narrowed, _ = self.collect(scope_projects=PROJECT, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((narrowed["fleet"], narrowed["removed_clusters"]), ([PROJECT], [other]))
+        self.assertNotIn(other, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+
+    def test_a_project_override_is_free_undeclared_and_must_be_inside_a_declared_scope(self):
+        # Undeclared: `--project` is a hand run's override and the run is scoped. Declared: an
+        # override outside the readable scope is refused before the lock, one inside it runs.
+        free, fleet = self.collect(scope_projects=None, project=PROJECT, full=False)
+        self.assertEqual((free["projects"], free["scoped"]), ([PROJECT], True))
+        self.assertFalse(any("projects list" in " ".join(c) for c in fleet.calls))
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(scope_projects=f"{PROJECT},other-project", project="acme-only", full=False)
+        self.assertIn("declared scope does not list", str(caught.exception))
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(scope_projects=PROJECT, scope_unread="payments-staging=denied", project="payments-staging", full=False)
+        self.assertIn("could not read", str(caught.exception))
+        inside, _ = self.collect(scope_projects=f"{PROJECT},other-project", project=PROJECT, full=False)
+        self.assertEqual(inside["projects"], [PROJECT])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ur.main(["--scope-projects", PROJECT, "--project", "acme-only"]), ur.EXIT_USAGE)
+        self.assertIn("declared scope does not list", err.getvalue())
+
+    def test_a_declared_install_without_the_flags_lists_nothing(self):
+        # The sandbox's scope guard: the operator says the install declares a scope, the collector got
+        # no collector_args, so it reports that and lists nothing; the probe still answers.
+        with mock.patch.dict(os.environ, {fleet_scope_env(): "true"}):
+            with self.assertRaises(argparse.ArgumentTypeError) as caught:
+                self.collect(scope_projects=None, project=None, full=False)
+            self.assertIn("got no collector_args", str(caught.exception))
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(ur.main(["--full"]), ur.EXIT_USAGE)
+            self.assertIn("got no collector_args", err.getvalue())
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--probe-lock"]), 0)
+            self.assertIn("is free", out.getvalue())
+            # A declared scope with nothing readable is a boundary with nothing inside it.
+            with self.assertRaises(argparse.ArgumentTypeError) as caught:
+                self.collect(scope_projects=None, scope_unread="payments-staging=denied", project=None, full=False)
+            self.assertIn("no project this install could read", str(caught.exception))
+        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+        self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
+
+    def test_main_hands_the_scope_flags_to_the_resolver_and_help_names_them(self):
+        with mock.patch.object(ur.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            ur.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+        proc = subprocess.run([sys.executable, ur.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
     def test_after_upgrade_rejects_full_and_cluster(self):
         with self.assertRaises(argparse.ArgumentTypeError):
             self.collect(full=True, after_upgrade=True)
         with self.assertRaises(argparse.ArgumentTypeError):
             self.collect(full=False, after_upgrade=True, cluster=[SEEDED])
-        for argv, text in ((["--after-upgrade", "--full", "--project", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT), (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT)):
+        for argv, text in ((["--after-upgrade", "--full", "--scope-projects", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT), (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT)):
             with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                     self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
@@ -3040,10 +3106,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         (self.home / ur.LEDGER_FILENAME).write_text("{broken")
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
             # The ledger is gone and a crash record sits beside its place: every run refuses.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
             self.assertIn("sits beside no live state file", err.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             # --dry-run lists the records and moves none; the block stands.
@@ -3059,7 +3125,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertEqual(list(self.home.glob(ur.CRASH_RECORD_GLOB)), [])
             self.assertTrue(list((self.home / ur.ARCHIVE_SUBDIR).rglob("ledger.json.unreadable-*")))
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), 0)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
             self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
@@ -3087,7 +3153,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         fleet = FakeFleet()
         with mock.patch.object(ur, "default_run", fleet), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                rc = ur.main(["--full", "--project", PROJECT, "--report", str(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK)])
+                rc = ur.main(["--full", "--scope-projects", PROJECT, "--report", str(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK)])
         self.assertEqual(rc, ur.EXIT_USAGE)
         self.assertIn("must not be named", err.getvalue())
         self.assertEqual(fleet.calls, [])  # refused before any read
@@ -3128,7 +3194,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.collect(full=True, cluster=[SEEDED])
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--cluster", SEEDED]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--cluster", SEEDED]), ur.EXIT_USAGE)
         self.assertIn(ur.FULL_WITH_CLUSTER_TEXT, err.getvalue())
         # A full run records the fleet; the same --project set without --full is scoped and changes nothing.
         self.collect()
@@ -3153,7 +3219,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261016T180000Z.md")
 
     def test_failed_listing_is_the_projects_gap_not_the_runs(self):
-        self.collect(project=[PROJECT, "other-project"])
+        self.collect(scope_projects=f"{PROJECT},other-project")
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         other = "other-project/us-central1-a/elsewhere"
         ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
@@ -3162,7 +3228,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         guards["guards"].append({**guards["guards"][0], "id": ur.guard_id(other, 7, "apps/Deployment/x"), "cluster": other, "entry": 7, "object": "apps/Deployment/x"})
         ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, guards)
         later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
-        result, _ = self.collect(FakeFleet(list_fail=["other-project"]), now=later, project=[PROJECT, "other-project"])
+        result, _ = self.collect(FakeFleet(list_fail=["other-project"]), now=later, scope_projects=f"{PROJECT},other-project")
         self.assertFalse(result["scoped"])
         self.assertEqual(result["fleet"], [PROJECT, "other-project"])
         self.assertEqual(result["removed_clusters"], [])
@@ -3376,10 +3442,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(incident["predates_upgrade"])
         self.assertNotIn("apps/Pod/legacy-worker", [i["object"] for i in result["sections"]["errors"]])
 
-    def test_full_needs_a_project_set_and_no_since(self):
+    def test_full_refuses_a_project_override_and_since(self):
         with self.assertRaises(argparse.ArgumentTypeError) as caught:
-            self.collect(full=True, project=None)
-        self.assertEqual(str(caught.exception), ur.FULL_WITHOUT_PROJECT_TEXT)
+            self.collect(full=True, scope_projects=None, project=PROJECT)
+        self.assertEqual(str(caught.exception), ur.FULL_WITH_PROJECT_TEXT)
         with self.assertRaises(argparse.ArgumentTypeError) as caught:
             self.collect(full=True, since="30")
         self.assertEqual(str(caught.exception), ur.FULL_WITH_SINCE_TEXT)
@@ -3546,12 +3612,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn("named by --cluster but not listed", missing["failed_reads"][0])
 
     def test_discovery_runs_without_project_flag(self):
-        result, fleet = self.collect(project=None)
+        # An install that declares no scope and a hand run without flags: the listing, as before.
+        result, fleet = self.collect(project=None, scope_projects=None)
         self.assertEqual(result["projects"], [PROJECT])
         self.assertTrue(any("projects list" in " ".join(c) for c in fleet.calls))
         # No environment variable takes part, as collect.py's discover_fleet.
         with mock.patch.dict(os.environ, {"MONITORED_PROJECT_IDS": "a-project,b-project", "GKE_PROJECT_ID": "c-project"}):
-            result, fleet = self.collect(project=None)
+            result, fleet = self.collect(project=None, scope_projects=None)
         self.assertEqual(result["projects"], [PROJECT])
         self.assertEqual([c for c in fleet.calls if "config" in c], [["gcloud", "config", "get-value", "project"]])
 
@@ -3674,7 +3741,7 @@ class ReportTest(unittest.TestCase):
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
-                rc = ur.main(["--full", "--project", PROJECT, "--output", str(home / "out.json"), "--report", str(report_path)])
+                rc = ur.main(["--full", "--scope-projects", PROJECT, "--output", str(home / "out.json"), "--report", str(report_path)])
         self.assertEqual(rc, 0)
         self.assertTrue(out.getvalue().startswith("# Upgrade retrospective 2026-10-08"))
         self.assertEqual(report_path.read_text(), out.getvalue())
@@ -3701,7 +3768,7 @@ class ReportTest(unittest.TestCase):
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW), mock.patch.object(ur, "write_json_atomically", spy):
             with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
                 with self.assertRaises(OSError):
-                    ur.main(["--full", "--project", PROJECT, "--output", str(home / "out.json")])
+                    ur.main(["--full", "--scope-projects", PROJECT, "--output", str(home / "out.json")])
         self.assertEqual(order, ["out.json", ur.GUARDS_FILENAME, ur.LEDGER_FILENAME])
         self.assertTrue((home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK).exists())
         self.assertEqual([p.name for p in (home / ur.REPORTS_SUBDIR).glob("*Z.md")], ["20261008T180000Z.md"])
@@ -3992,7 +4059,7 @@ class ManifestTest(unittest.TestCase):
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_failed_listing_and_upgrading_clusters_are_gate_failed(self):
-        self.collect(project=[PROJECT, "other-project"])
+        self.collect(scope_projects=f"{PROJECT},other-project")
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         other = "other-project/us-central1-a/elsewhere"
         ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
@@ -4000,7 +4067,7 @@ class ManifestTest(unittest.TestCase):
         ops = copy.deepcopy(OPERATIONS)
         running = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"])
         running["status"], running["endTime"] = "RUNNING", None
-        result, _ = self.collect(FakeFleet(list_fail=["other-project"], operations=ops), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), project=[PROJECT, "other-project"])
+        result, _ = self.collect(FakeFleet(list_fail=["other-project"], operations=ops), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), scope_projects=f"{PROJECT},other-project")
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         by_name = {c["name"]: c for c in manifest["clusters"]}
         self.assertEqual(by_name[other]["outcome"], ur.MANIFEST_OUTCOME_GATE_FAILED)
@@ -4579,6 +4646,39 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn(self.audit_report.published_id(old_identity), self.audit_report.collector_flagged_ids(manifest))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
+    def test_an_unread_declared_project_is_held_and_is_the_manifests_limitation(self):
+        # `--scope-unread`: the project is not swept, its known clusters are "Reads that failed"
+        # lines and `unreachable` manifest entries the document skips, its entry and guards are held,
+        # the fleet record keeps it, and the tool's unread note is the manifest's top-level limitation.
+        self.collect(scope_projects=f"{PROJECT},other-project")
+        other = "other-project/us-central1-a/elsewhere"
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        guards = ur.load_json(self.home / ur.GUARDS_FILENAME, {})
+        guard = ur.guard_id(other, 7, "apps/Deployment/x")
+        guards["guards"].append({**guards["guards"][0], "id": guard, "cluster": other, "entry": 7, "object": "apps/Deployment/x"})
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, guards)
+        result, fleet = self.collect(scope_projects=PROJECT, scope_unread="other-project=denied", now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertFalse(any("other-project" in " ".join(c) for c in fleet.calls))
+        self.assertEqual((result["fleet"], result["removed_clusters"], result["scope_unread"]), ([PROJECT, "other-project"], [], [("other-project", "denied")]))
+        line = ur.UNREAD_PROJECT_TEXT.format(cluster=other, project="other-project", outcome="denied")
+        self.assertIn(line, result["failed_reads"])
+        self.assertIn(other, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertIn(guard, {g["id"] for g in result["guards"]})
+        self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == other], [])
+        self.assertIn(line, ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        entry = next(c for c in manifest["clusters"] if c["name"] == other)
+        self.assertEqual((entry["outcome"], entry["project"]), (ur.MANIFEST_OUTCOME_UNREACHABLE, "other-project"))
+        self.assertIn("declared scope but was not read (denied)", entry["error"])
+        self.assertEqual(manifest["limitations"], ur.fleet_scope_args.unread_note([("other-project", "denied")]))
+        self.assertIn("other-project (denied)", manifest["limitations"])
+        self.assertTrue(manifest["partial"])
+        document = self.document_from(manifest)
+        self.assertIn(other, [s["cluster"] for s in document["scope"]["skipped"]])
+        self.audit_report.cross_check_manifest(document, manifest)
+
     def test_three_guards_on_one_object_are_one_candidate(self):
         # Two event-only guards on inference-server (a volume attach, a webhook rejection) beside its
         # pod-sourced entry-2 guard. The next run re-observes the pod guard, and the event guards
@@ -4610,7 +4710,7 @@ class ManifestTest(unittest.TestCase):
         self.audit_report.cross_check_manifest(document, manifest)
 
     def test_api_disabled_project_does_not_make_the_run_partial(self):
-        result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), project=[PROJECT, "no-gke-project"])
+        result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), scope_projects=f"{PROJECT},no-gke-project")
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         self.assertFalse(manifest["partial"])
         self.assertEqual([c["name"] for c in manifest["clusters"]], [GEMMA, SEEDED])
