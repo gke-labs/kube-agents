@@ -485,14 +485,14 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				//
 				// The same app serves the legacy consumer under today, which
 				// does answer interactions, so an install may well have
-				// interactivity on and these envelopes do arrive. Nothing the
-				// gateway posts carries an interactive element - the agent
-				// sends the audit card through the notify route with its
-				// buttons removed - so the only clicks that land here are on
-				// messages posted under today. Answering interactions means
-				// acking them here first: Slack wants the envelope acked
-				// inside three seconds, and an unacked one redelivers and
-				// shows the user a timeout.
+				// interactivity on and these envelopes do arrive: clicks on
+				// messages posted under today, and on the buttons a chat
+				// message's layout carries (renderSlackChat), which nothing
+				// answers yet. The notify route's raw blocks still carry none
+				// (the agent sends the audit card with its buttons removed).
+				// Answering interactions means acking them here first: Slack
+				// wants the envelope acked inside three seconds, and an
+				// unacked one redelivers and shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in

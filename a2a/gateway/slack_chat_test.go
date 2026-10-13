@@ -130,23 +130,31 @@ func TestSlackRichMarkdownSpans(t *testing.T) {
 	}
 }
 
-// Nothing renders as a mention: a field carrying a mention token makes the
-// message one the renderer will not send, and the fallback posts.
-func TestSlackChatRefusesAMention(t *testing.T) {
+// Nothing renders as a mention. A token in a literal field (rich_text text,
+// a button label, a plan row) is shown as written; one in the fold's mrkdwn
+// is escaped and sent verbatim. The one thing escaping cannot neutralise, a
+// bare broadcast word in mrkdwn, makes the message one the renderer will
+// not send (blocksMention), and the fallback posts.
+func TestSlackChatRendersNoMention(t *testing.T) {
 	for _, m := range []chatmsg.Message{
 		{Schema: chatmsg.Schema, Headline: "ping <!channel>"},
 		{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "cc <@U0123ABC>"}}},
-		{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "hey @here"}},
+		{Schema: chatmsg.Schema, Choices: []chatmsg.Choice{{Text: "<!here>"}}},
+		{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "write <!channel> to ping"}},
 	} {
-		if _, err := renderSlackChat(&m, "x"); err == nil || !strings.Contains(err.Error(), "mention") {
-			t.Errorf("renderSlackChat(%+v) err = %v, want a mention refusal", m, err)
+		layout, err := renderSlackChat(&m, "x")
+		if err != nil {
+			t.Errorf("renderSlackChat(%+v): %v", m, err)
+			continue
+		}
+		raw, _ := json.Marshal(layout)
+		if strings.Contains(string(raw), `"<!`) || strings.Contains(string(raw), `"text":"write <!`) {
+			t.Errorf("a token reached mrkdwn unescaped: %s", raw)
 		}
 	}
-	// The fold's mrkdwn is escaped before the check reads it, so a token
-	// there is inert and the message renders.
-	ok := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "write `<!channel>` to ping"}}
-	if _, err := renderSlackChat(&ok, "x"); err != nil {
-		t.Fatalf("an escaped token was refused: %v", err)
+	bare := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "hey @here, look"}}
+	if _, err := renderSlackChat(&bare, "x"); err == nil || !strings.Contains(err.Error(), "mention") {
+		t.Fatalf("err = %v, want the bare broadcast word in mrkdwn refused", err)
 	}
 }
 

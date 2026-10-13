@@ -71,6 +71,10 @@ const (
 	// slackChatRawTextCell is the Slack table cell type that shows its text
 	// as written.
 	slackChatRawTextCell = "raw_text"
+	// slackChatMrkdwn is the text object type Slack parses as mrkdwn; the
+	// renderer sends it verbatim, so Slack links and mentions nothing the
+	// text does not spell out as <url|label>.
+	slackChatMrkdwn = "mrkdwn"
 )
 
 // slackChatColors are the side-bar colours by tone: the presenter's
@@ -104,6 +108,9 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 	var blocks []map[string]any
 	if head := slackChatHead(m); head != nil {
 		blocks = append(blocks, head)
+	}
+	if detail := slackChatDetail(m.Detail); detail != nil {
+		blocks = append(blocks, detail)
 	}
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		blocks = append(blocks, slackChatPlan(m.Plan))
@@ -139,13 +146,16 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 	return layout, nil
 }
 
-// refuseSlackChat is the last check before a rendered message is sent: no
-// mention anywhere (blocksMention, the notify route's own check, so the two
-// Block Kit paths hold one bound), and no interactive element outside the
-// actions blocks the renderer wrote itself from the message's choices and
-// links (blocksInteractive). The renderer writes every block from validated
-// fields, rich_text text elements are literal and mrkdwn text is escaped,
-// so either firing is a renderer bug, and the fallback is the safe answer.
+// refuseSlackChat is the last check before a rendered message is sent. The
+// only text Slack parses for mentions is a mrkdwn text object (rich_text
+// text, plain_text and a task card's title are shown as written, so a field
+// carrying <!here> there is inert text), and the renderer writes mrkdwn only
+// for a fold's text, escaped (toMrkdwn) and verbatim. blocksMention, the
+// notify route's own check, reads every mrkdwn text object, so the two Block
+// Kit paths hold one bound; and blocksInteractive finds no interactive
+// element outside the actions blocks the renderer wrote itself from the
+// message's choices and links. Either firing means a field reached Slack in
+// a form it would act on, and the fallback is the safe answer.
 func refuseSlackChat(blocks []map[string]any) error {
 	// The checks walk decoded JSON (map[string]any, []any, string), so the
 	// layout is read back the way the notify route reads its request.
@@ -163,7 +173,7 @@ func refuseSlackChat(blocks []map[string]any) error {
 			content = append(content, b)
 		}
 	}
-	if why := blocksMention(all); why != "" {
+	if why := blocksMention(slackMrkdwnTexts(all, nil)); why != "" {
 		return fmt.Errorf("the rendered blocks carry a mention (%s)", why)
 	}
 	if kind := blocksInteractive(content); kind != "" {
@@ -172,8 +182,26 @@ func refuseSlackChat(blocks []map[string]any) error {
 	return nil
 }
 
+// slackMrkdwnTexts appends the text of every mrkdwn text object in v.
+func slackMrkdwnTexts(v any, out []any) []any {
+	switch node := v.(type) {
+	case []any:
+		for _, item := range node {
+			out = slackMrkdwnTexts(item, out)
+		}
+	case map[string]any:
+		if node["type"] == slackChatMrkdwn {
+			out = append(out, node["text"])
+		}
+		for _, item := range node {
+			out = slackMrkdwnTexts(item, out)
+		}
+	}
+	return out
+}
+
 // slackChatHead is the headline, bold, with the note after it on the same
-// line, and the detail as a second section under them: blocks_report's head.
+// line (blocks_report's head). It is the one block above the side bar.
 func slackChatHead(m *chatmsg.Message) map[string]any {
 	var head []map[string]any
 	if m.Headline != "" {
@@ -182,17 +210,20 @@ func slackChatHead(m *chatmsg.Message) map[string]any {
 	if m.Note != "" {
 		head = append(head, slackRichText(" "+m.Note, nil))
 	}
-	var sections []map[string]any
-	if len(head) > 0 {
-		sections = append(sections, slackRichSection(head))
-	}
-	if m.Detail != "" {
-		sections = append(sections, slackRichSection(slackRichMarkdown(m.Detail)))
-	}
-	if len(sections) == 0 {
+	if len(head) == 0 {
 		return nil
 	}
-	return slackRichBlock(sections)
+	return slackRichBlock([]map[string]any{slackRichSection(head)})
+}
+
+// slackChatDetail is the detail, a block of its own under the head, so a
+// message with a tone carries it inside the side bar, as the presenter's
+// subline under a question or an opened PR is.
+func slackChatDetail(detail string) map[string]any {
+	if strings.TrimSpace(detail) == "" {
+		return nil
+	}
+	return slackRichBlock([]map[string]any{slackRichSection(slackRichMarkdown(detail))})
 }
 
 // slackChatRows is the rows, one section each: the severity as inline code
@@ -248,7 +279,7 @@ func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 			}
 			children = append(children, map[string]any{
 				"type": "section",
-				"text": map[string]any{"type": "mrkdwn", "text": text},
+				"text": map[string]any{"type": slackChatMrkdwn, "text": text, "verbatim": true},
 			})
 		}
 	}
@@ -422,7 +453,7 @@ func slackRichSpan(md string, i int) (span map[string]any, n int, ok bool) {
 	rest := md[i:]
 	switch {
 	case strings.HasPrefix(rest, "`"):
-		if end := strings.IndexByte(rest[1:], '`'); end > 0 {
+		if end := strings.IndexByte(rest[1:], '`'); end > 0 && !strings.Contains(rest[1:1+end], "\n") {
 			return slackRichText(rest[1:1+end], map[string]any{"code": true}), end + 2, true
 		}
 	case strings.HasPrefix(rest, "**"):
