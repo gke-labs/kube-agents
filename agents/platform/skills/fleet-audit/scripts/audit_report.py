@@ -11762,28 +11762,28 @@ def resolve_repo(
 def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
     """`resolve_repo`, or `NO_FORGE_REPO` on an install that registers no repository.
 
-    Only a `managed_repos` value that is blank or an empty list means no forge.
-    A value that does not parse, or whose entries the image cannot serve,
-    keeps the resolver's error: that install registered something, and telling
-    its operator nothing is registered would be false. A list that cannot be
-    read raises here as it does inside `resolve_repo`, and so does a `--repo`
-    that did not resolve.
+    Decided from `managed_repos` before `resolve_repo` runs: its lease step
+    returns the repository an earlier forge-backed run recorded, and only the
+    forge path reaps that record, so an install whose repository was removed
+    would otherwise stay on the forge path for good. Only a raw value that is
+    blank or an empty list means no forge. A value that does not parse, or
+    whose entries this image cannot serve, fails with that said. A list that
+    parses to repositories keeps the resolver's own answer and errors (several
+    repositories ask for `--repo`), and a list that cannot be read raises.
     """
-    try:
-        return resolve_repo(audit_id=audit_id, repo=repo)
-    except RuntimeError:
+    if not (repo and str(repo).strip()):
         import gitops_workspace
 
-        if repo and str(repo).strip():
-            raise
-        if gitops_workspace.managed_repos_registered():
-            raise RuntimeError(
-                "managed_repos in $GITOPS_STATE_CONFIGMAP holds a value this image cannot "
-                "use (it does not parse as a list of {type, url} entries, or names a forge "
-                "type this image does not serve); fix the entry, or empty it to run the "
-                "audits with no forge"
-            ) from None
-        return NO_FORGE_REPO
+        if not gitops_workspace.get_managed_repos():
+            if gitops_workspace.managed_repos_registered():
+                raise RuntimeError(
+                    "managed_repos in $GITOPS_STATE_CONFIGMAP holds a value this image cannot "
+                    "use (it does not parse as a list of {type, url} entries, or names a forge "
+                    "type this image does not serve); fix the entry, or empty it to run the "
+                    "audits with no forge"
+                )
+            return NO_FORGE_REPO
+    return resolve_repo(audit_id=audit_id, repo=repo)
 
 
 def no_forge_workspace(audit_id: str) -> Path:
@@ -16105,6 +16105,8 @@ def _finish_without_forge(
     # it holds this run rather than promising it.
     note = NO_FORGE_NOTE if stored else NO_FORGE_UNSTORED_NOTE
     payload["no_forge"] = note
+    # For the same reason, a run the store does not hold is never quiet.
+    payload["silent_ok"] = bool(payload["silent_ok"]) and stored
     payload["summary"] = render_no_forge_summary(
         audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note
     )

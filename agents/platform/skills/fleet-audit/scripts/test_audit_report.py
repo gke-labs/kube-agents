@@ -25062,6 +25062,22 @@ class TestNoForge(BaseTestCase):
         self.assertIn("Failed to read ConfigMap", self.err)
         self.assertEqual(self.out, "")
 
+    def test_a_lease_from_an_earlier_forge_run_does_not_keep_the_forge_path(self):
+        holder = gitops_workspace.lease_dir(audit_report.GITOPS_WORKSPACE, AUDIT)
+        holder.mkdir(parents=True)
+        gitops_workspace.write_lease(holder, AUDIT, "acme/gitops", owner=f"fleet-audit:{AUDIT}")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+
+        self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_several_repositories_keep_the_resolvers_error(self):
+        self.managed_text = '[{"type": "github", "url": "https://github.com/acme/a"}, {"type": "github", "url": "https://github.com/acme/b"}]'
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/a", "acme/b"]):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertIn("Multiple repositories configured", self.err)
+        self.assertNotIn("cannot use", self.err)
+
     def test_an_empty_list_is_nothing_registered(self):
         self.managed_text = "[]"
         self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
@@ -25154,6 +25170,19 @@ class TestNoForge(BaseTestCase):
         out = self.finish(make_doc())
 
         self.assertEqual(out["no_forge"], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_an_unchanged_run_the_store_did_not_take_is_not_silent(self):
+        self.finish(make_doc())
+        self.assertTrue(self.finish(make_doc())["silent_ok"])
+        runs = self.store() / "runs"
+        runs.chmod(0o500)
+        self.addCleanup(runs.chmod, 0o755)
+
+        out = self.finish(make_doc())
+
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertEqual(out["no_forge"], audit_report.NO_FORGE_UNSTORED_NOTE)
+        self.assertFalse(out["silent_ok"])
         self.assertEqual(out["summary"].splitlines()[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
 
     def test_the_summary_names_the_object(self):

@@ -1283,7 +1283,8 @@ Two rules follow, and they are the whole rule:
 - On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
   report, and every report carries `issue_url` in full, with every URL in `prs_opened` and
   `prs_still_open`: a fix already waiting for review answers "was a fix proposed?" as much as one
-  this run opened.
+  this run opened. A `NO_FORGE` run has no `issue_url`; its report is `summary` (see
+  [No forge configured](#no-forge-configured)).
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and
