@@ -18,11 +18,13 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
   source evidence confirms a defect in the official repository. A failed verification can reveal
   a defect even when the upgrade exited 0. Report observed availability/data impact and recovery
   options; do not automatically roll back, delete data, or change the selected installation.
-- Ask the user once before the first post to `gke-labs/kube-agents` in a session, unless the user
-  has authorized that destination in this session. Authorization for other GitHub writes (a push
-  to a fork, a comment on the user's own issue, a GitOps pull request) does not cover it, and an
-  upgrade request alone does not authorize publishing installation details. Prepare the report
-  first so the user sees what would be posted; if they decline, keep the anonymized local draft.
+- Prepare the report first and show the user what would be posted, whether or not an ask is
+  needed. Ask the user once before the first upgrade report is posted to `gke-labs/kube-agents`
+  in a session, unless the user has authorized posting upgrade reports there in this session.
+  Authorization for other GitHub writes (a push to a fork, a comment on the user's own issue, a
+  GitOps pull request, a comment or review reply on the user's own pull request in
+  `gke-labs/kube-agents`) does not cover it, and an upgrade request alone does not authorize
+  publishing installation details. If the user declines, keep the anonymized local draft.
 - Before any issue, comment, reopening or label write, verify the requesting user's GitHub
   identity with `gh api user` and tie it to the requester. Use the official repository's current
   names as the eligibility source: the paginated GitHub contributors list and reviewers/approvers

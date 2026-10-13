@@ -8,9 +8,10 @@ stripped from the report, and which labels go on it. The skill is
 repository-level and not shipped in the agent images, so no bench case reaches
 it and the eval loop cannot go red on it; `test_skill_discovery.py` reads its
 frontmatter and never its body. Without this file an edit that drops the
-refusal, widens the consent back to "any GitHub write", or loses a term from
-the anonymization list ships silently, and the first check the behaviour gets
-is a public issue from an ineligible requester, or one carrying a project ID.
+refusal, widens the consent back to any GitHub write or to any write to the
+tracker, or loses a term from the anonymization list ships silently, and the
+first check the behaviour gets is a public issue from an ineligible requester,
+or one carrying a project ID.
 
 These tests pin what the text states and no more. Each reads the section as
 whitespace-normalised prose and asks whether a phrase is there; none parses the
@@ -73,20 +74,35 @@ NO_WRITE_FOR_REGULAR_USERS = (
     "Regular users must not open or modify issue tickets, even for p0 failures or after approving a post"
 )
 
-# (c) Consent is per destination. The user is asked before the first post to
-# the tracker in a session unless that destination was authorized; approval of
-# some other GitHub write earlier in the session does not stand in for it.
-CONSENT_ASK = re.compile(
-    rf"Ask the user once before the first post to `{re.escape(TRACKER)}` in a session, "
-    r"unless the user has authorized that destination"
+# (c) Consent attaches to the act, not to the repository. The user sees the
+# payload before every post, and is asked before the first upgrade report is
+# posted to the tracker in a session unless they authorized posting upgrade
+# reports there. A write to the same repository for another purpose, an issue
+# claim or a `/retest` on their own pull request, does not stand in for it.
+PAYLOAD_SHOWN_BEFORE_EVERY_POST = (
+    "Prepare the report first and show the user what would be posted, whether or not an ask is needed"
 )
-OTHER_WRITES_DO_NOT_COUNT = re.compile(r"Authorization for other GitHub writes\b[^.]*?\bdoes not cover it")
+CONSENT_ASK = re.compile(
+    rf"Ask the user once before the first upgrade report is posted to `{re.escape(TRACKER)}` in a session, "
+    r"unless the user has authorized posting upgrade reports there in this session"
+)
+OTHER_WRITES_SENTENCE = re.compile(r"Authorization for other GitHub writes \((?P<writes>[^.)]+?)\) does not cover it")
+WRITES_THAT_DO_NOT_COUNT = (
+    "a push to a fork",
+    "a comment on the user's own issue",
+    "a GitOps pull request",
+    f"a comment or review reply on the user's own pull request in `{TRACKER}`",
+)
 UPGRADE_REQUEST_IS_NOT_CONSENT = "upgrade request alone does not authorize publishing installation details"
-DECLINE_KEEPS_DRAFT = "if they decline, keep the anonymized local draft"
-# The condition this replaced: an ask gated on whether GitHub writes in general
-# had been authorized, which a push to a fork earlier in the session satisfies.
-# Its return is the regression, so its wording is pinned absent.
-GENERIC_WRITE_CONSENT = re.compile(r"GitHub writes have not been authorized|session's existing authorization")
+DECLINE_KEEPS_DRAFT = "If the user declines, keep the anonymized local draft"
+# The two conditions this replaced. The first gated the ask on whether GitHub
+# writes in general had been authorized, which a push to a fork earlier in the
+# session satisfies; the second on whether the destination had, which an issue
+# claim or a `/retest` on the user's own pull request in the tracker satisfies.
+# Either one's return is the regression, so both wordings are pinned absent.
+SUPERSEDED_CONSENT = re.compile(
+    r"GitHub writes have not been authorized|session's existing authorization|authorized that destination"
+)
 EXPLICIT_REPO_FLAG = f"`gh` with an explicit `--repo {TRACKER}`"
 
 # (d) What never reaches the public payload. The detail classes are the
@@ -198,15 +214,22 @@ class ReportingContractTest(unittest.TestCase):
         self.assertIn(REFUSAL_OUTCOME, refusal, "a refusal no longer ends in a local draft")
         self.assert_stated(NO_WRITE_FOR_REGULAR_USERS, "a regular user may now write, or an exception was added")
 
-    def test_consent_is_asked_per_destination_not_per_github_write(self) -> None:
-        self.assertRegex(self.prose, CONSENT_ASK, "the ask is no longer tied to the first post to the tracker")
-        self.assertRegex(self.prose, OTHER_WRITES_DO_NOT_COUNT, "another GitHub write may now stand in for consent")
+    def test_the_payload_is_shown_before_every_post(self) -> None:
+        self.assert_stated(PAYLOAD_SHOWN_BEFORE_EVERY_POST, "the user sees the payload only when an ask happens")
+
+    def test_consent_is_asked_for_the_act_not_the_repository(self) -> None:
+        self.assertRegex(self.prose, CONSENT_ASK, "the ask is no longer tied to posting upgrade reports to the tracker")
+        writes = self.sentence(OTHER_WRITES_SENTENCE, "writes", "another GitHub write may now stand in for consent")
+        for write in WRITES_THAT_DO_NOT_COUNT:
+            with self.subTest(write=write):
+                self.assertIn(write, writes, f"{write!r} may now stand in for consent")
         self.assert_stated(UPGRADE_REQUEST_IS_NOT_CONSENT, "the upgrade request may now count as consent")
         self.assert_stated(DECLINE_KEEPS_DRAFT, "a decline no longer ends in a local draft")
         self.assertNotRegex(
             self.prose,
-            GENERIC_WRITE_CONSENT,
-            "the ask is gated on GitHub writes in general again, which a push to a fork satisfies",
+            SUPERSEDED_CONSENT,
+            "the ask is gated on GitHub writes in general or on the destination again; "
+            "a push to a fork, or an issue claim in the tracker, then satisfies it",
         )
 
     def test_writes_name_the_tracker_explicitly(self) -> None:
