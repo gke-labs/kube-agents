@@ -167,7 +167,7 @@ exist.
 | ----- | --------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1     | Budget rule shipped; the watch runs it.                               | Signature: a budget with no allowance on a drained node.                 | Nothing once the watch and the collector merge.                                                                                                              |
 | 2     | No rule: surge settings and headroom are not read.                    | Signature: Pending for capacity after a pool operation.                  | Rule (capacity headroom).                                                                                                                                    |
-| 3     | None; the daily obtainability audit files it on its own schedule.     | No signature; the design excludes it today.                              | Signature (a design change; §3.4 excludes it today).                                                                                                         |
+| 3     | None; the daily obtainability audit files it on its own schedule.     | No signature; the design excludes it today.                              | Signature (a design change).                                                                                                                                 |
 | 4     | No rule.                                                              | No signature; shape: stateful `emptyDir` and local SSD volumes.          | Rule on the collector's shape, with the target known; the watch prints the collector's guard too.                                                            |
 | 5     | Maintenance rule shipped; the watch runs it.                          | No signature; the design excludes it today.                              | Signature (a design change).                                                                                                                                 |
 | 6     | GitOps scan on request only; audit-log stamps read in conversation.   | Signature: `no matches for kind`, a removed API named.                   | Rule (the exception below: no fixture of its own can be standing).                                                                                           |
@@ -187,8 +187,8 @@ exist.
 | 20    | No rule; the compliance audit reads floating tags, not retired hosts. | Signature: a pull failure on rebuilt nodes only; shape: retired hosts.   | Rule (images on retired registry hosts).                                                                                                                     |
 
 Two things cross every row. The fact tables the rules and the collector's shapes both read (dropped
-labels, runtime floors, retired hosts, driver and CUDA support) are one module in the
-`fleet-upgrade-verification` skill. The watch reading the collector's guards is its own change,
+labels, runtime floors, retired hosts, driver and CUDA support) go in one module in the
+`fleet-upgrade-verification` skill, built with the first rules. The watch reading the collector's guards is its own change,
 after the collector merges. Every rule lands with unit tests and a nightly case graded on a declared
 line. Entry 6 is the exception: no fixture of its own can be standing (its section says why), so its
 rule is unit-tested on a captured audit-log sample and its live stand-in is entry 9's
