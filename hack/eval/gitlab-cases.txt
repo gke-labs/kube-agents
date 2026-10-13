@@ -1,9 +1,9 @@
-# The GitLab lane's presubmit matrix: what pull-kube-agents-smoke-test-gitlab
-# runs (kube-agents#2394). hack/ci-eval-pr.sh reads this file instead of
-# presubmit-cases.txt when EVAL_FORGE=gitlab and EVAL_TIER is presubmit. A
-# GitLab nightly would run the whole catalogue, as the GitHub nightly does,
-# but none exists yet (#2832): today nothing runs the twelve cases
-# this file leaves out, or the nightly-only cases, against GitLab.
+# The GitLab lane's matrix: what pull-kube-agents-smoke-test-gitlab runs on
+# a pull request and ci-kube-agents-eval-nightly-gitlab runs once a night
+# (kube-agents#2394, #2832). hack/ci-eval-pr.sh reads this file in place of
+# the catalogue whenever EVAL_FORGE=gitlab, on either tier: nothing else
+# grades the forge, so the twelve other presubmit cases and the nightly-only
+# cases run on GitHub only. The nightly never appends to the evidence store.
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. Every entry must be a registered case,

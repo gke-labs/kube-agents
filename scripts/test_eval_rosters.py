@@ -424,7 +424,7 @@ def positive_check_types(node, negations: int = 0) -> set:
 
 
 class GitLabLaneTest(unittest.TestCase):
-    """hack/eval/gitlab-presubmit-cases.txt: what the GitLab lane's presubmit
+    """hack/eval/gitlab-cases.txt: what the GitLab lane's presubmit
     runs (kube-agents#2394). Registered cases only, every entry a case that
     grades the forge."""
 
@@ -432,18 +432,18 @@ class GitLabLaneTest(unittest.TestCase):
     PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
 
     def test_the_file_is_the_pinned_set(self):
-        self.assertEqual(eval_rosters.gitlab_presubmit_cases(), self.PINNED)
+        self.assertEqual(eval_rosters.gitlab_cases(), self.PINNED)
 
     def test_every_lane_case_is_registered(self):
         registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
-        for case in eval_rosters.gitlab_presubmit_cases():
+        for case in eval_rosters.gitlab_cases():
             with self.subTest(case=case):
                 self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
 
     def test_every_lane_case_grades_the_forge(self):
         import yaml
 
-        for case in eval_rosters.gitlab_presubmit_cases():
+        for case in eval_rosters.gitlab_cases():
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
@@ -462,7 +462,7 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
 
     def test_no_commented_out_case_path(self):
-        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_PRESUBMIT_CASES_FILE.read_text(encoding="utf-8")), [])
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_CASES_FILE.read_text(encoding="utf-8")), [])
 
 
 class InjectLaneExclusionsTest(unittest.TestCase):

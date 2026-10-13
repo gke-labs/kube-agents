@@ -38,7 +38,7 @@ EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
 readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
-readonly EVAL_GITLAB_PRESUBMIT_CASES_FILE="eval/gitlab-presubmit-cases.txt"
+readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -1657,7 +1657,7 @@ fi
 # 6. Task Matrix Execution Loop
 # The matrix is data, not code: six files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
-# runs (TASKS), gitlab-presubmit-cases.txt is what the GitLab lane runs in
+# runs (TASKS), gitlab-cases.txt is what the GitLab lane runs in
 # its place under EVAL_FORGE=gitlab (#2394, at the tier switch),
 # nightly-cases.txt is what EVAL_TIER=nightly appends
 # (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
@@ -1683,7 +1683,7 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
-GITLAB_PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_GITLAB_PRESUBMIT_CASES_FILE}"
+GITLAB_CASES_FILE="${SCRIPT_DIR}/${EVAL_GITLAB_CASES_FILE}"
 
 # One roster file's entries, one per line: `#` to end of line is a comment,
 # blank lines are skipped, surrounding whitespace is trimmed. Called inside a
@@ -1783,50 +1783,58 @@ done
 # both. Anything else is a typo that would silently run the wrong matrix,
 # so it stops the job before it spends a cluster.
 EVAL_TIER="${EVAL_TIER:-presubmit}"
-# The GitLab lane (kube-agents#2394): under EVAL_FORGE=gitlab a presubmit
-# runs hack/eval/gitlab-presubmit-cases.txt instead of the presubmit file --
-# the cases that grade the forge, each a registered case (presubmit or nightly
-# file), sized by that file's BUDGET note against the job's 360-minute deadline. A
-# nightly under gitlab would be the whole catalogue, as on GitHub; no such
-# periodic exists yet (#2832). The presubmit
-# names the lane left out are kept in GITLAB_LANE_DROPPED for the
-# BOOTSTRAP_ADMITTED export, as the nightly part's are.
+# The GitLab lane (kube-agents#2394): under EVAL_FORGE=gitlab both tiers run
+# hack/eval/gitlab-cases.txt instead of the catalogue -- the cases that grade
+# the forge, each a registered case (presubmit or nightly file), sized by
+# that file's BUDGET note against the job's deadline. The presubmit names the
+# lane left out are kept in GITLAB_LANE_DROPPED for the BOOTSTRAP_ADMITTED
+# export, as the nightly part's are. The GitLab nightly is the same list once
+# a night on its own leased project (oss-test-infra: ci-kube-agents-eval-
+# nightly-gitlab); it never appends to the evidence store (the recorder
+# decision below the matrix says why).
 GITLAB_LANE_DROPPED=""
+gitlab_lane_matrix() { # <tier word, for the log line>
+  GITLAB_LANE_ENTRIES="$(roster_entries "${GITLAB_CASES_FILE}")"
+  GITLAB_LANE_TASKS=()
+  while IFS= read -r ENTRY; do
+    if [ -n "${ENTRY}" ]; then GITLAB_LANE_TASKS+=("${ENTRY}"); fi
+  done <<< "${GITLAB_LANE_ENTRIES}"
+  if [ "${#GITLAB_LANE_TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: ${GITLAB_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
+    exit 1
+  fi
+  # Every entry must be a registered case, a presubmit or nightly entry,
+  # which check_case_entries has already proven to be a case path with a
+  # directory behind it; the lane picks from the catalogue, it does not
+  # register.
+  for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
+    if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+      echo "ERROR: ${GITLAB_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the GitLab lane runs registered cases only." >&2
+      exit 1
+    fi
+  done
+  for ENTRY in "${TASKS[@]}"; do
+    if ! grep -qxF -- "${ENTRY}" <<< "${GITLAB_LANE_ENTRIES}"; then
+      GITLAB_LANE_DROPPED="${GITLAB_LANE_DROPPED}$(basename "$(dirname "${ENTRY}")")
+"
+    fi
+  done
+  TASKS=("${GITLAB_LANE_TASKS[@]}")
+  echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} case(s) on the $1 tier (${EVAL_GITLAB_CASES_FILE}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
+}
 case "${EVAL_TIER}" in
   presubmit)
     if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
-      GITLAB_LANE_ENTRIES="$(roster_entries "${GITLAB_PRESUBMIT_CASES_FILE}")"
-      GITLAB_LANE_TASKS=()
-      while IFS= read -r ENTRY; do
-        if [ -n "${ENTRY}" ]; then GITLAB_LANE_TASKS+=("${ENTRY}"); fi
-      done <<< "${GITLAB_LANE_ENTRIES}"
-      if [ "${#GITLAB_LANE_TASKS[@]}" -eq 0 ]; then
-        echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
-        exit 1
-      fi
-      # Every entry must be a registered case, a presubmit or nightly entry,
-      # which check_case_entries has already proven to be a case path with a
-      # directory behind it; the lane picks from the catalogue, it does not
-      # register.
-      for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
-        if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
-          echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the GitLab lane runs registered cases only." >&2
-          exit 1
-        fi
-      done
-      for ENTRY in "${TASKS[@]}"; do
-        if ! grep -qxF -- "${ENTRY}" <<< "${GITLAB_LANE_ENTRIES}"; then
-          GITLAB_LANE_DROPPED="${GITLAB_LANE_DROPPED}$(basename "$(dirname "${ENTRY}")")
-"
-        fi
-      done
-      TASKS=("${GITLAB_LANE_TASKS[@]}")
-      echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} case(s) (${EVAL_GITLAB_PRESUBMIT_CASES_FILE}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
+      gitlab_lane_matrix presubmit
     fi
     ;;
   nightly)
-    TASKS+=("${NIGHTLY_TASKS[@]}")
-    echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      gitlab_lane_matrix nightly
+    else
+      TASKS+=("${NIGHTLY_TASKS[@]}")
+      echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
+    fi
     ;;
   *)
     echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
@@ -1849,6 +1857,10 @@ case "${EVAL_NIGHTLY_PART}" in
   main | writers)
     if [ "${EVAL_TIER}" != "nightly" ]; then
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
+      exit 1
+    fi
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} is the GitHub nightly's split; the GitLab nightly runs ${EVAL_GITLAB_CASES_FILE} whole. Unset it, or set it to 'all'." >&2
       exit 1
     fi
     ;;
@@ -2400,7 +2412,7 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # when the part holds no roster case, and is not the lane's doing.
 if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   if [ -n "${GITLAB_LANE_DROPPED:-}" ]; then
-    echo "ERROR: every blocking-roster case in ${EVAL_GITLAB_PRESUBMIT_CASES_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+    echo "ERROR: every blocking-roster case in ${EVAL_GITLAB_CASES_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   else
     echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   fi
@@ -2465,6 +2477,13 @@ case "${JOB_TYPE:-}" in
   *) EVAL_IS_MAIN_RUN="false" ;;
 esac
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# The GitLab lane never appends: a case's record in the store is per case
+# and version key, not per forge, so a GitLab night would pool its evidence
+# with the GitHub nights' under the same key. The lane reads the store like
+# a presubmit; a record of its own is a decision for later (#2832).
+if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then

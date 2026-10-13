@@ -29,16 +29,25 @@ RUNS_LISTED = 20
 # columns and nightly.py's running nights draw the same line).
 RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
+DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 RESULT_SUCCESS = "SUCCESS"
 
 
-def lane_job(data: dict) -> str:
-    """The job name as the newest GitLab run carries it, else the default."""
+def is_night(run: dict) -> bool:
+    """A GitLab run with no pull request is the lane's nightly's."""
+    return run.get("pr") is None
+
+
+def lane_job(data: dict, nights: bool = False) -> str:
+    """The job name as the newest GitLab pull-request run (or night) carries
+    it, else the default."""
     for run in reversed(tiers.gitlab_runs(data.get("runs"))):
+        if not isinstance(run, dict) or is_night(run) != nights:
+            continue
         job = run.get("job")
         if isinstance(job, str) and job:
             return job
-    return DEFAULT_JOB
+    return DEFAULT_NIGHTLY_JOB if nights else DEFAULT_JOB
 
 
 def task_counts(run: dict) -> dict:
@@ -59,6 +68,7 @@ def lane_run(run: dict) -> dict:
         "pr": run.get("pr"),
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
+        "log_url": run.get("log_url") if isinstance(run.get("log_url"), str) else None,
         "started": run.get("started"),
         "finished": run.get("finished"),
         "duration_s": run.get("duration_s") if isinstance(run.get("duration_s"), (int, float)) else None,
@@ -95,21 +105,30 @@ def running(data: dict, now: datetime.datetime | None = None) -> list[dict]:
     return out
 
 
-def gitlab_document(data: dict, now: datetime.datetime | None = None) -> dict:
-    """``{job, runs[], running[], counts}``: runs newest first, capped at
-    RUNS_LISTED; running judged against ``now``; counts over every GitLab
-    run on record."""
-    runs = [r for r in tiers.gitlab_runs(data.get("runs")) if isinstance(r, dict) and str(r.get("build_id") or "").isdigit()]
-    runs.sort(key=lambda r: int(r["build_id"]), reverse=True)
-    listed = [lane_run(r) for r in runs[:RUNS_LISTED]]
+def _counts(runs: list[dict]) -> dict:
     results = [str(r.get("result") or "").upper() for r in runs]
     return {
+        "on_record": len(runs),
+        "green": sum(1 for r in results if r == RESULT_SUCCESS),
+        "red": sum(1 for r in results if r and r != RESULT_SUCCESS),
+    }
+
+
+def gitlab_document(data: dict, now: datetime.datetime | None = None) -> dict:
+    """``{job, runs[], running[], counts, nightly_job, nights[], night_counts}``:
+    the lane's pull-request runs and its nights apart, each newest first and
+    capped at RUNS_LISTED, with counts over every one on record; running
+    judged against ``now``."""
+    every = [r for r in tiers.gitlab_runs(data.get("runs")) if isinstance(r, dict) and str(r.get("build_id") or "").isdigit()]
+    every.sort(key=lambda r: int(r["build_id"]), reverse=True)
+    runs = [r for r in every if not is_night(r)]
+    nights = [r for r in every if is_night(r)]
+    return {
         "job": lane_job(data),
-        "runs": listed,
+        "runs": [lane_run(r) for r in runs[:RUNS_LISTED]],
         "running": running(data, now),
-        "counts": {
-            "on_record": len(runs),
-            "green": sum(1 for r in results if r == RESULT_SUCCESS),
-            "red": sum(1 for r in results if r and r != RESULT_SUCCESS),
-        },
+        "counts": _counts(runs),
+        "nightly_job": lane_job(data, nights=True),
+        "nights": [lane_run(r) for r in nights[:RUNS_LISTED]],
+        "night_counts": _counts(nights),
     }

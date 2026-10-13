@@ -251,13 +251,13 @@ class GitLabLaneTest(unittest.TestCase):
     cases, and an empty export is said, not stopped (kube-agents#2394)."""
 
     def lane_entries(self) -> list[str]:
-        return [f"./tasks/{name}/task.yaml" for name in eval_rosters.gitlab_presubmit_cases()]
+        return [f"./tasks/{name}/task.yaml" for name in eval_rosters.gitlab_cases()]
 
     def test_a_gitlab_presubmit_runs_the_lanes_file_and_says_what_it_left_out(self):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn("EVAL_FORGE=gitlab: the GitLab lane runs 3 case(s)", result.stdout)
+        self.assertIn("EVAL_FORGE=gitlab: the GitLab lane runs 3 case(s) on the presubmit tier", result.stdout)
         self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
         # No seat is a roster case (two are nightly cases, one held out), so
         # the export is empty by design and the log says rung 4 is disarmed.
@@ -268,7 +268,7 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "gitlab-presubmit-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
             result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "ROSTER"), ["agent-kanban-smoke"], "the roster intersected with the lane")
@@ -281,10 +281,10 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "gitlab-presubmit-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("every blocking-roster case in eval/gitlab-presubmit-cases.txt is excluded on the inject lane", result.stderr)
+        self.assertIn("every blocking-roster case in eval/gitlab-cases.txt is excluded on the inject lane", result.stderr)
         self.assertIn("Seat another roster case there", result.stderr)
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
@@ -302,11 +302,38 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertNotIn("excluded on the inject lane", result.stderr)
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
-    def test_a_gitlab_nightly_is_the_whole_catalogue(self):
+    def test_a_gitlab_nightly_runs_the_same_lane_list(self):
+        """The GitLab nightly is the lane's list once a night, not the
+        catalogue: nothing else grades the forge, and the roster export is
+        the lane's (empty while no roster case is seated)."""
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries() + nightly_entries())
-        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
+        self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
+        self.assertIn("the GitLab lane runs 3 case(s) on the nightly tier", result.stdout)
+        self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
+
+    def test_the_github_nightlys_part_split_is_refused_on_the_gitlab_lane(self):
+        section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+        part_switch = lifted_block(r'^EVAL_NIGHTLY_PART="\$\{EVAL_NIGHTLY_PART:-all\}"\n.*?^esac$')
+        body = "\n".join([f'SCRIPT_DIR="{HACK_DIR}"', roster_constants(), section, part_switch, 'echo "PART_OK"'])
+        refused = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("is the GitHub nightly's split; the GitLab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
+        allowed = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "all"})
+        self.assertIn("PART_OK", allowed.stdout, allowed.stderr)
+        github = run_bash(body, {"EVAL_FORGE": "github", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        self.assertIn("PART_OK", github.stdout, github.stderr)
+
+    def test_the_gitlab_lane_never_appends_to_the_evidence_store(self):
+        """The recorder decision, lifted as written: a GitLab periodic reads
+        the store like a presubmit and never records, since a case's record
+        is per case and version key, not per forge."""
+        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
+        body = decision + '\necho "MAIN_RUN=${EVAL_IS_MAIN_RUN}"'
+        self.assertIn("MAIN_RUN=true", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "github"}).stdout)
+        self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "gitlab"}).stdout)
+        self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "presubmit", "EVAL_FORGE": "github"}).stdout)
 
     def test_the_github_presubmit_is_untouched(self):
         result = load_matrix({"EVAL_FORGE": "github"})
@@ -326,9 +353,9 @@ class GitLabLaneTest(unittest.TestCase):
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
             if text is None:
-                (hack / "eval" / "gitlab-presubmit-cases.txt").unlink()
+                (hack / "eval" / "gitlab-cases.txt").unlink()
             else:
-                (hack / "eval" / "gitlab-presubmit-cases.txt").write_text(text)
+                (hack / "eval" / "gitlab-cases.txt").write_text(text)
             result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("TASK ", result.stdout)
@@ -339,18 +366,18 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "gitlab-presubmit-cases.txt").write_text("./tasks/obtainability-planted-pdb/task.yaml\n")
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/obtainability-planted-pdb/task.yaml\n")
             result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/obtainability-planted-pdb/task.yaml"])
         # A real case directory that neither roster file names is not registered.
         unregistered = next(d.name for d in sorted(TASKS_DIR.iterdir()) if d.is_dir() and d.name not in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases())
-        self.refused(f"./tasks/{unregistered}/task.yaml\n", "gitlab-presubmit-cases.txt", unregistered, "registered cases only")
+        self.refused(f"./tasks/{unregistered}/task.yaml\n", "gitlab-cases.txt", unregistered, "registered cases only")
 
     def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
-        self.refused("# nothing\n", "gitlab-presubmit-cases.txt names no case")
-        self.refused(None, "gitlab-presubmit-cases.txt is missing")
-        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-presubmit-cases.txt", "registered cases only")
+        self.refused("# nothing\n", "gitlab-cases.txt names no case")
+        self.refused(None, "gitlab-cases.txt is missing")
+        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-cases.txt", "registered cases only")
 
     def test_the_lane_file_does_not_change_the_github_run_when_broken(self):
         # The file is read only under gitlab, so a GitHub presubmit is not
@@ -358,7 +385,7 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "gitlab-presubmit-cases.txt").unlink()
+            (hack / "eval" / "gitlab-cases.txt").unlink()
             result = load_matrix({"EVAL_FORGE": "github"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
 
