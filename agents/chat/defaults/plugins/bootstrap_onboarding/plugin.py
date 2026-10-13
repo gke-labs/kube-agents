@@ -1,9 +1,11 @@
+import importlib.util
 import json
 import logging
 import math
 import os
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -87,6 +89,18 @@ EVAL_PLATFORM = "api_server"
 EVAL_PHRASE_MIN_LENGTH = 12
 # Longer than one case's apply, run and destroy.
 EVAL_REQUEST_MAX_AGE_SECONDS = 3600
+
+# The ranked report, where bootstrap_delivery.py reads it. With the shell
+# sandbox on it is on the sandbox pod's data volume, which this pod does not
+# mount, so its presence is read across with sandbox_exec, as delivery does.
+REPORT_NAME = "INVENTORY.md"
+SANDBOX_HOME = "/opt/data"
+# The image's copy, not $HERMES_HOME/scripts on the volume.
+SANDBOX_EXEC_PATH = Path("/opt/defaults/scripts/sandbox_exec.py")
+SANDBOX_EXEC_MODULE = "_kube_agents_sandbox_exec"
+# The opening turn waits on this read. A slower sandbox greets as "in progress",
+# which stays true: delivery posts the report once it can read it.
+REPORT_CHECK_TIMEOUT_SECONDS = 5
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -271,6 +285,43 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
     return None
 
 
+def _load_sandbox_exec() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(SANDBOX_EXEC_MODULE, SANDBOX_EXEC_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {SANDBOX_EXEC_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _report_ready(data_dir: Path) -> bool:
+    """Whether the ranked report is written where delivery will read it.
+
+    Never raises. A sandbox read that fails or outlasts
+    REPORT_CHECK_TIMEOUT_SECONDS is False, and so is anything that keeps this
+    from telling whether the sandbox is on, after a look at the local path.
+    """
+    try:
+        sandbox_exec = _load_sandbox_exec()
+        in_sandbox = sandbox_exec.sandbox_enabled()
+    except Exception as e:
+        logger.warning("Could not tell whether the shell sandbox is on; checking %s locally: %s", REPORT_NAME, e)
+        in_sandbox = False
+    if not in_sandbox:
+        try:
+            return (data_dir / REPORT_NAME).exists()
+        except OSError:
+            return False
+    try:
+        report = sandbox_exec.read_bytes(
+            f"{SANDBOX_HOME}/{REPORT_NAME}", max_bytes=1, timeout=REPORT_CHECK_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        logger.warning("Could not read %s in the shell sandbox; greeting as in progress: %s", REPORT_NAME, e)
+        return False
+    return report is not None
+
+
 def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
     if completed:
         instructions = _load_instructions(data_dir, "scan_completed.md", _FALLBACK_COMPLETED)
@@ -350,6 +401,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
     home_channel_set = _set_home_channel_if_unset(**kwargs)
 
+    # Before .user_aligned and the trigger: once either is in place, delivery
+    # can claim the report and move it aside before this read lands.
+    report_ready = _report_ready(data_dir)
+
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)
         logger.info("Marked %s (human connected).", data_dir / ".user_aligned")
@@ -370,7 +425,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch %s: %s", GREETED_MARKER, e)
 
-    return _greeting(data_dir, (data_dir / "INVENTORY.md").exists(), home_channel_set)
+    return _greeting(data_dir, report_ready, home_channel_set)
 
 
 def register(ctx: Any) -> None:
