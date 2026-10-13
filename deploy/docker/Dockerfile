@@ -1301,10 +1301,11 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # cluster_dns_not_local rides it too: is_local_endpoint() calls any host ending
 # in .local an mDNS LAN box, so the agent's own model endpoint,
 # inference-gateway.<ns>.svc.cluster.local, got local-server handling. That
-# meant a 900s stream stale detector, an 1800s read timeout, no non-stream
-# stale detector, and Ollama/llama.cpp probes the gateway 404s. Kubernetes
-# service DNS (.svc, .cluster.local) now classifies as a cloud endpoint; a
-# real .local host stays local. See the module docstring in
+# meant, wherever no timeouts are configured, a 900s stream stale detector, an
+# 1800s read timeout and no non-stream stale detector, and always local-server
+# probes the gateway 404s and an uncached /models fetch. Kubernetes service DNS
+# (.svc, .cluster.local) now classifies as a cloud endpoint; a real .local host
+# stays local. The configs' providers.custom block sets the timeouts. See the module docstring in
 # deploy/docker/patches/apply_cluster_dns_not_local.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \

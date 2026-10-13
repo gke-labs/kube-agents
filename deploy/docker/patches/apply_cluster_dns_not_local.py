@@ -5,7 +5,8 @@ any host ending in ``.local`` as local (RFC 6762 mDNS), and a Kubernetes
 service's cluster DNS name ends in ``.svc.cluster.local``. So the agent's model
 endpoint, the in-cluster inference gateway
 (``inference-gateway.<namespace>.svc.cluster.local``), is classified as a
-local server. That flag switches every model call's failure handling:
+local server. Where no provider timeouts are configured, that flag switches
+every model call's failure handling:
 
 - the stream stale detector (no first chunk, or no chunk for a while) waits
   ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` (900s) instead of the cloud 180s;
@@ -17,7 +18,11 @@ local server. That flag switches every model call's failure handling:
 - ``/models`` metadata is not disk-cached between processes.
 
 A Gemini call that stalled for over ten minutes ran its full 628s without a
-reconnect for this reason (gke-labs/kube-agents#2914).
+reconnect for this reason (gke-labs/kube-agents#2914). The image's configs now
+set the gateway's timeouts explicitly (``providers.custom``), which bypasses the
+local timeout branches; this patch removes the rest: most of the local-server
+probes (the generic ``/api/show`` fallback still runs once), the uncached
+``/models`` fetch, and the local-only load poller and image-routing check.
 
 The edit puts an early ``return False`` for Kubernetes service DNS ahead of the
 ``.local`` rule, so a real mDNS host (``nas.local``), loopback, an unqualified
@@ -27,12 +32,16 @@ hostname, which ``urllib`` lowercases.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import patchlib
 
 METADATA_RELATIVE = "agent/model_metadata.py"
+
+# Where the image installs Hermes, when no root is given.
+DEFAULT_HERMES_ROOT = "/opt/hermes"
 
 # The def whose body gains the early return. Located by AST.
 LOCAL_DEF = "is_local_endpoint"
@@ -64,19 +73,21 @@ def apply(root: Path) -> None:
     definition = patch.find_def(LOCAL_DEF, label="local endpoint classification")
     indent = definition.body_indent
     # Bounded by line breaks, so the guard is matched whole and only at the
-    # def's own body indentation.
-    anchor = "".join("\n" + indent + line for line in HOST_NONE_GUARD) + "\n"
+    # def's own body indentation. The closing break is a lookahead so two
+    # guards in a row, which share it, are both counted.
+    anchor = "".join("\n" + indent + line for line in HOST_NONE_GUARD)
     body = "\n" + patch.source[definition.start : definition.end] + "\n"
-    found = body.count(anchor)
-    if found != 1:
+    matches = list(re.finditer(re.escape(anchor) + r"(?=\n)", body))
+    if len(matches) != 1:
         raise SystemExit(
             f"cluster-dns-not-local patch: {METADATA_RELATIVE}: expected 1 "
-            f"'host is None' guard in {LOCAL_DEF}(), found {found}. {patch.note}"
+            f"'host is None' guard in {LOCAL_DEF}(), found {len(matches)}. {patch.note}"
         )
-    offset = definition.start + body.index(anchor) + len(anchor) - 1
+    # Just past the guard's own line break, where the next line begins.
+    offset = definition.start + matches[0].end()
     patch.splice(offset, offset, inserted(indent))
     patch.commit("kubernetes service DNS classified as a cloud endpoint")
 
 
 if __name__ == "__main__":
-    apply(Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/hermes"))
+    apply(Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HERMES_ROOT))

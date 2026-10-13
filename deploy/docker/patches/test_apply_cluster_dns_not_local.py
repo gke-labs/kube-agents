@@ -104,6 +104,15 @@ class ApplyTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             apply(self.root)
 
+    def test_refuses_when_the_anchor_repeats(self):
+        twice = METADATA_STUB.replace(
+            "    if host is None:\n        return False\n    if host in",
+            "    if host is None:\n        return False\n    if host is None:\n        return False\n    if host in",
+        )
+        _write(self.root, twice)
+        with self.assertRaises(SystemExit):
+            apply(self.root)
+
     def test_refuses_when_the_anchor_is_gone(self):
         _write(self.root, METADATA_STUB.replace("    if host is None:\n        return False\n    if host in", "    if host in"))
         with self.assertRaises(SystemExit):

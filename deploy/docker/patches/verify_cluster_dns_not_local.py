@@ -7,8 +7,7 @@ this proves the patched ``is_local_endpoint`` classifies what it should:
 
 - the agent's own model endpoint (``deploy/shared/defaults/config.yaml``'s
   ``model.base_url`` shape) and the other forms of Kubernetes service DNS are
-  NOT local, so Hermes uses its cloud timeouts and skips the Ollama probes for
-  them;
+  NOT local, so Hermes skips its local-server handling for them;
 - loopback, an unqualified name, a private address and a real mDNS ``.local``
   host stay local, so the patch is no wider than service DNS.
 

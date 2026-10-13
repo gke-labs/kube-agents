@@ -33,8 +33,9 @@ model:
 # timeout (and the stream read timeout), not a cap on a whole call; the chart's
 # LiteLLM sets no timeout of its own. A call that stalls is retried inside each
 # of Hermes' 3 attempts (agent.api_max_retries) until five stale kills in a row
-# end it, so it costs up to six 300s windows, about 30 minutes plus backoff,
-# before the turn fails.
+# trip its breaker, so it costs five or six 300s windows, about 25 to 30
+# minutes plus backoff, before the turn fails. A one-off stall recovers at the
+# first 300s kill.
 providers:
   custom:
     stale_timeout_seconds: 300
