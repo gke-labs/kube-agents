@@ -1466,6 +1466,17 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
 #
+# kanban_wake_guard: a wake turn in a gateway conversation can't file a card.
+# When a card finishes, Hermes runs a synthetic turn in the session that filed
+# it (the wake self-post in gateway/wake.py), with every tool. On the next lane
+# a front-door session's wake turn filed a card acting on the worker's proposed
+# fix, and that card opened a pull request nobody asked for (#2610). The
+# self-post now marks its request, the API server's chat-completions handler
+# marks the turn for a front-door (a2a-ctx-*) session, _run_agent carries the
+# mark onto the turn's executor thread, and kanban_create refuses on a marked
+# turn. The wake turn can still answer.
+# See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
+#
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
 # record, the `queued` events) is in the kanban-scheduling stage above, which
@@ -1525,6 +1536,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/kanban_wake_guard.py \
+     deploy/docker/patches/apply_kanban_wake_guard.py \
+     deploy/docker/patches/verify_kanban_wake_guard.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
@@ -1586,6 +1600,12 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
+    cp /tmp/latency-patches/kanban_wake_guard.py /opt/hermes/tools/kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_guard.py /opt/hermes && \
+    grep -qF '_kanban_refuse_create_on_wake()' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
+    grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
+    grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -1615,6 +1635,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_chat_notify.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
