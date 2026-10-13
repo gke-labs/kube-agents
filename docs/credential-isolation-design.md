@@ -511,13 +511,13 @@ conservative than git. The cost is a refusal the argument's position would
 otherwise excuse — a commit message that is the bare word `foreach` or `help`,
 or `git clean -x` — which is the direction this is meant to fail in.
 
-Matching the subcommand by position instead would remove that last cost, and it
-is deliberately not done. Resolving the subcommand slot means knowing which of
-git's global options take a separated value, and the list is not one this
-runtime can keep complete: `git --attr-source HEAD help -m <page>` runs the
-configured viewer while a position-aware reading of the same argument vector
-sees the subcommand as `HEAD`. Scanning every argument cannot disagree with git
-about where the subcommand is.
+For the refused subcommand tokens and flags above, the check scans every
+argument rather than only the global-option or subcommand slot so that a flag
+or subcommand token cannot slip past a parser disagreement (`--attr-source`,
+`--config-env`, and `--shallow-file` are also included in
+`_GIT_GLOBAL_WITH_VALUE` and refused outright, so `_git_plan` and
+`git_argument_violation` resolve the subcommand slot after global value options
+and enforce `ALLOWED_GIT_SUBCOMMANDS` and `_git_config_violation` on that slot).
 
 Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,
@@ -604,10 +604,14 @@ layer and reinstating the runtime's own helper immediately after it discards a
 repository's helper while leaving authenticated push working — but that couples
 the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
-The refused-subcommand list is likewise a denylist over a set that is not closed:
-git holds a command in configuration for several tools, and a future release may
-add another. Allowlisting the subcommands the product issues, and failing closed
-on the rest, is the structurally correct form and is the recommended follow-up.
+As a latent defence-in-depth layer behind `/v1/exec` (which currently refuses
+`git` at `EXEC_ROUTE_EXECUTABLES`, while broker-internal git uses
+`WORKSPACE_GIT_SUBCOMMANDS` and `VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
+enforces an explicit allowlist of subcommands (`ALLOWED_GIT_SUBCOMMANDS`)
+alongside the denylist, failing closed on unknown or custom verbs if `git` is
+ever re-admitted to `/v1/exec`. Writing configuration via repository-local
+`git config` on that path is restricted to author identity keys (`user.name`,
+`user.email`), with non-query mutations to other keys refused.
 
 Reducing both is the motivation for having the runtime receive file content from
 the sandbox rather than operate inside a directory the sandbox controls. The

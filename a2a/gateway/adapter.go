@@ -54,6 +54,14 @@ type InboundMessage struct {
 	// a submission nobody took is still on the in subject for a bridge that
 	// binds later to run).
 	TaskID string
+	// TopLevel marks a message that roots a conversation of its own in a
+	// space whose questions each get their own thread, rather than one
+	// typed inside a thread: today a top-level Slack DM, which the adapter
+	// keys on its own message id. Such a conversation has nothing running
+	// in it, so a stop or a status question there gets a reply saying
+	// where to send it instead of being read as an ask. False is every
+	// other message, and every other backend's case.
+	TopLevel bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running

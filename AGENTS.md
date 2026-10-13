@@ -104,7 +104,7 @@ not apply `status:` labels here; those belong to the runtime claim loop in
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md`.
 - Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
-- `agents/platform/skills/gke-*` (a reserved prefix) are copies of `google/skills`. One with an `upstream.lock` in `agents/platform/skill-overlays/<skill>/` is edited in place and recorded with `make skills-refresh` (see `edit-mirrored-skill`); the rest are overwritten by `scripts/sync-upstream-skills.py`, so also register their changes in one of its `SKILL_*` registries (any file of the skill).
+- `agents/platform/skills/gke-*` (a reserved prefix) are copies of `google/skills`, generated from `third_party/google-skills/<skill>/` and the overlay in `agents/platform/skill-overlays/<skill>/`. Edit one in place and record it with `make skills-refresh` (see `edit-mirrored-skill`).
 
 ## Engineering Rules
 

@@ -19,8 +19,9 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
-one when they stop ([below](#a-backed-up-pool)), plus, for the watched Prow
+([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+are refused a project and one when they stop ([below](#a-backed-up-pool)),
+plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
 ([below](#the-watched-periodics)).
 The digest also carries one line on last night's run of the nightly tier
@@ -294,9 +295,10 @@ Runs still pass; /retest makes the queue longer.
 ```
 
 Those are the numbers the verdict was reached on. The periodic breaches on a
-day's row or on runs queued past p95 right now, never on the seven-day window,
-which one bad day leaves inside its own limit. A breach on only one of the two
-carries only that line.
+day's row, on runs queued past p95 right now, or on a run refused a project by
+Boskos in the last three hours; never on the seven-day window, which one bad
+day leaves inside its own limit. A breach on only one of the three carries only
+that line.
 
 The stretch quoted is the last three hours, not the worst day, which a
 week-long verdict leaves up to six days older than the incident. The three
@@ -305,9 +307,11 @@ day's row needs; otherwise the worst day is what is left to show, and the label
 says which it was.
 
 A ⏳ also needs a run that has been waiting past the p50 limit at the moment of
-the reading. Not the p95 limit, because a pool full all afternoon with every
-run waiting half an hour is the case this message is for; and not any queued
-run at all, because one triggered seconds ago is not a backlog. The remedy is
+the reading, or a refused acquire in the last three hours, which is a backlog
+that has already cost a run and leaves nothing queued to see. Not the p95
+limit, because a pool full all afternoon with every run waiting half an hour is
+the case this message is for; and not any queued run at all, because one
+triggered seconds ago is not a backlog. The remedy is
 recomputed hourly from a live count of leased projects while the verdict stands
 for a week, so a pool that filled on Monday and drained by Tuesday would
 otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
@@ -320,12 +324,17 @@ queue read too: it means the pool looked fine so Prow must be at fault, which
 holds only while something is queued. Unread, the message gives the free count
 and apportions no blame. `pool full` keeps its remedy either way and drops "and
 runs are queuing" whenever Deck did not see a backlog — the leased count is this
-hour's, the queue is Deck's.
+hour's, the queue is Deck's. A refusal keeps the cause for three hours, so once
+the pool has drained the header reads `pool was full` with the free count
+instead of calling the projects leased — unless a run is waiting past the p50
+limit with projects free, when the live diagnosis wins and the refusal is a
+line under it.
 
 A drained queue also ends what the jam said. The verdict holds for a week, so a
 pool that fills every afternoon would otherwise be announced on Monday and
 silent for the rest of it; the causes already named are forgotten on a reading
-that shows nothing waiting, and the next jam is news again — a next jam that has
+that shows nothing waiting and no refusal in the last three hours, and the next
+jam is news again — a next jam that has
 to be measured, since an hour Deck could not be read has seen no queue at all.
 The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same

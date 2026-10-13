@@ -66,8 +66,8 @@ JUNK_FILE_PATTERNS = (".DS_Store", "Thumbs.db", "*.swp", "*.swo", "*~")
 APPEND_NAME = "append.md"
 SKILL_MD = "SKILL.md"
 # Every append.md starts with a line that begins with this; the rest of the line is free text.
-# The footers scripts/sync-upstream-skills.py appends today carry such a line, so they move into
-# append.md byte for byte.
+# The footers this repository appended before the overlay existed carry such a line, so they
+# moved into append.md byte for byte.
 APPEND_MARKER_PREFIX = "<!-- kube-agents: local addition"
 PATCH_GLOB = "[0-9][0-9][0-9][0-9]-*.patch"
 PATCH_NUMBER_WIDTH = 4

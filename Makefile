@@ -120,13 +120,10 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # list is how a real finding gets silenced.
 #
 # The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
-# copies of google/skills, regenerated either by scripts/sync-upstream-skills.py
-# (deleted and re-copied wholesale; its substitution hooks rewrite only the
-# files registered with them) or by scripts/skill_overlay.py from the copy in third_party/google-skills/
-# (AGENTS.md, Skills Guidelines). A directive written into one of their .sh
-# files by hand lasts until the next sync, and the target goes red on a tree
-# nobody edited. A warning in one of them is fixed upstream, or registered in
-# SKILL_FILE_SUBSTITUTIONS, not here.
+# copies of google/skills that scripts/skill_overlay.py generates from the copy
+# in third_party/google-skills/ plus a patch overlay (AGENTS.md, Skills
+# Guidelines). A warning in one of them is fixed upstream, or in a patch when it
+# cannot wait, not by a directive written into the generated file.
 SHELLCHECK_PATHSPEC := *.sh
 # third_party/google-skills/ holds byte-identical copies of the same upstream skills
 # (scripts/skill_overlay.py), so it is left out for the same reason.

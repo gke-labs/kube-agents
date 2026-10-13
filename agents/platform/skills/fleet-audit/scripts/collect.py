@@ -6536,10 +6536,11 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
 # Management ports: remote access (22, 3389), the control plane's own (2379,
 # 2380, 10250), and the datastores -- ports whose service admits a caller on a
 # credential, so opening one to the internet makes that credential the whole
-# perimeter. The networking audit has no firewall-side check with a port set of
-# its own yet, so this is the only copy. One added there must use this same set
-# and a test must pin the pair: a port admitted on one side and not the other is
-# a firewall rule reported daily for a Service this check leaves open.
+# perimeter. The networking audit's firewall-world-open-ingress check keeps the
+# second copy (`networking_audit.MANAGEMENT_PORTS`), and
+# `test_networking_audit.ManagementPortsPinTest` pins the pair: a port admitted
+# on one side and not the other is a firewall rule reported daily for a Service
+# this check leaves open.
 #
 # 80, 443 and 8080 are absent on purpose: a LoadBalancer Service
 # publishing a web port to the internet is a LoadBalancer Service doing its job,

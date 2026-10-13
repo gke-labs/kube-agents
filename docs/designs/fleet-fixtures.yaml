@@ -10,7 +10,7 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks` and `startup-fail-vm` are project-scoped,
+# on a cluster at all (`orphan-disks`, `startup-fail-vm` and `world-open-ingress` are project-scoped,
 # so they have no cluster slot and no entry in a catalogue keyed by one).
 #
 # A case names a fixture by role and never by a cluster name or a project id.
@@ -189,6 +189,18 @@ fixtures:
       A standalone e2-micro, startup-fail-<prefix>, whose startup script
       exits 1 on every boot, so the guest agent's failure line is on its
       serial console from the first boot onward.
+
+  - role: world-open-ingress
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - firewall/world-open-2379-<prefix>
+      - instance/world-open-<prefix>
+      - firewall/world-open-deny-remote-<prefix>
+    defect: >-
+      A firewall rule opening tcp:2379 to the internet on the one VM that
+      carries its tag, which holds an external IP. Nothing listens on 2379.
+      A deny rule blocks tcp:22 and tcp:3389 on that VM.
 
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.

@@ -48,6 +48,8 @@ kube-agents/
 │       ├── governance/                            cron-run SOP playbooks + the
 │       │                                          first-run inventory-scan and
 │       │                                          report-prioritization SOPs
+│       ├── skill-overlays/                        patches + append.md behind the mirrored
+│       │                                          gke-* skills (scripts/skill_overlay.py)
 │       └── skills/                                SKILL.md bundles + the
 │                                                  gke-compute-classes references
 ├── a2a/docs/                                      design notes kept beside the A2A
@@ -117,7 +119,7 @@ CI enforcement: `make docs-check` runs the same checks as
   `docs/architecture/…` path cited from a code or configuration file (Python,
   Go, shell, Dockerfiles, YAML, Terraform, TypeScript) must be one too. The
   same script holds the **reachability rule**: every tracked `.md`/`.mdx`
-  outside a root-level dot-directory must be reachable from where a reader
+  outside a root-level dot-directory, the skill overlays' `append.md` fragments aside, must be reachable from where a reader
   starts. The starting points are files at the repository root, any
   `README.md` (its directory reaches it), the tooling under the root
   dot-directories, the site pages Starlight's sidebar lists (read from

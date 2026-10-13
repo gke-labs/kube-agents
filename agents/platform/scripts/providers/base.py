@@ -222,14 +222,30 @@ class Forge:
         """
         raise NotImplementedError
 
+    def file_url(self, repo: str) -> str | None:
+        """The web address of a file in `repo`, with `{ref}` and `{path}` to fill.
+
+        Composed from the validated repository and this forge's own host, as
+        `clone_url` is, so it needs no credential and no network. The caller
+        percent-encodes `{ref}` and `{path}` and keeps their `/` separators
+        (`quote(value, safe="/")`): a branch name may hold `#` or `%`, which
+        would break the link. A link that must outlive the branch uses a
+        commit SHA as `{ref}`. None when the forge has no such page.
+        """
+        return None
+
     def capabilities(self, repo: str) -> dict[str, Any]:
         """What this install can do here, before anything is spent.
 
         No credential, no network. A caller that discovers the gap by failing
         halfway through a publish has already written the revision it cannot
         deliver.
+
+        `fileUrl` is the web address of a file, from `file_url`. It is in the
+        answer only when the forge gives one, so that a link in an issue or a
+        proposal opens the file on this forge, not a path relative to the page.
         """
-        return {
+        answer = {
             "forge": self.name,
             "repo": repo,
             "proposalNoun": self.proposal_noun,
@@ -244,6 +260,10 @@ class Forge:
             "acknowledge": self.acknowledges,
             "missing": [],
         }
+        url = self.file_url(repo)
+        if url:
+            answer["fileUrl"] = url
+        return answer
 
     def can_write(
         self, api: Callable, repo: str, login: str, bot: bool = False

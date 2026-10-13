@@ -5294,8 +5294,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             emitted = emit("idle-workload", hit)
             # Without this the retracted impact never reaches a reader.
             # `adopt_arm_impact` adopts the collector's sentence only for
-            # candidates that mark it authoritative, and the pass `finish` plans
-            # for reusing last run's prose on byte-identical evidence would reuse
+            # candidates that mark it authoritative, and `carry_unchanged_findings`,
+            # which reuses last run's prose on byte-identical evidence, would reuse
             # it -- which for a workload idle for a month is every run. The
             # findings that stood down three Deployments would go on
             # publishing "a workload nobody is calling" forever with the constant

@@ -1,0 +1,23 @@
+Subject: Point Workload Identity at gke-workload-identity
+
+Why: upstream's Workload Identity split moved WI routing out of gke-workload-security in the skills' descriptions only; the bodies an agent reads after routing still sent it there and taught GSA impersonation as the recommended path, which gke-workload-identity calls legacy. The patch points the bodies at gke-workload-identity.
+Local-Issue: none (#2357)
+Upstream-Issue: none filed yet
+Retire-When: upstream's skill bodies route Workload Identity to gke-workload-identity
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -95,9 +95,9 @@ Ensure high availability and graceful degradation.
+ 
+ Harden the cluster and workloads.
+ 
+--   **Action**: You MUST run the `gke-platform-security` and
+-    `gke-workload-security` skills for Workload Identity, Network Policies, and
+-    Shielded Nodes.
++-   **Action**: You MUST run the `gke-workload-identity` skill for Workload
++    Identity, and the `gke-platform-security` and `gke-workload-security` skills
++    for Network Policies and Shielded Nodes.
+ -   **Namespace Isolation**: Ensure workloads run in dedicated namespaces with
+     Pod Security Standards (PSS) enforced via labels.
+ -   **Least Privilege**: Ensure workloads use dedicated ServiceAccounts instead

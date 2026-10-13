@@ -2322,13 +2322,19 @@ func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
 // unmentioned thread reply only once a task has started there, so the ack
 // after a bare /session in a Slack channel must not promise that the next
 // message opens the pod - it asks for the mention. DMs and every other
-// backend keep the plain promise.
+// backend keep the plain promise. A Slack DM is told to reply in the thread:
+// each top-level DM is a conversation of its own, so the binding holds only
+// there.
 func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
 	slackChannel := sessionOnAck("slack", "group", "platform")
 	if !strings.Contains(slackChannel, "mention") || strings.Contains(slackChannel, "your next message opens") {
 		t.Fatalf("slack channel ack = %q", slackChannel)
 	}
-	for _, c := range [][2]string{{"slack", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
+	slackDM := sessionOnAck("slack", "dm", "platform")
+	if !strings.Contains(slackDM, "reply in this thread") || strings.Contains(slackDM, "mention") || strings.Contains(slackDM, "your next message opens") {
+		t.Fatalf("slack dm ack = %q", slackDM)
+	}
+	for _, c := range [][2]string{{"discord", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
 		ack := sessionOnAck(c[0], c[1], "platform")
 		if !strings.Contains(ack, "your next message opens a session pod") || strings.Contains(ack, "mention") {
 			t.Fatalf("%s/%s ack = %q", c[0], c[1], ack)

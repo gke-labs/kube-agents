@@ -3962,6 +3962,7 @@ FLEET_RESOURCE_ROLES = {
     "google_container_cluster": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
     "google_container_node_pool": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
     "google_compute_disk": {"roles/compute.storageAdmin"},
+    "google_compute_firewall": {"roles/compute.securityAdmin", "roles/compute.viewer"},
     "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
     "google_service_account": {"roles/iam.serviceAccountAdmin"},
     "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},

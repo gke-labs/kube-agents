@@ -860,29 +860,38 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
-| Verb                                 | Request                                                              | Response                                                                 |
-| ------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing, baseBranch}`   |
-| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`        |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                        |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                             |
-| `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                          |
-| `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                             |
-| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}` |
-| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                         | `{comment}`                                                              |
-| `issue-create`                       | `{repository, title, body?, labels?}`                                | `{issue}`                                                                |
-| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                      |
-| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                      |
-| `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                            |
-| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                         |
-| `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                |
-| `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                 |
-| `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                     |
-| `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                    |
+| Verb                                 | Request                                                              | Response                                                                         |
+| ------------------------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing, baseBranch, fileUrl?}` |
+| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                                     |
+| `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                  |
+| `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                     |
+| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`         |
+| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                         | `{comment}`                                                                      |
+| `issue-create`                       | `{repository, title, body?, labels?}`                                | `{issue}`                                                                        |
+| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                              |
+| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                              |
+| `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                                    |
+| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                                 |
+| `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                        |
+| `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                         |
+| `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                             |
+| `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                            |
 
 `baseBranch` is the repository's configured base, or null when it has none.
 Where it is set, `proposal-create`'s `target`, and a first-round `publish`'s,
 must name it; [The shape](#the-shape) has the rule and the doors that hold it.
+
+`capabilities` also answers `fileUrl`: the web address of a file in the
+repository, with `{ref}` and `{path}` for the caller to fill. It is
+`https://github.com/<owner>/<name>/blob/{ref}/{path}` on GitHub, and
+`https://<host>/<group>/.../<project>/-/blob/{ref}/{path}` on GitLab. The forge
+composes it from the repository and its own host, so the sandbox builds no
+forge URL. A link in an issue or a proposal uses it, because a bare relative
+path resolves against the page and opens nothing. A forge that this install
+does not serve answers no `fileUrl`.
 
 The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read

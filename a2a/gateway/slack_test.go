@@ -25,6 +25,9 @@ import (
 // fakeSlackAPI fakes the five Web API calls the adapter makes; tests assert
 // on what was posted/updated.
 type fakeSlackAPI struct {
+	// mu guards posted and updated for the tests that drive the fake from
+	// gateway workers; single-goroutine tests read the slices directly.
+	mu sync.Mutex
 	// team is the team id auth.test answers with.
 	team     string
 	posted   []struct{ channel, thread, text string }
@@ -43,6 +46,8 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 	if err != nil {
 		return "", "", err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.posted = append(f.posted, struct{ channel, thread, text string }{
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
@@ -54,6 +59,8 @@ func (f *fakeSlackAPI) UpdateMessage(channelID, timestamp string, options ...sla
 	if err != nil {
 		return "", "", "", err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.updated = append(f.updated, struct{ channel, ts, text string }{
 		values.Get("channel"), timestamp, values.Get("text"),
 	})
@@ -206,7 +213,7 @@ func TestSlackWebAPIClientIsBounded(t *testing.T) {
 func TestSlackDMMentionIsStripped(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	got, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "<@UBOT> stop", "1.0", ""))
-	if !ok || got.Text != "stop" || got.Conversation != "slack:dm/D1" {
+	if !ok || got.Text != "stop" || got.Conversation != "slack:dm/D1/1.0" {
 		t.Fatalf("DM with a mention: delivered=%v text=%q conv=%q, want text \"stop\"", ok, got.Text, got.Conversation)
 	}
 	if _, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "<@UBOT>", "2.0", "")); ok {
@@ -843,8 +850,14 @@ func TestSlackPostThreadsAndTranslates(t *testing.T) {
 	if _, err := a.Post("slack:dm/D1", "hi"); err != nil {
 		t.Fatal(err)
 	}
-	if api.posted[1].thread != "" {
-		t.Error("DM posts must not set thread_ts")
+	if api.posted[1].channel != "D1" || api.posted[1].thread != "" {
+		t.Errorf("a post to the thread-less DM key must be top-level: %+v", api.posted[1])
+	}
+	if _, err := a.Post("slack:dm/D1/100.1", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if api.posted[2].channel != "D1" || api.posted[2].thread != "100.1" {
+		t.Errorf("a post to a DM thread's conversation must land in that thread: %+v", api.posted[2])
 	}
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")
@@ -925,7 +938,8 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		kind   string
 		text   string
 	}{
-		{"dm delivers", nil, slackMsg("im", "D1", "U1", "hi", "1.0", ""), true, "slack:dm/D1", "dm", "hi"},
+		{"dm delivers, rooted on its own ts", nil, slackMsg("im", "D1", "U1", "hi", "1.0", ""), true, "slack:dm/D1/1.0", "dm", "hi"},
+		{"dm thread reply is the thread's conversation", nil, slackMsg("im", "D1", "U1", "and this", "1.5", "1.0"), true, "slack:dm/D1/1.0", "dm", "and this"},
 		{"channel without mention drops", nil, slackMsg("channel", "C1", "U1", "hello", "2.0", ""), false, "", "", ""},
 		{"channel mention roots a thread on the ask", nil, slackMsg("channel", "C1", "U1", "<@UBOT> do a thing", "3.5", ""), true, "slack:C1/3.5", "group", "do a thing"},
 		{"display-name mention form strips", nil, slackMsg("channel", "C1", "U1", "<@UBOT|kage> do it", "3.6", ""), true, "slack:C1/3.6", "group", "do it"},
@@ -944,7 +958,7 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		{"bare mention drops", nil, slackMsg("channel", "C1", "U1", "<@UBOT>", "7.0", ""), false, "", "", ""},
 		// Slack transmits &, < and > entity-encoded; the ask must reach the
 		// executor as the user typed it.
-		{"entities decode in a dm", nil, slackMsg("im", "D1", "U1", "get pods -n foo &amp;&amp; describe node &lt;name&gt;", "10.0", ""), true, "slack:dm/D1", "dm", "get pods -n foo && describe node <name>"},
+		{"entities decode in a dm", nil, slackMsg("im", "D1", "U1", "get pods -n foo &amp;&amp; describe node &lt;name&gt;", "10.0", ""), true, "slack:dm/D1/10.0", "dm", "get pods -n foo && describe node <name>"},
 		{"entities decode after the mention strip", nil, slackMsg("channel", "C1", "U1", "<@UBOT> scale web if cpu &gt; 80%", "11.0", ""), true, "slack:C1/11.0", "group", "scale web if cpu > 80%"},
 		{"entities decode in a thread steer", nil, slackMsg("channel", "C1", "U3", "and &lt;this&gt; too", "12.0", "100.1"), true, "slack:C1/100.1", "group", "and <this> too"},
 	}
@@ -1001,6 +1015,7 @@ func TestSlackConversationIDRoundTrip(t *testing.T) {
 		wantChannel, wantThread        string
 	}{
 		{"im", "D0AB1", "", "slack:dm/D0AB1", "D0AB1", ""},
+		{"im", "D0AB1", "1725193344.000100", "slack:dm/D0AB1/1725193344.000100", "D0AB1", "1725193344.000100"},
 		{"channel", "C042", "1725193344.000100", "slack:C042/1725193344.000100", "C042", "1725193344.000100"},
 		{"group", "G777", "1700.42", "slack:G777/1700.42", "G777", "1700.42"},
 		{"mpim", "C9", "1700.43", "slack:C9/1700.43", "C9", "1700.43"},
@@ -1015,7 +1030,7 @@ func TestSlackConversationIDRoundTrip(t *testing.T) {
 			t.Errorf("slackChannelThread(%q) = %q,%q,%v want %q,%q,true", got, ch, ts, ok, c.wantChannel, c.wantThread)
 		}
 	}
-	for _, bad := range []string{"discord:1/2", "slack:", "slack:C1", "slack:C1/", "slack:dm/", "slack:/100.1"} {
+	for _, bad := range []string{"discord:1/2", "slack:", "slack:C1", "slack:C1/", "slack:dm/", "slack:/100.1", "slack:dm//1.0", "slack:dm/D1/", "slack:dm/D1/1.0/2.0"} {
 		if _, _, ok := slackChannelThread(bad); ok {
 			t.Errorf("slackChannelThread(%q) parsed; must refuse", bad)
 		}
@@ -2218,6 +2233,7 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 func TestSlackTaskStartedMarksOnlyThreads(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.TaskStarted("slack:dm/D1", "task-dm")
+	a.TaskStarted("slack:dm/D1/9.0", "task-dm-thread")
 	a.TaskStarted("not-a-slack-key", "task-other")
 	if n := len(a.sessionThreads); n != 0 {
 		t.Fatalf("a DM or a foreign key marked %d threads, want 0: %v", n, a.sessionThreads)

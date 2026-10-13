@@ -62,6 +62,7 @@ import credential_proxy  # noqa: E402
 # imports it by path. Distinct from the callback's own registration name so
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+SKILL_OVERLAY_MODULE_NAME = "kube_agents_skill_overlay"
 
 # The same, for the Slack click handler imported by path.
 SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
@@ -587,9 +588,23 @@ SOURCES: dict[str, Source] = {
         ),
     ),
     # --- supply chain -----------------------------------------------------
+    # The tool that keeps the mirrored gke-* skills, and the CI step that runs
+    # its offline check. C4 reads the pin and the checksum from the first and
+    # that they are enforced from the second.
     "skill_sync": Source(
-        "scripts/sync-upstream-skills.py",
-        ("UPSTREAM_REPO", "--depth"),
+        "scripts/skill_overlay.py",
+        ("def cmd_check(", "def verify_copy(", "def tree_sha256("),
+    ),
+    "validate_workflow": Source(
+        ".github/workflows/validate.yml",
+        ("Mirrored skills match their upstream copy and overlay",),
+    ),
+    "makefile": Source("Makefile", ("skills-check:", "SKILL_OVERLAY :=")),
+    # One member of the mirrored-skill set C4 walks, so the self-check names
+    # the set when the skills or their overlays move.
+    "skill_lock_gke_basics": Source(
+        "agents/platform/skill-overlays/gke-basics/upstream.lock",
+        ("commit:", "sha256:"),
     ),
     "tags_env": Source("tags.env", ("HERMES_AGENT_TAG",)),
     # `repository:` is C4's read. The platformAgent block is D2's: it is
@@ -776,6 +791,16 @@ def gateway_redactor_module():
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
     sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def skill_overlay_module():
+    """The mirrored-skill tool, imported by path for its pure helpers (tree_sha256)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SKILL_OVERLAY_MODULE_NAME, path_of("skill_sync"))
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 

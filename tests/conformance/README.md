@@ -68,7 +68,7 @@ ownership check, and pinning it would have encoded that gap as an intention.
 
 ## Known violations are expected failures
 
-Twelve assertions currently fail. They are decorated `@known_violation`, which
+Eleven assertions currently fail. They are decorated `@known_violation`, which
 is `unittest.expectedFailure` plus a registration, so CI is green and the gap
 still has a name, a line number and a citation. Fixing the control turns the
 expected failure into an _unexpected success_, which unittest reports as a
@@ -83,7 +83,7 @@ reads with an anchor string that `test_harness_selfcheck.py` verifies. Rename
 a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
-Two sets of inputs are not registered. The group-B workflow tests glob
+Three sets of inputs are not registered. The group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
@@ -99,11 +99,16 @@ digest on a `docker://` ref, and the fork-guard check on every auto-triggered
 credentialed workflow, run under `make test-python` in
 `tests/test_workflow_pins_and_fork_guards.py`.
 
-The other is the site's content tree, which D2 walks for the read-only
+Another is the site's content tree, which D2 walks for the read-only
 switch. `_harness.site_pages()` raises when the tree is missing or holds no
 page, the security reference under it is registered so the self-check names
 the tree when it moves, and the test requires the pages to name the broker's
 other variables before it reads their silence on this one.
+
+The third is the mirrored `gke-*` skills, which C4 globs under
+`agents/platform/skills/` to require an `upstream.lock` beside each one. The
+test asserts the glob is non-empty, and `gke-basics`'s lock is registered and
+required to be in the set, so the self-check names the tree when it moves.
 
 ## Invariant → test → bucket → historical attack
 
@@ -212,7 +217,7 @@ currently fails.
 | C4  | every third-party action is pinned to a commit                             | 1        | `test_C4_every_third_party_action_is_pinned_to_a_commit`                            | a retagged release silently changing what CI runs                                                                                                                                                                                                        |
 | C4  | the agent base image is pinned by digest                                   | 1        | `test_C4_the_agent_base_image_is_pinned_by_digest`                                  | — (the one reference this repo gets right)                                                                                                                                                                                                               |
 | C4  | every hermes plugin install is pinned to a commit                          | 1        | `test_C4_every_hermes_plugin_install_is_pinned_to_a_commit`                         | an upstream default branch shipping a plugin manifest the pinned installer cannot read, breaking every image build                                                                                                                                       |
-| C4  | upstream skills are pinned and verified                                    | 1 **KV** | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
+| C4  | upstream skills are pinned and verified                                    | 1        | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
 | C4  | every shipped image is pinned by digest                                    | 1 **KV** | `test_C4_every_shipped_image_is_pinned_by_digest`                                   | `DefaultPlatformAgentVersion = "latest"`                                                                                                                                                                                                                 |
 | C5  | no minted role grants a write verb                                         | 1        | `test_C5_no_minted_role_grants_a_write_verb`                                        | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                                                                |
 | C5  | the leader role stays confined to coordination                             | 1        | `test_C5_the_leader_role_stays_confined_to_coordination`                            | —                                                                                                                                                                                                                                                        |
@@ -292,7 +297,9 @@ the four `C1-a2a-gateway-*` mutations and the three `B1-slack-*` mutations, all
 KILLED when they were added on 2026-10-06, `B1-slack-method-shape-dropped`, KILLED
 when it was added on 2026-10-07, `A3-agent-answers-its-own-notify` (KILLED) and
 `A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
-they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08;
+they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
+`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
+`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07;
 re-run the harness rather than trusting these numbers, which is the sentence this
 paragraph exists to make cheap.
 Note that the summary line the harness prints accounts for 113 of the 115: a
