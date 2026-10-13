@@ -60,9 +60,6 @@ READS = {
     "gemma-gpu-upgraded": {key: items(f"gemma_{name}.json") for key, name in READ_FILES.items()},
 }
 SERVER_CONFIG = load("serverconfig_us-central1-a.json")
-# Discovery reads no environment variable; the store and kubeconfig homes
-# are the only ones the tests set.
-NO_PROJECT_ENV: dict[str, str] = {}
 API_OFF_STDERR = "ERROR: (gcloud.container.{api}.list) ResponseError: code=403, message=Kubernetes Engine API has not been used in project {project} before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project={project} then retry. reason: SERVICE_DISABLED"
 KUBECTL_KINDS = {"pdb": "pdbs", "replicasets,jobs": "owners", "deploy,ds,sts,cronjobs": "workloads", "pv,storageclasses": "storage", "validatingwebhookconfigurations,mutatingwebhookconfigurations": "webhooks"}
 INFERENCE = "seeded-capacity/Deployment/inference-server"
@@ -528,6 +525,15 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(pods=[pod("on-master", scheduled_message=mixed, node_selector={"node-role.kubernetes.io/master": ""})])
         self.assertEqual(entries(row), {(12, ur.MEDIUM)})
         self.assertEqual(row["classifications"][0]["detail"], "selector node-role.kubernetes.io/master=; node-role.kubernetes.io/master dropped in 1.24; " + ur.MIXED_CLAUSES_FORMAT.format(clauses="1 node(s) were unschedulable"))
+        # A taint clause carries a dotted key: the clause set ends at the preemption sentence, not at
+        # the first period, so the message is still read as mixed and the taint named in full.
+        spot = "0/5 nodes are available: 2 node(s) had untolerated taint {cloud.google.com/gke-spot: true}, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/5 nodes are available: 5 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("on-master", scheduled_message=spot, node_selector={"node-role.kubernetes.io/master": ""})])
+        self.assertEqual(entries(row), {(12, ur.MEDIUM)})
+        self.assertIn(ur.MIXED_CLAUSES_FORMAT.format(clauses="2 node(s) had untolerated taint {cloud.google.com/gke-spot: true}"), row["classifications"][0]["detail"])
+        gpu = "0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 2 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."
+        [row] = self.classify(pods=[pod("trainer", scheduled_message=gpu, node_selector={"beta.kubernetes.io/arch": "amd64"})])
+        self.assertEqual({c["entry"] for c in row["classifications"]}, {18})  # row 18 wins first; the clause set is read whole
         # The repository's entry-12 reproduction (bench/upgrade-scenarios/evidence/12/label.txt), read
         # during the drain: the clause set ends at the first period, the preemption sentence's own
         # `0/3 nodes are available` is not the total, and the row files at medium.
@@ -595,6 +601,18 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertIn("image host k8s.gcr.io; same image running on an untouched pool", row["classifications"][0]["detail"])
         [row] = self.classify(pods=[pod("hub-pull", statuses=[waiting("ErrImagePull")])])
         self.assertIn(f"image host {ur.DEFAULT_IMAGE_HOST}", row["classifications"][0]["detail"])
+
+    def test_reason_hit_on_a_sidecar_quotes_the_sidecar(self):
+        # The main container crash-loops, the sidecar cannot pull: entry 20 on the sidecar's reason,
+        # evidenced by the sidecar's own text, not the headline container's.
+        statuses = [
+            {"name": "main", "state": {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 5m0s restarting failed container=main"}}, "restartCount": 7},
+            {"name": "sidecar", "state": {"waiting": {"reason": "ImagePullBackOff", "message": 'Back-off pulling image "k8s.gcr.io/pause:3.9"'}}},
+        ]
+        [row] = self.classify(pods=[pod("api", containers=2, statuses=statuses, images=["example.com/api:1", "k8s.gcr.io/pause:3.9"])])
+        self.assertEqual({c["entry"] for c in row["classifications"]}, {20})
+        self.assertIn('ImagePullBackOff Back-off pulling image "k8s.gcr.io/pause:3.9"', row["classifications"][0]["evidence"])
+        self.assertNotIn("CrashLoopBackOff", row["classifications"][0]["evidence"])
 
     def test_entry_18_gpu_shortage_and_driver_error(self):
         [row] = self.classify(pods=[pod("cuda-job", scheduled_message="0/2 nodes are available: 2 Insufficient nvidia.com/gpu.")])
@@ -1597,7 +1615,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
-        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, **NO_PROJECT_ENV})
+        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name})
         self.env.start()
 
     def tearDown(self):
@@ -1621,10 +1639,18 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual([u["cluster"] for u in second["unchanged"]], [GEMMA, SEEDED])
 
     def test_dry_run_writes_nothing(self):
-        result, _ = self.collect(dry_run=True, output=str(self.home / "out.json"))
+        result, _ = self.collect(dry_run=True, output=str(self.home / "out.json"), manifest_file=str(self.home / "manifest.json"))
         self.assertTrue(result["dry_run"])
-        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+        self.assertIn(ur.SECTION_ERRORS, result["report"])
+        # None of the five artefacts: the report and its link, the JSON, the manifest, the guards,
+        # the ledger.
+        self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
         self.assertFalse((self.home / "out.json").exists())
+        self.assertFalse((self.home / "manifest.json").exists())
+        self.assertFalse((self.home / ur.GUARDS_FILENAME).exists())
+        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+        # The kubeconfigs the reads fetch are working files under HERMES_HOME, not store artefacts.
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [".kubeconfigs"])
 
     def test_output_json_carries_every_section(self):
         out = self.home / "out.json"
@@ -2133,10 +2159,26 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn(ur.GATED_TEXT.format(count=1, pods="seeded-debug/queued"), block)
 
     def test_recheck_for_risk_guards_reads_nodes(self):
+        # An entry-14 risk guard's pool exposure comes from the node list: the guard's recorded reads
+        # carry `nodes`, a scoped re-check (refreshing nothing) reads them, and the guard is refreshed.
+        self.assertIn("nodes", ur.SHAPE_READS_BY_ENTRY[ur.ENTRY_CGROUP_V2])
         self.collect()
-        second, fleet = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
-        self.assertTrue(second["rechecks"])
+        jvm = "seeded-shapes/Deployment/cgroup-blind-jvm"
+        [guard] = [g for g in ur.load_json(self.home / ur.GUARDS_FILENAME, {})["guards"] if g["id"] == ur.guard_id(SEEDED, 14, jvm, ur.GUARD_KIND_RISK)]
+        self.assertIn("nodes", guard["reads"])
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, {"version": ur.GUARDS_VERSION, "updated_at": "2026-10-08T18:00:00Z", "guards": [guard]})
+        second, fleet = self.collect(now=later, since="30")
+        self.assertEqual(second["reviews"], [])
+        [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
+        self.assertEqual((recheck["refreshed"], recheck["cleared"]), ([guard["id"]], []))
         self.assertIn("nodes", {c[2] for c in fleet.calls if c[0] == "kubectl"})
+        # A guard whose recorded reads omit nodes is re-checked without them: the regression this
+        # test exists for is the recorded reads, which come from SHAPE_READS_BY_ENTRY.
+        without = {**guard, "reads": [r for r in guard["reads"] if r != "nodes"]}
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, {"version": ur.GUARDS_VERSION, "updated_at": "2026-10-08T18:00:00Z", "guards": [without]})
+        third, fleet = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), since="30")
+        self.assertNotIn("nodes", {c[2] for c in fleet.calls if c[0] == "kubectl"})
 
     def test_not_ready_node_after_a_pool_operation_is_an_error(self):
         nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
@@ -3129,8 +3171,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn("named by --cluster but not listed", missing["failed_reads"][0])
 
     def test_discovery_runs_without_project_flag(self):
-        with mock.patch.dict(os.environ, NO_PROJECT_ENV):
-            result, fleet = self.collect(project=None)
+        result, fleet = self.collect(project=None)
         self.assertEqual(result["projects"], [PROJECT])
         self.assertTrue(any("projects list" in " ".join(c) for c in fleet.calls))
         # No environment variable takes part, as collect.py's discover_fleet.
@@ -3143,7 +3184,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
 class ReportTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, **NO_PROJECT_ENV})
+        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name})
         self.env.start()
 
     def tearDown(self):
@@ -3240,6 +3281,15 @@ class ReportTest(unittest.TestCase):
         report = ur.render_report(result)
         self.assertIn(f"### operation DONE — {SEEDED} — `operation/UPGRADE_NODES idle-batch-pool`", report)
         self.assertIn(f"{ur.PART_WHAT_FAILED} UPGRADE_NODES on idle-batch-pool ended DONE: Instance", report)
+        self.assertIn(f"{ur.PART_MITIGATE} {ur.OPERATION_MITIGATE_TEXT}", report)
+        # The manifest candidate's impact is the report's sentence; entry 2's repair joins it only
+        # when GKE's error is capacity-shaped (the fixture's stockout is), never for a webhook refusal.
+        candidate = ur._incident_candidate(op_incident, None)
+        self.assertTrue(candidate["impact"].startswith(ur.OPERATION_MITIGATE_TEXT))
+        self.assertIn(ur.MITIGATIONS[2]["mitigate_after"], candidate["impact"])
+        refused = copy.deepcopy(op_incident)
+        refused["operation"] = {**op_incident["operation"], "error": 'admission webhook "gate.example.io" denied the request'}
+        self.assertEqual(ur._incident_candidate(refused, None)["impact"], ur.OPERATION_MITIGATE_TEXT)
 
     def test_main_writes_report_and_latest_link(self):
         home = Path(self.tmp.name)
@@ -3306,7 +3356,7 @@ class ChecksRunTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
-        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, **NO_PROJECT_ENV})
+        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name})
         self.env.start()
 
     def tearDown(self):
@@ -3398,10 +3448,19 @@ class ChecksRunTest(unittest.TestCase):
             checks = [c["check"] for c in row["commands"]]
             self.assertNotIn(ur.CHECK_OPERATION_FAILED, checks)
             self.assertTrue(all(" kubectl get " in c["command"] for c in row["commands"]))
-        # And a scoped run of a cluster with no guard to re-read carries no command at all.
+        # An unchanged row names the listing that failed: the operation check is unevaluated and the
+        # failed listing is a limitation, as on a review.
+        for row in second["unchanged"]:
+            self.assertIn({"check": ur.CHECK_OPERATION_FAILED, "reason": "operations read failed"}, row["checks_unevaluated"])
+            self.assertTrue(row["limitations"].startswith("reads that failed: gcloud container operations"), row["limitations"])
+        # And a scoped run of a cluster with no guard to re-read carries no command at all, and still
+        # says why the operation check did not run.
         ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, ur.empty_guards())
         third, _ = self.collect(FakeFleet(clusters=[cluster_doc("gemma-gpu-upgraded")], ops_fail={PROJECT}), full=False)
         self.assertEqual([(u["cluster"], u["commands"]) for u in third["unchanged"]], [(GEMMA, [])])
+        [row] = third["unchanged"]
+        self.assertEqual(row["checks_unevaluated"], [{"check": ur.CHECK_OPERATION_FAILED, "reason": "operations read failed"}])
+        self.assertIn("gcloud container operations", row["limitations"])
 
     def test_a_review_with_no_answered_read_carries_no_command(self):
         every_read = {("seeded-a", key) for key in READS["seeded-a"]}
@@ -3422,7 +3481,7 @@ class ManifestTest(unittest.TestCase):
         self.home = Path(self.tmp.name)
         scratch = self.home / "scratch"
         scratch.mkdir()
-        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, "FLEET_AUDIT_SCRATCH_DIR": str(scratch), **NO_PROJECT_ENV})
+        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, "FLEET_AUDIT_SCRATCH_DIR": str(scratch)})
         self.env.start()
         import audit_report
 
@@ -3648,6 +3707,40 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([(g["check"], g["reviews"], g["first_seen"]) for g in sunday["guards"] if g["id"] == guard], [(ur.CHECK_BROKE_WORKLOAD, 2, "2026-10-13T17:30:00Z")])
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
+    def test_a_regraded_incident_moves_the_finding_identity_once(self):
+        # inference-server is an Error on the first run (`upgrade-broke-workload`). The cluster upgrades
+        # again with the symptom standing: the review grades it as predating the upgrade and files it
+        # under `symptom-predates-upgrade`. One finding per object: the new candidate carries the new
+        # check, no held candidate rides beside it under the old one, the guard follows, and the next
+        # unchanged run holds it under the new check alone.
+        first, _ = self.collect()
+        guard = ur.guard_id(SEEDED, 2, INFERENCE)
+        self.assertEqual([g["check"] for g in first["guards"] if g["id"] == guard], [ur.CHECK_BROKE_WORKLOAD])
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_MASTER" and "/clusters/seeded-a" in o["targetLink"]))
+        master.update(name="operation-second-master", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:10:00Z")
+        fleet = FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master])
+        second, _ = self.collect(fleet, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in second["reviews"] if r["cluster"] == SEEDED)
+        self.assertTrue(next(i for i in second["sections"]["warnings"] if i["object"] == INFERENCE)["predates_upgrade"])
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
+        inference = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
+        self.assertEqual([(c["check"], c["severity"], "persistence" in c) for c in inference], [(ur.CHECK_SYMPTOM_PREDATES, ur.MANIFEST_SEVERITY_MINOR, False)])
+        self.assertEqual([h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"], [])
+        self.assertEqual([(g["check"], g["reviews"]) for g in second["guards"] if g["id"] == guard], [(ur.CHECK_SYMPTOM_PREDATES, 2)])
+        ids = [self.audit_report.derive_finding_id(f) for f in self.document_from(manifest)["findings"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        # Unchanged a week on: the held candidate rides under the new check only.
+        third, _ = self.collect(fleet, now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        manifest = json.loads(Path(third["manifest_path"]).read_text())
+        seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
+        held = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
+        self.assertEqual([(c["check"], c["persistence"]) for c in held], [(ur.CHECK_SYMPTOM_PREDATES, ["persists since 2026-10-08T18:00:00Z, 3 review(s)"])])
+        self.assertEqual([h["check"] for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"], [ur.CHECK_SYMPTOM_PREDATES])
+
     def test_persisting_guard_keeps_its_check_id_and_a_cleared_guard_emits_nothing(self):
         # payments-api's entry-14 guard (pod-sourced, a Warning) persists through two re-checks under
         # `upgrade-symptom-tentative` with its review count; once the pods are healthy the re-check
@@ -3735,7 +3828,7 @@ class SweepEntryTest(unittest.TestCase):
         self.assertEqual(ur.MAX_WORKERS, 4)
         self.assertIs(ur.collect, ur.collect_fleet)
         self.assertEqual(inspect.signature(ur.collect_fleet).parameters["max_workers"].default, ur.MAX_WORKERS)
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: tmp, ur.STORE_HOME_ENV: tmp, **NO_PROJECT_ENV}):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: tmp, ur.STORE_HOME_ENV: tmp}):
             with redirect_stderr(io.StringIO()):
                 result = ur.collect_fleet(args(), run=FakeFleet(), now=NOW, max_workers=1)
         self.assertEqual([r["cluster"] for r in result["reviews"]], [GEMMA, SEEDED])

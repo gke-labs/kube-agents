@@ -711,6 +711,10 @@ OOM_REASON = "OOMKilled"
 # How a scheduling message counts the nodes that failed each predicate; entry
 # 12 is `high` only when every node failed the selector.
 SCHEDULING_TOTAL_RE = re.compile(r"0/(\d+) nodes are available")
+# The scheduler's clause set ends where its preemption sentence begins, not at
+# the first period: taint keys (`{cloud.google.com/gke-spot: true}`) and
+# `Insufficient nvidia.com/gpu` carry dots of their own.
+SCHEDULING_TAIL_RE = re.compile(r"\. (?:no new claims to deallocate, )?preemption:")
 SELECTOR_MISS_COUNT_RE = re.compile(r"(\d+) node\(s\) didn't match (?!PersistentVolume)[^,.]*node (?:selector|affinity)")
 WEBHOOK_NAME_RE = re.compile(r'failed calling webhook "([^"]+)"')
 IMAGE_HOST_RE = re.compile(r"^([^/]+\.[^/]+|localhost(?::\d+)?)/")
@@ -885,6 +889,10 @@ NO_SHAPE_TEXT = "no catalogue shape found; checked: "
 UNCLASSIFIED_MITIGATION_TEXT = "no catalogue entry matched this symptom; it is reported for a reader to classify, and the entries' rows above do not apply."
 NO_GUARD_TEXT = "no guard written."
 OPERATION_GUARD_TEXT = "no guard: an operation carries none; its cluster's risks are in the Info block."
+# A failed operation's mitigation: GKE's own error text names the cause; the
+# capacity entry's repair is quoted only when the error is capacity-shaped.
+OPERATION_MITIGATE_TEXT = "GKE's error text names the cause; the catalogue's entry 2 (capacity) and 5 (window) are the usual ones for an operation that did not complete."
+CAPACITY_ERROR_MARKERS = ("resources available", "insufficient", "quota", "stockout", "resource_pool_exhausted")
 INFO_UNCHANGED = "Unchanged clusters:"
 INFO_REMOVED = "Removed clusters:"
 INFO_RECHECKED = "Re-checked for live guards and refreshed symptom sets:"
@@ -2210,10 +2218,10 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
     row holds."""
     scopes = _scopes_of(symptom)
     for confidence, scope, pattern in SIGNATURE_ROWS.get(entry) or []:
-        hits = [hit for hit in scopes.get(scope) or [] if pattern.search(hit[0])]
+        hits = [(index, hit) for index, hit in enumerate(scopes.get(scope) or []) if pattern.search(hit[0])]
         if not hits:
             continue
-        text, api_set, container = next((hit for hit in hits if hit[1]), hits[0])
+        index, (text, api_set, container) = next(((i, hit) for i, hit in hits if hit[1]), hits[0])
         m = pattern.search(text)
         detail = ""
         if entry == ENTRY_NODE_LABEL:
@@ -2223,7 +2231,7 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
             # every node group a pinned pod does not target, beside the clause
             # that says why its own pool refused it: a mixed set is medium,
             # and only misses alone that name a dropped label are high.
-            clauses = text.split(".", 1)[0]
+            clauses = SCHEDULING_TAIL_RE.split(text, 1)[0].rstrip(".")
             total, missed = SCHEDULING_TOTAL_RE.search(clauses), SELECTOR_MISS_COUNT_RE.search(clauses)
             detail = _selector_detail(symptom)
             dropped = _dropped_label(symptom, ctx)
@@ -2262,8 +2270,10 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
             else:
                 confidence = MEDIUM
                 detail = (detail + "; " if detail else "") + "no pod with this image running on an untouched pool"
-        # A reason-only hit is evidenced by the reason with its message.
-        evidence = scopes[SCOPE_ANY][0][0] if scope == SCOPE_REASON else (text if scope == SCOPE_ANY else m.group(0))
+        # A reason-only hit is evidenced by that container's reason with its
+        # message: the reason and any scopes list the row's own entry first
+        # and then each container in order, so the index names the container.
+        evidence = scopes[SCOPE_ANY][index][0] if scope == SCOPE_REASON else (text if scope == SCOPE_ANY else m.group(0))
         if not api_set:
             # Text a namespace user can write: quoted as the object's own, and
             # never high on its own.
@@ -2935,7 +2945,7 @@ def _guard(key: str, kind: str, entry: int | None, title: str, obj: str, confide
 
 
 def _guard_check(guard: dict) -> str:
-    """The check a guard's finding was filed under; for a guard written
+    """The check a guard's finding was last filed under; for a guard written
     before checks were recorded, the nearest reading of its grade."""
     if guard.get("check"):
         return str(guard["check"])
@@ -3026,8 +3036,10 @@ def merge_guards(existing: dict, fresh: list[dict], reviewed: set[str], seen_at:
             if guard.get("source"):
                 old["source"] = guard["source"]
             if guard.get("check"):
-                # The check the finding was first filed with is its identity.
-                old.setdefault("check", guard["check"])
+                # The guard follows the check its finding was filed under this
+                # run: one finding per object, so a re-grade moves the identity
+                # and the old id is resolved by the absence of a candidate.
+                old["check"] = guard["check"]
         else:
             merged.append(guard)
     merged.sort(key=lambda g: (g["cluster"], g.get("entry") is None, g.get("entry") or 0, g["object"]))
@@ -3969,7 +3981,7 @@ def _incident_lines(incident: dict) -> list[str]:
     if incident["kind"] == INCIDENT_OPERATION:
         op = incident["operation"]
         lines.append(f"{PART_WHAT_FAILED} {_cell(op['type'])} on {_cell(op['target'])} ended {_cell(op['status'])}: {_cell(op['error'] or 'no error text')}")
-        lines.append(f"{PART_MITIGATE} GKE's error text names the cause; the catalogue's entry 2 (capacity) and 5 (window) are the usual ones for an operation that did not complete.")
+        lines.append(f"{PART_MITIGATE} {OPERATION_MITIGATE_TEXT}")
         lines.append(f"{PART_MITIGATION_SET_UP} {OPERATION_GUARD_TEXT}")
         return lines + [""]
     lines += [PART_WHAT_FAILED, "", "| Symptom | Since | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- | --- |"]
@@ -4095,7 +4107,8 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
         op = incident["operation"]
         namespace, obj = "", f"{OPERATION_OBJECT_KIND}/{op.get('name') or op['type']}"
         excerpt = f"{op['type']} on {op['target']} ended {op['status']}: {op['error'] or 'no error text'}"
-        impact = MITIGATIONS[ENTRY_CAPACITY]["mitigate_after"]
+        capacity_shaped = any(marker in (op.get("error") or "").lower() for marker in CAPACITY_ERROR_MARKERS)
+        impact = OPERATION_MITIGATE_TEXT + (f" {MITIGATIONS[ENTRY_CAPACITY]['mitigate_after']}" if capacity_shaped else "")
     elif incident["kind"] == INCIDENT_STALE_GUARD:
         # Every guard on the object in one candidate: one finding per object.
         namespace, obj = _split_object(incident["object"])
@@ -4128,14 +4141,24 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
     return candidate
 
 
-def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, str, str]], commands: dict[str, str], seen_at: str, unevaluated: set[str] | frozenset[str] = frozenset()) -> tuple[list[dict], list[dict]]:
+def candidate_objects(candidates: list[dict]) -> set[tuple[str, str]]:
+    """The one rule for a finding's identity across runs: one finding per
+    object per run, keyed (check, cluster, namespace, object). An object with
+    a fresh incident this run gets no held candidate beside it; when the
+    incident's check changes, the new candidate carries the new check and
+    the old finding is resolved by the absence of a candidate under it."""
+    return {(c["namespace"], c["object"]) for c in candidates}
+
+
+def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, str]], commands: dict[str, str], seen_at: str, unevaluated: set[str] | frozenset[str] = frozenset()) -> tuple[list[dict], list[dict]]:
     """One candidate per (check, object) for the failure guards this run
     observed again on a cluster (`last_seen` is this run: re-observed by the
-    re-check or kept by a keep rule) and no incident filed, under the check
-    its finding was filed under, with its persistence; and the still-flagged
-    identities beside them. A guard a failed read held emits nothing: a
-    candidate with no read behind it would vouch for an observation nobody
-    made; its check is unevaluated and the run partial instead."""
+    re-check or kept by a keep rule) whose object has no incident this run
+    (`covered`, per `candidate_objects`), under the check its finding was
+    filed under, with its persistence; and the still-flagged identities
+    beside them. A guard a failed read held emits nothing: a candidate with
+    no read behind it would vouch for an observation nobody made; its check
+    is unevaluated and the run partial instead."""
     groups: dict[tuple[str, str], list[dict]] = {}
     for guard in guards:
         if guard.get("last_seen") != seen_at:
@@ -4147,7 +4170,7 @@ def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, s
             # a check the manifest calls unevaluated.
             continue
         namespace, obj = _split_object(guard["object"])
-        if (check, namespace, obj) in covered:
+        if (namespace, obj) in covered:
             continue
         groups.setdefault((check, guard["object"]), []).append(guard)
     candidates, flagged = [], []
@@ -4206,7 +4229,7 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         # it; none under a check whose read failed this run.
         by_check = {c["check"]: c["command"] for c in commands}
         fresh = [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents_by_cluster.get(key, []) if i["kind"] != INCIDENT_STALE_GUARD]
-        covered = {(c["check"], c["namespace"], c["object"]) for c in fresh}
+        covered = candidate_objects(fresh)
         held, flagged = _held_candidates(key, guards_by_cluster.get(key, []), covered, by_check, result["generated_at"], {u["check"] for u in unevaluated or []})
         still_flagged.extend(flagged)
         return fresh + held
@@ -4666,16 +4689,24 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # An unchanged cluster's checks ran as the operations listing that found no
     # upgrade; a re-check that read pods or nodes backs those checks with that read.
     recheck_by_cluster = {r["cluster"]: r for r in rechecks}
+    listing_errors = {line.split(": ", 1)[0]: line.split(": ", 1)[1] for line in failed_reads if ": " in line and line.split(": ", 1)[0] in operations_unread}
     for row in unchanged:
+        project = row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]
         recheck = recheck_by_cluster.get(row["cluster"]) or {}
         failed = set(recheck.get("failed_reads") or [])
-        # A check whose read ran and failed in the re-check is unevaluated,
-        # not backed by the listing: the harness then holds the cluster's
-        # findings as a partial run rather than resolving or re-filing them.
-        row["commands"] = checks_run(recheck.get("commands") or {}, fallback=operations_commands.get(row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]), failed=failed)
+        if project in operations_unread:
+            failed.add(OPERATIONS_READ)
+        # A check whose read ran and failed -- a re-check read, or the
+        # project's operations listing -- is unevaluated, not backed by the
+        # listing: the harness then holds the cluster's findings as a partial
+        # run rather than resolving or re-filing them, as on a review.
+        row["commands"] = checks_run(recheck.get("commands") or {}, fallback=operations_commands.get(project), failed=failed)
         row["checks_unevaluated"] = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed]
-        if recheck.get("errors"):
-            row["limitations"] = "reads that failed: " + "; ".join(recheck["errors"])
+        errors = list(recheck.get("errors") or [])
+        if project in operations_unread:
+            errors.append(listing_errors.get(project) or f"{OPERATIONS_READ} list failed")
+        if errors:
+            row["limitations"] = "reads that failed: " + "; ".join(errors)
     new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading}, refreshed_baselines, advance=not scoped, attempted={s.key for s in selected}, route=route, since=since, outside=outside)
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
 
