@@ -25174,9 +25174,11 @@ class TestNoForge(BaseTestCase):
     def test_an_unchanged_run_the_store_did_not_take_is_not_silent(self):
         self.finish(make_doc())
         self.assertTrue(self.finish(make_doc())["silent_ok"])
-        runs = self.store() / "runs"
-        runs.chmod(0o500)
-        self.addCleanup(runs.chmod, 0o755)
+        # Raised rather than a read-only mode bit, which binds no root runner.
+        def unwritable(path, text):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        self.patch_attr("_atomic_write", unwritable)
 
         out = self.finish(make_doc())
 
@@ -25189,9 +25191,20 @@ class TestNoForge(BaseTestCase):
         out = self.finish(make_doc(findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="")]))
         self.assertIn("(prod-us-east/ClusterRoleBinding/debug-binding)", out["summary"])
 
+    def test_a_lost_latest_falls_back_to_the_ring(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        (self.store() / "latest.json").unlink()
+
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertTrue(out["silent_ok"])
+
     def test_an_unreadable_record_makes_the_delta_unknown(self):
         self.finish(make_doc())
         (self.store() / "latest.json").write_text("{", encoding="utf-8")
+        for entry in (self.store() / "runs").glob("*.json"):
+            entry.write_text("{", encoding="utf-8")
 
         out = self.finish(make_doc())
 

@@ -55,8 +55,9 @@ NO_FORGE`, `issue_number: null` and an empty `ledger_body`. No GitHub owner cont
 first segment without a dot is never another forge's host, so the key cannot name a real
 repository's store. With no public body to check it against, the next no-forge run trusts that
 `latest.json` on its own (its `status`, `repo` and `id_scheme`) and takes the delta from its
-`current_ids`. A missing directory is a first run, and a directory without a readable `latest.json`
-is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
+`current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
+that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
+envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
 counted as resolved, as the ledger holds it.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries

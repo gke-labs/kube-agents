@@ -15917,35 +15917,42 @@ def handle_remediate(args: argparse.Namespace) -> None:
 def previous_no_forge_ids(audit_id: str) -> list[str] | None:
     """The finding ids the previous run with no forge stored; None when unknowable.
 
-    `[]` when the store has never held this stream's no-forge reports: the run
-    is first, and everything it finds is new. There is no public ledger to hold
-    the record against, so `latest.json` is trusted on its own when a run with
-    no forge wrote it for this key under this id scheme. A directory without a
-    readable `latest.json` is a write that failed (`write_report` drops the
-    file then), so the delta is unknown rather than empty.
+    `[]` when the store holds no envelope for this key at all: the run is
+    first, and everything it finds is new. There is no public ledger to hold
+    the record against, so an envelope is trusted on its own when a run with
+    no forge wrote it for this key under this id scheme. `latest.json` first;
+    when it is missing or untrusted, the newest such envelope in `runs/`, as
+    `previous_run_document` reads it: a failed write drops `latest.json` and
+    leaves the ring, and on this install nothing else remembers the run. A
+    store with envelopes and none trusted is unknowable rather than empty.
     """
     directory = reports_dir_for(audit_id, NO_FORGE_REPO)
-    if not directory.exists():
-        return []
+    candidates = [directory / REPORT_LATEST_NAME]
     try:
-        envelope = json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        log(f"WARNING: no readable report store record for {audit_id} ({exc}); {MEMORY_UNKNOWABLE}")
-        return None
-    ids = envelope.get("current_ids") if isinstance(envelope, dict) else None
-    if (
-        not isinstance(ids, list)
-        or envelope.get("status") != NO_FORGE_STATUS
-        or _ledger_key(envelope.get("repo")) != _ledger_key(NO_FORGE_REPO)
-        or envelope.get("id_scheme") != ID_SCHEME
-    ):
-        log(
-            f"WARNING: the report store record for {audit_id} was not written by a "
-            f"run with no forge under id scheme {ID_SCHEME}; {MEMORY_UNKNOWABLE}"
-        )
-        return None
-    return [str(fid) for fid in ids]
-
+        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+    except OSError:
+        pass
+    present = [path for path in candidates if path.exists()]
+    if not present:
+        return []
+    for path in present:
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        ids = envelope.get("current_ids") if isinstance(envelope, dict) else None
+        if (
+            isinstance(ids, list)
+            and envelope.get("status") == NO_FORGE_STATUS
+            and _ledger_key(envelope.get("repo")) == _ledger_key(NO_FORGE_REPO)
+            and envelope.get("id_scheme") == ID_SCHEME
+        ):
+            return [str(fid) for fid in ids]
+    log(
+        f"WARNING: no report store record for {audit_id} was written by a run with no "
+        f"forge under id scheme {ID_SCHEME} and can be read; {MEMORY_UNKNOWABLE}"
+    )
+    return None
 
 def render_no_forge_summary(
     audit_id: str,
