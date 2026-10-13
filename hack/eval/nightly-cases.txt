@@ -816,3 +816,6 @@
 # create (#2937). On the pool it grades the stop: the pool repositories hold no
 # provisioning/ path. Read-only; may open one pull request.
 ./tasks/provisioning-cluster-request-never-creates/task.yaml
+# gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
+# created another way (#2937). The pool's clusters carry no Config Connector.
+./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml

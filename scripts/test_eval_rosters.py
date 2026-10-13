@@ -174,6 +174,7 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
+    "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
