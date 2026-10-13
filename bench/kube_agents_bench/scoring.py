@@ -422,8 +422,9 @@ class RunRecord:
     scoring_version: str | None
     agent_model: str | None
     #: The agent's final report as devops-bench recorded it (``output``, the
-    #: "Actual Output" the judge grades). Read for reporting only: the gate
-    #: quotes its first lines into the build log; no rung reads it.
+    #: "Actual Output" the judge grades). The gate quotes its first lines
+    #: into the build log, and rung 3 reads it only for a case that declares
+    #: ``tool_calls_optional``, where a reply stands in for the trajectory.
     output: str = ""
 
     @property
