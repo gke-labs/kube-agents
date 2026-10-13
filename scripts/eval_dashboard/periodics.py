@@ -938,7 +938,7 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
 
 
 def _fleet_tree(artifact) -> str | None:
-    """The fleet tree a run applied (the report's `fleet_tree`, a hash of the stack's inputs); None when it carries none."""
+    """The fleet tree a run applied (the report's `fleet_tree`: the hash of the stack's inputs, or the git tree id reports carried before it); None when it carries none."""
     tree = artifact.get(REPORT_KEY_FLEET_TREE) if isinstance(artifact, dict) else None
     return tree if isinstance(tree, str) and tree else None
 
