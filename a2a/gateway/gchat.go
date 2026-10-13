@@ -506,6 +506,16 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 	return a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
 }
 
+// PostMessage and EditMessage post text only: a chat message falls back to
+// its text (ErrTextOnly) until this adapter renders cards.
+func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
 // Roster returns one page of the space's membership (Adapter.Roster):
 // emails where the backend surfaced one — they resolve straight to
 // principals — the immutable users/ id where it did not, never the app

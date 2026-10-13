@@ -7,9 +7,11 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // InboundMessage is one chat message, normalized across backends. AuthorID is
@@ -84,13 +86,30 @@ type Adapter interface {
 	Run(ctx context.Context, handler func(InboundMessage)) error
 
 	// Post writes text to a conversation and returns the backend message id,
-	// used by the rolling progress line's Edit.
+	// used by the rolling progress line's Edit. It is PostMessage for a
+	// message that is text alone.
 	Post(conversation, text string) (messageID string, err error)
 
 	// Edit replaces the text of a previously posted message — the rolling
 	// progress line edits one message as progress artifacts arrive, at zero
 	// model cost.
 	Edit(conversation, messageID, text string) error
+
+	// PostMessage writes one message value. With m.Chat set, a backend that
+	// renders chat messages posts it laid out, as one message, with m.Text
+	// as its fallback; a backend that renders none returns ErrTextOnly, and
+	// a backend that cannot hold this one, or whose API refuses it, returns
+	// the reason. Either way nothing was posted, and the gateway posts
+	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
+	// With m.Chat nil it is Post(conversation, m.Text).
+	PostMessage(conversation string, m OutMessage) (messageID string, err error)
+
+	// EditMessage replaces a posted message with m, laid out or not, under
+	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
+	// message, which the gateway answers with Edit. With m.Chat nil a
+	// backend that laid the message out before replaces the layout with the
+	// text; any other backend makes it Edit.
+	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
 	// as AuthorID (so a member who is also the requester matches), and
@@ -103,6 +122,54 @@ type Adapter interface {
 	// that decides to use it comes later. Until then everything posts to the
 	// room it came from.
 	OpenDirect(userID string) (conversation string, err error)
+}
+
+// OutMessage is one post or edit as a value: the text, and the chat message
+// that lays the same content out (spec-a2a-payloads.md, "Chat messages").
+type OutMessage struct {
+	// Text is the message as text, and the whole of it: what a backend that
+	// renders no chat message posts, and the fallback (the notification,
+	// what a read-back sees) on one that does.
+	Text string
+	// Chat, when set, is a kube-agents.chat/v1 message the gateway has
+	// already read and validated for its carrier (chatmsg.Read); an adapter
+	// renders it or declines it, and never repairs one.
+	Chat *chatmsg.Message
+}
+
+// ErrTextOnly is a backend's answer to a message value with a chat message
+// when it renders none: Discord, Google Chat, the inject door, the console
+// and the A2A door. The gateway posts the text instead, so every one of them
+// posts exactly what it posted before chat messages existed.
+var ErrTextOnly = errors.New("this backend posts text only")
+
+// postTextOnly is PostMessage for a backend that renders no chat message.
+func postTextOnly(post func(conversation, text string) (string, error), conversation string, m OutMessage) (string, error) {
+	if m.Chat != nil {
+		return "", ErrTextOnly
+	}
+	return post(conversation, m.Text)
+}
+
+// editTextOnly is EditMessage for a backend that renders no chat message.
+func editTextOnly(edit func(conversation, messageID, text string) error, conversation, messageID string, m OutMessage) error {
+	if m.Chat != nil {
+		return ErrTextOnly
+	}
+	return edit(conversation, messageID, m.Text)
+}
+
+// ChatMarker is the optional extension an Adapter implements to receive the
+// mark a task's terminal status-update carried (spec-a2a-payloads.md,
+// "mark"): the reaction state for the message that started the work. The
+// relay reads and validates the terminal's mark-only chat message and hands
+// the mark over; the marks a posted chat message carries ride inside
+// OutMessage.Chat. Nothing implements it yet: the reactions, and the rule
+// that applies a mark only from the chain's newest task, come with the
+// Slack interactivity. Called on the relay queue under the session lock:
+// record and return.
+type ChatMarker interface {
+	ChatMark(conversation, taskID string, mark chatmsg.Mark)
 }
 
 // TaskObserver is the optional extension an Adapter implements when it has to

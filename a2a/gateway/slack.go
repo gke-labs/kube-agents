@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
@@ -709,6 +710,67 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 	}
 	_, _, _, err := s.api.UpdateMessage(channel, messageID, slack.MsgOptionText(toMrkdwn(text), false))
 	return err
+}
+
+// PostMessage posts a message value: a chat message laid out as Block Kit
+// (renderSlackChat) with the text, as mrkdwn, as its notification and
+// fallback, into the conversation's thread as Post does, link and media
+// previews off (its links are buttons). Without a chat message it is Post.
+// A chat message the renderer will not send, or that Slack refuses, is an
+// error and nothing is posted; the gateway posts the text instead.
+func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil {
+		return s.Post(conversation, m.Text)
+	}
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	return ts, err
+}
+
+// EditMessage replaces a posted message with a message value. Without a chat
+// message the text replaces the layout too: the blocks and the side bar are
+// sent empty, since chat.update keeps whatever it is not sent.
+func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	channel, _, ok := slackChannelThread(conversation)
+	if !ok {
+		return fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return err
+	}
+	_, _, _, err = s.api.UpdateMessage(channel, messageID, opts...)
+	return err
+}
+
+// slackMessageOptions is a message value as chat.postMessage and
+// chat.update options: the text as mrkdwn, and the chat message's layout, or
+// no blocks and no side bar when there is none.
+func slackMessageOptions(m OutMessage) ([]slack.MsgOption, error) {
+	text := toMrkdwn(m.Text)
+	if m.Chat == nil {
+		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(),
+			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
+	}
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return nil, errSlackChatTooLarge
+	}
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return nil, err
+	}
+	return slackChatOptions(layout, text)
 }
 
 // Roster is the channel's membership. Slack has no per-thread membership,

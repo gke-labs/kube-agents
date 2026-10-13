@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -10,10 +11,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // The chat.notify route: proactive posts (alerts, cron findings, audit
@@ -76,6 +79,16 @@ const (
 	// request may not post into, whatever the reason: no session record, a
 	// context id that does not match, or a record that cannot be read.
 	notifyConversationRefused = "not a live conversation with that context"
+	// notifyUpdateKeysMax is the spec's cap on a conversation's live update
+	// keys (spec-a2a-payloads.md, "Card work after the task ends"): past
+	// it the oldest key is forgotten, and a later request with it posts
+	// anew. notifyUpdateConversationsMax bounds the conversations the keys
+	// are kept for, oldest forgotten first, so the store is bounded however
+	// many conversations the agent works in.
+	notifyUpdateKeysMax          = 16
+	notifyUpdateConversationsMax = 1024
+	// notifyUpdateKeyMax bounds an update key, which the sender picks.
+	notifyUpdateKeyMax = 128
 )
 
 // notifyMentionPattern and notifyMentionElements are what blocksMention
@@ -91,11 +104,13 @@ var (
 
 // NotifyConversations is the gateway's side of a request aimed at a
 // conversation rather than the home channel: the context id of the
-// conversation's session record ("" when it has none), and a post into it
-// with the gateway's own adapter.
+// conversation's session record ("" when it has none), and a post into it,
+// or an edit of a post the route made there, with the gateway's own adapter.
 type NotifyConversations interface {
 	ConversationContext(ctx context.Context, key string) (string, error)
 	Post(conversation, text string) (messageID string, err error)
+	PostMessage(conversation string, m OutMessage) (messageID string, err error)
+	EditMessage(conversation, messageID string, m OutMessage) error
 }
 
 // notifyPoster is the backend half: post text into a space, new thread or
@@ -140,6 +155,14 @@ type Notifier struct {
 	// closed channel, which would panic.
 	mu       sync.Mutex
 	stopping bool
+
+	// updates is where a conversation request's update key last posted
+	// (notifyUpdates). Only the worker reads or writes it.
+	updates notifyUpdates
+	// metrics counts the chat messages conversation requests carry; nil
+	// counts nothing (a Notifier armed without the gateway's
+	// conversations).
+	metrics *Metrics
 }
 
 // NewGchatNotifier builds the Google Chat notifier. home is the configured
@@ -183,6 +206,9 @@ func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 // Call it before Start.
 func (n *Notifier) SetConversations(c NotifyConversations) {
 	n.conv = c
+	if gc, ok := c.(gatewayConversations); ok {
+		n.metrics = gc.g.metrics
+	}
 }
 
 // ServesConversations reports whether conversation requests are armed.
@@ -440,6 +466,9 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 		// its layout in the request's chat field, which the gateway renders.
 		return refuse("a conversation request carries no blocks")
 	}
+	if utf8.RuneCountInString(req.Update) > notifyUpdateKeyMax {
+		return refuse(fmt.Sprintf("the update key is longer than %d characters", notifyUpdateKeyMax))
+	}
 	if !strings.HasPrefix(req.Conversation, n.convPrefix) || len(req.Conversation) == len(n.convPrefix) {
 		return refuse(fmt.Sprintf("conversation %q is not on this route's backend", req.Conversation))
 	}
@@ -468,6 +497,9 @@ func (n *Notifier) post(job notifyJob) {
 	// first: the order is a second guard, not the only one.
 	if len(job.req.Blocks) > 0 && job.req.Conversation == "" {
 		n.postBlocks(job)
+		return
+	}
+	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "") && n.postConversation(job) {
 		return
 	}
 	thread := job.req.Thread
@@ -501,6 +533,153 @@ func (n *Notifier) post(job notifyJob) {
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
+}
+
+// postConversation answers a conversation request that carries a chat
+// message or an update key (spec-a2a-payloads.md, "Card work after the task
+// ends"), and reports whether it did. The chat message is read and
+// validated as on the bus; one that breaks a rule is dropped whole, logged
+// and counted, and its text stands. A keyed request edits the message its
+// key last posted in this conversation, laid out or as text, and posts one
+// message when the key has none here (another conversation's, one
+// forgotten, one lost to a restart) or the edit fails, so the key is one
+// message per conversation: its text goes as one message, cut to one
+// chunk, since an edit reaches one message only. An unkeyed request whose
+// chat message the adapter lays out is one message; otherwise it is not
+// answered here, and post sends its text in chunks as it always has. The
+// mark a chat message carries is not applied on this route yet.
+func (n *Notifier) postConversation(job notifyJob) bool {
+	conversation := job.req.Conversation
+	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
+	if len(reading.Problems) > 0 {
+		n.metrics.chatMessage(chatInvalid)
+		for _, p := range reading.Problems {
+			n.log.Warn("notify: chat message dropped; its text fallback stands",
+				"conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
+		}
+	}
+	m := OutMessage{Text: job.req.Text, Chat: reading.Message}
+	key := job.req.Update
+	if key == "" {
+		if m.Chat == nil {
+			return false
+		}
+		message, err := n.conv.PostMessage(conversation, m)
+		if !n.chatOutcome(conversation, err) {
+			return false
+		}
+		n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
+		n.log.Info("notify posted", "conversation", conversation, "message", message, "chat", true)
+		return true
+	}
+	text := OutMessage{Text: truncateRunes(m.Text, discordChunk)}
+	if message, ok := n.updates.get(conversation, key); ok {
+		if n.editKeyed(conversation, message, m, text) {
+			n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
+			n.log.Info("notify edited", "conversation", conversation, "message", message, "update", key)
+			return true
+		}
+	}
+	var message string
+	var err error
+	if m.Chat != nil {
+		message, err = n.conv.PostMessage(conversation, m)
+		if !n.chatOutcome(conversation, err) {
+			message, err = n.conv.PostMessage(conversation, text)
+		}
+	} else {
+		message, err = n.conv.PostMessage(conversation, text)
+	}
+	if err != nil {
+		n.log.Error("notify post failed", "conversation", conversation, "update", key, "err", err)
+		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+		return true
+	}
+	n.updates.put(conversation, key, message)
+	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
+	n.log.Info("notify posted", "conversation", conversation, "message", message, "update", key)
+	return true
+}
+
+// editKeyed edits a keyed message to m, laid out when the adapter lays it
+// out and as text otherwise, and reports whether an edit landed.
+func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) bool {
+	if m.Chat != nil {
+		if n.chatOutcome(conversation, n.conv.EditMessage(conversation, message, m)) {
+			return true
+		}
+	}
+	if err := n.conv.EditMessage(conversation, message, text); err != nil {
+		n.log.Warn("notify: editing the keyed message failed; posting a new one", "conversation", conversation, "err", err)
+		return false
+	}
+	return true
+}
+
+// chatOutcome is Gateway.chatOutcome for the route: it counts what became
+// of a chat message the adapter was handed and reports whether it was laid
+// out.
+func (n *Notifier) chatOutcome(conversation string, err error) bool {
+	switch {
+	case err == nil:
+		n.metrics.chatMessage(chatRendered)
+		return true
+	case errors.Is(err, ErrTextOnly):
+		n.metrics.chatMessage(chatTextOnly)
+	default:
+		n.metrics.chatMessage(chatRefused)
+		n.log.Warn("notify: chat message not rendered; posting its text fallback", "conversation", conversation, "err", err)
+	}
+	return false
+}
+
+// notifyUpdates remembers, per conversation, the message each update key
+// last posted: at most notifyUpdateKeysMax keys a conversation and
+// notifyUpdateConversationsMax conversations, the oldest forgotten first.
+// Process memory, so a restart forgets every key and the next request with
+// one posts anew, as the spec allows. Only the notifier's one worker uses
+// it, so it takes no lock.
+type notifyUpdates struct {
+	byConversation map[string]*notifyKeys
+	order          []string
+}
+
+type notifyKeys struct {
+	messages map[string]string
+	order    []string
+}
+
+func (u *notifyUpdates) get(conversation, key string) (string, bool) {
+	keys := u.byConversation[conversation]
+	if keys == nil {
+		return "", false
+	}
+	message, ok := keys.messages[key]
+	return message, ok
+}
+
+func (u *notifyUpdates) put(conversation, key, message string) {
+	if u.byConversation == nil {
+		u.byConversation = map[string]*notifyKeys{}
+	}
+	keys := u.byConversation[conversation]
+	if keys == nil {
+		keys = &notifyKeys{messages: map[string]string{}}
+		u.byConversation[conversation] = keys
+		u.order = append(u.order, conversation)
+		if len(u.order) > notifyUpdateConversationsMax {
+			delete(u.byConversation, u.order[0])
+			u.order = u.order[1:]
+		}
+	}
+	if _, ok := keys.messages[key]; !ok {
+		keys.order = append(keys.order, key)
+		if len(keys.order) > notifyUpdateKeysMax {
+			delete(keys.messages, keys.order[0])
+			keys.order = keys.order[1:]
+		}
+	}
+	keys.messages[key] = message
 }
 
 // blocksMention reports a mention anywhere in decoded Block Kit, or "": a
@@ -635,6 +814,14 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 
 func (c gatewayConversations) Post(conversation, text string) (string, error) {
 	return c.poster.Post(conversation, text)
+}
+
+func (c gatewayConversations) PostMessage(conversation string, m OutMessage) (string, error) {
+	return c.poster.PostMessage(conversation, m)
+}
+
+func (c gatewayConversations) EditMessage(conversation, messageID string, m OutMessage) error {
+	return c.poster.EditMessage(conversation, messageID, m)
 }
 
 // Conversations is what Notifier.SetConversations takes: the gateway's

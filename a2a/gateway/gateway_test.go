@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
@@ -177,6 +178,15 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// rendersChat makes the fake a backend that lays chat messages out:
+	// PostMessage and EditMessage with one record it in chatPosts and
+	// chatEdits (the text too, in posts and edits); without it they answer
+	// ErrTextOnly, as every backend but Slack does. refuseChat makes a
+	// rendering fake refuse every chat message, as an API refusal would.
+	rendersChat bool
+	refuseChat  bool
+	chatPosts   []*chatmsg.Message
+	chatEdits   []*chatmsg.Message
 	// stopped is closed when Run returns, so a test can assert that a
 	// backend was actually told to stop rather than left running.
 	stopped  chan struct{}
@@ -225,6 +235,45 @@ func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 		return errors.New("fake edit failure")
 	}
 	a.edits = append(a.edits, fakePost{conversation, messageID, text})
+	return nil
+}
+
+func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil {
+		return a.Post(conversation, m.Text)
+	}
+	a.mu.Lock()
+	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	a.mu.Unlock()
+	if !rendersChat {
+		return "", ErrTextOnly
+	}
+	if refuseChat {
+		return "", errors.New("fake chat refusal")
+	}
+	id, err := a.Post(conversation, m.Text)
+	a.mu.Lock()
+	a.chatPosts = append(a.chatPosts, m.Chat)
+	a.mu.Unlock()
+	return id, err
+}
+
+func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	a.mu.Lock()
+	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	a.mu.Unlock()
+	if m.Chat != nil && !rendersChat {
+		return ErrTextOnly
+	}
+	if m.Chat != nil && refuseChat {
+		return errors.New("fake chat refusal")
+	}
+	if err := a.Edit(conversation, messageID, m.Text); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.chatEdits = append(a.chatEdits, m.Chat)
+	a.mu.Unlock()
 	return nil
 }
 
