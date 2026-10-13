@@ -163,7 +163,9 @@ when another run holds it, so the SOP probes before `start`; a run that
 still loses the lock, taken between the probe and the run, exits with the
 lock line and writes nothing, and the SOP releases the in-flight note at
 once with a limitations-only `finish` (its step: `--no-collector-manifest`,
-since the collector wrote none this run), not the note's two-hour TTL. A run
+since the collector wrote none this run), not the note's two-hour TTL; the
+lock line and the crash-record line end with the projects the run resolved
+for its route (`this run's projects: ...`), which that `finish` lists. A run
 writes its report, then the JSON, then the guards, then the ledger last, each
 atomically, so a crash leaves at most a report with no ledger advance. A
 ledger or guards file that exists but cannot be read, or carries another
@@ -473,6 +475,17 @@ SCOPE_UNRESOLVED_HOLD_TEXT = "{cluster}: its project {project} is outside the pr
 LISTING_FAILED_NOTE_FORMAT = "gcloud projects list rc={rc}: {error}; the run swept the active project alone, and how many other projects the fleet holds is unknown"
 LISTING_FILTERED_NOTE_FORMAT = "gcloud projects list rc=0 did not name the active project {project}, so it is filtered rather than complete: it returned {count} project(s), and how many other projects the fleet holds is unknown"
 LISTING_INCOMPLETE_HOLD_TEXT = "{cluster}: its project {project} is outside the projects this run listed, and the listing was incomplete; ledger entry and guards kept unchanged"
+# A listing with no active gcloud project to check it against cannot be called
+# complete, so it holds too; one that names no project at all is the failed
+# case, as `collect.discover_fleet` treats it.
+LISTING_UNCHECKED_NOTE_FORMAT = "gcloud projects list rc=0 with no active gcloud project to check it against: it returned {count} project(s), and whether the listing is complete is unknown"
+LISTING_EMPTY_NOTE_TEXT = "gcloud projects list rc=0 returned no project and no active gcloud project is set; nothing was swept, and how many projects the fleet holds is unknown"
+# An exit after `start` without a manifest (the lock held past the wait, a
+# crash record) ends with the projects the run resolved for its route, so the
+# SOP's recovery `finish` lists their clusters without resolving the scope again.
+EXIT_PROJECTS_FORMAT = "; this run's projects: {projects}{note}"
+EXIT_PROJECTS_NONE = "none"
+EXIT_NOTE_FORMAT = " ({note})"
 # A `--cluster` names its project under `--project`'s rule: inside the readable scope.
 FORCED_OUTSIDE_SCOPE_TEXT = "--cluster {cluster}: {error}"
 SCOPE_LOG_FORMAT = "scope: the install's declared scope, {count} project(s) from the fleet_scope tool"
@@ -637,6 +650,12 @@ KUBECONFIG_ENV = "KUBECONFIG"
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md), the
 # contract the fleet-audit `finish` cross-checks the SOP's document against.
 AUDIT_ID = "upgrade-retrospective"
+# Where the harness looks for this run's manifest (`audit_report.manifest_path_for`):
+# `finish`'s `--no-collector-manifest` waiver and `start`'s scrub read that path
+# and no other, so the SOP passes it as `--manifest-file`.
+SCRATCH_DIR_ENV = "FLEET_AUDIT_SCRATCH_DIR"
+DEFAULT_SCRATCH_DIR = "/opt/data/scratch"
+HARNESS_MANIFEST_FILENAME = f"manifest_{AUDIT_ID}.json"
 MANIFEST_VERSION = 1
 # A digest of this file, carried as `checks_revision` like the sibling
 # collectors'; the same width so two sources never collide in a log line.
@@ -793,6 +812,9 @@ OPERATION_GUARD_TARGET_KEY = "operation_target"
 RECHECK_EVENT_READS = ("events",)
 RECHECK_HELD_FORMAT = "{count} guard(s) held, a needed read failed"
 STALE_PARTIAL_TEXT = "cluster read partially this run ({failed}); the guard below could not be re-observed and was kept."
+# A review that never reached its reads (credentials failed, or the review
+# raised after they answered): the review's error, not the five read names.
+STALE_UNREAD_TEXT = "cluster not read this run ({errors}); the guard below could not be re-observed and was kept."
 STALE_RECHECK_FAILED_TEXT = "cluster re-checked this run but the read failed ({errors}); the guard below was kept."
 SPEC_SHAPE_READS = ("pods", "owners", "workloads")
 SHAPE_READS_BY_ENTRY = {
@@ -1102,6 +1124,9 @@ NO_OPERATION_LINE = "no upgrade operation in the window"
 AFTER_UPGRADE_SETTLE = timedelta(minutes=15)
 AFTER_UPGRADE_WITH_FULL_TEXT = "--after-upgrade is a scoped run and cannot be combined with --full"
 AFTER_UPGRADE_WITH_CLUSTER_TEXT = "--after-upgrade finds its clusters from the operations listing and the ledger and cannot be combined with --cluster"
+# The route selects by the reviewed-operations record, which a full run prunes
+# at its own window; a wider window would outrun the record and review again.
+AFTER_UPGRADE_WITH_SINCE_TEXT = "--after-upgrade selects by the ledger's reviewed operations inside each cluster's own window and cannot be combined with --since (a hand run; --cluster re-reviews a cluster)"
 AFTER_UPGRADE_SCOPE_TEXT = "--after-upgrade reviews the clusters with an upgrade operation not yet reviewed"
 AFTER_UPGRADE_REASON_FORMAT = "{count} upgrade operation(s) not yet reviewed, ended by {floor}"
 AFTER_UPGRADE_QUIET_LOG = "after-upgrade: no settled operation awaits review; nothing written"
@@ -1244,13 +1269,33 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> tuple[list[str], 
     else:
         listed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
         projects |= listed
-        if base and base not in listed:
+        if not base:
+            # No active project to check the listing against: whether it is
+            # complete is unknown, and an empty one is the failed case
+            # (`collect.discover_fleet`); either holds a full run.
+            note = LISTING_UNCHECKED_NOTE_FORMAT.format(count=len(listed)) if listed else LISTING_EMPTY_NOTE_TEXT
+        elif base not in listed:
             # rc 0 and the active project absent from its own output: the
             # listing is filtered rather than complete (`collect.discover_fleet`).
             note = LISTING_FILTERED_NOTE_FORMAT.format(project=base, count=len(listed))
     if not projects:
         errors.append("project discovery named no project: no `--project` and no active gcloud project")
     return sorted(projects), errors, note
+
+
+def exit_projects_text(discovery: tuple[list[str], list[str], str | None], forced: set[str]) -> str:
+    """The tail of an exit line after `start` without a manifest: the projects
+    this run resolved for its route, `--cluster`'s included, and the
+    listing's note when it was incomplete, so the SOP's recovery `finish`
+    lists their clusters rather than resolving the scope again."""
+    projects, _, note = discovery
+    named = sorted(set(projects) | {c.split(CLUSTER_KEY_SEPARATOR)[0] for c in forced})
+    return EXIT_PROJECTS_FORMAT.format(projects=", ".join(named) or EXIT_PROJECTS_NONE, note=EXIT_NOTE_FORMAT.format(note=note) if note else "")
+
+
+def harness_manifest_path() -> str:
+    """Where the harness reads this stream's manifest, as `audit_report.manifest_path_for` names it."""
+    return f"{os.environ.get(SCRATCH_DIR_ENV) or DEFAULT_SCRATCH_DIR}/{HARNESS_MANIFEST_FILENAME}"
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | None]:
@@ -4367,6 +4412,10 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 partial_reads[r["cluster"]] = failed
     upgrading_keys = {row["cluster"] for row in upgrading or []}
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
+    # A review that reached no read at all: the credentials failed, or the
+    # review raised after the reads answered. Its error is the reason the
+    # guards were kept, not the five read names `partial` lists for it.
+    unread_errors = {r["cluster"]: list(r.get("read_errors") or []) for r in reviews if r.get("partial") and not r["reviewed"] and not r["answered"]}
     stale: dict[str, list[dict]] = {}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
@@ -4389,7 +4438,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             stale.setdefault(guard["cluster"], []).append(guard)
     for cluster, held in stale.items():
-        warnings.extend(fold_held_guards(cluster, held, partial_reads.get(cluster) or [], recheck_errors.get(cluster) or []))
+        warnings.extend(fold_held_guards(cluster, held, partial_reads.get(cluster) or [], recheck_errors.get(cluster) or [], unread_errors.get(cluster) or []))
     errors.sort(key=_incident_key)
     warnings.sort(key=_incident_key)
     return {
@@ -4399,11 +4448,13 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     }
 
 
-def fold_held_guards(cluster: str, held: list[dict], partial: list[str] | None = None, recheck_errors: list[str] | None = None) -> list[dict]:
+def fold_held_guards(cluster: str, held: list[dict], partial: list[str] | None = None, recheck_errors: list[str] | None = None, unread_errors: list[str] | None = None) -> list[dict]:
     """Failure guards held on a cluster this run did not re-observe, as one
     stale-guard incident per object whatever the number of entries its
     guards carry: a finding is identified by check, cluster, namespace and
-    object, so two guards on one object are one finding."""
+    object, so two guards on one object are one finding. `unread_errors`
+    is why a review reached no read (the credentials, a raise); `partial`
+    the reads that failed on one that did."""
     by_object: dict[str, dict] = {}
     for guard in held:
         incident = by_object.get(guard["object"])
@@ -4411,6 +4462,7 @@ def fold_held_guards(cluster: str, held: list[dict], partial: list[str] | None =
             by_object[guard["object"]] = incident = {
                 "partial": list(partial or []),
                 "recheck_errors": list(recheck_errors or []),
+                "unread_errors": list(unread_errors or []),
                 "kind": INCIDENT_STALE_GUARD,
                 "severity": SEVERITY_WARNING,
                 "cluster": cluster,
@@ -4464,7 +4516,9 @@ def _cell(text: object) -> str:
 def _incident_lines(incident: dict) -> list[str]:
     lines = [f"### {incident['entries']} — {_cell(incident['cluster'])} — `{_cell(incident['object'])}`" + (" (system)" if incident["system"] else ""), ""]
     if incident["kind"] == INCIDENT_STALE_GUARD:
-        if incident.get("partial"):
+        if incident.get("unread_errors"):
+            lines.append(f"{PART_WHAT_HAPPENED} {STALE_UNREAD_TEXT.format(errors=_cell('; '.join(incident['unread_errors'])))}")
+        elif incident.get("partial"):
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_PARTIAL_TEXT.format(failed=', '.join(incident['partial']))}")
         elif incident.get("recheck_errors"):
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_RECHECK_FAILED_TEXT.format(errors=_cell('; '.join(incident['recheck_errors'])))}")
@@ -5040,6 +5094,8 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
             raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_FULL_TEXT)
         if forced:
             raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_CLUSTER_TEXT)
+        if args.since:
+            raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_SINCE_TEXT)
     if args.report and Path(args.report).name == LATEST_REPORT_LINK:
         raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
     parse_since(getattr(args, "since", None), now or now_utc())
@@ -5130,10 +5186,13 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             entries[key].pop("partial_read", None)
     return {"version": LEDGER_VERSION, "updated_at": seen_at, LEDGER_PROJECTS_KEY: ledger.get(LEDGER_PROJECTS_KEY) or [], "clusters": entries}
 
-def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS) -> dict:
+def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
     configs, the reviews, the re-checks); the default is the figure the
-    sibling collectors pin to the credential proxy's admitted count."""
+    sibling collectors pin to the credential proxy's admitted count.
+    `discovery` is `discover_fleet`'s answer when the caller resolved it
+    already (`main` does, before the lock, so an exit line can name the
+    projects); without it the run resolves the projects itself."""
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish
@@ -5163,7 +5222,8 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         return {"generated_at": seen_at, "since": fmt_ts(since), "projects": [], "reviews": [], "unchanged": [], "upgrading": [], "failed_reads": [], "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "no_baseline": True, "report": NO_BASELINE_TEXT + "\n", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
 
     failed_reads: list[str] = []
-    projects, failed_reads, listing_note = discover_fleet(project_override(args) or None, run=run)
+    projects, failed_reads, listing_note = discovery if discovery is not None else discover_fleet(project_override(args) or None, run=run)
+    failed_reads = list(failed_reads)
     projects = sorted(set(projects))
     # The declared projects the install could not read: not swept, their
     # known clusters this run's gap, held unchanged in the ledger and the
@@ -5535,11 +5595,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help=f"write the JSON result here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].json")
     parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
-    parser.add_argument("--manifest-file", help="also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against)")
+    parser.add_argument("--manifest-file", help=f"also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against); the SOP passes the harness's path for the stream, {harness_manifest_path()}, where `finish`'s --no-collector-manifest waiver and `start`'s scrub look for this run's manifest")
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
     parser.add_argument("--probe-lock", action="store_true", help="test the lock without taking it: a non-blocking flock attempt on .lock, held for no time, reading and writing nothing; exit 0 when free, 1 with the holder line when another run holds it. With no other mode flag")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters (no project when handed the fleet_scope tool's {fleet_scope_args.UNRESOLVED_SCOPE_ROW} row, or when an undeclared install's projects listing failed or did not name the active project: the swept set is then not the fleet), writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
-    parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full or --cluster")
+    parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full, --cluster or --since")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing; with --reset-ledger, list the crash records and move none")
     return parser
 
@@ -5651,20 +5711,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.reset_ledger:
         print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
         return 0
+    # The projects this run resolves for its route, before the lock: an exit
+    # after `start` without a manifest names them, so the SOP's recovery
+    # `finish` lists their clusters rather than resolving the scope again.
+    discovery = discover_fleet(project_override(args) or None, run=default_run)
+    exit_tail = exit_projects_text(discovery, forced_clusters(args))
     lock = None
     if not args.dry_run:
         lock_path = data_dir() / LOCK_FILENAME
         lock = acquire_lock(lock_path)
         if lock is None:
-            print(lock_held_line(lock_path, LOCK_WAIT))
+            print(lock_held_line(lock_path, LOCK_WAIT) + exit_tail)
             return 0
     try:
-        result = collect(args)
+        result = collect(args, discovery=discovery)
     except argparse.ArgumentTypeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     except StateUnreadable as exc:
-        print(str(exc), file=sys.stderr)
+        print(str(exc) + exit_tail, file=sys.stderr)
         return EXIT_USAGE
     finally:
         if lock is not None:

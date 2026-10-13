@@ -98,7 +98,7 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
         self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
@@ -109,6 +109,8 @@ class FakeFleet:
         # An undeclared install's `gcloud projects list`: its exit code, and the projects it names
         # (the active project alone by default; a list without it is a filtered listing).
         self.projects_list_rc, self.projects_listed = projects_list_rc, projects_listed
+        # The active gcloud project (`config get-value project`); "" is a configuration with none set.
+        self.active_project = active_project
         self.calls = []
 
     def __call__(self, argv, *, timeout=None, env=None):
@@ -140,7 +142,7 @@ class FakeFleet:
                 return run_of(1, "", "Unable to connect to the server")
             return run_of(0, json.dumps({"items": READS[cluster][key]}))
         if "config get-value" in joined:
-            return run_of(0, PROJECT + "\n")
+            return run_of(0, self.active_project + "\n") if self.active_project else run_of(0, "")
         if "projects list" in joined:
             if self.projects_list_rc:
                 return run_of(self.projects_list_rc, "", "PERMISSION_DENIED")
@@ -1966,6 +1968,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 rc = ur.main(["--full", "--scope-projects", PROJECT, "--no-report"])
         self.assertEqual(rc, ur.EXIT_USAGE)
         self.assertIn("crash record, not a re-baseline", err.getvalue())
+        self.assertIn(ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note=""), err.getvalue())
         self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
         # The crash record blocks a fresh start until it is archived.
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
@@ -2022,7 +2025,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
                     with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
                         rc = ur.main(["--full", "--scope-projects", PROJECT])
                 self.assertEqual(rc, 0)
-                self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(seconds=0.05)))
+                line = out.getvalue().strip()
+                self.assertTrue(line.startswith(ur.lock_held_line(lock_path, timedelta(seconds=0.05))), line)
+                self.assertTrue(line.endswith(ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note="")), line)
                 self.assertIn("waited 0 min for it; nothing written", out.getvalue())
                 self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
                 # Released while the second run waits: it takes the lock and runs.
@@ -2141,7 +2146,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
                     rc = ur.main(["--full", "--scope-projects", PROJECT])
             self.assertEqual(rc, 0)
-            self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(0)))
+            line = out.getvalue().strip()
+            # The line ends with the projects the run resolved, which the SOP's recovery `finish` lists.
+            self.assertTrue(line.startswith(ur.lock_held_line(lock_path, timedelta(0))), line)
+            self.assertTrue(line.endswith(ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note="")), line)
             self.assertIn("another retrospective run holds", out.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
@@ -2151,7 +2159,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 with mock.patch.object(ur, "LOCK_WAIT", timedelta(0)), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                     with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
                         self.assertEqual(ur.main(argv), 0, argv)
-                self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(0)), argv)
+                line = out.getvalue().strip()
+                self.assertTrue(line.startswith(ur.lock_held_line(lock_path, timedelta(0))), (argv, line))
+                self.assertTrue(line.endswith(ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note="")), (argv, line))
                 self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
                 self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
             # A dry run takes no lock and still prints its report.
@@ -2884,10 +2894,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
     def test_the_declared_scope_is_swept_exactly_and_nothing_is_listed(self):
         # The fleet is the fleet_scope tool's resolved set: swept as handed, no listing, recorded as
         # the fleet; a project the next scope no longer names is pruned with its clusters and guards.
-        result, fleet = self.collect(scope_projects=f"{PROJECT},other-project")
+        result, fleet = self.collect(scope_projects=f"{PROJECT},other-project", manifest_file=str(self.home / "manifest.json"))
         self.assertEqual((result["projects"], result["fleet"]), ([PROJECT, "other-project"], [PROJECT, "other-project"]))
         self.assertFalse(any("projects list" in " ".join(c) or "config get-value" in " ".join(c) for c in fleet.calls))
-        self.assertNotIn("limitations", json.loads(Path(result["manifest_path"]).read_text()) if result.get("manifest_path") else {})
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        self.assertNotIn("limitations", manifest)
+        self.assertNotIn(ur.UNENUMERATED_PROJECTS_TARGET, [c["name"] for c in manifest["clusters"]])
+        self.assertFalse(manifest["partial"])
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         other = "other-project/us-central1-a/elsewhere"
         ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
@@ -2913,6 +2926,42 @@ class LedgerAndGuardsTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
             self.assertEqual(ur.main(["--scope-projects", PROJECT, "--project", "acme-only"]), ur.EXIT_USAGE)
         self.assertIn("declared scope does not list", err.getvalue())
+
+    def test_exit_lines_name_the_runs_projects(self):
+        # The tail every exit after `start` without a manifest carries: the resolved projects,
+        # `--cluster`'s included, the listing's note when it was incomplete, `none` when nothing resolved.
+        self.assertEqual(ur.exit_projects_text((["b", "a"], [], None), set()), "; this run's projects: a, b")
+        self.assertEqual(ur.exit_projects_text((["a"], [], "why"), {"c/us-central1-a/x"}), "; this run's projects: a, c (why)")
+        self.assertEqual(ur.exit_projects_text(([], ["no project"], None), set()), "; this run's projects: none")
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(after_upgrade=True, since="30d", full=False)
+        self.assertEqual(str(caught.exception), ur.AFTER_UPGRADE_WITH_SINCE_TEXT)
+
+    def test_a_held_guard_on_a_cluster_not_read_names_the_reason_not_the_five_reads(self):
+        # A review that never reached its reads holds its guards with the review's own error, not
+        # the five read names: the credentials failed, or the review raised after the reads
+        # answered. A partial read still names the reads that failed.
+        self.collect()
+        unread, _ = self.collect(FakeFleet(broken=["seeded-a"]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        stale = [w for w in unread["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["cluster"] == SEEDED]
+        self.assertTrue(stale)
+        report = ur.render_report(unread)
+        self.assertEqual(report.count(ur.STALE_UNREAD_TEXT.format(errors="get-credentials rc=1: ERROR: cluster seeded-a not found")), len(stale))
+        self.assertNotIn("read partially this run", report)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("planted")
+
+        with mock.patch.object(ur, "collect_symptoms", boom):
+            raised, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        stale = [w for w in raised["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["cluster"] == SEEDED]
+        self.assertTrue(stale)
+        report = ur.render_report(raised)
+        self.assertEqual(report.count(ur.STALE_UNREAD_TEXT.format(errors="review failed: RuntimeError('planted')")), len(stale))
+        partial, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        report = ur.render_report(partial)
+        self.assertIn(ur.STALE_PARTIAL_TEXT.format(failed="pods"), report)
+        self.assertNotIn("cluster not read this run", report)
 
     def test_a_forced_cluster_names_its_project_under_the_overrides_rule(self):
         # `--cluster` names a project as `--project` does: free on an undeclared install, and on a
@@ -2966,7 +3015,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.collect(full=True, after_upgrade=True)
         with self.assertRaises(argparse.ArgumentTypeError):
             self.collect(full=False, after_upgrade=True, cluster=[SEEDED])
-        for argv, text in ((["--after-upgrade", "--full", "--scope-projects", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT), (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT)):
+        for argv, text in ((["--after-upgrade", "--full", "--scope-projects", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT), (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT), (["--after-upgrade", "--since", "30d"], ur.AFTER_UPGRADE_WITH_SINCE_TEXT)):
             with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                     self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
@@ -3758,6 +3807,7 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn(ur.NONE_LINE, clean_block.split(ur.INFO_FAILED_READS)[0])
         self.assertIn(f"{ur.INFO_FAILED_READS}\n\n- {GEMMA}: get-credentials rc=1", info)
         self.assertEqual(first["sections"]["errors"], [])
+        self.assertIn(f"{ur.SECTION_ERRORS}\n\n{ur.NONE_LINE}\n", report)
         with redirect_stderr(io.StringIO()):
             second = ur.collect(args(), run=FakeFleet(broken=["gemma-gpu-upgraded"]), now=NOW)
         info = ur.render_report(second).split(ur.SECTION_INFO)[1]
@@ -4839,6 +4889,18 @@ class ManifestTest(unittest.TestCase):
         filtered, _ = self.collect(FakeFleet(projects_listed=["third-project"]), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         self.assertEqual(filtered["scope_note"], ur.LISTING_FILTERED_NOTE_FORMAT.format(project=PROJECT, count=1))
         self.assertEqual((filtered["projects"], filtered["fleet"], filtered["removed_clusters"], list(filtered["held_clusters"])), ([PROJECT, "third-project"], [PROJECT, "other-project", "third-project"], [], [other]))
+        # No active gcloud project: the listing cannot be checked against one, so it holds whatever it
+        # names; an empty one is the failed case, and nothing is swept or pruned.
+        unchecked, _ = self.collect(FakeFleet(projects_listed=["third-project"], active_project=""), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 16, 19, 0, tzinfo=timezone.utc))
+        self.assertEqual((unchecked["scope_note"], unchecked["projects"], unchecked["removed_clusters"], sorted(unchecked["held_clusters"])), (ur.LISTING_UNCHECKED_NOTE_FORMAT.format(count=1), ["third-project"], [], sorted([GEMMA, SEEDED, other])))
+        self.assertIn(guard, {g["id"] for g in unchecked["guards"]})
+        empty, _ = self.collect(FakeFleet(projects_listed=[], active_project=""), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 16, 20, 0, tzinfo=timezone.utc))
+        self.assertEqual((empty["scope_note"], empty["projects"], empty["fleet"], empty["removed_clusters"], sorted(empty["held_clusters"])), (ur.LISTING_EMPTY_NOTE_TEXT, [], [PROJECT, "other-project", "third-project"], [], sorted([GEMMA, SEEDED, other])))
+        self.assertIn(guard, {g["id"] for g in empty["guards"]})
+        self.assertEqual(sorted(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]), sorted([GEMMA, SEEDED, other]))
+        self.assertTrue(any(line.startswith("project discovery named no project") for line in empty["failed_reads"]), empty["failed_reads"])
+        manifest = json.loads(Path(empty["manifest_path"]).read_text())
+        self.assertEqual((manifest["partial"], manifest["limitations"], [c["name"] for c in manifest["clusters"] if c["outcome"] == ur.MANIFEST_OUTCOME_GATE_FAILED]), (True, ur.LISTING_EMPTY_NOTE_TEXT, [ur.UNENUMERATED_PROJECTS_TARGET]))
         # A complete listing that no longer names the project prunes it, as before.
         complete, _ = self.collect(FakeFleet(projects_listed=[PROJECT]), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc))
         self.assertEqual((complete.get("scope_note"), complete["fleet"], complete["removed_clusters"]), (None, [PROJECT], [other]))
