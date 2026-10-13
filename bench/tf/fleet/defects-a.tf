@@ -1222,6 +1222,16 @@ resource "kubernetes_deployment_v1" "cache_on_emptydir" {
       }
     }
   }
+
+  # Set on every shape Deployment and DaemonSet. They run today, and the
+  # designed end of several is a pod that cannot (arch-pinned-worker once a
+  # node image drops the beta label, legacy-registry-pull once the k8s.gcr.io
+  # redirect goes; README.md, recovery notes). A project that first creates
+  # the object after that end would otherwise block the apply on a rollout
+  # that cannot finish, and the scheduled reconcile would read as a
+  # provisioning failure. The apply confirms presence; the hourly
+  # fixture-state scan reads the pod's state.
+  wait_for_rollout = false
 }
 
 # Defect (entry 12, role deprecated-label-selector): a nodeSelector on a label
@@ -1264,6 +1274,9 @@ resource "kubernetes_deployment_v1" "arch_pinned_worker" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 13, role containerd-socket-agent): a node agent that talks to
@@ -1317,6 +1330,9 @@ resource "kubernetes_daemon_set_v1" "node_runtime_probe" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 19, role intree-pd-volume): a PersistentVolume written against
@@ -1417,6 +1433,9 @@ resource "kubernetes_deployment_v1" "intree_pd_reader" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 20, role retired-registry-image): an image pulled from a
@@ -1462,6 +1481,9 @@ resource "kubernetes_deployment_v1" "legacy_registry_pull" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 8, role moving-admission-default): a default that changes
@@ -1519,6 +1541,9 @@ resource "kubernetes_deployment_v1" "baseline_edge_worker" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 10, role stale-client-skew): a client outside the supported
@@ -1654,6 +1679,9 @@ resource "kubernetes_deployment_v1" "cgroup_blind_jvm" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 15, role multi-process-container): several processes under one
@@ -1697,6 +1725,9 @@ resource "kubernetes_deployment_v1" "multi_process_worker" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 17, role node-image-coupled-agent): a per-node agent in the
@@ -1751,6 +1782,9 @@ resource "kubernetes_daemon_set_v1" "cni_shaped_agent" {
       }
     }
   }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
 }
 
 # Defect (entry 18, role cuda-pinned-gpu-job): a GPU job that pins a CUDA

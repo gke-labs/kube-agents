@@ -784,6 +784,29 @@ class PassTest(_Harness):
         assert "status.containerStatuses[*].ready any_eq true: observed false" in self.drift_files()["retired-registry-image"]
         assert 'status.phase any_eq "Running"' not in self.drift_files()["retired-registry-image"]
 
+    def test_each_shape_pods_readiness_is_asserted_under_its_own_role(self):
+        """`load_assertions` checks a subject's shape, not which role's list it
+        sits in, so a ready-container assertion filed under another role loads
+        and runs silently and the wrong role's `.drift` file names the pod.
+        Each shape pod made unready must drift its own role and no other."""
+        shapes = {
+            "node-local-state": "cache-on-emptydir",
+            "deprecated-label-selector": "arch-pinned-worker",
+            "intree-pd-volume": "intree-pd-reader",
+            "retired-registry-image": "legacy-registry-pull",
+            "moving-admission-default": "baseline-edge-worker",
+            "cgroup-blind-runtime": "cgroup-blind-jvm",
+            "multi-process-container": "multi-process-worker",
+        }
+        for role, app in shapes.items():
+            with self.subTest(role=role):
+                world = _healthy_world()
+                world["kubectl"][f"pod?app={app}"] = _pods(_pod(restarts=1, last_reason=None, waiting_reason="CrashLoopBackOff"))
+                self.provision()
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {role}, (role, done.stderr)
+                assert "status.containerStatuses[*].ready any_eq true: observed false" in self.drift_files()[role], role
+
     def test_an_oom_killed_cgroup_shape_is_drift_though_its_pod_runs_again(self):
         """An OOM-killed container restarts and is ready again between kills;
         the last termination is where the after-state shows."""

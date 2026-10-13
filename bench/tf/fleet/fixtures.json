@@ -653,6 +653,13 @@
           "op": "any_eq",
           "value": "Running",
           "why": "the attach is the before-state: a Running pod with the claim mounted shows CSI migration still carries the in-tree volume. A pod stuck in ContainerCreating is the after-state the entry describes"
+        },
+        {
+          "subject": "pod?app=intree-pd-reader",
+          "path": "status.containerStatuses[*].ready",
+          "op": "any_eq",
+          "value": true,
+          "why": "a container that cannot start after an in-place restart leaves the pod's phase Running; a ready container is what says the volume is mounted"
         }
       ]
     },
@@ -675,13 +682,6 @@
           "op": "any_eq",
           "value": true,
           "why": "an in-place restart whose pull fails leaves the pod Running with the container in ImagePullBackOff; a ready container is what says the image still pulls"
-        },
-        {
-          "subject": "pod?app=intree-pd-reader",
-          "path": "status.containerStatuses[*].ready",
-          "op": "any_eq",
-          "value": true,
-          "why": "a container that cannot start after an in-place restart leaves the pod's phase Running; a ready container is what says the volume is mounted"
         },
         {
           "subject": "deployment/legacy-registry-pull",
