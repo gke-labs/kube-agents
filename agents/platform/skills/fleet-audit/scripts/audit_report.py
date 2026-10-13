@@ -11762,28 +11762,42 @@ def resolve_repo(
 def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
     """`resolve_repo`, or `NO_FORGE_REPO` on an install that registers no repository.
 
-    Decided from `managed_repos` before `resolve_repo` runs: its lease step
-    returns the repository an earlier forge-backed run recorded, and only the
-    forge path reaps that record, so an install whose repository was removed
-    would otherwise stay on the forge path for good. Only a raw value that is
-    blank or an empty list means no forge. A value that does not parse, or
-    whose entries this image cannot serve, fails with that said. A list that
-    parses to repositories keeps the resolver's own answer and errors (several
-    repositories ask for `--repo`), and a list that cannot be read raises.
-    """
-    if not (repo and str(repo).strip()):
-        import gitops_workspace
+    Only a raw `managed_repos` value that is blank or an empty list means no
+    forge. A value that does not parse, or whose entries this image cannot
+    serve, fails with that said; a list that parses to repositories keeps the
+    resolver's own errors (several repositories ask for `--repo`); a list that
+    cannot be read raises.
 
-        if not gitops_workspace.get_managed_repos():
-            if gitops_workspace.managed_repos_registered():
-                raise RuntimeError(
-                    "managed_repos in $GITOPS_STATE_CONFIGMAP holds a value this image cannot "
-                    "use (it does not parse as a list of {type, url} entries, or names a forge "
-                    "type this image does not serve); fix the entry, or empty it to run the "
-                    "audits with no forge"
-                )
-            return NO_FORGE_REPO
-    return resolve_repo(audit_id=audit_id, repo=repo)
+    The resolver's lease step can answer with the repository an earlier
+    forge-backed run recorded, and only the forge path reaps that record, so
+    an answer the resolver gives without `--repo` is checked against the list
+    too: an install whose repository was removed must not stay on the forge
+    path for good. That check reads the list only where it can; a list that
+    cannot be read leaves the resolver's answer standing, as before.
+    """
+    import gitops_workspace
+
+    explicit = bool(repo and str(repo).strip())
+    try:
+        resolved = resolve_repo(audit_id=audit_id, repo=repo)
+    except RuntimeError:
+        if explicit or gitops_workspace.get_managed_repos():
+            raise
+        if gitops_workspace.managed_repos_registered():
+            raise RuntimeError(
+                "managed_repos in $GITOPS_STATE_CONFIGMAP holds a value this image cannot "
+                "use (it does not parse as a list of {type, url} entries, or names a forge "
+                "type this image does not serve); fix the entry, or empty it to run the "
+                "audits with no forge"
+            ) from None
+        return NO_FORGE_REPO
+    if not explicit:
+        try:
+            if not gitops_workspace.managed_repos_registered():
+                return NO_FORGE_REPO
+        except RuntimeError:
+            pass
+    return resolved
 
 
 def no_forge_workspace(audit_id: str) -> Path:
