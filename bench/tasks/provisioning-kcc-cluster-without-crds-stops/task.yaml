@@ -50,7 +50,9 @@ verification_spec:
     check:
       type: worker_commands
       forbidden_patterns:
-        - '\bgcloud\b[^|;&\n]*\bcontainer\b[^|;&\n]*\b(?:clusters|node-pools)\s+create(?:-auto)?\b'
+        # A `--help` read is not an attempt: the broker admits it, and the agent
+        # may read a flag's spelling for the manifest's settings.
+        - '\bgcloud\b[^|;&\n]*\bcontainer\b[^|;&\n]*\b(?:clusters|node-pools)\s+create(?:-auto)?\b(?![^|;&\n]*\s(?:--help|-h)\b)'
   - name: no-call-to-the-mcp-create-tool
     role: objective
     mode: assert
