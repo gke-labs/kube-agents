@@ -127,7 +127,13 @@ The store (`ledger.json`, `guards.json`, `reports/`) lives on the shell
 sandbox's data volume under /opt/data/upgrade-retrospective, readable by the
 agent's tools in any session and surviving restarts. One run at a time: an
 exclusive lock on `.lock` there is held for the whole run, and a second run
-exits 0 saying so with nothing written (`--dry-run` takes no lock). A run
+exits 0 saying so with nothing written (`--dry-run` takes no lock).
+`--probe-lock` tests the lock without taking it: a non-blocking flock
+attempt held for no time that reads and writes nothing (a missing lock file
+is free and is not created), exit 0 when free and 1 with the holder line
+when another run holds it, so the SOP probes before `start`, whose
+in-flight note the harness cannot release and whose `finish` refuses a run
+that filed nothing. A run
 writes its report, then the JSON, then the guards, then the ledger last, each
 atomically, so a crash leaves at most a report with no ledger advance. A
 ledger or guards file that exists but cannot be read, or carries another
@@ -193,6 +199,13 @@ REPORTS_SUBDIR = "reports"
 LOCK_FILENAME = ".lock"
 REPORT_IS_LINK_TEXT = "--report must not be named {name}: that is the link a full run points at the newest report"
 LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; waited {minutes} min for it; nothing written"
+# `--probe-lock`, the SOP's probe before `start`: a non-blocking flock attempt
+# held for no time, reading and writing nothing; the held line shares
+# `LOCK_HELD_TEXT`'s form so one match reads both.
+LOCK_PROBE_FREE_TEXT = "{path} is free; no retrospective run holds it"
+LOCK_PROBE_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing started"
+PROBE_LOCK_WITH_OTHERS_TEXT = "--probe-lock takes no other mode flag: it tests the lock and nothing else"
+PROBE_LOCK_EXCLUSIVE = ("full", "after_upgrade", "cluster", "since", "dry_run", "reset_ledger", "report", "output", "manifest_file", "no_report")
 # Three triggers write the same files: a run that finds the lock held waits
 # this long for it, polling, and only then prints the line above and exits.
 # Two minutes: the SOP runs the collector in the foreground under the
@@ -205,6 +218,7 @@ STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
 STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
 EXIT_USAGE = 2
+EXIT_LOCK_HELD = 1
 # Reports are named by the run's finish time in UTC; a scoped run (one that
 # did not cover the whole fleet) is marked so it never stands for the fleet.
 REPORT_TS_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -4828,6 +4842,8 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
     going to proceed. `main` calls it before the lock; `collect` repeats it
     for callers that skip `main`."""
     forced = forced_clusters(args)
+    if getattr(args, "probe_lock", False) and any(getattr(args, flag, None) for flag in PROBE_LOCK_EXCLUSIVE):
+        raise argparse.ArgumentTypeError(PROBE_LOCK_WITH_OTHERS_TEXT)
     full = bool(getattr(args, "full", False))
     if full:
         if forced:
@@ -5293,6 +5309,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
     parser.add_argument("--manifest-file", help="also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against)")
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
+    parser.add_argument("--probe-lock", action="store_true", help="test the lock without taking it: a non-blocking flock attempt on .lock, held for no time, reading and writing nothing; exit 0 when free, 1 with the holder line when another run holds it. With no other mode flag")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters, writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full or --cluster")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing; with --reset-ledger, list the crash records and move none")
@@ -5337,12 +5354,40 @@ def acquire_lock(path: Path, *, wait: timedelta | None = None, poll: timedelta |
     return handle
 
 
-def lock_held_line(path: Path, waited: timedelta | None = None) -> str:
+def _lock_since(path: Path) -> str:
     try:
-        since = fmt_ts(datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc))
+        return fmt_ts(datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc))
     except OSError:
-        since = "unknown"
-    return LOCK_HELD_TEXT.format(path=path, since=since, minutes=int((waited or timedelta(0)).total_seconds() // SECONDS_PER_MINUTE))
+        return "unknown"
+
+
+def lock_held_line(path: Path, waited: timedelta | None = None) -> str:
+    return LOCK_HELD_TEXT.format(path=path, since=_lock_since(path), minutes=int((waited or timedelta(0)).total_seconds() // SECONDS_PER_MINUTE))
+
+
+def lock_probe_held_line(path: Path) -> str:
+    return LOCK_PROBE_HELD_TEXT.format(path=path, since=_lock_since(path))
+
+
+def probe_lock(path: Path) -> tuple[int, str]:
+    """`--probe-lock`: whether another run holds `path`, without taking it
+    for any time and without writing. A lock file that does not exist is
+    free and is not created; an existing one is opened read-only and tried
+    with a non-blocking flock that is released at once. Exit 0 with the
+    free line, or `EXIT_LOCK_HELD` with the holder line."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return 0, LOCK_PROBE_FREE_TEXT.format(path=path)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return EXIT_LOCK_HELD, lock_probe_held_line(path)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+    return 0, LOCK_PROBE_FREE_TEXT.format(path=path)
 
 def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, guards_path: Path | None = None, move: bool = True) -> str:
     """Archive the crash records beside the ledger and guards files (the
@@ -5365,14 +5410,18 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.reset_ledger:
-        print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
-        return 0
     try:
         validate_args(args)
     except argparse.ArgumentTypeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
+    if args.probe_lock:
+        rc, line = probe_lock(data_dir() / LOCK_FILENAME)
+        print(line)
+        return rc
+    if args.reset_ledger:
+        print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
+        return 0
     lock = None
     if not args.dry_run:
         lock_path = data_dir() / LOCK_FILENAME

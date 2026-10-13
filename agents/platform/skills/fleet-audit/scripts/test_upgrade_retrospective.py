@@ -19,6 +19,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -135,7 +136,7 @@ class FakeFleet:
 def args(**overrides):
     """The scheduled run's arguments: `--full` unless the test narrows the run
     with --cluster or --since, or says otherwise."""
-    base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "manifest_file": None, "after_upgrade": False}
+    base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "probe_lock": False, "manifest_file": None, "after_upgrade": False}
     base.update(overrides)
     base.setdefault("full", base["cluster"] is None and base["since"] is None and bool(base["project"]))
     if "full" in overrides:
@@ -1758,6 +1759,19 @@ class NextUpgradeTest(unittest.TestCase):
         self.assertEqual(sum(1 for c in fleet.calls if "get-server-config" in c), 1)
 
 
+# Another process holding the lock: it takes the flock, says so, and releases it on a line of stdin.
+HOLD_LOCK_SCRIPT = """
+import fcntl, os, sys
+path = sys.argv[1]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("held", flush=True)
+sys.stdin.readline()
+fcntl.flock(fd, fcntl.LOCK_UN)
+"""
+
+
 class LedgerAndGuardsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2052,6 +2066,37 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual((rc, out.getvalue()), (0, ""))
         self.assertIn(ur.AFTER_UPGRADE_QUIET_LOG, err.getvalue())
         self.assertEqual(sorted(p.name for p in (self.home / ur.REPORTS_SUBDIR).iterdir()), ["20261008T180000Z.json", "20261008T180000Z.md", ur.LATEST_REPORT_LINK])
+
+    def test_probe_lock_reports_free_or_held_and_touches_nothing(self):
+        # `--probe-lock` tests the lock without taking it for any time and without writing: a store
+        # with no lock file is free and stays untouched; a lock another process's flock holds is
+        # reported with the holder line and exit 1; once released it is free again. It takes no
+        # other mode flag.
+        lock_path = self.home / ur.LOCK_FILENAME
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ur.main(["--probe-lock"]), 0)
+        self.assertEqual(out.getvalue().strip(), ur.LOCK_PROBE_FREE_TEXT.format(path=lock_path))
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [])
+        holder = subprocess.Popen([sys.executable, "-c", HOLD_LOCK_SCRIPT, str(lock_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--probe-lock"]), ur.EXIT_LOCK_HELD)
+            self.assertEqual(out.getvalue().strip(), ur.lock_probe_held_line(lock_path))
+            self.assertTrue(out.getvalue().startswith("another retrospective run holds"))
+            self.assertEqual(sorted(p.name for p in self.home.iterdir()), [ur.LOCK_FILENAME])
+        finally:
+            holder.stdin.write("release\n")
+            holder.stdin.flush()
+            holder.wait(timeout=30)
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ur.main(["--probe-lock"]), 0)
+        self.assertEqual(out.getvalue().strip(), ur.LOCK_PROBE_FREE_TEXT.format(path=lock_path))
+        for argv in (["--probe-lock", "--full", "--project", PROJECT], ["--probe-lock", "--after-upgrade"], ["--probe-lock", "--dry-run"], ["--probe-lock", "--reset-ledger"], ["--probe-lock", "--cluster", SEEDED]):
+            with self.subTest(argv=argv):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
+                self.assertIn(ur.PROBE_LOCK_WITH_OTHERS_TEXT, err.getvalue())
 
     def test_lock_makes_a_second_run_exit_quietly(self):
         lock_path = self.home / ur.LOCK_FILENAME
