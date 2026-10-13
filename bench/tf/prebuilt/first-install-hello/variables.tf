@@ -58,12 +58,26 @@ variable "case_suffix" {
 
 variable "variant" {
   type        = string
-  description = "Which greeting the plugin injects: in_progress (scan running) or completed (scan done)"
+  description = "Which greeting the plugin injects: in_progress (scan running), completed (scan done), or from_report (the plugin checks for the report, which this stack plants on the shell sandbox)"
 
   validation {
-    condition     = contains(["in_progress", "completed"], var.variant)
-    error_message = "variant must be in_progress or completed."
+    condition     = contains(["in_progress", "completed", "from_report"], var.variant)
+    error_message = "variant must be in_progress, completed or from_report."
   }
+}
+
+# from_report plants the report on the shell sandbox, where the ranking worker
+# writes it. The apply refuses unless exactly one pod matches.
+variable "sandbox_selector" {
+  type        = string
+  description = "Label selector for the shell sandbox pods in agent_namespace"
+  default     = "app=platform-agent-shell"
+}
+
+variable "sandbox_container" {
+  type        = string
+  description = "Container inside the shell sandbox pods"
+  default     = "shell"
 }
 
 variable "home_channel_set" {

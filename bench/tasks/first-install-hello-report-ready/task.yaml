@@ -1,0 +1,116 @@
+---
+id: first-install-hello-report-ready
+name: The first-install hello says the first look is done when the report is ready in the shell sandbox
+
+# The greeting a new user gets on their first chat turn when the ranked report
+# is already written. The bootstrap_onboarding plugin picks between the
+# in-progress and the completed greeting by checking for INVENTORY.md where the
+# delivery stage reads it: with the shell sandbox on, the ranking worker writes
+# it on the sandbox pod, which the agent pod does not mount. A check on the
+# agent pod's own volume never finds it, and every user is told the scan is
+# still running while the report is posted a minute later.
+#
+# The sibling cases (first-install-hello-running and -done) fix the variant in
+# the eval seam's request, so the plugin's check never runs. This one asks for
+# variant from_report: the stack plants INVENTORY.md on the sandbox, and the
+# plugin runs the same check the opening turn of a real chat makes. The shape
+# of the greeting is graded by the siblings; this case grades which greeting
+# it is.
+#
+# Isolation class: read-only on the cluster. It plants INVENTORY.md on the
+# shell sandbox and the seam's request in the agent pod, and refuses an install
+# whose sandbox already holds a report or where a person is waiting on one;
+# the destroy removes both files.
+
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/first-install-hello"
+  teardown: true
+  variables:
+    case_suffix: "report-ready"
+    variant: "from_report"
+    # A substring of the prompt below and of no other case's prompt.
+    phrase: "back from lunch"
+
+validated: false
+
+domain: chat-and-routing
+
+owner: toshiowang
+
+prompt: "hi, sam here, back from lunch"
+
+expected_output: |
+  critical requirements:
+  - One short kube-agents greeting that says its first look at the GKE fleet
+    is done and the summary is in this chat.
+  - It does not say it is still looking, or that it will post the results
+    when it is done.
+
+verification_spec:
+  # Every check reads the final message, so each sets `mode: assert`, as in
+  # the sibling cases. Phrases are forgiving substrings over the lowercased,
+  # emphasis-stripped reply; patterns are re.search over it.
+  - name: says-the-first-look-is-done
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        [
+          "is done",
+          "is finished",
+          "is complete",
+          "has finished",
+          "have finished",
+          "finished my first",
+          "finished a first",
+        ]
+
+  - name: says-the-results-are-in-this-chat
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["in this chat", "in the chat", "posted"]
+
+  # The in-progress greeting's two points: it is still looking, and it will
+  # post what it finds later.
+  - name: does-not-say-the-scan-is-running
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - "when (it'?s|it is|i'?m|i am) (done|finished)"
+        - "once (it'?s|it is|i'?m|i am) (done|finished)"
+        - "when it finishes"
+        - "\\b(i'?ll|i will|will) (post|share|send)"
+        - "\\b(i'?m|i am) taking"
+        - "still (running|looking|scanning)"
+
+  - name: at-most-sixty-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\A\s*(?:\S+\s+){60}\S']
+
+  - name: no-architecture
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        [
+          "planning agent",
+          "platform agent",
+          "cluster agent",
+          "specialist",
+          "kanban",
+          "hierarchy",
+        ]

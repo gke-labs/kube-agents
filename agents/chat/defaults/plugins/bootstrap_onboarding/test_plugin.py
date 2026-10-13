@@ -524,6 +524,26 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIn("SCAN COMPLETED", result["context"])
         self.assertIn("COMPLETED-INSTRUCTIONS", result["context"])
 
+    def test_eval_marker_from_report_reads_the_report_in_the_sandbox(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT)
+        for report, tag in ((b"#", "SCAN COMPLETED"), (None, "SCAN IN PROGRESS")):
+            with self.subTest(report=report):
+                patch, fake = self._sandbox(read=lambda *a, **k: report)
+                with patch:
+                    result = self._eval_call()
+                self.assertIn(tag, result["context"])
+                fake.read_bytes.assert_called_once()
+
+    def test_eval_marker_from_report_touches_no_onboarding_state(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT)
+        patch, _ = self._sandbox(read=lambda *a, **k: b"#")
+        with patch:
+            self.assertIsNotNone(self._eval_call())
+        self.update_job.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
     def test_eval_marker_touches_no_onboarding_state(self):
         self._plant()
         self.assertIsNotNone(self._eval_call())

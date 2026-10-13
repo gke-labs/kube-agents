@@ -111,6 +111,8 @@ chat-routing-fleet-question
 first-install-hello-running
 # #2039: the same for the greeting once the first-look scan has finished.
 first-install-hello-done
+# #2039: the same for the greeting picked by the plugin's report check.
+first-install-hello-report-ready
 
 # #2039: grades the chat front door's ack for a fleet question and the
 # platform worker's fan-out beneath the one card it files. The same gap as

@@ -34,8 +34,18 @@
 # Destroy removes the file and reads back, failing when it is still there;
 # until then it stays armed for its phrase. The request also carries the time
 # it was written, and the plugin refuses one older than an hour, so a file a
-# failed destroy leaves behind disarms on its own. Nothing else is planted, so
-# nothing else is torn down.
+# failed destroy leaves behind disarms on its own.
+#
+# With variant from_report the plugin picks the greeting with the opening
+# turn's own check for the ranked report, so this stack also plants
+# INVENTORY.md on the shell sandbox's data volume, where the ranking worker
+# writes it, before it writes the request. The apply refuses when the sandbox
+# already holds a report, which is not this case's to plant over or remove, and
+# when a person has connected and onboarding has not delivered, since the
+# delivery stage would then post the planted file to them. Destroy removes the
+# file only while it still holds what this stack planted. A person's first chat
+# on the install during the case would also find the planted report, so run it
+# on an eval install nobody chats with. The other variants plant nothing else.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -50,9 +60,129 @@ terraform {
 locals {
   marker_name = ".bootstrap_greet_eval-${var.case_suffix}"
   request     = jsonencode({ phrase = var.phrase, variant = var.variant, home_channel_set = var.home_channel_set })
+  # The sandbox's data volume, as bootstrap_delivery.py's SANDBOX_HOME names it.
+  sandbox_report = "/opt/data/INVENTORY.md"
+  # The plugin reads only that the file exists; the text names its owner for
+  # anyone who finds it.
+  planted_report = "Planted by the bench stack prebuilt/first-install-hello for case ${var.case_suffix}; its destroy removes it.\n"
+}
+
+resource "null_resource" "planted_report" {
+  count = var.variant == "from_report" ? 1 : 0
+
+  triggers = {
+    host_cluster      = var.host_cluster_name
+    host_location     = var.host_cluster_location
+    host_project      = var.project_id
+    namespace         = var.agent_namespace
+    deployment        = var.agent_deployment
+    container         = var.agent_container
+    sandbox_selector  = var.sandbox_selector
+    sandbox_container = var.sandbox_container
+    report_path       = local.sandbox_report
+    report_b64        = base64encode(local.planted_report)
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    environment = {
+      REPORT_PATH = local.sandbox_report
+      REPORT_B64  = base64encode(local.planted_report)
+    }
+    command = <<-EOT
+      set -euo pipefail
+
+      kubeconfig_dir="$(mktemp -d)"
+      trap 'rm -rf "$kubeconfig_dir"' EXIT
+      trap 'exit 143' TERM INT
+      KUBECONFIG="$kubeconfig_dir/config"
+      export KUBECONFIG
+
+      project="${var.project_id}"
+      if [ -z "$project" ]; then
+        project="$(gcloud config get-value project 2>/dev/null || true)"
+      fi
+      if [ -z "$project" ]; then
+        echo "ERROR: no project id. Pass -var project_id=... or set a gcloud default project; this stack needs one to fetch credentials for ${var.host_cluster_name}." >&2
+        exit 1
+      fi
+
+      gcloud container clusters get-credentials "${var.host_cluster_name}" \
+        --location "${var.host_cluster_location}" --project "$project" --quiet
+
+      sandbox_pods="$(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name)"
+      set -- $sandbox_pods
+      if [ "$#" -ne 1 ]; then
+        echo "ERROR: expected one shell sandbox pod matching ${var.sandbox_selector} in ${var.agent_namespace}, found $#. The plugin reads the report there." >&2
+        exit 1
+      fi
+      sandbox_pod="$1"
+      in_sandbox=(kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" --)
+
+      # One read that has to answer `clear`, so a failed exec refuses rather
+      # than reading as "no marker".
+      state="$(kubectl exec -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" -c "${var.agent_container}" -- sh -c \
+        'home="$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}"; if [ -e "$home/.user_aligned" ] && [ ! -e "$home/.bootstrap_completed" ]; then echo waiting; else echo clear; fi' </dev/null || true)"
+      if [ "$state" != clear ]; then
+        echo "ERROR: a person has connected and onboarding has not delivered its report (read: $${state:-nothing}). The delivery stage would post the planted report to them." >&2
+        exit 1
+      fi
+
+      present="$("$${in_sandbox[@]}" sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi' sh "$REPORT_PATH" </dev/null)"
+      if [ "$present" != absent ]; then
+        echo "ERROR: $REPORT_PATH is already on $sandbox_pod (read: $present). It is not this case's to replace or remove." >&2
+        exit 1
+      fi
+
+      # Owned as the data volume is, so the plugin's read as the terminal's
+      # login can open it.
+      printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
+        'base64 -d > "$1.tmp" && chown "$(stat -c %u:%g "$(dirname "$1")")" "$1.tmp" && chmod 0644 "$1.tmp" && mv -f "$1.tmp" "$1"' \
+        sh "$REPORT_PATH"
+      echo "Planted $REPORT_PATH on $sandbox_pod."
+    EOT
+  }
+
+  # No on_failure = continue, as for the request below.
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    environment = {
+      REPORT_PATH = self.triggers.report_path
+      REPORT_B64  = self.triggers.report_b64
+    }
+    command = <<-EOT
+      set -euo pipefail
+      kubeconfig_dir="$(mktemp -d)"
+      trap 'rm -rf "$kubeconfig_dir"' EXIT
+      KUBECONFIG="$kubeconfig_dir/config"
+      export KUBECONFIG
+
+      project="${self.triggers.host_project}"
+      if [ -z "$project" ]; then
+        project="$(gcloud config get-value project 2>/dev/null || true)"
+      fi
+
+      gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
+        --location "${self.triggers.host_location}" --project "$project" --quiet
+
+      sandbox_pods="$(kubectl get pods -n "${self.triggers.namespace}" -l "${self.triggers.sandbox_selector}" -o name)"
+      for pod in $sandbox_pods; do
+        # Only while it holds what the apply planted: the delivery stage may
+        # have moved it aside, and a report written since is not this case's.
+        result="$(printf '%s' "$REPORT_B64" | kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- sh -c \
+          'planted="$(base64 -d)"; if [ ! -e "$1" ]; then echo absent; elif [ "$(cat "$1")" = "$planted" ]; then rm -f "$1" && echo removed; else echo kept; fi' \
+          sh "$REPORT_PATH")"
+        echo "$REPORT_PATH on $pod: $result."
+      done
+    EOT
+  }
 }
 
 resource "null_resource" "greet_request" {
+  # The report first, so the request never answers before it is in place.
+  depends_on = [null_resource.planted_report]
+
   triggers = {
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location

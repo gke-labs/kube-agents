@@ -77,6 +77,8 @@ GREETED_MARKER = ".bootstrap_greeted"
 # one a failed destroy leaves behind disarms on its own.
 # JSON: {"phrase": str, "variant": str, "written_at": number,
 # "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION)}.
+# The variant names the greeting, or is EVAL_VARIANT_FROM_REPORT: pick it with
+# the same report check the opening turn makes.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
@@ -84,6 +86,7 @@ EVAL_KEY_WRITTEN_AT = "written_at"
 # True tells the plugin to greet as if this turn made the chat the home channel.
 EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
+EVAL_VARIANT_FROM_REPORT = "from_report"
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
@@ -241,9 +244,9 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
     """The eval seam's request whose phrase is in this turn's message, if any.
 
     Returns None when no request names this turn. Else it returns two values:
-    whether the greeting is the completed variant, and whether to greet as if
-    this turn set the home channel. The file stays for the stack's destroy
-    step, so a retry of the same turn greets again.
+    whether to give the completed greeting, and whether to greet as if this
+    turn set the home channel. The file stays for the stack's destroy step, so
+    a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
@@ -281,6 +284,8 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
             )
             continue
         logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
+        if variant == EVAL_VARIANT_FROM_REPORT:
+            return _report_ready(data_dir), home_channel_set
         return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
 

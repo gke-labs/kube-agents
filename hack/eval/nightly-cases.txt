@@ -247,6 +247,12 @@
 # the last entry below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
+#
+# 2026-10-13 adds first-install-hello-report-ready (#2143): one case, three
+# units at the 200s default (one front-door turn; the stack is a few kubectl
+# execs each way). Counted from the lists, this file is now sixty-nine cases
+# (207 units) of an eighty-three-case, 249-unit matrix. Its stack holds the
+# infra lock for a few minutes a repetition, like its two siblings.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -643,6 +649,10 @@
 # prebuilt/first-install-hello arms per case. No fixture; the host install only.
 ./tasks/first-install-hello-running/task.yaml
 ./tasks/first-install-hello-done/task.yaml
+# Which greeting the plugin picks when the ranked report is ready on the shell
+# sandbox (#2143): the stack plants the report there and asks the seam to run
+# the opening turn's own check. No fixture; the host install only.
+./tasks/first-install-hello-report-ready/task.yaml
 
 # The fleet-audit report store's reader: a user's question about a past
 # audit, graded on the route (the worker queried the store through the
