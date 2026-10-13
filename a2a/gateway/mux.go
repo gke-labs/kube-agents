@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
-	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 const (
@@ -183,18 +182,6 @@ func (m *MultiAdapter) EditMessage(conversation, messageID string, msg OutMessag
 		return err
 	}
 	return a.EditMessage(conversation, messageID, msg)
-}
-
-// ChatMark reaches the backend that owns the conversation, when it
-// implements ChatMarker.
-func (m *MultiAdapter) ChatMark(conversation, taskID string, mark chatmsg.Mark) {
-	a, err := m.pick(conversation)
-	if err != nil {
-		return
-	}
-	if marker, ok := a.(ChatMarker); ok {
-		marker.ChatMark(conversation, taskID, mark)
-	}
 }
 
 func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {

@@ -16,7 +16,8 @@ import (
 // breaks a rule), and the chat message that survives goes to the adapter
 // beside its text. An adapter that renders it posts one laid-out message; any
 // other posts the text, exactly as before chat messages existed. A terminal's
-// mark-only message is read for its mark alone (ChatMarker).
+// mark-only message is read for its mark alone, and every carrier's mark is
+// drawn by the gateway's mark rules (mark.go).
 
 // chatProblemMax bounds, in runes, the rule a dropped chat message broke as
 // the log line carries it: the rule quotes the offending value for some
@@ -131,24 +132,33 @@ func lineKey(line string, chat *chatmsg.Message) string {
 // resultChat reads the result's chat message: off the chunks this process
 // relayed, or, when the render state had no result and the stream was
 // replayed for it, off the replayed artifact, which arrives folded.
-func (g *Gateway) resultChat(conversation, taskID string, rs *relayState, replayed []lib.Part) *chatmsg.Message {
+func (g *Gateway) resultChat(conversation, taskID string, rs *relayState, replayed []lib.Part) chatmsg.Reading {
 	switch {
 	case replayed != nil:
-		return g.readChat(conversation, taskID, chatmsg.Result, replayed).Message
+		return g.readChat(conversation, taskID, chatmsg.Result, replayed)
 	case len(rs.resultChunks) > 0:
-		return g.readChatArtifact(conversation, taskID, chatmsg.Result, rs.resultChunks).Message
+		return g.readChatArtifact(conversation, taskID, chatmsg.Result, rs.resultChunks)
 	}
-	return nil
+	return chatmsg.Reading{}
 }
 
-// relayMark hands a terminal's mark to an adapter that applies marks.
-func (g *Gateway) relayMark(conversation, taskID string, r chatmsg.Reading) {
-	if r.Mark == nil {
+// markFrom draws the mark a task's chat message carried, if it carried one
+// (mark.go): a bad mark was dropped alone by the read, so the layout and the
+// mark stand or fall apart.
+func (g *Gateway) markFrom(rec *SessionRecord, taskID string, r chatmsg.Reading) {
+	if r.Mark != nil {
+		g.applyTaskMark(rec, taskID, MarkState{Ask: r.Mark.Ask, Settle: r.Mark.Settle})
+	}
+}
+
+// terminalMark draws a terminal's mark: the one its mark-only chat message
+// carried, or the default for a terminal with none.
+func (g *Gateway) terminalMark(rec *SessionRecord, taskID string, state lib.TaskState, r chatmsg.Reading) {
+	if r.Mark != nil {
+		g.markFrom(rec, taskID, r)
 		return
 	}
-	if marker, ok := g.adapter.(ChatMarker); ok {
-		marker.ChatMark(conversation, taskID, *r.Mark)
-	}
+	g.applyTerminalMark(rec, taskID, state)
 }
 
 // appendChunk folds one artifact-update into a chunk list the way A2A

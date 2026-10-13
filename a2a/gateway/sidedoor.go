@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
-	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // sideDoorDrainBound is how long Run waits for the other halves to stop once
@@ -215,18 +214,6 @@ func (s *sideDoorAdapter) EditMessage(conversation, messageID string, m OutMessa
 		return fmt.Errorf("no ingress owns conversation %q", conversation)
 	}
 	return s.primary.EditMessage(conversation, messageID, m)
-}
-
-// ChatMark routes like TaskDelivered: the owning door, else the primary when
-// it implements ChatMarker.
-func (s *sideDoorAdapter) ChatMark(conversation, taskID string, mark chatmsg.Mark) {
-	if door := s.doorFor(conversation); door != nil {
-		if marker, ok := door.(ChatMarker); ok {
-			marker.ChatMark(conversation, taskID, mark)
-		}
-	} else if marker, ok := s.primary.(ChatMarker); ok {
-		marker.ChatMark(conversation, taskID, mark)
-	}
 }
 
 func (s *sideDoorAdapter) Roster(conversation string) ([]string, bool, error) {

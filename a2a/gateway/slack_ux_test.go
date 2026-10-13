@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
@@ -84,11 +85,10 @@ func newUXSlackAdapter(api *fakeSlackAPI) (*SlackAdapter, *fakeSessionsAPI) {
 	return a, sessions
 }
 
-// A question as the renderer draws it: headline, waiting line, then one
-// actions block with two choices and a link.
+// A question as the renderer draws it: headline, then one actions block with
+// two choices and a link.
 const uxQuestionBlocks = `[
  {"type":"section","block_id":"h","text":{"type":"mrkdwn","text":"*Which one?*"}},
- {"type":"context","block_id":"kage.waiting","elements":[{"type":"mrkdwn","text":"waiting on you"}]},
  {"type":"actions","block_id":"a","elements":[
   {"type":"button","action_id":"kage.choice.0","text":{"type":"plain_text","text":"Option A"},"value":"Option A: restart"},
   {"type":"button","action_id":"kage.choice.1","text":{"type":"plain_text","text":"Option B"},"value":"Option B"},
@@ -159,7 +159,7 @@ func TestSlackVerifiedClickRewritesTheQuestion(t *testing.T) {
 		t.Fatalf("updates = %+v, want one rewrite of the clicked message", api.updated)
 	}
 	blocks := api.updatedBlocks[0]
-	for _, gone := range []string{"kage.choice.0", "kage.choice.1", "waiting on you"} {
+	for _, gone := range []string{"kage.choice.0", "kage.choice.1"} {
 		if strings.Contains(blocks, gone) {
 			t.Errorf("rewrite still carries %q: %s", gone, blocks)
 		}
@@ -249,6 +249,36 @@ func TestSlackTypedReplyAnswersTheOpenQuestion(t *testing.T) {
 	a.InboundVerified(again.Conversation, again.MessageID, true)
 	if len(api.updated) != 1 {
 		t.Error("one reply answers one question")
+	}
+}
+
+// The post path records a laid-out question so a typed reply can answer it,
+// and the card's later settle edit (no choices) keeps the answered line.
+func TestSlackPostedQuestionIsAnsweredByATypedReplyAndKeepsItsLine(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {Name: "jay"}}}
+	a, _ := newUXSlackAdapter(api)
+	conv := "slack:C1/40.0"
+	question := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster first?",
+		Choices: []chatmsg.Choice{{Text: "prod-eu", Reply: "prod-eu first, for card t-1"}, {Text: "prod-us"}}}
+	ts, err := a.PostMessage(conv, OutMessage{Text: "Which cluster first?", Chat: question})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := InboundMessage{Conversation: conv, AuthorID: "U1", MessageID: "41.0", Text: "prod-us please"}
+	a.notePending(reply)
+	a.InboundVerified(conv, reply.MessageID, true)
+	if len(api.updated) != 1 || api.updated[0].ts != ts {
+		t.Fatalf("updates = %+v, want the posted question rewritten", api.updated)
+	}
+	if b := api.updatedBlocks[0]; strings.Contains(b, "kage.choice") || !strings.Contains(b, "✓ jay: prod-us please") || !strings.Contains(b, "Which cluster first?") {
+		t.Errorf("rewrite = %s", b)
+	}
+	settled := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster first?"}
+	if err := a.EditMessage(conv, ts, OutMessage{Text: "Which cluster first?", Chat: settled}); err != nil {
+		t.Fatal(err)
+	}
+	if b := api.updatedBlocks[1]; !strings.Contains(b, "✓ jay: prod-us please") {
+		t.Errorf("the settle edit lost the answered line: %s", b)
 	}
 }
 

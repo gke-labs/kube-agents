@@ -533,6 +533,17 @@ type fakeConversations struct {
 	rendersChat bool
 	edits       []notifyPost
 	chats       []*chatmsg.Message
+	// marks records MarkConversation calls as "conversation ask/settle",
+	// with postsAtMark the number of posts made by then.
+	marks       []string
+	postsAtMark []int
+}
+
+func (f *fakeConversations) MarkConversation(conversation string, mark MarkState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.marks = append(f.marks, conversation+" "+mark.Ask+"/"+mark.Settle)
+	f.postsAtMark = append(f.postsAtMark, len(f.posts))
 }
 
 func (f *fakeConversations) ConversationContext(_ context.Context, key string) (string, error) {

@@ -199,19 +199,6 @@ func editTextOnly(edit func(conversation, messageID, text string) error, convers
 	return edit(conversation, messageID, m.Text)
 }
 
-// ChatMarker is the optional extension an Adapter implements to receive the
-// mark a task's terminal status-update carried (spec-a2a-payloads.md,
-// "mark"): the reaction state for the message that started the work. The
-// relay reads and validates the terminal's mark-only chat message and hands
-// the mark over; the marks a posted chat message carries ride inside
-// OutMessage.Chat. Nothing implements it yet: the reactions, and the rule
-// that applies a mark only from the chain's newest task, come with the
-// Slack interactivity. Called on the relay queue under the session lock:
-// record and return.
-type ChatMarker interface {
-	ChatMark(conversation, taskID string, mark chatmsg.Mark)
-}
-
 // TaskObserver is the optional extension an Adapter implements when it has to
 // answer questions ABOUT a task rather than only render one. The gateway type
 // asserts for it and calls it where it mints and retires tasks; an adapter

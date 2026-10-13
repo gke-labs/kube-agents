@@ -20,9 +20,9 @@ import (
 // passes the principal map and the allowlist like one and carries no intent
 // of its own (spec-a2a-payloads.md, "choices"). Once the gateway says the
 // clicker is verified (VerifiedObserver), the clicked message is rewritten:
-// its choice buttons and its "waiting on you" line removed and "✓ <name>:
-// <label>" added, the clicker named by their Slack display name, never by a
-// mention or an id. A click from a sender the gateway drops changes nothing.
+// its choice buttons removed and "✓ <name>: <label>" added, the clicker
+// named by their Slack display name, never by a mention or an id. A click
+// from a sender the gateway drops changes nothing.
 //
 // A typed reply in a conversation whose question is still open answers it
 // the same way (gap G3 on #2149): the question loses its buttons and gains
@@ -33,14 +33,9 @@ import (
 // a restart keeps its buttons until clicked, and the click is still a turn.
 const (
 	// slackChoiceActionPrefix begins the action_id of every choice button
-	// the renderer draws; a link button's action_id begins with
-	// slackLinkActionPrefix and needs nothing but the ack (Slack has opened
-	// the url).
-	slackChoiceActionPrefix = "kage.choice."
-	slackLinkActionPrefix   = "kage.link."
-	// slackWaitingBlockID is the block_id of the renderer's "waiting on you"
-	// context line under an open question, which an answer removes.
-	slackWaitingBlockID = "kage.waiting"
+	// the renderer draws (slackChatActions); a link button's needs nothing
+	// but the ack, since Slack has opened the url.
+	slackChoiceActionPrefix = slackChatActionPrefix + "." + slackChatChoiceAction + "."
 
 	// slackAnsweredLine is the line an answer leaves on its question.
 	slackAnsweredLine = "✓ %s: %s"
@@ -101,8 +96,8 @@ type slackClickPayload struct {
 // needs it: where it is, its text, and its blocks and attachments as Slack
 // holds them.
 type slackQuestion struct {
-	channel, ts, text   string
-	blocks, attachments json.RawMessage
+	channel, thread, ts, text string
+	blocks, attachments       json.RawMessage
 }
 
 // slackPending is a message handed to the gateway and not yet verified: a
@@ -126,6 +121,10 @@ type slackUX struct {
 	claims        map[string]bool
 	answered      map[string]bool
 	answeredOrder []string
+	// lines is the answered line a rewrite left on a question, so a later
+	// edit of that message without its choices (the card's question
+	// settled on the notify route) keeps it (answeredLine).
+	lines map[string]string
 	// questions is each conversation's open question, the latest posted.
 	questions      map[string]slackQuestion
 	questionsOrder []string
@@ -135,7 +134,7 @@ type slackUX struct {
 func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
-			answered: map[string]bool{}, questions: map[string]slackQuestion{}}
+			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{}}
 	}
 	return s.ux
 }
@@ -165,6 +164,64 @@ func (s *SlackAdapter) noteQuestion(conversation string, q slackQuestion) {
 		remember(&ux.questionsOrder, conversation, func(k string) { delete(ux.questions, k) })
 	}
 	ux.questions[conversation] = q
+}
+
+// trackQuestion keeps the open-question record in step with a message the
+// adapter just posted or edited at ts: one whose chat message carries
+// choices becomes the conversation's open question, and an edit that leaves
+// the open question without them (a card's question settled on the notify
+// route by its update key) closes it. Called once Slack has the message.
+func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
+	channel, thread, _ := slackChannelThread(conversation)
+	if m.Chat == nil || len(m.Chat.Choices) == 0 {
+		s.mu.Lock()
+		ux := s.uxLocked()
+		if open, ok := ux.questions[conversation]; ok && open.ts == ts {
+			delete(ux.questions, conversation)
+		}
+		s.mu.Unlock()
+		return
+	}
+	text := toMrkdwn(m.Text)
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return
+	}
+	blocks, err := json.Marshal(layout.Blocks)
+	if err != nil {
+		return
+	}
+	var attachments json.RawMessage
+	if len(layout.Attachments) > 0 {
+		if attachments, err = json.Marshal(layout.Attachments); err != nil {
+			return
+		}
+	}
+	s.noteQuestion(conversation, slackQuestion{channel: channel, thread: thread, ts: ts, text: text, blocks: blocks, attachments: attachments})
+}
+
+// slackAnsweredOptions is slackMessageOptions for a chat message laid out
+// over a question already answered: the same layout with the answered line
+// added where slackAnsweredLayout would put it.
+func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
+	text := toMrkdwn(m.Text)
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return nil, errSlackChatTooLarge
+	}
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return nil, err
+	}
+	note := map[string]any{"type": slackContextBlock, "elements": []any{
+		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
+	if n := len(layout.Attachments); n > 0 {
+		last := layout.Attachments[n-1]
+		inner, _ := last["blocks"].([]map[string]any)
+		last["blocks"] = append(inner, note)
+	} else {
+		layout.Blocks = append(layout.Blocks, note)
+	}
+	return slackChatOptions(layout, text)
 }
 
 // notePending records a typed turn the gateway has not verified yet.
@@ -235,7 +292,7 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if strings.TrimSpace(text) == "" {
 		return InboundMessage{}, false
 	}
-	q := slackQuestion{channel: p.Channel.ID, ts: p.Message.TS, text: p.Message.Text,
+	q := slackQuestion{channel: p.Channel.ID, thread: thread, ts: p.Message.TS, text: p.Message.Text,
 		blocks: p.Message.Blocks, attachments: p.Message.Attachments}
 	claim := q.channel + "/" + q.ts
 	s.mu.Lock()
@@ -313,8 +370,19 @@ func (s *SlackAdapter) answerLocked(claim string) {
 	ux := s.uxLocked()
 	if !ux.answered[claim] {
 		ux.answered[claim] = true
-		remember(&ux.answeredOrder, claim, func(k string) { delete(ux.answered, k) })
+		remember(&ux.answeredOrder, claim, func(k string) {
+			delete(ux.answered, k)
+			delete(ux.lines, k)
+		})
 	}
+}
+
+// answeredLine is the line a rewrite left on the message at channel/ts, or
+// "".
+func (s *SlackAdapter) answeredLine(channel, ts string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uxLocked().lines[channel+"/"+ts]
 }
 
 // slackTypedWords is a typed answer's words for its line: whitespace
@@ -351,6 +419,9 @@ func (s *SlackAdapter) slackUserName(userID string) string {
 // instead, so an answer always shows once.
 func (s *SlackAdapter) rewriteAnswered(q slackQuestion, userID, label string) {
 	line := fmt.Sprintf(slackAnsweredLine, s.slackUserName(userID), label)
+	s.mu.Lock()
+	s.uxLocked().lines[q.channel+"/"+q.ts] = line
+	s.mu.Unlock()
 	blocks, attachments, err := slackAnsweredLayout(q.blocks, q.attachments, line)
 	if err == nil {
 		opts := []slack.MsgOption{slack.MsgOptionText(q.text, false), slack.MsgOptionBlocks(blocks.BlockSet...)}
@@ -363,13 +434,17 @@ func (s *SlackAdapter) rewriteAnswered(q slackQuestion, userID, label string) {
 		return
 	}
 	s.log.Warn("slack: rewriting an answered question failed; posting the answer in its thread", "channel", q.channel, "ts", q.ts, "err", err)
-	if _, _, err := s.api.PostMessage(q.channel, slack.MsgOptionText(slackEscaper.Replace(line), false), slack.MsgOptionTS(q.ts)); err != nil {
+	thread := q.thread
+	if thread == "" {
+		thread = q.ts
+	}
+	if _, _, err := s.api.PostMessage(q.channel, slack.MsgOptionText(slackEscaper.Replace(line), false), slack.MsgOptionTS(thread)); err != nil {
 		s.log.Warn("slack: posting an answered line failed", "channel", q.channel, "err", err)
 	}
 }
 
 // slackAnsweredLayout is a question's blocks and attachments with its choice
-// buttons and "waiting on you" line removed and line added: after the
+// buttons removed and line added: after the
 // blocks the buttons were taken from (an attachment's, beside its colour,
 // when the question has a side bar), else after the message's own blocks.
 func slackAnsweredLayout(rawBlocks, rawAttachments json.RawMessage, line string) (slack.Blocks, []slack.Attachment, error) {
@@ -436,16 +511,12 @@ func slackAnsweredLayout(rawBlocks, rawAttachments json.RawMessage, line string)
 }
 
 // slackWithoutChoices drops the choice buttons (and an actions block they
-// leave empty) and the waiting line from blocks, and appends note, when
-// given, if anything was dropped. It reports whether anything was.
+// leave empty) from blocks, and appends note, when given, if any were
+// dropped. It reports whether any were.
 func slackWithoutChoices(blocks []map[string]any, note map[string]any) ([]map[string]any, bool) {
 	out := make([]map[string]any, 0, len(blocks)+1)
 	dropped := false
 	for _, b := range blocks {
-		if id, _ := b["block_id"].(string); id == slackWaitingBlockID {
-			dropped = true
-			continue
-		}
 		if t, _ := b["type"].(string); t == slackBlockActionsT {
 			elems, _ := b["elements"].([]any)
 			kept := make([]any, 0, len(elems))

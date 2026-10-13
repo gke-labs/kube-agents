@@ -45,6 +45,29 @@ func TestNotifyConversationChatIsLaidOut(t *testing.T) {
 	}
 }
 
+// A conversation request's mark is drawn after its post, and a bad mark is
+// dropped alone with the layout still posted.
+func TestNotifyConversationMarkIsDrawnAfterThePost(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	settled := testReport
+	settled.Mark = &chatmsg.Mark{Settle: chatmsg.SettleDone}
+	got := serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, settled),
+		Conversation: testConversation, ContextID: testContext, Update: "plan"})
+	if got.Error != "" {
+		t.Fatalf("reply = %+v", got)
+	}
+	if fmt.Sprint(conv.marks) != fmt.Sprint([]string{testConversation + " /done"}) || conv.postsAtMark[0] != 1 {
+		t.Fatalf("marks = %v at posts %v, want the settle drawn after the one post", conv.marks, conv.postsAtMark)
+	}
+	bad := testReport
+	bad.Mark = &chatmsg.Mark{Ask: "Not A Token"}
+	serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, bad),
+		Conversation: testConversation, ContextID: testContext})
+	if len(conv.marks) != 1 || len(conv.chats) != 2 || conv.chats[1] == nil {
+		t.Fatalf("marks %v, chats %d: a bad mark is dropped alone", conv.marks, len(conv.chats))
+	}
+}
+
 // On a backend that renders none, or for a chat message that breaks a rule,
 // the request posts its text, chunked, as it always has.
 func TestNotifyConversationChatFallsBackToText(t *testing.T) {

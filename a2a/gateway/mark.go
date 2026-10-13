@@ -130,21 +130,23 @@ func (g *Gateway) applyTerminalMark(rec *SessionRecord, taskID string, state lib
 // applyNotifyMark draws a mark a conversation notify carried (card work
 // after the task ended): on the conversation's latest chain message, and
 // only once every task in it has ended -- while a chain is running, the
-// notify's mark is dropped.
-func (g *Gateway) applyNotifyMark(rec *SessionRecord, next MarkState) {
+// notify's mark is dropped. It reports whether the record changed.
+func (g *Gateway) applyNotifyMark(rec *SessionRecord, next MarkState) bool {
 	if rec.ActiveTask != nil {
-		return
+		g.log.Info("notify: mark dropped while a chain runs in the conversation", "conversation", rec.Key)
+		return false
 	}
-	g.drawMark(rec, rec.latestChainIndex(), next)
+	return g.drawMark(rec, rec.latestChainIndex(), next)
 }
 
 // drawMark draws next on the ask message of rec.Tasks[i] over what was drawn
-// there before, records it on the entry, and tells a MarkObserver. Best
-// effort: a reaction that fails is logged and the state still advances, so
-// a reaction refused once (a missing scope) is not retried on every event.
-func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) {
+// there before, records it on the entry, and tells a MarkObserver; it
+// reports whether anything changed. Best effort: a reaction that fails is
+// logged and the state still advances, so a reaction refused once (a missing
+// scope) is not retried on every event.
+func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 	if i < 0 || i >= len(rec.Tasks) || rec.Tasks[i].AskMessageID == "" {
-		return
+		return false
 	}
 	ref := &rec.Tasks[i]
 	prev := MarkState{}
@@ -152,7 +154,7 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) {
 		prev = *ref.Mark
 	}
 	if prev == next {
-		return
+		return false
 	}
 	remove, add := markDiff(prev, next)
 	for _, t := range remove {
@@ -174,4 +176,5 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) {
 	if observer, ok := g.adapter.(MarkObserver); ok {
 		observer.MarkChanged(rec.Key, next.Ask, next.Settle)
 	}
+	return true
 }

@@ -1644,12 +1644,15 @@ envelopes are acked like events. A click on a choice button the renderer drew is
 the clicker whose text is the choice's reply, handed to the gateway like a typed one, so the
 allowlist and the map judge it the same way and it carries no intent. The gateway tells the
 adapter whether each message's sender passed (`VerifiedObserver`), and only then does the
-adapter rewrite the clicked question: its choice buttons and waiting line removed, "✓ <name>:
-<label>" added, the name from `users.info` (display name, real name, handle; never an id). A
+adapter rewrite the clicked question: its choice buttons removed, "✓ <name>: <label>"
+added, the name from `users.info` (display name, real name, handle; never an id). A
 typed reply in a conversation whose question is still open answers it the same way, with the
 reply's first words; a gateway command (a stop, a status ask, `/session`, a delegate) answers
 nothing. A question is answered once, and a second click on it is dropped. The open question
-and the answered set live in the process, so a question posted before a restart keeps its
+is the latest message the adapter laid out with choices in the conversation; an edit that
+takes its choices away (a card's question settled by its notify `update` key) closes it, and
+keeps the answered line when one was drawn. The open question and the answered set live in
+the process, so a question posted before a restart keeps its
 buttons until clicked, and a typed reply then rewrites nothing. A thread's Agent Session is
 `processing` from `TaskStarted` until the chain ends, and past that while the chain's mark
 still carries its ask (card work still open), `suspended` while the settle is `blocked`, and
@@ -1701,8 +1704,10 @@ and `Edit`. Discord, Google Chat, the inject door, the console and the A2A door 
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
 them posts exactly what it posted before chat messages existed. The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
-refuses it, gets the text instead, once. A terminal's `mark` goes to an adapter that implements
-`ChatMarker`; none does yet, since the reactions come with the Slack interactivity.
+refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
+the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
+default for a newest task that ends without one, drawn through the adapter's `React` and
+`RemoveReaction` (the Slack adapter section).
 
 The Slack adapter lays a chat message out as Block Kit, in the spec's fixed order and in the
 `today` presenter's shape (`slack_presenter.blocks_report`, `with_side_bar`,
