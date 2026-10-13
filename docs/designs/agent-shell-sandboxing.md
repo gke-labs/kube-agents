@@ -2076,8 +2076,8 @@ which is wrong about the pod and right about the path the worker must write.
 The one agent-pod reader whose behaviour the move changes is the onboarding plugin, which
 picks its first greeting by whether `INVENTORY.md` is written. It reads the report across with
 `sandbox_exec.read_bytes`, as delivery does, and greets as though the scan were still running
-only when that read fails or takes longer than `REPORT_CHECK_TIMEOUT_SECONDS`. The report
-still arrives on the next delivery tick either way.
+when the report is not there yet, or when that read fails or takes longer than
+`REPORT_CHECK_TIMEOUT_SECONDS`. The report still arrives on the next delivery tick either way.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 

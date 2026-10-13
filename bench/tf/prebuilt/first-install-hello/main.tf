@@ -65,6 +65,11 @@ locals {
   # The plugin reads only that the file exists; the text names its owner for
   # anyone who finds it.
   planted_report = "Planted by the bench stack prebuilt/first-install-hello for case ${var.case_suffix}; its destroy removes it.\n"
+  # In-sandbox tests on the report path $1, shared by the apply and the destroy
+  # so the file the apply plants over is the file the destroy removes. "Ours"
+  # compares against $planted, the decoded planted_report.
+  report_absent = "[ ! -e \"$1\" ] && [ ! -L \"$1\" ]"
+  report_ours   = "[ -f \"$1\" ] && [ ! -L \"$1\" ] && [ \"$(cat \"$1\")\" = \"$planted\" ]"
 }
 
 resource "null_resource" "planted_report" {
@@ -81,6 +86,8 @@ resource "null_resource" "planted_report" {
     sandbox_container = var.sandbox_container
     report_path       = local.sandbox_report
     report_b64        = base64encode(local.planted_report)
+    report_absent     = local.report_absent
+    report_ours       = local.report_ours
   }
 
   provisioner "local-exec" {
@@ -132,7 +139,7 @@ resource "null_resource" "planted_report" {
       # destroy that did not finish or an apply killed after the rename; it is
       # planted over and removed with this run's.
       present="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
-        'planted="$(base64 -d)"; if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; elif [ -f "$1" ] && [ ! -L "$1" ] && [ "$(cat "$1")" = "$planted" ]; then echo ours; else echo other; fi' \
+        'planted="$(base64 -d)"; if ${local.report_absent}; then echo absent; elif ${local.report_ours}; then echo ours; else echo other; fi' \
         sh "$REPORT_PATH")"
       case "$present" in
         absent | ours) ;;
@@ -176,14 +183,14 @@ resource "null_resource" "planted_report" {
 
       sandbox_pods="$(kubectl get pods -n "${self.triggers.namespace}" -l "${self.triggers.sandbox_selector}" -o name)"
       if [ -z "$sandbox_pods" ]; then
-        echo "ERROR: no shell sandbox pod matches ${self.triggers.sandbox_selector} in ${self.triggers.namespace}, so $REPORT_PATH could not be checked or removed. Until it is, the plugin greets a person's first chat as though the report were ready." >&2
+        echo "ERROR: no shell sandbox pod matches ${self.triggers.sandbox_selector} in ${self.triggers.namespace}, so $REPORT_PATH could not be checked or removed. Until it is, a person's first chat on an install that has not delivered onboarding is sent it as the onboarding report." >&2
         exit 1
       fi
       for pod in $sandbox_pods; do
         # Only while it holds what the apply planted: the delivery stage may
         # have moved it aside, and a report written since is not this case's.
         result="$(printf '%s' "$REPORT_B64" | kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- sh -c \
-          'planted="$(base64 -d)"; if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; elif [ -f "$1" ] && [ ! -L "$1" ] && [ "$(cat "$1")" = "$planted" ]; then rm -f "$1" && echo removed; else echo kept; fi' \
+          'planted="$(base64 -d)"; if ${self.triggers.report_absent}; then echo absent; elif ${self.triggers.report_ours}; then rm -f "$1" && echo removed; else echo kept; fi' \
           sh "$REPORT_PATH")"
         case "$result" in
           absent | removed | kept) echo "$REPORT_PATH on $pod: $result." ;;

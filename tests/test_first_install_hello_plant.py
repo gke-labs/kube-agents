@@ -39,7 +39,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "first-install-hello" / "main.tf"
 _RESOURCE_RE = re.compile(r'resource "null_resource" "planted_report" \{(.*?)\n\}\n', re.S)
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
-_PLANTED_RE = re.compile(r'planted_report\s*=\s*"((?:[^"\\]|\\.)*)"')
+_LOCAL_RE = r'\n  {}\s*=\s*"((?:[^"\\]|\\.)*)"'
 _SUFFIX = "report-ready"
 _REPORT = "/opt/data/INVENTORY.md"
 _POD_HOME = "/opt/data"
@@ -78,6 +78,9 @@ if argv[:1] == ["get"]:
     for n in range(int(os.environ.get("SANDBOX_PODS", "1"))):
         print("pod/platform-agent-shell-%d" % n)
     sys.exit(0)
+if os.environ.get("ODD_OUTPUT") == "1" and "base64 -d" in argv[-3]:
+    print("Permission denied")
+    sys.exit(0)
 if os.environ.get("EXEC_FAIL") == "1":
     sys.stderr.write("error: unable to upgrade connection: container not found\n")
     sys.exit(1)
@@ -100,14 +103,21 @@ def _render(text: str, values: dict) -> str:
     return text.replace(escaped, "${")
 
 
+def _local(module: str, name: str) -> str:
+    """A string local's value, unescaped as Terraform reads it."""
+    raw = re.search(_LOCAL_RE.format(name), module).group(1)
+    return _render(raw, _VARS).encode().decode("unicode_escape")
+
+
 def _blocks() -> tuple[str, str, str]:
     """The planted text, and the create and destroy provisioner scripts."""
     module = _MODULE.read_text()
     resource = _RESOURCE_RE.search(module).group(1)
     create, destroy = (textwrap.dedent(b) + "\n" for b in _HEREDOC_RE.findall(resource))
-    planted = _render(_PLANTED_RE.search(module).group(1), _VARS)
-    planted = planted.encode().decode("unicode_escape")
-    return planted, _render(create, _VARS), _render(destroy, _TRIGGERS)
+    tests = {name: _local(module, name) for name in ("report_absent", "report_ours")}
+    create_values = {**_VARS, **{f"local.{k}": v for k, v in tests.items()}}
+    destroy_values = {**_TRIGGERS, **{f"self.triggers.{k}": v for k, v in tests.items()}}
+    return _local(module, "planted_report"), _render(create, create_values), _render(destroy, destroy_values)
 
 
 _PLANTED, _CREATE, _DESTROY = _blocks()
@@ -236,6 +246,28 @@ class PlantTest(unittest.TestCase):
         result = self._run(_DESTROY)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("absent", result.stdout)
+
+    def test_destroy_keeps_a_symlink_at_the_path(self):
+        target = self.sandbox / "elsewhere"
+        target.write_text(_PLANTED)
+        self.report.symlink_to(target)
+        result = self._run(_DESTROY)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.report.is_symlink())
+        self.assertEqual(target.read_text(), _PLANTED)
+        self.assertIn("kept", result.stdout)
+
+    def test_destroy_fails_on_an_answer_it_does_not_know(self):
+        self.report.write_text(_PLANTED)
+        result = self._run(_DESTROY, ODD_OUTPUT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not remove", result.stderr)
+
+    def test_apply_and_destroy_share_one_ownership_test(self):
+        module = _MODULE.read_text()
+        self.assertEqual(module.count("[ -f "), 1)
+        self.assertIn("${local.report_ours}", module)
+        self.assertIn("${self.triggers.report_ours}", module)
 
     def test_destroy_fails_without_a_sandbox_pod(self):
         result = self._run(_DESTROY, SANDBOX_PODS="0")
