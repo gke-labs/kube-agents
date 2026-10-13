@@ -63,6 +63,12 @@ const (
 	// interim answer ("still running, results will post here") loops until
 	// the depth bound refuses, with nothing answered.
 	EnvDelegateTool = "A2A_DELEGATE_TOOL"
+	// EnvPrimerFile names the file the spawner mounts the conversation's
+	// transcript primer at (the pod's rehydration-primer annotation, through
+	// the downward API). Every turn is a fresh pod, so this is how one picks
+	// up the conversation it is continuing. Unset, or an empty file, is a
+	// conversation with nothing before this turn.
+	EnvPrimerFile = "A2A_PRIMER_FILE"
 )
 
 const (
