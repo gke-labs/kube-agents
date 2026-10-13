@@ -232,8 +232,9 @@ question asked inside the floor, within fifteen minutes of an operation's `DONE`
 cluster's settling line (§3.2): the answer says the review runs once the pods have settled, on the
 after-upgrade route's next wake. A fleet-wide question that finds the collector's lock held past
 the probe's wait is answered from the latest saved report, with the line that a run is in progress
-(§3.6); a lost lock, as any collector exit without a manifest after `start`, releases the
-in-flight note at once (§3.6), so `start` does not refuse the question.
+(§3.6); a collector exit without a manifest after `start`, the lost lock among them, releases
+the in-flight note by §3.6's recovery rule, so `start` refuses the question only in the one case
+§3.6 names.
 
 ### 3.2 Scope: new or upgraded since the last run
 
@@ -331,8 +332,10 @@ the render's answer when no snapshot answers, and the row a carried tick or a fa
 organisation or selector lookup appends, under which the members are exactly what is unknown
 (`DeclaredScope.sweep_is_declared` in `fleet_scope_args.py` is the tree's predicate, false while
 the row is present). A full run handed that row, or any `--scope-unread` entry that is not a
-project id, or one on an undeclared install whose `gcloud projects list` failed or did not name
-the active project (an incomplete listing, as `collect.py` reads it), is handed a set that is not
+project id, or one on an undeclared install whose `gcloud projects list` failed, did not name
+the active project, or had no active project to check it against (an incomplete listing, as
+`collect.py` reads it; an empty one with no active project is the failed case), is handed a set
+that is not
 the fleet: it prunes no project, holds every ledger entry and guard of a project outside the
 handed set the way it holds an unread project's below, lists those clusters under "Reads that
 failed" with the row's note, or the listing's, as `unreachable` manifest entries,
@@ -374,7 +377,9 @@ cannot name one, so the case is an undeclared install's), writes its report unde
 name, does not move the latest link, and never calls the fleet-audit `start` or `finish`, so a
 question about one clean cluster cannot close the fleet's ledger issue.
 `--since` is a hand-run flag that widens the window a scoped run reviews; it never replaces the
-ledger's last-run time. A cluster with an operation still `PENDING`, `RUNNING` or `ABORTING`, or
+ledger's last-run time, and `--after-upgrade` refuses it as `--full` does, since that route selects
+by the reviewed-operations record inside each cluster's own window, which a wider window would
+outrun. A cluster with an operation still `PENDING`, `RUNNING` or `ABORTING`, or
 with an operation that reached `DONE` inside the floor, less than fifteen minutes before the run,
 is not reviewed on any route: a drain in progress shows a budget with no allowance, a Pending
 replacement and a `NotReady` node, which are the signatures of entries 1, 2 and 17 on a cluster
@@ -428,8 +433,12 @@ candidate (a guard is dropped only when every read that could show it answered).
 resolved, and the cluster's previous findings wait for a run that reads it (below). `coverage_gaps`
 also measures every `scope.clusters` entry against all six checks and files a gap for any it finds
 in neither `checks_run` nor `checks_not_applicable`, so each `collected` entry carries all six or
-names its gap. On a full run the collector writes the manifest beside the report
-(`--manifest-file`), one `clusters[]` entry per cluster it enumerated. A reviewed cluster is
+names its gap. On a full run the collector writes the manifest at the harness's manifest path
+for the stream (`audit_report.manifest_path_for`: `manifest_upgrade-retrospective.json` under the
+scratch directory, `/opt/data/scratch` by default), which the SOP passes as `--manifest-file`, as
+the sibling SOPs tell their collectors: `finish`'s `--no-collector-manifest` waiver and `start`'s
+scrub of a previous run's manifest read that path and no other (§3.6). The manifest has one
+`clusters[]` entry per cluster it enumerated. A reviewed cluster is
 `collected`, with a `commands[]` record per check naming its deciding read. An unchanged cluster
 is `collected` too: the operations listing, with the cluster's versions, decided that nothing
 upgraded it, which answers every check that asks what the upgrade did, so `commands[]` carries all
@@ -463,7 +472,14 @@ The SOP's `draft` builds `scope.clusters` from the `collected` entries, with `ch
 their `commands[]` and the collector's `limitations` copied, and `scope.skipped` from the rest
 with their errors, so on a Sunday where every cluster was read and nothing was upgraded
 `coverage_gaps` is empty, the run is complete, and a clean document closes the ledger issue and
-runs silent (requirements 3(D) and 4).
+runs silent (requirements 3(D) and 4). When `draft` leaves `scope.clusters` empty, every cluster
+upgrading, settling or unreachable at the tick (a one-cluster install whose maintenance window
+overlaps it), the SOP moves the skipped entries into `scope.clusters` as rows with
+`checks_run: []` and the collector's reason as `limitations`: the validator admits an entry with
+no checks when its `limitations` says why, `cross_check_manifest` admits a target the collector
+could not read in `scope.clusters` with `limitations`, and `coverage_gaps` reads each as a gap, so
+`finish` takes the partial clean branch, posts the gap and releases the note. The sibling SOPs'
+rule for zero clusters, no `finish`, would leave the note standing after `start`.
 
 The hold follows the rule the harness implements and no other. A previous finding is announced
 resolved only on a complete run, and only when no candidate carries its `(check, cluster,
@@ -730,22 +746,28 @@ stands, two hours, the fleet-wide question included. The harness releases the no
 `finish`, and `finish` admits a run that read nothing when the document says so: a cluster entry
 with no `checks_run` is valid when its `limitations` says why, and a collector stream may publish
 without a manifest through `--no-collector-manifest "<why>"`, refused only when the collector
-wrote a manifest this run, which a collector that lost the lock did not. So the Sunday route and
+wrote a manifest this run at the stream's manifest path (§3.3), which a collector that lost the
+lock did not. So the Sunday route and
 the fleet-wide on-demand route probe the lock before `start`: the collector's `--probe-lock`
 tries the lock without blocking, holds it for no time and writes nothing, and the SOP spends the
 two-minute wait on the probe, before any note exists, then calls `start` and runs the collector. A
 collector exit without a manifest after `start`, the lock lost between the probe and the run or a
-crash record beside no ledger (below), releases the note at once with a limitations-only `finish`:
-`findings: []`; under `scope.clusters`, each with `checks_run: []` and a `limitations` naming the
-exit's line (the lock, its holder and the time; the crash record's path), the clusters the recovery
-document can name, the latest saved report's or, when no report exists yet, on the first-run
-stage's run or the first Sunday of an install that predates the job, the clusters the handed
-`--scope-projects` list by the sibling SOPs' step-1 `clusters list` per project, which the SOP
-runs itself; and `--no-collector-manifest` with the same reason. The validator refuses an empty
-`scope.clusters` and keeps the note on a refusal, so the listing is what makes a first run's
-recovery possible; a first run whose every handed project failed to list can name no cluster,
-reports the exit's line, and leaves the note to its TTL, a window in which no saved report could
-have answered a question either. A declared scope with no readable project never reaches `start`:
+crash record beside no ledger (below), releases the note at once with a limitations-only `finish`.
+The recovery scope is defined once: the collector ends each such exit line with the projects it
+resolved for the route (`this run's projects: …`: the handed `--scope-projects`, or on an
+undeclared install the active project plus `gcloud projects list`, with the listing's note when it
+was incomplete), so the SOP reads the set from the line rather than resolving it again. The
+document is `findings: []`; under `scope.clusters`, each with `checks_run: []` and a `limitations`
+naming the exit's line (the lock, its holder and the time; the crash record's path), the latest
+saved report's clusters or, when no report exists yet, on the first-run stage's run or the first
+Sunday of an install that predates the job, the clusters the line's projects list by the sibling
+SOPs' step-1 `clusters list` per project, which the SOP runs itself; and `--no-collector-manifest`
+with the same reason. The validator refuses an empty `scope.clusters` and keeps the note on a
+refusal, so the listing is what makes a first run's recovery possible; the one case it cannot
+cover is a first run whose line names no project, or whose every named project fails to list: the
+SOP reports the exit's line and the note stands to its TTL, a window in which no saved report
+could have answered a question either. A declared scope with no readable project never reaches
+`start`:
 the tool's `collector_args` carry `--scope-unread` alone, which the collector refuses (§3.2), and
 the SOP reports that as its line before the probe. `finish` takes the clean branch over a gap: it
 posts a partial all-clear comment naming the gap on the open ledger issue, or opens the coverage
@@ -916,8 +938,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   as the ledger's set plus the projects read, an API-disabled project counted empty with its
   ledger clusters leaving on a full run, `--project` refused outside a declared scope and a
   `--cluster` outside it refused the same way, the listing on an undeclared install, and a
-  listing that failed or did not name the active project holding every ledger project outside
-  it; a locked-out full run exiting 0 with the lock-held line and
+  listing that failed, did not name the active project, or had no active project to check it
+  against (an empty one the failed case) holding every ledger project outside it;
+  `--after-upgrade` refusing `--since`; a locked-out full run exiting 0 with the lock-held line and
   writing nothing; a
   persisting guard's candidate under the check its guard records, moved on a re-grade, with first
   seen and the review count, a cleared
@@ -939,9 +962,15 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   per operator: a pod kept off spot nodes by `cloud.google.com/gke-spot DoesNotExist` or
   `gke-preemptible NotIn [true]` and refused for `Insufficient cpu` is row 2, and `Exists` on a key
   no node carries is row 12; `--probe-lock` exiting 0 when the lock is free and 1 with the holder
-  line when it is held, holding it for no time and writing nothing; the recovery `finish` of a
-  run that lost the lock on a first run, with no saved report: `scope.clusters` from the handed
-  projects' listing, admitted by the validator, and the note released; the report rendering,
+  line when it is held, holding it for no time and writing nothing; the lock-held and
+  crash-record lines ending with the projects the run resolved, the handed scope or the
+  undeclared listing with its note; the recovery `finish` of a run that lost the lock on a first
+  run, with no saved report: `scope.clusters` from the listing of the projects the exit line
+  names, admitted by the validator, and the note released; a document whose every cluster the
+  collector could not read, carried as `scope.clusters` rows with `checks_run: []` and the
+  collector's reason as `limitations`, admitted by the validator and `cross_check_manifest`, so
+  the note is released; a held guard on a cluster the run did not read naming the read's error
+  rather than the five reads; the report rendering,
   including an empty section and the severity of each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
