@@ -57,10 +57,6 @@ infrastructure:
   deployer: noop
 validated: false
 
-# Red on main: the fix is the sibling issues' (#1944 persona, #1946 runtime
-# stop). Their pull request removes this marker in the same diff.
-expected_fail: true
-
 # Slug per docs/designs/domains.yaml.
 domain: remediation
 
