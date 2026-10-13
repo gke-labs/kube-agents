@@ -315,6 +315,7 @@ class LedgerProbeTest(unittest.TestCase):
         self.assertIn(("PUT", "/issues/1", "agent-tok"), steps)
         self.assertEqual(steps[-2:], [("GET", "/issues/1", "ledger-tok"), ("GET", "/issues/1/notes", "ledger-tok")])
         self.assertEqual({t for (m, _, t) in steps if m in ("POST", "PUT")}, {"agent-tok"})
+        self.assertEqual([s for s in steps if s[1] == "/user"], [("GET", "/user", "agent-tok")], "the login is read once and handed to the reset")
         created = fake.calls[1][2]
         self.assertEqual(created["title"], "[audit] eval ledger-path probe")
         self.assertEqual(created["labels"], "agent:audit,audit:eval-ledger-probe")
@@ -361,9 +362,10 @@ class LedgerProbeTest(unittest.TestCase):
         iid, faults, _ = self._probe(fake)
         self.assertEqual(iid, 1)
         self.assertIn("read-back: GitLab answered the read of issue #1 with an empty body", faults)
-        # The issue is still retired; the post-close read fails the same way and says so.
+        # The issue is still retired; the post-close read comes back empty too and says that, not "not closed".
         self.assertEqual(fake.detail[1]["state"], "closed")
-        self.assertIn("reset read-back: issue #1 is not closed after the reset", faults)
+        self.assertIn("reset read-back: GitLab answered the read of issue #1 after the close with an empty body", faults)
+        self.assertNotIn("reset read-back: issue #1 is not closed after the reset", faults)
 
     def test_a_body_that_does_not_come_back_as_written_is_the_read_back_fault(self):
         fake = FakeGitLab()
@@ -382,6 +384,11 @@ class LedgerProbeTest(unittest.TestCase):
         iid, faults, _ = self._probe(fake)
         self.assertEqual(iid, 1)
         self.assertIn("read-back: issue #1 does not read as a ledger: author someone-else is not kube-agents-eval-bot", faults)
+        # The reset's rule would skip it too, so the probe closes it by number and says so; nothing is left open.
+        self.assertIn("reset: issue #1 closed by number, since the reset's ledger rule would not have found it", faults)
+        self.assertEqual(fake.detail[1]["state"], "closed")
+        self.assertTrue(fake.notes[1][0]["body"].startswith(ledgers.RESET_MARKER))
+        self.assertEqual([f for f in faults if f.startswith("reset read-back")], [])
 
     def test_a_stamp_that_does_not_come_back_as_written_is_the_read_back_fault(self):
         fake = FakeGitLab()
@@ -410,6 +417,15 @@ class LedgerProbeTest(unittest.TestCase):
         fake.unmarked_notes = True
         _, faults, _ = self._probe(fake)
         self.assertEqual(faults, ["reset read-back: issue #1 carries no note opening with the reset marker"])
+
+    def test_a_listing_the_reset_cannot_make_is_the_reset_fault(self):
+        # The reset's own listing fails after the create: named as the reset step, the issue
+        # said to stay open until the next lease, no traceback out of the probe.
+        fake = FakeGitLab(fail={("GET", "/issues")})
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertEqual(len([f for f in faults if f.startswith("reset: issue #1 could not be listed or closed in gke-agentic/kube-agents-evals-2-infra")]), 1, faults)
+        self.assertIn("stays open until the next lease", faults[-1])
 
     def test_a_reset_that_cannot_close_is_the_reset_fault(self):
         fake = FakeGitLab(fail={("PUT", "/issues/1")})

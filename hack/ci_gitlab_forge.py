@@ -286,13 +286,14 @@ def open_ledgers(path: str, token: str, audit_id: str | None, host: str = DEFAUL
     return found
 
 
-def reset_ledgers(path: str, project: str, build: str, token: str, audit_id: str | None, dry_run: bool, host: str = DEFAULT_HOST, scope: str | None = None) -> int:
+def reset_ledgers(path: str, project: str, build: str, token: str, audit_id: str | None, dry_run: bool, host: str = DEFAULT_HOST, scope: str | None = None, bot_login: str | None = None) -> int:
     """Close the open ledgers; return how many did not close. The GitHub
     reset's contract, note for comment and `state_event` for the close. The
-    note's scope follows the audit id unless the caller names one."""
+    note's scope follows the audit id unless the caller names one, and the
+    bot's login is read from the token unless the caller already holds it."""
     expected_project(path, project)
     scope = scope or (f"before repetition of the {audit_id} stream" if audit_id else "at lease time")
-    found = open_ledgers(path, token, audit_id, host, current_login(token, host))
+    found = open_ledgers(path, token, audit_id, host, bot_login or current_login(token, host))
     unclosed = []
     for issue in found:
         iid = issue["iid"]
@@ -378,10 +379,11 @@ def probe_ledger_path(path: str, project: str, build: str, agent_token: str, led
         seen = None
     elif seen is None and not faults:
         faults.append(f"read-back: GitLab answered the read of issue #{iid} with an empty body")
+    not_a_ledger = None
     if isinstance(seen, dict):
-        why = not_a_ledger_because(seen, PROBE_AUDIT_ID, bot_login)
-        if why:
-            faults.append(f"read-back: issue #{iid} does not read as a ledger: {why}")
+        not_a_ledger = not_a_ledger_because(seen, PROBE_AUDIT_ID, bot_login)
+        if not_a_ledger:
+            faults.append(f"read-back: issue #{iid} does not read as a ledger: {not_a_ledger}")
         _, audit, stamp = _probe_issue_view(seen)
         if audit != PROBE_AUDIT_ID:
             faults.append(f"read-back: issue #{iid} carries no parseable footer for {PROBE_AUDIT_ID} (got {audit!r})")
@@ -389,10 +391,24 @@ def probe_ledger_path(path: str, project: str, build: str, agent_token: str, led
             faults.append(f"read-back: issue #{iid}'s footer stamp did not come back as written ({stamp})")
         if str(seen.get("state") or "") != "opened":
             faults.append(f"read-back: issue #{iid} is {seen.get('state')!r}, not opened")
-    # Retire it through the reset, the code that retires real ledgers.
-    unclosed = reset_ledgers(path, project, build, agent_token, PROBE_AUDIT_ID, False, host, scope=PROBE_RESET_SCOPE)
-    if unclosed:
-        faults.append(f"reset: {unclosed} probe ledger(s) did not close in {path}")
+    # Retire it through the reset, the code that retires real ledgers. An
+    # issue the ledger rule refused is one the reset cannot see (it applies
+    # the same rule, and so does every later lease), so that one is closed
+    # here by number instead: a probe never leaves its issue open.
+    try:
+        if not_a_ledger:
+            _write("POST", f"/projects/{encoded(path)}/issues/{iid}/notes", agent_token, {"body": ledgers.closing_comment(build, PROBE_RESET_SCOPE)}, host)
+            _write("PUT", f"/projects/{encoded(path)}/issues/{iid}", agent_token, {"state_event": "close"}, host)
+            faults.append(f"reset: issue #{iid} closed by number, since the reset's ledger rule would not have found it")
+        else:
+            unclosed = reset_ledgers(path, project, build, agent_token, PROBE_AUDIT_ID, False, host, scope=PROBE_RESET_SCOPE, bot_login=bot_login)
+            if unclosed:
+                faults.append(f"reset: {unclosed} probe ledger(s) did not close in {path}")
+    except RateLimited:
+        raise
+    except CALL_FAULTS + (ResetError,) as exc:
+        faults.append(f"reset: issue #{iid} could not be listed or closed in {path} ({exc}); it stays open until the next lease's reset")
+        return iid, faults
     try:
         after = call("GET", f"/projects/{encoded(path)}/issues/{iid}", ledger_token, None, host)
         notes = call("GET", f"/projects/{encoded(path)}/issues/{iid}/notes", ledger_token, None, host)
@@ -401,7 +417,11 @@ def probe_ledger_path(path: str, project: str, build: str, agent_token: str, led
     except CALL_FAULTS as exc:
         faults.append(f"reset read-back: the ledger token could not read issue #{iid} after the close ({exc})")
         return iid, faults
-    if not isinstance(after, dict) or str(after.get("state") or "") != "closed":
+    if after is None:
+        faults.append(f"reset read-back: GitLab answered the read of issue #{iid} after the close with an empty body")
+    elif not isinstance(after, dict):
+        faults.append(f"reset read-back: GitLab answered the read of issue #{iid} after the close with no object ({str(after)[:PROBE_REPLY_EXCERPT_CHARS]})")
+    elif str(after.get("state") or "") != "closed":
         faults.append(f"reset read-back: issue #{iid} is not closed after the reset")
     marked = isinstance(notes, list) and any(str(n.get("body") or "").startswith(RESET_MARKER) for n in notes if isinstance(n, dict))
     if not marked:
