@@ -376,6 +376,49 @@ note column does. The rules registered today, with the catalogue entry each read
   provisioner is `kubernetes.io/no-provisioner` (how Local SSD becomes a PersistentVolume) is a
   `risk`, named with the volume; a volume name that suggests state is marked. A Deployment's
   `emptyDir`, a memory-backed `emptyDir` and a `hostPath` mounted read-only are notes.
+- **Removed-API callers** (`removed-api-callers`, entry 6; can block). From the removed-release
+  audit read: each caller is one principal, user agent and API (`core/v1 endpoints`). The
+  operator's callers are user accounts, service accounts, and Kubernetes service accounts outside
+  the system namespaces (`kube-system`, `kube-public`, `kube-node-lease`, `gatekeeper-system`,
+  `cnrm-system`, `asm-system`, and the `gke-`, `gmp-` and `config-management-` namespaces); every
+  other `system:` principal, the node identities and Google-managed service agents are the
+  provider's. An operator caller of an API removed at or before the target minor whose last write
+  is within 48 hours blocks, named with the release and, where `removed_apis.json` knows one, the
+  replacement; one silent for longer is a risk naming its last write, since a migrated caller must
+  not block for a week. A removal after the target, a provider caller (GKE moves its own
+  components) and a principal the rule cannot place are risks, never blockers. A read that failed
+  or timed out is `unknown`, graded on the pages before it; a sampled read is a note.
+- **Changed defaults** (`changed-defaults`, entry 8). The minors the upgrade crosses, from the
+  control plane for an admission default and from the lowest node pool for a kubelet default, are
+  looked up in `upgrade_shape_tables.DEFAULT_CHANGES_BY_MINOR`, each row with its source (the Pod
+  Security Standards page, the Kubernetes 1.33 changelog, the 1.36 release notes). A namespace
+  whose `pod-security.kubernetes.io/enforce-version` is `latest` or absent follows the running
+  minor; where a crossed minor tightens the level it enforces (1.23 restricted: no `runAsUser: 0`;
+  1.34 baseline: no host field on probes), it is a risk naming the namespace and the setting; a
+  minor that only widens an allowlist is a note; a namespace pinned to a named version is the safe
+  case and is counted. A workload with a `gitRepo` volume is a risk across 1.33 (disabled by
+  default) and 1.36 (permanently). A target past the table's `as_of` (1.36) is graded on the
+  minors the table covers, with a note that the table ends there; a namespaced read that failed
+  leaves the labels ungraded, in the note, since the rule never blocks.
+- **Deprecated-API callers** (`deprecated-api-callers`, entry 9). From the deprecated-or-kubectl
+  audit read: each operator caller of an API stamped `k8s.io/deprecated` with no removal release
+  is a risk named with its principal, user agent, API and, for Endpoints, the successor
+  (EndpointSlice); a principal the rule cannot place is a risk naming it. The provider's callers
+  the filter did not express are counted in the note, not filed; kube-system's
+  endpoint-controller is stamped on every Service's Endpoints it writes, so the label alone
+  identifies nothing.
+- **Client and add-on skew** (`client-addon-skew`, entry 10). kubectl is supported within one
+  minor of kube-apiserver (`upgrade_shape_tables.KUBECTL_SKEW_SOURCE`, the Kubernetes version skew
+  policy): a `kubectl/vX.Y` user agent in the deprecated-or-kubectl read, or a workload image
+  whose repository ends in `kubectl`, further than one minor from the target is a risk naming the
+  version and the principal or workload. A client-go user agent carries the binary's version, not
+  the library's, so those callers are counted, not graded; the log carries writes, so a kubectl
+  that only reads is not in it. `addonsConfig` names the GKE-managed add-ons that are on; they
+  expose no version and GKE owns them, so they are listed in the note and not graded. A
+  third-party add-on recognised by image repository is graded against
+  `upgrade_shape_tables.ADDON_SUPPORT` (the vendor's page and the day it was read): a target
+  outside the release's supported range is a risk; an add-on with no table, or at a release the
+  table does not list, is a note ("version not graded"). Nothing is inferred.
 - **Zonal control plane** (`zonal-control-plane`, entry 11). A cluster whose `location` is a zone
   is a risk on every report, never a blocker: the Kubernetes API is unreachable for a short window
   while the single control-plane replica is rebuilt, running pods are unaffected, and the cell

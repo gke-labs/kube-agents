@@ -1096,7 +1096,7 @@ MITIGATIONS = {
     6: {
         "title": "A served API version is removed",
         "before": "Clients still calling an API version the target minor removes (the deprecation insight, audit entries labelled k8s.io/removed-release, declared apiVersions).",
-        "read_today": "the deprecation scan in `fleet-upgrade-verification` reads the `apiVersion`s a linked GitOps repository declares in raw YAML and JSON, skipping Helm templates",
+        "read_today": "the readiness report's `removed-api-callers` rule reads each cluster's audit log for `k8s.io/removed-release` stamps (a paged `gcloud logging read`, seven days, writes only) and blocks on an operator caller of an API the target removes while it still writes; the deprecation scan in `fleet-upgrade-verification` reads the `apiVersion`s a linked GitOps repository declares in raw YAML and JSON, skipping Helm templates",
         "mitigate_before": "Migrate the callers: bump client libraries and kubectl, rewrite manifests and Helm release state to the new version.",
         "mitigate_after": "The stored objects still exist; re-apply them through the new version and the clients recover.",
     },
@@ -1110,21 +1110,21 @@ MITIGATIONS = {
     8: {
         "title": "A default changes in the new minor",
         "before": "The target minor's release notes read against the cluster: admission enforcement, seccomp defaults, feature gates that flip on.",
-        "read_today": "nothing reads a namespace's admission pin; the upgrade plan hands the compatibility check to the operator after at most a quick search",
+        "read_today": "the readiness report's `changed-defaults` rule reads each namespace's Pod Security Admission labels and flags a namespace at `latest` whose level a crossed minor tightens, and workloads with `gitRepo` volumes, from a per-minor table with sources; the rest of the compatibility check stays with the operator",
         "mitigate_before": "Read the target minor's notes, run Pod Security Admission in warn and audit before enforce, rehearse on staging at the target version.",
         "mitigate_after": "The audit log names the rejecting rule; relabel the namespace or adjust the pod.",
     },
     9: {
         "title": "A feature is deprecated but still served",
         "before": "Deprecation warnings in API responses and audit logs (k8s.io/deprecated) for a feature with a removal date.",
-        "read_today": "nothing scheduled; the audit log stamps every deprecated call (`k8s.io/deprecated`), and the agent can read it on request",
+        "read_today": "the readiness report's `deprecated-api-callers` rule reads the audit log's `k8s.io/deprecated` stamps (a paged `gcloud logging read` per cluster, seven days, writes only), on request and under the daily readiness watch, and names each operator caller with its principal, user agent and API",
         "mitigate_before": "Plan the migration while the feature still works.",
         "mitigate_after": "None needed yet.",
     },
     10: {
         "title": "Add-on and client skew",
         "before": "Installed add-on versions against their support matrices for the target minor; a node pool further behind the control plane than the skew policy allows.",
-        "read_today": "the readiness mode grades node-pool skew, and the security-patch orchestrator's `pool-skew` check flags a pool too far behind its control plane every Monday; add-on and client skew are unread",
+        "read_today": "the readiness mode grades node-pool skew, and the security-patch orchestrator's `pool-skew` check flags a pool too far behind its control plane every Monday; the readiness mode's `client-addon-skew` rule grades kubectl clients (audit-log user agents and kubectl images) against the one-minor window and third-party add-on images against a sourced support table; GKE-managed add-ons expose no version and are listed, not graded",
         "mitigate_before": "Upgrade add-ons to a version whose matrix includes the target before the cluster moves; keep node pools inside the skew window.",
         "mitigate_after": "Upgrade the add-on.",
     },
