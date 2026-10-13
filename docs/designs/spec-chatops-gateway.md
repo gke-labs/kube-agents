@@ -1652,7 +1652,7 @@ thematic break is dropped, a list marker
 becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
 keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
 its label and URL, since a code block renders no link; only an escaped `\|` stays inside
-a cell). A table the chunker cuts renders as a block up to the cut and raw after it. A
+a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
 heading run onto the end of a sentence with no line break is moved to its own line
 first. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a

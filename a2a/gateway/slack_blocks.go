@@ -18,8 +18,9 @@ import (
 // Slack will display (Slack decodes the escaped &, < and > back). Widths are
 // counted in runes, so a cell holding East Asian wide characters or emoji
 // pads short. The relay chunks a long answer before this runs and each
-// chunk is rewritten alone, so a table the chunker cuts renders as a block
-// up to the cut and raw rows after it.
+// chunk is rewritten alone; a table the chunker cuts gets its header and
+// delimiter rows again at the head of the next chunk (chatChunks), so each
+// part renders as a block.
 var (
 	// slackHeadingRE is an ATX heading: up to three spaces, one to six #,
 	// whitespace, the text, and an optional closing run of # set off by
