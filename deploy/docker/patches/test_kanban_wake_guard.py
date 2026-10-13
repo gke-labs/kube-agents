@@ -137,6 +137,20 @@ class TestTheCreateGate(unittest.TestCase):
         self.assertIsNone(other)
 
 
+class TestTheUnblockGate(unittest.TestCase):
+    def test_a_marked_turn_is_refused(self):
+        token = guard._WAKE_TURN.set(True)
+        try:
+            refusal = guard.refuse_unblock_on_wake()
+        finally:
+            guard._WAKE_TURN.reset(token)
+        self.assertIsNotNone(refusal)
+        self.assertIn("for the person", refusal)
+
+    def test_an_unmarked_turn_is_not(self):
+        self.assertIsNone(guard.refuse_unblock_on_wake())
+
+
 class TestTheApplier(unittest.TestCase):
     """Drive apply_kanban_wake_guard against a fixture tree."""
 
@@ -168,6 +182,10 @@ class TestTheApplier(unittest.TestCase):
                 + applier.CREATE_ANCHOR
                 + "    title = args['title']\n"
                 "    return title\n"
+                "\n"
+                "def _handle_unblock(args, **kw):\n"
+                + applier.UNBLOCK_ANCHOR
+                + "    return args['task_id']\n"
             ),
         }
         for rel, text in files.items():
@@ -189,6 +207,7 @@ class TestTheApplier(unittest.TestCase):
         self.assertIn("_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)", api)
         self.assertIn("_kanban_refuse_create_on_wake()", tools)
         self.assertIn("run_in_executor(None, _kanban_wake_carry(_run))", api)
+        self.assertIn("_kanban_refuse_unblock_on_wake()", tools)
         for text in (wake, api, tools):
             ast.parse(text)
 

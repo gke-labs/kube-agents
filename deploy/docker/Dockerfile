@@ -1474,7 +1474,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # self-post now marks its request, the API server's chat-completions handler
 # marks the turn for a front-door (a2a-ctx-*) session, _run_agent carries the
 # mark onto the turn's executor thread, and kanban_create refuses on a marked
-# turn. The wake turn can still answer.
+# turn, as does kanban_unblock (the person's answer can unblock). The wake
+# turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
 # kanban_priority: user cards ahead of background
@@ -1603,6 +1604,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     cp /tmp/latency-patches/kanban_wake_guard.py /opt/hermes/tools/kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_guard.py /opt/hermes && \
     grep -qF '_kanban_refuse_create_on_wake()' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '_kanban_refuse_unblock_on_wake()' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
     grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
     grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \

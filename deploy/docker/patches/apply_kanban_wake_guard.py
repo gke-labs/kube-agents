@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wire tools/kanban_wake_guard.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Four anchored
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Five anchored
 edits across three files, plus their imports:
 
 * ``gateway/wake.py`` — ``_self_post_chat_completion``'s request headers gain
@@ -13,7 +13,8 @@ edits across three files, plus their imports:
   ``run_in_executor`` call is wrapped in ``carry_wake_mark``, so the mark
   reaches the thread the turn runs on.
 * ``tools/kanban_tools.py`` — ``kanban_create`` checks the gate right after
-  upstream's delegated-child check, before it reads any argument.
+  upstream's delegated-child check, before it reads any argument, and
+  ``kanban_unblock`` right after its orchestrator check.
 
 Why the change is needed is documented in the module docstring of
 ``deploy/docker/patches/kanban_wake_guard.py``. Usage::
@@ -92,10 +93,22 @@ CREATE_PATCHED = CREATE_ANCHOR + (
     "    if _wake_err:\n"
     "        return tool_error(_wake_err)\n"
 )
+# The kanban_unblock handler's orchestrator check, which only it has.
+UNBLOCK_ANCHOR = '    _require_orchestrator_tool("kanban_unblock")\n'
+UNBLOCK_PATCHED = UNBLOCK_ANCHOR + (
+    "    # kube-agents patch: a wake turn in a gateway conversation can't\n"
+    "    # release a card; the person's answer can (#2610). See\n"
+    "    # tools/kanban_wake_guard.py.\n"
+    "    _wake_unblock_err = _kanban_refuse_unblock_on_wake()\n"
+    "    if _wake_unblock_err:\n"
+    "        return tool_error(_wake_unblock_err)\n"
+)
+
 TOOLS_TRAILER = (
     "\n\n# kube-agents patch: see tools/kanban_wake_guard.py\n"
     "from tools.kanban_wake_guard import (  # noqa: E402\n"
     "    refuse_create_on_wake as _kanban_refuse_create_on_wake,\n"
+    "    refuse_unblock_on_wake as _kanban_refuse_unblock_on_wake,\n"
     ")\n"
 )
 
@@ -116,11 +129,12 @@ def apply(root: Path) -> None:
     tools = patchlib.Patch(root, TOOLS_RELATIVE, prefix="kanban_wake_guard")
     tools.refuse_if_patched("_kanban_refuse_create_on_wake()")
     tools.substitute(CREATE_ANCHOR, CREATE_PATCHED, label="create gate")
+    tools.substitute(UNBLOCK_ANCHOR, UNBLOCK_PATCHED, label="unblock gate")
     tools.append(TOOLS_TRAILER)
 
     wake.commit("1 anchor")
     api.commit("3 anchors")
-    tools.commit("1 anchor")
+    tools.commit("2 anchors")
 
 
 if __name__ == "__main__":

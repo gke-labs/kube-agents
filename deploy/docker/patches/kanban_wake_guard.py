@@ -5,7 +5,7 @@ wired in by ``deploy/docker/patches/apply_kanban_wake_guard.py`` at four
 places: ``gateway/wake.py`` (the self-post marks its request),
 ``gateway/platforms/api_server.py`` (the chat-completions handler marks the
 turn, and ``_run_agent`` carries the mark onto the thread the turn runs on),
-and ``tools/kanban_tools.py`` (``kanban_create`` refuses on a marked turn).
+and ``tools/kanban_tools.py`` (``kanban_create`` and ``kanban_unblock`` refuse on a marked turn).
 
 Why
 ---
@@ -28,9 +28,13 @@ card's worker opened the pull request nobody asked for: #231 (2026-10-10) and
 
 The wake turn is not a message from the person. So, as for a ``/session``
 wake in the A2A gateway (#2819), it can relay or summarize what came back but
-can't file a new card: only a person's turn starts new work that way. That's
-#2205's "open a pull request only when asked" enforced at ``kanban_create``
-rather than left to the model reading the request.
+can't file a new card or unblock one: only a person's turn starts work. That's
+#2205's "open a pull request only when asked" enforced at the tools rather than
+left to the model reading the request. Unblock is the sibling path: a worker
+that held to "don't open a PR" can block asking whether to open one, and a wake
+turn that answers "yes" and unblocks it opens the PR just the same. The
+blocked card's question is for the person; their reply arrives as a real turn,
+which can still unblock it.
 
 What this changes
 -----------------
@@ -50,7 +54,7 @@ What this changes
    follow, so its ``run_in_executor`` call is wrapped in :func:`carry_wake_mark`,
    which sets the same value on that thread for the turn. Tool calls the agent
    runs in parallel copy that thread's context (``agent/tool_executor.py``).
-4. ``kanban_create`` refuses on a marked turn. The mark belongs to the turn,
+4. ``kanban_create`` and ``kanban_unblock`` refuse on a marked turn. The mark belongs to the turn,
    not the session, so a person's message that lands in the same session while
    a wake turn runs is a separate turn and is untouched.
 
@@ -63,10 +67,9 @@ Scope
 Only front-door ``a2a-ctx-*`` sessions. The event watcher's ``k8s-evt-*``
 sessions get the same wake and are a separate follow-up (#2911). Nothing else
 that files cards is affected: dispatcher-spawned workers, cron, the CLI, and a
-person's own turns. The guard is on ``kanban_create`` only. A wake turn that
-unblocks a blocked card (``kanban_unblock``, perhaps after a
-``kanban_comment``), shells out to ``hermes kanban create``, or delegates isn't
-covered.
+person's own turns. The guard is on ``kanban_create`` and ``kanban_unblock``.
+``kanban_comment`` stays open, since a comment alone starts nothing. A wake turn
+that shells out to ``hermes kanban``, or delegates, isn't covered.
 
 Fail-open throughout: anything short of a positive "this session is on a wake
 turn" lets the create through.
@@ -102,6 +105,13 @@ WAKE_REFUSAL = (
     "work. Don't file a card from it. If you'd suggest a follow-up (a fix, a "
     "pull request, another investigation), say so in your reply and wait for "
     "the person to ask for it."
+)
+
+UNBLOCK_REFUSAL = (
+    "kanban_unblock refused: this turn is an automatic notification that a "
+    "card changed, not a message from the person, so it can't release work. "
+    "If the card is waiting on a question, that question is for the person: "
+    "relay it and wait for their answer, which can unblock the card."
 )
 
 #: Whether the running turn is a wake turn in a front-door session.
@@ -191,3 +201,11 @@ def refuse_create_on_wake() -> str | None:
         return None
     logger.warning("kanban_wake_guard: refused kanban_create on a front-door wake turn")
     return WAKE_REFUSAL
+
+
+def refuse_unblock_on_wake() -> str | None:
+    """The ``kanban_unblock`` gate. ``None`` when the unblock may proceed."""
+    if not is_wake_turn():
+        return None
+    logger.warning("kanban_wake_guard: refused kanban_unblock on a front-door wake turn")
+    return UNBLOCK_REFUSAL

@@ -15,6 +15,8 @@ This drives the patched code itself:
 4. The real ``kanban_create`` handler refuses on a marked turn and writes no
    card. A turn in another context, such as a person's message landing in the
    same session meanwhile, still creates.
+5. The real ``kanban_unblock`` handler refuses on a marked turn and leaves the
+   card blocked; the person's answer, a turn of its own, still unblocks it.
 
 The #2610 shape: periodic run 2109358269314109440, where a front-door
 session's wake turn filed the card whose worker opened #210.
@@ -231,6 +233,29 @@ check("a turn in another context, meanwhile, still creates", person.get("ok") is
 check("only that card was written", cards() == before + 1, f"cards {before} -> {cards()}")
 after = tool_create("Next question")
 check("once the wake turn ends, the session creates again", after.get("ok") is True, json.dumps(after))
+
+# --- 5. kanban_unblock -------------------------------------------------------------
+print("kanban_unblock:")
+
+
+def status(task_id):
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row[0] if row else None
+
+
+asked = tool_create("Fix ready: shall I open a PR?")["task_id"]
+conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (asked,))
+conn.commit()
+token = guard._WAKE_TURN.set(True)
+try:
+    wake_unblock = json.loads(kt._handle_unblock({"task_id": asked}))
+finally:
+    guard._WAKE_TURN.reset(token)
+check("a wake turn's unblock is refused", not wake_unblock.get("ok") and "refused" in json.dumps(wake_unblock), json.dumps(wake_unblock))
+check("the refusal says the question is for the person", "for the person" in json.dumps(wake_unblock))
+check("the card stays blocked", status(asked) == "blocked", f"status={status(asked)}")
+answer = json.loads(contextvars.Context().run(kt._handle_unblock, {"task_id": asked}))
+check("the person's answer, a turn of its own, still unblocks it", answer.get("ok") is True, json.dumps(answer))
 
 print()
 if FAILURES:
