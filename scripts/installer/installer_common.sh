@@ -154,7 +154,8 @@ readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/sla
 # A-Z0-9. This mirrors the gateway's slackIsHomeChannelID and
 # slackMinChannelIDLen (a2a/gateway/slack.go). The operator's
 # a2aSlackHomeChannel (k8s-operator platformagent_a2a_manifests.go) holds
-# the same rule. #2791 adds both. Keep the three in step.
+# the same rule. Keep the three in step (docs/README.md lists them; a test
+# checks this one against the gateway's).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
