@@ -1,6 +1,7 @@
 package hermesbridge
 
 import (
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -51,6 +52,10 @@ const (
 	// kanbanCreateTool is the Hermes tool that files a card; a turn that
 	// called it successfully keeps its ask marked on the terminal.
 	kanbanCreateTool = "kanban_create"
+	// slackUXEnv is the agent's KAGE_SLACK_UX, which the bridge inherits
+	// with the rest of the agent environment: unset is on, and once set only
+	// slackUXOnValues keep it on (slack_presenter.FLAG_ON_VALUES).
+	slackUXEnv = "KAGE_SLACK_UX"
 	// codeHold wraps a held code span's index (CODE_PLACEHOLDER's NULs).
 	codeHold = "\x00"
 )
@@ -104,6 +109,15 @@ var (
 		"describe": true,
 	}
 )
+
+// slackUXOnValues are the KAGE_SLACK_UX values that keep it on.
+var slackUXOnValues = map[string]bool{"1": true, "true": true, "yes": true, "on": true}
+
+// slackUXOn reads KAGE_SLACK_UX as slack_presenter.enabled does.
+func slackUXOn() bool {
+	value, set := os.LookupEnv(slackUXEnv)
+	return !set || slackUXOnValues[strings.ToLower(strings.TrimSpace(value))]
+}
 
 // askKind is the mark.ask token for an ask, from its words alone.
 func askKind(text string) string {

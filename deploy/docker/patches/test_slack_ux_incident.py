@@ -423,7 +423,7 @@ class RuntimeTest(unittest.TestCase):
         _wrapped, res = self.deliver(adapter)
         self.assertTrue(res.success)
         (kind, chat_id, text, chat, update), = adapter.log
-        self.assertEqual((kind, chat_id, update), ("send_chat", CHANNEL, "alert"))
+        self.assertEqual((kind, chat_id, update), ("send_chat", CHANNEL, "alert-k8s-evt-0000abcd"), "the key the alert was posted under")
         self.assertEqual(chat["headline"], runtime.parse_triage(REPORT)["headline"])
         self.assertEqual([c["reply"] for c in chat["choices"]],
                          [f"{c['text']} — apply Option {letter}" for c, letter in zip(chat["choices"], "AB")])

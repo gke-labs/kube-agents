@@ -95,7 +95,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(cm.plan_mark("fleet", [running, done]), {"ask": "fleet"})
         self.assertEqual(cm.plan_mark("fleet", [done, failed]), {"settle": "failed"})
         self.assertEqual(cm.plan_mark("fleet", [done, archived]), {"settle": "done"}, "an archive is not a failure")
-        self.assertEqual(cm.plan_mark("", [running]), {})
+        self.assertIsNone(cm.plan_mark("", [running]), "no recorded kind: a running plan leaves the mark alone")
         self.assertIsNone(cm.plan_mark("fleet", []))
 
     def test_text_is_unescaped(self):

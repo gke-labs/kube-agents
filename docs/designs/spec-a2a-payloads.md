@@ -712,19 +712,24 @@ that would turn every follow-up into a steer queued behind hours of idle.
 **The emitter.** Two halves, each a port of the `today` presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
 first sentence as `headline`, the rest as `detail`, or under `fold` past `detail`'s cap),
-the prompt's `mark.ask` on each `progress` heartbeat, and the terminal's mark-only message
-when the turn filed a card (a `kanban_create` call that did not fail). The kanban notifier,
-in the Hermes gateway process where the board is, sends a card's work through
-`a2a notify --chat-file <object> --update <key>` with these keys: `plan` for a thread's
-plan (`plan-2` and on for later plans in the same thread), `question-<card>` for a card's
-question and its answered form, and `alert` for an incident's triage, which edits the
-event watcher's alert because the watcher posts it under that key. The plan carries the
-`mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked` while one
-waits on the user, and `settle: done` or `failed` once all have settled. The notifier has
-not seen the ask, so the bridge records its kind on the conversation route
+the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
+`kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on,
+the terminal's mark-only message; anywhere else nothing settles the ask later, so the
+terminal keeps its default. The kanban notifier, in the Hermes gateway process where the
+board is, sends a card's work through `a2a notify --chat-file <object> --update <key>`
+with these keys: `plan` for a thread's plan, `question-<card>` for a card's question and
+its answered form (each later one in the same thread or card numbered after it, `plan-2`,
+`question-<card>-2`), and `alert-<event session>` for an incident's triage, which edits the
+event watcher's alert because the watcher posts it under that key. The alert is a
+home-channel post and its triage a reply in its thread, so the edit asks the gateway to
+keep `update` keys for a home-channel thread as it does for a conversation. The plan
+carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
+while one waits on the user, and `settle: done` or `failed` once all have settled. The
+notifier has not seen the ask, so the bridge records its kind on the conversation route
 (`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
 typed answer read back onto the question it answers, which needs the backend's own
-history.
+history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
+stands), it posts each notify's text, a later `update` of the same key included.
 
 ### Rules
 

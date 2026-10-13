@@ -729,10 +729,15 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             chat = _failure_chat(content)
         argv, path = [], ""
         if isinstance(chat, dict) and str(content or "").strip():
-            with tempfile.NamedTemporaryFile("w", prefix=CHAT_FILE_PREFIX, suffix=CHAT_FILE_SUFFIX,
-                                             delete=False, encoding="utf-8") as handle:
-                json.dump(chat, handle, ensure_ascii=False)
-                path = handle.name
+            # Serialized before the file exists, so a value JSON cannot hold leaves no file behind.
+            body = json.dumps(chat, ensure_ascii=False)
+            fd, path = tempfile.mkstemp(prefix=CHAT_FILE_PREFIX, suffix=CHAT_FILE_SUFFIX)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+            except OSError:
+                os.unlink(path)
+                raise
             argv += ["--chat-file", path]
         if update:
             argv += ["--update", update]

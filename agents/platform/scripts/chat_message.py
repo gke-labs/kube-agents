@@ -77,13 +77,14 @@ ASK_BY_REACTION = {
 #: A needs-you choice's reply: the label, then the card it answers, as a click
 #: posts it today (``slack_ux_clicks.CARD_NOTE`` after a blank line).
 NEEDS_YOU_REPLY = "{label}\n\n(Clicked on the question from card {card}.)"
-#: The ``update`` keys a card's notifies carry: the thread's plan (a later plan
-#: in the same thread numbered after it), a card's question, and the alert
-#: the event watcher posted, which the triage edits.
+#: The ``update`` keys a card's notifies carry: the thread's plan and a card's
+#: question, each later one in the same thread or card numbered after the
+#: first, and the alert the event watcher posted, which the triage edits
+#: (``chat_notify.alert_update_key``, one per alert).
 PLAN_UPDATE = "plan"
 PLAN_UPDATE_NEXT = "plan-{number}"
 QUESTION_UPDATE = "question-{card}"
-ALERT_UPDATE = _notify.ALERT_UPDATE_KEY
+QUESTION_UPDATE_NEXT = "question-{card}-{number}"
 #: Plan item statuses whose title shows the note, so the note rides beside it.
 NOTE_STATUSES = frozenset({_status.TASK_RUNNING, _status.TASK_ERROR})
 #: Today's suffix on the recommended incident option's label; on next the
@@ -228,6 +229,11 @@ def ask_kind(text: str | None) -> str:
     return ASK_BY_REACTION[_presenter.arrival_reaction(text)]
 
 
+def alert_update(session_id: str) -> str:
+    """The ``update`` key of the alert an event session posted ("" for none), which its triage edits."""
+    return _notify.alert_update_key(session_id)
+
+
 def mark(ask: str = "", settle: str = "") -> dict:
     """A whole ``mark`` state: ``{}`` takes the ask's reaction off and settles nothing."""
     out: dict = {}
@@ -289,7 +295,8 @@ def plan_mark(ask: str, rows: Sequence[Any]) -> dict | None:
     keeps the kind alone; once every row has settled the kind comes off, with
     ``failed`` if a card gave up (an archived one is not a failure) and ``done``
     otherwise. None for no rows. ``ask`` is the kind the conversation's route
-    recorded, "" when none was.
+    recorded, "" when none was; with none, a running plan sends no mark rather
+    than one that would take a kind off that another sender set.
     """
     rows = list(rows)
     if not rows:
@@ -298,7 +305,7 @@ def plan_mark(ask: str, rows: Sequence[Any]) -> dict | None:
     if _status.TASK_PENDING in statuses:
         return mark(ask, SETTLE_BLOCKED)
     if _status.TASK_RUNNING in statuses:
-        return mark(ask)
+        return mark(ask) if ask else None
     failed = any(row.status == _status.TASK_ERROR and not getattr(row, "archived", False) for row in rows)
     return mark(settle=SETTLE_FAILED if failed else SETTLE_DONE)
 

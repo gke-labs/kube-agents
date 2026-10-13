@@ -75,7 +75,8 @@ def _out(chat: dict | None, carrier: str, update: str = "") -> dict | None:
 
 class SharedCasesTest(unittest.TestCase):
     def setUp(self):
-        for store in (slack_ux_moments._questions, slack_ux_moments._unsettled, slack_ux_moments._announced):
+        for store in (slack_ux_moments._questions, slack_ux_moments._unsettled, slack_ux_moments._announced,
+                      slack_ux_moments._question_keys):
             store.clear()
 
     def run_case(self, case: dict) -> list:

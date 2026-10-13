@@ -161,6 +161,7 @@ func sameChat(t *testing.T, got lib.Part, want json.RawMessage) bool {
 // for a turn that filed cards). The notifies are the kanban notifier's,
 // which deploy/docker/patches/test_chat_conformance.py runs.
 func TestBridgeSharedCases(t *testing.T) {
+	t.Setenv(slackUXEnv, "1")
 	ran := 0
 	for _, c := range loadSharedCases(t) {
 		if c.Input.Markdown != "" {
@@ -184,8 +185,7 @@ func TestBridgeSharedCases(t *testing.T) {
 				}
 			case ev.Terminal != "":
 				ran++
-				run := &taskRun{origin: &lib.Envelope{}}
-				run.origin.Payload, _ = json.Marshal(lib.Message{Parts: []lib.Part{{Kind: "text", Text: c.Input.Events[i-1].Ask}}})
+				run := &taskRun{origin: slackOrigin(t, c.Input.Events[i-1].Ask)}
 				act := newActivityState(false)
 				act.cardsFiled.Store(len(ev.FiledCards) > 0)
 				run.act.Store(act)
@@ -246,6 +246,7 @@ func terminalParts(t *testing.T, url, taskID string) []lib.Part {
 // mark; a turn that filed a card ends on a mark-only terminal keeping the
 // ask's kind, and a kanban_create that failed files nothing.
 func TestBridge_TheResultIsFoldedAndATurnThatFiledCardsKeepsItsAsk(t *testing.T) {
+	t.Setenv(slackUXEnv, "1")
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 prompt = sys.argv[-1]
@@ -258,14 +259,16 @@ print("**Two clusters are restarting.** The first is seeded-a.\n\nseeded-b has 3
 	c := gatewayClient(t, url)
 
 	for _, tc := range []struct {
-		id, prompt string
-		mark       map[string]any
+		id, conversation, prompt string
+		mark                     map[string]any
 	}{
-		{"task-direct", "is checkout-gateway restarting in seeded-a?", nil},
-		{"task-fan", "which clusters have pods restarting right now? fan out", map[string]any{"ask": askFleet}},
-		{"task-broken", "which clusters are broken right now?", nil},
+		{"task-direct", "slack:C1/1.1", "is checkout-gateway restarting in seeded-a?", nil},
+		{"task-fan", "slack:C1/1.2", "which clusters have pods restarting right now? fan out", map[string]any{"ask": askFleet}},
+		{"task-broken", "slack:C1/1.3", "which clusters are broken right now?", nil},
+		// Only the Slack plan settles the ask, so a Google Chat turn keeps the default.
+		{"task-gchat", "gchat:spaces/A/threads/B", "which clusters have pods restarting right now? fan out", nil},
 	} {
-		submit(t, c, tc.id, tc.prompt)
+		submitFrom(t, c, tc.id, "ctx-"+tc.id, tc.conversation, tc.prompt)
 		task := waitTerminal(t, c, tc.id)
 		if task.State != lib.StateCompleted {
 			t.Fatalf("%s: state = %s, want completed", tc.id, task.State)
@@ -290,6 +293,54 @@ print("**Two clusters are restarting.** The first is seeded-a.\n\nseeded-b has 3
 		}
 	}
 }
+
+// slackOrigin is a submission from a Slack conversation asking prompt.
+func slackOrigin(t *testing.T, prompt string) *lib.Envelope {
+	t.Helper()
+	payload, err := json.Marshal(lib.Message{Parts: []lib.Part{{Kind: "text", Text: prompt}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &lib.Envelope{ContextID: "ctx-1", Payload: payload,
+		Authority: json.RawMessage(`{"audience": {"conversation": "slack:C1/1.2"}}`)}
+}
+
+// The terminal keeps the ask only where the cards' posts settle it: a Slack
+// conversation with KAGE_SLACK_UX on. Off, on Google Chat, or with no
+// conversation, the terminal's default takes it off.
+func TestCardsSettleTheAsk(t *testing.T) {
+	gchat := slackOrigin(t, "x")
+	gchat.Authority = json.RawMessage(`{"audience": {"conversation": "gchat:spaces/A/threads/B"}}`)
+	none := slackOrigin(t, "x")
+	none.Authority = nil
+	for _, tc := range []struct {
+		name   string
+		flag   *string
+		origin *lib.Envelope
+		want   bool
+	}{
+		{"slack, flag unset", nil, slackOrigin(t, "x"), true},
+		{"slack, flag on", ptr(" TRUE "), slackOrigin(t, "x"), true},
+		{"slack, flag off", ptr("false"), slackOrigin(t, "x"), false},
+		{"slack, flag empty", ptr(""), slackOrigin(t, "x"), false},
+		{"google chat", nil, gchat, false},
+		{"no conversation", nil, none, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.flag == nil {
+				t.Setenv(slackUXEnv, "")
+				os.Unsetenv(slackUXEnv)
+			} else {
+				t.Setenv(slackUXEnv, *tc.flag)
+			}
+			if got := cardsSettleTheAsk(tc.origin); got != tc.want {
+				t.Errorf("cardsSettleTheAsk = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
 
 // The presenter's linear-time cases: nothing here retries a line's end from
 // every marker.

@@ -56,17 +56,22 @@ NOTIFY_WAIT_SECONDS = 60
 NOTIFY_CONNECT_SECONDS = 30
 NOTIFY_MARGIN_SECONDS = 15
 NOTIFY_SUBPROCESS_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MARGIN_SECONDS
-# The `a2a notify --update` key an event alert is posted under: the gateway
-# edits the message it posted with that key in the same conversation, which is
-# how the alert's triage replaces the alert in place under next
-# (slack_ux_incident's chat route, chat_message.ALERT_UPDATE). Hermes's send
-# has no such key, so the today path posts as before.
-ALERT_UPDATE_KEY = "alert"
+# The `a2a notify --update` key an event alert is posted under, one per alert
+# (its event session's id): the gateway edits the message it posted with that
+# key, which is how the alert's triage replaces the alert in place under next
+# (slack_ux_incident's chat route, which finds the session by the alert's
+# thread). Hermes's send has no such key, so the today path posts as before.
+ALERT_UPDATE_FORMAT = "alert-{session}"
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
 GCHAT_PLATFORM = "google_chat"
 GCHAT_MESSAGES_TOKEN = "/messages/"
 GCHAT_THREADS_TOKEN = "/threads/"
+
+
+def alert_update_key(session_id: str) -> str:
+    """The ``--update`` key of the alert an event session posted, or "" for no session."""
+    return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
 
 
 def routed_platform() -> str:

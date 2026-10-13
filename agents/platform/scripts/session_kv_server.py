@@ -1351,20 +1351,21 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
-def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+def _run_alert_send(active_platform: str, alert_msg: str, session_id: str = "") -> subprocess.CompletedProcess:
     """Run the alert's send, waiting out a gateway route that is briefly not there.
 
     The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
     roll, or its bind retry) is retried on chat_notify's schedule rather than
     dropping the alert; every other outcome is the caller's to read. Under
-    next the post carries the alert's update key, so the gateway can edit it
-    in place into the triage when the report lands (slack_ux_incident).
+    next the post carries the update key of ``session_id``'s alert, so the
+    gateway can edit it in place into the triage when the report lands
+    (slack_ux_incident).
     """
     delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
     for delay in (*delays, None):
         try:
             return subprocess.run(
-                chat_notify.command(active_platform, alert_msg, update=chat_notify.ALERT_UPDATE_KEY),
+                chat_notify.command(active_platform, alert_msg, update=chat_notify.alert_update_key(session_id)),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -1379,7 +1380,7 @@ def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.Complete
     raise AssertionError("unreachable: the last attempt returns or raises")
 
 
-def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = "") -> str | None:
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
@@ -1389,7 +1390,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = _run_alert_send(active_platform, alert_msg)
+        res = _run_alert_send(active_platform, alert_msg, session_id)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
@@ -2430,7 +2431,8 @@ def trigger_agent_troubleshooter(
         thread_id = None
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
             thread_id = _post_initial_alert(
-                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
+                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg,
+                session_id,
             )
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and

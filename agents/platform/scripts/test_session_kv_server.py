@@ -1011,20 +1011,20 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         return alert
 
     def test_a_slack_thread_gets_the_slack_text_and_the_title(self):
-        alert = self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
-                         [("google_chat", "alert"), ("slack", "slack alert")])
+                         [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
         session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         session_kv_server._start_agent_turn.side_effect = (
             lambda *_args: session_kv_server._record_alert_title.assert_called_once_with("s1", "the title"))
-        self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         session_kv_server._start_agent_turn.assert_called_once()
 
     def test_a_google_chat_thread_gets_neither(self):
-        alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
-        self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert")])
+        alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
+        self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
 
 
@@ -1714,21 +1714,21 @@ class TestAlertPlatformFallback(unittest.TestCase):
 
     def test_a_dead_first_leg_does_not_cost_the_alert(self):
         alert = self._run(
-            lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+            lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args[0] for c in alert.call_args_list], ["google_chat", "slack"])
         session_kv_server._register_session_routing.assert_called_once_with(
             "s1", "slack", "1712345678.000100")
         session_kv_server.mark_delivery_failed.assert_not_called()
 
     def test_the_first_leg_wins_when_it_works(self):
-        alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+        alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         self.assertEqual([c.args[0] for c in alert.call_args_list], ["google_chat"],
                          "a working first leg must not also post to the second")
         session_kv_server._register_session_routing.assert_called_once_with(
             "s1", "google_chat", "spaces/AAA/threads/T1")
 
     def test_every_leg_failing_is_still_recorded_as_undelivered(self):
-        self._run(lambda _platform, _msg: None)
+        self._run(lambda _platform, _msg, _session: None)
         session_kv_server._register_session_routing.assert_not_called()
         session_kv_server.mark_delivery_failed.assert_called_once()
         detail = session_kv_server.mark_delivery_failed.call_args.args[1]
@@ -1744,7 +1744,7 @@ class TestAlertPlatformFallback(unittest.TestCase):
         and taking `platforms[0]` directly would emit nothing at all.
         """
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
-            self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+            self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         picked = [line for line in logs.output if "will not receive it" in line]
         self.assertEqual(len(picked), 1, "exactly one warning, on the pick")
         self.assertIn("google_chat", picked[0])
@@ -1758,7 +1758,7 @@ class TestAlertPlatformFallback(unittest.TestCase):
         is recorded as unconfirmed instead.
         """
         alert = self._run(
-            lambda platform, _msg: session_kv_server.ALERT_SENT_WITHOUT_THREAD
+            lambda platform, _msg, _session: session_kv_server.ALERT_SENT_WITHOUT_THREAD
             if platform == "google_chat" else "1712345678.000100")
         self.assertEqual(
             [c.args[0] for c in alert.call_args_list], ["google_chat"],
@@ -5700,7 +5700,7 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                     session_id="k8s-evt-next",
                 )
                 session_kv_server.trigger_agent_troubleshooter("k8s-evt-next", "alert", {}, next_row_id)
-                mock_post.assert_called_once_with("google_chat", "alert")
+                mock_post.assert_called_once_with("google_chat", "alert", "k8s-evt-next")
                 mock_route.assert_called_once_with("k8s-evt-next", "google_chat", "spaces/A/threads/T-next")
 
         # Toggling chat back on later must not flip either historical row's status.

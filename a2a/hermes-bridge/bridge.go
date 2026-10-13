@@ -1697,14 +1697,25 @@ func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.Ta
 // that filed kanban cards: the ask stays marked, so the terminal's no-mark
 // default does not take it off at the acknowledgement, and the cards'
 // notifies settle it (spec-a2a-payloads, "Card work after the task ends").
-// The one carrier with no text fallback.
+// The one carrier with no text fallback. Only where something settles it:
+// the kanban notifier's Slack plan (deploy/docker/patches/slack_ux_status.py)
+// carries the cards' mark, for a Slack conversation with KAGE_SLACK_UX on,
+// which the bridge reads from the agent environment it inherits. Anywhere
+// else the terminal keeps the default and takes the ask off.
 func cardsMark(run *taskRun, state lib.TaskState) (lib.Part, bool) {
 	a := run.act.Load()
-	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() {
+	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !cardsSettleTheAsk(run.origin) {
 		return lib.Part{}, false
 	}
 	part, err := chatmsg.MarkPart(chatmsg.Mark{Ask: run.askKind()})
 	return part, err == nil
+}
+
+// cardsSettleTheAsk reports whether the cards of origin's conversation carry
+// the ask's settle: a Slack conversation, with KAGE_SLACK_UX on.
+func cardsSettleTheAsk(origin *lib.Envelope) bool {
+	route, err := routeFor(origin)
+	return err == nil && route.Platform == lib.NotifyPlatformSlack && slackUXOn()
 }
 
 // askKind is the mark.ask token for the task's prompt (chat.go).

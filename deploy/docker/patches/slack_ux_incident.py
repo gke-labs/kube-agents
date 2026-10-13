@@ -55,8 +55,9 @@ threaded reply or fold where Slack draws no divider.
 Under ``spec.mode: next`` the report reaches the alert's thread through the
 kanban notifier's chat.notify stand-in (``kanban_chat_notify``), and the edit
 is a ``kube-agents.chat/v1`` message (:func:`chat_triage`) sent with the
-``update`` key the event watcher's alert post carries (``alert``,
-``chat_notify.ALERT_UPDATE_KEY``), so the gateway edits the alert in place. The
+``update`` key the event watcher's alert post carries, one per alert
+(``chat_notify.alert_update_key`` of the alert's event session, found by its
+thread as :func:`alert_title` finds it), so the gateway edits the alert in place. The
 fold is the report's markdown up to the same divider, laid out by the
 renderer. Each button is the option's title, the recommended one primary, and
 its reply starts with that title: "<title> — apply Option B" (or "<title> —
@@ -387,13 +388,18 @@ def _db_path() -> str:
 
 def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[dict]:
     """The routing metadata of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
+    return [meta for _session, meta in _alert_rows(conn, chat_id, thread_id)]
+
+
+def _alert_rows(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[tuple[str, dict]]:
+    """``(event session id, routing metadata)`` of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
     # The LIKE on metadata narrows the scan; the JSON check below decides.
     rows = conn.execute(
-        "SELECT metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
+        "SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
         (ALERT_SESSION_LIKE, thread_id),
     ).fetchall()
     metas = []
-    for (blob,) in rows:
+    for session_id, blob in rows:
         try:
             meta = json.loads(blob or "")
         except ValueError:
@@ -404,8 +410,18 @@ def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list
             and str(meta.get("thread_id") or "") == thread_id
             and str(meta.get("chat_id") or "") == chat_id
         ):
-            metas.append(meta)
+            metas.append((str(session_id), meta))
     return metas
+
+
+def alert_session(chat_id: str, thread_id: str, db_path: str | None = None) -> str:
+    """The event session whose alert was posted as ``thread_id`` in ``chat_id``, else ""."""
+    db_path = db_path or _db_path()
+    if not os.path.exists(db_path):
+        return ""
+    with closing(_read_only(db_path)) as conn:
+        rows = _alert_rows(conn, chat_id, thread_id)
+    return rows[0][0] if rows else ""
 
 
 def _read_only(db_path: str) -> sqlite3.Connection:
@@ -516,9 +532,8 @@ class _ChatAlertEditor:
             while len(_edited) > EDITED_MAX:
                 _edited.popitem(last=False)
             try:
-                result = await self._adapter.send_chat(
-                    chat_id, self._text, self._chat, _chat.ALERT_UPDATE, metadata=metadata,
-                )
+                update = _chat.alert_update(alert_session(self._chat_id, self._thread_id))
+                result = await self._adapter.send_chat(chat_id, self._text, self._chat, update, metadata=metadata)
             except Exception as exc:  # noqa: BLE001 — the threaded reply still delivers it
                 result = SimpleNamespace(success=False, error=str(exc))
             if getattr(result, "success", False) is True:
