@@ -1218,6 +1218,7 @@ _MAX_NAMED_COMMANDS = 5
 # starts a new command on. A token made of these characters alone is such an operator.
 _SHELL_OPERATOR_CHARS = frozenset("&|;()")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
+_SHELL_COMMENT_CHAR = "#"
 _USAGE_FLAGS = ("-h", "--help")
 
 
@@ -1252,9 +1253,13 @@ class WorkerRun(BaseModel):
 def _shell_words(command: str) -> list[str]:
     """The command line as the shell's words, quotes honoured and removed, operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
-    quotes do not balance is split on whitespace instead."""
+    quotes do not balance is split on whitespace instead. The lexer's ``#`` commenter is off, as
+    in ``shlex.split``: bash reads ``#`` as a comment only at the start of a word, which
+    :func:`_shell_argvs` honours, and a ``#`` inside a word (``readiness-#2.json``) is part of
+    the word."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""
     try:
         return list(lexer)
     except ValueError:
@@ -1269,11 +1274,19 @@ def _shell_argvs(command: str) -> list[list[str]]:
     which is read the same way and yields its own argvs."""
     argvs: list[list[str]] = []
     argv: list[str] = []
+    commented = False
     for word in [*_shell_words(command), ";"]:
         if word and set(word) <= _SHELL_OPERATOR_CHARS:
             if argv:
                 argvs.append(argv)
             argv = []
+            commented = False
+            continue
+        if commented:
+            continue
+        if word.startswith(_SHELL_COMMENT_CHAR):
+            # A word opening with `#` starts a comment that runs to the segment's end, as bash reads it.
+            commented = True
             continue
         argv.append(word)
     for argv in list(argvs):
