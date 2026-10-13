@@ -38,7 +38,13 @@ neither, the sandbox's ``gcloud config get-value project``; and with nothing
 at all the tick fails closed rather than let the report script enumerate every
 project the credential can list. Every cluster in those projects is read,
 including ones ``spec.scope.exclude.clusters`` keeps a Cluster Agent from,
-because the report script enumerates by project. The readiness read runs once
+because the report script enumerates by project. A project spelled by its
+number is keyed by the id ``gcloud projects describe`` resolves, learned on
+its first table run; a number the credential cannot resolve is never a key,
+so its clusters earn no report until it resolves: when nothing was read under
+a key, the tick fails with the reason and the remedy, once, through the
+failure marker; beside keyed projects, the table is partial and the line and
+the ledger's ``table_errors`` carry the reason. The readiness read runs once
 per project that holds a pending cluster, each run with its own timeout, so a
 project the sandbox cannot finish leaves only its own clusters ungraded.
 
@@ -75,8 +81,8 @@ Stdout is the chat message (``deliver: "chat"``): one line per report
 produced, naming the target version, the clusters pending it, how many the
 report graded blocked, ready and not graded and which are blocked, where the
 report is on the gateway pod, and when the next refresh is due; one line per
-version retired; one line when the version table was partial; and one line
-when a tick fails. A quiet tick prints nothing, and
+version retired; one line when the version table was partial, with the
+reason per project; and one line when a tick fails. A quiet tick prints nothing, and
 nothing reaches chat. Exit code is 0 on every path except a ledger or report
 that cannot be written, because a tick whose ledger did not save would report
 the same version as new again tomorrow.
@@ -197,7 +203,14 @@ BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could 
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
 TABLE_CUT_SHORT_DETAIL = "the version table's run for project {project} was cut short by its share of the budget"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
-TABLE_UNRESOLVED_DETAIL = "version table for {project} not keyed: the project number did not resolve to its id (`gcloud projects describe` failed); read again tomorrow"
+# The remedy rides on the message: every read role the install binds carries
+# resourcemanager.projects.get (cluster_agent_reconcile.py relies on it), and
+# the CRD reference wants spec.harness.projectId to be the id, not the number.
+TABLE_UNRESOLVED_DETAIL = (
+    "the project number did not resolve to its id (`gcloud projects describe` failed), so its clusters are not keyed and earn no "
+    "report until it does; grant the credential `resourcemanager.projects.get` or name the project by its id"
+)
+UNRESOLVED_TICK_DETAIL = "no project was read under a key; {reasons}"
 PROJECT_NOT_RUN_DETAIL = "readiness run for {project} not started: {error}"
 PROJECT_CUT_SHORT_DETAIL = "readiness run for {project} cut short by the tick budget; it goes first next time"
 STDERR_EXCERPT_CHARS = 300
@@ -241,6 +254,9 @@ LAST_TICK_KEY = "last_tick"
 # versions are due then.
 TABLE_RUNS_KEY = "table_runs"
 READINESS_RUNS_KEY = "readiness_runs"
+# The last tick's version-table read errors, reason included, so a cause the
+# partial line posted once is readable afterwards.
+TABLE_ERRORS_KEY = "table_errors"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
 # watch's own read errors and stamps. learn_project_id is the one place that
@@ -282,12 +298,13 @@ FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
 PARTIAL_LINE = (
-    "{prefix} watch: the version table was partial ({errors} read error(s){where}, exit {code}); a version is retired only once "
+    "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}): {reasons}; a version is retired only once "
     "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it"
 )
-# The projects the read errors name, so the line says which project went
-# unread; the announcement stays keyed on the kinds, so the names are the day's.
-PARTIAL_WHERE = " in {projects}"
+# One reason per project the read errors name, so the line says what went
+# wrong where; the announcement stays keyed on the kinds, so the reasons are the day's.
+PARTIAL_REASON = "{project}: {message}"
+REASONS_SEPARATOR = "; "
 PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
 DRY_RUN_WOULD_RETIRE = "dry run: would retire {version} (no cluster is pending it)"
 UNGRADED_LINE = (
@@ -341,6 +358,10 @@ DATE_FORMAT = "%Y-%m-%d"
 
 class SandboxTimedOut(RuntimeError):
     """The sandbox run hit the client-side timeout."""
+
+
+class ProjectUnresolved(RuntimeError):
+    """Every project the table ran is a number the report could not resolve: nothing was read under a key."""
 
 
 class WriteFailed(Exception):
@@ -697,7 +718,10 @@ def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_err
 
 
 def empty_ledger() -> dict:
-    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}, TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}, PROJECT_IDS_KEY: {}}
+    return {
+        LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {},
+        TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}, PROJECT_IDS_KEY: {}, TABLE_ERRORS_KEY: [],
+    }
 
 
 def announced(ledger: dict) -> dict:
@@ -736,6 +760,8 @@ def load_ledger(path: Path) -> dict:
     for key in (TABLE_RUNS_KEY, READINESS_RUNS_KEY, PROJECT_IDS_KEY):
         runs = data.get(key)
         data[key] = {k: v for k, v in runs.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(runs, dict) else {}
+    errors = data.get(TABLE_ERRORS_KEY)
+    data[TABLE_ERRORS_KEY] = [e for e in errors if isinstance(e, dict)] if isinstance(errors, list) else []
     return data
 
 
@@ -915,13 +941,19 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
     number the report could not resolve: it is keyed by nothing, since the
     ledger never holds a key under a number (``learn_project_id``), and when
     the roster also spells the project by its id, that spelling's run lists
-    it. The ledger's table-run stamps are set for every project that ran to
-    completion or to its own cap, so the next table starts with the ones it
-    did not, and a run that resolves a project's id teaches the ledger."""
+    it. A table that read nothing under a key fails the tick instead of
+    announcing a partial table of nothing: every run failed is the sandbox or
+    the credential, and every run an unresolved number is the credential's
+    missing ``resourcemanager.projects.get`` or a roster that should name the
+    id, said with the remedy. The ledger's table-run stamps are set for every
+    project that ran to completion or to its own cap, so the next table starts
+    with the ones it did not, and a run that resolves a project's id teaches
+    the ledger."""
     last_runs = ledger[TABLE_RUNS_KEY]
     ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
-    ran: list[str] = []
+    keyed_runs: list[str] = []
+    unresolved: dict[str, str] = {}
     unrun: list[str] = []
     cut_short: list[str] = []
     failed: dict[str, Exception] = {}
@@ -963,27 +995,33 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             )
             continue
         last_runs[project] = iso(now)
-        ran.append(project)
         key = learn_project_id(ids, project, envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY))
         if key is None:
             # A number the report could not resolve keys nothing: the run is
             # this spelling's listing failure, read again tomorrow, so its
             # members never enter under a key the ledger would not join against.
             merge_exit(merged, envelope)
+            unresolved[project] = TABLE_UNRESOLVED_DETAIL
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRESOLVED, MESSAGE_KEY: TABLE_UNRESOLVED_DETAIL.format(project=project)}
+                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRESOLVED, MESSAGE_KEY: TABLE_UNRESOLVED_DETAIL}
             )
             continue
         # The id just learned is tabled too, so the other spelling of it is skipped.
         tabled.add(key)
+        keyed_runs.append(project)
         merge_envelope(merged, envelope)
-    if failed and not ran and not unrun and not cut_short:
-        # Every project the table ran failed and the budget left none untried:
-        # that is the sandbox or the credential, not a project. One failure
-        # line for the tick, announced once, rather than a partial table nobody
-        # can act on. Judged on the runs, not the roster's spellings, since two
-        # spellings of one project are one run.
-        raise next(iter(failed.values()))
+    if not keyed_runs and not unrun and not cut_short:
+        # Nothing read under a key and the budget left none untried is not a
+        # project's gap but the tick's: one failure line, announced once through
+        # the marker, rather than a partial table nobody can act on. Judged on
+        # the runs, not the roster's spellings, since two spellings of one
+        # project are one run. A sandbox failure outranks an unresolved number.
+        if failed:
+            raise next(iter(failed.values()))
+        if unresolved:
+            raise ProjectUnresolved(
+                UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))
+            )
     # Both budget shapes are one kind: the announcement must not re-post when a
     # cut-short run comes and goes beside the projects never reached.
     for project in unrun:
@@ -1047,8 +1085,8 @@ def readiness_by_project(
     return merged, failures, unfinished
 
 
-def shown_names(names: list[str]) -> str:
-    shown = ", ".join(names[:MAX_NAMES_IN_LINE])
+def shown_names(names: list[str], separator: str = ", ") -> str:
+    shown = separator.join(names[:MAX_NAMES_IN_LINE])
     if len(names) > MAX_NAMES_IN_LINE:
         shown += NAMES_OVERFLOW.format(more=len(names) - MAX_NAMES_IN_LINE)
     return shown
@@ -1058,9 +1096,14 @@ def cluster_names(clusters: list[str]) -> str:
     return shown_names([key.rsplit(MEMBER_KEY_SEPARATOR, 1)[-1] for key in clusters])
 
 
-def error_projects(read_errors: list) -> list[str]:
-    """The projects the read errors name, sorted: which projects a partial table left unread."""
-    return sorted({str(error.get(MEMBER_ID_KEYS[0])) for error in read_errors if error.get(MEMBER_ID_KEYS[0])})
+def error_reasons(read_errors: list) -> str:
+    """One reason per project the read errors name, the first recorded, in
+    project order: what the partial line says went wrong where."""
+    reasons: dict[str, str] = {}
+    for error in read_errors:
+        project = str(error.get(MEMBER_ID_KEYS[0]) or NONE_WORD)
+        reasons.setdefault(project, str(error.get(MESSAGE_KEY) or error_kind(error)))
+    return shown_names([PARTIAL_REASON.format(project=project, message=reasons[project]) for project in sorted(reasons)], REASONS_SEPARATOR)
 
 
 def signature_pairs(kinds: dict[str, str]) -> list[list[str]]:
@@ -1222,18 +1265,11 @@ def tick(dry_run: bool = False) -> list[str]:
     signature = partial_signature(read_errors) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
     if signature and signature != already:
-        named = error_projects(read_errors)
-        lines.append(
-            PARTIAL_LINE.format(
-                prefix=LINE_PREFIX,
-                errors=len(read_errors),
-                where=PARTIAL_WHERE.format(projects=shown_names(named)) if named else "",
-                code=versions.get(ENVELOPE_EXIT_KEY),
-            )
-        )
+        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
     elif complete and already:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
+    ledger[TABLE_ERRORS_KEY] = read_errors
     if due:
         readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
         canonicalise_projects(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])

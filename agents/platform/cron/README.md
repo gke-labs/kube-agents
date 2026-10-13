@@ -186,7 +186,20 @@ Cluster Agent from is still read here. That read is `gcloud` cluster metadata
 for the version table and, on a report day, one `get-credentials` and one
 `kubectl get pdb,deploy,statefulset -A` per cluster for the readiness grade;
 the budget names those objects in the saved report, which is tenant-written
-text, so the entry declares `risk: high` as `stall-watch` does.
+text, so the entry declares `risk: high` as `stall-watch` does. A project
+spelled by its number is keyed by the id `gcloud projects describe` resolves,
+learned on its first table run. A number the credential cannot resolve is
+never a key, so its clusters earn no report until it resolves: when nothing
+was read under a key (it is the only project, or every other is an unresolved
+number too), the tick fails with the reason and the remedy, posted once and
+kept in `last-failure.txt` until the next clean tick posts the recovery;
+beside projects that were keyed, the table is partial, posted once with the
+reason, and the ledger's `table_errors` keeps it. The remedy is
+`resourcemanager.projects.get` on the credential (every read role the install
+binds carries it, as `cluster_agent_reconcile.py` relies on, so a credential
+without it is a custom grant) or the project id in place of the number
+(`spec.harness.projectId` has to be the id; `UPGRADE_READINESS_PROJECTS` for a
+hand run).
 
 It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
 are read from the agent image's `/opt/platform-template/skills/` copy and
@@ -218,9 +231,11 @@ hour Hermes gives a `no_agent` script: the version table and the readiness
 runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
-line names the projects with a read error, and a version's own line the
-project whose readiness run was not started or was cut short (a version none
-of whose projects ran is not recorded and is retried tomorrow),
+line names each project with a read error and its reason (the budget, the
+sandbox's error, a failed listing, an unresolved project number), the
+ledger's `table_errors` keeps the last tick's, and a version's own line names
+the project whose readiness run was not started or was cut short (a version
+none of whose projects ran is not recorded and is retried tomorrow),
 and each sweep runs the projects least recently run first, so a budget that
 never reaches the end of the list does not leave the same project unread
 twice, whichever versions are due. Three guards
