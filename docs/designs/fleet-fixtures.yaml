@@ -355,7 +355,7 @@ fixtures:
       - deployment/cgroup-blind-jvm
     namespace: seeded-shapes
     defect: >-
-      cgroup-blind-jvm Deployment (one replica) running eclipse-temurin 8u302, a JDK 8 from before cgroup v2 support, under a memory limit
+      cgroup-blind-jvm Deployment (one replica) whose image is eclipse-temurin 8u302, a JDK 8 from before cgroup v2 support, under a memory limit; the image's JDK version is the dependency and the container process is a sleep
 
   - role: multi-process-container
     slot: a

@@ -280,7 +280,7 @@ pool can still be created on a 1.34 cluster, GKE refused its 1.35 upgrade with a
 the migration to v2 first, and after the migration the old JVM was OOMKilled five times while a
 fixed JVM stayed up.
 
-Fleet: `cgroup-blind-runtime` on seeded-a (`cgroup-blind-jvm`, eclipse-temurin 8u302 under a memory limit) carries the runtime half, which no node change heals; a cgroup v1 pool would not hold, since GKE migrates one to v2 at 1.33 and refuses v1 at 1.35.
+Fleet: `cgroup-blind-runtime` on seeded-a (`cgroup-blind-jvm`, the eclipse-temurin 8u302 image under a memory limit, with a sleep as the container process) carries the runtime half, which no node change heals; a cgroup v1 pool would not hold, since GKE migrates one to v2 at 1.33 and refuses v1 at 1.35.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/14c.sh` (`14.sh` is the symptom alone), evidence
 `bench/upgrade-scenarios/evidence/14c/cgroup.txt`, and item 14 of the harness README. Detection,
