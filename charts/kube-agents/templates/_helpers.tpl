@@ -454,7 +454,8 @@ Takes a dict of field name to value.
 
 {{/*
 The LiteLLM gateway config, mirroring
-k8s-operator/config/integrations/litellm/base/config.yaml.
+k8s-operator/config/integrations/litellm/base/config.yaml and its provider
+overlays.
 
 Defined once and consumed twice — as the ConfigMap body and as the input to the
 Deployment's checksum annotation — because those two must not be able to

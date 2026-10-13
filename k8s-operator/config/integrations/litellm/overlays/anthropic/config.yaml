@@ -27,9 +27,8 @@ litellm_settings:
 #
 # Anthropic allows four breakpoints per request. LiteLLM counts client-supplied
 # ones and never overwrites them, so a caller that sends its own layout still
-# wins. Non-Anthropic backends drop the markers in their provider transforms —
-# gemini and gemma routes answer 200 with unchanged token counts, and their
-# implicit caching is untouched.
+# wins. Only this overlay carries the block: on Gemini, LiteLLM turns the markers
+# into Vertex explicit context caching (see the base config.yaml).
 router_settings:
   default_litellm_params:
     cache_control_injection_points:
