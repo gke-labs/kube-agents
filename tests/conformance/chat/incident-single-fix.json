@@ -1,0 +1,28 @@
+{
+  "name": "incident-single-fix",
+  "source": "deploy/docker/patches/test_slack_ux_incident.py::SINGLE",
+  "notes": "G2: today a button reads the option's title and posts 'apply: <title>', which does not contain the label. The reply is reordered to '<title> — apply'; '(recommended)' becomes primary. G4: editing the alert in place needs the event watcher's post to carry an update key; until then this posts as its own message.",
+  "input": {
+    "report": "## What's wrong\n\nThe quota for n2 CPUs in us-central1 is exhausted.\n\n## Why\n\n- Scale-up fails with QUOTA_EXCEEDED.\n\n## What to do\n\n- **Proposed fix (Lower the node pool max):** Set max nodes to 4 in the GitOps repo.\n- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The quota for n2 CPUs in us-central1 is exhausted.",
+        "fold": {
+          "title": "why · what the fix does",
+          "text": "## What's wrong\n\nThe quota for n2 CPUs in us-central1 is exhausted.\n\n## Why\n\n- Scale-up fails with QUOTA_EXCEEDED.\n\n## What to do\n\n- **Proposed fix (Lower the node pool max):** Set max nodes to 4 in the GitOps repo.\n- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix."
+        },
+        "choices": [
+          {
+            "text": "Lower the node pool max",
+            "reply": "Lower the node pool max — apply",
+            "primary": true
+          }
+        ]
+      }
+    }
+  ]
+}

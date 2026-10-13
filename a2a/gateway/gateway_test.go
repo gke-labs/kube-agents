@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // ---- harness ----------------------------------------------------------
@@ -824,12 +825,12 @@ func TestNormalizePhrases(t *testing.T) {
 		"do the thing":      false,
 	} {
 		// These phrases exercise normalization through the exact set.
-		if got := isStatusQuery(phrase, false); got != want {
-			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
+		if got := chattext.IsStatusQuery(phrase, false); got != want {
+			t.Errorf("chattext.IsStatusQuery(%q) = %v, want %v", phrase, got, want)
 		}
 	}
-	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
-		t.Error("isStop misclassifies")
+	if !chattext.IsStop("Stop!") || !chattext.IsStop("cancel") || chattext.IsStop("stop the deploy") {
+		t.Error("chattext.IsStop misclassifies")
 	}
 }
 

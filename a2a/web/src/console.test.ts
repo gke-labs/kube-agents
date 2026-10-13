@@ -105,7 +105,7 @@ describe("console frames", () => {
 });
 
 describe("gateway text mirrors", () => {
-  it("normalizes like text.go normalize", () => {
+  it("normalizes like chattext.Normalize", () => {
     expect(normalizeTurn("  What's it DOING?!  ")).toBe("whats it doing");
     expect(normalizeTurn("a\t\n  b")).toBe("a b");
     expect(normalizeTurn("a\rb")).toBe("ab");

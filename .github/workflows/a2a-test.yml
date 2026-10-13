@@ -38,6 +38,9 @@ on:
       # This job runs `make -C k8s-operator envtest-path`, so it depends on
       # that Makefile as surely as on its own sources.
       - "k8s-operator/Makefile"
+      # lib/chatmsg validates every shared chat case, so a case-only change
+      # has to run it.
+      - "tests/conformance/chat/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -71,6 +74,7 @@ jobs:
               - "a2a/**"
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
+              - "tests/conformance/chat/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'

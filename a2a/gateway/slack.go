@@ -1132,7 +1132,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			MessageID:    m.TimeStamp,
 			TopLevel:     m.ThreadTimeStamp == "",
 			// Decoding also changes what the affordance matchers see. That is
-			// intended, and it is not obvious: normalize (text.go) strips
+			// intended, and it is not obvious: chattext.Normalize strips
 			// every non-alphanumeric, so a typed "<stop>" — on the wire as
 			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
 			// nothing, and decoded first it normalizes to "stop" and is a
