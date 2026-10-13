@@ -6049,7 +6049,9 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 proc = self._interview(flags, "", chat + answers, choice=choice)
                 out = proc.stdout + proc.stderr
                 self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
-                self.assertIn("PROMPT: Allowed Slack User IDs / Emails (comma-separated)", out)
+                # The today prompt (#2787's wording), not the gateway's.
+                self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)", out)
+                self.assertIn("PROMPT: Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)", out)
                 self.assertNotIn("look like emails", out)
 
     # ── after the generator's Secret recovery ──
