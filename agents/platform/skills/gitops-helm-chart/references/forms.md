@@ -132,8 +132,13 @@ spec:
       <key>: <value>
 ```
 
-`includeCRDs: true` is what lets a chart's own CRDs through; without it
-Config Sync drops them. Add a `Namespace` manifest for the release namespace
+`includeCRDs: true` lets through the CRDs in a chart's `crds/` directory;
+without it Config Sync drops them. A chart that templates its CRDs behind a
+value (cert-manager's `crds.enabled`) needs that value as well, and
+`includeCRDs` alone installs none of them. Config Sync renders the chart
+without skipping hooks, so a chart's hook manifests (a post-install test
+Job, say) are applied as ordinary objects; read the chart's `templates/` for
+`helm.sh/hook` annotations and say in the PR body what they will do. Add a `Namespace` manifest for the release namespace
 in the root repository when the siblings do.
 
 A `RepoSync` is not a smaller `RootSync`. It applies only objects in its own

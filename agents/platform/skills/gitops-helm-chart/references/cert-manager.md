@@ -19,7 +19,14 @@ cluster, which makes it the first chart to try this skill on.
 ## Values
 
 - `crds.enabled: true`. Without it the chart installs no CRDs and the
-  controller has nothing to serve. `installCRDs` is the deprecated spelling;
+  controller has nothing to serve. The CRDs are templates behind this value,
+  not files in the chart's `crds/` directory, so a Config Sync `RootSync`
+  needs the value too; its `includeCRDs` alone installs none of them.
+- `startupapicheck` is a `post-install` hook Job (`startupapicheck.jobAnnotations`).
+  Argo CD runs it as a hook and Flux through Helm. Config Sync applies it as
+  an ordinary Job that it then keeps in sync. On a Config Sync repository,
+  say so in the PR body, or set `startupapicheck.enabled: false` when the
+  repository's other charts turn their hook Jobs off. `installCRDs` is the deprecated spelling;
   never set both.
 - `crds.keep` stays at its default (`true`). It marks the CRDs with Helm's
   `helm.sh/resource-policy: keep`, so removing the release later does not
