@@ -168,6 +168,14 @@ func TestEveryRule(t *testing.T) {
 		{"link url control character", func(m *Message) { m.Links[0].URL = "https://example.com/\x07" }, "links[0].url"},
 		{"link url backslash in the host", func(m *Message) { m.Links[0].URL = `https://good.example\evil.example/` }, "links[0].url"},
 		{"link url backslash in the path", func(m *Message) { m.Links[0].URL = `https://example.com/a\b` }, ""},
+		// Read as the presenter's urlsplit reads them: neither a bad escape
+		// nor a port that is not a number refuses the url.
+		{"link url bad escape", func(m *Message) { m.Links[0].URL = "https://a.example/%zz" }, ""},
+		{"link url port not a number", func(m *Message) { m.Links[0].URL = "https://a.example:abc/" }, ""},
+		{"link url ipv6 host", func(m *Message) { m.Links[0].URL = "https://[::1]:8443/x" }, ""},
+		{"link url empty ipv6 host", func(m *Message) { m.Links[0].URL = "https://[]/x" }, "links[0].url"},
+		{"link url port alone", func(m *Message) { m.Links[0].URL = "https://:443/x" }, "links[0].url"},
+		{"link url no authority", func(m *Message) { m.Links[0].URL = "https:example.com" }, "links[0].url"},
 		{"link url at cap", func(m *Message) { m.Links[0].URL = "https://example.com/" + long(urlMax-20) }, ""},
 		{"link url over cap", func(m *Message) { m.Links[0].URL = "https://example.com/" + long(urlMax-19) }, "links[0].url"},
 		{"label naming the url's host", func(m *Message) {
@@ -351,8 +359,23 @@ func TestParse(t *testing.T) {
 	if err != nil || m.Mark == nil || *m.Mark != (Mark{}) {
 		t.Errorf("an empty mark: Parse = %+v, %v; want present and empty", m, err)
 	}
+	// Keys match exactly, at every depth: a key spelled in another case is
+	// unknown and ignored, never read as the field, and never fails the
+	// message by its type.
+	m, err = Parse([]byte(`{"schema":"kube-agents.chat/v1","Headline":"x","MARK":"bad",` +
+		`"rows":[{"Text":"y","text":"row"}],"plan":{"items":[{"id":"a","status":"pending","StepCount":"z"}]},` +
+		`"mark":{"Ask":"Not A Token","settle":"done"}}`))
+	if err != nil {
+		t.Fatalf("Parse refused a message for keys it should ignore: %v", err)
+	}
+	if m.Headline != "" || m.Rows[0].Text != "row" || m.Plan.Items[0].StepCount != 0 || m.Mark == nil || *m.Mark != (Mark{Settle: SettleDone}) {
+		t.Errorf("Parse read a key spelled in another case: %+v (mark %+v)", m, m.Mark)
+	}
+	if layout, mark := Validate(m, Progress); layout != nil || mark != nil {
+		t.Errorf("Validate = %v, %v", layout, mark)
+	}
 	for _, bad := range []string{
-		`[]`, `"x"`, `{"schema":"kube-agents.chat/v1","rows":"r"}`,
+		`[]`, `"x"`, `null`, `{"schema":"kube-agents.chat/v1","rows":"r"}`,
 		`{"schema":"kube-agents.chat/v1","plan":{"items":[{"id":"a","status":"pending","stepCount":1.5}]}}`,
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {

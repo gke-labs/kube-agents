@@ -553,7 +553,7 @@ artifact names).
 | a conversation chat.notify request (Card work, below)  | a card's post, or an edit of one by `update` key | the request's `text`                                 |
 
 At most one chat message per artifact chunk or status message. `plan` is read only in
-`progress`. In `progress` the chat message is the whole current state, not a delta, so a
+`progress` and on a conversation chat.notify (Card work, below). In `progress` the chat message is the whole current state, not a delta, so a
 consumer that missed an event renders the next one correctly.
 A click on a choice arrives like any message in the conversation: a new turn once the task
 has ended, a steer while it runs, under the steering rules above (so on the fixed route,

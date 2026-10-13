@@ -15,7 +15,7 @@ const casesDir = "../../../tests/conformance/chat"
 
 // sharedCase is the part of a case file this test reads.
 type sharedCase struct {
-	Name     string  `json:"name"`
+	Name     string `json:"name"`
 	Expected []*struct {
 		Carrier Carrier         `json:"carrier"`
 		Chat    json.RawMessage `json:"chat"`

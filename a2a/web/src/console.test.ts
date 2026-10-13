@@ -111,12 +111,12 @@ describe("gateway text mirrors", () => {
     expect(normalizeTurn("a\rb")).toBe("ab");
   });
 
-  it("reads the stop words like isStop", () => {
+  it("reads the stop words like chattext.IsStop", () => {
     for (const t of ["stop", "STOP", " cancel. ", "abort!"]) expect(isStopTurn(t)).toBe(true);
     for (const t of ["stop it", "stopped", "please stop"]) expect(isStopTurn(t)).toBe(false);
   });
 
-  it("strips a delegate turn like isDelegate", () => {
+  it("strips a delegate turn like chattext.IsDelegate", () => {
     expect(delegateRest("delegate: check the nodes")).toBe("check the nodes");
     expect(delegateRest("  Delegate - Check It")).toBe("Check It");
     expect(delegateRest("DELEGATE\u2014 x")).toBe("x");
@@ -128,7 +128,7 @@ describe("gateway text mirrors", () => {
     expect(delegateRest("delegate.x")).toBeNull();
   });
 
-  it("reads /session like isSessionCommand and isSessionOff", () => {
+  it("reads /session like chattext.IsSessionCommand and IsSessionOff", () => {
     expect(sessionCommandRest("/session")).toBe("");
     expect(sessionCommandRest("  /Session   off  ")).toBe("off");
     expect(sessionCommandRest("/session\u00a0check it")).toBe("check it");
