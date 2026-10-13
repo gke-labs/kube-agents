@@ -1867,8 +1867,9 @@ def render(summary: dict) -> str:
     releasing = summary["releasing_leases"]
     if releasing:
         out.append(
-            f"\n{len(releasing)} lease(s) held by runs that finished in the last"
-            f" {int(RELEASE_GRACE.total_seconds() // SECONDS_PER_MINUTE)} min, still tearing down:"
+            f"\n{len(releasing)} lease(s) held by runs whose Deck completion stamp is inside the"
+            f" last {int(RELEASE_GRACE.total_seconds() // SECONDS_PER_MINUTE)} min, so still tearing"
+            " down (an abort's stamp is start + 30:00, see docs/ci-pool-projects.md):"
         )
         for holder in releasing:
             out.append(f"      {holder}")
@@ -1876,7 +1877,8 @@ def render(summary: dict) -> str:
     if orphans:
         out.append(f"\n[!] {len(orphans)} lease(s) held by runs Deck does not show running.")
         out.append("    A leaked lease occupies a project exactly as a running test does,")
-        out.append("    so the pool reads as full without the demand to justify it.")
+        out.append("    so the pool reads as full without the demand to justify it. A hand")
+        out.append("    hold named after a run reads the same: rename it rather than release it.")
         for holder in orphans:
             out.append(f"      {holder}")
 
@@ -1961,7 +1963,7 @@ def _pool_now_lines(
     if leaked:
         lines.append(f"  {len(leaked)} lease(s) leaked, named under leaked_leases")
     if releasing:
-        lines.append(f"  {len(releasing)} lease(s) releasing after a run that just finished")
+        lines.append(f"  {len(releasing)} lease(s) releasing, their run's Deck stamp inside the grace")
     return lines
 
 

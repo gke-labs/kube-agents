@@ -376,12 +376,12 @@ class HealthInputsTest(unittest.TestCase):
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
              "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
              "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700,
-             "lease_failures": None, "lease_failures_hours": None, "no_build_id": None},
+             "lease_failures": None, "lease_failures_hours": None},
         )
         # The refusal count and its window reach the page as counts; anything
         # else arrives as null, like the other numbers.
-        refused = render.normalize_health(health_doc("GREEN", pool=note | {"lease_failures": 26, "lease_failures_hours": 3, "no_build_id": "two"}))["pool"]
-        self.assertEqual((26, 3, None), (refused["lease_failures"], refused["lease_failures_hours"], refused["no_build_id"]))
+        refused = render.normalize_health(health_doc("GREEN", pool=note | {"lease_failures": 26, "lease_failures_hours": "three"}))["pool"]
+        self.assertEqual((26, None), (refused["lease_failures"], refused["lease_failures_hours"]))
         # Dated like every other timestamp the page renders: a string that is
         # not one drops rather than reaching `new Date`.
         self.assertEqual("2026-09-08T16:45:00+00:00", render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"}))["pool"]["waiting_since"])

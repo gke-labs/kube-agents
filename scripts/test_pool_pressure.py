@@ -1250,9 +1250,9 @@ class EndToEnd(unittest.TestCase):
             code, out = run(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertNotIn("held by runs Deck does not show running", out)
-        self.assertIn("1 lease(s) held by runs that finished in the last 15 min, still tearing down:", out)
+        self.assertIn("1 lease(s) held by runs whose Deck completion stamp is inside the last 15 min", out)
         self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", out.split("tearing down")[1])
-        self.assertIn("1 lease(s) releasing after a run that just finished", out)
+        self.assertIn("1 lease(s) releasing, their run's Deck stamp inside the grace", out)
 
     def test_a_quiet_day_is_green_and_reports_no_leaks(self):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)

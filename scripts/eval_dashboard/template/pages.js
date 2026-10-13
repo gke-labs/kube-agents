@@ -260,7 +260,6 @@ function normalizeHealth(raw) {
       threshold_p95_s: count(pool.threshold_p95_s),
       lease_failures: count(pool.lease_failures),
       lease_failures_hours: count(pool.lease_failures_hours),
-      no_build_id: count(pool.no_build_id),
     } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
