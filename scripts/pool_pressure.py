@@ -233,8 +233,10 @@ BUILD_ID_IN_OWNER = re.compile(r"(?<!\d)(\d{19})(?!\d)")
 # pod tears down and the wrapper releases the project; in between the lease
 # is releasing, not leaked. On an abort Deck sets the stamp at the abort but
 # to startTime + 30:00 (see fetch_live_queue), so an early-aborted run reads
-# as releasing for up to 45 minutes after the abort: a real leak from one is
-# named one hourly tick late, which is the price of not naming every abort.
+# as releasing for up to 45 minutes after the abort, and a run aborted later
+# than that is already outside the grace and reads as leaked for its teardown
+# minutes: the stamp is the only clock Deck offers, and this is the price of
+# not naming every abort.
 RELEASE_GRACE = timedelta(minutes=15)
 # The fixed owners the hack/ scripts that lease through boskos_pool.py fall
 # back to when nothing names the build (test_integration_contracts.py pins

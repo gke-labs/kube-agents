@@ -1065,9 +1065,10 @@ refusal breached; `over_threshold` counts the queued runs and `lease_failures`
 the refused ones. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
-`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
-`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
-headline and on the last-24-hours view.
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `waiting_now`,
+`waiting_since`, `over_threshold`, `threshold_p50_s`, `threshold_p95_s`,
+`lease_failures` and `lease_failures_hours` for one sentence on the Brief's
+healthy headline and on the last-24-hours view.
 `metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
 `null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
 the artifact was there at all. Nothing else answers that: `pool` is `null` for a
