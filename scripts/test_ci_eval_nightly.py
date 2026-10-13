@@ -278,6 +278,16 @@ class ArrayHygieneTest(unittest.TestCase):
                     f"{audit} is audit-shaped and must carry an explicit unit_cost_hint in the 600-1300s band, not the 200s default",
                 )
 
+    def test_the_refusal_case_is_priced_at_its_measured_cost(self):
+        # stop-on-permission-refusal is a noop, transcript-only case that runs
+        # the worker to its retries on main: measured 13-28 minutes a
+        # repetition on a dev install (2026-10-09). At the 200s default it
+        # would launch in the last cost tier, the one a deadline cut truncates.
+        hint_fn = lifted_block(r"^unit_cost_hint\(\) \{.*?^\}$")
+        result = run_bash(f"{hint_fn}\nunit_cost_hint stop-on-permission-refusal")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(int(result.stdout.strip()), 900)
+
     def test_the_version_control_cases_are_priced_above_the_default(self):
         # None is audit-shaped, so the check above does not reach them, and
         # all are far above the 200s default (each price's comment in
@@ -291,7 +301,6 @@ class ArrayHygieneTest(unittest.TestCase):
             ("vcs-issue-resolver-triage", 1300),
             ("vcs-review-feedback-read-back", 600),
             ("vcs-spent-branch-reuse", 900),
-            ("stop-on-permission-refusal", 900),
         ):
             with self.subTest(case=case):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {case}")
