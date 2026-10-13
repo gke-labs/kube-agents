@@ -141,7 +141,8 @@ def check_case(case: Any, stem: str, root: Path = REPO_ROOT) -> None:
 
 def load(cases_dir: Path = CASES_DIR) -> list[dict]:
     """Every case under ``cases_dir``, checked, sorted by name. Raises on an empty directory."""
-    paths = sorted(cases_dir.glob(CASE_GLOB))
+    # By stem, not path: "pr-opened.json" sorts after "pr-opened-twice.json", "pr-opened" before it.
+    paths = sorted(cases_dir.glob(CASE_GLOB), key=lambda path: path.stem)
     if not paths:
         raise CaseError(f"no cases under {cases_dir}")
     cases = []
