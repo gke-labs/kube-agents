@@ -11,6 +11,9 @@ the stock path.
 
 from __future__ import annotations
 
+import importlib.util
+import json
+import sys
 import tempfile
 import unittest
 from collections import deque
@@ -21,22 +24,26 @@ import apply_permission_refusal_stop as applier
 import permission_refusal_stop as stop
 from kanban_guardrail_exit import guardrail_halt_nudge
 
-REFUSAL = (
-    '{"output": "Agents hold read-only access to Kubernetes. Propose this change as a pull request '
-    "instead. This is a permission boundary, not an error to work around: if this command would "
-    "change cluster or cloud state, that change is refused however it is attempted, so do not "
-    'retry it through another command, tool, flag, or identity.\\npolicy rule: kubernetes.read-only\\n", '
-    '"exit_code": 77}'
+# The notices come from the policy module itself, so a reword there fails here.
+_POLICY_PATH = Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts" / "command_policy.py"
+_spec = importlib.util.spec_from_file_location("command_policy_under_test", _POLICY_PATH)
+command_policy = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = command_policy
+_spec.loader.exec_module(command_policy)
+
+
+def _result(output, exit_code=77):
+    return json.dumps({"output": output, "exit_code": exit_code, "error": None})
+
+
+REFUSAL = _result(
+    "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. "
+    + command_policy._ACTION_BOUNDARY_NOTICE + "\npolicy rule: kubernetes.read-only"
 )
-FLAG_REFUSAL = (
-    '{"output": "This is a permission boundary, not an error to work around: the command may be retried '
-    'without the flag.\\npolicy rule: identity.caller-supplied-impersonation\\n", "exit_code": 77}'
-)
-GCLOUD_REFUSAL = (
-    '{"output": "Agents hold read-only access to Google Cloud. Propose this change as a pull request '
-    "instead. This is a permission boundary, not an error to work around: if this command would change "
-    'cluster or cloud state, that change is refused however it is attempted.\\npolicy rule: gcp.read-only\\n", '
-    '"exit_code": 77}'
+FLAG_REFUSAL = _result(command_policy._FLAG_BOUNDARY_NOTICE + "\npolicy rule: identity.caller-supplied-impersonation")
+GCLOUD_REFUSAL = _result(
+    "Agents hold read-only access to Google Cloud. Propose this change as a pull request instead. "
+    + command_policy._ACTION_BOUNDARY_NOTICE + "\npolicy rule: gcp.read-only"
 )
 K8S_403 = '{"output": "Error from server (Forbidden): deployments.apps \\"kube-dns\\" is forbidden: User cannot patch", "exit_code": 1}'
 GCP_403 = '{"output": "ERROR: (gcloud.container.clusters.update) ResponseError: code=403, message=Required permission denied PERMISSION_DENIED", "exit_code": 1}'
@@ -84,9 +91,9 @@ WRITE = {"command": "kubectl scale deploy kube-dns -n kube-system --replicas=3"}
 ALLOW = Decision()
 
 
-def observe(controller, result, tool="terminal", args=WRITE, stock=ALLOW):
+def observe(controller, result, tool="terminal", args=WRITE, stock=ALLOW, failed=True):
     return stop.observe_refusal(
-        controller, tool, args, result, "sig", stock=stock, decide=controller._decide, decision_cls=Decision
+        controller, tool, args, result, "sig", stock=stock, failed=failed, decide=controller._decide, decision_cls=Decision
     )
 
 
@@ -97,42 +104,65 @@ class ClassifyTests(unittest.TestCase):
             "kubectl -n kube-system patch deploy kube-dns -p '{}'",
             "kubectl rollout -n kube-system restart deploy/kube-dns",
             "timeout 30 /usr/bin/kubectl apply -f x.yaml",
+            "sudo -E kubectl apply -f x.yaml",
+            "KUBECONFIG=/tmp/kc kubectl scale deploy x --replicas=3",
             "kubectl get deploy x; kubectl delete deploy x",
-            'subprocess.run(["kubectl", "scale", "deploy/kube-dns", "--replicas=3"])',
+            "kubectl scale deploy x --replicas=3; kubectl get deploy x",
+            "kubectl scale deploy x --replicas=3 2>&1 | tee /tmp/scale.log",
+            "kubectl apply -f x.yaml || true",
             "kubectl \\\n  -n kube-system \\\n  scale deploy kube-dns --replicas=3",
-            'subprocess.run([\n    "kubectl",\n    "scale",\n    "deploy/kube-dns",\n])',
+            "sh -c 'kubectl scale deploy x --replicas=3'",
+            "bash -c -- 'kubectl scale deploy x --replicas=3'",
+            'out="$(kubectl scale deploy kube-dns -n kube-system --replicas=3 2>&1)"; echo "$out"',
+            "kubectl exec -n kube-system deploy/x -- kubectl scale deploy kube-dns --replicas=3",
             "kubectl debug node/x -it --image=busybox",
             "kubectl certificate approve csr-1",
             "kubectl auth reconcile -f rbac.yaml",
+            "kubectl --context foo rollout restart deploy/kube-dns -n kube-system",
         ):
             self.assertEqual(stop.classify_refusal(command, REFUSAL), "policy", command)
 
-    def test_a_result_that_echoes_a_refusal_with_exit_zero_is_not_one_and_any_other_code_is(self):
-        echoed = REFUSAL.replace('"exit_code": 77', '"exit_code": 0')
-        self.assertIsNone(stop.classify_refusal("grep -r 'policy rule' /opt/data/kanban/logs", echoed))
-        # The exec path returned 126 for a real refusal on a live run (2026-10-13).
-        self.assertEqual(stop.classify_refusal(WRITE["command"], REFUSAL.replace('"exit_code": 77', '"exit_code": 126')), "policy")
-        self.assertEqual(stop.classify_refusal("kubectl config view", REFUSAL.replace('"exit_code": 77}', '}')), "advisory")
+    def test_program_text_is_read_loosely(self):
+        for text in (
+            'subprocess.run(["kubectl", "scale", "deploy/kube-dns", "--replicas=3"])',
+            'subprocess.run([\n    "kubectl",\n    "scale",\n    "deploy/kube-dns",\n])',
+            'os.system("kubectl patch deploy x -p y")',
+        ):
+            self.assertEqual(stop.classify_refusal(text, REFUSAL, loose=True), "policy", text)
+        self.assertEqual(stop.classify_refusal('subprocess.run(["kubectl", "get", "pods"])', REFUSAL, loose=True), "advisory")
 
-    def test_the_verb_search_is_linear_on_long_punctuation(self):
-        import time
-        for text in ("/" * 50000, "*" * 20000, "kubectl " + "-" * 30000 + " scale x"):
-            started = time.monotonic()
-            stop.names_mutating_verb(text)
-            self.assertLess(time.monotonic() - started, 0.5)
-
-    def test_a_refused_read_spelling_or_a_gcloud_refusal_is_advisory(self):
+    def test_a_refused_read_spelling_a_help_read_or_a_gcloud_refusal_is_advisory(self):
         for command in (
             "kubectl config view",
             "kubectl cluster-info dump",
             "kubectl diff -f patch.yaml",
             "kubectl port-forward svc/x 8080:80",
+            "kubectl port-forward -n run svc/x 8080:80",
             "kubectl rollout --unknown status deploy/x",
+            "kubectl rollout status deploy/x",
             "kubectl get deploy x --selector app=scale-set",
+            "kubectl scale --help",
+            "kubectl patch -h",
+            "kubectl help scale",
+            "kubectl -n kube-system scale --help",
+            "kubectl exec -n kube-system deploy/kube-dns -- sh -c 'set -e; cat /etc/resolv.conf'",
+            "kubectl exec -n debug pod -- ls create",
+            "kubectl cp pod:/tmp/f ./out -n label",
+            "kubectl exec -n kube-system deploy/kube-dns-autoscaler -- cat /etc/config/linear",
+            "grep -r 'kubectl scale deploy kube-dns' /opt/data/kanban/logs",
+            "grep -r kubectl scale /opt/data/kanban/logs",
+            "echo kubectl scale deploy x --replicas=3",
             "",
         ):
             self.assertEqual(stop.classify_refusal(command, REFUSAL), "advisory", command)
         self.assertEqual(stop.classify_refusal("gcloud container clusters resize x --num-nodes 3", GCLOUD_REFUSAL), "advisory")
+
+    def test_the_verb_resolution_is_linear_on_long_input(self):
+        import time
+        for text in ("/" * 50000, "*" * 20000, "kubectl " + "-" * 30000 + " scale x", "kubectl scale " + "'" + "a" * 20000):
+            started = time.monotonic()
+            stop.names_mutating_verb(text)
+            self.assertLess(time.monotonic() - started, 0.5)
 
     def test_a_flag_refusal_is_not_a_refusal_of_the_change(self):
         self.assertIsNone(stop.classify_refusal(WRITE["command"], FLAG_REFUSAL))
@@ -146,9 +176,9 @@ class ClassifyTests(unittest.TestCase):
             self.assertIsNone(stop.classify_refusal("kubectl get pods", result), result)
 
     def test_the_command_is_read_from_the_call_arguments(self):
-        self.assertEqual(stop.command_text({"command": "kubectl scale x"}), "kubectl scale x")
-        self.assertEqual(stop.command_text({"code": "import os", "language": "python"}), "import os\npython")
-        self.assertEqual(stop.command_text(None), "")
+        self.assertEqual(stop.command_text({"command": "kubectl scale x"}), ("kubectl scale x", False))
+        self.assertEqual(stop.command_text({"code": "import os", "language": "python"}), ("import os\npython", True))
+        self.assertEqual(stop.command_text(None), ("", False))
 
 
 class ObserveTests(unittest.TestCase):
@@ -225,6 +255,14 @@ class ObserveTests(unittest.TestCase):
         self.assertIsNone(controller.halt_decision)
         self.assertEqual(observe(controller, REFUSAL).count, 1)
         self.assertEqual(stop.DEFAULT_HALT_AFTER, 1)
+
+    def test_a_successful_read_whose_output_quotes_a_denial_is_not_an_api_denial(self):
+        controller = FakeController()
+        events = _result('LAST SEEN  MESSAGE\n2m  Error creating: pods "x" is forbidden: exceeded quota', exit_code=0)
+        self.assertIsNone(observe(controller, events, args={"command": "kubectl get events -n tenant"}, failed=False))
+        self.assertEqual(observe(controller, K8S_403, failed=True).code, stop.API_WARN_CODE)
+        # A definitive refusal does not need the failure flag: a write chained before a read exits 0.
+        self.assertEqual(observe(controller, REFUSAL, args={"command": "kubectl scale deploy x --replicas=3; kubectl get deploy x"}, failed=False).action, "halt")
 
     def test_anything_else_falls_through_to_the_stock_path(self):
         controller = FakeController()

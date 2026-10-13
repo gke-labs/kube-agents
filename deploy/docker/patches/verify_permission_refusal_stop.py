@@ -33,27 +33,30 @@ from __future__ import annotations
 import os
 import sys
 
-REFUSAL = (
-    '{"output": "Agents hold read-only access to Kubernetes. Propose this change as a pull '
-    "request instead. This is a permission boundary, not an error to work around: if this "
-    "command would change cluster or cloud state, that change is refused however it is "
-    'attempted, so do not retry it through another command, tool, flag, or identity.\\npolicy '
-    'rule: kubernetes.read-only\\n", "exit_code": 77}'
+import json
+
+# The notices come from the policy module the image ships (Dockerfile copies
+# agents/platform/scripts/command_policy.py to tools/), so a reword fails here.
+from tools.command_policy import _ACTION_BOUNDARY_NOTICE, _FLAG_BOUNDARY_NOTICE
+
+
+def _result(output, exit_code=77):
+    return json.dumps({"output": output, "exit_code": exit_code, "error": None})
+
+
+REFUSAL = _result(
+    "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. "
+    + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: kubernetes.read-only"
 )
-FLAG_REFUSAL = (
-    '{"output": "This is a permission boundary, not an error to work around: the command may be '
-    'retried without the flag, but what the flag itself does is withheld.\\npolicy rule: '
-    'identity.caller-supplied-impersonation\\n", "exit_code": 77}'
+FLAG_REFUSAL = _result(_FLAG_BOUNDARY_NOTICE + "\npolicy rule: identity.caller-supplied-impersonation")
+API_DENIED = _result("Error from server (Forbidden): pods is forbidden: User cannot list", 1)
+GCLOUD_REFUSAL = _result(
+    "Agents hold read-only access to Google Cloud. Propose this change as a pull request instead. "
+    + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: gcp.read-only"
 )
-API_DENIED = '{"output": "Error from server (Forbidden): pods is forbidden: User cannot list", "exit_code": 1}'
-GCLOUD_REFUSAL = (
-    '{"output": "Agents hold read-only access to Google Cloud. Propose this change as a pull request '
-    "instead. This is a permission boundary, not an error to work around: if this command would change "
-    'cluster or cloud state, that change is refused however it is attempted.\\npolicy rule: gcp.read-only\\n", '
-    '"exit_code": 77}'
-)
-PLAIN_FAILURE = '{"output": "error: the server doesn\'t have a resource type \\"foo\\"", "exit_code": 1}'
-OK = '{"output": "deployment.apps/kube-dns 2/2", "exit_code": 0}'
+PLAIN_FAILURE = _result("error: the server doesn't have a resource type \"foo\"", 1)
+OK = _result("deployment.apps/kube-dns 2/2", 0)
+EVENTS = _result('LAST SEEN  MESSAGE\n2m  Error creating: pods "x" is forbidden: exceeded quota', 0)
 
 
 def fail(message: str) -> int:
@@ -107,15 +110,21 @@ def main() -> int:
     gcloud = controller.after_call("terminal", {"command": "gcloud artifacts docker tags list x"}, GCLOUD_REFUSAL)
     if (gcloud.action, gcloud.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
         return fail(f"a gcp.read-only refusal decided {gcloud!r}")
-    read = controller.after_call("terminal", {"command": "kubectl config view"}, REFUSAL)
-    if (read.action, read.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
-        return fail(f"a refused read spelling decided {read!r}")
-    joined = controller.after_call("terminal", {"command": "kubectl \\\n  -n kube-system \\\n  scale deploy x --replicas=3"}, REFUSAL)
-    if joined.code not in (stop.WARN_CODE, stop.HALT_CODE):
-        return fail(f"a line-continued write decided {joined!r}")
-    code126 = controller.after_call("terminal", {"command": "kubectl scale deploy x --replicas=3"}, REFUSAL.replace('"exit_code": 77', '"exit_code": 126'))
-    if code126.code not in (stop.WARN_CODE, stop.HALT_CODE):
-        return fail(f"a refusal returned with exit 126 decided {code126!r}")
+    for command in ("kubectl config view", "kubectl scale --help", "kubectl exec -n kube-system deploy/x -- sh -c 'set -e; cat /etc/resolv.conf'"):
+        read = controller.after_call("terminal", {"command": command}, REFUSAL)
+        if (read.action, read.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
+            return fail(f"{command!r} refused decided {read!r}")
+    events = controller.after_call("terminal", {"command": "kubectl get events -n tenant"}, EVENTS)
+    if events.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):
+        return fail(f"a successful read quoting a denial decided {events!r}")
+    for command, result in (
+        ("kubectl \\\n  -n kube-system \\\n  scale deploy x --replicas=3", REFUSAL),
+        ("kubectl scale deploy x --replicas=3; kubectl get deploy x", REFUSAL.replace('"exit_code": 77', '"exit_code": 0')),
+        ("kubectl scale deploy x --replicas=3", REFUSAL.replace('"exit_code": 77', '"exit_code": 126')),
+    ):
+        decided = controller.after_call("terminal", {"command": command}, result)
+        if decided.code not in (stop.WARN_CODE, stop.HALT_CODE):
+            return fail(f"{command!r} decided {decided!r}")
     if not hasattr(controller, "_kube_stock_after_call"):
         return fail("the stock after_call was not kept under its new name")
     for result in (FLAG_REFUSAL, PLAIN_FAILURE, OK):

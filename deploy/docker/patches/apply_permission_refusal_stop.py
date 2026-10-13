@@ -28,6 +28,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import patchlib
+
+PREFIX = "permission-refusal-stop"
 GUARDRAILS_RELATIVE = "agent/tool_guardrails.py"
 RUN_AGENT_RELATIVE = "run_agent.py"
 
@@ -50,9 +53,11 @@ AFTER_CALL_WRAPPER = """    def after_call(
         try:
             from hermes_cli.permission_refusal_stop import observe_refusal as _kube_observe_refusal
 
+            if failed is None:
+                failed, _ = classify_tool_failure(tool_name, result)
             _kube_refusal = _kube_observe_refusal(
                 self, tool_name, _coerce_args(args), result, decision.signature,
-                stock=decision, decide=self._decide, decision_cls=ToolGuardrailDecision,
+                stock=decision, failed=failed, decide=self._decide, decision_cls=ToolGuardrailDecision,
             )
         except Exception:
             _kube_refusal = None
@@ -88,31 +93,21 @@ HALT_RESPONSE_PATCHED = (
 )
 HALT_RESPONSE_MARKER = 'decision.code == "permission_refusal_halt"'
 
-# (file, label, anchor, replacement, marker)
-EDITS = (
-    (GUARDRAILS_RELATIVE, "after_call", AFTER_CALL_ANCHOR,
-     AFTER_CALL_WRAPPER + AFTER_CALL_ANCHOR.replace("def after_call(", "def _kube_stock_after_call("), AFTER_CALL_MARKER),
-    (GUARDRAILS_RELATIVE, "from_mapping", FROM_MAPPING_ANCHOR, FROM_MAPPING_PATCHED, FROM_MAPPING_MARKER),
-    (RUN_AGENT_RELATIVE, "halt_response", HALT_RESPONSE_ANCHOR, HALT_RESPONSE_PATCHED, HALT_RESPONSE_MARKER),
-)
+AFTER_CALL_PATCHED = AFTER_CALL_WRAPPER + AFTER_CALL_ANCHOR.replace("def after_call(", "def _kube_stock_after_call(")
 
 
 def apply(root: Path) -> None:
-    sources = {}
-    for relative, label, anchor, patched, marker in EDITS:
-        path = root / relative
-        source = sources.get(relative)
-        if source is None:
-            source = sources[relative] = path.read_text(encoding="utf-8")
-        if marker in source:
-            raise SystemExit(f"{path}: {label} already patched (marker {marker!r} present)")
-        count = source.count(anchor)
-        if count != 1:
-            raise SystemExit(f"{path}: {label} anchor matched {count} times, expected exactly one")
-        sources[relative] = source.replace(anchor, patched)
-    for relative, source in sources.items():
-        (root / relative).write_text(source, encoding="utf-8")
-        print(f"apply_permission_refusal_stop: patched {root / relative}")
+    guardrails = patchlib.Patch(root, GUARDRAILS_RELATIVE, prefix=PREFIX)
+    guardrails.refuse_if_patched(AFTER_CALL_MARKER, FROM_MAPPING_MARKER)
+    guardrails.substitute(AFTER_CALL_ANCHOR, AFTER_CALL_PATCHED, label="after_call wrapper")
+    guardrails.substitute(FROM_MAPPING_ANCHOR, FROM_MAPPING_PATCHED, label="from_mapping threshold")
+
+    run_agent = patchlib.Patch(root, RUN_AGENT_RELATIVE, prefix=PREFIX)
+    run_agent.refuse_if_patched(HALT_RESPONSE_MARKER)
+    run_agent.substitute(HALT_RESPONSE_ANCHOR, HALT_RESPONSE_PATCHED, label="chat halt reply")
+
+    guardrails.commit("after_call runs the stock counters, then the permission-refusal classifier; from_mapping reads the threshold")
+    run_agent.commit("a permission-refusal halt is the chat turn's reply")
 
 
 def main(argv: list[str]) -> int:

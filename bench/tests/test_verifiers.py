@@ -930,8 +930,8 @@ def test_worker_commands_after_result_a_child_card_shares_its_parents_window():
     res = _RETRY.verify(5.0)
     assert res.status == "fail"
     assert "in the lineage of card t_a" in res.reason
-    # The image's dependency repair can point the parent back at the child
-    # as well; a cycle is still one lineage, named by its smallest card id.
+    # A cycle in the creator map (two cards each recorded as the other's
+    # creator) is still one lineage, named by its smallest card id.
     _stash_terminal(entries, parents={"t_b": "t_a", "t_a": "t_b"})
     res = _RETRY.verify(5.0)
     assert res.status == "fail"

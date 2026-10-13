@@ -19,16 +19,23 @@ then decides whether a refusal overrides its decision. For every tool result
 it asks :func:`classify_refusal`:
 
 * ``policy``: the command policy's ``kubernetes.read-only`` rule refused a
-  command that names a mutating kubectl verb (:data:`_MUTATING_VERBS`), with
+  command whose kubectl verb is a mutating one (:data:`_MUTATING_VERBS`), with
   the action boundary notice ``command_policy.py`` prints ("refused however it
   is attempted"). The rule is an allowlist of read verbs and refuses an
   unlisted read spelling (``config view``, ``cluster-info dump``, ``diff``,
-  ``port-forward``, ``cp``, ``exec``) with the same words, so the verb is what
-  tells a refused write from a refused read: a write is counted, per turn,
-  across every tool and whatever succeeded in between. A result that carries
-  an exit code of 0 is not a refusal (a read that echoed a logged refusal);
-  the shim's own code is 77, but the exec path has been seen to return 126
-  for the same refusal, so no other value is required. The ``permission_refusal_halt_after``-th
+  ``port-forward``, ``cp``, ``exec``, and ``<verb> --help``) with the same
+  words, so the verb is what tells a refused write from a refused read. The
+  verb is resolved the way kubectl reads it (:func:`names_mutating_verb`):
+  the command is split into simple commands at ``;``, ``&&``, ``||``, ``|``
+  and newlines, a ``kubectl`` in command position (after assignments and
+  wrappers, inside a ``sh -c`` string, after an ``exec … --`` passthrough,
+  or inside a ``$(…)``) has its global flags walked, and the first operand is
+  the verb; ``-h``/``--help`` anywhere before ``--`` makes it a help read.
+  A verb word elsewhere in the line (an argument, a passthrough, a quoted
+  string) is not a verb. A write is counted, per turn, across every tool and
+  whatever succeeded in between; the call's exit code is not consulted,
+  because the shell reports the last command's status and a refused write
+  chained before a read arrives with exit 0. The ``permission_refusal_halt_after``-th
   (``tool_loop_guardrails`` in the profile config, default
   :data:`DEFAULT_HALT_AFTER`, the first) halts the turn through the controller's
   own halt decision, which ``agent/turn_tool_round.py`` already routes through
@@ -72,6 +79,7 @@ no non-resetting counter; this module goes when it ships one.
 from __future__ import annotations
 
 import re
+import shlex
 
 #: Definitive refusals in one turn before the run is halted: the first.
 DEFAULT_HALT_AFTER = 1
@@ -86,20 +94,37 @@ HALT_CODE = "permission_refusal_halt"
 _POLICY_ACTION_RE = re.compile(r"refused however it is attempted")
 #: The rule whose refusal of a mutating verb is definitive.
 _DEFINITIVE_RULE_RE = re.compile(r"policy rule: kubernetes\.read-only\b")
-#: kubectl verbs that change state (``debug`` starts a pod or container,
-#: ``certificate`` approves or denies, ``reconcile`` is ``auth reconcile``);
-#: ``rollout`` only with a mutating sub-verb.
-_MUTATING_VERBS = (
-    "scale|patch|edit|apply|replace|autoscale|annotate|label|create|delete|set|run|expose"
-    "|cordon|uncordon|drain|taint|debug|certificate|reconcile"
-)
-#: Line continuations, and newlines after a comma or an opening bracket (a
-#: formatted Python list), read as one line before the verb is looked for.
-_JOIN_RE = re.compile(r"\\\n\s*|(?<=[,(\[])\s*\n\s*")
-#: A command that succeeded only echoed the notice; the shim itself exits 77,
-#: and the exec path has returned 126 for the same refusal.
-_SUCCESS_EXIT_CODE = "0"
-_EXIT_CODE_RE = re.compile(r'"exit_code":\s*(-?\d+)')
+#: kubectl verbs that change state (``debug`` starts a pod or container).
+_MUTATING_VERBS = frozenset({
+    "scale", "patch", "edit", "apply", "replace", "autoscale", "annotate", "label", "create",
+    "delete", "set", "run", "expose", "cordon", "uncordon", "drain", "taint", "debug",
+})
+#: Verbs whose first operand decides: ``rollout restart``, ``auth reconcile``, ``certificate approve``.
+_MUTATING_SUBVERBS = {
+    "rollout": frozenset({"restart", "undo", "pause", "resume"}),
+    "auth": frozenset({"reconcile"}),
+    "certificate": frozenset({"approve", "deny"}),
+}
+#: kubectl global flags that take the next token as their value.
+_KUBECTL_VALUE_FLAGS = frozenset({
+    "-n", "--namespace", "--context", "--kubeconfig", "-s", "--server", "--as", "--as-group",
+    "--as-uid", "--token", "--user", "--cluster", "-v", "--v", "--request-timeout", "--cache-dir",
+    "--certificate-authority", "--client-certificate", "--client-key", "--tls-server-name",
+    "--profile", "--profile-output", "--password", "--username", "--vmodule",
+})
+_HELP_FLAGS = frozenset({"-h", "--help"})
+#: Words a shell command may carry before the command word.
+_WRAPPERS = frozenset({"sudo", "env", "time", "nice", "ionice", "nohup", "command", "stdbuf", "timeout"})
+_WRAPPERS_WITH_OPERAND = frozenset({"timeout"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_PASSTHROUGH = "--"
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_CONTINUATION_RE = re.compile(r"\\\n")
+#: ``$(…)`` and backticks: the command inside runs too.
+_SUBSTITUTION_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+#: Python list punctuation, dropped so ``["kubectl", "scale"]`` reads as words.
+_PYTHON_PUNCTUATION_RE = re.compile(r"[\[\](),]")
+_MAX_DEPTH = 6
 #: A kubectl word, then within the same simple command one of the verbs above, as
 #: a word of its own (``patch.yaml`` and ``--replicas=3`` are not verbs). The
 #: separator class admits the quoted, comma-separated form a Python list uses.
@@ -151,31 +176,136 @@ HALT_MESSAGE = (
 )
 
 
-def command_text(args) -> str:
-    """The command a tool call ran, as far as its arguments say: ``command`` first, else every string."""
+def command_text(args) -> tuple[str, bool]:
+    """The command a tool call ran and whether it is program text rather than a shell command."""
     if not isinstance(args, dict):
-        return ""
+        return "", False
     command = args.get("command")
     if isinstance(command, str):
-        return command
-    return "\n".join(v for v in args.values() if isinstance(v, str))
+        return command, False
+    return "\n".join(v for v in args.values() if isinstance(v, str)), True
 
 
-def names_mutating_verb(command: str) -> bool:
-    """Whether ``command`` runs kubectl with a verb that changes state."""
-    joined = _JOIN_RE.sub(" ", command)
-    return bool(_MUTATING_CALL_RE.search(joined) or _ROLLOUT_CALL_RE.search(joined))
+def _tokens(text: str, *, loose: bool) -> list[str]:
+    """Shell words with ``;``, ``&&``, ``||``, ``|``, ``&`` and newlines as separators
+    (in program text a newline separates nothing)."""
+    text = _CONTINUATION_RE.sub(" ", text).replace("\n", " " if loose else " ; ")
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";|&")
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return text.split()
 
 
-def classify_refusal(command, result) -> str | None:
+def _simple_commands(tokens: list[str]) -> list[list[str]]:
+    out: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= set(";|&"):
+            out.append([])
+        else:
+            out[-1].append(token)
+    return [c for c in out if c]
+
+
+def _operands(tokens: list[str]) -> list[str]:
+    """The non-flag words of a kubectl argument list, value flags consumed with their value."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == _PASSTHROUGH:
+            break
+        if token.startswith("-"):
+            i += 2 if token in _KUBECTL_VALUE_FLAGS else 1
+            continue
+        out.append(token)
+        i += 1
+    return out
+
+
+def _kubectl_is_mutating(args: list[str], depth: int) -> bool:
+    """``args`` are the tokens after a ``kubectl`` word."""
+    own = args[: args.index(_PASSTHROUGH)] if _PASSTHROUGH in args else args
+    if any(t in _HELP_FLAGS for t in own):
+        return False
+    operands = _operands(own)
+    if not operands or operands[0] == "help":
+        return False
+    verb = operands[0]
+    rest = args[args.index(verb) + 1 :] if verb in args else []
+    if verb in _MUTATING_SUBVERBS:
+        return len(operands) > 1 and operands[1] in _MUTATING_SUBVERBS[verb]
+    if verb in _MUTATING_VERBS:
+        return True
+    # ``kubectl exec … -- kubectl scale …``: what runs behind the passthrough.
+    if _PASSTHROUGH in rest:
+        return _command_is_mutating(rest[rest.index(_PASSTHROUGH) + 1 :], depth + 1)
+    return False
+
+
+def _command_is_mutating(words: list[str], depth: int) -> bool:
+    """One simple command: strip assignments and wrappers, then read the command word."""
+    if depth > _MAX_DEPTH:
+        return False
+    i = 0
+    while i < len(words) and (_ASSIGNMENT_RE.match(words[i]) or words[i] in _WRAPPERS or (i and words[i - 1] in _WRAPPERS and words[i].startswith("-"))):
+        if words[i] in _WRAPPERS_WITH_OPERAND:
+            i += 1
+        i += 1
+    if i >= len(words):
+        return False
+    word, args = words[i].rsplit("/", 1)[-1], words[i + 1 :]
+    if word == "kubectl":
+        return _kubectl_is_mutating(args, depth)
+    if word in _SHELLS and "-c" in args:
+        script = args[args.index("-c") + 1 :]
+        if script and script[0] == _PASSTHROUGH:
+            script = script[1:]
+        return bool(script) and _text_is_mutating(script[0], depth + 1, loose=False)
+    if word == "eval":
+        return _text_is_mutating(" ".join(args), depth + 1, loose=False)
+    return False
+
+
+def _text_is_mutating(text: str, depth: int, *, loose: bool) -> bool:
+    if depth > _MAX_DEPTH or not text:
+        return False
+    for inner in _SUBSTITUTION_RE.findall(text):
+        if _text_is_mutating(inner[0] or inner[1], depth + 1, loose=False):
+            return True
+    tokens = _tokens(text, loose=loose)
+    for words in _simple_commands(tokens):
+        if _command_is_mutating(words, depth):
+            return True
+        if loose:
+            # Program text (a Python list, a subprocess call): kubectl may sit anywhere,
+            # and a quoted string is a command of its own.
+            for k, token in enumerate(words):
+                if token.rsplit("/", 1)[-1] == "kubectl" and _kubectl_is_mutating(words[k + 1 :], depth):
+                    return True
+                if " " in token and _text_is_mutating(token, depth + 1, loose=False):
+                    return True
+    return False
+
+
+def names_mutating_verb(command: str, *, loose: bool = False) -> bool:
+    """Whether ``command`` runs kubectl with a verb that changes state, read as kubectl reads it.
+
+    ``loose`` is for program text rather than a shell command: list punctuation is
+    dropped and ``kubectl`` may appear at any word position.
+    """
+    if loose:
+        command = _PYTHON_PUNCTUATION_RE.sub(" ", command)
+    return _text_is_mutating(command, 0, loose=loose)
+
+
+def classify_refusal(command, result, *, loose: bool = False) -> str | None:
     """``"policy"`` for a definitive refusal, ``"advisory"`` or ``"api"`` for guidance, else ``None``."""
     if not isinstance(result, str) or not result:
         return None
     if _POLICY_ACTION_RE.search(result):
-        exit_code = _EXIT_CODE_RE.search(result)
-        if exit_code and exit_code.group(1) == _SUCCESS_EXIT_CODE:
-            return None
-        definitive = _DEFINITIVE_RULE_RE.search(result) and names_mutating_verb(command or "")
+        definitive = _DEFINITIVE_RULE_RE.search(result) and names_mutating_verb(command or "", loose=loose)
         return "policy" if definitive else "advisory"
     if _API_DENIED_RE.search(result):
         return "api"
@@ -202,18 +332,21 @@ def count_refusal(controller) -> int:
     return count
 
 
-def observe_refusal(controller, tool_name, args, result, signature, *, stock, decide, decision_cls):
+def observe_refusal(controller, tool_name, args, result, signature, *, stock, failed, decide, decision_cls):
     """The decision that replaces ``stock`` when ``result`` is a refusal, else ``None``.
 
     ``args`` are the call's arguments (the command is read from them);
     ``stock`` is what the unpatched ``after_call`` decided, which guidance
-    never overrides when it is a block or a halt; ``decide`` is the
+    never overrides when it is a block or a halt; ``failed`` is the call's
+    failure classification, which an API denial must carry (a successful read
+    whose output quotes someone else's 403 is not one); ``decide`` is the
     controller's ``_decide`` (which records a halt as the turn's halt
     decision); ``decision_cls`` is ``ToolGuardrailDecision``. The last two are
     injected so this module never imports Hermes.
     """
-    kind = classify_refusal(command_text(args), result)
-    if kind is None:
+    command, loose = command_text(args)
+    kind = classify_refusal(command, result, loose=loose)
+    if kind is None or (kind == "api" and not failed):
         return None
     if kind != "policy":
         if getattr(stock, "action", "allow") not in ("allow", "warn"):
