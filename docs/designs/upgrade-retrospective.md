@@ -477,8 +477,10 @@ persistence. An incident therefore supersedes the guard's candidate for the run:
 that Sunday reviews again, or a budget that holds the next upgrade's drain, yields one candidate,
 the incident's, never two under one id, which `validate_findings` would refuse. The guard follows
 the incident: it keeps its first-seen date, gains a review, and takes the incident's check when
-the grading moved (§3.5), so when the check changed the old id is resolved by the absence of a
-candidate under it and the new id is filed, one finding per object. A `risk`
+the grading moved (§3.5), and every guard of the object takes that check with it, one a keep rule
+kept or a failed read held included, so an object's guards carry one check and the held path can
+never file a second identity beside the moved one; when the check changed the old id is resolved
+by the absence of a candidate under it and the new id is filed, one finding per object. A `risk`
 guard is Info, filed nowhere, and is no candidate. The carried keys the manifest reserves for
 collector-resolved fleet facts hold the versions, operations and incident kinds the SOP copies.
 The SOP's `draft` builds `scope.clusters` from the `collected` entries, with `checks_run` equal to
@@ -677,7 +679,8 @@ automatic and both reversible:
   entry (`unclassified` for a symptom no row holds for, `operation` for a failed operation), object
   (`namespace/kind/name`, or `Node/<name>`, `NodePool/<pool>` or `Operation/<name>` with no
   namespace), evidence, source (pod or node state, events alone, or the operations listing), the
-  check id its incident was last filed under (a re-grade moves it, §3.3), first and last seen, and
+  check id its incident was last filed under (a re-grade moves it, and every guard of the object
+  with it, §3.3), first and last seen, and
   the number of reviews that have seen it; the last three are what its re-emitted candidate
   carries (§3.3). An operation's guard is re-checked through the operations listing every run
   already makes for its project, so it costs no read. The listing's earliest bound reaches the
@@ -1031,7 +1034,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   the profiles' projects on an undeclared install, and no listing in either case; the guards
   reader printing a guard as quoted content and one line for an absent, unreadable, over-cap or
   malformed file;
-  one candidate per object on a reviewed cluster whose incident covers a guard (the incident's,
+  two guards on one object re-graded together, a kept guard taking the object's new check, the
+  next run's re-check emitting one held candidate and one still-flagged entry and never the
+  resolved identity; one candidate per object on a reviewed cluster whose incident covers a guard
+  (the incident's,
   under this run's check, with the guard's first-seen date and review count), the guard's check
   moved on a re-grade and the old id absent from `collector_flagged_ids`; row 12's node predicate
   per operator: a pod kept off spot nodes by `cloud.google.com/gke-spot DoesNotExist` or
