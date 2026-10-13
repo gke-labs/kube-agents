@@ -1039,6 +1039,30 @@ class StageTest(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
         self.assertNotIn("scan chatter", err.getvalue())
 
+    def test_a_stage_log_that_cannot_take_writes_still_restores_the_streams(self):
+        class Unwritable(io.StringIO):
+            def fileno(self):
+                return os.open(os.devnull, os.O_WRONLY)
+
+            def flush(self):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                # As a real buffered file does: closed, and the failed flush raised.
+                super().close()
+                raise OSError(28, "No space left on device")
+
+        self.scan.side_effect = lambda _d, *_r: sys.stderr.write("scan line\n")
+        self.deliver.return_value = 0
+        before = [os.fstat(fd).st_ino for fd in (oobe.STDOUT_FD, oobe.STDERR_FD)]
+        with mock.patch.object(oobe, "_open_stage_log", side_effect=lambda _d: Unwritable()), mock.patch.object(
+            oobe, "first_run_audits"
+        ) as audits, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 0)
+        audits.assert_called_once()
+        self.assertEqual([os.fstat(fd).st_ino for fd in (oobe.STDOUT_FD, oobe.STDERR_FD)], before)
+        self.assertIn("could not write the stage log", err.getvalue())
+
     def test_the_stage_log_is_rotated_past_its_cap(self):
         log = self.d / oobe.STAGE_LOG
         log.parent.mkdir(parents=True)

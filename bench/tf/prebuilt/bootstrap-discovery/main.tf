@@ -298,7 +298,7 @@ resource "null_resource" "sweep" {
           echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the report a fresh sweep writes would be delivered to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         completed)
-          echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and the ${local.scan_job} job removes itself after delivery. There is no gate left to re-arm." >&2
+          echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and the ${local.scan_job} job removes itself after delivery once its audits stage is done. There is no gate left to re-arm." >&2
           exit 1 ;;
         nojob)
           echo "ERROR: the ${local.scan_job} cron job is not in ${local.home}/cron/jobs.json on ${var.host_cluster_name}, so nothing will file a sweep." >&2

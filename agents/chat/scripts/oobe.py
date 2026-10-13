@@ -560,7 +560,9 @@ def _quiet(log):
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             yield
     finally:
-        log.flush()
+        # The restore must run even when the log cannot take the tick's lines.
+        with contextlib.suppress(OSError):
+            log.flush()
         os.dup2(saved[0], STDOUT_FD)
         os.dup2(saved[1], STDERR_FD)
         for fd in saved:
@@ -575,11 +577,14 @@ def _quiet_stage(name: str, stage, data_dir: Path, *args) -> None:
         # Losing the log must not stop onboarding: the stage still runs, unheard.
         _log(f"cannot open the stage log, so the {name} stage runs without one: {e}")
         log = open(os.devnull, "w", encoding="utf-8")
-    with log, _quiet(log):
-        try:
-            stage(data_dir, *args)
-        except Exception as e:  # noqa: BLE001 - the next tick retries; delivery must still run
-            _log(f"the {name} stage failed: {e!r}")
+    try:
+        with log, _quiet(log):
+            try:
+                stage(data_dir, *args)
+            except Exception as e:  # noqa: BLE001 - the next tick retries; delivery must still run
+                _log(f"the {name} stage failed: {e!r}")
+    except OSError as e:
+        _log(f"could not write the stage log for the {name} stage: {e}")
 
 
 def first_run_audits(data_dir: Path, now: float) -> None:
