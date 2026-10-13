@@ -19,8 +19,9 @@ name: The first-install hello says the first look is done when the report is rea
 #
 # Isolation class: read-only on the cluster. It plants INVENTORY.md on the
 # shell sandbox and the seam's request in the agent pod, and refuses an install
-# whose sandbox already holds a report or where a person is waiting on one;
-# the destroy removes both files.
+# whose sandbox already holds a report it did not plant or where a person is
+# waiting on one. The destroy removes the request, and the report while it
+# still holds the planted text.
 
 fixtures: []
 
@@ -36,6 +37,10 @@ infrastructure:
     phrase: "back from lunch"
 
 validated: false
+
+# A greeting needs no tool call, so the liveness rung reads the reply instead
+# of the trajectory.
+tool_calls_optional: true
 
 domain: chat-and-routing
 

@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/first-install-hello-running and
-# first-install-hello-done.
+# The scenario driver for bench/tasks/first-install-hello-running,
+# first-install-hello-done and first-install-hello-report-ready.
 #
 # The first-install greeting fires once per deployment, on the first turn from
 # a chat platform with durable delivery (the bootstrap_onboarding plugin in
@@ -128,11 +128,19 @@ resource "null_resource" "planted_report" {
         exit 1
       fi
 
-      present="$("$${in_sandbox[@]}" sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi' sh "$REPORT_PATH" </dev/null)"
-      if [ "$present" != absent ]; then
-        echo "ERROR: $REPORT_PATH is already on $sandbox_pod (read: $present). It is not this case's to replace or remove." >&2
-        exit 1
-      fi
+      # A file holding this stack's own text is one an earlier run left, by a
+      # destroy that did not finish or an apply killed after the rename; it is
+      # planted over and removed with this run's.
+      present="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
+        'planted="$(base64 -d)"; if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; elif [ -f "$1" ] && [ ! -L "$1" ] && [ "$(cat "$1")" = "$planted" ]; then echo ours; else echo other; fi' \
+        sh "$REPORT_PATH")"
+      case "$present" in
+        absent | ours) ;;
+        *)
+          echo "ERROR: $REPORT_PATH is already on $sandbox_pod and was not planted by this stack (read: $${present:-nothing}). It is not this case's to replace or remove." >&2
+          exit 1
+          ;;
+      esac
 
       # Owned as the data volume is, so the plugin's read as the terminal's
       # login can open it.
@@ -167,13 +175,23 @@ resource "null_resource" "planted_report" {
         --location "${self.triggers.host_location}" --project "$project" --quiet
 
       sandbox_pods="$(kubectl get pods -n "${self.triggers.namespace}" -l "${self.triggers.sandbox_selector}" -o name)"
+      if [ -z "$sandbox_pods" ]; then
+        echo "ERROR: no shell sandbox pod matches ${self.triggers.sandbox_selector} in ${self.triggers.namespace}, so $REPORT_PATH could not be checked or removed. Until it is, the plugin greets a person's first chat as though the report were ready." >&2
+        exit 1
+      fi
       for pod in $sandbox_pods; do
         # Only while it holds what the apply planted: the delivery stage may
         # have moved it aside, and a report written since is not this case's.
         result="$(printf '%s' "$REPORT_B64" | kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- sh -c \
-          'planted="$(base64 -d)"; if [ ! -e "$1" ]; then echo absent; elif [ "$(cat "$1")" = "$planted" ]; then rm -f "$1" && echo removed; else echo kept; fi' \
+          'planted="$(base64 -d)"; if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; elif [ -f "$1" ] && [ ! -L "$1" ] && [ "$(cat "$1")" = "$planted" ]; then rm -f "$1" && echo removed; else echo kept; fi' \
           sh "$REPORT_PATH")"
-        echo "$REPORT_PATH on $pod: $result."
+        case "$result" in
+          absent | removed | kept) echo "$REPORT_PATH on $pod: $result." ;;
+          *)
+            echo "ERROR: could not remove $REPORT_PATH from $pod (read: $${result:-nothing})." >&2
+            exit 1
+            ;;
+        esac
       done
     EOT
   }
