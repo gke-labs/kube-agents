@@ -23,6 +23,10 @@ import (
 // rules (an unknown schema), and that value is executor output.
 const chatProblemMax = 200
 
+// lineKeySeparator joins a line's text and its chat message in lineKey: a
+// NUL, which no status line carries.
+const lineKeySeparator = "\x00"
+
 // readChat reads carrier c's chat message out of parts, logging and counting
 // what it dropped.
 func (g *Gateway) readChat(conversation, taskID string, c chatmsg.Carrier, parts []lib.Part) chatmsg.Reading {
@@ -93,7 +97,7 @@ func (g *Gateway) chatOutcome(conversation string, err error) bool {
 // chat message the adapter will not lay out falls back to the text edit.
 func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayState) bool {
 	line = truncateRunes(line, discordChunk)
-	if rs.lineChat == nil && !rs.lineLaidOut {
+	if rs.lineTextOnly || (rs.lineChat == nil && !rs.lineLaidOut) {
 		return g.editLine(conversation, messageID, line)
 	}
 	if rs.lineChat != nil {
@@ -101,6 +105,11 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 		if g.chatOutcome(conversation, err) {
 			rs.lineLaidOut = true
 			return true
+		}
+		if errors.Is(err, ErrTextOnly) {
+			// The backend shows text only, and will for the life of the
+			// task: from here the line is the text edit alone.
+			rs.lineTextOnly = true
 		}
 		if !rs.lineLaidOut {
 			return g.editLine(conversation, messageID, line)
@@ -116,16 +125,19 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 }
 
 // lineKey is what the rolling line shows, for the relay's skip of an edit
-// that would change nothing: the text, and the chat message laid out with it.
-func lineKey(line string, chat *chatmsg.Message) string {
-	if chat == nil {
+// that would change nothing: the text, and the chat message laid out with
+// it. On a backend that showed it renders text only (lineTextOnly) the chat
+// message changes nothing it shows, so it is no part of the key.
+func lineKey(line string, rs *relayState) string {
+	chat := rs.lineChat
+	if chat == nil || rs.lineTextOnly {
 		return line
 	}
 	encoded, err := json.Marshal(chat)
 	if err != nil {
 		return line
 	}
-	return line + "\x00" + string(encoded)
+	return line + lineKeySeparator + string(encoded)
 }
 
 // resultChat reads the result's chat message: off the chunks this process

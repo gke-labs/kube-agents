@@ -529,8 +529,10 @@ type fakeConversations struct {
 	contexts map[string]string
 	err      error
 	posts    []notifyPost
-	// rendersChat, edits and chats: see PostMessage.
+	// rendersChat, edits and chats: see PostMessage. failEdits fails
+	// every EditMessage.
 	rendersChat bool
+	failEdits   bool
 	edits       []notifyPost
 	chats       []*chatmsg.Message
 }
@@ -566,6 +568,9 @@ func (f *fakeConversations) EditMessage(conversation, messageID string, m OutMes
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failEdits {
+		return errors.New("fake edit failure")
+	}
 	f.edits = append(f.edits, notifyPost{thread: messageID, text: m.Text})
 	f.chats = append(f.chats, m.Chat)
 	return nil

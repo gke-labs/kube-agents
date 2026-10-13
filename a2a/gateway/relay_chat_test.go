@@ -287,6 +287,47 @@ func TestChatProgressOnATextOnlyBackendEditsText(t *testing.T) {
 	}
 }
 
+// On a text-only backend a progress chat message that changes while the
+// line's text does not costs no edit: the backend shows the text alone.
+func TestChatProgressChangeAloneEditsNothingOnATextOnlyBackend(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.DisplayMode = displayModeDefault })
+	origin := startChatTask(t, r, "discord:g1/text-plan-change", false)
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "a"}, chatPart(t, testPlan)}, false, false)
+	waitFor(t, "the working line", func() bool {
+		texts := r.adapter.editTexts()
+		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "working")
+	})
+	time.Sleep(200 * time.Millisecond)
+	before := len(r.adapter.editTexts())
+	changed := testPlan
+	changed.Plan = &chatmsg.Plan{Title: "Upgrade readiness", Items: []chatmsg.PlanItem{{ID: "t-1", Title: "Read cluster versions", Status: chatmsg.StatusComplete}}}
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "b"}, chatPart(t, changed)}, false, false)
+	time.Sleep(500 * time.Millisecond)
+	if after := len(r.adapter.editTexts()); after != before {
+		t.Fatalf("edits went from %d to %d for a line whose text did not change", before, after)
+	}
+}
+
+// A laid-out line whose next chat message the backend refuses is replaced by
+// its text, the layout cleared (EditMessage with no chat message).
+func TestChatProgressRefusedAfterLayoutClearsIt(t *testing.T) {
+	r := startRig(t)
+	origin := startChatTask(t, r, "discord:g1/chat-progress-refused", true)
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "a"}, chatPart(t, testPlan)}, false, false)
+	waitFor(t, "the laid-out line", func() bool {
+		edits := r.adapter.chatEditsCopy()
+		return len(edits) > 0 && edits[len(edits)-1] != nil
+	})
+	r.adapter.mu.Lock()
+	r.adapter.refuseChat = true
+	r.adapter.mu.Unlock()
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "b"}, chatPart(t, testPlan)}, false, false)
+	waitFor(t, "the layout cleared", func() bool {
+		edits := r.adapter.chatEditsCopy()
+		return len(edits) > 1 && edits[len(edits)-1] == nil
+	})
+}
+
 // markingAdapter is a fake that applies marks.
 type markingAdapter struct {
 	*fakeAdapter

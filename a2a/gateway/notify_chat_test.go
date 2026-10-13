@@ -106,6 +106,23 @@ func TestNotifyUpdateKeyEditsAsTextOnATextOnlyBackend(t *testing.T) {
 	}
 }
 
+// An edit that fails posts a new message, and the key moves to it, so the
+// next request edits the message that is there rather than the lost one.
+func TestNotifyUpdateKeyPostsAnewWhenTheEditFails(t *testing.T) {
+	n, conv := newChatNotifier(t, false)
+	first := serveJSON(t, n, lib.NotifyRequest{Text: "a", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	conv.failEdits = true
+	second := serveJSON(t, n, lib.NotifyRequest{Text: "b", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	if second.Error != "" || second.MessageID == first.MessageID || len(conv.posts) != 2 {
+		t.Fatalf("replies %+v, %+v, posts %d; want a second post", first, second, len(conv.posts))
+	}
+	conv.failEdits = false
+	serveJSON(t, n, lib.NotifyRequest{Text: "c", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	if len(conv.edits) != 1 || conv.edits[0].thread != second.MessageID {
+		t.Fatalf("edits = %+v, want the key on the second post", conv.edits)
+	}
+}
+
 // A conversation keeps at most notifyUpdateKeysMax keys; the oldest is
 // forgotten, and a request with it posts anew.
 func TestNotifyUpdateKeysAreBounded(t *testing.T) {

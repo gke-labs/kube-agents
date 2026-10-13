@@ -123,6 +123,10 @@ type relayState struct {
 	// is set while the live message shows a layout (renderLine).
 	lineChat    *chatmsg.Message
 	lineLaidOut bool
+	// lineTextOnly is set once the adapter answered a laid-out line with
+	// ErrTextOnly: its edits are text from then on, and a change to the
+	// progress chat message alone costs no backend edit.
+	lineTextOnly bool
 }
 
 // relayFor is the task's render state, created on first use.
@@ -770,7 +774,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	line := withLineNote(statusLine(rs.state, progress), active.LineNote)
 	// The progress chat message is laid out under every display mode: it is
 	// the executor's statement of where the work is (a plan), not narration.
-	shown := lineKey(line, rs.lineChat)
+	shown := lineKey(line, rs)
 	if shown == rs.lastLine {
 		return
 	}
@@ -779,7 +783,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
 	if g.renderLine(rec.Key, active.StatusMsgID, line, rs) {
-		rs.lastLine = shown
+		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
 }
 

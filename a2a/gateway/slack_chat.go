@@ -75,6 +75,9 @@ const (
 	// renderer sends it verbatim, so Slack links and mentions nothing the
 	// text does not spell out as <url|label>.
 	slackChatMrkdwn = "mrkdwn"
+	// slackChatActionsBlock is the block the renderer writes its buttons
+	// into, the one block refuseSlackChat lets carry interactive elements.
+	slackChatActionsBlock = "actions"
 )
 
 // slackChatColors are the side-bar colours by tone: the presenter's
@@ -179,7 +182,7 @@ func refuseSlackChat(blocks []map[string]any) error {
 	}
 	var content []any
 	for _, b := range all {
-		if block, _ := b.(map[string]any); block["type"] != "actions" {
+		if block, _ := b.(map[string]any); block["type"] != slackChatActionsBlock {
 			content = append(content, b)
 		}
 	}
@@ -366,8 +369,8 @@ func slackChatPlan(p *chatmsg.Plan) map[string]any {
 }
 
 // slackChatActions is the buttons, choices before links, five to a row. A
-// choice's value is what a click sends (its reply, else its text; PR 4
-// answers the click); a link button opens its url. The one primary entry is
+// choice's value is what a click will send (its reply, else its text;
+// nothing answers a click yet); a link button opens its url. The one primary entry is
 // drawn as Slack's primary button.
 func slackChatActions(choices []chatmsg.Choice, links []chatmsg.Link) []map[string]any {
 	var buttons []map[string]any
@@ -388,7 +391,7 @@ func slackChatActions(choices []chatmsg.Choice, links []chatmsg.Link) []map[stri
 	var blocks []map[string]any
 	for start := 0; start < len(buttons); start += slackChatButtonsPerRow {
 		end := min(start+slackChatButtonsPerRow, len(buttons))
-		blocks = append(blocks, map[string]any{"type": "actions", "elements": buttons[start:end]})
+		blocks = append(blocks, map[string]any{"type": slackChatActionsBlock, "elements": buttons[start:end]})
 	}
 	return blocks
 }
