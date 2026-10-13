@@ -259,6 +259,15 @@ KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
 KUBECONFIG_DIR_MODE = 0o1777
 KUBECONFIG_DIR_MODE_MASK = 0o7777
 KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
+# The shared rule's notes, as `collect.usable_kubeconfig_dir` words them: the
+# reason a directory or file could not be made usable, with the owner named,
+# and the stderr line for a directory moved aside.
+KUBECONFIG_MOVED_ASIDE_FORMAT = "{directory}: owned by uid {uid}, moved aside to {aside}; this run makes its own"
+KUBECONFIG_NOT_MOVED_FORMAT = "{directory} is owned by uid {uid} and this run is uid {euid}; it could not be moved aside ({error})"
+KUBECONFIG_NOT_MADE_FORMAT = "{directory} could not be made ({error})"
+KUBECONFIG_MODE_NOT_CHANGED_FORMAT = "{directory} is at mode {mode}, not {wanted}, and could not be changed ({error})"
+KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is another uid's and could not be replaced ({error})"
+KUBECONFIG_NOT_PREPARED_FORMAT = "cannot prepare kubeconfig: {note}"
 KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
@@ -683,17 +692,21 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> None:
+def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
     """The kubeconfig directory usable before `get-credentials` writes `path`
     into it, and a kubeconfig this uid cannot write removed. The default
-    shared directory follows `collect.prepare_kubeconfig`'s rule: made at
-    `KUBECONFIG_DIR_MODE` whatever the umask, widened when this uid owns it,
-    moved aside and remade when another uid's. A directory the caller named
-    is made under the caller's umask. Raises OSError, which the caller
-    reports with the directory."""
+    shared directory follows `collect.prepare_kubeconfig`'s rule and its
+    contract: made at `KUBECONFIG_DIR_MODE` whatever the umask, widened when
+    this uid owns it, moved aside (said on stderr) and remade when another
+    uid's; None when it is usable, else why not, with the owner named, which
+    the caller reports as the member's read error. A directory the caller
+    named is made under the caller's umask."""
     shared = os.path.realpath(kubeconfig_dir) == os.path.realpath(default_kubeconfig_dir())
     if not shared:
-        os.makedirs(kubeconfig_dir, exist_ok=True)
+        try:
+            os.makedirs(kubeconfig_dir, exist_ok=True)
+        except OSError as exc:
+            return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
     else:
         euid = os.geteuid()
         try:
@@ -702,17 +715,31 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> None:
             current = None
         if current is not None and current.st_uid != euid and euid != ROOT_UID:
             aside = os.path.join(os.path.dirname(kubeconfig_dir), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(kubeconfig_dir), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
-            os.rename(kubeconfig_dir, aside)
+            try:
+                os.rename(kubeconfig_dir, aside)
+            except OSError as exc:
+                return KUBECONFIG_NOT_MOVED_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, euid=euid, error=exc)
+            print(KUBECONFIG_MOVED_ASIDE_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, aside=os.path.basename(aside)), file=sys.stderr)
             current = None
         if current is None:
             # Made at the caller's umask and chmodded below: the umask is
             # process-wide, and a toggle here would race the other threads.
-            os.makedirs(kubeconfig_dir, exist_ok=True)
-            current = os.stat(kubeconfig_dir)
+            try:
+                os.makedirs(kubeconfig_dir, exist_ok=True)
+                current = os.stat(kubeconfig_dir)
+            except OSError as exc:
+                return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
         if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
-            os.chmod(kubeconfig_dir, KUBECONFIG_DIR_MODE)
+            try:
+                os.chmod(kubeconfig_dir, KUBECONFIG_DIR_MODE)
+            except OSError as exc:
+                return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(current.st_mode & KUBECONFIG_DIR_MODE_MASK), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
     if os.path.exists(path) and not os.access(path, os.W_OK):
-        os.unlink(path)
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return KUBECONFIG_NOT_REPLACED_FORMAT.format(path=path, error=exc)
+    return None
 
 
 def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:
@@ -723,10 +750,9 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tu
     the member is then graded `unknown` on the PDB rule and the run exits 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
-    try:
-        prepare_kubeconfig(kubeconfig_dir, path)
-    except OSError as e:
-        return None, f"cannot prepare kubeconfig directory {kubeconfig_dir} for {path}: {e}", path
+    note = prepare_kubeconfig(kubeconfig_dir, path)
+    if note:
+        return None, KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), path
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
     rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)

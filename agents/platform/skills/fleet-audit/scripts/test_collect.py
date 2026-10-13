@@ -12408,6 +12408,27 @@ class TestDefaultRun(unittest.TestCase):
         self.assertIsInstance(result.stdout, str)
         self.assertIsInstance(result.stderr, str)
 
+class CredentialsNoteTest(unittest.TestCase):
+    def test_a_refused_directory_names_its_owner_in_the_failed_credentials(self):
+        # `prepare_kubeconfig`'s note reaches the failed `get-credentials` result, so the entry built
+        # from it names the owner rather than gcloud's bare refusal; a result that succeeded keeps
+        # gcloud's own text.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            owner = kc.parent.stat().st_uid
+            other = owner + 1
+            refused = lambda argv, env=None, **kwargs: run_of(1, "", "ERROR: (gcloud.container.clusters.get-credentials) Permission denied")  # noqa: E731
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = collect.fetch_credentials("p", "c", "l", run=refused)
+            self.assertEqual(result.rc, 1)
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            self.assertTrue(result.stderr.endswith("Permission denied"))
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, ok = collect.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: run_of(0))
+            self.assertEqual((ok.rc, ok.stderr), (0, ""))
+
+
 class PrepareKubeconfigTest(unittest.TestCase):
     """The shared `.kubeconfigs` after a hand run as another uid, in either
     order: root first, or uid 1000 first."""

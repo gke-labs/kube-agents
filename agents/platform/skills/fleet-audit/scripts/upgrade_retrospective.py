@@ -67,9 +67,12 @@ project whose Kubernetes Engine API is off is an empty project for both
 listings, never a gap. `--project` names one project and
 is a hand run's override: free on an install that declares no scope, and on
 one that does admitted only beside the scope flags and for a project inside
-the readable scope. Without any of them, on an install that declares no
-scope, the projects are the active gcloud project plus `gcloud projects
-list`; on a sandbox whose operator says a scope is declared
+the readable scope; `--cluster` names its project under the same rule.
+Without any of them, on an install that declares no scope, the projects are
+the active gcloud project plus `gcloud projects list`, and a listing that
+failed or did not name the active project is incomplete: the run sweeps
+what it has, a full run holds every ledger project outside it the same way,
+and the listing's error is the gap; on a sandbox whose operator says a scope is declared
 (`KUBEAGENTS_SCOPE_DECLARED`) a run without the flags is refused and lists
 nothing. The shared `fleet_scope_args` module (agents/platform/scripts)
 holds the flags and the rule, as for `collect.py` and `patch_readiness.py`.
@@ -462,6 +465,16 @@ UNREAD_PROJECT_TEXT = "{cluster}: its project {project} is in the install's decl
 # prunes no project and holds every ledger project outside the set as it holds
 # an unread one, its known clusters this run's gap.
 SCOPE_UNRESOLVED_HOLD_TEXT = "{cluster}: its project {project} is outside the projects handed this run, and the install's declared scope is not resolved yet ({row}={outcome}); ledger entry and guards kept unchanged"
+# An undeclared install's `projects list` that failed, or answered without the
+# active project (a filtered listing, as `collect.discover_fleet` reads it):
+# the swept set is not the fleet either, and a full run holds a ledger project
+# outside it the same way. The note is the manifest's gap, as `collect.py`'s
+# `discovery.partial` is.
+LISTING_FAILED_NOTE_FORMAT = "gcloud projects list rc={rc}: {error}; the run swept the active project alone, and how many other projects the fleet holds is unknown"
+LISTING_FILTERED_NOTE_FORMAT = "gcloud projects list rc=0 did not name the active project {project}, so it is filtered rather than complete: it returned {count} project(s), and how many other projects the fleet holds is unknown"
+LISTING_INCOMPLETE_HOLD_TEXT = "{cluster}: its project {project} is outside the projects this run listed, and the listing was incomplete; ledger entry and guards kept unchanged"
+# A `--cluster` names its project under `--project`'s rule: inside the readable scope.
+FORCED_OUTSIDE_SCOPE_TEXT = "--cluster {cluster}: {error}"
 SCOPE_LOG_FORMAT = "scope: the install's declared scope, {count} project(s) from the fleet_scope tool"
 FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
 NOT_FULL_TEXT = "no --full: a scoped run"
@@ -1075,8 +1088,9 @@ OPERATION_IN_FLIGHT_STATUSES = ("PENDING", "RUNNING", "ABORTING")
 INFO_UPGRADING = "Upgrading now:"
 INFO_SCOPED = "Scoped run: {reason}. Nothing outside the scope was pruned, no stale guard outside it is reported, and the fleet link was not moved."
 # The scope note on the human report too: a Sunday report whose fleet the tool
-# could not hand in full says so where a reader looks, not in the manifest alone.
-INFO_SCOPE_NOTE = "Declared scope: {note}"
+# could not hand, or the listing could not name, in full says so where a reader
+# looks, not in the manifest alone.
+INFO_SCOPE_NOTE = "Scope: {note}"
 UPGRADING_LINE = "{cluster}: upgrading now ({operation} {target} since {start}); reviewed on the next run"
 NO_OPERATION_LINE = "no upgrade operation in the window"
 # The after-upgrade route (--after-upgrade): the clusters with an
@@ -1202,31 +1216,41 @@ def run_json(argv: list[str], *, run: RunFn, timeout: int = GCLOUD_TIMEOUT_S, en
 # --------------------------------------------------------------------------- #
 
 
-def discover_fleet(base_project: str | None, *, run: RunFn) -> tuple[list[str], list[str]]:
-    """The projects to enumerate and the reads that failed on the way, as the
-    sibling collectors resolve them: `--project` names one project and is a
-    hand run's override (`validate_args` refused one outside a declared
-    scope); else the declared scope the SOP handed from the fleet_scope
-    tool, swept exactly as handed with nothing listed; else the active
-    gcloud project plus every project `gcloud projects list` returns."""
+def discover_fleet(base_project: str | None, *, run: RunFn) -> tuple[list[str], list[str], str | None]:
+    """The projects to enumerate, the reads that failed on the way, and, on an
+    undeclared install, the note that the listing was incomplete (it failed,
+    or did not name the active project, so it is filtered), under which the
+    swept set is not the fleet. Resolved as the sibling collectors resolve
+    it: `--project` names one project and is a hand run's override
+    (`validate_args` refused one outside a declared scope); else the
+    declared scope the SOP handed from the fleet_scope tool, swept exactly
+    as handed with nothing listed; else the active gcloud project plus every
+    project `gcloud projects list` returns."""
     if base_project:
-        return [base_project], []
+        return [base_project], [], None
     if declared_scope.declared:
         log(SCOPE_LOG_FORMAT.format(count=len(declared_scope.projects or [])))
-        return list(declared_scope.projects or []), []
+        return list(declared_scope.projects or []), [], None
     errors: list[str] = []
     projects: set[str] = set()
     result = run(["gcloud", "config", "get-value", "project"])
-    if result.rc == 0 and result.stdout.strip():
-        projects.add(result.stdout.strip())
+    base = result.stdout.strip() if result.rc == 0 else ""
+    if base:
+        projects.add(base)
+    note = None
     result = run(["gcloud", "projects", "list", "--format", "value(projectId)"])
     if result.rc != 0:
-        errors.append(f"gcloud projects list rc={result.rc}: {_excerpt(result)}; only the configured project was read")
+        note = LISTING_FAILED_NOTE_FORMAT.format(rc=result.rc, error=_excerpt(result))
     else:
-        projects |= {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        listed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        projects |= listed
+        if base and base not in listed:
+            # rc 0 and the active project absent from its own output: the
+            # listing is filtered rather than complete (`collect.discover_fleet`).
+            note = LISTING_FILTERED_NOTE_FORMAT.format(project=base, count=len(listed))
     if not projects:
         errors.append("project discovery named no project: no `--project` and no active gcloud project")
-    return sorted(projects), errors
+    return sorted(projects), errors, note
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | None]:
@@ -3931,7 +3955,10 @@ def recheck_operation_guards(guards: list[dict], operations: list[dict], listed:
         if op_type == OP_UPGRADE_NODES and target and target != CONTROL_PLANE_TARGET and cluster_pools is not None and target not in cluster_pools:
             result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_POOL_GONE_FORMAT.format(target=target)})
             continue
-        retries = [o for o in ops if o.get("name") != name and op_type and o.get("operationType") == op_type and target and operation_summary(o)["target"] == target and (o.get("status") or "") == OPERATION_TERMINAL_STATUS and not o.get("error") and started is not None and (parse_ts(o.get("startTime")) or started) > started]
+        # The one failure predicate decides the retry too: `DONE` with a
+        # `statusMessage` and no `error` object is a failed operation to the
+        # guard and the Error, so it is no clean retry here.
+        retries = [o for o in ops if o.get("name") != name and op_type and o.get("operationType") == op_type and target and operation_summary(o)["target"] == target and not _operation_failed(operation_summary(o)) and started is not None and (parse_ts(o.get("startTime")) or started) > started]
         if retries:
             retry = operation_summary(sorted(retries, key=lambda o: o.get("startTime") or "")[0])
             result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_RETRIED_FORMAT.format(type=retry["type"], target=retry["target"], name=retry["name"], end=retry["end"] or "?")})
@@ -4803,15 +4830,14 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         seen.add(key)
         _, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
         entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_UNREACHABLE, "error": UNREAD_PROJECT_TEXT.format(cluster=key, project=project, outcome=unread_outcomes.get(project, fleet_scope_args.SCOPE_UNREAD_DEFAULT_OUTCOME)).split(": ", 1)[-1][:ERROR_EXCERPT_CHARS]})
-    # A ledger project outside the handed set on a full run handed the tool's
-    # unresolved row: held as an unread one is, the row the reason.
-    for key, project in sorted((result.get("held_clusters") or {}).items()):
+    # A ledger project outside the handed or listed set on a full run whose
+    # set is not the fleet: held as an unread one is, with its reason.
+    for key, reason in sorted((result.get("held_clusters") or {}).items()):
         if key in seen:
             continue
         seen.add(key)
-        _, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
-        reason = SCOPE_UNRESOLVED_HOLD_TEXT.format(cluster=key, project=project, row=fleet_scope_args.UNRESOLVED_SCOPE_ROW, outcome=result.get("scope_unresolved") or fleet_scope_args.SCOPE_UNREAD_DEFAULT_OUTCOME)
-        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_UNREACHABLE, "error": reason.split(": ", 1)[-1][:ERROR_EXCERPT_CHARS]})
+        project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
+        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_UNREACHABLE, "error": reason[:ERROR_EXCERPT_CHARS]})
     for line in result["failed_reads"]:
         key, _, reason = line.partition(": ")
         if key in seen or key.count(CLUSTER_KEY_SEPARATOR) != 2 or not reason.startswith("its project's listing failed"):
@@ -4993,6 +5019,14 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
                 raise argparse.ArgumentTypeError(override_error)
         elif declared_scope.declared and not declared_scope.projects:
             raise argparse.ArgumentTypeError(declared_scope.empty_error())
+        for key in sorted(forced):
+            # The project a `--cluster` names is admitted by the override's
+            # rule: free on an undeclared install, else inside the readable
+            # scope; a sweep of a project outside the declared scope is what
+            # the scope exists to refuse, whichever flag names it.
+            forced_error = declared_scope.override_error(key.split(CLUSTER_KEY_SEPARATOR)[0])
+            if forced_error:
+                raise argparse.ArgumentTypeError(FORCED_OUTSIDE_SCOPE_TEXT.format(cluster=key, error=forced_error))
     full = bool(getattr(args, "full", False))
     if full:
         if forced:
@@ -5129,7 +5163,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         return {"generated_at": seen_at, "since": fmt_ts(since), "projects": [], "reviews": [], "unchanged": [], "upgrading": [], "failed_reads": [], "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "no_baseline": True, "report": NO_BASELINE_TEXT + "\n", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
 
     failed_reads: list[str] = []
-    projects, failed_reads = discover_fleet(project_override(args) or None, run=run)
+    projects, failed_reads, listing_note = discover_fleet(project_override(args) or None, run=run)
     projects = sorted(set(projects))
     # The declared projects the install could not read: not swept, their
     # known clusters this run's gap, held unchanged in the ledger and the
@@ -5138,7 +5172,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # The tool's unresolved row: not a project, and the one `--scope-unread`
     # entry under which the handed set is not the fleet (`sweep_is_declared`).
     unresolved_outcome = next((outcome for p, outcome in declared_scope.unread if p == fleet_scope_args.UNRESOLVED_SCOPE_ROW), None)
-    scope_note = declared_scope.note()
+    # The gap under which the handed or listed set is not the fleet: the
+    # tool's unresolved row, or an undeclared install's incomplete listing.
+    scope_note = declared_scope.note() or listing_note
     if forced:
         projects = sorted(set(projects) | {c.split(CLUSTER_KEY_SEPARATOR)[0] for c in forced})
 
@@ -5230,15 +5266,15 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     unread_clusters = {key: key.split(CLUSTER_KEY_SEPARATOR)[0] for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in unread_outcomes}
     for key, project in sorted(unread_clusters.items()):
         failed_reads.append(UNREAD_PROJECT_TEXT.format(cluster=key, project=project, outcome=unread_outcomes[project]))
-    # Ledger clusters of a project outside the handed set on a full run handed
-    # the tool's unresolved row: held, with the row as the reason.
+    # Ledger clusters of a project outside the handed or listed set on a full
+    # run whose set is not the fleet: held, each with its reason.
     held_clusters: dict[str, str] = {}
     if scoped:
         new_fleet = fleet
         removed = set()
     else:
         handed = set(projects) | set(unread_outcomes)
-        if unresolved_outcome is None:
+        if unresolved_outcome is None and listing_note is None:
             # The scope the run was handed is the fleet it records, the declared
             # projects it could not read included: they are held, not pruned.
             new_fleet = handed
@@ -5247,16 +5283,23 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             # with its clusters; a roster project whose listing failed stays.
             removed = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] not in new_fleet}
         else:
-            # The handed set is not the fleet: no project is pruned, the
-            # ledger's set stands with the projects this run read added (a
-            # first run with the row still records what it read, else its
-            # reviews would fall outside the fleet and write no guard), and a
-            # ledger project outside the handed set is held as an unread one.
+            # The handed or listed set is not the fleet: no project is pruned,
+            # the ledger's set stands with the projects this run read added (a
+            # first run still records what it read, else its reviews would
+            # fall outside the fleet and write no guard), and a ledger project
+            # outside the set is held as an unread one, with the reason.
             new_fleet = fleet | handed
             removed = set()
-            held_clusters = {key: key.split(CLUSTER_KEY_SEPARATOR)[0] for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] not in handed}
-            for key, project in sorted(held_clusters.items()):
-                failed_reads.append(SCOPE_UNRESOLVED_HOLD_TEXT.format(cluster=key, project=project, row=fleet_scope_args.UNRESOLVED_SCOPE_ROW, outcome=unresolved_outcome))
+            for key in sorted(ledger.get("clusters") or {}):
+                project = key.split(CLUSTER_KEY_SEPARATOR)[0]
+                if project in handed:
+                    continue
+                if unresolved_outcome is not None:
+                    line = SCOPE_UNRESOLVED_HOLD_TEXT.format(cluster=key, project=project, row=fleet_scope_args.UNRESOLVED_SCOPE_ROW, outcome=unresolved_outcome)
+                else:
+                    line = LISTING_INCOMPLETE_HOLD_TEXT.format(cluster=key, project=project)
+                held_clusters[key] = line.split(": ", 1)[-1]
+                failed_reads.append(line)
         # A cluster a successful listing no longer names leaves, whatever the scope's state.
         removed |= {key for project, listed in listed_projects.items() for key in (ledger.get("clusters") or {}) if key.startswith(project + CLUSTER_KEY_SEPARATOR) and key not in listed}
         for key in sorted(unlisted_clusters):
@@ -5495,7 +5538,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-file", help="also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against)")
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
     parser.add_argument("--probe-lock", action="store_true", help="test the lock without taking it: a non-blocking flock attempt on .lock, held for no time, reading and writing nothing; exit 0 when free, 1 with the holder line when another run holds it. With no other mode flag")
-    parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters (no project when handed the fleet_scope tool's {fleet_scope_args.UNRESOLVED_SCOPE_ROW} row, under which the handed set is not the fleet), writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
+    parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters (no project when handed the fleet_scope tool's {fleet_scope_args.UNRESOLVED_SCOPE_ROW} row, or when an undeclared install's projects listing failed or did not name the active project: the swept set is then not the fleet), writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full or --cluster")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing; with --reset-ledger, list the crash records and move none")
     return parser

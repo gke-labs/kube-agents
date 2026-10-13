@@ -31,7 +31,13 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+# Every resolver asks the operator's answer when a run passes neither scope flag: the root-owned
+# file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell that carries either would turn
+# this suite's --project runs into refusals; both are neutralised at import, as the sibling suites do.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 import upgrade_retrospective as ur  # noqa: E402
+
+ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 FIXTURES = Path(__file__).parent / "testdata" / "upgrade_retrospective"
 PROJECT = "example-project"
@@ -92,7 +98,7 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=()):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
         self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
@@ -100,6 +106,9 @@ class FakeFleet:
         self.ops_fail = set(ops_fail)
         # Projects with the Kubernetes Engine API off: both listings refuse with gcloud's words for it.
         self.api_off = set(api_off)
+        # An undeclared install's `gcloud projects list`: its exit code, and the projects it names
+        # (the active project alone by default; a list without it is a filtered listing).
+        self.projects_list_rc, self.projects_listed = projects_list_rc, projects_listed
         self.calls = []
 
     def __call__(self, argv, *, timeout=None, env=None):
@@ -133,7 +142,9 @@ class FakeFleet:
         if "config get-value" in joined:
             return run_of(0, PROJECT + "\n")
         if "projects list" in joined:
-            return run_of(0, PROJECT + "\n")
+            if self.projects_list_rc:
+                return run_of(self.projects_list_rc, "", "PERMISSION_DENIED")
+            return run_of(0, "\n".join(self.projects_listed if self.projects_listed is not None else [PROJECT]) + "\n")
         raise AssertionError(f"unexpected command {joined}")
 
 
@@ -246,6 +257,25 @@ class OperationsTest(unittest.TestCase):
         self.assertEqual(summary["duration_s"], 3814)
         self.assertIn("does not have enough resources", summary["error"])
         self.assertIsNone(ur.operation_summary(ops_for("seeded-a")[0])["error"])
+
+    def test_a_retry_with_a_status_message_and_no_error_is_not_a_clean_retry(self):
+        # One predicate decides a failed operation everywhere: `operation_summary` reads the failure as
+        # `error.message` or `statusMessage`, so a later operation that reached DONE with a
+        # `statusMessage` and no `error` object is a failed operation to the guard and the Error, and
+        # does not clear the earlier guard as a clean retry; without the message it does.
+        bad = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/idle-batch-pool" in o["targetLink"]))
+        errored = next(o for o in OPERATIONS if o.get("error"))
+        bad["error"], bad["statusMessage"] = errored["error"], errored["statusMessage"]
+        [guard] = ur.operation_guards_for(SEEDED, [ur.operation_summary(bad)], "2026-10-08T18:00:00Z")
+        retry = {**copy.deepcopy(bad), "name": "operation-retry", "startTime": "2026-10-20T03:00:00Z", "endTime": "2026-10-20T03:12:00Z"}
+        retry.pop("error", None)
+        self.assertTrue(ur._operation_failed(ur.operation_summary(retry)))
+        later = "2026-10-22T18:00:00Z"
+        result = ur.recheck_operation_guards([guard], [bad, retry], {PROJECT}, set(), later)
+        self.assertEqual((result["refreshed"], result["cleared"]), ([guard["id"]], []))
+        retry.pop("statusMessage", None)
+        result = ur.recheck_operation_guards([guard], [bad, retry], {PROJECT}, set(), later)
+        self.assertEqual(([item["id"] for item in result["cleared"]], result["refreshed"]), ([guard["id"]], []))
 
     def test_list_operations_filters_type_and_window_itself(self):
         fleet = FakeFleet()
@@ -2884,6 +2914,24 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertEqual(ur.main(["--scope-projects", PROJECT, "--project", "acme-only"]), ur.EXIT_USAGE)
         self.assertIn("declared scope does not list", err.getvalue())
 
+    def test_a_forced_cluster_names_its_project_under_the_overrides_rule(self):
+        # `--cluster` names a project as `--project` does: free on an undeclared install, and on a
+        # declared one admitted only inside the readable scope; a cluster of a project outside it, or
+        # of an unread one, is refused before the lock with the override's reason.
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(scope_projects=PROJECT, cluster=["acme-only/us-central1-a/x"], full=False)
+        self.assertIn("--cluster acme-only/us-central1-a/x: ", str(caught.exception))
+        self.assertIn("declared scope does not list", str(caught.exception))
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(scope_projects=PROJECT, scope_unread="payments-staging=denied", cluster=["payments-staging/us-central1-a/x"], full=False)
+        self.assertIn("could not read (denied)", str(caught.exception))
+        inside, _ = self.collect(scope_projects=PROJECT, cluster=[SEEDED], full=False)
+        self.assertEqual(([r["cluster"] for r in inside["reviews"]], inside["scoped"]), ([SEEDED], True))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ur.main(["--scope-projects", PROJECT, "--cluster", "acme-only/us-central1-a/x"]), ur.EXIT_USAGE)
+        self.assertIn("--cluster acme-only/us-central1-a/x: ", err.getvalue())
+        self.assertFalse((self.home / ur.LOCK_FILENAME).exists())
+
     def test_a_declared_install_without_the_flags_lists_nothing(self):
         # The sandbox's scope guard: the operator says the install declares a scope, the collector got
         # no collector_args, so it reports that and lists nothing; the probe still answers.
@@ -4723,8 +4771,8 @@ class ManifestTest(unittest.TestCase):
         # A Sunday on which the snapshot does not answer: the tool hands the host project and the row.
         held, fleet = self.collect(scope_projects=PROJECT, scope_unread=row, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
         self.assertFalse(any("other-project" in " ".join(c) for c in fleet.calls))
-        self.assertEqual((held["fleet"], held["removed_clusters"], held["scope_unread"], held["scoped"], held["held_clusters"]), ([PROJECT, "other-project"], [], [], False, {other: "other-project"}))
         line = ur.SCOPE_UNRESOLVED_HOLD_TEXT.format(cluster=other, project="other-project", row=ur.fleet_scope_args.UNRESOLVED_SCOPE_ROW, outcome="unresolved")
+        self.assertEqual((held["fleet"], held["removed_clusters"], held["scope_unread"], held["scoped"], held["held_clusters"]), ([PROJECT, "other-project"], [], [], False, {other: line.split(": ", 1)[1]}))
         self.assertIn(line, held["failed_reads"])
         report = ur.render_report(held)
         self.assertIn(line, report.split(ur.INFO_FAILED_READS)[1])
@@ -4746,6 +4794,55 @@ class ManifestTest(unittest.TestCase):
         narrowed, _ = self.collect(scope_projects=PROJECT, now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
         self.assertEqual((narrowed["fleet"], narrowed["removed_clusters"], narrowed["held_clusters"]), ([PROJECT], [other], {}))
         self.assertNotIn(guard, {g["id"] for g in narrowed["guards"]})
+
+    def test_a_full_run_on_an_undeclared_install_holds_what_an_incomplete_listing_omits(self):
+        # On an install that declares no scope the listing is the fleet, so a `projects list` that
+        # fails, or answers without the active project (filtered), is a set that is not the fleet: a
+        # full run sweeps what it has, prunes no project, holds every ledger project outside the
+        # listing with its guards, carries the listing's note as the manifest's gap and the report's
+        # Scope line, and records the fleet as the ledger's set plus what it read. A complete listing
+        # that no longer names a project prunes it, as before.
+        both, _ = self.collect(FakeFleet(projects_listed=[PROJECT, "other-project"]), full=True, scope_projects=None, project=None)
+        self.assertEqual((both["fleet"], both["scoped"], both.get("scope_note")), ([PROJECT, "other-project"], False, None))
+        other = "other-project/us-central1-a/elsewhere"
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        guards = ur.load_json(self.home / ur.GUARDS_FILENAME, {})
+        guard = ur.guard_id(other, 7, "apps/Deployment/x")
+        guards["guards"].append({**guards["guards"][0], "id": guard, "cluster": other, "entry": 7, "object": "apps/Deployment/x"})
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, guards)
+        failed, _ = self.collect(FakeFleet(projects_list_rc=1), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertTrue(failed["scope_note"].startswith("gcloud projects list rc=1: PERMISSION_DENIED"), failed["scope_note"])
+        self.assertEqual((failed["projects"], failed["fleet"], failed["removed_clusters"], failed["scoped"]), ([PROJECT], [PROJECT, "other-project"], [], False))
+        line = ur.LISTING_INCOMPLETE_HOLD_TEXT.format(cluster=other, project="other-project")
+        self.assertEqual(failed["held_clusters"], {other: line.split(": ", 1)[1]})
+        self.assertIn(line, failed["failed_reads"])
+        self.assertIn(guard, {g["id"] for g in failed["guards"]})
+        self.assertIn(other, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})[ur.LEDGER_PROJECTS_KEY], [PROJECT, "other-project"])
+        self.assertEqual([i for i in failed["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == other], [])
+        report = ur.render_report(failed)
+        self.assertIn(ur.INFO_SCOPE_NOTE.format(note=failed["scope_note"]), report)
+        self.assertNotIn(ur.INFO_REMOVED, report)
+        manifest = json.loads(Path(failed["manifest_path"]).read_text())
+        self.assertEqual((manifest["partial"], manifest["limitations"], manifest["fleet"]), (True, failed["scope_note"], [PROJECT, "other-project"]))
+        entry = next(c for c in manifest["clusters"] if c["name"] == other)
+        self.assertEqual((entry["outcome"], entry["error"]), (ur.MANIFEST_OUTCOME_UNREACHABLE, line.split(": ", 1)[1]))
+        [gap] = [c for c in manifest["clusters"] if c["name"] == ur.UNENUMERATED_PROJECTS_TARGET]
+        self.assertEqual((gap["outcome"], gap["error"]), (ur.MANIFEST_OUTCOME_GATE_FAILED, failed["scope_note"]))
+        document = self.document_from(manifest)
+        self.assertEqual([s["cluster"] for s in document["scope"]["skipped"]], [other, ur.UNENUMERATED_PROJECTS_TARGET])
+        self.audit_report.cross_check_manifest(document, manifest)
+        # A listing that answers without the active project is filtered: the same hold, the third
+        # project it did name swept and joined.
+        filtered, _ = self.collect(FakeFleet(projects_listed=["third-project"]), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(filtered["scope_note"], ur.LISTING_FILTERED_NOTE_FORMAT.format(project=PROJECT, count=1))
+        self.assertEqual((filtered["projects"], filtered["fleet"], filtered["removed_clusters"], list(filtered["held_clusters"])), ([PROJECT, "third-project"], [PROJECT, "other-project", "third-project"], [], [other]))
+        # A complete listing that no longer names the project prunes it, as before.
+        complete, _ = self.collect(FakeFleet(projects_listed=[PROJECT]), full=True, scope_projects=None, project=None, now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((complete.get("scope_note"), complete["fleet"], complete["removed_clusters"]), (None, [PROJECT], [other]))
+        self.assertNotIn(guard, {g["id"] for g in complete["guards"]})
 
     def test_a_review_that_raises_keeps_the_listing_backed_operation_check_and_guard(self):
         # `_safe_review`'s fallback keeps what the listing established before any read, as `review_cluster`

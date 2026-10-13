@@ -1057,25 +1057,37 @@ class PrepareKubeconfigTest(unittest.TestCase):
             os.chmod(path, 0o400)
             mask = os.umask(0o077)
             try:
-                report.prepare_kubeconfig(shared, path)
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
             finally:
                 os.umask(mask)
             self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
             self.assertEqual(os.path.exists(path), os.geteuid() == 0)
             with open(path, "w", encoding="utf-8") as f:
                 f.write("root's")
-            with patch.object(os, "geteuid", return_value=os.stat(shared).st_uid + 1):
-                report.prepare_kubeconfig(shared, path)
+            with patch.object(os, "geteuid", return_value=os.stat(shared).st_uid + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            # The move-aside is said, as the shared rule says it.
+            self.assertIn("moved aside to .kubeconfigs.unusable-", err.getvalue())
             self.assertFalse(os.path.exists(path))
             self.assertEqual(len([n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]), 1)
             self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
             named = os.path.join(root, "nested", "kubeconfigs")
             mask = os.umask(0o077)
             try:
-                report.prepare_kubeconfig(named, report.kubeconfig_path(named, "p1", "seeded-a", "us-central1-a"))
+                self.assertIsNone(report.prepare_kubeconfig(named, report.kubeconfig_path(named, "p1", "seeded-a", "us-central1-a")))
             finally:
                 os.umask(mask)
             self.assertEqual(os.stat(named).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
+            # The shared rule's note contract: a directory another uid owns in a parent this uid
+            # cannot rename in is a note naming the owner, which the member's read error carries,
+            # not an OSError reported as a directory creation.
+            other = os.stat(shared).st_uid + 1
+            with patch.object(os, "geteuid", return_value=other), patch.object(os, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertIn(f"this run is uid {other}; it could not be moved aside", note)
+            with patch.object(report, "prepare_kubeconfig", return_value=note):
+                items, error, kubeconfig = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
+            self.assertEqual((items, error, kubeconfig), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), path))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

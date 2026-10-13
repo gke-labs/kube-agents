@@ -1029,6 +1029,10 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
         ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project],
         env=env,
     )
+    if note and result.rc != 0:
+        # gcloud's refusal follows the directory's: the entry built from
+        # this result names the owner, not the bare refusal alone.
+        result = result._replace(stderr=f"{note}; {result.stderr}")
     return kc, result
 
 
