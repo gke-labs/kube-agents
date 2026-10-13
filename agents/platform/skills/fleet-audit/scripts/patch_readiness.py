@@ -267,12 +267,16 @@ DEFAULT_SCRATCH_DIR = "/opt/data/scratch"
 # per project because projects are collected concurrently, so it neither reads
 # nor rewrites the skill's own history.
 READINESS_OUTPUT_FORMAT = "upgrade-readiness_{project}_{location}_{cluster}.json"
-# The reporter writes to this file beside the report path, and the collector
-# moves it onto the path once the row is graded: a reporter that times out,
-# fails or dies before writing leaves last week's report where the recorded
-# command and the count forms point, and nothing stale is read back because
-# the collector reads only the per-run file it handed the reporter.
-READINESS_OUTPUT_PENDING_SUFFIX = ".tmp"
+# Both files this check rewrites in place every run are written beside their
+# path and moved onto it. The report: the reporter writes to the per-run file,
+# and the collector moves it onto the report path once the row is graded, so a
+# reporter that times out, fails or dies before writing leaves last week's
+# report where the recorded command and the count forms point, and nothing
+# stale is read back because the collector reads only the per-run file it
+# handed the reporter. The rotation record (`last-run.json`): a kill or a
+# failed write mid-dump leaves last week's record, not an empty or torn file
+# that would read next week as a project never served.
+PENDING_SUFFIX = ".tmp"
 READINESS_STATE_SUBDIR = "upgrade-readiness-state"
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
@@ -1575,13 +1579,22 @@ def _last_turn(project: str) -> str:
 
 
 def _write_last_run(state_dir: str, project: str, stamps: dict[str, str]) -> None:
+    """Written beside the record and moved onto it, as the report is: a kill
+    or a failed write mid-dump leaves last week's record in place, where an
+    empty or torn file would read next week as a project never served and
+    send every cluster in it out in listing order."""
     path = os.path.join(state_dir, READINESS_LAST_RUN_FILE)
+    pending = path + PENDING_SUFFIX
     try:
         os.makedirs(state_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(pending, "w", encoding="utf-8") as handle:
             json.dump(stamps, handle, indent=2, sort_keys=True)
+        os.replace(pending, path)
     except OSError as exc:
         log(f"{project}: cannot write {path} ({exc}); next week's order will not know this run")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(pending)
 
 
 def _reporter_argv(project: str, spec: str, report: str, state_dir: str) -> list[str]:
@@ -1685,7 +1698,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
         # recorded command and the count forms name, so a run that times out,
         # fails or dies before writing leaves last week's report there, and
         # nothing stale is read back because this file is the only one read.
-        pending = output + READINESS_OUTPUT_PENDING_SUFFIX
+        pending = output + PENDING_SUFFIX
         timeout = READINESS_TIMEOUT_S
         if deadline is not None:
             timeout = min(READINESS_TIMEOUT_S, int(deadline - time.monotonic()))

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for patch_readiness.py, the security-patch-orchestrator collector."""
 
+import errno
 import io
 import json
 import os
@@ -87,6 +88,8 @@ NOW = datetime(2026, 1, 15, tzinfo=timezone.utc)
 # stubs it, this way when it does not care what the check finds.
 REPORTER_NEEDLE = "fleet_upgrade_report.py"
 NO_REPORTER = run_of(1, "", "no reporter in this test")
+# The crash fallback's reason up to its `({error})` tail: what `CollectFleetTest.fleet` refuses to find.
+PHASE_CRASHED_PREFIX = pr.UNEVALUATED_PHASE_CRASHED.split("{error}")[0]
 _SCRATCH_HOME = tempfile.TemporaryDirectory(prefix="patch-readiness-test-")
 
 
@@ -1146,15 +1149,44 @@ class CollectProjectTest(unittest.TestCase):
 
 
 class CollectFleetTest(unittest.TestCase):
+    def setUp(self):
+        self.unmodelled_calls: list[list[str]] = []
+
+    def unmodelled(self, argv):
+        """What a stub does with a call the fixture did not model: record it
+        for `fleet()` to fail on, then raise as before. The raise alone is no
+        guard on a reporter invocation: `collect_fleet`'s phase-2 fallback
+        catches the `AssertionError` and files the cluster under
+        `UNEVALUATED_PHASE_CRASHED`, with every other assertion in the test
+        intact. `collect_both` has no such fallback, so the direct callers in
+        `UpgradeBlockedTest` need none of this."""
+        self.unmodelled_calls.append(list(argv))
+        raise AssertionError(f"unexpected call: {argv}")
+
+    def fleet(self, *args, crash_planted=False, **kwargs):
+        """`pr.collect_fleet`, then the guard the stubs cannot enforce alone:
+        no unmodelled call was made, and no cluster carries the phase-2 crash
+        reason unless the test planted the crash."""
+        manifest = pr.collect_fleet(*args, **kwargs)
+        self.assertEqual(self.unmodelled_calls, [])
+        if not crash_planted:
+            crashed = [
+                c["name"]
+                for c in manifest["clusters"]
+                if any(PHASE_CRASHED_PREFIX in u.get("reason", "") for u in c.get("checks_unevaluated") or [])
+            ]
+            self.assertEqual(crashed, [])
+        return manifest
+
     def test_project_override_skips_discovery(self):
         def run(argv, **kwargs):
             if "clusters" in argv and "list" in argv:
                 return run_of(0, json.dumps([cluster()]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected discovery call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet("acme-only", run=run, now=NOW)
+        manifest = self.fleet("acme-only", run=run, now=NOW)
         read = [c for c in manifest["clusters"] if c["name"] != pr.UNENUMERATED_PROJECTS_TARGET]
         self.assertEqual({c["project"] for c in read}, {"acme-only"})
         self.assertEqual(manifest["audit"], "security-patch-orchestrator")
@@ -1170,9 +1202,9 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps([cluster()]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected discovery call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet("acme-only", run=run, now=NOW)
+        manifest = self.fleet("acme-only", run=run, now=NOW)
         by_name = {short(c): c for c in manifest["clusters"]}
         entry = by_name["project/UNENUMERATED_PROJECTS"]
         self.assertEqual(entry["outcome"], "gate-failed")
@@ -1194,9 +1226,9 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps([cluster()]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         by_name = {short(c): c for c in manifest["clusters"]}
         self.assertIn("project/forbidden", by_name)
         self.assertEqual(by_name["project/forbidden"]["outcome"], "gate-failed")
@@ -1222,9 +1254,9 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps([cluster()]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         by_name = {short(c): c for c in manifest["clusters"]}
         self.assertEqual(by_name["project/boom"]["outcome"], "gate-failed")
         self.assertIn("TypeError", by_name["project/boom"]["error"])
@@ -1249,9 +1281,9 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps(server_config(valid_versions=["1.28.0-gke.1", "1.30.0-gke.1"])))
             if REPORTER_NEEDLE in " ".join(argv):
                 return NO_REPORTER
-            raise AssertionError(f"unexpected call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         by_name = {short(c): c for c in manifest["clusters"]}
         self.assertIn("fleet-spread", {c["check"] for c in by_name["old"]["candidates"]})
         self.assertNotIn("fleet-spread", {c["check"] for c in by_name["new"]["candidates"]})
@@ -1272,9 +1304,9 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps([cluster(name="seeded-b", channel="")]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         names = sorted(c["name"] for c in manifest["clusters"])
         self.assertEqual(names, ["a/us-central1/seeded-b", "b/us-central1/seeded-b"])
         for entry in manifest["clusters"]:
@@ -1343,9 +1375,9 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps([cluster()]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected call: {argv}")
+            self.unmodelled(argv)
 
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         self.assertEqual({c["project"] for c in manifest["clusters"]}, {"base"})
 
 
@@ -1363,7 +1395,7 @@ class CollectFleetTest(unittest.TestCase):
                 return clusters.get(project, run_of(0, json.dumps([cluster(name=f"{project}-c")])))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config()))
-            raise AssertionError(f"unexpected call: {argv}")
+            self.unmodelled(argv)
 
         return run
 
@@ -1373,14 +1405,14 @@ class CollectFleetTest(unittest.TestCase):
         project the credential sees a coverage gap on every run."""
         disabled = run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project 42")
         run = self.discovering(listing=(0, "base\nnogke\n"), clusters={"nogke": disabled})
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         self.assertEqual({c["project"] for c in manifest["clusters"]}, {"base"})
         self.assertNotIn("error", manifest)
 
     def test_a_listing_some_zones_did_not_answer_keeps_its_clusters_and_says_so(self):
         partial = run_of(0, json.dumps([cluster()]), "WARNING: The following zones did not respond: us-east1-b.")
         run = self.discovering(clusters={"base": partial})
-        entries = pr.collect_fleet(run=run, now=NOW)["clusters"]
+        entries = self.fleet(run=run, now=NOW)["clusters"]
         self.assertEqual([e["outcome"] for e in entries if e["project"] == "base"].count("collected"), 1)
         (row,) = [e for e in entries if e["outcome"] == "gate-failed"]
         self.assertEqual(row["name"], "project/base")
@@ -1388,7 +1420,7 @@ class CollectFleetTest(unittest.TestCase):
 
     def test_a_failed_project_listing_leaves_an_unenumerated_row(self):
         run = self.discovering(listing=(1, ""))
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         by_name = {short(c): c for c in manifest["clusters"]}
         self.assertEqual(by_name["project/UNENUMERATED_PROJECTS"]["outcome"], "gate-failed")
         self.assertIn("PERMISSION_DENIED", by_name["project/UNENUMERATED_PROJECTS"]["error"])
@@ -1399,27 +1431,27 @@ class CollectFleetTest(unittest.TestCase):
         """rc 0 without the active project in its own output: the listing is
         filtered, so the fleet is short by projects nobody can name."""
         run = self.discovering(listing=(0, "other\n"))
-        by_name = {short(c): c for c in pr.collect_fleet(run=run, now=NOW)["clusters"]}
+        by_name = {short(c): c for c in self.fleet(run=run, now=NOW)["clusters"]}
         self.assertIn("filtered", by_name["project/UNENUMERATED_PROJECTS"]["error"])
         self.assertIn("base-c", by_name)
         self.assertIn("other-c", by_name)
 
     def test_a_complete_listing_leaves_no_unenumerated_row(self):
         run = self.discovering(listing=(0, "base\nother\n"))
-        names = [short(c) for c in pr.collect_fleet(run=run, now=NOW)["clusters"]]
+        names = [short(c) for c in self.fleet(run=run, now=NOW)["clusters"]]
         self.assertNotIn("project/UNENUMERATED_PROJECTS", names)
         self.assertEqual(sorted(names), ["base-c", "other-c"])
 
     def test_no_project_at_all_is_a_top_level_error(self):
         run = self.discovering(base="", listing=(1, ""))
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         self.assertIn("project discovery failed", manifest["error"])
         self.assertEqual(manifest["clusters"], [])
 
     def test_every_project_failing_is_a_top_level_error(self):
         denied = run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
         run = self.discovering(listing=(0, "base\nother\n"), clusters={"base": denied, "other": denied})
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         self.assertIn("no cluster could be read", manifest["error"])
 
     def test_a_failed_project_beside_one_holding_only_out_of_scope_clusters(self):
@@ -1428,7 +1460,7 @@ class CollectFleetTest(unittest.TestCase):
         denied = run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
         provisioning = run_of(0, json.dumps([cluster(name="new", status="PROVISIONING")]))
         run = self.discovering(listing=(0, "base\nother\n"), clusters={"base": denied, "other": provisioning})
-        manifest = pr.collect_fleet(run=run, now=NOW)
+        manifest = self.fleet(run=run, now=NOW)
         self.assertIn("no cluster could be read", manifest["error"])
         self.assertIn("no auditable cluster (1 out of scope)", manifest["error"])
         self.assertNotIn("held none", manifest["error"])
@@ -1933,7 +1965,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         # row moves it onto the path, which is what the recorded command names.
         outputs = {argv[argv.index("--cluster") + 1]: argv[argv.index("--output") + 1] for argv in self.calls}
         paths = {"us-central1/prod": self.report_path("prod", "us-central1"), "europe-west1/prod": self.report_path("prod", "europe-west1")}
-        self.assertEqual(outputs, {spec: path + pr.READINESS_OUTPUT_PENDING_SUFFIX for spec, path in paths.items()})
+        self.assertEqual(outputs, {spec: path + pr.PENDING_SUFFIX for spec, path in paths.items()})
         for spec, path in paths.items():
             location = spec.split("/")[0]
             self.assertFalse(os.path.exists(outputs[spec]))
@@ -2219,6 +2251,34 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.project(run)
         self.assertEqual(self.calls, ["us-central1/b", "us-central1/a", "us-central1/c"])
 
+    def test_a_torn_rotation_record_write_leaves_last_weeks_record_intact(self):
+        """The record is rewritten in place every run. A write that dies
+        mid-dump (a killed pod, a full disk) must not leave an empty or torn
+        file, which next week would read as a project never served and send
+        every cluster in it out in listing order: the record is written beside
+        its path and moved onto it, so last week's stays until a whole write
+        replaces it, and nothing is left beside it either way."""
+        state_dir = os.path.join(self.scratch.name, pr.READINESS_STATE_SUBDIR, "acme")
+        os.makedirs(state_dir)
+        path = os.path.join(state_dir, pr.READINESS_LAST_RUN_FILE)
+        last_week = json.dumps({"us-central1/a": "2026-01-08T00:00:00Z"}, indent=2, sort_keys=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(last_week)
+
+        def torn(obj, handle, **kwargs):
+            handle.write('{"us-central1/a": "2026-01-15')
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(pr.json, "dump", side_effect=torn):
+            pr._write_last_run(state_dir, "acme", {"us-central1/a": "2026-01-15T00:00:00Z", "us-central1/b": "2026-01-15T00:00:00Z"})
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), last_week)
+        self.assertEqual(os.listdir(state_dir), [pr.READINESS_LAST_RUN_FILE])
+        self.assertEqual(pr._read_last_run(state_dir, "acme"), {"us-central1/a": "2026-01-08T00:00:00Z"})
+        pr._write_last_run(state_dir, "acme", {"us-central1/a": "2026-01-15T00:00:00Z"})
+        self.assertEqual(pr._read_last_run(state_dir, "acme"), {"us-central1/a": "2026-01-15T00:00:00Z"})
+        self.assertEqual(os.listdir(state_dir), [pr.READINESS_LAST_RUN_FILE])
+
     def test_projects_the_budget_skipped_lead_the_next_week(self):
         """Phase 2 runs the projects against one budget in submission order,
         so the order decides which projects a spent budget skips: least
@@ -2395,7 +2455,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         with open(path, encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["week"], "last")
-        self.assertFalse(os.path.exists(path + pr.READINESS_OUTPUT_PENDING_SUFFIX))
+        self.assertFalse(os.path.exists(path + pr.PENDING_SUFFIX))
 
     def test_a_static_cluster_with_a_pool_only_lag_and_a_clean_budget_read_is_a_clean_run_not_a_declaration(self):
         """The target matters only to the ceiling. On a static cluster whose
@@ -2830,7 +2890,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         clears the per-run file before the run. The report at the path the
         ledger points at is the second seed: it is not read either, and it
         stays, neither removed nor replaced by the leftover."""
-        pending = self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX
+        pending = self.report_path() + pr.PENDING_SUFFIX
         os.makedirs(os.path.dirname(pending), exist_ok=True)
         with open(pending, "w", encoding="utf-8") as handle:
             json.dump({"members": [self.member("lag", pdbs=[self.BUDGET])], "errors": [], "narrowed_to": ["us-central1/lag"]}, handle)
@@ -2862,12 +2922,12 @@ class UpgradeBlockedTest(unittest.TestCase):
                 by = self.collect([cluster(name="lag", master=self.BEHIND)], reporter_rc=rc, write_report=False)
                 entry = by["lag"]
                 argv = self.calls[0]
-                self.assertEqual(argv[argv.index("--output") + 1], self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX)
+                self.assertEqual(argv[argv.index("--output") + 1], self.report_path() + pr.PENDING_SUFFIX)
                 self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
                 self.assertIn(reason, self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
                 with open(self.report_path(), encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), last_week)
-                self.assertFalse(os.path.exists(self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX))
+                self.assertFalse(os.path.exists(self.report_path() + pr.PENDING_SUFFIX))
 
     def test_a_graded_run_moves_its_report_onto_the_path_the_recorded_command_names(self):
         """The reporter writes a per-run file; once the row is graded the
@@ -2879,14 +2939,14 @@ class UpgradeBlockedTest(unittest.TestCase):
         entry = by["lag"]
         self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         argv = self.calls[0]
-        self.assertEqual(argv[argv.index("--output") + 1], self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX)
+        self.assertEqual(argv[argv.index("--output") + 1], self.report_path() + pr.PENDING_SUFFIX)
         recorded = next(c for c in entry["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
         self.assertIn(f"--output {self.report_path()} --state-dir", recorded)
         with open(self.report_path(), encoding="utf-8") as handle:
             written = json.load(handle)
         self.assertNotIn("week", written)
         self.assertEqual(written["members"][0]["cluster"], "lag")
-        self.assertFalse(os.path.exists(self.report_path() + pr.READINESS_OUTPUT_PENDING_SUFFIX))
+        self.assertFalse(os.path.exists(self.report_path() + pr.PENDING_SUFFIX))
 
     def test_a_partial_exit_still_vouches_for_the_rows_it_graded(self):
         """The reporter exits 1 when any member in the project errored and
