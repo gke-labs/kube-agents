@@ -66,8 +66,8 @@ func TestNotifyConversationMarkIsDrawnAfterThePost(t *testing.T) {
 	conv.mu.Lock()
 	marks, at := fmt.Sprint(conv.marks), conv.postsAtMark[0]
 	conv.mu.Unlock()
-	if marks != fmt.Sprint([]string{testConversation + " /done"}) || at != 1 {
-		t.Fatalf("marks = %v at posts %v, want the settle drawn after the one post", marks, at)
+	if marks != fmt.Sprint([]string{testConversation + " /done@plan"}) || at != 1 {
+		t.Fatalf("marks = %v at posts %v, want the settle drawn after the one post, with its update key", marks, at)
 	}
 	bad := testReport
 	bad.Mark = &chatmsg.Mark{Ask: "Not A Token"}

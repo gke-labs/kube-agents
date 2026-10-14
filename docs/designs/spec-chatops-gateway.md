@@ -1661,9 +1661,11 @@ choices away (a card's question settled by its notify `update` key, laid out or 
 it, and keeps the answered line when one was drawn. The open question and the answered set live in
 the process, so a question posted before a restart keeps its
 buttons until clicked, and a typed reply then rewrites nothing. A thread's Agent Session is
-`processing` from `TaskStarted` until the chain ends, and past that while the chain's mark
-still carries its ask (card work still open), `suspended` while the settle is `blocked`, and
-`closed` after, sent even for a thread this process never opened, since a restarted gateway
+`processing` from `TaskStarted` until the chain ends, and past that while the latest chain's
+mark still carries its ask (card work still open), `suspended` while its settle is `blocked`,
+and `closed` after. When the latest chain's mark holds no open work and an older ask's still
+does (its cards still running, or blocked), the session follows the newest such ask instead,
+so it holds until every chain's cards have settled. `closed` is sent even for a thread this process never opened, since a restarted gateway
 otherwise leaves the old process's Working… on it; the thread is renamed once from its first
 verified ask that is not a gateway command, with today's title sanitiser. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
@@ -1779,8 +1781,13 @@ conversation edits it, laid out or as text, on Google Chat too. A key with no me
 (another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.
 A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
 forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
-`mark` is drawn once its post lands, on the ask of the conversation's latest chain (Reactions,
-clicks and Agent Sessions, above).
+`mark` is drawn once its post lands, on the ask of the chain its `update` key is bound to
+(spec-a2a-payloads.md, "Card work after the task ends"): the first keyed `mark` binds the key
+to the conversation's latest chain, recorded on that chain's root history entry beside its
+mark (at most 16 keys a chain), so the binding survives a restart and a later `mark` with the
+key reaches that ask while a newer chain runs. A `mark` with no key goes to the latest chain
+once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
+chain runs.
 
 ## The console adapter (added 9/23)
 
@@ -2025,6 +2032,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_events_received_total` | none                                                                                                                                             | Google Chat events pulled from the broker's relay, before parsing or classification. A payload that does not parse, or an event that is not a turn, still counts.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `kubeagents_a2a_gateway_gchat_pulls_total`           | `outcome`: `events`, `empty`, `failed`                                                                                                           | Pulls of the Chat relay: one that returned an event, one that returned nothing, one the relay refused or that never answered. The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                                                                                                                                                              |
 | `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time. |
+| `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 Every series is created at zero, so a `rate()` over a state that has not happened reads 0
 rather than no data. A pull carries at most one event today, so `gchat_events_received_total`

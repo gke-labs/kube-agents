@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -458,15 +459,16 @@ func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
 	}
 }
 
-// A conversation notify's mark lands on the latest chain's ask once its task
-// has ended, and is written to the record; while a task runs it is dropped.
+// A conversation notify's mark lands on its chain's ask once that chain's
+// task has ended, and is written to the record; while the chain runs it is
+// dropped.
 func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/notify-mark"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-3", Text: "restart the fleet"}
 	origin := r.awaitTask(t, "platform")
 	marker := r.g.Conversations(r.adapter).(notifyMarker)
-	marker.MarkConversation(conv, MarkState{Ask: "fleet", Settle: "blocked"})
+	marker.MarkConversation(conv, "plan-1", MarkState{Ask: "fleet", Settle: "blocked"})
 	if got := r.adapter.reactionCalls(); len(got) != 0 {
 		t.Fatalf("a notify mark drew while the chain ran: %v", got)
 	}
@@ -481,8 +483,8 @@ func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
 		rec, err := r.g.reg.Get(context.Background(), conv)
 		return err == nil && rec != nil && rec.ActiveTask == nil
 	})
-	marker.MarkConversation(conv, MarkState{Ask: "fleet", Settle: "blocked"})
-	marker.MarkConversation(conv, MarkState{})
+	marker.MarkConversation(conv, "plan-1", MarkState{Ask: "fleet", Settle: "blocked"})
+	marker.MarkConversation(conv, "plan-1", MarkState{})
 	want := []string{conv + " +fleet@d-3", conv + " +blocked@d-3", conv + " -fleet@d-3", conv + " -blocked@d-3"}
 	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("reactions = %v, want %v", got, want)
@@ -490,6 +492,11 @@ func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
 	rec, err := r.g.reg.Get(context.Background(), conv)
 	if err != nil || rec == nil || rec.Tasks[0].Mark != nil {
 		t.Fatalf("record mark = %+v (err %v), want cleared", rec.Tasks[0].Mark, err)
+	}
+	// The key was bound to the chain it was first seen under, while that
+	// chain ran, and the binding is in the stored record.
+	if !slices.Equal(rec.Tasks[0].NotifyKeys, []string{"plan-1"}) {
+		t.Fatalf("stored notify keys = %v, want [plan-1] on the chain's root", rec.Tasks[0].NotifyKeys)
 	}
 }
 

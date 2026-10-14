@@ -314,6 +314,13 @@ type TaskRef struct {
 	// (whose marks then draw nothing).
 	AskMessageID string     `json:"askMessageId,omitempty"`
 	Mark         *MarkState `json:"mark,omitempty"`
+	// NotifyKeys are the update keys of the conversation notifies whose
+	// marks belong to this chain, on its root entry only: a key is bound to
+	// the conversation's latest chain the first time a notify carrying it
+	// and a mark arrives, and every later mark with that key marks this
+	// chain's ask, whatever chain has started since (applyNotifyMark). At
+	// most notifyUpdateKeysMax, the oldest dropped first.
+	NotifyKeys []string `json:"notifyKeys,omitempty"`
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to

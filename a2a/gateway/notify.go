@@ -175,6 +175,7 @@ type Notifier struct {
 // notifyMarkJob is one conversation mark waiting to be drawn.
 type notifyMarkJob struct {
 	conversation string
+	update       string
 	mark         MarkState
 	marker       notifyMarker
 }
@@ -274,7 +275,7 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 	// the answer is in the thread and not when it failed to be.
 	if r.Error == "" && job.mark != nil {
 		if marker, ok := n.conv.(notifyMarker); ok {
-			n.queueMark(notifyMarkJob{conversation: job.req.Conversation, mark: *job.mark, marker: marker})
+			n.queueMark(notifyMarkJob{conversation: job.req.Conversation, update: job.req.Update, mark: *job.mark, marker: marker})
 		}
 	}
 }
@@ -287,7 +288,7 @@ func (n *Notifier) queueMark(job notifyMarkJob) {
 		n.marks = make(chan notifyMarkJob, notifyQueueDepth)
 		go func() {
 			for j := range n.marks {
-				j.marker.MarkConversation(j.conversation, j.mark)
+				j.marker.MarkConversation(j.conversation, j.update, j.mark)
 			}
 		}()
 	})
@@ -598,8 +599,8 @@ func (n *Notifier) post(job notifyJob) {
 // chunk, since an edit reaches one message only. An unkeyed request whose
 // chat message the adapter lays out is one message; otherwise it is not
 // answered here, and post sends its text in chunks as it always has. The
-// mark a chat message carries is drawn on the conversation's latest chain
-// message once a post answers the request (reply, MarkConversation).
+// mark a chat message carries is drawn on the ask of the chain its update
+// key is bound to once a post answers the request (reply, applyNotifyMark).
 func (n *Notifier) postConversation(job notifyJob) bool {
 	conversation := job.req.Conversation
 	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
@@ -936,13 +937,13 @@ func (c gatewayConversations) EditMessage(conversation, messageID string, m OutM
 // notifyMarker is the optional half of NotifyConversations that draws the
 // mark a conversation notify carried; gatewayConversations implements it.
 type notifyMarker interface {
-	MarkConversation(conversation string, mark MarkState)
+	MarkConversation(conversation, update string, mark MarkState)
 }
 
 // MarkConversation draws a conversation notify's mark under the
 // conversation's session lock, as the relay draws a task's (mark.go,
 // applyNotifyMark), and writes the record when the drawn state changed.
-func (c gatewayConversations) MarkConversation(conversation string, mark MarkState) {
+func (c gatewayConversations) MarkConversation(conversation, update string, mark MarkState) {
 	g := c.g
 	l := g.lockSession(conversation)
 	l.Lock()
@@ -958,7 +959,7 @@ func (c gatewayConversations) MarkConversation(conversation string, mark MarkSta
 		g.log.Warn("notify: mark not drawn; no session record", "conversation", conversation)
 		return
 	}
-	if !g.applyNotifyMark(rec, mark) {
+	if !g.applyNotifyMark(rec, update, mark) {
 		return
 	}
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {

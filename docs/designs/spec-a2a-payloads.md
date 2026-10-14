@@ -698,11 +698,18 @@ carry the same chat message:
   has no message for (another conversation's, one evicted, or one lost to a restart)
   posts a new message and edits nothing. A conversation holds at most 16 live keys, and
   the oldest is evicted first, so a chatty card can't grow gateway state without bound.
-- **`mark`** on a conversation notify marks the conversation's latest chain message, and
-  counts as that chain's newest writer once every task in it has ended. While a newer
-  chain is running in the conversation, a notify's `mark` is dropped. (A card that
-  settles after a later question has finished marks the later message. That is a known
-  limit of addressing by conversation rather than by task.)
+- **`mark`** on a conversation notify marks the message of the chain the card belongs to,
+  and counts as that chain's newest writer once every task in it has ended. A notify names
+  no task, so its `update` key names the chain: the first notify with a key and a `mark`
+  binds the key to the conversation's latest chain, the gateway records the binding on that
+  chain, and every later `mark` with the key marks that chain's message, whether or not a
+  newer chain has started since. A sender therefore keys each ask's plan afresh, as it
+  must anyway for the plan to post as a new message. While a chain marking the same
+  message runs, the `mark` is dropped. A `mark` with no key names no chain: it marks the
+  latest chain message once nothing runs, and is dropped, logged and counted while a chain
+  runs. (A card whose first keyed `mark` arrives after a later question was asked binds to
+  the later message. That is the remaining limit of addressing by conversation rather
+  than by task.)
 
 So the Planning Agent's terminal carries a mark-only chat message with `ask` still set, and the terminal no-mark default doesn't fire at the ack. Its cards' notifies
 then carry the plan (`update: "plan"`), ⏸️ (`settle: blocked`), the one answer per fan-out
