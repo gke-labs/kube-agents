@@ -1779,21 +1779,44 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # when the policy holds it -- absent, the missing finding above already
     # carries the repair, and a role that does not exist has no permissions to
     # read.
+    # True while there is nothing to read: the policy was read and did not
+    # hold the role, so the missing finding above is the whole answer. An
+    # unread policy leaves this unchecked too, since nothing is known.
+    calendar_mode_role_checked = roles_checked and calendar_mode_role not in platform_held
     if roles_checked and calendar_mode_role in platform_held:
         rc, out, err = run_cmd([
             "gcloud", "iam", "roles", "describe", PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
             f"--project={project_id}", "--format=json",
         ])
         if rc != 0:
-            unread = _unread_reason(err)
-            if unread:
-                warnings.append(Unread(unread))
-            else:
+            # A refused or transient read is a warning naming what went
+            # unchecked, like every other read here; any other exit (a
+            # NOT_FOUND on a role the policy still binds) is the role absent,
+            # which is the missing finding with its create-then-bind repair.
+            if not _record_unreadable(
+                err,
+                f"The platform agent GSA is bound to {calendar_mode_role} on {project_id}, but the role could not be read "
+                f"({err.strip()}), so the binding grants nothing",
+                f"Could not read {calendar_mode_role} on {project_id}, so its permissions were not checked",
+                details,
+                warnings,
+            ):
                 passed = False
-                details.append(f"Could not read {calendar_mode_role} on {project_id}: {err.strip()}")
+                findings.append(Finding(
+                    FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+                    f"{calendar_mode_role} on {project_id} is bound but cannot be read",
+                    REPAIR_CALENDAR_MODE_ROLE.format(
+                        role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                        project_id=project_id,
+                        permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                        member=platform_member,
+                        role=calendar_mode_role,
+                    ),
+                ))
         else:
             try:
                 role_doc = _load_json(out)
+                calendar_mode_role_checked = True
                 granted = set(role_doc.get("includedPermissions") or [])
                 expected_permissions = {PLATFORM_GSA_CALENDAR_MODE_PERMISSION}
                 if role_doc.get("deleted"):
@@ -1825,8 +1848,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                             permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
                         ),
                     ))
-            except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+            except Exception as exc:  # like the sibling reads: a parse failure is a failed check, not a traceback before the report
                 passed = False
+                calendar_mode_role_checked = False
                 details.append(f"Failed parsing {calendar_mode_role} on {project_id}: {exc}")
 
     # The summary must not assert an item a warning above retracts.
@@ -1835,6 +1859,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             ("the Workload Identity binding", wi_checked),
             ("the LiteLLM gateway's Workload Identity binding", litellm_checked),
             ("the runners' and platform GSA project roles", roles_checked),
+            ("the calendar-mode advice role's permissions", calendar_mode_role_checked),
             ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
     )
