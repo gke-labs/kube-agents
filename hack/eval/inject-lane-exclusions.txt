@@ -125,8 +125,3 @@ chat-voice-answer-first
 # thread and the lane's delegation wait reads no card ids. Returns to the
 # lane with agent-kanban-smoke.
 chat-fanout-fleet-restarts-rows
-
-# #2978: its objectives read the Cluster Agents' own trajectories (scope:
-# workers), which the inject lane sets aside on every record, so here it would
-# grade only the answer's wording. The same gap as chat-fanout-fleet-restarts-rows.
-fanout-absent-cluster-cards-complete
