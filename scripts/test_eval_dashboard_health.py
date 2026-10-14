@@ -1630,6 +1630,13 @@ class PoolNote(unittest.TestCase):
         note = health.pool_note(artifact, T0, None)
         measured = health.parse_iso(note["measured_at"])
         self.assertEqual(health.parse_iso(note["waiting_since"]), measured - timedelta(minutes=40))
+        # The waits are measured against the moment Deck was read, which on a
+        # live run comes after the sweep that window_end was fixed before; the
+        # queue block says when, and the backlog is dated from that clock, or
+        # it would read as starting before its oldest run was created.
+        artifact["queue"]["read_at"] = health.iso(measured + timedelta(minutes=3))
+        later = health.pool_note(artifact, T0, None)
+        self.assertEqual(health.parse_iso(later["waiting_since"]), measured + timedelta(minutes=3) - timedelta(minutes=40))
         # Nothing to date: no backlog, and no reading of the queue at all.
         artifact["queue"]["waiting_runs"] = [{"minutes": 9, "pull": 2}]
         self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])

@@ -413,6 +413,8 @@ class PoolStateFields(unittest.TestCase):
         # build to the job name with a dash.
         self.assertIsNone(pp.build_of("x-21100177583505448961"))
         self.assertIsNone(pp.build_of("repair2110017758350544896x"))
+        # Nineteen digits in another script are not a build Deck could name.
+        self.assertIsNone(pp.build_of("repair-１２３４５６７８９０１２３４５６７８９"))
         pool = pp.PoolState({"busy": 1}, {"ci-kube-agents-pull-sweep-2110017758350544896-gitlab": 1})
         self.assertEqual({}, pool.no_build_id())
 
@@ -1434,6 +1436,9 @@ class JsonOutput(unittest.TestCase):
         self.assertEqual(["pull-kube-agents-smoke-test-2108220000000000000"],
                          payload["leaked_leases"])
         self.assertEqual(pp.CAUSE_CAPACITY, payload["cause"])
+        # The queue block carries the clock its waits were measured against:
+        # a live read's is the Deck read, after the sweep, not window_end.
+        self.assertEqual("2026-10-08T18:30:00Z", payload["queue"]["read_at"])
 
     def test_an_unread_pool_leaves_the_holds_and_states_null(self):
         with tempfile.TemporaryDirectory() as tmp:

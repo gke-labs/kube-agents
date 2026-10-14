@@ -230,7 +230,7 @@ BOSKOS_NO_OWNER = ""
 # it is the lane's. Nothing here knows job names or lane suffixes; a new job
 # needs nothing from this file. A hand hold must not name a build: the check
 # cannot tell a quoted build from a run's own, and the runbook says so.
-BUILD_ID_IN_OWNER = re.compile(r"(?<=-)(\d{19})(?!\d)")
+BUILD_ID_IN_OWNER = re.compile(r"(?<=-)([0-9]{19})(?![0-9])")
 # How long after Deck's completionTime a lease may still be held while the
 # pod tears down and the wrapper releases the project; in between the lease
 # is releasing, not leaked. On an abort Deck sets the stamp at the abort but
@@ -573,6 +573,7 @@ class LiveQueue:
         running_build_ids: set,
         all_running_build_ids: Optional[set] = None,
         releasing_build_ids: Optional[set] = None,
+        read_at: Optional[datetime] = None,
     ):
         self.waiting = waiting
         self.running_build_ids = running_build_ids
@@ -580,6 +581,9 @@ class LiveQueue:
             set(running_build_ids) if all_running_build_ids is None else all_running_build_ids
         )
         self.releasing_build_ids = set() if releasing_build_ids is None else releasing_build_ids
+        # The clock the waits and the release grace were measured against, so
+        # a reader dating a backlog from a wait subtracts from the right stamp.
+        self.read_at = read_at
 
     @property
     def running(self) -> int:
@@ -1236,7 +1240,7 @@ def fetch_live_queue(now: Optional[datetime], from_dir: Optional[str] = None) ->
             continue
         waiting.append(LiveWait(_pull_of(item), created, now))
     waiting.sort(key=lambda w: w.seconds, reverse=True)
-    return Source(value=LiveQueue(waiting, running, all_running, releasing))
+    return Source(value=LiveQueue(waiting, running, all_running, releasing, read_at=now))
 
 
 def _free_port() -> int:
@@ -1497,8 +1501,9 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
 
 
 def releasing_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List[str]:
-    """Lease holders whose run finished inside RELEASE_GRACE: the wrapper
-    releases the project after the pod's teardown, so these free themselves."""
+    """Lease holders whose run's Deck completion stamp is inside RELEASE_GRACE:
+    the wrapper releases the project after the pod's teardown, so these free
+    themselves."""
     if pool is None or queue is None:
         return []
     return [h for h in pool.lease_holders() if build_of(h) in queue.releasing_build_ids]
@@ -1672,6 +1677,11 @@ def summarise(
         "queue": {
             "read": live.ok,
             "error": live.error,
+            # When Deck was read: the clock `waiting_runs[].minutes` counts
+            # from, which on a live run is after the sweep, not window_end.
+            "read_at": (
+                queue.read_at.strftime(TIMESTAMP_FORMAT) if queue and queue.read_at else None
+            ),
             "waiting": len(queue.waiting) if queue else None,
             "running": queue.running if queue else None,
             "over_threshold": len(live_breach),

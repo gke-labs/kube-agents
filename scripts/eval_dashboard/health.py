@@ -1567,6 +1567,9 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
     source = recent if quotable else day
     longest = _longest_wait_s(_section(artifact, "queue"))
+    # The waits count from the moment Deck was read, which a live run stamps
+    # in the queue block; it falls after window_end, the sweep's bound.
+    queue_read_at = parse_iso(_section(artifact, "queue").get("read_at")) or measured
     limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
     backlog = None if longest is None or limit_p50 is None else longest > limit_p50
     return note | {
@@ -1585,7 +1588,7 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # When this backlog began, not when the episode did: the verdict spans
         # a week, so "waiting since Monday" can stand over a Thursday jam. The
         # oldest queued run dates it, and only while there is one.
-        "waiting_since": iso(measured - timedelta(seconds=longest)) if backlog else None,
+        "waiting_since": iso(queue_read_at - timedelta(seconds=longest)) if backlog else None,
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": limit_p50,
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
