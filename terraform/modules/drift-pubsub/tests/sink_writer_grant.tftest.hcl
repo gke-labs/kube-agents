@@ -19,7 +19,8 @@ mock_provider "google-beta" {}
 mock_provider "time" {}
 
 variables {
-  project_id = "drift-project-1"
+  project_id                     = "drift-project-1"
+  detector_service_account_email = "kube-agents@drift-project-1.iam.gserviceaccount.com"
 }
 
 override_data {

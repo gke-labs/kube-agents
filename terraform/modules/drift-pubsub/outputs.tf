@@ -59,10 +59,15 @@ output "teardown_gate" {
     it out costs nothing -- a sink deleted while a cluster still emits is the
     case the drain already covers, with the topic and the grant both still in
     place behind this gate.
+
+    `.id` on the grant, never `.etag`: the provider refreshes etag to the
+    topic policy's, so any other IAM change on that topic would show this
+    value updating in place and upgrade.sh's preview would call it
+    PLAN_DRIFT. The dependency is the same either way.
   EOT
   value = join(",", [
     time_sleep.sink_drain.id,
-    google_pubsub_topic_iam_member.sink_writer.etag,
+    google_pubsub_topic_iam_member.sink_writer.id,
     google_pubsub_topic.drift_audit.id,
   ])
 }

@@ -86,9 +86,12 @@ the topic is deleted while the control plane is still up and still emitting
 matching audit records -- measured on a CI teardown at topic t+124s against a
 last record at t+366s -- and each one mails the owners. The edge exists only
 for the destroy, so nothing an apply or a plan prints will show it missing.
-Its companion asserts the other half: that the ingress module references
-nothing cluster-side, which is both what makes the edge legal (otherwise it is
-a cycle) and what the detector's GSA used to smuggle back in.
+Its companions assert the other halves: that the edge is an input rather than
+a depends_on, that it indexes a single output rather than taking a splat, and
+that the output it indexes names all three resources the ordering covers.
+Each of those is invisible to a reader of the composition and to
+`terraform validate`, and getting any of them wrong either breaks the install
+or silently narrows the ordering.
 
 The second assertion is the specific way the fix gets undone. The grant used to
 read `google_logging_project_sink.drift_audit.writer_identity`, which is what
@@ -183,10 +186,11 @@ _ESCAPE_WIDTH = 3
 _NOT_AN_ASSIGNMENT = ("=", ">")
 
 # The composition's half of the ordering, which the module cannot express.
-# gke_cluster names drift_pubsub so that Terraform, destroying dependents
-# first, tears the cluster down BEFORE the topic. drift_pubsub must in turn
-# name nothing cluster-side, or the edge is a cycle; kube_agents_iam is the
-# one that used to creep back in, through detector_service_account_email.
+# gke_cluster takes a value from drift_pubsub so that Terraform, destroying
+# dependents first, tears the cluster down BEFORE the ingress. The ingress
+# does reach kube_agents_iam -- #2862's source_projects does, and that module
+# depends on the cluster -- so the edge has to index one output whose own
+# value reaches none of it; a splat over the module would close the cycle.
 INGRESS_MODULE = "drift_pubsub"
 CLUSTER_MODULE = "gke_cluster"
 IAM_MODULE = "kube_agents_iam"
@@ -195,24 +199,37 @@ IAM_MODULE_REFERENCE = f"{_MODULE}.{IAM_MODULE}"
 #: output, because it is the one that reaches the drain, the grant and the
 #: topic -- see its description in the module's outputs.tf.
 TEARDOWN_GATE = "teardown_gate"
+MODULE_OUTPUTS = (
+    REPO_ROOT / "terraform" / "modules" / "drift-pubsub" / "outputs.tf"
+)
+_OUTPUT = "output"
+_OUTPUT_LABELS = 1
 
-# The detector's own access, which moved out of the module to break the
-# dependency above and so is no longer guaranteed by instantiating it. Both
-# have to exist and both have to bind to the module's subscription; a merge
-# that drops one leaves a detector that starts, is denied on every pull, and
-# stays Ready -- the silent mode the detector's `enabled` default exists to
-# avoid. Nothing else in the repository asserts they are there.
+# The detector's own access. Both have to exist and both have to bind to the
+# subscription; a merge that drops one leaves a detector that starts, is
+# denied on every pull, and stays Ready -- the silent mode the detector's
+# `enabled` default exists to avoid. Nothing else in the repository asserts
+# they are there.
 SUBSCRIPTION_GRANT = "google_pubsub_subscription_iam_member"
 DETECTOR_GRANTS = (
     ("detector_subscriber", "roles/pubsub.subscriber"),
     ("detector_viewer", "roles/pubsub.viewer"),
 )
-SUBSCRIPTION_REFERENCE = f"{_MODULE}.{INGRESS_MODULE}[0].subscription_id"
-COMPOSITION_PATH = "terraform/examples/full-install/main.tf"
+SUBSCRIPTION_REFERENCE = "google_pubsub_subscription.drift_audit.id"
 
 GRANT = ("google_pubsub_topic_iam_member", "sink_writer")
 DRAIN = ("time_sleep", "sink_drain")
 SINK = ("google_logging_project_sink", "drift_audit")
+
+#: What teardown_gate has to name. The drain is first of the three destroyed,
+#: so the cluster going before it carries the other two -- but all three are
+#: asserted, because the value is the only place the breadth now lives and
+#: narrowing it is invisible everywhere else.
+GATE_MUST_NAME = (
+    f"{DRAIN[0]}.{DRAIN[1]}",
+    f"{GRANT[0]}.{GRANT[1]}",
+    "google_pubsub_topic.drift_audit",
+)
 IDENTITY_WAIT = ("time_sleep", "logging_identity")
 SERVICE_IDENTITY = ("google_project_service_identity", "logging")
 SOURCE_GRANT = ("google_pubsub_topic_iam_member", "source_sink_writer")
@@ -548,6 +565,42 @@ class DriftPubsubOrdering(unittest.TestCase):
             f"topic_permission_denied",
         )
 
+    def test_the_gate_names_the_drain_the_grant_and_the_topic(self) -> None:
+        """What the gate reaches is the fix; the composition cannot show it.
+
+        The edge indexes one output, so the ordering is only as wide as that
+        output's value. Narrowing it -- to the topic alone, or dropping the
+        drain -- changes nothing a reader of the composition or of
+        `terraform validate` would notice, and every other test here still
+        passes, because they check that the cluster takes `teardown_gate`
+        rather than what `teardown_gate` is. The failure it reopens is the
+        publish grant being revoked while a control plane is still emitting:
+        `topic_permission_denied`, the same mail under a different code.
+        """
+        for labels, body in _blocks(
+            _tokens(MODULE_OUTPUTS.read_text(encoding="utf-8")),
+            _OUTPUT,
+            _OUTPUT_LABELS,
+        ):
+            if labels != [TEARDOWN_GATE]:
+                continue
+            value = _code_text(body)
+            for resource in GATE_MUST_NAME:
+                with self.subTest(resource=resource):
+                    self.assertIn(
+                        resource,
+                        value,
+                        f"{TEARDOWN_GATE} must name {resource}. It is the only thing "
+                        f"carrying the destroy ordering now that the edge indexes a "
+                        f"single output, and nothing else in this suite or in "
+                        f"terraform validate sees it narrow",
+                    )
+            return
+        self.fail(
+            f"terraform/modules/drift-pubsub/outputs.tf declares no "
+            f'output "{TEARDOWN_GATE}", which is what the cluster is ordered behind'
+        )
+
     def test_the_cluster_is_ordered_by_a_value_and_not_by_depends_on(self) -> None:
         """The edge has to be an input; a depends_on here breaks the install.
 
@@ -575,17 +628,13 @@ class DriftPubsubOrdering(unittest.TestCase):
     def test_the_composition_still_grants_the_detector_its_subscription(self) -> None:
         for name, role in DETECTOR_GRANTS:
             with self.subTest(grant=name):
-                body = _resource_body(
-                    self.composition, SUBSCRIPTION_GRANT, name, COMPOSITION_PATH
-                )
+                body = _resource_body(self.tokens, SUBSCRIPTION_GRANT, name)
                 code = _code_text(body)
                 self.assertIn(
                     SUBSCRIPTION_REFERENCE,
                     code,
                     f"{SUBSCRIPTION_GRANT}.{name} must bind to {SUBSCRIPTION_REFERENCE}; "
-                    f"these grants left the module so that it could stay independent of "
-                    f"the cluster, which also means instantiating the module no longer "
-                    f"produces them and nothing but this test does",
+                    f"nothing but this test asserts the detector's own access exists",
                 )
                 self.assertIn(
                     role,

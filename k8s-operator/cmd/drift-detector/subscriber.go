@@ -236,8 +236,7 @@ type pubsubSource struct {
 
 // newPubsubSource builds a source for a subscription, using Application
 // Default Credentials -- inside the agent pod, the Workload Identity the
-// full-install composition granted roles/pubsub.subscriber to, beside the
-// drift-pubsub module rather than inside it.
+// drift-pubsub module granted roles/pubsub.subscriber to.
 func newPubsubSource(ctx context.Context, project, subscription string) (*pubsubSource, error) {
 	service, err := pubsub.NewService(ctx)
 	if err != nil {

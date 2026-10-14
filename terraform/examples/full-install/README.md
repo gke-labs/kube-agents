@@ -79,10 +79,9 @@ install without the interview.
   sink exporting GKE audit logs (`drift_pubsub_sink`), one more in each project
   the scope lists, the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
-  (`drift_pubsub_subscription`), the sink-writer IAM on the topic, and
-  publisher on it for anything `drift_pubsub_topic_publishers` names — plus
-  the agent GSA's subscription grants, which this composition makes beside the
-  module rather than inside it; and, with
+  (`drift_pubsub_subscription`), the sink-writer and agent-GSA IAM on
+  them, and publisher on the topic for anything
+  `drift_pubsub_topic_publishers` names; and, with
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
@@ -781,25 +780,23 @@ exports mutating GKE audit-log calls (`drift_pubsub_sink`, default
 `platform-agent-drift-audit-sink`), the topic it publishes to
 (`drift_pubsub_topic`, default `platform-agent-drift-audit`), the pull
 subscription (`drift_pubsub_subscription`, default
-`platform-agent-drift-audit-sub`), and `roles/pubsub.publisher` on the topic
-for the sink's writer identity. It also adds `pubsub.googleapis.com` to the
-enabled APIs.
+`platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
+the sink's writer identity, and `roles/pubsub.subscriber` plus
+`roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
+`pubsub.googleapis.com` to the enabled APIs.
 
-`roles/pubsub.subscriber` and `roles/pubsub.viewer` on the subscription for the
-agent's GSA are granted here rather than inside the module, next to the module
-call. That is what keeps the module clear of `kube-agents-iam`, and so clear of
-the cluster: `gke_cluster` takes the ingress's `teardown_gate` output as its
-`create_after` input, which makes Terraform destroy the cluster first and delete the topic
-last. Without that ordering the topic goes while the control plane is still
+The module creates the sink after its publish grant, and `gke_cluster` takes
+the ingress's `teardown_gate` output as its `create_after` input, which makes
+Terraform destroy the cluster before the drain, the publish grant and the
+topic. Without that ordering the topic goes while the control plane is still
 emitting matching audit records, and each one mails every project owner. An
 input rather than a `depends_on` on the module call, because a module-level
 `depends_on` would also defer `gke-cluster`'s data sources — including the one
 a `create_cluster = false` install reads the endpoint from, which the Helm
-provider needs at plan time. The module README's
+provider needs at plan time; and an indexed output rather than a splat, which
+would reach `source_projects` and close a cycle. The module README's
 [ordering section](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical; `moved` blocks beside the two grants keep an install created
-by an earlier version, which had them inside the module, from planning a
-destroy and create of the detector's access on its next apply.
+is canonical.
 
 `drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
 on the topic to each member it lists, on top of the sink's writer identity.
@@ -809,7 +806,7 @@ not attach the publisher's identity to the message, so anything that can
 publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
-Beyond the three names and that list, the module's one required input is
+Beyond the three names and that list, the module's two required inputs are
 passed and four more of its optional ones:
 `drift_pubsub_sink_writer_identity_override`, which the module's own
 postcondition tells an operator to set when a project's sink reports a writer
