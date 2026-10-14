@@ -7026,6 +7026,18 @@ def _run_objective(command: str) -> str:
         # the dictated per-run name is one word, whatever order the flags come in; a reserved word stands ahead
         (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness_$(date +%s).json", True),
         (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p", True),
+        (f"python3 {_SCRIPT_PATH} --readiness --scope-projects p --output /opt/data/scratch/fleet_readiness_$(date +%s)_$$.json", True),
+        # the commands inside a command substitution, a process substitution or a backtick pair run, so they are read
+        (f"OUT=$(python3 {_SCRIPT_PATH} --readiness --scope-projects p)", True),
+        (f'echo "$(python3 {_SCRIPT_PATH} --readiness)"', True),
+        (f"cat <(python3 {_SCRIPT_PATH} --readiness)", True),
+        (f"OUT=`python3 {_SCRIPT_PATH} --readiness`", True),
+        (f"echo '$(python3 {_SCRIPT_PATH} --readiness)'", False),
+        # an operator is one outside quotes only: a quoted `>` or `;` is text, so it neither refuses the line nor splits it
+        (f'python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json && echo ">"', True),
+        (f'python3 {_SCRIPT_PATH} --readiness | grep -c ">"', True),
+        (f"echo ';' && python3 {_SCRIPT_PATH} --readiness", True),
+        ("echo see ';' fleet_upgrade_report.py --readiness", False),
         # one quote model for the whole line: an apostrophe inside double quotes ahead of the name is text, and a `#`
         # glued to the substitution's closing paren is part of the word
         (f'echo "don\'t fan out" && python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p', True),
@@ -7106,19 +7118,27 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _argv_runs(["sudo", "ls", "fleet_upgrade_report.py", "--readiness"], run) is False
     assert _argv_runs(["sudo", "-u", "hermes", "python3", "fleet_upgrade_report.py", "--readiness"], run) is True
     # a substitution stays inside its word; a bare `(` still opens a subshell; a quoted one is text
-    assert _shell_argvs("python3 f.py --output r_$(date +%s).json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s).json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"], ["date", "+%s"]]
     assert _shell_argvs("echo $((1+2)) && python3 f.py --readiness") == [["echo", "$((1+2))"], ["python3", "f.py", "--readiness"]]
-    assert _shell_argvs("diff <(echo a) <(echo b)") == [["diff", "<(echo a)", "<(echo b)"]]
+    # the commands a substitution runs are read as argvs of their own; the arithmetic form runs none
+    assert _shell_argvs("diff <(echo a) <(echo b)") == [["diff", "<(echo a)", "<(echo b)"], ["echo", "a"], ["echo", "b"]]
+    assert _shell_argvs("OUT=$(python3 f.py --readiness)") == [["OUT=$(python3 f.py --readiness)"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs('echo "run: $(python3 f.py --readiness)"') == [["echo", "run: $(python3 f.py --readiness)"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("OUT=`python3 f.py --readiness`") == [["OUT=`python3 f.py --readiness`"], ["python3", "f.py", "--readiness"]]
     assert _shell_argvs("echo '$(not run)'") == [["echo", "$(not run)"]]
+    # an operator is one outside quotes only
+    assert _shell_argvs('python3 f.py --readiness && echo ">"') == [["python3", "f.py", "--readiness"], ["echo", ">"]]
+    assert _shell_argvs("tr ';' ',' < f && echo a") == [["tr", ";", ",", "<", "f"], ["echo", "a"]]
+    assert _shell_argvs('nohup ">" ls f.py --readiness') == [["nohup", ">", "ls", "f.py", "--readiness"]]
     # one quote model: a `'` inside double quotes is text, so a later substitution still folds; a `)` that closes a
     # span never opens a word, so a `#` glued to it is part of the word and one after a space is a comment
     assert _shell_argvs("echo \"don't\" && python3 f.py --output r_$(date +%s).json --readiness") == [
-        ["echo", "don't"], ["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"]]
-    assert _shell_argvs("python3 f.py --output r_$(date +%s)#1.json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)#1.json", "--readiness"]]
-    assert _shell_argvs("python3 f.py --output r_$(date +%s) #done --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)"]]
-    assert _shell_argvs('echo "a $(echo "b c") d"') == [["echo", 'a $(echo "b c") d']]
+        ["echo", "don't"], ["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"], ["date", "+%s"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s)#1.json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)#1.json", "--readiness"], ["date", "+%s"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s) #done --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)"], ["date", "+%s"]]
+    assert _shell_argvs('echo "a $(echo "b c") d"') == [["echo", 'a $(echo "b c") d'], ["echo", "b c"]]
     # an escaped quote inside a span does not open a quote there
-    assert _shell_argvs("python3 f.py --output r_$(echo don\\'t).json --readiness") == [["python3", "f.py", "--output", "r_$(echo don\\'t).json", "--readiness"]]
+    assert _shell_argvs("python3 f.py --output r_$(echo don\\'t).json --readiness") == [["python3", "f.py", "--output", "r_$(echo don\\'t).json", "--readiness"], ["echo", "don't"]]
     assert _shell_argvs("python3 f.py --readiness >#log") == []
     # a wrapped shell is unwrapped behind the wrappers that hand their argv on
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]

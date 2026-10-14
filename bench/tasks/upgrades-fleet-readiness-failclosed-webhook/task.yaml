@@ -202,9 +202,11 @@ verification_spec:
   # their own words (a flag, the word after a flag, a count, an unresolved expansion, `--`) may stand, and a `sh -c` string is
   # read as commands of its own. A quoted mention of the invocation (a grep, an echo, a sed) is
   # one word and so not a run; a `find`, an `ls` or an unquoted `echo` naming the file and the
-  # flag, at the front or behind a wrapper (`sudo ls`, `nohup echo`), runs something else; a run spelled through a
-  # variable holding the whole path, a backtick capture or a quoted `$(…)` is not read, since
-  # no expansion is resolved and the Delegation bullet dictates the path in full; a usage call
+  # flag, at the front or behind a wrapper (`sudo ls`, `nohup echo`), runs something else; the
+  # commands inside a command substitution, a process substitution or a backtick pair are read as
+  # commands of their own, as the shell runs them; a run spelled through a variable holding the
+  # whole path is not read, since no expansion is resolved and the Delegation bullet dictates the
+  # path in full; a quoted `>` or `;` is text, not an operator; a usage call
   # prints the help and runs nothing. A reply that reaches the right verdicts by a hand kubectl
   # survey passes the line checks and fails this one; the persona routes a fleet readiness
   # question to this one run.
