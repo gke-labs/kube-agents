@@ -21,9 +21,12 @@ The **gateway Pod** holds the harness and nothing credentialed:
 1. `platform-agent`: the untrusted agent sandbox.
 2. `platform-agent-dashboard`: the optional local dashboard.
 3. `fluent-bit`: log forwarding.
-4. `agent-api-auth`: the PlatformAgent API authenticator and the
+4. `agent-api-auth`: the PlatformAgent API authenticator, the
    `k8s-event-watcher`, which forwards cluster events using a non-secret
-   internal key. It holds no credential path.
+   internal key, and, where enabled, the drift detector. It holds no Google
+   credential: both watchers make their Google calls through the broker's
+   watcher routes with a token for the `watcher` audience, which is mounted
+   here and in no other container.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
@@ -316,10 +319,13 @@ read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
 gateway calling. The event watcher has a separate one-hour token with the Kubernetes
 API's default audience, plus the cluster CA and Pod namespace, mounted at the
-conventional in-cluster path in `agent-api-auth`. Two differently audienced tokens
-therefore sit side by side in the gateway Pod: the broker-audience one, which the
-Kubernetes API will not accept, and the watcher's, which it will. Neither is
-shared with the sandbox or dashboard.
+conventional in-cluster path in `agent-api-auth`, and a third, for the broker's
+`kubeagents-credential-proxy-watcher` audience, mounted in `agent-api-auth` alone: the
+event watcher and drift detector present it to the broker's watcher routes for their
+Google calls. Three differently audienced tokens therefore sit in the gateway Pod: the
+two broker-audience ones, which the Kubernetes API will not accept, and the event
+watcher's Kubernetes token, which it will. None is shared with the sandbox or
+dashboard, and the model's container holds only the chat one.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.
 

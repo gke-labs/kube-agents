@@ -183,12 +183,18 @@ func (d Discoverer) describedBy() string {
 // clientConfig is the config one discovered cluster is reached with. Through
 // the proxy the describe still runs -- it is what proves the cluster exists and
 // carries the Autopilot bit -- but its addressing is not used: the proxy
-// resolves the control plane itself.
+// resolves the control plane itself. The addressing is still checked: the proxy
+// applies the same rule to every request, so a cluster the describe gives no
+// usable endpoint is skipped here, and counted as a discovery error, rather
+// than becoming an informer that is refused for the life of the process.
 func (d Discoverer) clientConfig(id Identity, described *container.Cluster, ts oauth2.TokenSource) (*rest.Config, error) {
+	cfg, err := ClientConfigForIdentity(described)
 	if d.Broker != nil {
+		if err != nil {
+			return nil, err
+		}
 		return d.Broker.ClientConfig(id)
 	}
-	cfg, err := ClientConfigForIdentity(described)
 	if err != nil {
 		return nil, err
 	}
