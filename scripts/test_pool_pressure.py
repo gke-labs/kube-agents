@@ -998,6 +998,34 @@ class IndexCopy(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(["2110431553740869632"], [v["build_id"] for v in vanished])
 
+    def test_a_stem_int_refuses_is_not_a_build(self):
+        # isdigit() admits a superscript that int() refuses; the sweep must
+        # not reach int() on it (the periodic died with no artifact).
+        odd = self.VANISHED.replace("2110431553740869632", "1%C2%B2")
+        entries, err, vanished = self._copy(1, odd)
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertEqual([], vanished)
+        self.assertIsNone(pp._build_id_of("1².txt"))
+        self.assertEqual(2110431553740869632, pp._build_id_of("2110431553740869632.txt"))
+
+    def test_an_exit_other_than_a_partial_failure_still_fails(self):
+        # A copy killed by a signal after a pointer 404'd prints no further
+        # error line; the exit status is what says it did not finish.
+        entries, err, vanished = self._copy(-9, self.VANISHED)
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+
+    def test_more_vanished_pointers_than_the_limit_fail_the_copy(self):
+        lines = [self.VANISHED.replace("2110431553740869632", f"21104315537408696{i:02d}")
+                 for i in range(pp.VANISHED_POINTER_LIMIT + 1)]
+        entries, err, vanished = self._copy(1, "\n".join(lines))
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        entries, err, vanished = self._copy(1, "\n".join(lines[:-1]))
+        self.assertIsNone(err)
+        self.assertEqual(pp.VANISHED_POINTER_LIMIT, len(vanished))
+
     def test_any_other_error_still_fails_the_copy(self):
         denied = "ERROR: (gcloud.storage.cp) HTTPError 403: caller does not have storage.objects.get"
         entries, err, vanished = self._copy(1, self.VANISHED + "\n" + denied + "\n")

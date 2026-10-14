@@ -85,6 +85,14 @@ GCS_CP_ERROR_PREFIX = "ERROR: "
 GCS_CP_PROGRESS_DOT = "."
 GCS_OBJECT_NOT_FOUND = re.compile(r"^ERROR: (gs://\S+) not found: 404\.?$")
 INDEX_POINTER_VANISHED = "index pointer rewritten during the copy (404)"
+# gcloud's exit status when some operations failed and the rest completed;
+# a signal or a crash exits otherwise and may print no error line, so only
+# this status is read as a partial copy.
+GCLOUD_PARTIAL_FAILURE_EXIT = 1
+# Prow's rewrite touches one or two pointers an hour. More vanishing in one
+# copy is something removing index objects in bulk, and the hour is not
+# measured over whatever subset landed.
+VANISHED_POINTER_LIMIT = 10
 
 # The three artifacts setup time is read from, in the order the run writes
 # them. Only prowjob.json is required: initupload writes it when the pod starts,
@@ -885,20 +893,25 @@ def _index_entries_from_gcs(
     if rc == 0:
         return _index_entries_from_dir(dest), None, []
     vanished, errors = _gcloud_errors(err)
-    entries = _index_entries_from_dir(dest) if vanished and len(errors) == len(vanished) else {}
+    partial = (
+        rc == GCLOUD_PARTIAL_FAILURE_EXIT
+        and 0 < len(vanished) <= VANISHED_POINTER_LIMIT
+        and len(errors) == len(vanished)
+    )
+    entries = _index_entries_from_dir(dest) if partial else {}
     if not entries:
         # The error lines alone: the stderr is thousands of Copying lines.
         reason = "; ".join(errors) or err.strip() or f"exit {rc}"
         return {}, f"could not read the build index: {reason}", []
     return entries, None, [
-        {"build_id": build, "error": INDEX_POINTER_VANISHED} for build in vanished
+        {"build_id": str(build), "error": INDEX_POINTER_VANISHED} for build in vanished
     ]
 
 
-def _gcloud_errors(stderr: str) -> Tuple[List[str], List[str]]:
+def _gcloud_errors(stderr: str) -> Tuple[List[int], List[str]]:
     """gcloud's error lines, and among them the build IDs whose index pointer
     it reported missing; the two lengths differ when any other error is in."""
-    vanished: List[str] = []
+    vanished: List[int] = []
     errors: List[str] = []
     prefix = f"{GCS_BUILD_INDEX}/"
     for raw in stderr.splitlines():
@@ -909,20 +922,27 @@ def _gcloud_errors(stderr: str) -> Tuple[List[str], List[str]]:
         errors.append(line)
         match = GCS_OBJECT_NOT_FOUND.match(line)
         name = urllib.parse.unquote(match.group(1)) if match else ""
-        stem = name[len(prefix) : -len(BUILD_INDEX_SUFFIX)]
-        if name.startswith(prefix) and name.endswith(BUILD_INDEX_SUFFIX) and stem.isdigit():
-            vanished.append(stem)
+        build_id = _build_id_of(name[len(prefix) :]) if name.startswith(prefix) else None
+        if build_id is not None:
+            vanished.append(build_id)
     return vanished, errors
+
+
+def _build_id_of(name: str) -> Optional[int]:
+    """The build ID an index file name carries, or None: the one grammar for
+    the names the copy lands and the names gcloud reports missing."""
+    if not name.endswith(BUILD_INDEX_SUFFIX):
+        return None
+    stem = name[: -len(BUILD_INDEX_SUFFIX)]
+    # isdecimal, not isdigit: int() refuses the superscripts isdigit admits.
+    return int(stem) if stem.isdecimal() else None
 
 
 def _index_entries_from_dir(dest: str) -> Dict[int, str]:
     entries: Dict[int, str] = {}
     for name in os.listdir(dest):
-        if not name.endswith(BUILD_INDEX_SUFFIX):
-            continue
-        try:
-            build_id = int(name[: -len(BUILD_INDEX_SUFFIX)])
-        except ValueError:
+        build_id = _build_id_of(name)
+        if build_id is None:
             continue
         try:
             path = Path(dest, name).read_text(encoding="utf-8").strip()
