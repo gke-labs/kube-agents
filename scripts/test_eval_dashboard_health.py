@@ -1392,6 +1392,64 @@ class NearDeadline(unittest.TestCase):
         self.assertIsNone(degraded["near_deadline"])
         self.assertFalse(any("close to deadline" in line for line in degraded["evidence"]))
 
+    def test_sub_minute_headroom_renders_at_the_deadline(self):
+        # 21570s = 359.5m -> 30s headroom -> renders "at the 360-minute Prow timeout", not "0 min under"
+        finished = T0 - timedelta(hours=2)
+        started = finished - timedelta(seconds=21570)
+        r = run(3004, 604, finished, minutes=359, tasks=full_tasks())
+        r["started"] = started.isoformat()
+        r["duration_s"] = 21570
+        doc = data(r)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIn(
+            "close to deadline: slowest run 359 min in the last 24h (at the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_exact_timeout_without_kills_does_not_claim_killed(self):
+        # 21600s = 360m exactly, completed with a verdict (kills = 0)
+        finished = T0 - timedelta(hours=2)
+        started = finished - timedelta(seconds=21600)
+        r = run(3005, 605, finished, minutes=360, tasks=full_tasks())
+        r["started"] = started.isoformat()
+        r["duration_s"] = 21600
+        doc = data(r)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["near_deadline"]["kills"], 0)
+        self.assertIn(
+            "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_deadline_kill_outage_recovery_does_not_fire_near_deadline(self):
+        # Three deadline kills cause an OUTAGE
+        outage_runs = [
+            run(3101 + i, 701 + i, T0 - timedelta(hours=3 - i * 0.5), minutes=363, result="FAILURE", tasks=[task("case-0", "ppp")])
+            for i in range(3)
+        ]
+        for r in outage_runs:
+            r["eval_verdict"] = None
+        # Then three distinct-PR green runs finish to recover the gate
+        recovery_runs = [
+            run(3201 + i, 801 + i, T0 - timedelta(minutes=40 - i * 10), minutes=120, result="SUCCESS", tasks=full_tasks())
+            for i in range(3)
+        ]
+        doc = data(*(outage_runs + recovery_runs))
+        # Previous state was OUTAGE
+        prev_outage = {
+            "state": "OUTAGE",
+            "condition": "deadline_kill",
+            "since": health.iso(T0 - timedelta(hours=2)),
+            "cause": "deadline_kill",
+            "failing_cases": [],
+        }
+        result = adjudicate(doc, T0, prev_outage)
+        self.assertEqual(result["state"], "GREEN")
+        # Near deadline must NOT fire using the outage's own kills
+        self.assertIsNone(result["near_deadline"])
+
 
 # --------------------------------------------------------------------------- #
 # Rule 8: pool pressure

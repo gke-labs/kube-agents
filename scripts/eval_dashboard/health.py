@@ -1421,15 +1421,17 @@ def slow_evidence(slow: dict) -> str:
     )
 
 
-def near_deadline(full_runs, now: datetime, prev: dict | None) -> dict | None:
+def near_deadline(
+    full_runs, now: datetime, prev: dict | None, non_green_end: datetime | None = None
+) -> dict | None:
     """The note's numbers while runs are close to PROW_JOB_TIMEOUT, else None.
 
     Measures the slowest run among qualifying runs finished in the last 24h.
     A run qualifies if it finished in (now - 24h, now], has non-null wall_clock,
     has 0 storm repetitions, and either completed at least SLOW_MIN_TASKS tasks
     with SUCCESS/FAILURE or was killed at the deadline with at least one task
-    recorded. If the window has no qualifying runs (weekends), keeps the
-    previous note unchanged.
+    recorded and finished after the previous non-GREEN episode ended. If the
+    window has no qualifying runs (weekends), keeps the previous note unchanged.
     """
     window_start = now - NEAR_DEADLINE_WINDOW
     qualifying = [
@@ -1441,7 +1443,7 @@ def near_deadline(full_runs, now: datetime, prev: dict | None) -> dict | None:
         and window_start < run.finished <= now
         and (
             (run.result in (RUN_SUCCESS, RUN_FAILURE) and len(run.tasks) >= SLOW_MIN_TASKS)
-            or (run.deadline_kill and run.full)
+            or (run.deadline_kill and run.full and (non_green_end is None or run.finished > non_green_end))
         )
     ]
     if not qualifying:
@@ -1481,12 +1483,20 @@ def near_deadline_margin(nd: dict) -> str:
     headroom_s = nd.get("headroom_s")
     if headroom_s is None:
         headroom_s = max(0, deadline_s - max_s)
+    kills = nd.get("kills", 0)
     timeout_min = minutes_text(deadline_s)
-    if headroom_s > 0:
-        return f"{minutes_text(headroom_s)} min under the {timeout_min}-minute Prow timeout"
-    if max_s > deadline_s:
-        return f"{minutes_text(max_s - deadline_s)} min past the {timeout_min}-minute Prow timeout"
-    return "killed at the deadline"
+    headroom_min = int(headroom_s // SECONDS_PER_MINUTE)
+    overrun_min = int((max_s - deadline_s) // SECONDS_PER_MINUTE) if max_s > deadline_s else 0
+
+    if headroom_min > 0:
+        return f"{headroom_min} min under the {timeout_min}-minute Prow timeout"
+    if kills > 0:
+        if overrun_min > 0:
+            return f"{overrun_min} min past the {timeout_min}-minute Prow timeout"
+        return "killed at the deadline"
+    if overrun_min > 0:
+        return f"{overrun_min} min past the {timeout_min}-minute Prow timeout"
+    return f"at the {timeout_min}-minute Prow timeout"
 
 
 def near_deadline_headroom_text(nd: dict) -> str:
@@ -1496,11 +1506,19 @@ def near_deadline_headroom_text(nd: dict) -> str:
     headroom_s = nd.get("headroom_s")
     if headroom_s is None:
         headroom_s = max(0, deadline_s - max_s)
-    if headroom_s > 0:
-        return f"{minutes_text(headroom_s)} min of headroom"
-    if max_s > deadline_s:
-        return f"{minutes_text(max_s - deadline_s)} min past the timeout"
-    return "killed at the deadline"
+    kills = nd.get("kills", 0)
+    headroom_min = int(headroom_s // SECONDS_PER_MINUTE)
+    overrun_min = int((max_s - deadline_s) // SECONDS_PER_MINUTE) if max_s > deadline_s else 0
+
+    if headroom_min > 0:
+        return f"{headroom_min} min of headroom"
+    if kills > 0:
+        if overrun_min > 0:
+            return f"{overrun_min} min past the timeout"
+        return "killed at the deadline"
+    if overrun_min > 0:
+        return f"{overrun_min} min past the timeout"
+    return "at the timeout"
 
 
 def near_deadline_evidence(nd: dict) -> str:
@@ -2448,7 +2466,21 @@ def adjudicate(
     slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
     if slow:
         evidence.append(slow_evidence(slow))
-    near_deadline_note = near_deadline(assessed["full_runs"], now, (prev or {}).get("near_deadline") or None) if decided["state"] == GREEN else None
+    non_green_end = (
+        now
+        if prev and prev.get("state") != GREEN
+        else ((prev.get("since") if isinstance(prev.get("since"), datetime) else parse_iso((prev or {}).get("since"))) if prev and prev.get("state") == GREEN else None)
+    )
+    near_deadline_note = (
+        near_deadline(
+            assessed["full_runs"],
+            now,
+            (prev or {}).get("near_deadline") or None,
+            non_green_end=non_green_end,
+        )
+        if decided["state"] == GREEN
+        else None
+    )
     if near_deadline_note:
         evidence.append(near_deadline_evidence(near_deadline_note))
     # Rule 8 rides beside the state in every state, unlike rule 7: the wait is
