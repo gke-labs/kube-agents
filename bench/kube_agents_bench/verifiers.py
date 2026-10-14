@@ -1485,13 +1485,28 @@ _USAGE_FLAGS = ("-h", "--help")
 
 
 class WorkerRun(BaseModel):
-    """One program run a case requires of a worker: a script by its basename (or its module stem
-    under ``-m``) and the flags that have to follow it on the same shell segment."""
+    """One program run a case requires of a worker, or forbids: a script by its basename (or its
+    module stem under ``-m``), the flags that have to follow it on the same shell segment as exact
+    words, and ``word_patterns``, regular expressions each of which some later word of the segment
+    must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
+    ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
+    whole, and a quoted mention of the whole command is one word that is no command)."""
 
     model_config = ConfigDict(extra="forbid")
 
     script: str
     flags: list[str] = Field(default_factory=list)
+    word_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("word_patterns")
+    @classmethod
+    def _word_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"word pattern {pattern!r} does not compile: {error}") from error
+        return patterns
 
     @field_validator("script")
     @classmethod
@@ -1749,6 +1764,11 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
             # A redirect takes the next word as its target; a bare fd number ahead of one is its own.
             takes_value = not word.isdigit()
             continue
+        if after_wrapper and word.startswith(_SHELL_FLAG_PREFIX):
+            # A flag in its own right, never the previous flag's value (`sudo -E -u hermes`); `--`
+            # ends the options and takes nothing.
+            takes_value = word != _SHELL_OPTIONS_END
+            continue
         if takes_value:
             takes_value = False
             continue
@@ -1761,11 +1781,6 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
             continue
         return None
     return None
-        if after_wrapper and word.startswith(_SHELL_FLAG_PREFIX):
-            # A flag in its own right, never the previous flag's value (`sudo -E -u hermes`); `--`
-            # ends the options and takes nothing.
-            takes_value = word != _SHELL_OPTIONS_END
-            continue
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -1783,7 +1798,7 @@ def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
         return False
     stem = run.script.rsplit(".", 1)[0]
     if os.path.basename(argv[command]) == run.script:
-        return all(flag in argv[command + 1:] for flag in run.flags)
+        return _words_after_carry(argv[command + 1:], run)
     if not _INTERPRETER_RE.match(os.path.basename(argv[command])):
         return False
     for index in range(command + 1, len(argv)):
@@ -1791,9 +1806,15 @@ def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
         if _INTERPRETER_CODE_FLAG in argv[command + 1:index]:
             return False
         is_script = os.path.basename(word) == run.script or (argv[index - 1] == "-m" and word == stem)
-        if is_script and all(flag in argv[index + 1:] for flag in run.flags):
+        if is_script and _words_after_carry(argv[index + 1:], run):
             return True
     return False
+
+
+def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
+    """Whether the words after the script carry every flag as an exact word and, for every word
+    pattern, some word that matches it on its own."""
+    return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
 @VERIFIERS.register("worker_commands")
@@ -1811,10 +1832,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
     ``required_runs``: each names a script (by basename, or module stem under
-    ``-m``) and flags; some command's shell segment, read as an argv, must run
-    it with those flags after it and no ``-h``/``--help`` (:func:`_argv_runs`).
-    An argv tells a quoted mention of the invocation from a run, where a pattern
-    over the text cannot.
+    ``-m``), flags and word patterns; some command's shell segment, read as an
+    argv, must run it with those flags after it, a word matching each pattern,
+    and no ``-h``/``--help`` (:func:`_argv_runs`). ``forbidden_runs``: the same
+    shape, and no segment may run it. An argv tells a quoted mention of the
+    invocation from a run, where a pattern over the text cannot: a forbidden
+    ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
+    or an echoed sentence, where ``forbidden_patterns`` over the text would be.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
@@ -1849,6 +1873,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     required_runs: list[WorkerRun] = Field(default_factory=list)
+    forbidden_runs: list[WorkerRun] = Field(default_factory=list)
 
     @field_validator("required_patterns", "forbidden_patterns")
     @classmethod
@@ -1884,7 +1909,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         ]
         argvs = [argv for c in commands for argv in _shell_argvs(c)]
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
-        if missing or hits or unrun:
+        ran = [(run, argv) for run in self.forbidden_runs for argv in argvs if _argv_runs(argv, run)]
+        if missing or hits or unrun or ran:
             parts = []
             if missing:
                 parts.append(
@@ -1900,6 +1926,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
                 more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")
+            if ran:
+                shown = "; ".join(f"{run.script} ran as {' '.join(argv)[:120]!r}" for run, argv in ran[:_MAX_NAMED_COMMANDS])
+                more = f" (+{len(ran) - _MAX_NAMED_COMMANDS} more)" if len(ran) > _MAX_NAMED_COMMANDS else ""
+                parts.append(f"forbidden run(s) made by worker commands: {shown}{more}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -1911,7 +1941,8 @@ class WorkerCommandsVerifier(BaseVerifier):
             reason=(
                 f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
                 f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
-                f"none of {len(self.forbidden_patterns)} forbidden"
+                f"none of {len(self.forbidden_patterns)} forbidden pattern(s) matched, "
+                f"none of {len(self.forbidden_runs)} forbidden run(s) made"
             ),
         )
 

@@ -210,11 +210,13 @@ verification_spec:
   # prints the help and runs nothing. The route is read both ways: the run must be there, and
   # the hand survey the bullet forbids must not be, since on an install that declares a scope
   # the dictated command without the `fleet_scope` call exits 2 and a worker that then surveys
-  # budgets and webhooks by `kubectl` could reach the right verdicts; the forbidden pattern is
-  # a `kubectl get` or `describe` of budgets or webhook configurations in any worker's
-  # commands, with any global flags between `kubectl` and the verb (`--context`, `--kubeconfig`,
-  # `-n`), as the governance SOPs spell a per-cluster read (the script's own kubectl calls are
-  # not captured; they are its subprocesses, not the worker's). A worker that runs the script and then reads those objects itself fails
+  # budgets and webhooks by `kubectl` could reach the right verdicts; the forbidden run is
+  # `kubectl` as a segment's command word with `get` or `describe` and a budget or webhook
+  # configuration resource among its words, read from the argv as the run is, so any global
+  # flags between `kubectl` and the verb (`--context`, `--kubeconfig`, `-n`) stand as the
+  # governance SOPs spell a per-cluster read, and a quoted mention of the survey (a grep of a
+  # skill file, an echoed sentence) is one word that is no command (the script's own kubectl
+  # calls are not captured; they are its subprocesses, not the worker's). A worker that runs the script and then reads those objects itself fails
   # this objective too: the bullet says the script's grading is the answer. A reply that
   # reaches the right verdicts by a hand kubectl survey passes the line checks and fails this
   # one; the persona routes a fleet readiness question to this one run.
@@ -226,8 +228,11 @@ verification_spec:
       required_runs:
         - script: fleet_upgrade_report.py
           flags: ["--readiness"]
-      forbidden_patterns:
-        - '(?i)\bkubectl\b[^\n|;&]*?\s(?:get|describe)\s+[^\n|;&]*\b(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)\b'
+      forbidden_runs:
+        - script: kubectl
+          word_patterns:
+            - "^(?:get|describe)$"
+            - "(?i)^(?:[a-z0-9.-]+,)*(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)(?:[./,].*)?$"
 
   - name: no-invented-cves
     role: objective
