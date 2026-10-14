@@ -10,6 +10,9 @@ so the ordinary upgrade names no version at all.
 
 ## Before you start
 
+A GitLab install needs nothing extra for an upgrade: no token and no flag. See
+[Upgrade and uninstall](/kube-agents/install/gitlab/#upgrade-and-uninstall).
+
 Record what the install runs now, so you can tell afterwards what moved:
 
 ```bash

@@ -162,7 +162,7 @@ func TestShippedTreeIsLoadableByClaudeCode(t *testing.T) {
 // edit that adds an unmarked write fails here.
 func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 	out := buildShipped(t)
-	writes := 0
+	blocks := 0
 	for _, name := range sessionSkills {
 		body, err := os.ReadFile(filepath.Join(out, skillsDir, name, skillFile))
 		if err != nil {
@@ -176,12 +176,12 @@ func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 			if strings.HasPrefix(trimmed, codeFence) {
 				if !inFence {
 					lastNote = precedingNote(lines, i)
+					blocks++
 				}
 				inFence = !inFence
 				continue
 			}
 			if writeCommandRE.MatchString(l) {
-				writes++
 				if !inFence {
 					t.Errorf("%s:%d: a write outside a code block, where no note marks it: %s", name, i+1, trimmed)
 				} else if lastNote != proposeOnlyNote {
@@ -193,10 +193,11 @@ func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 			}
 		}
 	}
-	// The source skills do contain writes; zero would mean the scan matched
-	// nothing, not that the skills are clean.
-	if writes == 0 {
-		t.Fatal("found no write commands at all; the scan is not reading the skills")
+	// The cluster skills teach no writes (the Cluster Agent is read-only and
+	// proposes changes in its card), so count code blocks instead: zero would
+	// mean the scan read nothing, not that the skills are clean.
+	if blocks == 0 {
+		t.Fatal("found no code blocks at all; the scan is not reading the skills")
 	}
 }
 
@@ -489,6 +490,61 @@ func TestConsoleTranscriptOfAReadIsNotMarked(t *testing.T) {
 	for _, note := range []string{unavailableNote, proposeOnlyNote, pipeNote} {
 		if strings.Contains(string(out), note) {
 			t.Errorf("a read-only console block was marked %q:\n%s", note, out)
+		}
+	}
+}
+
+// The cluster agent reads the source skills, not the session tree, and it is
+// read-only (agents/cluster/SOUL.md, Read-Only Boundary), so a source skill
+// that teaches a write fails here even though the session build would mark it.
+func TestSourceSkillsTeachNoWrites(t *testing.T) {
+	for _, name := range sessionSkills {
+		body, err := os.ReadFile(filepath.Join(repoSkillsDir, name, skillFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, l := range strings.Split(string(body), "\n") {
+			if writeCommandRE.MatchString(l) {
+				t.Errorf("%s:%d: teaches a write; propose the change instead: %s", name, i+1, strings.TrimSpace(l))
+			}
+		}
+	}
+}
+
+// A block that writes is marked as a proposal. The shipped skills teach no
+// writes any more, so this fixture is what exercises the mark.
+func TestWriteBlockIsMarkedProposeOnly(t *testing.T) {
+	src := "---\nname: demo\ndescription: A demo.\n---\n\n# Demo\n\n```bash\ngcloud container clusters update c --location l --enable-shielded-nodes\n```\n"
+	out, err := transformSkill("demo", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(out), "\n")
+	i := slices.IndexFunc(lines, func(l string) bool { return strings.HasPrefix(strings.TrimSpace(l), codeFence) })
+	if i < 0 || precedingNote(lines, i) != proposeOnlyNote {
+		t.Errorf("the write block is not marked propose-only:\n%s", out)
+	}
+}
+
+// writeCommandRE is the read-only test's only detector, and the shipped skills
+// no longer give it anything to find, so its matches are pinned here.
+func TestWriteCommandRE(t *testing.T) {
+	for _, tc := range []struct {
+		line  string
+		write bool
+	}{
+		{"kubectl scale deployment web --replicas=3", true},
+		{"kubectl autoscale deployment web --min=1 --max=10", true},
+		{"kubectl apply -f assets/hpa-example.yaml", true},
+		{"kubectl label --overwrite ns x pod-security.kubernetes.io/enforce=restricted", true},
+		{"gcloud container clusters update c --location l --enable-vertical-pod-autoscaling", true},
+		{"gcloud iam service-accounts add-iam-policy-binding sa --role roles/iam.workloadIdentityUser", true},
+		{"kubectl get deployment web -o yaml", false},
+		{"kubectl describe hpa web", false},
+		{"gcloud container clusters describe c --location l", false},
+	} {
+		if got := writeCommandRE.MatchString(tc.line); got != tc.write {
+			t.Errorf("writeCommandRE.MatchString(%q) = %v, want %v", tc.line, got, tc.write)
 		}
 	}
 }

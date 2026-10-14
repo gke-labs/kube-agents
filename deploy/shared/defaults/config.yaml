@@ -5,6 +5,25 @@ model:
   base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
+# Model-call deadlines for the gateway above. Hermes reads them per provider
+# (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
+# detectors: a stream with no first chunk, or no chunk for that long, and a
+# non-streamed call with no answer; then Hermes drops the stream and retries.
+# It is 600s because Gemini thinks in silence on this path: with the request
+# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
+# 140-210s before its first chunk, so a shorter bound would cut off healthy
+# long thinks, and every retry would repeat the same think.
+# request_timeout_seconds is the per-read socket timeout (and the stream read
+# timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
+# its own. A call that stalls is retried inside each of Hermes' 3 attempts
+# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
+# a persistent stall costs five or six 600s windows before the turn fails; a
+# one-off stall recovers at the first 600s kill.
+providers:
+  custom:
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+
 # MCP Servers configuration.
 #
 # `agent_common` (the `call_agent` A2A tool) was declared here and is not any

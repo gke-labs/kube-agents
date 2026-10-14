@@ -1050,5 +1050,19 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn("!var.enable_github_minter", self.main)
 
 
+class GitLabSecretOrderTest(unittest.TestCase):
+    """An empty token source stops the run with exit 1 after the apply. The CA
+    Secret must exist by then, so it is created first."""
+
+    def test_the_ca_secret_is_created_before_the_token_secret(self):
+        source = _INSTALL_SH.read_text()
+        # The post-apply block: the only place both functions are called.
+        start = source.index('create_gitlab_token_secret "$namespace"') - 400
+        block = source[start: source.index('create_gitlab_token_secret "$namespace"') + 400]
+        self.assertLess(
+            block.index('create_gitlab_ca_secret "$namespace"'),
+            block.index('create_gitlab_token_secret "$namespace"'),
+        )
+
 if __name__ == "__main__":
     unittest.main()

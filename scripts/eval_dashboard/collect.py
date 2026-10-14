@@ -227,6 +227,10 @@ DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
 # over a main build the listing has not named yet.
 DEFAULT_NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
 DEFAULT_NIGHTLY_WRITERS_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_JOB}/"
+# The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
+# archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
+DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
+DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
 # Where Prow's Spyglass shows a build directory: the gs:// path after the
 # scheme, so a link follows the bucket the build was read from.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
@@ -774,6 +778,7 @@ def build_run(
     pr_hint: int | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
     job: str | None = None,
+    periodic: bool = False,
 ) -> dict | None:
     """Assemble one `runs[]` entry.
 
@@ -900,7 +905,7 @@ def build_run(
     pull = started.get("pull")
     if isinstance(pull, (int, str)) and str(pull).isdigit():
         pr = int(pull)
-    if tier == tiers.TIER_NIGHTLY:
+    if periodic:
         # A periodic runs main; the number a hint or a stray `pull` key
         # might carry is nobody's pull request.
         pr = None
@@ -1424,6 +1429,7 @@ def _read_build(
     since_cutoff: datetime | None,
     tier: str = tiers.TIER_PRESUBMIT,
     job: str | None = None,
+    periodic: bool = False,
 ) -> tuple[str, dict | None, str]:
     """One build's reads: (build_id, run or None, _RECORDED/_UNFINISHED/_FILTERED).
 
@@ -1444,14 +1450,14 @@ def _read_build(
         if started_at is not None and started_at < since_cutoff:
             return build_id, None, _FILTERED
     try:
-        run = build_run(build_id, reader, pr_hint, tier=tier, job=job)
+        run = build_run(build_id, reader, pr_hint, tier=tier, job=job, periodic=periodic)
     except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
         print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
         return build_id, None, _UNFINISHED
     if run is None:
         print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
         return build_id, None, _UNFINISHED
-    if tier == tiers.TIER_NIGHTLY:
+    if periodic:
         run["log_url"] = spyglass_url(base)
     return build_id, run, _RECORDED
 
@@ -1463,6 +1469,7 @@ def _read_builds(
     unfinished: set[str] | None,
     tier: str = tiers.TIER_PRESUBMIT,
     job: str | None = None,
+    periodic: bool = False,
 ) -> list[dict]:
     """Read `(build_id, base_url)` candidates READ_WORKERS at a time.
 
@@ -1474,7 +1481,7 @@ def _read_builds(
     runs = []
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         results = pool.map(
-            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff, tier=tier, job=job),
+            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff, tier=tier, job=job, periodic=periodic),
             candidates,
         )
         for build_id, run, status in results:
@@ -1677,6 +1684,7 @@ def runs_from_periodic(
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
     job: str | None = None,
+    tier: str = tiers.TIER_NIGHTLY,
 ) -> list[dict]:
     """The nightly periodic's builds: list its log prefix, then read them.
 
@@ -1723,7 +1731,7 @@ def runs_from_periodic(
         file=sys.stderr,
     )
     return _read_builds(
-        candidates, gsutil, since_cutoff, unfinished, tier=tiers.TIER_NIGHTLY, job=job
+        candidates, gsutil, since_cutoff, unfinished, tier=tier, job=job, periodic=True
     )
 
 
@@ -2007,6 +2015,7 @@ def collect(
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
     gitlab_globs: list[str] | None = None,
+    gitlab_nightly_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2051,6 +2060,7 @@ def collect(
     nightly_after = None
     writers_after = None
     gitlab_after = None
+    gitlab_night_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
@@ -2058,7 +2068,10 @@ def collect(
             after_build = newest_build_id(tiers.presubmit_runs(prior))
             nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") != writers_job])
             writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
-            gitlab_after = newest_build_id(tiers.gitlab_runs(prior))
+            # The lane's pull-request builds and its nights are two sources
+            # of one tier, each above its own watermark; `pr` tells them apart.
+            gitlab_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is not None])
+            gitlab_night_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is None])
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -2186,6 +2199,23 @@ def collect(
             )
         gitlab_pending |= unfinished - listed_before
         fresh.extend(gitlab_fresh)
+    # The GitLab nightly: the lane's list once a night, read as a periodic
+    # (its prefix is its index, pr null, log_url set), tagged tier gitlab
+    # above the nights' own watermark; the nightly's rule on a listing that
+    # fails (runs_from_periodic) applies, so a night that has not run yet is
+    # a note.
+    gitlab_night_fresh: list[dict] = []
+    if gitlab_nightly_prefix:
+        listed_before = set(unfinished)
+        gitlab_night_fresh.extend(
+            runs_from_periodic(
+                gitlab_nightly_prefix, gsutil, after_build=gitlab_night_after, since_cutoff=since_cutoff,
+                retry_builds=frozenset(b for b in retry if b in gitlab_pending), unfinished=unfinished,
+                tier=tiers.TIER_GITLAB,
+            )
+        )
+        gitlab_pending |= unfinished - listed_before
+        fresh.extend(gitlab_night_fresh)
     # The nightly periodics, each above its own watermark. The shared retry
     # list is safe to hand over whole: a pending id is only re-read where
     # its source's listing names it, and no id is in two listings.
@@ -2235,6 +2265,12 @@ def collect(
                 f"; gitlab scan resumed above build {gitlab_after},"
                 f" {len(gitlab_fresh)} new"
                 if gitlab_globs
+                else ""
+            )
+            + (
+                f"; gitlab nights resumed above build {gitlab_night_after},"
+                f" {len(gitlab_night_fresh)} new"
+                if gitlab_nightly_prefix
                 else ""
             )
             + ")",
@@ -2358,6 +2394,17 @@ def main(argv: list[str] | None = None) -> int:
         " tier=nightly, pr=null, and their own incremental watermark",
     )
     parser.add_argument(
+        "--gitlab-nightly-prefix",
+        nargs="?",
+        const=DEFAULT_GITLAB_NIGHTLY_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the GitLab lane's nightly periodic from this Prow log"
+        f" prefix (given without a value: {DEFAULT_GITLAB_NIGHTLY_PREFIX}). Its"
+        " runs carry tier=gitlab, pr=null, job the prefix's last segment, and"
+        " their own watermark apart from the lane's pull-request builds",
+    )
+    parser.add_argument(
         "--nightly-job",
         default=None,
         metavar="NAME",
@@ -2460,11 +2507,12 @@ def main(argv: list[str] | None = None) -> int:
         and not args.rc_glob
         and args.rc_from_dir is None
         and not args.gitlab_pr_glob
+        and args.gitlab_nightly_prefix is None
     ):
         parser.error(
-            "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --nightly-prefix,"
-            " --nightly-writers-prefix, --from-dir, --rc-glob, --rc-from-dir"
-            " and/or --merge-with"
+            "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --gitlab-nightly-prefix,"
+            " --nightly-prefix, --nightly-writers-prefix, --from-dir, --rc-glob,"
+            " --rc-from-dir and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
@@ -2486,6 +2534,7 @@ def main(argv: list[str] | None = None) -> int:
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,
         gitlab_globs=args.gitlab_pr_glob,
+        gitlab_nightly_prefix=args.gitlab_nightly_prefix,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     nightly = len(tiers.nightly_runs(data["runs"]))

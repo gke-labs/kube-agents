@@ -89,7 +89,9 @@ dispatches `rc-release-pipeline.yml` whenever a new candidate exists, and
 `step-4-tag-validated` depends on the suite. Breaking a test there is not free — it reds the
 release-candidate pipeline within three hours and stops the tag. Both it and `staging-promotion-pipeline.yml`
 reach the suite through the same reusable `e2e-run.yml`; `e2e-gchat-test.yml` and
-`e2e-manual-runner.yml` are the by-hand callers. `tests/e2e/operator/agentplugins_e2e_test.py` is
+`e2e-manual-runner.yml` are the by-hand callers. `autopush-next-e2e-gchat.yml` runs `gchat_agent_test.py` every three hours against the
+long-lived `autopush-next` environment, outside any gate, and skips until that environment is
+provisioned for it. `tests/e2e/operator/agentplugins_e2e_test.py` is
 the exception inside the exception: it is the whole of the `agent-plugin` suite and is in the
 `nightly` E2E test set too, and `staging-promotion-pipeline.yml` runs `agent-plugin` as tolerated coverage
 rather than as its gate — so the scheduler dispatches the pipeline daily when an eligible

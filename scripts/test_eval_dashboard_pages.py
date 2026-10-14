@@ -900,6 +900,15 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("<th>Prow</th><th>Eval verdict</th>", page, "the result pill sits under Prow, not Job")
         # The gate's own list does not carry it.
         self.assertNotIn('href="run.html#build=2097282860221206600"', page)
+        # A night of the lane sits in the same section under Nights, linked by its own log_url.
+        self.assertIn("No GitLab night on record", page)
+        night = dict(base, build_id="2097282860221206700", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab", pr=None, result="SUCCESS", eval_verdict="GREEN", log_url="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700")
+        data["runs"].append(night)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn("1 night on record: 1 green, 0 not", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
         """Ceiling reps sit under their own key in `reps` (#1874). The card's
