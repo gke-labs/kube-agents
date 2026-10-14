@@ -13,7 +13,7 @@ What ships today is the outbound half: the gateway can post messages and Adaptiv
 ### Architecture & Security Boundaries
 
 - **Credential Isolation**: The `platform-agent` container runs without Microsoft Entra client secrets. The `credential-proxy` broker holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, acquires and caches Microsoft Entra OAuth2 tokens (`https://api.botframework.com/.default`), and exposes `/v1/chat/teams/*` to the gateway only: the broker checks both the token's audience and the caller's ServiceAccount against its allowed-callers list, which the operator renders and the CR cannot widen.
-- **Outbound Egress & Method Guards**: `/v1/chat/teams/api` permits only `POST v3/conversations/<id>/activities` to official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`) with HTTP redirects disabled, preventing Bearer token forwarding to arbitrary `*.trafficmanager.net` or tenant-owned hosts.
+- **Outbound Egress & Method Guards**: `/v1/chat/teams/api` forwards `POST` to `v3/conversations/<id>/activities` (send) and `v3/conversations/<id>/activities/<activityId>` (reply) only, never `activities/history`, and only to `smba.trafficmanager.net`, `botframework.com` and its subdomains over HTTPS, with redirects refused. The bot token never reaches another `*.trafficmanager.net` or tenant-owned host.
 - **Inbound delivery (not shipped)**: `POST /v1/chat/teams/events` queues an activity for the gateway, but only a caller on the broker's allowed-callers list can reach it, and the operator renders no public `Ingress` or `LoadBalancer` for the broker. No shipped component validates the Bot Framework JWT or forwards Microsoft's deliveries to this route. Registering a messaging endpoint therefore has nothing to point at yet.
 - **Single-Tenant Lock-Down**: When `TEAMS_TENANT_ID` (`spec.integration.teams.tenantId`) is configured, both the credential broker (`POST /v1/chat/teams/events`, returning `403 Forbidden`) and the gateway adapter (`_process_activity`) verify that `channelData.tenant.id` (falling back to `conversation.tenantId`) matches the configured tenant ID.
 - **User Authorization (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`)**: The operator wires `spec.integration.teams.allowedUsers` to `TEAMS_ALLOWED_USERS` and `spec.integration.teams.allowAllUsers` to `TEAMS_ALLOW_ALL_USERS`. Authorization matches `from.aadObjectId` (Entra ID Object ID), `from.userPrincipalName` / `from.email` (when supplied by the forwarder or activity), or `from.id` (Teams `29:…` channel account ID). Display names (`from.name`) are never matched for authorization.
@@ -52,8 +52,9 @@ type: Opaque
 stringData:
   TEAMS_APP_ID: "00000000-0000-0000-0000-000000000000"
   TEAMS_APP_PASSWORD: "your-azure-app-client-secret"
-  TEAMS_TENANT_ID: "11111111-1111-1111-1111-111111111111" # Optional single-tenant lock-down
 ```
+
+The tenant lock-down is `spec.integration.teams.tenantId` on the PlatformAgent (below), not a Secret key.
 
 ---
 
@@ -74,7 +75,6 @@ platformAgent:
         - "alice@example.com"
       allowAllUsers: false
       homeChannel: "19:abc123conversationid@thread.v2"
-      serviceUrl: "https://smba.trafficmanager.net/teams/"
       adaptiveCards: true
 ```
 
@@ -103,7 +103,6 @@ spec:
         - "22222222-2222-2222-2222-222222222222"
       allowAllUsers: false
       homeChannel: "19:teamchannelid@thread.v2"
-      serviceUrl: "https://smba.trafficmanager.net/teams/"
       adaptiveCards: true
 ```
 
@@ -122,11 +121,6 @@ spec:
 
 ---
 
-## Interactive ChatOps Commands
+## Talking to the agent
 
-Once inbound delivery ships and the app is installed, you can interact with the agent:
-
-- `@Kage /audit fleet` — Trigger a fleet-wide cgroup and GCE/GKE configuration audit.
-- `@Kage /remediate <finding-id>` — Review and execute automated remediation workflows with Interactive Adaptive Cards.
-- `@Kage status` — Check agent health, cluster connectivity, and queue state.
-- `@Kage help` — List available toolsets and ChatOps capabilities.
+Once inbound delivery ships and the app is installed, you mention the bot and ask in plain language, as on Google Chat and Slack; there is no command syntax.

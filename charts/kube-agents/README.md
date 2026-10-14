@@ -479,8 +479,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   credentials are read from the credentials Secret's `TEAMS_APP_ID` and
   `TEAMS_APP_PASSWORD` keys. Optional single-tenant lock-down is set via
   `tenantId`, and user authorization is configured via `allowedUsers` (or
-  `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
-  fallback.
+  `allowAllUsers: true`). Outbound posts render as Adaptive Cards v1.5 when
+  `adaptiveCards: true` (the default) and as plain text otherwise. Only the
+  outbound half ships; see `docs/chatops/microsoft-teams.md` for what is not.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
   `namespace` and `credentialsRef`), and
