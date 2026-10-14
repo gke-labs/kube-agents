@@ -245,6 +245,23 @@ func TestMarkSessionHoldsUntilEveryChainsCardsSettle(t *testing.T) {
 	}
 }
 
+// A chain that a click or typed answer continued no longer marks its ask:
+// its late terminal (a stop confirmed after the answer) would diff against
+// the copy taken at hand-over and strip the continuing chain's reactions.
+func TestMarkAContinuedChainsLateTerminalLeavesTheAsk(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", Mark: &MarkState{Ask: "investigate", Settle: "blocked"}},
+		{ID: "c", RootTaskID: "c", AskMessageID: "10.0", Mark: &MarkState{Ask: "investigate"}},
+	}}
+	rec.ActiveTask = &ActiveTask{TaskID: "c"}
+	g.applyTerminalMark(rec, "a", lib.StateCanceled)
+	g.applyTaskMark(rec, "a", MarkState{})
+	if got := obs.reactionCalls(); len(got) != 0 {
+		t.Errorf("the continued chain's terminal drew %v on the ask the continuing chain holds", got)
+	}
+}
+
 // An older ask's hold is bounded: one whose mark was last drawn longer ago
 // than markOlderAskHold (a card that died before its settle, or a settle the
 // gateway lost) no longer holds the session.

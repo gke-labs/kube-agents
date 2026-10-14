@@ -1645,7 +1645,9 @@ wake's terminal settles the chain, or the child's end does when no wake starts. 
 click starts, or a typed answer to the conversation's open question (`InboundMessage.Answer`),
 continues that ask's work, so it marks the ask of the conversation's previous chain, from what
 is already drawn there: a click is no message of its own, and a card that settles after its
-question was answered then lifts ⏸️ on the ask rather than marking the answer. Interactive
+question was answered then lifts ⏸️ on the ask rather than marking the answer. The chain it
+continued no longer marks that ask, so its late terminal (a stop confirmed after the answer)
+leaves the reactions to the continuing chain. Interactive
 envelopes are acked like events. A click on a choice button the renderer drew is a message from
 the clicker whose text is the choice's reply, handed to the gateway like a typed one, so the
 allowlist and the map judge it the same way and it carries no intent. The gateway tells the

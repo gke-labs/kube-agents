@@ -125,14 +125,27 @@ func (rec *SessionRecord) continuedAskMessage() (string, *MarkState) {
 	return rec.Tasks[i].AskMessageID, mark
 }
 
+// markingRootIndex is the index of taskID's chain root when the task may
+// mark its ask: it is the chain's newest task, and no later chain has
+// continued the ask (continuedAskMessage), since a continued chain's stored
+// mark is the copy taken at hand-over and the continuing chain is the ask's
+// newest writer. -1 otherwise.
+func (rec *SessionRecord) markingRootIndex(taskID string) int {
+	if !rec.chainNewest(taskID) {
+		return -1
+	}
+	i := rec.chainRootIndex(taskID)
+	if i < 0 || rec.askIndex(rec.Tasks[i].AskMessageID) != i {
+		return -1
+	}
+	return i
+}
+
 // applyTaskMark draws a mark a task's own chat message carried. Only the
 // chain's newest task's mark counts. The caller holds the session lock and
 // writes the record after.
 func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkState) {
-	if !rec.chainNewest(taskID) {
-		return
-	}
-	g.drawMark(rec, rec.chainRootIndex(taskID), next)
+	g.drawMark(rec, rec.markingRootIndex(taskID), next)
 }
 
 // applyTerminalMark is the default for the newest task ending with no mark
@@ -144,15 +157,12 @@ func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkStat
 // (handOffEnd): a session turn whose delegate request minted no child ends
 // failed, whatever its hand-off line's completed says.
 func (g *Gateway) applyTerminalMark(rec *SessionRecord, taskID string, state lib.TaskState) {
-	if !rec.chainNewest(taskID) {
+	i := rec.markingRootIndex(taskID)
+	if i < 0 {
 		return
 	}
 	if replaced, _, handOff := rec.handOffEnd(taskID, state); handOff {
 		state = replaced
-	}
-	i := rec.chainRootIndex(taskID)
-	if i < 0 {
-		return
 	}
 	next := MarkState{}
 	if prev := rec.Tasks[i].Mark; prev != nil && prev.Settle != markSettleBlocked {

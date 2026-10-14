@@ -83,8 +83,8 @@ const (
 	// keys (spec-a2a-payloads.md, "Card work after the task ends"): past
 	// it the least recently used key is forgotten, and a later request with
 	// it posts anew. notifyUpdateConversationsMax bounds the conversations
-	// the keys are kept for, oldest forgotten first, so the store is
-	// bounded however many conversations the agent works in.
+	// the keys are kept for, the least recently used forgotten first, so
+	// the store is bounded however many conversations the agent works in.
 	notifyUpdateKeysMax          = 16
 	notifyUpdateConversationsMax = 1024
 	// notifyUpdateKeyMax bounds an update key, which the sender picks.
