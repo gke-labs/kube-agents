@@ -1709,7 +1709,7 @@ The live message shows the newest progress chat message under every display mode
 when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress
 chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
-so a live message laid out before a gateway restart does not keep a stale plan. Nothing answers a click yet: a choice button opens nothing, and Slack
+so a live message laid out before a gateway restart does not keep a stale plan. A post or edit that fails for any other reason (a rate limit, an outage, a message that is gone) is no refusal: it is not counted, and the live message tries the layout again on its next artifact. Nothing answers a click yet: a choice button opens nothing, and Slack
 marks a click on any button, a link's included, as failed until the gateway acks interactions.
 That is the exception to the notify route's refusal of interactive blocks below: a raw `blocks`
 request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat

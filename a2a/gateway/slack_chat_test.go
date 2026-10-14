@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/slack-go/slack"
+
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
@@ -251,5 +253,19 @@ func TestSlackEditClearsAnyLayout(t *testing.T) {
 	form := stub.forms[0]
 	if form.Get("text") != "✅ *completed*" || form.Get("blocks") != "[]" || form.Get("attachments") != "[]" {
 		t.Fatalf("form = %v", form)
+	}
+}
+
+// Slack's refusal of a layout is ErrLayoutRefused; any other API error is
+// not, and is left to be retried.
+func TestSlackLayoutErrorClassifies(t *testing.T) {
+	if err := slackLayoutError(slack.SlackErrorResponse{Err: "invalid_blocks"}); !errors.Is(err, ErrLayoutRefused) {
+		t.Errorf("invalid_blocks: %v, want ErrLayoutRefused", err)
+	}
+	if err := slackLayoutError(slack.SlackErrorResponse{Err: "ratelimited"}); errors.Is(err, ErrLayoutRefused) {
+		t.Errorf("ratelimited: %v, want no refusal", err)
+	}
+	if slackLayoutError(nil) != nil {
+		t.Error("nil error wrapped")
 	}
 }

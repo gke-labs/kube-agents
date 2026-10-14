@@ -16,8 +16,9 @@ import (
 // (tests/conformance/chat, lifted from the today presenters' tests) expect
 // an emitter to send, laid out as Block Kit, against a stored file per case
 // under testdata/slack-chat. `go test ./gateway -run SlackChatGolden
-// -update-slack-chat` rewrites them; a diff in review is a change to what
-// Slack shows.
+// -update-slack-chat` rewrites them, and deletes one whose case no longer
+// lays anything out, so run it over the whole test, not one subtest; a diff
+// in review is a change to what Slack shows.
 const (
 	chatCasesDir    = "../../tests/conformance/chat"
 	slackGoldenDir  = "testdata/slack-chat"
@@ -121,8 +122,14 @@ func TestSlackChatGolden(t *testing.T) {
 	// stale, and a reviewer reading it would read a layout nothing makes.
 	stored, _ := filepath.Glob(filepath.Join(slackGoldenDir, "*.json"))
 	for _, path := range stored {
-		if !seen[filepath.Base(path)] && !*updateSlackGolden {
-			t.Errorf("%s has no shared case that lays it out; delete it", path)
+		switch {
+		case seen[filepath.Base(path)]:
+		case *updateSlackGolden:
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Errorf("%s has no shared case that lays it out; delete it, or run with -update-slack-chat", path)
 		}
 	}
 }
