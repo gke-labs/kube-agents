@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import unittest.mock
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -901,7 +902,7 @@ class SweepDeadline(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None)), \
+                                           return_value=(entries, None, [])), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for), \
                 unittest.mock.patch.object(pp.time, "monotonic", side_effect=clock):
             return pp.collect_waits(
@@ -955,6 +956,84 @@ class IndexCopy(unittest.TestCase):
             "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
             argv[3],
         )
+        # Parallel copies already carry on past one failed object; the flag
+        # makes a sequential one do the same, so a vanished pointer never
+        # stops the rest of the index from landing.
+        self.assertIn("--continue-on-error", argv)
+
+    # Prow rewrites a build's pointer while the build runs and again when it
+    # finishes, so any pointer can be replaced between the copy's listing and
+    # its fetch. gcloud then exits 1 after copying the rest, with this line
+    # (the object name comes back percent-encoded) among the `Copying` ones:
+    # builds 2110421170670014464 and 2110451369931444224 on 2026-10-14.
+    VANISHED = (
+        "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fpull-kube-agents-smoke-test"
+        "%2F2110431553740869632.txt not found: 404."
+    )
+
+    def _copy(self, rc, stderr, landed=("2110451366894768128",)):
+        """Run the index copy with gcloud stubbed to exit `rc` after writing
+        the `landed` pointers, as a real partial copy leaves them."""
+        def fake_cp(cmd, timeout=0):
+            dest = cmd[4]  # gcloud storage cp <glob> <dest> ...
+            for build in landed:
+                Path(dest, f"{build}.txt").write_text(f"gs://b/{build}", encoding="utf-8")
+            return rc, "", stderr
+        with unittest.mock.patch.object(pp, "run_cmd", side_effect=fake_cp), \
+                tempfile.TemporaryDirectory() as tmp:
+            return pp._index_entries_from_gcs(tmp)
+
+    def test_a_pointer_that_vanished_mid_copy_is_unreadable_not_the_whole_hour(self):
+        stderr = "Copying gs://b/2110451366894768128.txt to file:///tmp/x\n" + self.VANISHED + "\n..\n"
+        entries, err, vanished = self._copy(1, stderr)
+        self.assertIsNone(err)
+        self.assertEqual({2110451366894768128: "gs://b/2110451366894768128"}, entries)
+        self.assertEqual([{"build_id": "2110431553740869632",
+                           "error": pp.INDEX_POINTER_VANISHED}], vanished)
+
+    def test_any_other_error_still_fails_the_copy(self):
+        denied = "ERROR: (gcloud.storage.cp) HTTPError 403: caller does not have storage.objects.get"
+        entries, err, vanished = self._copy(1, self.VANISHED + "\n" + denied + "\n")
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn("403", err)
+        # The error names what went wrong, not the thousands of Copying lines.
+        self.assertNotIn("Copying", err)
+        self.assertEqual([], vanished)
+
+    def test_a_404_outside_the_index_is_not_a_vanished_pointer(self):
+        other = "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fother-job%2F2110431553740869632.txt not found: 404."
+        entries, err, vanished = self._copy(1, other)
+        self.assertEqual({}, entries)
+        self.assertIn("other-job", err)
+
+    def test_a_failed_exit_with_nothing_copied_still_fails(self):
+        entries, err, vanished = self._copy(1, self.VANISHED, landed=())
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+
+    def test_a_failed_exit_with_no_error_line_still_fails(self):
+        entries, err, vanished = self._copy(124, "timed out after 300s: gcloud storage cp")
+        self.assertEqual({}, entries)
+        self.assertIn("timed out", err)
+
+    def test_a_vanished_pointer_is_named_with_the_unreadable_builds(self):
+        build = 2110451366894768128
+        gone = {"build_id": "2110431553740869632", "error": pp.INDEX_POINTER_VANISHED}
+        as_of = pp.snowflake_time(build) + timedelta(hours=1)
+        wait = pp.Wait(build, "1", pp.snowflake_time(build), pp.snowflake_time(build), 15)
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=({build: "p"}, None, [gone])), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", return_value=wait):
+            source = pp.collect_waits(as_of - timedelta(days=1), as_of)
+        self.assertIsNone(source.error)
+        self.assertEqual([gone], source.value.unreadable)
+        self.assertEqual([build], [w.build_id for w in source.value.waits])
+        summary = pp.summarise(as_of - timedelta(days=1), as_of, 15, 45, 45, source,
+                               pp.Source(error="not read"), pp.Source(error="not read"))
+        self.assertEqual([gone], summary["trend"]["unreadable"])
+        self.assertIn("2110431553740869632", pp.render(summary))
 
 
 class LogHead(unittest.TestCase):
@@ -1042,7 +1121,7 @@ class SweepUnreadable(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None)), \
+                                           return_value=(entries, None, [])), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
             return pp.collect_waits(self.AS_OF - timedelta(days=days), self.AS_OF)
 

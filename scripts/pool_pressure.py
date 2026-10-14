@@ -52,6 +52,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +76,14 @@ BUILD_INDEX_SUFFIX = ".txt"
 # can 404 mid-copy and turn the hour into "could not measure" for a file the
 # check never reads (2 of 716 runs by 2026-10-08).
 GCS_BUILD_INDEX_GLOB = f"{GCS_BUILD_INDEX}/[0-9]*{BUILD_INDEX_SUFFIX}"
+# Prow rewrites a build's pointer while the build runs and when it finishes,
+# so one can vanish between the copy's listing and its fetch. gcloud copies
+# the rest and exits 1 with this line, the object name percent-encoded, among
+# the Copying lines (2 of 30 runs on 2026-10-14). That build is reported
+# unreadable and the hour is still measured; any other error still fails it.
+GCS_CP_ERROR_PREFIX = "ERROR: "
+GCS_OBJECT_NOT_FOUND = re.compile(r"^ERROR: (gs://\S+) not found: 404\.?$")
+INDEX_POINTER_VANISHED = "index pointer rewritten during the copy (404)"
 
 # The three artifacts setup time is read from, in the order the run writes
 # them. Only prowjob.json is required: initupload writes it when the pod starts,
@@ -852,8 +861,11 @@ def wait_from_prowjob(
     )
 
 
-def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]:
-    """Every build ID in the flat index, mapped to its artifact directory.
+def _index_entries_from_gcs(
+    tmpdir: str,
+) -> Tuple[Dict[int, str], Optional[str], List[Dict[str, str]]]:
+    """Every build ID in the flat index, mapped to its artifact directory,
+    with the builds whose pointer vanished mid-copy as unreadable entries.
 
     Copied in bulk rather than listed and read one at a time: one `gcloud
     storage cp` of the whole prefix is a few seconds, where a thousand
@@ -862,14 +874,44 @@ def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]
     dest = os.path.join(tmpdir, "index")
     os.makedirs(dest, exist_ok=True)
     # A wildcard, not `cp -r` on the directory, which exits 0 having copied
-    # nothing; and the build files only, for the reason beside the constant.
+    # nothing; the build files only, for the reason beside the constant; and
+    # the rest of the index after one failed object even when gcloud copies
+    # sequentially (a parallel copy, the default, carries on regardless).
     rc, _, err = run_cmd(
-        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest],
+        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest, "--continue-on-error"],
         timeout=GCS_INDEX_TIMEOUT_SECONDS,
     )
-    if rc != 0:
-        return {}, f"could not read the build index: {err.strip() or f'exit {rc}'}"
-    return _index_entries_from_dir(dest), None
+    if rc == 0:
+        return _index_entries_from_dir(dest), None, []
+    vanished, other = _vanished_pointers(err)
+    entries = _index_entries_from_dir(dest) if vanished and not other else {}
+    if not entries:
+        # The error lines alone: the stderr is thousands of Copying lines.
+        errors = [line for line in err.splitlines() if line.startswith(GCS_CP_ERROR_PREFIX)]
+        reason = "; ".join(errors) or err.strip() or f"exit {rc}"
+        return {}, f"could not read the build index: {reason}", []
+    return entries, None, [
+        {"build_id": build, "error": INDEX_POINTER_VANISHED} for build in vanished
+    ]
+
+
+def _vanished_pointers(stderr: str) -> Tuple[List[str], List[str]]:
+    """The build IDs whose index pointer gcloud reported missing, and every
+    other error line, so a caller can tell the race from a real failure."""
+    vanished: List[str] = []
+    other: List[str] = []
+    for line in stderr.splitlines():
+        if not line.startswith(GCS_CP_ERROR_PREFIX):
+            continue
+        match = GCS_OBJECT_NOT_FOUND.match(line)
+        name = urllib.parse.unquote(match.group(1)) if match else ""
+        prefix = f"{GCS_BUILD_INDEX}/"
+        stem = name[len(prefix) : -len(BUILD_INDEX_SUFFIX)]
+        if name.startswith(prefix) and name.endswith(BUILD_INDEX_SUFFIX) and stem.isdigit():
+            vanished.append(stem)
+        else:
+            other.append(line)
+    return vanished, other
 
 
 def _index_entries_from_dir(dest: str) -> Dict[int, str]:
@@ -1042,11 +1084,15 @@ def collect_waits(
 
     began = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="pool-pressure-") as tmpdir:
-        entries, err = _index_entries_from_gcs(tmpdir)
+        entries, err, vanished = _index_entries_from_gcs(tmpdir)
         if err:
             return Source(error=err)
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
+        # A vanished pointer is a build the sweep never saw: named with the
+        # unreadable builds, left out of the numbers, and not counted against
+        # the newest-builds share below, which judges the reader, not Prow.
+        unreadable: List[Dict[str, str]] = list(vanished)
 
         candidates: Dict[str, List[int]] = {}
         for build_id in entries:
@@ -1059,11 +1105,10 @@ def collect_waits(
                 candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(build_id)
         if not candidates:
             return Source(
-                value=Sweep([], 0, time.monotonic() - began, window_start)
+                value=Sweep([], 0, time.monotonic() - began, window_start, False, unreadable)
             )
 
         collected: List[Wait] = []
-        unreadable: List[Dict[str, str]] = []
         read = 0
         done: List[str] = []
         truncated = False
