@@ -7023,6 +7023,15 @@ def _run_objective(command: str) -> str:
         # a shell word behind `echo` or `printf` is printed, and the string after its `-c` never runs
         (f'echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
         (f"printf '%s' sh -c 'python3 {_SCRIPT_PATH} --readiness'", False),
+        # a wrapper's flag may take a word: everything after a wrapper is its own until the shell or interpreter
+        (f'timeout -s KILL 600 bash -c "python3 {_SCRIPT_PATH} --readiness"', True),
+        (f"env -u KUBECONFIG sh -c 'python3 {_SCRIPT_PATH} --readiness'", True),
+        (f"sudo -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        # the file and the flag as another command's arguments are not a run of the file
+        (f"find /opt/data/profiles/platform/skills -name fleet_upgrade_report.py -exec grep -n -- --readiness {{}} \\;", False),
+        ("ls fleet_upgrade_report.py --readiness", False),
+        ("echo run fleet_upgrade_report.py --readiness", False),
+        (f'python3 -c "print(1)" {_SCRIPT_PATH} --readiness', False),
         # a line whose quotes do not balance is one bash refuses: nothing on it ran
         ('echo "run fleet_upgrade_report.py --readiness', False),
         (f"python3 {_SCRIPT_PATH} --readiness --output 'unbalanced", False),
@@ -7059,6 +7068,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     # a shell word behind a command that prints is text, not a shell to unwrap
     assert _shell_argvs('echo bash -c "python3 /x/f.py --readiness"') == [["echo", "bash", "-c", "python3 /x/f.py --readiness"]]
     assert _shell_argvs('nice -n 10 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs('timeout -s KILL 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     # a wrapped shell is unwrapped behind the wrappers that hand their argv on
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]

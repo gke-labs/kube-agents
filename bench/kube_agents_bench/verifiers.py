@@ -1224,7 +1224,9 @@ _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # `printf` is text the command prints, and the string after its `-c` is not run.
 _SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command"))
 _SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SHELL_WRAPPER_VALUE_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+# The interpreters a case's script is run through; `-m <stem>` is read after one of these.
+_INTERPRETER_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?|uv)$")
+_INTERPRETER_CODE_FLAG = "-c"
 _SHELL_COMMENT_CHAR = "#"
 _SHELL_QUOTE_CHARS = frozenset("'\"")
 _SHELL_SINGLE_QUOTE = "'"
@@ -1337,8 +1339,8 @@ def _shell_argvs(command: str) -> list[list[str]]:
             continue
         argv.append(word)
     for argv in list(argvs):
-        index = _shell_program_index(argv)
-        if index is None:
+        index = _command_word_index(argv)
+        if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         for flag_index in range(index + 1, len(argv) - 1):
             flag = argv[flag_index]
@@ -1348,31 +1350,52 @@ def _shell_argvs(command: str) -> list[list[str]]:
     return argvs
 
 
-def _shell_program_index(argv: list[str]) -> int | None:
-    """The index of the shell program this argv runs, or None: the first word that is not an
-    assignment, an exec wrapper, a wrapper's flag or its value must be the shell, else the
-    segment runs something else (`echo bash -c "..."` prints) and no string inside it runs."""
+def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
+    """The index of the word the shell runs as this argv's command, when it is one the reader
+    knows: a shell program, an interpreter, or ``script`` itself. Leading ``NAME=value``
+    assignments are skipped; after an exec wrapper (``timeout``, ``sudo``, ``env`` ...) every
+    word is the wrapper's until one of those three appears, so a wrapper's flag and its value
+    (``-s KILL 600``, ``-u user``) need no grammar of their own. A first word that is none of
+    them (``echo``, ``find``, ``ls``, ``grep``) is a command of its own, and None is returned:
+    nothing it names as an argument runs."""
+    after_wrapper = False
     for index, word in enumerate(argv):
-        if os.path.basename(word) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+        base = os.path.basename(word)
+        if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
             return index
-        if _SHELL_ASSIGNMENT_RE.match(word) or os.path.basename(word) in _SHELL_EXEC_WRAPPERS:
+        if _SHELL_ASSIGNMENT_RE.match(word):
             continue
-        if word.startswith("-") or _SHELL_WRAPPER_VALUE_RE.match(word):
+        if base in _SHELL_EXEC_WRAPPERS:
+            after_wrapper = True
+            continue
+        if after_wrapper:
             continue
         return None
     return None
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
-    """Whether one argv runs ``run.script``: the script is a word of the argv by its basename
-    (``python3 -m <stem>`` counts), every one of ``run.flags`` is a later word, and no word is a
-    usage flag, which prints the help and runs nothing. What stands ahead of the script (an
-    interpreter and its flags, a ``timeout``, an ``env``, a ``NAME=value``) is not read."""
+    """Whether one argv runs ``run.script``: the script is the argv's command word by its
+    basename, or follows an interpreter that is (``python3 -m <stem>`` counts, ``python3 -c``
+    does not, since the code string runs and the file is its argument); every one of
+    ``run.flags`` is a later word, and no word is a usage flag, which prints the help and runs
+    nothing. A segment whose command is something else (``find``, ``ls``, an unquoted ``echo``)
+    is not a run however it names the file and the flag."""
     if any(word in _USAGE_FLAGS for word in argv):
         return False
+    command = _command_word_index(argv, run.script)
+    if command is None:
+        return False
     stem = run.script.rsplit(".", 1)[0]
-    for index, word in enumerate(argv):
-        is_script = os.path.basename(word) == run.script or (index > 0 and argv[index - 1] == "-m" and word == stem)
+    if os.path.basename(argv[command]) == run.script:
+        return all(flag in argv[command + 1:] for flag in run.flags)
+    if not _INTERPRETER_RE.match(os.path.basename(argv[command])):
+        return False
+    for index in range(command + 1, len(argv)):
+        word = argv[index]
+        if _INTERPRETER_CODE_FLAG in argv[command + 1:index]:
+            return False
+        is_script = os.path.basename(word) == run.script or (argv[index - 1] == "-m" and word == stem)
         if is_script and all(flag in argv[index + 1:] for flag in run.flags):
             return True
     return False
@@ -1405,7 +1428,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     word, so a script a case names this way is built with ``allow_abbrev=False``
     (argparse's default lets ``--readi`` run ``--readiness``), as
     ``fleet_upgrade_report.py`` is; and a line bash refuses (an unclosed quote)
-    yields no words, so nothing on it is credited or forbidden. Fails closed
+    yields no words, so nothing on it is credited or forbidden; and no shell
+    expansion is resolved, so a run spelled through a variable that holds the
+    whole path (``python3 "$SCRIPT" ...``), a backtick capture or a quoted
+    ``$(...)`` is not read as one -- the dictated command spells the path in
+    full. Fails closed
     like its siblings -- a run with no captured worker commands is
     ``status="error"``, not a pass.
     """
