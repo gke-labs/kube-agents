@@ -11,6 +11,8 @@
 # fixed form, and the deterministic objectives read those lines and nothing
 # else; a report that only says "an exclusion exists" cannot fill the line.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # No deterministic mutation safeguard, documented: the exclusion is on the
@@ -76,7 +78,7 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-states-the-scope
     role: objective
@@ -91,9 +93,9 @@ verification_spec:
       # no_minor_upgrades both arrive as "no-minor-upgrades"; the optional
       # separator also admits a spaced spelling.
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?no[-_ ]?minor[-_ ]?upgrades; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?no[-_ ]?minor[-_ ]?upgrades(?: \([^)\n;]*\))?; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?(?!no[-_ ]?minor[-_ ]?upgrades;)[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?(?!no[-_ ]?minor[-_ ]?upgrades(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-states-the-end-date
     role: objective
@@ -104,9 +106,9 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d[^;\n?!]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d[^;\n?!]*; holds the automatic minor upgrade: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d[^;\n?!]*;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d[^;\n?!]*;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-says-it-holds-the-automatic-upgrade
     role: objective
@@ -117,9 +119,9 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: yes$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

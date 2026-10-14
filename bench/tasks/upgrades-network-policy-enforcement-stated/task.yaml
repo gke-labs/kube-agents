@@ -29,6 +29,8 @@
 # class: a negation word in it is refused as an item of its own, and a word
 # outside it is the judge's.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # No deterministic mutation safeguard, documented. No catalogue role probes
@@ -137,9 +139,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; network[ -]?policy enforce(?:d|ment): no; namespaces with policies: [^\n?!]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; network[ -]?policy enforce(?:d|ment): no(?: \([^)\n;]*\))?; namespaces with policies: [^\n?!]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; network[ -]?policy enforce(?:d|ment): (?!no;)[^;\n]+; namespaces with policies: [^\n?!]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; network[ -]?policy enforce(?:d|ment): (?!no(?: \([^)\n;]*\))?;)[^;\n]+; namespaces with policies: [^\n?!]+$'
 
   - name: seeded-a-lists-its-four-policy-namespaces
     role: objective

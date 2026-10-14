@@ -7319,6 +7319,8 @@ def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text
 _GROUP3 = {
     "upgrades-removed-api-callers-distinguished": (
         [
+            "seeded-a: next minor 1.36; removed apis still called: none (audit log clean); deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowschemas flowcontrol.apiserver.k8s.io/v1beta3",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints",
             "seeded-a: next minor 1.36 (REGULAR channel); removed apis still called: none; deprecated but still served: v1 endpoints",
             "seeded-a: next minor: 1.36; removed apis still called: none; deprecated but still served: endpoints v1",
@@ -7365,6 +7367,7 @@ _GROUP3 = {
     ),
     "upgrades-network-policy-enforcement-stated": (
         [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no (add-on off); namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane: legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane legacy; network policy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
@@ -7482,12 +7485,14 @@ _GROUP5 = {
     ),
     "upgrades-cgroup-blind-runtime-named": (
         [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre (jdk 8u302, pre-8u372); reads cgroup v2 limits: no (cgroup v1 only); memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit: 192Mi",
             "- `seeded-a/seeded-shapes/cgroup-blind-jvm`: runtime `eclipse-temurin:8u302-b08-jre`; reads cgroup v2 limits: no; memory limit 192Mi.",
             "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
         ],
         [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes (since 8u372); memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit none",
@@ -7512,12 +7517,14 @@ _GROUP5 = {
     ),
     "upgrades-node-image-coupled-agent-named": (
         [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes (hostNetwork: true); host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths: /etc/cni/net.d; coupled to the node image: yes",
             "- `seeded-a/seeded-shapes/cni-shaped-agent`: host network: yes; host paths `/etc/cni/net.d` (read-only, mounted at /host/etc/cni/net.d); coupled to the node image: yes.",
             "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
         ],
         [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: no (hostNetwork: false); host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none (/etc/cni/net.d is read-only and does not count); coupled to the node image: yes",
@@ -7621,6 +7628,7 @@ _GROUP2 = {
     ),
     "upgrades-no-surge-pool-recreate-warned": (
         [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no (maxSurge 0); workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1 (e2-medium, us-central1-a); replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in seeded-upgrade",
@@ -7644,6 +7652,7 @@ _GROUP2 = {
     ),
     "upgrades-zonal-skew-replicas-warned": (
         [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes (both in us-central1-a); cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2/2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node-affinity",
@@ -7688,6 +7697,7 @@ _GROUP2 = {
 _GROUP4 = {
     "upgrades-node-local-state-named": (
         [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes emptyDir queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir-7c9d4b5f6-k2x8q: node-local volumes: queue; survives a node rebuild: no",
             "- `seeded-a/seeded-shapes/cache-on-emptydir`: node-local volumes `queue` (emptyDir); survives a node rebuild: no.",
@@ -7920,3 +7930,33 @@ def test_a_gloss_after_the_object_is_admitted(case):
     glossed = bare.replace(": ", " (object gloss, one node): ", 1)
     verdicts = _group5_verdicts(case, _group5_report(glossed))
     assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+_TABLED_CASES = [*_GROUP2, *_GROUP3, *_GROUP4, *_GROUP5]
+
+
+def _bare_line(case: str) -> str:
+    rows = {**_GROUP2, **_GROUP3, **_GROUP4, **_GROUP5}[case][0]
+    return next(r for r in rows if "(" not in r and not r.startswith(("-", "*", "1.")))
+
+
+def _verdicts_for_line(case: str, line: str) -> dict[str, str]:
+    if case in _GROUP3:
+        return _group3_verdicts(case, _group3_report(case, line))
+    return _group5_verdicts(case, _group5_report(line))
+
+
+@pytest.mark.parametrize("case", _TABLED_CASES)
+def test_a_gloss_after_any_mid_line_value_is_admitted(case):
+    """A parenthetical after a value grades as the bare line wherever the value
+    sits before a `;`: the frame, the free slots and the graded literals and
+    verdicts alike. The line-end slot is outside this: the fold strips a
+    line-final `)`, and the hedge rows decide it."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    parts = bare.split("; ")
+    assert len(parts) > 1, bare
+    for k in range(len(parts) - 1):
+        glossed = "; ".join(parts[: k + 1]) + " (object gloss); " + "; ".join(parts[k + 1 :])
+        verdicts = _verdicts_for_line(case, glossed)
+        assert verdicts and all(s == "pass" for s in verdicts.values()), (k, glossed, verdicts)
