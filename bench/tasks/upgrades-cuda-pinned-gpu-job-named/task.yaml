@@ -17,6 +17,8 @@
 # CronJob's line and nothing else. Whether the target image's driver serves
 # CUDA 12.2 depends on the target version's driver table and is the judge's.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguards: the image and the suspend flag. An image built for
@@ -87,9 +89,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?nvidia-l4; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?nvidia-l4(?: \([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?(?!nvidia-l4;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?(?!nvidia-l4(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
 
   # The CUDA pin, with or without its patch.
   - name: the-declared-line-names-the-cuda-pin
@@ -101,9 +103,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?(?: \([^)\n;]*\))?; suspended: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?;)[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
 
   # The job is suspended: an inventory that saw it saw that, and one that
   # skipped suspended workloads has no line at all.

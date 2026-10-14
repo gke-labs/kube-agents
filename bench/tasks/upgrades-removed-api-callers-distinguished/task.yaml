@@ -19,6 +19,8 @@
 # its parenthetical), an API path or a dotted group, so a negation standing
 # as an item is refused whatever the word; only the graded token stands bare.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the writer's suspend flag.
@@ -101,9 +103,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: none; deprecated but still served: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: none(?: \([^)\n;]*\))?; deprecated but still served: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: (?!none;)[^;\n]+; deprecated but still served: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: (?!none(?: \([^)\n;]*\))?;)[^;\n]+; deprecated but still served: [^\n]+$'
 
   - name: seeded-a-keeps-the-endpoints-writer-under-deprecated
     role: objective
@@ -114,9 +116,9 @@ verification_spec:
       fixture_roles:
         - deprecated-api-caller
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?:(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?(?:, ?|,? and ))*(?:/?api/)?(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?)*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?:(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?(?:, ?|,? and ))*(?:/?api/)?(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?)*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!(?:(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?(?:, ?|,? and ))*(?:/?api/)?(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?)*$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!(?:(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?(?:, ?|,? and ))*(?:/?api/)?(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= \((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: \([^)\n;]*(?:\)|$))?)*$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

@@ -14,6 +14,8 @@
 # answer to end in one declared line per such volume, in a fixed form; the
 # deterministic objectives read the planted volume's line and nothing else.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the volume source. A CSI volume in its place is the
@@ -79,9 +81,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?in-tree gcepersistentdisk; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?in-tree gcepersistentdisk(?: \([^)\n;]*\))?; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!in-tree gcepersistentdisk;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!in-tree gcepersistentdisk(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
 
   - name: the-declared-line-names-the-claim-and-the-migration
     role: objective
@@ -92,9 +94,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?seeded-shapes/intree-pd; attaches through csi migration: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?seeded-shapes/intree-pd(?: \([^)\n;]*\))?; attaches through csi migration: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!seeded-shapes/intree-pd; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!seeded-shapes/intree-pd(?: \([^)\n;]*\))?; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

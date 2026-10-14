@@ -15,6 +15,8 @@
 # in kube-system also mount the socket; the case does not grade whether the
 # agent lists them.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the host-path mount. Dropping it is the heal that
@@ -67,7 +69,7 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no); path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-socket-is-mounted
     role: objective
@@ -78,9 +80,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: yes; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: yes(?: \([^)\n;]*\))?; path:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?!yes;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?!yes(?: \([^)\n;]*\))?;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-containerd-socket-path
     role: objective
@@ -91,9 +93,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no); path:? ?/run/containerd/containerd\.sock$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?/run/containerd/containerd\.sock$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no); path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective
