@@ -301,6 +301,8 @@ def _expand(text: str, expands: bool) -> str:
 
 def _find_exec_argv(piece: str) -> str | None:
     """What a ``find -exec … \;`` runs, as one command string with its quoting kept, or ``None``."""
+    if "-exec" not in piece and "-ok" not in piece:  # cheap gate: the piece is tokenised again below
+        return None
     tokens = _tokens(piece)
     index = _command_index(tokens)
     if index is None or _unquote(tokens[index][2]).rsplit("/", 1)[-1] != "find":
@@ -329,6 +331,8 @@ def _value_options(base: str) -> frozenset[str]:
 def _env_split_string(piece: str) -> str | None:
     """What GNU ``env -S '<string>'`` splits and runs, or ``None``. ``env`` is a wrapper
     word, so this is read from the raw tokens before the wrapper walk drops it."""
+    if "env" not in piece or "-S" not in piece and "--split-string" not in piece:  # cheap gate
+        return None
     tokens = _tokens(piece)
     index = _command_index(tokens, keep=frozenset({"env"}))
     if index is None or _unquote(tokens[index][2]).rsplit("/", 1)[-1] != "env":
