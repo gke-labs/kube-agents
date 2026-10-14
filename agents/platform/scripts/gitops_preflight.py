@@ -118,7 +118,7 @@ def _reachable(repo: str) -> tuple[str, str]:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return BROKER, type(exc).__name__
+        return BROKER, f"{type(exc).__name__} running the version-control client: {_one_line(str(exc))}"
     if result.returncode == 0:
         return OK, ""
     code, message = _error_of(result)
@@ -126,6 +126,11 @@ def _reachable(repo: str) -> tuple[str, str]:
     if code == NOT_MANAGED_CODE:
         return NOT_MANAGED, reason
     return (REPOSITORY if code in REPOSITORY_CODES else BROKER), reason
+
+
+def _one_line(text: str) -> str:
+    """`text` folded onto one line, so the answer stays exactly one line."""
+    return " ".join(text.split())
 
 
 def _error_of(result: subprocess.CompletedProcess) -> tuple[str, str]:
@@ -194,7 +199,7 @@ def listing() -> tuple[int, str]:
         context = _context_names(gitops_workspace.get_context_repo_entries())
     except Exception as exc:  # noqa: BLE001 - any failure to read is the same answer
         return EXIT_STATE_UNREADABLE, (
-            f"STATE_UNREADABLE: the registry could not be read ({exc}); {STOP}"
+            f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}); {STOP}"
         )
     managed_text = " ".join(managed)
     if not managed:
@@ -218,7 +223,7 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
         repos = gitops_workspace.get_managed_repos()
     except Exception as exc:  # noqa: BLE001 - any failure to read is the same answer
         return EXIT_STATE_UNREADABLE, (
-            f"STATE_UNREADABLE: the registry could not be read ({exc}); {STOP}"
+            f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}); {STOP}"
         )
     if not repos:
         skipped = _unusable_entries()
@@ -236,12 +241,17 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
         )
     if repo is None:
         return EXIT_REGISTERED, "REGISTERED: " + " ".join(repos)
-    repo = _normalised(repo, repos)
-    if repo.lower() not in {name.lower() for name in repos}:
+    asked = _display_name(repo)
+    by_lower = {name.lower(): name for name in repos}
+    registered = by_lower.get(_normalised(repo, repos).lower())
+    if registered is None:
         return EXIT_NO_REGISTERED_REPO, (
-            f"NO_REGISTERED_REPO: {repo} is not registered on this install "
+            f"NO_REGISTERED_REPO: {asked} is not registered on this install "
             f"(registered: {' '.join(repos)}); {STOP} {REGISTRATION_STEPS}"
         )
+    # From here on the name is the list's own spelling, which is what every
+    # later gate (the broker, submit-suggestion) compares against.
+    repo = registered
     outcome, why = _reachable(repo)
     if outcome == NOT_MANAGED:
         return EXIT_NO_REGISTERED_REPO, (

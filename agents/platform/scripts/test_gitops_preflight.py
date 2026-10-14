@@ -134,6 +134,26 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
         self.assertTrue(line.startswith("NO_REGISTERED_REPO: the broker does not manage"), line)
 
+    def test_registered_answers_in_the_lists_spelling(self):
+        answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with _StateDir(entries=ENTRY), patch("subprocess.run", return_value=answered) as run:
+            code, line = gitops_preflight.preflight("https://GitHub.com/Acme/Fleet.git")
+        self.assertEqual(f"REGISTERED: {REPO}", line)
+        self.assertIn(REPO, run.call_args.args[0])
+
+    def test_an_unregistered_url_is_never_echoed_with_userinfo(self):
+        with _StateDir(entries=ENTRY):
+            code, line = gitops_preflight.preflight("https://user:s3cret@github.com/acme/other")
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertNotIn("s3cret", line)
+
+    def test_a_multi_line_read_error_stays_one_line(self):
+        with patch.object(
+            gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=RuntimeError("a\nb\nc")
+        ):
+            code, line = gitops_preflight.preflight()
+        self.assertEqual(1, len(line.splitlines()))
+
     def test_a_github_browser_url_names_its_repository(self):
         answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
         for url in ("https://github.com/acme/fleet/tree/main", "https://github.com/acme/fleet/pull/12"):
