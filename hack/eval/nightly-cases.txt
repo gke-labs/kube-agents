@@ -219,9 +219,9 @@
 #
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the last entry below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# kubectl execs each). It is the next-to-last entry below: sixty-five cases
+# (195 units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds
+# the infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
 # there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
 # the thirteen come to ~583 serial minutes against the 480m deadline.
 #
@@ -247,6 +247,14 @@
 # the last entry below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
+#
+# 2026-10-08 adds upgrades-audit-reports-upgrade-blocked (rebased past the
+# 2026-10-09 entries above): one case, three units at the 900s hint the full
+# audits take (hack/ci-eval-pr.sh prices and ceilings it with its siblings).
+# Counted over every entry below, this case, the last entry after
+# fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
+# (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
+# file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -782,6 +790,13 @@
 # it holds the infra lock, and its run is a full drift audit (the 900s audit
 # band of consistency-drift-outlier).
 ./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would be held. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
 
 # The upgrade audit's criteria store: a confirmed threshold change written
 # through capability_criteria under the operator's name, read back, and
