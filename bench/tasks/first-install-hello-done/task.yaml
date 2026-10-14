@@ -124,7 +124,7 @@ verification_spec:
         - "when (it'?s|it is|i'?m|i am) (done|finished)"
         - "once (it'?s|it is|i'?m|i am) (done|finished)"
         - "when it finishes"
-        - "\\b(i'?ll|i will|will) (post|share|send)"
+        - "\\b(i'?ll|i will|will) (post|share|send) (what|the (results|findings|summary))"
         - "\\b(i'?m|i am) taking"
         - "still (running|looking|scanning)"
 

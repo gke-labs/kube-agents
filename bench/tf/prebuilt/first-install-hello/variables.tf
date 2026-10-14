@@ -80,6 +80,16 @@ variable "sandbox_container" {
   default     = "shell"
 }
 
+# The plant and the destroy run as this login, the one the model's terminal
+# uses, not as the container's root: /opt/data is that login's, so nothing the
+# model places there can turn a write by this stack onto anything it could not
+# write itself.
+variable "sandbox_user" {
+  type        = string
+  description = "Login inside the shell sandbox that owns /opt/data (the terminal's ssh_user)"
+  default     = "agent"
+}
+
 variable "home_channel_set" {
   type        = bool
   description = "When true, the plugin greets as if this turn made the chat the home channel. The greeting then says that scheduled reports come to this chat."

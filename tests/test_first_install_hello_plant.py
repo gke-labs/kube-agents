@@ -54,6 +54,7 @@ _VARS = {
     "var.agent_container": "platform-agent",
     "var.sandbox_selector": "app=platform-agent-shell",
     "var.sandbox_container": "shell",
+    "var.sandbox_user": "agent",
     "var.case_suffix": _SUFFIX,
 }
 _TRIGGERS = {
@@ -63,11 +64,13 @@ _TRIGGERS = {
     "self.triggers.namespace": _VARS["var.agent_namespace"],
     "self.triggers.sandbox_selector": _VARS["var.sandbox_selector"],
     "self.triggers.sandbox_container": _VARS["var.sandbox_container"],
+    "self.triggers.sandbox_user": "agent",
 }
 
-# Runs the in-pod `sh -c` script locally: the agent pod's home and each sandbox
-# pod's /opt/data are directories under $STATE, and `chown`/`stat` are stubbed,
-# since the test user owns everything and macOS's stat has no -c.
+# Runs the in-pod `sh -c` script locally: each sandbox pod's /opt/data is a
+# directory under $STATE. A `setpriv` prefix is dropped, since the test user
+# owns everything; the call log keeps it. With $STUB_PID set, the script's `$$`
+# is that value, so a test can occupy the temporary name the script will use.
 _KUBECTL_STUB = r'''#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
 
@@ -86,13 +89,16 @@ if os.environ.get("EXEC_FAIL") == "1":
     sys.stderr.write("error: unable to upgrade connection: container not found\n")
     sys.exit(1)
 cmd = argv[argv.index("--") + 1 :]
+if cmd[:1] == ["setpriv"]:
+    cmd = cmd[cmd.index("--") + 1 :]
 assert cmd[:2] == ["sh", "-c"], cmd
+script = cmd[2].replace("$$", os.environ["STUB_PID"]) if os.environ.get("STUB_PID") else cmd[2]
 target = next(a for a in argv if a.startswith(("deployment/", "pod/")))
 home = state / ("agent" if target.startswith("deployment/") else target.split("/", 1)[1])
 home.mkdir(parents=True, exist_ok=True)
 args = [a.replace("/opt/data", str(home)) for a in cmd[3:]]
 env = dict(os.environ, PLATFORM_AGENT_HOME=str(home), PATH=os.environ["FAKEBIN"] + ":" + os.environ["PATH"])
-sys.exit(subprocess.run(["sh", "-c", cmd[2]] + args, env=env).returncode)
+sys.exit(subprocess.run(["sh", "-c", script] + args, env=env, timeout=20).returncode)
 '''
 
 
@@ -140,8 +146,6 @@ class PlantTest(unittest.TestCase):
         for path, body in (
             (bin_dir / "kubectl", _KUBECTL_STUB),
             (bin_dir / "gcloud", "#!/bin/sh\nexit 0\n"),
-            (fakebin / "chown", "#!/bin/sh\nexit 0\n"),
-            (fakebin / "stat", "#!/bin/sh\necho 0:0\n"),
             # A report that lands between the check and the link.
             (fakebin / "ln", '#!/bin/sh\nif [ "$RACE" = 1 ]; then echo raced > "$2"; exit 1; fi\nexec /bin/ln "$@"\n'),
         ):
@@ -204,16 +208,33 @@ class PlantTest(unittest.TestCase):
         self.assertTrue(self.report.is_symlink())
         self.assertEqual(target.read_text(), _PLANTED)
 
-    def test_never_writes_through_a_link_at_a_temporary_name(self):
-        # The shell runs as root in a directory the model can write.
-        victim = self.sandbox / "victim"
-        victim.write_text("UNTOUCHED\n")
-        (self.sandbox / (self.report.name + ".tmp")).symlink_to(victim)
-        result = self._run(_CREATE)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(victim.read_text(), "UNTOUCHED\n")
-        self.assertIn("set -C", _CREATE)
-        self.assertNotIn("chown", _CREATE)
+    def test_runs_in_the_sandbox_as_the_terminal_login(self):
+        self.report.write_text(_PLANTED)
+        self.assertEqual(self._run(_CREATE).returncode, 0)
+        self.assertEqual(self._run(_DESTROY).returncode, 0)
+        execs = [line for line in self.calls.read_text().splitlines() if line.startswith("exec")]
+        self.assertEqual(len(execs), 2)
+        for line in execs:
+            self.assertIn("-- setpriv --reuid=agent --regid=agent --init-groups -- sh -c", line)
+
+    def test_a_taken_temporary_name_fails_the_plant_without_waiting(self):
+        taken = self.sandbox / f"{self.report.name}.4242.tmp"
+        for kind in ("fifo", "link", "file"):
+            with self.subTest(kind=kind):
+                victim = self.sandbox / "victim"
+                victim.write_text("UNTOUCHED\n")
+                if kind == "fifo":
+                    os.mkfifo(taken)
+                elif kind == "link":
+                    taken.symlink_to(victim)
+                else:
+                    taken.write_text("SOMEONE ELSE\n")
+                result = self._run(_CREATE, STUB_PID="4242")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("could not plant", result.stderr)
+                self.assertFalse(self.report.exists())
+                self.assertEqual(victim.read_text(), "UNTOUCHED\n")
+                taken.unlink()
 
     def test_the_planted_file_is_not_the_real_report(self):
         module = _MODULE.read_text()

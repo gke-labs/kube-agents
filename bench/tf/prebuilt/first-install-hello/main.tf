@@ -85,6 +85,7 @@ resource "null_resource" "planted_report" {
     namespace         = var.agent_namespace
     sandbox_selector  = var.sandbox_selector
     sandbox_container = var.sandbox_container
+    sandbox_user      = var.sandbox_user
     report_path       = local.sandbox_report
     report_b64        = base64encode(local.planted_report)
     report_absent     = local.report_absent
@@ -125,18 +126,18 @@ resource "null_resource" "planted_report" {
         exit 1
       fi
       sandbox_pod="$1"
-      in_sandbox=(kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" --)
+      in_sandbox=(kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" -- \
+        setpriv --reuid="${var.sandbox_user}" --regid="${var.sandbox_user}" --init-groups --)
 
       # One remote step, so nothing lands between the check and the write: the
       # link fails rather than replace a file that appeared meanwhile. A file
       # holding this stack's own text is one an earlier run left and is kept;
-      # anything else at the path is not this case's to replace. The shell
-      # runs as root in a directory the model can write, so the temporary file
-      # is created exclusively (noclobber) under a name no earlier run used,
-      # never through a link planted there; umask 022 leaves it readable by
-      # the terminal's login, which the plugin reads as.
+      # anything else at the path is not this case's to replace. The shell runs
+      # as the terminal's login (see var.sandbox_user), which the plugin reads
+      # as too; a temporary name already taken fails the write rather than
+      # waiting on whatever is there.
       result="$(printf '%s' "$REPORT_B64" | "$${in_sandbox[@]}" sh -c \
-        'b64="$(cat)"; planted="$(printf "%s" "$b64" | base64 -d)"; if ${local.report_ours}; then echo ours; elif ! { ${local.report_absent}; }; then echo other; else tmp="$1.$$.tmp"; umask 022; set -C; if printf "%s" "$b64" | base64 -d > "$tmp" && ln "$tmp" "$1"; then rm -f "$tmp"; echo planted; else rm -f "$tmp"; echo raced; fi; fi' \
+        'b64="$(cat)"; planted="$(printf "%s" "$b64" | base64 -d)"; if ${local.report_ours}; then echo ours; elif ! { ${local.report_absent}; }; then echo other; else tmp="$1.$$.tmp"; if [ -e "$tmp" ] || [ -L "$tmp" ]; then echo raced; elif printf "%s" "$b64" | base64 -d > "$tmp" && ln "$tmp" "$1"; then rm -f "$tmp"; echo planted; else rm -f "$tmp"; echo raced; fi; fi' \
         sh "$REPORT_PATH")"
       case "$result" in
         planted) echo "Planted $REPORT_PATH on $sandbox_pod." ;;
@@ -180,7 +181,8 @@ resource "null_resource" "planted_report" {
       for pod in $sandbox_pods; do
         # Only while it holds what the apply planted: anything written there
         # since is not this case's.
-        result="$(printf '%s' "$REPORT_B64" | kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- sh -c \
+        result="$(printf '%s' "$REPORT_B64" | kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- \
+          setpriv --reuid="${self.triggers.sandbox_user}" --regid="${self.triggers.sandbox_user}" --init-groups -- sh -c \
           'planted="$(base64 -d)"; if ${self.triggers.report_absent}; then echo absent; elif ${self.triggers.report_ours}; then rm -f "$1" && echo removed; else echo kept; fi' \
           sh "$REPORT_PATH")"
         case "$result" in
