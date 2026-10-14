@@ -7443,3 +7443,180 @@ def test_group5_case_fails_every_objective_without_the_declared_line(case):
     _, _, missing = _GROUP5[case]
     verdicts = _group5_verdicts(case, missing)
     assert verdicts and all(s == "fail" for s in verdicts.values()), verdicts
+
+
+# ------------------------------------ the group-2 and group-4 catalogue cases
+#
+# The nine remaining declared-line cases of the catalogue series, read with
+# the group-5 helpers: each grades one planted object's line (seeded-b's
+# budget, pool and exclusion, seeded-d's zone-pinned workload, seeded-a's
+# shapes) and nothing else in the report, so a one-line report is the whole
+# test. Rows as in `_GROUP5`: the renderings a report gives a line, each
+# graded value's exact wrong word or an off-vocabulary value with a hedge
+# after the last value, and a report that names no line at all.
+
+_GROUP2 = {
+    "upgrades-drain-blocking-budget-named": (
+        [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "- `seeded-b/seeded-upgrade/pinned-batch-runner`: maxUnavailable: 0; minAvailable: none; disruptionsAllowed: 0; blocks a drain: yes.",
+            "**seeded-b/seeded-upgrade/pinned-batch-runner**: maxUnavailable 0%; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "1. seeded-b (us-central1-a)/seeded-upgrade/pinned-batch-runner: maxUnavailable 0 (0); minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+        ],
+        [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 1; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 1; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: no",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes while the pod is healthy",
+        ],
+        "No PodDisruptionBudget on the seeded clusters would stop a node drain; every budget allows at least one disruption.",
+    ),
+    "upgrades-no-surge-pool-recreate-warned": (
+        [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
+            "- `seeded-b/no-surge-pool`: nodes: 1; replacement node first: no; workloads pinned to this pool: seeded-upgrade/pinned-batch-runner.",
+            "**seeded-b/no-surge-pool**: nodes 1; replacement node first: no; workloads pinned to this pool: deployment pinned-batch-runner (1 replica)",
+            "1. seeded-b (us-central1-a)/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-7d9f8b6c4-abcde and other-worker",
+        ],
+        [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: yes; workloads pinned to this pool: pinned-batch-runner",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: none",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: batch-runner",
+            "seeded-b/no-surge-pool: nodes one; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
+        ],
+        "Every node pool on the seeded clusters brings a replacement node up before it drains; nothing is pinned to a single-node pool.",
+    ),
+    "upgrades-zonal-skew-replicas-warned": (
+        [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
+            "- `seeded-d/seeded-topology/zone-pinned-api`: replicas: 2; zones in use: 1; all replicas in one zone: yes; cause: spread constraint.",
+            "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
+            "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
+        ],
+        [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2; all replicas in one zone: yes; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: no; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: capacity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity (required)",
+        ],
+        "Every multi-replica workload on the multi-zone cluster spreads its replicas over both zones; nothing holds a workload in one zone.",
+    ),
+    "upgrades-exclusion-end-date-named": (
+        [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+            "- `seeded-b`: exclusion: hold-the-minor-lag; scope: no-minor-upgrades; ends: 2026-10-21T00:00:00Z; holds the automatic minor upgrade: yes.",
+            "**seeded-b**: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21 (seven days from now); holds the automatic minor upgrade: yes",
+            "1. seeded-b (us-central1-a): exclusion hold-the-minor-lag; scope NO MINOR UPGRADES; ends 2026-10-21 00:00 UTC; holds the automatic minor upgrade: yes",
+        ],
+        [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 21 October 2026; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: no",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes, until then",
+        ],
+        "No seeded cluster carries a maintenance exclusion; every automatic minor upgrade follows the channel's schedule.",
+    ),
+}
+
+_GROUP4 = {
+    "upgrades-node-local-state-named": (
+        [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no",
+            "- `seeded-a/seeded-shapes/cache-on-emptydir`: node-local volumes `queue` (emptyDir); survives a node rebuild: no.",
+            "**seeded-a/seeded-shapes/cache-on-emptydir**: node-local volumes queue (emptyDir at /var/lib/queue); survives a node rebuild: no",
+            "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
+        ],
+        [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue-data; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: yes",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no (one replica)",
+        ],
+        "No workload on the seeded clusters keeps state on the node; every emptyDir holds scratch the container rebuilds at start.",
+    ),
+    "upgrades-deprecated-node-label-selector-named": (
+        [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
+            "- `seeded-a/seeded-shapes/arch-pinned-worker`: label `beta.kubernetes.io/arch`; deprecated: yes; replacement `kubernetes.io/arch`.",
+            "**seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch**",
+            "1. seeded-a (us-central1-a)/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
+        ],
+        [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement none",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch (since 1.14)",
+        ],
+        "No workload on the seeded clusters selects nodes by a deprecated label; every nodeSelector names a GA key.",
+    ),
+    "upgrades-containerd-socket-agent-named": (
+        [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+            "- `seeded-a/seeded-shapes/node-runtime-probe`: runtime socket mounted: yes; path `/run/containerd/containerd.sock`.",
+            "**seeded-a/seeded-shapes/node-runtime-probe**: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+            "1. seeded-a (us-central1-a)/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+        ],
+        [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /var/run/docker.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path none",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock (read-only)",
+        ],
+        "No workload on the seeded clusters mounts the container runtime's socket from the host.",
+    ),
+    "upgrades-intree-volume-named": (
+        [
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "- `seeded-a/intree-pd`: source in-tree gcePersistentDisk; bound by `seeded-shapes/intree-pd`; attaches through CSI migration: yes.",
+            "**seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes**",
+            "1. seeded-a (us-central1-a)/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+        ],
+        [
+            "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by none; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: no",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes (pd.csi.storage.gke.io)",
+        ],
+        "No PersistentVolume on the seeded clusters uses an in-tree plugin; a CSI driver provisioned every volume.",
+    ),
+    "upgrades-retired-registry-image-named": (
+        [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
+            "- `seeded-a/seeded-shapes/legacy-registry-pull`: image `k8s.gcr.io/pause:3.9`; registry host `k8s.gcr.io`; retired: yes.",
+            "**seeded-a/seeded-shapes/legacy-registry-pull**: image k8s.gcr.io/pause:3.9 (imagePullPolicy Always); registry host k8s.gcr.io; retired: yes",
+            "1. seeded-a (us-central1-a)/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
+        ],
+        [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image registry.k8s.io/pause:3.9; registry host registry.k8s.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: no",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes (redirects today)",
+        ],
+        "No workload on the seeded clusters pulls from a retired registry host; every image reference names registry.k8s.io or Artifact Registry.",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "case,line",
+    [(c, l) for table in (_GROUP2, _GROUP4) for c, (ok, _, _) in table.items() for l in ok],
+)
+def test_group2_and_group4_case_accepts_the_declared_line_as_rendered(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize(
+    "case,line",
+    [(c, l) for table in (_GROUP2, _GROUP4) for c, (_, bad, _) in table.items() for l in bad],
+)
+def test_group2_and_group4_case_refuses_a_wrong_or_hedged_value(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert any(s != "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case", list(_GROUP2) + list(_GROUP4))
+def test_group2_and_group4_case_fails_every_objective_without_the_declared_line(case):
+    _, _, missing = {**_GROUP2, **_GROUP4}[case]
+    verdicts = _group5_verdicts(case, missing)
+    assert verdicts and all(s == "fail" for s in verdicts.values()), verdicts
