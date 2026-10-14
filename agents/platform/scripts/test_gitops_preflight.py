@@ -149,6 +149,12 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
         self.assertNotIn("s3cret", line)
 
+    def test_an_unparseable_multi_line_repo_is_echoed_on_one_line(self):
+        with _StateDir(entries=ENTRY):
+            code, line = gitops_preflight.preflight("not a\nrepo\nat all")
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertEqual(1, len(line.splitlines()))
+
     def test_a_multi_line_read_error_stays_one_line(self):
         with patch.object(
             gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=RuntimeError("a\nb\nc")

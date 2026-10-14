@@ -177,8 +177,8 @@ def _display_name(url: str) -> str:
             port = None
         # repo_ref drops a port, and a port is often why an entry is unusable.
         return f"{ref.host}:{port}/{ref.path}" if port else str(ref)
-    # Unparseable: still never echo userinfo.
-    return url.split(URL_SCHEME_SEPARATOR, 1)[-1].rsplit(USERINFO_SEPARATOR, 1)[-1]
+    # Unparseable: still never echo userinfo, and keep the answer one line.
+    return _one_line(url.split(URL_SCHEME_SEPARATOR, 1)[-1].rsplit(USERINFO_SEPARATOR, 1)[-1])
 
 
 def _context_names(entries: list[dict[str, str]]) -> list[str]:
