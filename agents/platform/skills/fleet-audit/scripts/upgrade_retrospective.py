@@ -572,6 +572,11 @@ SCOPE_LOG_FORMAT = "scope: the install's declared scope, {count} project(s) from
 FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
 NOT_FULL_TEXT = "no --full: a scoped run"
 LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger entry and guards kept unchanged"
+# gcloud exits 0 when a zone did not respond and lists the clusters it
+# reached, warning on stderr (`collect.ZONE_TIMEOUT_MARKER`): the siblings
+# read that as an incomplete listing, and so does this collector, since a
+# cluster missing from it has not left.
+LISTING_INCOMPLETE_FORMAT = "clusters list incomplete: {detail}"
 # A crash record beside no ledger or guards file, or a guards file absent
 # beside a live ledger, blocks every run until the operator restores the
 # file or runs --reset-ledger, which archives the records and the live files
@@ -1401,7 +1406,10 @@ def harness_manifest_path() -> str:
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | None]:
     """Every cluster in `project` as the raw `clusters list` item plus
-    `project`; a project whose GKE API is off is empty rather than failed."""
+    `project`; a project whose GKE API is off is empty rather than failed. A
+    listing a zone did not answer returns the clusters it reached *and* an
+    error (`LISTING_INCOMPLETE_FORMAT`), so those are reviewed while the
+    project is held, not pruned, as the sibling collectors read it."""
     result = run(["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"])
     if result.rc != 0:
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
@@ -1421,6 +1429,11 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | N
     for cluster in clusters:
         cluster["project"] = project
         cluster["location"] = cluster.get("location") or cluster.get("zone") or ""
+    from collect import ZONE_TIMEOUT_MARKER  # noqa: PLC0415 -- the siblings' marker for a zone that did not answer
+
+    incomplete = [line.strip() for line in result.stderr.splitlines() if ZONE_TIMEOUT_MARKER in line]
+    if incomplete:
+        return clusters, LISTING_INCOMPLETE_FORMAT.format(detail="; ".join(incomplete)[:ERROR_EXCERPT_CHARS])
     return clusters, None
 
 
@@ -3846,17 +3859,17 @@ def _budget_demands_the_only_pod(spec: dict, covered: int | None) -> bool:
     behind a budget whose spec forbids evicting its only pod. The budget's
     controller counts every pod the selector covers together (`covered`), so
     a selector spanning several workloads asks whether the spec allows no
-    disruption across the set: `maxUnavailable` 0, or a percentage the
-    controller rounds down to no pod; `minAvailable` at the covered count,
-    or a percentage it rounds up to every pod. A budget that still allows one
-    eviction across the set does not demand the singleton's pod; over one
-    covered pod any `minAvailable` percentage above zero does."""
+    disruption across the set: `maxUnavailable` 0 or `0%` (a positive one,
+    by count or by percentage, allows at least one eviction, since the
+    controller rounds a percentage up); `minAvailable` at the covered count,
+    or a percentage the controller rounds up to every pod. A budget that
+    still allows one eviction across the set does not demand the singleton's
+    pod; over one covered pod any `minAvailable` percentage above zero does."""
     total = covered or SINGLE_REPLICA
     if _budget_allows_no_disruption(spec, total):
         return True
-    max_unavailable = _percent(spec.get("maxUnavailable"))
     if spec.get("maxUnavailable") is not None:
-        return max_unavailable is not None and (max_unavailable * total) // PERCENT_ALL == 0
+        return False
     min_available = _percent(spec.get("minAvailable"))
     return min_available is not None and -(-(min_available * total) // PERCENT_ALL) >= total
 
@@ -5618,6 +5631,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         operations.extend(ops)
         if not list_error:
             listed_projects[project] = {cluster_key(project, c["location"], c["name"]) for c in found}
+    # What the listings returned, a partial one's clusters included: those
+    # are reviewed, and never also held as their project's unlisted ones.
+    enumerated_keys = {cluster_key(c["project"], c["location"], c["name"]) for c in clusters}
     if forced:
         clusters = [c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) in forced]
         missing = forced - {cluster_key(c["project"], c["location"], c["name"]) for c in clusters}
@@ -5697,7 +5713,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     scoped = bool(scope_reasons)
     route = ROUTE_AFTER_UPGRADE if after_upgrade else (ROUTE_SCOPED if scoped else ROUTE_FULL)
     unlisted = {project for project in projects if project not in listed_projects}
-    unlisted_clusters = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in unlisted}
+    unlisted_clusters = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in unlisted and key not in enumerated_keys}
     unread_clusters = {key: key.split(CLUSTER_KEY_SEPARATOR)[0] for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in unread_outcomes}
     for key, project in sorted(unread_clusters.items()):
         failed_reads.append(UNREAD_PROJECT_TEXT.format(cluster=key, project=project, outcome=unread_outcomes[project]))

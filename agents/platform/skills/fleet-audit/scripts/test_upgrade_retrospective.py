@@ -89,6 +89,9 @@ def fleet_scope_env():
     return ur.fleet_scope_args.SCOPE_DECLARED_ENV
 
 
+ZONE_TIMEOUT_STDERR = "WARNING: The following zones did not respond: us-central1-b. List results may be incomplete."
+
+
 def run_of(rc=0, stdout="", stderr=""):
     return ur.Run(["x"], rc, stdout, stderr, 0.01)
 
@@ -98,7 +101,7 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT, api_off_names=None, stall=None):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=(), projects_list_rc=0, projects_listed=None, active_project=PROJECT, api_off_names=None, stall=None, zone_timeout=()):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
         self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
@@ -112,6 +115,9 @@ class FakeFleet:
         # given, as a subprocess does, and answers rc 124 when the hang outlasts it.
         self.stall = stall or {}
         self.timeouts = []
+        # Projects whose `clusters list` exits 0 with gcloud's zone-timeout warning on stderr, listing
+        # the clusters it reached (the fixture's, less whatever the test left out).
+        self.zone_timeout = set(zone_timeout)
         # The fake's clock, for a run handed `clock`: a stall advances it by the time the read took
         # rather than sleeping, so a deadline test decides on this clock and not on a wall-clock second.
         self.now = 0.0
@@ -134,7 +140,7 @@ class FakeFleet:
                 return run_of(1, "", API_OFF_STDERR.format(project=self.api_off_names or project, api="clusters"))
             if self.list_rc or project in self.list_fail:
                 return run_of(self.list_rc or 1, "", "PERMISSION_DENIED")
-            return run_of(0, json.dumps([{k: v for k, v in c.items() if k != "project"} for c in self.clusters if c.get("project", PROJECT) == project]))
+            return run_of(0, json.dumps([{k: v for k, v in c.items() if k != "project"} for c in self.clusters if c.get("project", PROJECT) == project]), ZONE_TIMEOUT_STDERR if project in self.zone_timeout else "")
         if "operations list" in joined:
             if argv[argv.index("--project") + 1] in self.api_off:
                 return run_of(1, "", API_OFF_STDERR.format(project=self.api_off_names or argv[argv.index("--project") + 1], api="operations"))
@@ -1723,8 +1729,9 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual([(s["object"], s["entry"], s["confidence"]) for s in ur.budget_shapes([percent], READS["seeded-a"]["workloads"])], [("seeded-debug/Deployment/payments-api", 1, ur.HIGH)])
         # A budget whose selector spans several workloads counts their pods together, as its controller
         # does: one that still allows an eviction across the set does not demand the singleton's only
-        # pod; one that allows none does, by count or by a percentage rounded as the controller rounds
-        # it (minAvailable up, maxUnavailable down).
+        # pod; one that allows none does. A positive maxUnavailable, by count or by percentage, allows
+        # at least one eviction (the controller rounds a percentage up); a minAvailable percentage
+        # rounds up to the pods that must stay.
         workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
         payments = next(w for w in workloads if w["metadata"]["name"] == "payments-api")
         payments["spec"]["template"]["metadata"].setdefault("labels", {})["tier"] = "payments"
@@ -1737,9 +1744,9 @@ class ShapeTest(unittest.TestCase):
         def singleton(spec):
             return [(s["object"], s["confidence"]) for s in ur.budget_shapes([{**pdb, "spec": {**spec, "selector": shared}}], workloads) if s["object"].startswith("seeded-debug/Deployment/")]
 
-        for allows_one in ({"minAvailable": 1}, {"minAvailable": 3}, {"minAvailable": "50%"}, {"minAvailable": "75%"}, {"maxUnavailable": 1}, {"maxUnavailable": "25%"}):
+        for allows_one in ({"minAvailable": 1}, {"minAvailable": 3}, {"minAvailable": "50%"}, {"minAvailable": "75%"}, {"maxUnavailable": 1}, {"maxUnavailable": "25%"}, {"maxUnavailable": "10%"}, {"maxUnavailable": "1%"}):
             self.assertEqual(singleton(allows_one), [], allows_one)
-        for allows_none in ({"minAvailable": 4}, {"minAvailable": "100%"}, {"minAvailable": "80%"}, {"maxUnavailable": 0}, {"maxUnavailable": "0%"}, {"maxUnavailable": "10%"}):
+        for allows_none in ({"minAvailable": 4}, {"minAvailable": "100%"}, {"minAvailable": "80%"}, {"maxUnavailable": 0}, {"maxUnavailable": "0%"}):
             self.assertEqual(singleton(allows_none), [("seeded-debug/Deployment/payments-api", ur.HIGH)], allows_none)
         [evidence] = [s["evidence"] for s in ur.budget_shapes([{**pdb, "spec": {"maxUnavailable": 0, "selector": shared}}], workloads) if s["object"] == "seeded-debug/Deployment/payments-api"]
         self.assertIn("covering 4 pod(s)", evidence)
@@ -3762,6 +3769,31 @@ class LedgerAndGuardsTest(unittest.TestCase):
         report = ur.render_report(result)
         self.assertIn(f"- {other}: its project's listing failed (clusters list rc=1: PERMISSION_DENIED); ledger entry and guards kept unchanged", report.split(ur.INFO_FAILED_READS)[1])
         self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261015T180000Z.md")
+
+    def test_a_zone_timeout_listing_holds_the_silent_zones_clusters(self):
+        # gcloud exits 0 when a zone did not respond and lists the clusters it reached, warning on
+        # stderr; the siblings read that as an incomplete listing, and so does this collector: the
+        # reached cluster is read as usual, the silent zone's cluster keeps its ledger entry and guards,
+        # held with the warning as its reason and a `gate-failed` entry, and nothing is pruned or
+        # announced resolved; the next complete listing finds it unchanged, not new.
+        first, _ = self.collect()
+        gemma_guards = {g["id"] for g in first["guards"] if g["cluster"] == GEMMA}
+        self.assertTrue(gemma_guards)
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        result, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a")], zone_timeout=[PROJECT]), now=later, manifest_file=str(self.home / "manifest.json"))
+        self.assertEqual((result["scoped"], result["removed_clusters"], [u["cluster"] for u in result["unchanged"]]), (False, [], [SEEDED]))
+        self.assertIn(GEMMA, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertTrue(gemma_guards <= {g["id"] for g in result["guards"]})
+        failed = ur.render_report(result).split(ur.INFO_FAILED_READS)[1]
+        self.assertIn(f"- {PROJECT}: clusters list incomplete: {ZONE_TIMEOUT_STDERR}", failed)
+        self.assertIn(f"- {GEMMA}: its project's listing failed (clusters list incomplete: {ZONE_TIMEOUT_STDERR}); ledger entry and guards kept unchanged", failed)
+        self.assertNotIn(f"- {SEEDED}: its project's listing failed", failed)
+        manifest = json.loads(Path(self.home / "manifest.json").read_text())
+        by_name = {e["name"]: e for e in manifest["clusters"]}
+        self.assertEqual((by_name[SEEDED]["outcome"], by_name[GEMMA]["outcome"], manifest["partial"]), (ur.MANIFEST_OUTCOME_COLLECTED, ur.MANIFEST_OUTCOME_GATE_FAILED, True))
+        self.assertIn("clusters list incomplete", by_name[GEMMA]["error"])
+        third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(([r["cluster"] for r in third["reviews"]], sorted(u["cluster"] for u in third["unchanged"])), ([], [GEMMA, SEEDED]))
 
     def test_newly_displaced_replicas_make_an_already_recorded_row_new(self):
         # A StatefulSet carries no dated failure condition, so its pods are dated by their own evidence.
