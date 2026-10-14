@@ -2626,6 +2626,22 @@ unit_cost_hint() {
     # One delegation and one forge list call. Measured on `dev-vcs3-20261001b`:
     # 173-237s a repetition over three runs, 225s the middle one.
     vcs-forge-cli-request-uses-the-verbs) echo 240 ;;
+    # The upgrade-failure catalogue's scenario cases, nightly-only from
+    # 2026-10-14: read-only chat prompts that fan out across the seeded
+    # clusters (entries 1 and 2 to one Cluster Agent card per cluster; entry 3
+    # names the multi-zone cluster without saying which, so the agent reads
+    # each to find it; entries 6 and 16 ask for one declared line per
+    # cluster). Measured on a dev install with one user worker slot, so the
+    # cards ran one at a time: entries 1, 2 and 3 at 400-1081s a repetition
+    # (2026-10-07 and 10-08) and 475-1092s (2026-10-13); entries 6 and 16 at
+    # 2041s and 2538-2551s (2026-10-08 and 10-13, the latter two at the 2400s
+    # delegation ceiling). All priced at the 900 band they share.
+    upgrades-drain-blocking-budget-named | upgrades-no-surge-pool-recreate-warned) echo 900 ;;
+    upgrades-zonal-skew-replicas-warned) echo 900 ;;
+    upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
+    # Entry 5's follow-up: one maintenance-policy read per seeded cluster, no
+    # card fan-out. 571s wall clock on 2026-10-08, 257-354s on 2026-10-13.
+    upgrades-exclusion-end-date-named) echo 600 ;;
     *) echo 200 ;;
   esac
 }

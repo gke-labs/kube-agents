@@ -265,6 +265,33 @@
 # (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
 # file's fourteen.
 
+# 2026-10-14 adds the upgrade-failure catalogue's scenario cases whose
+# fixtures the fleet already carries: six cases, eighteen units, the last six
+# entries below. The second group (entries 1, 2, 3 and 5:
+# upgrades-drain-blocking-budget-named, -no-surge-pool-recreate-warned,
+# -zonal-skew-replicas-warned, -exclusion-end-date-named) and two of the
+# third (entries 6 and 16: upgrades-removed-api-callers-distinguished,
+# -network-policy-enforcement-stated). Each is a read-only chat prompt over a
+# fixture the seeded fleet plants, deployer: noop with no stack and no audit
+# stream, so none takes the infra lock or a stream lock. Five fan out:
+# entries 1 and 2 to one Cluster Agent card per seeded cluster, entry 3 to
+# every cluster to find the multi-zone one, and entries 6 and 16 to one
+# declared line per seeded cluster, so each carries a 900s unit_cost_hint
+# rather than the 200s default. Measured on a dev install with one user
+# worker slot, so the cards ran one at a time: entries 1, 2 and 3 at
+# 400-1081s a repetition (2026-10-07 and 10-08) and 475-1092s (2026-10-13);
+# entries 6 and 16 at 2041s and 2538-2551s (2026-10-08 and 10-13, the latter
+# two at the 2400s delegation ceiling). Entry 5's follow-up takes 600s (one
+# maintenance-policy read per cluster, 257-571s measured). About 255 serial
+# minutes at three repetitions, none of it on a lock. The eleven cases of the
+# fourth and fifth groups (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and
+# 20) are in the tree and parked in the validator's FIXTURE_NOT_READY until
+# the fleet plants their seeded-a shapes; they join this file in the pull
+# request that unparks them. Counted from the lists rather than the
+# paragraphs above (which had fallen three behind): seventy-five cases (225
+# units) here, of an eighty-nine-case, 267-unit matrix with the presubmit
+# file's fourteen.
+
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
@@ -818,3 +845,73 @@
 # the api lane it reaches the platform agent as a plain prompt and its
 # forbidden-phrase check passes without testing anything. deployer: noop.
 ./tasks/session-cluster-question-wake-answers-once/task.yaml
+
+# Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
+# eviction), the first of the catalogue's scenario cases on fixtures the
+# fleet already carries (entries 1, 2, 3, 5, 6 and 16, the six entries that
+# end this file). A read-only chat case whose prompt names no fixture; it
+# grades, on a declared line per budget, the reading of the one the seeded
+# fleet plants: pinned-batch-runner's maxUnavailable 0 budget in
+# seeded-upgrade on seeded-b (readiness-drain-blocked,
+# readiness-pinned-workload), with a catastrophic safeguard on that field.
+# deployer: noop, no lock; one Cluster Agent card per seeded cluster, 900s
+# hint. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-drain-blocking-budget-named/task.yaml
+
+# Catalogue entry 2 (no spare capacity for the displaced pods), in the shape
+# the seeded fleet plants it: seeded-b's no-surge-pool, maxSurge 0 on one
+# node, with pinned-batch-runner pinned to it (readiness-surge-blocked,
+# readiness-pinned-workload). Read-only chat prompt graded on a declared
+# line per node pool, with a catastrophic safeguard on the pin. deployer:
+# noop, no lock; one Cluster Agent card per seeded cluster, 900s hint.
+# Nightly from its first merge; a presubmit seat is a later pull request
+# that cites its record.
+./tasks/upgrades-no-surge-pool-recreate-warned/task.yaml
+
+# Catalogue entry 3 (every replica in one zone or on one node), in the shape
+# the seeded fleet plants it: zone-pinned-api in seeded-topology on
+# seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only
+# chat prompt graded on a declared line per multi-replica workload, with a
+# catastrophic safeguard on the spread's whenUnsatisfiable. deployer: noop,
+# no lock; the prompt names the multi-zone cluster without saying which, so
+# the agent reads every cluster to find it, 900s hint. Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-zonal-skew-replicas-warned/task.yaml
+
+# Catalogue entry 5 (maintenance window too short, or an exclusion ends
+# mid-roll), the scheduling half: seeded-b's hold-the-minor-lag exclusion
+# with its scope and end time (version-laggard), where
+# upgrades-fleet-readiness-exclusion grades the readiness report's verdict.
+# Read-only chat prompt graded on a declared line per cluster; the
+# exclusion is a GKE API setting, not an object in a cluster, so the case
+# carries no cluster safeguard and the fleet's reconcile owns it. deployer:
+# noop, no lock; one maintenance-policy read per cluster, 600s hint.
+# Nightly from its first merge; a presubmit seat is a later pull request
+# that cites its record.
+./tasks/upgrades-exclusion-end-date-named/task.yaml
+
+# Catalogue entry 6 (a served API version is removed), read the way the
+# catalogue separates it from entry 9: the seeded clusters call no API their
+# next minor stops serving, and seeded-a's legacy-endpoints-writer
+# (deprecated-api-caller) writes Endpoints v1, deprecated and still served.
+# Read-only chat prompt graded on a declared line per seeded cluster, with a
+# catastrophic safeguard on the writer's suspend flag; its four roles are one
+# per slot, so a cluster the agent missed reads as a miss and one the project
+# lacks as a broken environment. deployer: noop, no lock; one declared line
+# per cluster from a read of every cluster, 900s hint. Nightly from its first
+# merge; a presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-removed-api-callers-distinguished/task.yaml
+
+# Catalogue entry 16 (the network dataplane changes), in the shape the seeded
+# fleet holds it: every seeded cluster runs the legacy dataplane with the
+# NetworkPolicy add-on off, and three carry policies nothing enforces.
+# Read-only chat prompt graded on a declared line per seeded cluster (the
+# dataplane, whether policy is enforced today, the namespaces with policies).
+# No deterministic mutation safeguard, documented in the case: no catalogue
+# role probes the policies, and the dataplane is cluster configuration.
+# deployer: noop, no lock; one declared line per cluster from a read of every
+# cluster, 900s hint. Nightly from its first merge; a presubmit seat is a
+# later pull request that cites its record.
+./tasks/upgrades-network-policy-enforcement-stated/task.yaml

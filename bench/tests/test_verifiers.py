@@ -7221,3 +7221,78 @@ def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text
     v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
     transcript.set(final_message, [], final_message=final_message)
     assert v.verify(1.0).success is matches, final_message
+
+
+# ------------------------------------------------ the group-3 catalogue cases
+#
+# Two declared-line cases read the way the zonal case is read: the objective
+# out of the task file, the fleet directory standing in for the runner's, the
+# renderings a report gives a line. The reviewer's counter-examples (a
+# `v`-prefixed or patch-bearing next minor; the singular `Endpoint`; a
+# dataplane value that contradicts "enforced: no"; a hedge after the last
+# value) are the rows.
+
+_GROUP3 = {
+    "upgrades-removed-api-callers-distinguished": (
+        [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor v1.36; removed apis still called: none; deprecated but still served: core/v1 Endpoint",
+            "seeded-a: next minor 1.36.4-gke.1391000; removed apis still called: none; deprecated but still served: endpoints (core/v1)",
+            "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
+        ],
+        [
+            "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
+        ],
+        "seeded-{s}: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+    ),
+    "upgrades-network-policy-enforcement-stated": (
+        [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-intent, seeded-stall and seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 6 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-intent, seeded-stall)",
+        ],
+        [
+            "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: yes; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability are unenforced)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity-x, seeded-debug-x, seeded-deprecation-x, seeded-reliability-x",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-reliability",
+        ],
+        "seeded-{s}: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none",
+    ),
+}
+
+
+def _group3_report(case: str, seeded_a_line: str) -> str:
+    _, _, other = _GROUP3[case]
+    return "\n".join([seeded_a_line] + [other.format(s=s) for s in "bcd"])
+
+
+def _group3_verdicts(case: str, text: str) -> dict[str, str]:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    out = {}
+    with tempfile.TemporaryDirectory(prefix="group3-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            for entry in spec["verification_spec"]:
+                check = entry["check"]
+                if check.get("type") != "report_contains" or not check.get("any_of_patterns"):
+                    continue
+                v = parse_node(dict(check))
+                _stash(text)
+                out[entry["name"]] = v.verify(5.0).status
+    return out
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _GROUP3.items() for l in ok])
+def test_group3_case_accepts_the_declared_lines_as_rendered(case, line):
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _GROUP3.items() for l in bad])
+def test_group3_case_refuses_a_wrong_or_hedged_seeded_a_line(case, line):
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert any(s != "pass" for s in verdicts.values()), verdicts

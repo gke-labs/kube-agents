@@ -1,0 +1,174 @@
+# Upgrade-failure catalogue entry 16 (the network dataplane changes), in the
+# shape the seeded fleet holds it: every seeded cluster runs the legacy
+# dataplane with the NetworkPolicy add-on off, and three of them carry
+# NetworkPolicy objects that nothing enforces (seeded-a's default-deny
+# policies in seeded-reliability, seeded-debug and seeded-capacity and the
+# apiserver-egress-only policy in seeded-deprecation; seeded-b's and
+# seeded-d's default-deny in seeded-upgrade and seeded-topology; a fleet
+# applied from a newer catalogue carries more, in seeded-intent and
+# seeded-stall). GKE's NETWORK_POLICIES_UNRECONCILED insight says the same
+# when it publishes it. A dataplane change that
+# turns enforcement on makes every one of those policies take effect at once,
+# which is the break the catalogue entry describes.
+#
+# The prompt names no dataplane, no policy and no namespace. It asks, per
+# seeded cluster, which dataplane enforces policy, whether policies are
+# enforced today, and which namespaces carry policies, and for the answer to
+# end in one declared line per cluster, in a fixed form; the deterministic
+# objectives read those lines and nothing else. The namespace list is graded
+# on four seeded-a namespaces as a subset (seeded-reliability, seeded-debug,
+# seeded-capacity, seeded-deprecation); a fleet carries more and the agent
+# lists them, which the patterns allow. The dataplane slot is graded too:
+# every seeded cluster runs the legacy dataplane, and "GKE Dataplane V2"
+# beside "enforced: no" would contradict itself.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# No deterministic mutation safeguard, documented. No catalogue role probes
+# the policies, so no fleet_resource_property can ground on one, and the
+# heal has no silent path: deleting seeded-reliability's default-deny makes
+# the agent's correct list fail the four-namespace objective rather than
+# pass it. The dataplane setting is cluster configuration no
+# fleet_resource_property can read, so a fleet that turns enforcement on
+# changes this case's answer, and the header says so.
+id: upgrades-network-policy-enforcement-stated
+name: Which NetworkPolicies nothing enforces today is stated per cluster before a dataplane change
+
+prompt: >-
+  Before the seeded clusters in this project are upgraded, tell me for each
+  one which dataplane enforces NetworkPolicy, whether the NetworkPolicy
+  objects on it are enforced today, and which namespaces carry NetworkPolicy
+  objects that would start or stop taking effect if enforcement changed with
+  the upgrade. Read only; change nothing. End your answer with one line per
+  seeded cluster in exactly this form, no other words on the line:
+  "<cluster>: dataplane <dataplane v2|legacy>; networkpolicy enforced:
+  <yes|no>; namespaces with policies: <comma-separated list or none>".
+
+expected_output: >-
+  It reads each seeded cluster's dataplane provider and NetworkPolicy add-on
+  from the GKE API and the NetworkPolicy objects from the Kubernetes API, and
+  reports that every seeded cluster runs the legacy dataplane with
+  enforcement off, so the policies on seeded-a (at least seeded-reliability,
+  seeded-debug, seeded-capacity and seeded-deprecation; a fleet applied from
+  a newer catalogue also has seeded-intent and seeded-stall), seeded-b
+  (seeded-upgrade) and seeded-d (seeded-topology) are not enforced today and
+  would all take effect if an upgrade or a dataplane migration turned
+  enforcement on; seeded-c carries none. It names GKE's
+  NETWORK_POLICIES_UNRECONCILED insight if it reads insights and GKE has
+  published it, says what the default-deny policies would block, and
+  recommends reviewing them before any dataplane change. It performs no
+  change and cites no CVE identifiers. It ends with the declared line for
+  every seeded cluster, seeded-a's listing every namespace that holds a
+  policy, the four above among them, and seeded-c's reading "namespaces with
+  policies: none".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# The four roles are one per seeded slot, the way the zonal case names them:
+# the runner's per-slot credential is how a declared-line objective tells a
+# cluster the agent missed from a cluster the project does not have
+# (`fixture_roles`). No catalogue role carries the NetworkPolicies; the first
+# role names the namespace whose default-deny the safeguard reads.
+fixtures:
+  - no-pdb-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - no-pdb-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:b}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:d}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)'
+
+  # The fleet's clusters run the legacy dataplane with the add-on off.
+  - name: every-seeded-cluster-runs-the-legacy-dataplane
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - no-pdb-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane legacy[^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane (?!legacy)[^;\n]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$'
+
+  - name: no-seeded-cluster-is-said-to-enforce-policy-today
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - no-pdb-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: no; namespaces with policies: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: (?!no;)[^;\n]+; namespaces with policies: [^\n]+$'
+
+  - name: seeded-a-lists-its-four-policy-namespaces
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - no-pdb-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!none\b)(?=[^\n]*\bseeded-reliability(?![a-z0-9-]))(?=[^\n]*\bseeded-debug(?![a-z0-9-]))(?=[^\n]*\bseeded-capacity(?![a-z0-9-]))(?=[^\n]*\bseeded-deprecation(?![a-z0-9-]))[^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!(?!none\b)(?=[^\n]*\bseeded-reliability(?![a-z0-9-]))(?=[^\n]*\bseeded-debug(?![a-z0-9-]))(?=[^\n]*\bseeded-capacity(?![a-z0-9-]))(?=[^\n]*\bseeded-deprecation(?![a-z0-9-]))[^\n]+$)[^\n]+$'
+
+  # Slot c carries no NetworkPolicy: the drift outlier is a control-plane
+  # shape, not a workload.
+  - name: seeded-c-has-none
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - no-pdb-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: none$'
+      forbidden_patterns:
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!none$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]

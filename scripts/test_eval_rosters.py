@@ -174,6 +174,12 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
+    "upgrades-drain-blocking-budget-named",  # upgrade-failure catalogue entries 1, 2, 3 and 5, the second scenario group
+    "upgrades-no-surge-pool-recreate-warned",
+    "upgrades-zonal-skew-replicas-warned",
+    "upgrades-exclusion-end-date-named",
+    "upgrades-removed-api-callers-distinguished",  # catalogue entries 6 and 16, the third group's two cases on fixtures the fleet carries
+    "upgrades-network-policy-enforcement-stated",
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

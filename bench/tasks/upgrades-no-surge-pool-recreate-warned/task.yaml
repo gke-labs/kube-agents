@@ -1,0 +1,132 @@
+# Upgrade-failure catalogue entry 2 (no spare capacity for the displaced
+# pods), in the shape the seeded fleet plants it: seeded-b's no-surge-pool
+# upgrades with maxSurge 0 and maxUnavailable 1 on a single node, so the
+# upgrade recreates its only node in place rather than adding a replacement
+# first, and pinned-batch-runner, pinned to that pool by a nodeSelector, has
+# nowhere to go for the whole recreate.
+#
+# The prompt names no pool, no setting and no workload. It asks, per node
+# pool, whether the upgrade adds a node before taking one away and which
+# workloads are pinned to the pool, and for the answer to end in one
+# declared line per pool, in a fixed form; the deterministic objectives read
+# those lines and nothing else. The first live run of a prose-graded version
+# read every pool's upgrade settings correctly and never looked at which
+# workloads were pinned to the pool, which is the half of the question that
+# turns a setting into an outage; the declared line asks for both halves.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the pin that makes the pool's recreate an outage. An
+# agent that "fixed" the case by dropping the nodeSelector would pass every
+# objective and heal the fixture for every later case. The other heal, raising
+# the pool's maxSurge to 1, is a GKE API field no fleet_resource_property can
+# read, so it is guarded by the prompt's "change and upgrade nothing" alone.
+id: upgrades-no-surge-pool-recreate-warned
+name: A pool that upgrades by taking its only node away is named, with the workload that goes down with it
+
+prompt: >-
+  We are going to upgrade the node pools of the seeded clusters in this
+  project. Before I schedule it, tell me for each node pool whether the
+  upgrade brings up a replacement node before it takes one away, which
+  workloads can only run on that pool, and what the upgrade means for them.
+  Read only; change and upgrade nothing. End your answer with one line per
+  node pool in exactly this form, no other words on the line:
+  "<cluster>/<pool>: nodes <count>; replacement node first: <yes|no>;
+  workloads pinned to this pool: <comma-separated names or none>".
+
+expected_output: >-
+  A per-pool answer that reads each pool's upgrade settings and the
+  workloads' node selectors and affinities. It singles out no-surge-pool on
+  seeded-b: maxSurge 0 and maxUnavailable 1 on a one-node pool, so the
+  upgrade recreates the only node in place with no replacement first, and
+  pinned-batch-runner in seeded-upgrade, pinned to that pool by its
+  nodeSelector, is down for the whole recreate with no other node it may
+  schedule onto. The other pools surge (a replacement comes up first), so
+  their workloads move. It recommends what an operator would change, such as
+  maxSurge 1, a second node, or dropping the pin, and performs no change. It
+  ends with the declared line for every pool, no-surge-pool's reading
+  "nodes 1; replacement node first: no; workloads pinned to this pool:
+  pinned-batch-runner". It cites no CVE identifiers.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+fixtures:
+  - readiness-surge-blocked
+  - readiness-pinned-workload
+
+verification_spec:
+  # The declared lines are what the deterministic objectives read; each
+  # pattern matches a whole line that starts with the planted pool's cluster
+  # and name.
+  - name: the-pool-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-pinned-workload
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?:yes|no); workloads pinned to this pool: [^\n]+$'
+
+  - name: the-declared-line-says-no-replacement-comes-first
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-pinned-workload
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: no; workloads pinned to this pool: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?!no;)[^;\n]+; workloads pinned to this pool: [^\n]+$'
+
+  # The pinned-workload slot admits the name as the agent has it in hand:
+  # bare, namespaced, with a kind word in front, as a pod name with its
+  # ReplicaSet and pod suffixes, or with a parenthetical after it, alone or
+  # in a comma- or "and"-joined list; the fold may take a line-final closing
+  # parenthesis, so that one is optional.
+  - name: the-declared-line-names-the-pinned-workload
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-pinned-workload
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?:yes|no); workloads pinned to this pool: (?:(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?)*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?:yes|no); workloads pinned to this pool: (?!(?:(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?)*$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The pin survived the run. Dropping the nodeSelector is the heal that
+  # passes every objective above and empties the fixture for every later case.
+  - name: the-planted-pin-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: readiness-pinned-workload
+      kind: deployment
+      resource_name: pinned-batch-runner
+      namespace: seeded-upgrade
+      path: spec.template.spec.nodeSelector.seeded-role
+      op: eq
+      value: no-surge
