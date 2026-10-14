@@ -33,9 +33,12 @@ With --repo, the named repository (a bare path, a clone URL, an scp remote:
 anything repo_ref parses, then spelt as the managed list spells it) must be
 registered and must answer a read the broker serves with the install's forge
 credential (`vcs.py proposal list --limit 1`). A name not in the list is
-NO_REGISTERED_REPO for that name; a refusal about the repository is
-REPO_UNREACHABLE; a broker or forge that cannot answer right now (a transport
-failure, a rate limit) is BROKER_UNAVAILABLE. A registry whose entries were
+NO_REGISTERED_REPO for that name (a GitHub browser URL counts as its first two
+path segments). The forge saying the repository is missing or the credential
+cannot see it (FORGE_NOT_FOUND, FORGE_FORBIDDEN, FORGE_UNAUTHENTICATED) is
+REPO_UNREACHABLE; every other failure -- a forge or broker outage, a rate
+limit, a broker that does not route the verb, a sandbox missing the client --
+is BROKER_UNAVAILABLE, with the reason saying whether to wait or roll an image. A registry whose entries were
 all dropped as unusable says so and names them, under NO_REGISTERED_REPO. Every non-zero line tells the reader to
 stop and block, because that is the whole point of having one.
 """
@@ -44,6 +47,7 @@ import argparse
 import json
 import subprocess
 import sys
+from urllib.parse import urlsplit
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -56,11 +60,13 @@ EXIT_REPO_UNREACHABLE = 4
 EXIT_STATE_UNREADABLE = 5
 EXIT_BROKER_UNAVAILABLE = 6
 
-# Client and broker answers that say the broker or the forge could not answer
-# right now, not that this repository is missing or unreadable. The client's
-# transport failures carry no code and say "Retry shortly".
-TRANSIENT_CODES = frozenset({"FORGE_RATE_LIMITED", "BROKER_ROUTE_UNSUPPORTED", "FORGE_CALL_FAILED"})
-TRANSIENT_MARKERS = ("Retry shortly", "CREDENTIAL_PROXY_URL")
+# The forge's answers that are about this repository and this credential
+# (providers/errors.py): the repository is missing, or the credential cannot
+# see it. Every other failure -- a forge or broker outage, a rate limit, a
+# broker that does not route the verb, a sandbox missing the client -- is not
+# the repository's, and says so as BROKER_UNAVAILABLE.
+REPOSITORY_CODES = frozenset({"FORGE_UNAUTHENTICATED", "FORGE_FORBIDDEN", "FORGE_NOT_FOUND"})
+GITHUB_REPOSITORY_DEPTH = 2
 
 REACH_TIMEOUT_SECONDS = 60
 # This script ships in <profile>/scripts/; the version-control client in
@@ -104,9 +110,8 @@ def _reachable(repo: str) -> tuple[str, str]:
     if result.returncode == 0:
         return OK, ""
     code, message = _error_of(result)
-    if code in TRANSIENT_CODES or any(marker in message for marker in TRANSIENT_MARKERS):
-        return BROKER, f"{code}: {message}" if code else message
-    return REPOSITORY, f"{code}: {message}" if code else message
+    reason = f"{code}: {message}" if code else message
+    return (REPOSITORY if code in REPOSITORY_CODES else BROKER), reason
 
 
 def _error_of(result: subprocess.CompletedProcess) -> tuple[str, str]:
@@ -130,17 +135,33 @@ def _normalised(repo: str, repos: list[str]) -> str:
     """
     ref = repo_ref.try_parse(repo)
     if ref is not None:
+        if ref.is_github and len(ref.segments) > GITHUB_REPOSITORY_DEPTH:
+            # A browser URL (/tree/main, /pull/12): on GitHub the repository
+            # is exactly the first two segments.
+            ref = repo_ref.RepoRef(ref.host, "/".join(ref.segments[:GITHUB_REPOSITORY_DEPTH]))
         repo = str(ref)
     return gitops_workspace.qualify(repo, repos)
+
+
+def _display_name(url: str) -> str:
+    """`host/path` for a registered URL, through repo_ref, never with userinfo."""
+    ref = repo_ref.try_parse(url)
+    if ref is not None:
+        try:
+            port = urlsplit(url).port if URL_SCHEME_SEPARATOR in url else None
+        except ValueError:
+            port = None
+        # repo_ref drops a port, and a port is often why an entry is unusable.
+        return f"{ref.host}:{port}/{ref.path}" if port else str(ref)
+    # Unparseable: still never echo userinfo.
+    return url.split(URL_SCHEME_SEPARATOR, 1)[-1].rsplit(USERINFO_SEPARATOR, 1)[-1]
 
 
 def _context_names(entries: list[dict[str, str]]) -> list[str]:
     """`host/path`, with `@ref` when the entry pins one, for each context entry."""
     names = []
     for entry in entries:
-        name = entry["url"].split(URL_SCHEME_SEPARATOR, 1)[-1].rstrip("/")
-        # A URL can carry credentials as userinfo; never echo them.
-        name = name.rsplit(USERINFO_SEPARATOR, 1)[-1]
+        name = _display_name(entry["url"])
         ref = entry.get(gitops_workspace.CONTEXT_REF_KEY)
         refused = entry.get(gitops_workspace.CONTEXT_REF_REFUSED_KEY)
         if refused is not None:
@@ -161,9 +182,11 @@ def listing() -> tuple[int, str]:
         return EXIT_STATE_UNREADABLE, (
             f"STATE_UNREADABLE: the registry could not be read ({exc}); {STOP}"
         )
-    return EXIT_REGISTERED, (
-        f"MANAGED: {' '.join(managed) or NONE}\nCONTEXT: {' '.join(context) or NONE}"
-    )
+    managed_text = " ".join(managed)
+    if not managed:
+        skipped = _unusable_entries()
+        managed_text = f"{NONE} usable ({len(skipped)} registered, unusable: {' '.join(skipped)})" if skipped else NONE
+    return EXIT_REGISTERED, f"MANAGED: {managed_text}\nCONTEXT: {' '.join(context) or NONE}"
 
 
 def _unusable_entries() -> list[str]:
@@ -172,10 +195,7 @@ def _unusable_entries() -> list[str]:
         entries = gitops_workspace.get_managed_repo_entries()
     except Exception:  # noqa: BLE001 - the caller already read the list once
         return []
-    return [
-        entry["url"].split(URL_SCHEME_SEPARATOR, 1)[-1].rsplit(USERINFO_SEPARATOR, 1)[-1]
-        for entry in entries
-    ]
+    return [_display_name(entry["url"]) for entry in entries]
 
 
 def preflight(repo: str | None = None) -> tuple[int, str]:
@@ -211,9 +231,9 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
     outcome, why = _reachable(repo)
     if outcome == BROKER:
         return EXIT_BROKER_UNAVAILABLE, (
-            f"BROKER_UNAVAILABLE: the broker or the forge could not answer for {repo} "
-            f"right now ({why}); {STOP} This is not a registration problem; the "
-            "request can be retried once the broker answers."
+            f"BROKER_UNAVAILABLE: the broker, the forge or this sandbox could not "
+            f"answer for {repo} ({why}); {STOP} This is not a registration problem; "
+            "the reason in parentheses says whether to wait or to roll an image."
         )
     if outcome == REPOSITORY:
         return EXIT_REPO_UNREACHABLE, (
