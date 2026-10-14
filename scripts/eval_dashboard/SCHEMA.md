@@ -1128,7 +1128,8 @@ finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
 when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
-over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them);
+over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
+from before #2645 carry the git tree id of `bench/tf/fleet` instead);
 `main_check_error` is set when the moved-check could
 not read main; outcomes are applied, converged, unchanged, planned, busy,
 refused, failed, interrupted, not_reached); the sweep's,
@@ -1145,9 +1146,10 @@ reading arrived for this tick, whether or not they are noted; the poster clears
 a told job on a reading that shows it clean, or when `periodics_superseded`
 marks it recovered. That map is `{job: {build, recovery[, by]}}` for the jobs
 whose latest failed build a later build of the job that supersedes them (the
-daily, for the on-merge reconcile) has dealt with: `recovery` true when the
+daily, for the postsubmit reconcile) has dealt with: `recovery` true when the
 daily passed having reached every project the failed build named, at the same
-`fleet_tree` (a project a whole pass no longer lists has left the pool and
+`fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
+is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
 failed itself, so its own note is the current story and nothing clears; `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,

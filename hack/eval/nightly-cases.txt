@@ -812,6 +812,13 @@
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
 
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
+
 # A fleet search's per-cluster cards complete on the clusters that don't have
 # the workload, rather than waiting for it (#2978). Worker-scope checks, so it
 # grades on the api lanes; fixture no-pdb-workload on seeded-a.
