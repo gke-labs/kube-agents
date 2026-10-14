@@ -23,10 +23,10 @@ The **gateway Pod** holds the harness and nothing credentialed:
 3. `fluent-bit`: log forwarding.
 4. `agent-api-auth`: the PlatformAgent API authenticator, the
    `k8s-event-watcher`, which forwards cluster events using a non-secret
-   internal key, and, where enabled, the drift detector. It holds no Google
-   credential: both watchers make their Google calls through the broker's
-   watcher routes with a token for the `watcher` audience, which is mounted
-   here and in no other container.
+   internal key, and, where enabled, the drift detector. Neither calls Google
+   on the pod's own identity: both make their Google calls through the
+   broker's watcher routes with a token for the `watcher` audience, which is
+   mounted here and in no other container.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a

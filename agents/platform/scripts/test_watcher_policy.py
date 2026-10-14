@@ -161,8 +161,15 @@ class K8sTest(unittest.TestCase):
                 self.assertEqual(self.evaluate(path).rule_id, "kubernetes.watcher.named-get")
 
     def test_watch_is_decided_like_the_api_server_decides_it(self):
-        self.assertTrue(w.is_watch({"watch": ["t"]}))
-        self.assertFalse(w.is_watch({"watch": ["0", "1"]}))
+        # apimachinery's Convert_Slice_string_To_bool: false only for "0" or a
+        # case-insensitive "false"; every other first value streams, the empty
+        # string included.
+        for value in ("t", "1", "true", "yes", "on", "f", "F", "2", "tRuE", ""):
+            with self.subTest(value=value):
+                self.assertTrue(w.is_watch({"watch": [value, "0"]}))
+        for value in ("0", "false", "FALSE", "False"):
+            with self.subTest(value=value):
+                self.assertFalse(w.is_watch({"watch": [value, "1"]}))
         self.assertFalse(w.is_watch({}))
 
     def test_the_watches_client_go_actually_sends_are_allowed(self):

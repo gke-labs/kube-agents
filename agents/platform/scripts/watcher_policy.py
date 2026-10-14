@@ -244,16 +244,19 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
     return Decision(allowed=True, rule_id="kubernetes.watcher.named-get", message="")
 
 
-# Go's strconv.ParseBool true spellings, which the API server reads `watch` with.
-WATCH_TRUE = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+# The values the API server reads `watch` as false. It decodes ListOptions with
+# apimachinery's runtime.Convert_Slice_string_To_bool, not strconv.ParseBool:
+# no value is false, "0" or a case-insensitive "false" is false, and any other
+# first value -- "yes", "on", "f", the empty string -- is true.
+WATCH_FALSE = frozenset({"0", "false"})
 
 
 def is_watch(query: dict[str, Any]) -> bool:
     """True when an events request asks for a watch stream.
 
     Decided as the API server decides it: the first `watch` value, read with
-    ParseBool. Anything the server would stream is therefore under the watch
-    caps here.
+    Convert_Slice_string_To_bool. Anything the server would stream is
+    therefore under the watch caps here.
     """
     values = query.get("watch") or []
-    return bool(values) and values[0] in WATCH_TRUE
+    return bool(values) and values[0].lower() not in WATCH_FALSE

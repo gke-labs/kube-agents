@@ -301,6 +301,18 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAVAILABLE")
         self.assertNotIn(key, CredentialProxyHandler.watcher_endpoints)
 
+    def test_both_routes_log_the_caller_before_the_decision(self):
+        # The broker calls on its own credential, so this line is the only
+        # record of which ServiceAccount presented the watcher token.
+        for path in ("/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events",
+                     f"/v1/watcher/gcp/pubsub.googleapis.com/v1/{SUB}"):
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    self._request("GET", path)
+                self.assertTrue(
+                    any("principal=" in line and CALLER in line for line in logs.output), logs.output
+                )
+
     # -- who may call it ---------------------------------------------------
 
     def test_only_the_watcher_role_reaches_either_route(self):

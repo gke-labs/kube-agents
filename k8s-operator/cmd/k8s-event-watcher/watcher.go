@@ -89,9 +89,12 @@ const (
 	preflightDeniedFormat = "watcher: [%s] %s %s denied at preflight for %s, holding %s before the next check: %s"
 
 	// directProfile is the Profile main.go gives the one cluster reached with
-	// the process's own credential rather than a token for the pod's Google
-	// identity; whoAmI reads it to say which of the two was refused when the
-	// API server will not name the identity itself.
+	// the process's own credential rather than as a Google identity (the
+	// broker's, through the credential proxy, or the pod's without one); whoAmI
+	// reads it to say which of the two was refused when the API server will not
+	// name the identity itself. Through the broker the preflight's reviews are
+	// refused before they are asked, so whoAmI is reached on a profile cluster
+	// only without one.
 	directProfile = "direct"
 	// The two fallbacks whoAmI names in that case, and the shape it wraps
 	// them in with the reason the identity could not be read.

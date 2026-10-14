@@ -9093,6 +9093,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
+        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9229,6 +9230,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.watcher_endpoints[key] = (now + WATCHER_ENDPOINT_TTL_S, resolved[0], resolved[1])
         return resolved
 
+    def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
+        """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
+
+        The broker makes every watcher call on its own credential, so this line
+        is the record of which ServiceAccount presented the watcher token.
+        """
+        principal = self.principal
+        LOGGER.info(
+            "%s request_id=%s principal=%s target=%s",
+            label,
+            request_id,
+            _sanitize_for_logging(principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH),
+            _sanitize_for_logging(target),
+        )
+
     def _watcher_k8s_connection(self, host: str, ca_pem: str) -> http.client.HTTPConnection:
         """A TLS connection to a fleet control plane; the seam a test points at a fake.
 
@@ -9255,6 +9271,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             drain_request_body(self, self.max_request_bytes)
         parts = urllib.parse.urlsplit(self.path)
         rest = parts.path[len(watcher_policy.WATCHER_K8S_PREFIX) :]
+        self._log_watcher_request("watcher k8s", request_id, rest)
         if len(parts.query) > API_RELAY_MAX_QUERY_BYTES or not API_RELAY_QUERY_SHAPE.match(parts.query):
             # The same bound the Cloud API relay puts on a query it forwards:
             # bytes http.client will put on a request line, and not too many.
