@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu). Both are opt-in and default to disabled.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
@@ -55,19 +55,19 @@ Every Chat message carries session context (space, user, thread) that flows thro
 
 ## Slack
 
-Slack is opt-in. Enable it in the installer's chat menu; the installer prompts for the token values below.
+Slack is opt-in. Enable it in the installer's chat menu, where the installer prompts for the token values below, or pass `--enable-slack` with the tokens as flags.
 
 ### How it's wired
 
 - The installer's Slack interview collects `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USERS`, `SLACK_HOME_CHANNEL`, and `SLACK_HOME_CHANNEL_NAME`; the chart stores the tokens in the credentials Secret and wires the CR's `slack` section.
 - The Slack listener itself lives inside the Hermes runtime; it uses Socket Mode (no public webhook required) driven by the app token.
-- Setup for the Slack app itself (creating the app, generating tokens, installing to workspace) is documented in the Hermes docs: [hermes-agent.nousresearch.com/docs/user-guide/messaging/slack](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack).
+- [Slack app setup](/kube-agents/install/slack-app/) covers creating the app, its tokens, the allowlist and how to verify, for both modes.
 
 Under the unsupported `spec.mode: next` toggle, Slack terminates at the A2A gateway instead, on the same app and tokens, unless Google Chat is enabled too (Chat then holds the gateway and Slack stays on Hermes). The Hermes Slack listener and the credential broker's Socket Mode relay are off on such an install, so one app has one Socket Mode consumer, except on version skew (a `spec.mode` the operator does not recognise): the legacy consumer renders again beside the frozen gateway's connection, and each message is answered by whichever consumer receives it, both admitting by the same list (only the gateway refuses another workspace's member) (the `slack` field of [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration) has the detail). Who is answered is decided by the same `allowedUsers` list, as on Google Chat: a sender must be on the list (or the list must be empty, which allows all), and one who is not is dropped with a notice. A member of another workspace, posting in a channel shared with yours through Slack Connect, is never answered, whatever the list says. The gateway's `user_id` principal map (the `a2a-slack-principal-map` Secret) is optional: a sender it names is attributed by the identity it maps them to, and any other admitted sender by their Slack member id. Proactive alerts and scheduled reports reach the [home channel](#home-channel-1) through the gateway, and the gateway takes a single bot token. The design of record is [`docs/designs/spec-chatops-gateway.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-chatops-gateway.md).
 
 ### Allowed users
 
-Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack user IDs). Messages from users not on the list are silently ignored — a per-channel allowlist for the harness. Leaving it empty allows all users (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case).
+Slack ingress is gated by `SLACK_ALLOWED_USERS`, a comma-separated list of Slack member IDs such as `U0123ABCD`, matched exactly: an email or display name matches nobody. [Slack app setup](/kube-agents/install/slack-app/#allowed-users) says how to find a member ID. Under `spec.mode: today` a message from a member not on the list is ignored with no reply; under `next` the A2A gateway answers once with a notice naming the member's ID, so an admin can add it. Leaving the list empty allows every member of the workspace (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case), which in a shared workspace lets anyone there drive the agent.
 
 ### Slash commands
 
@@ -118,6 +118,122 @@ With `KAGE_SLACK_UX` on, the alert for a crash-looping workload reads as one lin
 ### Harness messages
 
 With `KAGE_SLACK_UX` on, the harness's own messages stay out of the way on Slack. Scheduled reports arrive without the `Cronjob Response` header, job ID and footer. The long-turn heartbeat, if it is enabled for Slack, says the agent is still working without naming the tool running. The agent does not announce that it is back after a restart, post the session-database warnings (the error stays in the log), or append Hermes' tip about its queueing setting. Its replies about restarting, shutting down, stopping, being busy with an earlier message, a command sent while it is working, a `/steer` it could not take, or the model provider failing or turning a request down are written plainly in its own voice, with no console commands or error text. That covers the English replies; an install set to another display language gets Hermes' translation of the restart and stop replies. Other chat platforms are unchanged, and with the flag off nothing changes.
+
+## Sending another message while it works
+
+A message sent while the Planning Agent is still answering an earlier one in the same conversation interrupts that turn, and the agent takes the new message up in its place. This is Hermes' default `interrupt` mode, which kube-agents does not change; Hermes queues the message instead while the turn has subagents running or is compressing its context. The agent acknowledges with a short busy reply, at most once every 30 seconds per conversation. Work already filed on the board keeps running, and its progress and report still post into the thread. Under `spec.mode: next` a follow-up is queued behind the running task instead; see [Follow-ups while a task runs](#follow-ups-while-a-task-runs).
+
+## Conversations under `spec.mode: next`
+
+Under the unsupported `spec.mode: next` toggle, the A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds Google Chat when Google Chat is enabled, and Slack otherwise. With both enabled, Slack stays on the default path described above. On the backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself. Every other message goes as a task, by default to the `platform` route: the Hermes bridge in the agent's pod runs it as a Planning Agent turn in that conversation's own Hermes session, and the Planning Agent answers it or files board cards as it does on the default path. How the agent then answers the question is in [How a chat question is answered under `next`](#how-a-chat-question-is-answered-under-next); this section covers what you see in the conversation.
+
+### Which messages it answers
+
+On Slack:
+
+- **A direct message.** Every message is a turn, with or without a mention. Each top-level message starts a conversation of its own in the thread under it, and the gateway posts its replies in that thread. A message typed in that thread is the same conversation: a follow-up while its task runs, and a new task with the earlier ones in context after it ends.
+- **A channel.** A top-level message is a turn only when it mentions the bot. It starts a conversation in the thread under that message, and every reply to it posts in that thread. A reply in the thread is a turn when it mentions the bot. Without a mention, it is a turn only while the thread's conversation is live: a task the gateway started in the thread is still running, or the thread's last task started or ended in the last 30 minutes (the gateway's `A2A_IDLE_TTL`). After that, mention the bot again. A thread someone else started becomes live the same way, once a mention in it starts a task.
+- A message that is only a mention, an edit, another bot's message, or a message from a member of another workspace in a Slack Connect channel is not a turn and gets no reply.
+
+On Google Chat:
+
+- **A direct message.** Every message is a turn. Top-level messages share one conversation, and the gateway answers them top-level. A message typed in a thread is a conversation of its own, answered in that thread; the next message typed there joins it.
+- **A space.** Chat sends the app only the messages that mention it. In a space with threads, each thread is its own conversation. In a space without threads, and in a group chat, the whole space is one conversation.
+
+A sender the allowlist does not admit gets one notice, once per sender until the gateway restarts, and nothing else. On Slack it reads `⛔ I can't verify who you are on slack (id U0123ABCD), so I can't take asks from you yet — an admin has to add you to the allowed users list (or correct their principal map entry).` On Google Chat it names `gchat`, the sender's email and `the allowed users list`. The fix is in Troubleshooting, [for Slack](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#5-slack-bot-doesnt-answer) and [for Google Chat](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops).
+
+### What carries over from default mode
+
+| In default mode                                                                                                   | Under `next`, on the backend the gateway holds                                                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Slash commands: `/new`, `/sethome`, `/steer`, `/hermes …`                                                         | None of them. The gateway reads one command, [`/session`](#session).                                                                                                                      |
+| Reactions, buttons, cards and the plan status message (`KAGE_SLACK_UX`)                                           | None. Each task gets one status line, edited in place.                                                                                                                                    |
+| Slack agent view and suggested prompts                                                                            | None.                                                                                                                                                                                     |
+| The home channel ([Google Chat](#home-channel), [Slack](#home-channel-1)): proactive alerts and scheduled reports | Posted by the gateway to the home channel on the `PlatformAgent`: `spec.integration.googleChat.homeChannel` on Google Chat, `spec.integration.slack.homeChannel` (a channel ID) on Slack. |
+| A board card's progress and report post into the thread                                                           | A card the agent files while answering posts each progress note as a message of its own, and its report, into the conversation you asked in; a file the card produced is not attached.    |
+| A message sent while the agent works interrupts its turn                                                          | It is queued as a follow-up to the running task.                                                                                                                                          |
+| An unlisted Slack sender is ignored silently                                                                      | An unlisted sender gets one notice.                                                                                                                                                       |
+| Several Slack workspaces from one install                                                                         | One workspace.                                                                                                                                                                            |
+
+### What a task looks like
+
+Each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed on Slack by the agent's latest progress note (on Google Chat only with `googleChat.mode: debug`). The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer.
+
+### Follow-ups while a task runs
+
+A conversation runs one task at a time. A message sent while its task runs, other than the commands below, goes to that task as a follow-up, and the gateway answers `✏️ got it, I'll take that next`. The agent finishes the turn it is on, then takes each follow-up in the order it arrived as a further turn in the same session, so it answers with the earlier turns in context. Each turn's answer posts as soon as the next turn starts, and the last one closes the task. A task takes at most 16 follow-ups. One the agent cannot take is answered `⚠️ not taken: <why>. Send it again after the answer.`, where the reason is that the task has already taken as many follow-ups as it runs, that it was already finishing, that the message had no text, that the task's capability check did not pass, or that the agent's executor cannot continue a session (the bridge's `cli` executor; the default `api` executor can). When the task ends, follow-ups that never ran are counted in `⚠️ N queued follow-up(s) did not run before the task ended; send them again if they still matter`, and follow-ups that arrived as it finished in `⚠️ N follow-up(s) arrived as the task finished and were not taken; send them again`.
+
+If the task has produced nothing yet, a follow-up gets `✏️ steering sent — task <id> has shown nothing on its event stream yet, so no reply is promised: it may still be starting, or nothing may have taken it; if it is still silent 10m0s after it was submitted, your next message here starts a new task` instead. When that time is up and nobody has written since, the gateway posts `⚠️ task <id> has produced nothing on its event stream in 10m0s; unless it starts first, your next message here starts a new task instead of going to it`. The next message then posts `⚠️ task <id> has produced nothing on its event stream in 10m0s, so this conversation is released and this message is handled as a new turn` and starts a new task. The 10 minutes are the gateway's `A2A_FIRST_EVENT_GRACE`.
+
+Besides [`/session`](#session), two kinds of message are commands rather than follow-ups. Each must be the whole message; case and punctuation are ignored, and on Slack a mention of the bot is stripped first, so `@bot stop` counts.
+
+- **`stop`, `cancel` or `abort`.** With a task running, the gateway answers `🛑 cancel sent — the task ends when the executor confirms`, and the status line ends at `🛑 **canceled**` when it does. Your next message starts a new task. A second `stop` before the task ends gets `🛑 cancel already sent — the task ends when the executor confirms`. With nothing running in the conversation, `stop` gets `🤷 nothing is running`. A `stop` acts only on the conversation it is sent in, so on Slack send it in the task's thread: a new top-level message in a channel or a DM is a new conversation. A top-level `stop` in a Slack DM starts nothing and gets `🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread`.
+- **A status question**, exactly one of `status`, `progress`, `any progress`, `any update`, `any updates`, `what is it doing`, `what's it doing`, `what are you doing`, `what's happening`, `what is happening`, `what's going on`, `what is going on`, `where are we`, `how's it going` or `how is it going`. With a task running, the gateway answers from the task's event stream without asking the agent: `🔎 task <id> is **working** (2m14s so far)`, the request it is working on, its state history, its latest progress note, and the line `(answered by stream replay — no live connection to the executor)`. A task with no events yet gets `📭 no events on the stream for this task yet`. With nothing running, a status question is an ordinary message and starts a task, except at the top level of a Slack DM, where it gets the same `nothing is running here` reply as `stop`. Any other wording, such as "how is the upgrade doing", is a follow-up, which the agent answers itself.
+
+### When it is busy
+
+The agent answers a fixed number of tasks at once: the Hermes bridge's worker count, 10 unless the operator's `A2A_BRIDGE_CONCURRENCY` sets another. When a new task starts while at least that many tasks from other conversations are outstanding, counting the running ones, its status line reads `⏳ **queued** — 12 requests are ahead of yours; I'll start on it as soon as there's room` in place of `⏳ submitted…`, and changes to `⚙️ **working**` when the task starts. The notice is informational: the task is already submitted. The operator's `A2A_BUSY_NOTICE_AT` moves the threshold. A conversation on the session route below never gets the notice, since each of its tasks runs on a pod of its own.
+
+### `/session`
+
+By default every conversation's tasks go to the `platform` route above. `/session` moves the conversation to the session route, where each new task runs in a session pod of its own, started for it from the `chat` profile. The pod is deleted when the conversation's next task starts, or after 30 minutes without activity. An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`), and a task refused at that cap is answered `🚦 not started: 10 session workers are already running (cap 10). …`. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
+
+On Slack, start the message with the bot's mention, `@bot /session`, because Slack takes a bare leading `/` as one of its own slash commands. In a Google Chat space, mention the app as with any message.
+
+| You send          | The gateway answers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/session`        | `🧵 session route on — your next message opens a session pod; /session off returns to platform`. In a Slack channel thread it asks for a mention instead: `🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); /session off returns to platform`. In a Slack DM, where `/session` sent top-level opens a thread of its own: `🧵 session route on — reply in this thread to open a session pod; /session off returns to platform`. |
+| `/session <text>` | Turns the route on and runs `<text>` as its first task.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `/session off`    | `↩️ session route off — back to platform`. With a session task still running: `⚠️ a session task is still running — stop it first, then /session off`. When the route was not on: `ℹ️ not on the session route; nothing to turn off`. Sent top-level in a Slack DM: `ℹ️ /session off acts on the thread it's typed in — reply /session off in that question's thread`.                                                                                                                                                               |
+| `/session` again  | `ℹ️ already on the session route`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `/session stop`   | `ℹ️ to leave the session route say /session off; to stop a running task say stop`. Nothing is stopped.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+
+If a task is already running on the `platform` route when you send `/session`, that task finishes there, and the message after it opens the first session pod; `/session <text>` sent then is not run, and the gateway says so. A message that starts with `delegate`, such as `delegate check the node pools`, sends that one task to a fresh session pod and leaves the conversation on the `platform` route.
+
+## How a chat question is answered under `next`
+
+Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from the default `today` mode is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
+
+The commands below assume the default resource names (`platform-agent`) and the `kubeagents-system` namespace. The gateway logs one JSON object per line.
+
+1. **The gateway takes the message.** It refuses a sender the channel's allowed-users list does not admit, posts a status line in the thread that reads `⏳ submitted…`, and publishes the message as a task for the `platform` addressee. When at least as many requests are already waiting or running as the bridge runs at once (10 by default), the status line says how many are ahead of yours instead: `⏳ queued — 10 requests are ahead of yours; I'll start on it as soon as there's room`. Each message that starts a turn logs an `ingress` line with its `taskId`, `conversation` and `addressee`:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"ingress"'
+   ```
+
+2. **The bridge hands it to the Planning Agent.** The `hermes-bridge` container in the agent pod takes the task from the bus and sends its text to the Hermes API server in the same pod, which runs it as a turn under the `default` profile: the Planning Agent (on an install that enables the experimental `platformFrontDoor`, the Platform Agent instead). Every message in one thread lands in the same Hermes session, so a turn sees the thread's earlier turns. The status line changes to `⚙️ working`. The bridge logs which executor it runs when it starts, and a `task accepted` line for each task:
+
+   ```bash
+   kubectl logs deployment/platform-agent-gateway -n kubeagents-system -c hermes-bridge | grep -E 'hermes bridge consuming|task accepted'
+   ```
+
+   The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread, and a card it files does not report back to the thread.
+
+3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message and the status line becomes `✅ completed`. The turn has ended; the work has not. The gateway logs the end of the turn:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"task terminal"'
+   ```
+
+   A message sent while a turn is still running is queued as the next turn in the same session (`✏️ got it, I'll take that next`); the `cli` executor refuses it instead. One sent after the acknowledgement starts a new turn.
+
+4. **The specialist works the card.** The kanban dispatcher in the agent pod starts the specialist against its own profile, with the same identity, permissions and cluster access it has under `today` ([Security and IAM](/kube-agents/reference/security-and-iam/) is canonical). No setting is needed to let it read a cluster. To inspect the cards and read one:
+
+   ```bash
+   kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban list
+   kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes kanban show <task_id>
+   ```
+
+5. **The answer comes back to the thread.** Before a task's first turn the bridge records which conversation its Hermes session answers, so the card is addressed to that conversation. As the specialist works, the gateway posts each progress note into the thread or DM you asked in, and then the card's result. Two things differ from delivery under `today`: each progress note is a message of its own rather than a line added to one message, because the gateway posts but does not edit, and a file the card produced is not attached. If the card blocks or fails, the thread gets the card's own blocked or failed line from the notifier. The Planning Agent's wake for it runs in the bridge's session, and its reply is not posted. The gateway posts only into a conversation it is still holding, the one whose session record carries the card's context, and refuses anything else. It logs each post it makes:
+
+   ```bash
+   kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep -E '"msg":"(chat.notify route armed|notify posted|notify refused)'
+   ```
+
+   At startup `chat.notify route armed` should carry `"conversations":true`. Each `notify posted` line names the conversation it posted into in its `thread` field, the same key as the `conversation` field on the question's `ingress` line.
+
+The short-lived session pods that [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) describes are a different path. The gateway starts one only for a message that begins with the word `delegate` (`delegate: check prod-east`), which runs that one task in its own pod, or for a conversation moved onto its session route with the `/session` command. Such a pod reads the cluster only when the operator runs with `A2A_SESSION_CLUSTER_VIEW=true`. Any other message follows the steps above, which that setting does not affect.
 
 ## Proactive alerts (both channels)
 

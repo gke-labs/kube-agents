@@ -97,10 +97,11 @@ Four behaviours worth knowing before the first run:
   container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
-  reports it. It costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull
-  subscription — and it reaches past the clusters this install manages: the sink exports the
-  admin-activity audit records of every GKE cluster in the project, including clusters this
-  install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
+  reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub
+  topic and a pull subscription — and a sink in each project a declared scope lists, and it reaches
+  past the clusters this install manages: the sinks export the admin-activity audit records of
+  every GKE cluster in those projects, including clusters this install does not manage, and the
+  subscription retains a copy of them for 31 days. Opt out with
   `ENABLE_DRIFT_DETECTOR=false` in `install.env`. A first run records the
   `--enable-drift-detector=false` flag for you, because it is the run that writes that file; over
   an `install.env` that already exists the flag applies to one run and is recorded nowhere, which
@@ -515,6 +516,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is only `SLACK_HOME_CHANNEL`, a channel ID, and that page's home-channel section says how to set it.
+
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
    - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
@@ -525,7 +528,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
    - If you left `SLACK_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its channel or DM the home channel, where scheduled audits post (step 5).
 3. **Approve Pairing Code (Optional / First-time setup)**:
-   - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
+   - Only if you set the Hermes Slack DM policy to `pairing` yourself: a kube-agents install gates Slack with the allowlist instead, and the A2A gateway under `spec.mode: next` has no pairing. A member the policy does not know gets a one-time code; approve it from the gateway logs:
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve slack <PAIRING_CODE>
      ```
@@ -572,9 +575,10 @@ To add a chat platform later, edit `install.env` and re-run `./install.sh`, then
 
 - Google Chat: set `GOOGLE_CHAT_ENABLED=true` and `ALLOWED_USERS=` to the comma-separated emails
   allowed to use the agent. `./install.sh --menu` edits both for you.
-- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated user IDs or
-  emails, and re-run with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked
-  for them.
+- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated Slack member
+  IDs (for example `U0123ABCD`), not emails or display names: an email matches nobody. To find a
+  member ID, open the person's Slack profile, then the **⋮** menu, then **Copy member ID**. Re-run
+  with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked for them.
 
 The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
 empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,
@@ -624,10 +628,12 @@ helm upgrade kube-agents ./charts/kube-agents \
 
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
-On an install that came from `install.sh`, put the same value in `extra_helm_values` in
-`terraform/examples/full-install/terraform.tfvars` as well. The next `upgrade.sh` or `install.sh`
-re-run regenerates that file from `install.env`, which does not record this setting, and reverts a
-value set only on the Helm release.
+On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead. A
+first install writes it as true, but a file without the key reads as false to `upgrade.sh`, and a
+re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
+`install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
+`agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
+set only on the Helm release or only in `terraform.tfvars` is reverted.
 
 Installing the chart directly with `helm install` gives you a sandbox the agent cannot log into: the
 chart cannot generate an `authorized_keys`-form public key, so `platform-agent-shell-authorized-keys`
@@ -966,8 +972,12 @@ kubectl get pods -n kubeagents-system
 
 `Ready` means the gateway, the shell sandbox and the credential broker are all up. A first boot can
 take over fifteen minutes. The site's quickstart
-[Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is and
-which startup errors to ignore. If a pod stays unready, see
+[Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is,
+which startup errors to ignore, and how to check that Slack connected. On an install made with
+`--mode=next`, `Ready` also waits for the NATS bus, the auth callout, the bus provisioning Job's
+first run and, with a chat backend, the A2A gateway; run the quickstart's "Verify a
+`spec.mode: next` install" checks as well, for those, the verifier and console it does not wait
+on, the conditions, and the Slack check that applies under `next`. If a pod stays unready, see
 [Troubleshooting & Common FAQ](#troubleshooting--common-faq).
 
 ### After the first chat message: the inventory report
@@ -1081,9 +1091,10 @@ or the install was made by a release that predates this engine — re-run it wit
 
 ### Manual Local Uninstall
 
-To uninstall the operator controller and CRDs manually:
+To uninstall the operator controller and CRDs manually, delete the `PlatformAgent` first and wait, so the operator is still running to clear its finalizer:
 
 ```bash
+kubectl delete platformagent platform-agent -n kubeagents-system --wait --timeout=180s
 cd k8s-operator
 make undeploy
 make uninstall
@@ -1130,8 +1141,10 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
   - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
-- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Unlisted users are ignored without a reply; an empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md#verify) maps the A2A gateway's log lines to causes and fixes.
 
 **Which logs to read:**
 
@@ -1154,3 +1167,70 @@ When a Slack bot connects or is online in your workspace but never replies to me
     kubectl get platformagent platform-agent -n kubeagents-system -o yaml
     ```
     (The `A2AGateway` condition is present only while the gateway runs nothing: `status: False` with reason `NoChatBackend` when no chat backend is configured, or `WaitingForReplica` while a scaled-up replica comes back. On an install with Slack enabled it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
+
+### 6. Tracing Where a Chat Message Stops
+
+When the checks in the entry above pass and a message still gets no reply, follow it to the component that should answer.
+
+- Find out which component answers chat. An empty result, or `today`, is the default mode; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
+  ```
+- **Default mode.** The credential broker holds the Slack connection, and its startup lines say whether the tokens work. `Slack relay enabled workspaces=N` means the relay is up with N workspaces. `Slack bot token authentication failed` means Slack's `auth.test` rejected one of the bot tokens in `SLACK_BOT_TOKEN`; the relay still starts on the others. `Slack relay initialization failed; retrying` means no bot token authenticated or the Socket Mode connection with the app token failed, and the broker tries again every 30 seconds. A `Slack relay operation failed` line is something else: one Slack call the agent made failed (its `error` field says why, such as `channel_not_found` or `missing_scope`), not the tokens.
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
+  ```
+  On Google Chat, a sender must be on `ALLOWED_USERS` (emails; empty admits everyone), and the Chat app has to publish to the install's Pub/Sub topic ([ChatOps → Google Chat](docs/site/src/content/docs/concepts/chatops.md#google-chat)).
+- **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway (one that already exists is kept at zero replicas), and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system \
+    -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
+  kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
+  ```
+- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
+  ```
+  - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
+  - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
+  - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
+  - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
+  - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn. Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+- **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system \
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+  kubectl rollout status deployment/platform-agent-a2a-callout -n kubeagents-system
+  kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system
+  ```
+
+### 7. A Question Gets No Answer Under `spec.mode: next`
+
+The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
+
+- **It stays at `⏳ submitted…`.** Nothing has taken the task. (A line reading `⏳ **queued** — N requests are ahead of yours` is waiting its turn behind other conversations' tasks, which is not this.) Tasks on the `platform` route are run by the `hermes-bridge` container in the agent's pod, which logs `hermes bridge consuming` when it starts and `task accepted` for each task:
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | tail -n 50
+  ```
+  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
+  ```bash
+  kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
+  ```
+- **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. The gateway posts a card's report into the conversation you asked in, on Slack and Google Chat alike. Check each hop:
+  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `"conversations":true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations and logs `chat.notify home posts not armed: … conversation posts are`. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
+     ```bash
+     kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
+     ```
+     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record could not be read (logged first as `notify: session record unreadable`).
+  2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
+     ```bash
+     kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'
+     ```
+  3. The card was addressed to that route. The agent logs a line ending `— a report completed on this card will not reach chat` when it was not:
+     ```bash
+     kubectl exec -n kubeagents-system deploy/platform-agent-gateway -c platform-agent -- \
+       sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
+     ```
+     `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.

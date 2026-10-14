@@ -142,6 +142,26 @@ mcp_servers:
     lazy: true
     connect_timeout: 30
     timeout: 60
+    # Read tools only, as an allowlist: the credential proxy's relay refuses
+    # the write tools, and this list keeps them out of the model's offer. deploy/shared/defaults/config.yaml carries the full rationale; the
+    # list is the same one, name for name.
+    tools:
+      include:
+        - check_k8s_auth
+        - describe_k8s_resource
+        - get_cluster
+        - get_k8s_cluster_info
+        - get_k8s_logs
+        - get_k8s_resource
+        - get_k8s_rollout_status
+        - get_k8s_version
+        - get_node_pool
+        - get_operation
+        - list_clusters
+        - list_k8s_api_resources
+        - list_k8s_events
+        - list_node_pools
+        - list_operations
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.

@@ -2041,8 +2041,9 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, EventsIngestedTotal,
-// RemediationsProposedTotal, LastActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's and the event watcher's metrics
+// RemediationsProposedTotal, RemediationsMergedTotal, LastActiveTime,
+// ClustersRegistered and ClustersMonitored from the broker's and the event
+// watcher's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
 // ServiceAccount holds no write verb on this status. SessionsTotal and
 // RemediationsAppliedTotal are declared so that the schema names them, but
@@ -2089,6 +2090,24 @@ type AgentUsageStatus struct {
 	// +optional
 	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
 
+	// RemediationsMergedTotal is the cumulative count of proposals this install
+	// opened that the forge reported merged. The agent never merges, so the
+	// credential broker learns of a merge when one of its own reads of the
+	// proposal, proposal-list or proposal-view, shows the merged state; it
+	// counts each such proposal once per broker process, only when its author
+	// is the broker's own login and it merged no earlier than the broker
+	// process started, so a restart cannot count a merge twice, to within the
+	// forge's and the pod's clocks agreeing. Read from the
+	// broker's kubeagents_vcs_proposals_merged_total every five minutes and
+	// kept monotonic the same way as ToolExecutionsTotal. A merge no read of
+	// the broker's ever shows is not counted, and a credential whose login the
+	// broker cannot name counts nothing (the broker logs that once), so this
+	// under-counts rather than over-counts and stays absent on such an
+	// install; it is the forge's word, where RemediationsAppliedTotal is the
+	// install's. Moves LastActiveTime.
+	// +optional
+	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
 	// Agent profiles the GKE API would describe, the management cluster
@@ -2132,8 +2151,8 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened, or an event was
-	// accepted for triage.
+	// moved: a brokered command ran, a proposal was opened or merged, or an
+	// event was accepted for triage.
 	// Until SessionsTotal has a source, a chat turn that runs no brokered
 	// command does not move it. Scheduled maintenance jobs that run brokered
 	// commands do move it, though -- the Controller Stall Watch cron runs some
