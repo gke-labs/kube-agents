@@ -229,6 +229,28 @@ class StoreTest(unittest.TestCase):
         self.assertIn("no stored value", str(ctx.exception))
         self.assertEqual(cs.load(self.root, "demo").criteria[cs.REVISION_KEY], 1, "a refused call writes nothing")
 
+    def test_a_stale_key_is_returned_to_the_default_with_null_too(self):
+        # A key a release dropped is the one `get` lists under stale_keys and the one an operator
+        # asks to clear; `null` on it is an unset, not an unknown-key refusal, and the entry says
+        # it was asked for rather than pruned as a side effect.
+        seed(self.root, criteria={"threshold": 3, "retired": True})
+        entry = cs.apply_changes(self.root, "demo", {"retired": None}, reason="clear it", confirmed_by="ops@example")
+        self.assertEqual(entry["unset"], {"retired": {"before": True, "after": None}})
+        self.assertEqual(entry["pruned"], {})
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3, cs.REVISION_KEY: 1, cs.UPDATED_AT_KEY: entry["ts"]})
+        with self.assertRaises(cs.CapabilityError):
+            cs.apply_changes(self.root, "demo", {"retired": 5}, reason="x", confirmed_by="ops@example")
+
+    def test_a_changelog_line_that_is_not_utf8_is_skipped_not_raised(self):
+        seed(self.root)
+        first = cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        with (self.root / "demo" / cs.CHANGELOG_FILENAME).open("ab") as fh:
+            fh.write(b"\xff\xfe not a line\n")
+        self.assertEqual(cs.history(self.root, "demo"), [first])
+        second = cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="y", confirmed_by="ops@example")
+        self.assertEqual(second["revision"], 2)
+        self.assertEqual(cs.history(self.root, "demo"), [first, second])
+
     def test_a_pattern_on_a_string_is_enforced(self):
         # The flag that carries a list cannot carry an entry with a comma, a space, a quote or a
         # newline, so the schema refuses it at the store and `get`, the flag and the manifest

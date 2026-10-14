@@ -68,6 +68,9 @@ SCHEMA_FILENAME = "criteria.schema.json"
 LEARNING_FILENAME = "learning.json"
 CHANGELOG_FILENAME = "changelog.jsonl"
 CHANGELOG_LINE_END = b"\n"
+# How the changelog's readers decode a byte sequence that is not UTF-8: replaced, so the line
+# fails its JSON parse and is skipped like any torn line, rather than raising out of `set`.
+UNDECODABLE_LINE_POLICY = "replace"
 # Held for the whole read -> validate -> write of one change. A cron child and
 # a kanban worker each run their own platform_control process against the same
 # volume, so without it two simultaneous sets would lose one update.
@@ -434,8 +437,11 @@ def _apply_locked(
     props = cap.properties()
     # Unknown keys first, so a typo is reported as a typo rather than as a
     # policy refusal on a key that does not exist.
+    # A `null` on a key the volume holds is a return to the default even when the schema no
+    # longer defines the key: that is the stale key `get` lists, and the one an operator asks to
+    # clear, so it takes the unset path below rather than this refusal.
     if cap.is_closed():
-        unknown = [k for k in changes if k not in props and k not in STATE_KEYS]
+        unknown = [k for k, v in changes.items() if k not in props and k not in STATE_KEYS and not (v is None and k in cap.criteria)]
         if unknown:
             raise CapabilityError(
                 f"invalid: {', '.join(unknown)}: not a key this capability defines; "
@@ -473,7 +479,9 @@ def _apply_locked(
 
     before = effective_criteria(cap)
     defaults = cap.defaults()
-    pruned = stale_keys(cap)
+    # A stale key this call returns to the default is recorded under `unset`, as asked, not as
+    # a pruning side effect.
+    pruned = [k for k in stale_keys(cap) if k not in unset]
     # Every invalid stored value is recorded, including one this call replaces:
     # `before` carries the default that stood in for it, so the changelog is the
     # only place the raw value survives.
@@ -506,7 +514,7 @@ def _apply_locked(
         "confirmed_by": confirmed_by,
         "reason": reason,
         "changes": {k: {"before": before.get(k), "after": v} for k, v in sets.items()},
-        "unset": {k: {"before": before.get(k), "after": defaults.get(k)} for k in unset},
+        "unset": {k: {"before": cap.criteria.get(k), "after": defaults.get(k)} for k in unset},
         "pruned": {k: cap.criteria[k] for k in pruned},
         "reset": {k: {"value": cap.criteria[k], "error": e} for k, e in reset.items()},
     }
@@ -544,7 +552,9 @@ def _last_logged_revision(directory: Path) -> int:
     if not path.is_file():
         return 0
     last = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # Decoded with replacement: a line that is not UTF-8 (a hand edit, filesystem damage) is
+    # one more line the JSON parse skips, not an exception out of every later `set`.
+    for line in path.read_text(encoding="utf-8", errors=UNDECODABLE_LINE_POLICY).splitlines():
         try:
             entry = json.loads(line)
         except ValueError:
@@ -569,7 +579,9 @@ def history(root: Path, name: str, limit: int = MAX_HISTORY_ENTRIES) -> list[dic
     if not path.is_file():
         return []
     entries: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # Decoded with replacement: a line that is not UTF-8 (a hand edit, filesystem damage) is
+    # one more line the JSON parse skips, not an exception out of every later `set`.
+    for line in path.read_text(encoding="utf-8", errors=UNDECODABLE_LINE_POLICY).splitlines():
         line = line.strip()
         if not line:
             continue
