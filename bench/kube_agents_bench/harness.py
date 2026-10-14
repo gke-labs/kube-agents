@@ -1027,6 +1027,7 @@ try:
     if not kb.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_worker_children'"
     ).fetchone():
+        print("listed")
         sys.exit(0)
     # Only cards created after the earliest stalled card: a card someone else
     # filed earlier that a worker's idempotent create handed back (and so got
@@ -1046,15 +1047,22 @@ try:
             if cid in seen:
                 continue
             seen.add(cid)
+            if created < since:
+                continue  # not this unit's: skip it and everything under it
             queue.append(cid)
-            if status not in ("done", "archived") and created >= since:
+            if status not in ("done", "archived"):
                 out.append(cid)
     print("\n".join(out[:CAP]))
     if len(out) > CAP:
         print("capped at %d" % CAP)
+    print("listed")
 except sqlite3.Error as exc:
     print("descendants unread: %s" % exc)
 """
+
+# How many times the descendants are listed and archived: a listed child's
+# worker can still fan out until its own archive, and the next pass finds that.
+_DESCENDANT_PASSES = 3
 
 # How many fan-out descendants one settle archives. A fan-out is a handful of
 # clusters; the cap keeps a runaway creator from turning cleanup into a storm.
@@ -1078,6 +1086,13 @@ def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
     )
     out = _agent_shell(script, timeout)
     ids = [line.strip() for line in out.splitlines() if _CARD_ID.fullmatch(line.strip())]
+    # The script ends every completed listing with this line, so "found no
+    # children" and "could not look" stay different things.
+    if "listed" not in out.splitlines() and "descendants unread" not in out:
+        _log.warning(
+            "could not list the fan-out children of stalled cards %s; any of them may still hold a "
+            "dispatcher slot (%s)", ", ".join(stalled), out[:_LOG_EXCERPT_CHARS] or "no output",
+        )
     if "capped at" in out:
         _log.warning(
             "the stalled cards fanned out more than %d unsettled cards; only the first %d are archived",
@@ -1108,23 +1123,37 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     its worker may still hold a slot, and the run log should not say
     otherwise.
     """
-    descendants = [d for d in _stalled_descendants(stalled, timeout) if d not in stalled]
-    for tid in [*stalled, *descendants]:
-        kind = "stalled card" if tid in stalled else "fan-out child of a stalled card"
-        script = (
-            f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
-            f'"$H" kanban archive {_shell_quote(tid)} 2>&1 || true'
+    # The stalled cards first, so their workers can't file another child while
+    # the rest is listed. Then the descendants, listed again until a pass finds
+    # nothing new: a listed child's worker is alive until its own archive.
+    for tid in stalled:
+        _archive_card(tid, "stalled card", timeout)
+    done = set(stalled)
+    for _ in range(_DESCENDANT_PASSES):
+        fresh = [d for d in _stalled_descendants(stalled, timeout) if d not in done]
+        if not fresh:
+            break
+        for tid in fresh:
+            _archive_card(tid, "fan-out child of a stalled card", timeout)
+            done.add(tid)
+
+
+def _archive_card(tid: str, kind: str, timeout: float) -> None:
+    """``hermes kanban archive`` one card in its own exec, logging the outcome."""
+    script = (
+        f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
+        f'"$H" kanban archive {_shell_quote(tid)} 2>&1 || true'
+    )
+    out = _agent_shell(script, timeout).strip()
+    if out.startswith(_ARCHIVED_PREFIX):
+        _log.info("archived %s %s", kind, tid)
+    else:
+        _log.warning(
+            "could not archive %s %s; its worker may still hold a dispatcher slot (%s)",
+            kind,
+            tid,
+            out[:_LOG_EXCERPT_CHARS] or "no output",
         )
-        out = _agent_shell(script, timeout).strip()
-        if out.startswith(_ARCHIVED_PREFIX):
-            _log.info("archived %s %s", kind, tid)
-        else:
-            _log.warning(
-                "could not archive %s %s; its worker may still hold a dispatcher slot (%s)",
-                kind,
-                tid,
-                out[:_LOG_EXCERPT_CHARS] or "no output",
-            )
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
