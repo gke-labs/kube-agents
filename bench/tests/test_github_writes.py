@@ -233,6 +233,16 @@ def test_no_note_when_the_reply_links_the_configured_repository(env, github):
     assert "the reply links" not in res.reason
 
 
+def test_refs_elsewhere_skip_a_number_also_named_here_and_dedupe_casings():
+    owner, name = REPO.split("/")
+    typo = f"{owner}/{name}s"
+    text = (f"https://github.com/{typo}/pull/39 https://github.com/{typo.upper()}/pull/39 "
+            f"https://github.com/{typo}/pull/40 {PR39_URL.replace('/39', '/40')}")
+    # 39 is linked only on the typo (once, despite two casings); 40 is also
+    # linked on the right repository, so it is named and gets no note.
+    assert github_writes.proposal_refs_elsewhere(text, REPO, "github") == {39: [typo]}
+
+
 def test_a_second_write_beyond_the_allowance_is_unrequested(env, github):
     stash(final_message=f"Fix proposed: {PR39_URL}")
     listing = fixture("pulls-unrequested.json")

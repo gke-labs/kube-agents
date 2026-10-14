@@ -655,9 +655,15 @@ def proposal_refs_elsewhere(
     links its own pull request under a mistyped repository (#3048) names nothing
     for the allowance, and without this the reader is left to find why.
     """
+    refs = proposal_refs(text, forge, environ)
+    named_here = {n for path, n in refs if path.lower() == repo.lower()}
     elsewhere: dict[int, list[str]] = {}
-    for path, n in proposal_refs(text, forge, environ):
-        if path.lower() != repo.lower() and path not in elsewhere.get(n, []):
+    for path, n in refs:
+        # A number the reply also links on the right repository is named; the
+        # note would be wrong for it. Casings of one wrong path list once.
+        if n in named_here or path.lower() == repo.lower():
+            continue
+        if path.lower() not in (p.lower() for p in elsewhere.get(n, [])):
             elsewhere.setdefault(n, []).append(path)
     return elsewhere
 
