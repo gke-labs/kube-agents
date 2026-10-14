@@ -562,6 +562,12 @@ class CapabilityCriteriaMergeTest(unittest.TestCase):
         self.overlay()
         self.assertEqual((self.home / self.CAP / "criteria.json").read_text(), "{not json")
         self.assertEqual(self.read("criteria.schema.json"), {"v": 2})
+        # Valid JSON of the wrong shape (a hand edit): held the same way, not replaced by the
+        # template, so the store keeps naming the file until an operator fixes it.
+        wrong_shape = json.dumps(json.dumps({"threshold": 5}))
+        write(self.home / self.CAP / "criteria.json", wrong_shape)
+        self.overlay()
+        self.assertEqual((self.home / self.CAP / "criteria.json").read_text(), wrong_shape)
         write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7}))
         real_read_json = ps.read_json
 

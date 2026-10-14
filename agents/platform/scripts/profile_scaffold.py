@@ -440,8 +440,11 @@ def _restore_volume_wins(
         parts = relative.split("/")
         if parts[0] not in names:
             continue
-        if previous is None:
-            log(f"WARN: could not read {relative}; the volume's copy stands untouched and is not merged")
+        if not isinstance(previous, dict):
+            # None is a file that could not be read or parsed; anything else parsed to the wrong
+            # shape. Either way the image's empty template must not replace it: the store names
+            # the file until an operator fixes it, and a restart erases nothing.
+            log(f"WARN: could not read {relative} as a JSON object; the volume's copy stands untouched and is not merged")
             continue
         source = template_dir.joinpath(*parts)
         if not source.is_file():
