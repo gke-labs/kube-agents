@@ -1014,16 +1014,92 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog | None] | None, stalled: Sequen
         _log.warning("could not write the worker log index: %s", exc)
 
 
+# Lists the unsettled cards the stalled cards' workers fanned out, and theirs in
+# turn, from the attribution table the image's kanban_children_settled patch
+# writes (``kanban_worker_children``: which running card created which).
+# Read-only, capped, one id per line. A board without the table lists nothing.
+_DESCENDANTS_SCRIPT = r"""
+import sqlite3, sys
+ROOT, CAP = sys.argv[1], int(sys.argv[2])
+roots = [a for a in sys.argv[3:] if a]
+try:
+    kb = sqlite3.connect("file:%s/kanban.db?mode=ro" % ROOT, uri=True, timeout=10)
+    if not kb.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_worker_children'"
+    ).fetchone():
+        sys.exit(0)
+    # Only cards created after the earliest stalled card: a card someone else
+    # filed earlier that a worker's idempotent create handed back (and so got
+    # attributed to it) is left alone.
+    placeholders = ",".join("?" * len(roots))
+    since = kb.execute(
+        "SELECT MIN(created_at) FROM tasks WHERE id IN (%s)" % placeholders, roots
+    ).fetchone()[0] or 0
+    seen, queue, out = set(roots), list(roots), []
+    while queue and len(out) <= CAP:
+        tid = queue.pop(0)
+        for cid, status, created in kb.execute(
+            "SELECT c.child_id, t.status, COALESCE(t.created_at, 0) FROM kanban_worker_children c "
+            "JOIN tasks t ON t.id = c.child_id WHERE c.creator_id = ? "
+            "ORDER BY c.created_at, c.child_id", (tid,)
+        ):
+            if cid in seen:
+                continue
+            seen.add(cid)
+            queue.append(cid)
+            if status not in ("done", "archived") and created >= since:
+                out.append(cid)
+    print("\n".join(out[:CAP]))
+    if len(out) > CAP:
+        print("capped at %d" % CAP)
+except sqlite3.Error as exc:
+    print("descendants unread: %s" % exc)
+"""
+
+# How many fan-out descendants one settle archives. A fan-out is a handful of
+# clusters; the cap keeps a runaway creator from turning cleanup into a storm.
+_MAX_ARCHIVED_DESCENDANTS = 32
+
+_CARD_ID = re.compile(r"t_[0-9a-f]+")
+
+
+def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
+    """The unsettled cards the stalled cards' workers fanned out, recursively."""
+    if not stalled:
+        return []
+    args = " ".join(
+        _shell_quote(a)
+        for a in [worker_trajectory.DATA_ROOT, str(_MAX_ARCHIVED_DESCENDANTS), *stalled]
+    )
+    script = (
+        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
+        f'"$PY" -c {_shell_quote(_DESCENDANTS_SCRIPT)} {args}'
+    )
+    out = _agent_shell(script, timeout)
+    ids = [line.strip() for line in out.splitlines() if _CARD_ID.fullmatch(line.strip())]
+    if "capped at" in out:
+        _log.warning(
+            "the stalled cards fanned out more than %d unsettled cards; only the first %d are archived",
+            _MAX_ARCHIVED_DESCENDANTS, _MAX_ARCHIVED_DESCENDANTS,
+        )
+    if out.strip() and not ids and "descendants unread" in out:
+        _log.warning("could not list the stalled cards' fan-out children (%s)", out[:_LOG_EXCERPT_CHARS])
+    return ids
+
+
 def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
-    """Archive the cards that ran to the ceiling, which stops their workers.
+    """Archive the cards that ran to the ceiling, and the cards they fanned out.
 
     The unit has given up on them: its record is written and their files are
     about to be deleted. Left alone, a worker that still heartbeats keeps its
     dispatcher slot until it finishes on its own (the dispatcher's stale timer
     reclaims only a silent one), and every later unit's card queues behind
     it. ``hermes kanban archive`` moves a running card to the terminal
-    ``archived`` state and terminates its worker. Children the worker filed
-    are not known here and keep running.
+    ``archived`` state and terminates its worker. The cards a stalled card's
+    worker fanned out (and theirs) are archived too: a per-cluster card waiting
+    on a workload its cluster doesn't have otherwise holds its slot for hours
+    into later units (#3019, #2978).
 
     One exec per card, so a card the dispatcher already archived does not
     fail the batch for the rest, and each kill has the whole exec timeout.
@@ -1032,17 +1108,20 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     its worker may still hold a slot, and the run log should not say
     otherwise.
     """
-    for tid in stalled:
+    descendants = [d for d in _stalled_descendants(stalled, timeout) if d not in stalled]
+    for tid in [*stalled, *descendants]:
+        kind = "stalled card" if tid in stalled else "fan-out child of a stalled card"
         script = (
             f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
             f'"$H" kanban archive {_shell_quote(tid)} 2>&1 || true'
         )
         out = _agent_shell(script, timeout).strip()
         if out.startswith(_ARCHIVED_PREFIX):
-            _log.info("archived stalled card %s", tid)
+            _log.info("archived %s %s", kind, tid)
         else:
             _log.warning(
-                "could not archive stalled card %s; its worker may still hold a dispatcher slot (%s)",
+                "could not archive %s %s; its worker may still hold a dispatcher slot (%s)",
+                kind,
                 tid,
                 out[:_LOG_EXCERPT_CHARS] or "no output",
             )
@@ -2799,7 +2878,8 @@ class KubeAgentsHarness(AgentHarness):
         they are part of the answer. ``stalled`` is the subset of ``awaited``
         that ran to the delegation ceiling: their transcripts are copied out
         under ``ARTIFACTS`` before the purge deletes them with the rest, and the
-        cards are archived so their workers stop holding dispatcher slots.
+        cards are archived so their workers stop holding dispatcher slots,
+        along with the cards their workers fanned out.
         Keyword-only with a default
         so a caller that has no stalled cards, in-tree or in a sibling branch,
         need not name it.
