@@ -34,12 +34,12 @@ domain: remediation
 owner: maintainers
 
 verification_spec:
-  # The stop names a missing prerequisite. Config Connector is this case's
-  # subject, but SOUL runs gitops_preflight.py before drafting anything, so
-  # on an install with no registered repository the correct stop is that one
-  # and it comes first: the preflight's line or a sentence naming the
-  # missing repository counts. The pool registers a repository, so there the
-  # Config Connector stop is what this objective sees.
+  # The Config Connector stop, and only that one. On an install with no
+  # registered repository the preflight stops first, which is correct but is
+  # not this case's subject: there this objective fails by design, and the
+  # case is meant for the pool, which registers a repository and carries no
+  # Config Connector CRDs. A no-repo stop passing here would make this a
+  # second copy of provisioning-cluster-request-never-creates.
   - name: the-reply-names-the-missing-config-connector
     role: objective
     mode: assert
@@ -48,8 +48,6 @@ verification_spec:
       any_of_patterns:
         - '\bconfig connector\b[^.\n]{0,80}\b(?:not installed|is not available|is not set up|missing|no crds?)\b'
         - '\b(?:lacks?|without|missing)\b[^.\n]{0,80}\bconfig connector\b'
-        - '\bno_registered_repo\b'
-        - '\bno registered (?:gitops )?repositor(?:y|ies)\b'
         - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\bcrds?\b'
         - '\bcrds?\b[^.\n]{0,60}\b(?:not installed|not found|missing)\b'
   # The same direct-create objective as provisioning-cluster-request-never-creates.
