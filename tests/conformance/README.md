@@ -366,4 +366,7 @@ home, but they are wire-format rules rather than security invariants, so
 `run.py` and the self-check never read these files. The Go tests in
 `a2a/lib/chatmsg` validate every expected message, and
 `agents/platform/scripts/test_chat_cases.py` checks the files' shape under
-`make test-python`.
+`make test-python`. The emitter runs every case: the kanban notifier's half in
+`deploy/docker/patches/test_chat_conformance.py`, and the hermes-bridge's half
+(the answer, and the ask's mark on its heartbeat and terminal) in
+`a2a/hermes-bridge/chat_test.go`.

@@ -289,6 +289,11 @@ SILENT_PLAN_KINDS = ("archived", "unblocked")
 #: ``spawned`` are not among its kinds. See :func:`silent_event`.
 STARTED_KIND = "heartbeat"
 
+#: Under ``spec.mode: next``, the terminal kind whose report is laid out as an
+#: answer (its first sentence the headline, the rest the detail) when it goes
+#: out through the chat.notify stand-in (:func:`_with_answer`).
+ANSWER_KIND = "completed"
+
 #: Kinds that settle a plan row past an earlier ``unblocked`` in the same
 #: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
 #: other than running, plus ``archived``. ``crashed`` and ``timed_out`` are
@@ -793,6 +798,44 @@ async def silent_event(notification: Any, ev: Any) -> None:
     await _settle_reaction(adapter, sub, kind, getattr(notification, "board_slug", None))
 
 
+def _chat_notify() -> Any:
+    """``kanban_chat_notify``, or None in an image without it."""
+    try:
+        from gateway import kanban_chat_notify
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import kanban_chat_notify
+        except ImportError:
+            return None
+    return kanban_chat_notify
+
+
+def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
+    """``metadata`` with a completed card's report laid out as an answer, for the chat.notify stand-in.
+
+    Under ``spec.mode: next`` the gateway lays the report out from a
+    ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
+    ``KAGE_SLACK_UX`` on for a Slack card, never for an actionable report,
+    whose call to action stays in view as today, and never raises: anything
+    that goes wrong posts the text alone, as today.
+    """
+    notify = _chat_notify()
+    if quiet is None or kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
+        return metadata
+    try:
+        import chat_message
+
+        if quiet.actionable_report(message):
+            return metadata
+        chat = chat_message.answer_message(message)
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: laying out the answer for chat.notify failed: %s", exc)
+        return metadata
+    if chat is None:
+        return metadata
+    return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
+
+
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
     if quiet is None:
         return False
@@ -951,7 +994,7 @@ async def deliver(
         ):
             await _settle_reaction(adapter, sub, kind, board)
             return None
-        result = await adapter.send(chat_id, message, metadata=metadata)
+        result = await adapter.send(chat_id, message, metadata=_with_answer(adapter, quiet, kind, message, metadata))
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
         # MAX_SEND_FAILURES it drops the subscription instead, and the ask

@@ -328,3 +328,44 @@ func TestNotifyAimsAtAConversation(t *testing.T) {
 		}
 	}
 }
+
+// --chat-file and --update ride the request as chat and update, the chat
+// object as written; a chat file that is not a JSON object, one beside
+// --blocks-file, or an update key with surrounding space is refused before
+// anything is sent.
+func TestNotifyCarriesAChatMessageAndAnUpdateKey(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	got, _ := answerNotify(t, s.ClientURL(), lib.NotifyReply{MessageID: "m"})
+	dir := t.TempDir()
+	chat := filepath.Join(dir, "chat.json")
+	body := `{"schema":"kube-agents.chat/v1","headline":"3 nodes"}`
+	if err := os.WriteFile(chat, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"notify", "--platform", "google_chat", "--chat-file", chat, "--update", "plan-t_1", "--", "3 nodes"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	req := <-got
+	if string(req.Chat) != body || req.Update != "plan-t_1" || req.Text != "3 nodes" {
+		t.Fatalf("request = %+v", req)
+	}
+	array := filepath.Join(dir, "array.json")
+	if err := os.WriteFile(array, []byte(`[1]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"not an object": {"--chat-file", array},
+		"missing":       {"--chat-file", filepath.Join(dir, "none.json")},
+		"both layouts":  {"--chat-file", chat, "--blocks-file", chat},
+		"spaced key":    {"--update", " plan"},
+		"long key":      {"--update", strings.Repeat("k", notifyUpdateMax+1)},
+	} {
+		// A request that is not refused goes out and, unanswered here, times out as
+		// outcome-unknown; the short timeout keeps that a quick failure.
+		argv := append([]string{"notify", "--platform", "google_chat", "--timeout", "200ms"}, append(args, "--", "x")...)
+		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) || errors.Is(err, errNotifyOutcomeUnknown) {
+			t.Errorf("%s: err = %v, want a usage refusal", name, err)
+		}
+	}
+}

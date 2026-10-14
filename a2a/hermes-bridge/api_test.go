@@ -1770,7 +1770,7 @@ func TestAPI_CancelBetweenTurnsStaysCanceledWhenTheResultCopyFails(t *testing.T)
 	_, url := startServer(t)
 	stub := newAPIStub(t, nil)
 	b, _ := startAPIBridgeHooked(t, url, stub, nil, func(b *Bridge) {
-		b.resultPublish = func(context.Context, *taskRun, string) error {
+		b.resultPublish = func(context.Context, *taskRun, string, []byte) error {
 			return errors.New("injected result publish failure")
 		}
 	}, func(net.Addr) bool { return true })

@@ -68,11 +68,14 @@ var errNoChatConversation = errors.New("no chat conversation to route to")
 // errRouteDisabled is a bridge configured with no route store (RouteURL).
 var errRouteDisabled = errors.New("no route store configured")
 
-// conversationRoute is the PUT's body.
+// conversationRoute is the PUT's body. Ask is the kind of the task's ask,
+// a mark.ask token (askKind in chat.go): the kanban notifier keeps it marked
+// on the chat messages its cards send while they run.
 type conversationRoute struct {
 	Platform     string `json:"platform"`
 	Conversation string `json:"conversation"`
 	ContextID    string `json:"context_id"`
+	Ask          string `json:"ask,omitempty"`
 }
 
 // routeFor reads the conversation the gateway's authority block names
@@ -110,8 +113,14 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	if err != nil {
 		return err
 	}
+	prompt, _ := promptFromMessage(env.Payload)
+	route.Ask = askKind(prompt)
 	if err := b.putRoute(ctx, sessionID, route); err != nil {
-		if b.recordedRoute(sessionID) == route {
+		// The ask is a reaction's kind, not what a card needs to report
+		// back: an earlier record of the same conversation still routes it.
+		earlier := b.recordedRoute(sessionID)
+		earlier.Ask = route.Ask
+		if earlier == route {
 			b.cfg.Logger.Warn("conversation route PUT failed; the session's earlier record of the same route stands",
 				"session", sessionID, "err", err)
 			return nil

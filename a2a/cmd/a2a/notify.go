@@ -57,13 +57,22 @@ const notifyExitRouteUnavailable = 4
 // notifyExitRouteUnavailable.
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path>] [--timeout <d>] [--] [text]
+// notifyUpdateMax bounds an --update key. The gateway keeps at most 16 per
+// conversation (spec-a2a-payloads, "Card work after the task ends"); the
+// senders pick short ones (plan-<card>-<serial>, question-<card>-<serial>,
+// alert-<event session>).
+const notifyUpdateMax = 128
+
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path> | --chat-file <path>] [--update <key>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
 With --conversation and --context, post into that conversation instead (the
 gateway's conversation key, and the context id its tasks carry): the gateway
 posts only into a live conversation whose session record has that context.
+--chat-file names a kube-agents.chat/v1 object to lay the post out with, the
+text being its fallback; --update names the message: a later notify with the
+same key, in the same conversation, edits that message instead of posting.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway
@@ -80,8 +89,16 @@ func runNotify(args []string) error {
 	contextID := fs.String("context", "", "the conversation's context id (with --conversation)")
 	timeout := fs.Duration("timeout", notifyDefaultTimeout, "how long to wait for the gateway's answer")
 	blocksFile := fs.String("blocks-file", "", "a JSON array of Slack Block Kit blocks to post as one message, with the text as its fallback (Slack only)")
+	chatFile := fs.String("chat-file", "", "a kube-agents.chat/v1 JSON object to lay the post out with, the text as its fallback")
+	update := fs.String("update", "", "a key naming the message: a later notify with the same key edits it in place")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *blocksFile != "" && *chatFile != "" {
+		return errors.New("notify: --blocks-file or --chat-file, not both")
+	}
+	if len(*update) > notifyUpdateMax || strings.TrimSpace(*update) != *update {
+		return fmt.Errorf("notify: --update must be at most %d characters with no surrounding space", notifyUpdateMax)
 	}
 	subject, ok := lib.NotifySubjects[*platform]
 	if !ok {
@@ -111,6 +128,18 @@ func runNotify(args []string) error {
 		}
 		req.Blocks = raw
 	}
+	if *chatFile != "" {
+		raw, err := os.ReadFile(*chatFile)
+		if err != nil {
+			return fmt.Errorf("notify: --chat-file: %w", err)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+			return fmt.Errorf("notify: --chat-file %s is not a JSON object", *chatFile)
+		}
+		req.Chat = raw
+	}
+	req.Update = *update
 	body, err := json.Marshal(req)
 	if err != nil {
 		return err

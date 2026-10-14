@@ -161,6 +161,14 @@ CONVERSATION_ROUTE_KEY = "conversation_route"
 # Bounds on what a route carries: a gateway conversation key and context id
 # are short, and anything longer is not one.
 CONVERSATION_FIELD_MAX_CHARS = 512
+# The kind of ask the turn's prompt is: a `mark.ask` token of the
+# kube-agents.chat/v1 format, chosen by the bridge with
+# slack_presenter.arrival_reaction's rules. Optional. The kanban notifier reads
+# it back to keep the ask's reaction on while the conversation's cards run.
+# Anything but a token is dropped rather than refused: the route itself is what
+# a card needs.
+CONVERSATION_ROUTE_ASK_KEY = "ask"
+CONVERSATION_ASK_TOKEN = re.compile(r"[a-z0-9-]{1,16}")
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -1343,18 +1351,21 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
-def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+def _run_alert_send(active_platform: str, alert_msg: str, session_id: str = "") -> subprocess.CompletedProcess:
     """Run the alert's send, waiting out a gateway route that is briefly not there.
 
     The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
     roll, or its bind retry) is retried on chat_notify's schedule rather than
-    dropping the alert; every other outcome is the caller's to read.
+    dropping the alert; every other outcome is the caller's to read. Under
+    next the post carries the update key of ``session_id``'s alert, so the
+    gateway can edit it in place into the triage when the report lands
+    (slack_ux_incident).
     """
     delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
     for delay in (*delays, None):
         try:
             return subprocess.run(
-                chat_notify.command(active_platform, alert_msg),
+                chat_notify.command(active_platform, alert_msg, update=chat_notify.alert_update_key(session_id)),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -1369,7 +1380,7 @@ def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.Complete
     raise AssertionError("unreachable: the last attempt returns or raises")
 
 
-def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = "") -> str | None:
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
@@ -1379,7 +1390,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = _run_alert_send(active_platform, alert_msg)
+        res = _run_alert_send(active_platform, alert_msg, session_id)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
@@ -2420,7 +2431,8 @@ def trigger_agent_troubleshooter(
         thread_id = None
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
             thread_id = _post_initial_alert(
-                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
+                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg,
+                session_id,
             )
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and
@@ -3985,7 +3997,9 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     the turn files subscribes to `api_server` and this session id, and
     `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
     `conversation_route` (`platform`, `conversation`, the gateway's key, and
-    `context_id`) and addresses the subscription to the conversation. The
+    `context_id`) and addresses the subscription to the conversation; `ask`,
+    when the bridge sends a valid token, is the kind of the turn's ask, which
+    the notifier's chat messages keep marked while the cards run. The
     kanban notifier then posts the card's report with `a2a notify
     --conversation`, and the gateway posts it only if the conversation's
     session record carries that context id.
@@ -3998,6 +4012,7 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     platform = str(request_data.get("platform") or "").strip()
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
+    ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
     prefix = CONVERSATION_KEY_PREFIXES.get(platform)
     if prefix is None:
         raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
@@ -4022,11 +4037,14 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
                     meta = loaded if isinstance(loaded, dict) else {}
                 except ValueError:
                     meta = {}
-            meta[CONVERSATION_ROUTE_KEY] = {
+            route = {
                 "platform": platform,
                 "conversation": conversation,
                 "context_id": context_id,
             }
+            if CONVERSATION_ASK_TOKEN.fullmatch(ask):
+                route[CONVERSATION_ROUTE_ASK_KEY] = ask
+            meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",

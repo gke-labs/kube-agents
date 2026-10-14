@@ -112,14 +112,28 @@ either closes the thread's session, or suspends
 it while the card waits on the user, so the Working… the old process set
 does not stick; it can also clear Working… for another card from before the
 restart that is still running, until that card's next heartbeat or note.
+
+Under ``spec.mode: next`` the A2A gateway holds Slack, and a card reaches the
+thread through the kanban notifier's chat.notify stand-in
+(``kanban_chat_notify``), which has no Slack client. The plan is the same
+state machine: :func:`_render` sends it as a ``kube-agents.chat/v1`` plan
+(``agents/platform/scripts/chat_message.py``) with an ``update`` key, so it is
+edited in place as here, under ``plan-<the plan's first card>-<serial>``, which no
+other plan shares, before or after a restart. The message carries the
+ask's reaction state as ``mark`` when it changes: the ask's kind (recorded on
+the conversation's route by the hermes-bridge) while a card runs, ⏸️ beside
+it while one waits on the user, and ``done`` or ``failed`` once all have
+settled. The session status is the gateway's there, so nothing is set.
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
@@ -132,6 +146,10 @@ try:
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
     _status = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
 
 #: The flag, read here only to word the warning when the presenter is missing.
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -186,6 +204,9 @@ MOVE_KINDS = {"review": "review_requested"}
 #: it refuses, as opposed to a thread with no session yet or a network fault.
 RENAME_REFUSED_ERROR = "invalid_name"
 
+#: Hex characters of the per-process nonce in a plan's ``update`` key: enough
+#: that two notifier processes do not draw the same one.
+KEY_NONCE_CHARS = 8
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
 ASKS_MAX = 512
@@ -288,6 +309,14 @@ _lapsed: OrderedDict[tuple, list] = OrderedDict()
 _seen: OrderedDict[tuple, bool] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
+
+#: ``(channel, thread) -> the mark the thread's plans last carried over chat.notify``. The
+#: mark is the thread's ask's state, so it is the thread's, not one plan's (:func:`_render_chat`).
+_marks_sent: OrderedDict[tuple, dict] = OrderedDict()
+#: The serial in a plan's ``update`` key: this process's nonce, then a count no
+#: plan in the process repeats (:func:`_plan_key`).
+_KEY_NONCE = uuid.uuid4().hex[:KEY_NONCE_CHARS]
+_plan_serials = itertools.count(1)
 #: ``(channel, thread) -> suspended`` for a card waiting after a restart, with
 #: no plan to hold it: :func:`_settle_orphan` sends the legacy setter a clear,
 #: and :func:`set_thread_status` reads this once to send the wait instead.
@@ -481,6 +510,91 @@ def _open(row: _Row) -> bool:
     return _live(row) or (row.status == _status.TASK_ERROR and not row.archived)
 
 
+def _chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is the chat.notify stand-in and the chat message composer is importable."""
+    return _chat is not None and callable(getattr(adapter, "send_chat", None))
+
+
+def _drawable(adapter: Any) -> bool:
+    """Whether a plan can be posted through ``adapter``: a Slack client, or the chat.notify stand-in."""
+    return hasattr(adapter, "_get_client") or _chat_route(adapter)
+
+
+def _plan_key(key: tuple, plan: _Plan) -> str:
+    """The ``update`` key of a new plan: ``plan-<its first card>-<serial>``.
+
+    The serial is this process's nonce and a count no plan in it repeats, so no
+    plan takes another's key and edits that message, which the gateway still
+    holds, down to its own rows: not a plan the same card reopens after a lapse,
+    and not one opened after a restart.
+    """
+    # A new plan is a new ask's: its first mark goes out even when it equals the last ask's.
+    _marks_sent.pop(key, None)
+    first = next(iter(plan.rows), "") or next(iter(plan.pending), "")
+    return _chat.PLAN_UPDATE.format(card=first, serial=f"{_KEY_NONCE}{next(_plan_serials)}")
+
+
+def _thread_rows(key: tuple, plan: _Plan) -> list:
+    """The rows the thread's ask state is read from: every row of the thread's current plan
+    (``plan`` when there is none), and the live rows, running or waiting, of every other plan
+    in the thread, as :func:`_plan_session` reads them for the session status.
+
+    A settled row on another plan is an earlier ask's: a card there that gave up must not mark
+    a later ask failed, and one that completed must not mark it done.
+    """
+    current = _plans.get(key) or plan
+    others = [old for old in (*_lapsed.get(key, ()), plan) if old is not current]
+    live = {id(row): row for old in others for row in old.rows.values() if _live(row)}
+    return [*current.rows.values(), *live.values()]
+
+
+def _thread_mark(adapter: Any, key: tuple, plan: _Plan) -> dict | None:
+    """The ask's state the thread's cards leave, when it changed since the thread's plans last carried it.
+
+    Read from :func:`_thread_rows`: the current plan's cards decide done or failed, and a
+    card still running or waiting on any plan in the thread holds the ask or its pause. With
+    no ask recorded on the route, a lifted pause is still sent (``{}``), as nothing else would
+    take ⏸️ off.
+    """
+    ask_of = getattr(adapter, "ask", None)
+    if not callable(ask_of):
+        return None
+    ask = ask_of(key[0])
+    mark = _chat.plan_mark(ask, _thread_rows(key, plan))
+    sent = _marks_sent.get(key)
+    if mark is None and sent is not None and sent.get("settle") == _chat.SETTLE_BLOCKED:
+        mark = _chat.mark(ask)
+    return None if mark is None or mark == sent else mark
+
+
+async def _render_chat(adapter: Any, key: tuple, plan: _Plan, title: str | None, rows: list) -> bool:
+    """:func:`_render` over chat.notify: the plan as a chat message, edited in place by its key."""
+    chat_id, thread_ts = key
+    chat = _chat.plan_message(title or _alert_title(key) or None, rows)
+    update = plan.ts or _plan_key(key, plan)  # before the mark: a new plan's key starts the thread's mark memory over
+    mark = _thread_mark(adapter, key, plan)
+    if mark is not None:
+        chat["mark"] = mark
+    try:
+        result = await adapter.send_chat(
+            chat_id, _chat.plan_text(title or _alert_title(key) or None, rows), chat, update,
+            metadata={"thread_id": thread_ts},
+        )
+        if getattr(result, "success", False) is not True:
+            raise RuntimeError(getattr(result, "error", None) or "chat.notify refused it")
+    except Exception as exc:  # noqa: BLE001 — the rolling line takes over
+        logger.warning(
+            "slack_ux_status: the plan in %s/%s failed over chat.notify (%s); using progress lines",
+            chat_id, thread_ts, exc,
+        )
+        plan.fallback = True
+        return False
+    plan.ts = update
+    if mark is not None:
+        _remember(_marks_sent, key, mark, SESSIONS_MAX)
+    return True
+
+
 def _prune(plan: _Plan) -> None:
     """Drop the oldest settled rows past ``ROWS_MAX``, so the renderer's cap cuts no live card."""
     extra = len(plan.rows) - _status.ROWS_MAX
@@ -495,6 +609,8 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
     title = _titles.get(key)
     _prune(plan)
     rows = list(plan.rows.values())
+    if _chat_route(adapter):
+        return await _render_chat(adapter, key, plan, title, rows)
     blocks = _status.plan_blocks(title, rows)
     text = _status.plan_text(title, rows)
     try:
@@ -883,7 +999,7 @@ async def deliver_row(
     """
     key = _thread(sub)
     card = str(sub.get("task_id") or "")
-    if not (key[0] and key[1] and card and hasattr(adapter, "_get_client")):
+    if not (key[0] and key[1] and card and _drawable(adapter)):
         return False
     if moved is not None:
         # Not seen: a move opens no row, so the card's terminal event still must.
@@ -950,7 +1066,7 @@ async def start_row(adapter: Any, sub: dict, title: str = "") -> bool:
     """
     key = _thread(sub)
     card = str(sub.get("task_id") or "")
-    if not (key[0] and key[1] and card and hasattr(adapter, "_get_client")) or _shown(key, card):
+    if not (key[0] and key[1] and card and _drawable(adapter)) or _shown(key, card):
         return False
     plan = _plans.get(key)
     if plan is not None and plan.fallback:
@@ -1076,7 +1192,7 @@ async def _open_settled(
     refused post or edit drops the row and leaves the plan fallen back, as a
     refused note does, with a card waiting on the user rolling on it.
     """
-    if not (key[0] and key[1] and card and hasattr(adapter, "_get_client")):
+    if not (key[0] and key[1] and card and _drawable(adapter)):
         return None
     plan = _plans.get(key)
     if plan is None:

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -520,10 +521,31 @@ func finalEvent(events []*Envelope, meta []replayTerminal) replayTerminal {
 	return replayTerminal{}
 }
 
+// chatSchemaFamily prefixes the "schema" of every version of the chat
+// message (lib/chatmsg, which imports this package, so it cannot be used
+// here).
+const chatSchemaFamily = "kube-agents.chat/"
+
+// chatMessagePart reports whether p is a chat message: a data part whose
+// object's "schema" is in the chat message's family.
+func chatMessagePart(p Part) bool {
+	if p.Kind != "data" {
+		return false
+	}
+	// Through a map, so the key matches exactly, as chatmsg's reader does;
+	// a struct decode would take "Schema" too.
+	var head map[string]json.RawMessage
+	var schema string
+	return json.Unmarshal(p.Data, &head) == nil && json.Unmarshal(head["schema"], &schema) == nil &&
+		strings.HasPrefix(schema, chatSchemaFamily)
+}
+
 // ValidateArtifacts enforces assertion 18: a completed task carries at least
 // one result artifact, and reserved names carry only their defined content —
-// result is the deliverable, thinking and progress are text, activity is the
-// structured tool-call trace.
+// result is the deliverable, thinking is text, progress is text with a chat
+// message beside each chunk's text (spec "Chat messages"; the folded
+// artifact holds every chunk's parts), activity is the structured tool-call
+// trace.
 func (t *Task) ValidateArtifacts() error {
 	if t.State == StateCompleted && t.Artifact(ArtifactResult) == nil {
 		return &ProtocolError{Msg: fmt.Sprintf("task %q completed without a result artifact", t.ID)}
@@ -532,8 +554,12 @@ func (t *Task) ValidateArtifacts() error {
 		switch a.Name {
 		case ArtifactThinking, ArtifactProgress:
 			for _, p := range a.Parts {
-				if p.Kind != "text" {
-					return &ProtocolError{Msg: fmt.Sprintf("artifact %q carries a %q part; reserved name is text-only", a.Name, p.Kind)}
+				if p.Kind != "text" && !(a.Name == ArtifactProgress && chatMessagePart(p)) {
+					allowed := "text only"
+					if a.Name == ArtifactProgress {
+						allowed = "text and chat messages only"
+					}
+					return &ProtocolError{Msg: fmt.Sprintf("artifact %q carries a %q part; reserved name carries %s", a.Name, p.Kind, allowed)}
 				}
 			}
 		case ArtifactActivity:

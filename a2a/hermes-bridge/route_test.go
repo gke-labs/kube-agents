@@ -80,7 +80,7 @@ func submitFrom(t *testing.T, c *lib.Client, taskID, contextID, conversation, pr
 }
 
 // Before the turn, the bridge records the conversation its session answers:
-// the platform, the gateway's conversation key and the context id, under the
+// the platform, the gateway's conversation key, the context id and the ask's kind, under the
 // Hermes session id, so a card the turn files can report back there.
 func TestAPI_TheTurnRecordsItsConversationRoute(t *testing.T) {
 	_, url := startServer(t)
@@ -104,7 +104,7 @@ func TestAPI_TheTurnRecordsItsConversationRoute(t *testing.T) {
 	}
 	puts := store.seen()
 	want := routePut{path: "PUT /v1/sessions/a2a-ctx-route/route", auth: "Bearer kv-key",
-		body: conversationRoute{Platform: "slack", Conversation: "slack:dm/D123", ContextID: "ctx-route"}}
+		body: conversationRoute{Platform: "slack", Conversation: "slack:dm/D123", ContextID: "ctx-route", Ask: askQuestion}}
 	if len(puts) != 1 || puts[0] != want {
 		t.Fatalf("route PUTs = %+v, want %+v", puts, want)
 	}

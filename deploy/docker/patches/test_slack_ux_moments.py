@@ -165,6 +165,57 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual(adapter.teams, ["T1"])
         self.assertIn("PR #412", post["text"])
 
+    def test_under_next_the_pr_card_is_a_chat_message_posted_once(self):
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((chat_id, content, chat, update, metadata))
+                return SimpleNamespace(success=True)
+
+        self.assertTrue(_run(runtime.pr_opened(StandIn(), SUB, f"Opened {PR}")))
+        self.assertFalse(_run(runtime.pr_opened(StandIn(), SUB, f"Report: opened {PR}")))
+        (chat_id, text, chat, update, metadata), = sent
+        self.assertEqual((chat_id, update, metadata), ("C0KAGE", "", {"thread_id": "1700000000.000100"}))
+        self.assertEqual(chat["tone"], "success")
+        self.assertEqual(chat["links"][0], {"text": "Open PR ↗", "url": PR, "primary": True})
+        self.assertIn(PR, text)
+
+    def test_under_next_a_card_that_asks_again_posts_a_new_question(self):
+        # Each question has its own key, so the second does not edit the first
+        # up the thread, and the first's settle cannot overwrite the second.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((update, "choices" in chat))
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        adapter = StandIn()
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 1)))
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 2))
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 3)))
+        self.assertEqual(sent, [("question-t_e0c1-1", True), ("question-t_e0c1-1", False), ("question-t_e0c1-3", True)])
+
+    def test_under_next_a_question_after_a_restart_takes_a_new_key(self):
+        # Named by its blocked event, the key does not repeat once the count is gone.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append(update)
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 7)))
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 9)))
+        self.assertEqual(sent, ["question-t_e0c1-7", "question-t_e0c1-9"])
+
     def test_the_pr_sits_beside_a_green_bar_under_its_headline(self):
         adapter = _Adapter()
         _run(runtime.pr_opened(adapter, SUB, f"Opened {PR}"))

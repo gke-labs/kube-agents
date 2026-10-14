@@ -406,6 +406,35 @@ class RuntimeTest(unittest.TestCase):
         kept = [e["text"]["text"] for b in answered if b["type"] == "actions" for e in b["elements"]]
         self.assertEqual(kept, ["GKE Workloads ↗", "Cloud Logs ↗"])
 
+    def test_under_next_the_triage_edits_the_alert_by_its_update_key(self):
+        # The chat.notify stand-in has no Slack client: the edit is a
+        # kube-agents.chat/v1 message under the key the watcher's alert post
+        # carries, and a refusal falls back to the threaded reply.
+        class StandIn(_Adapter):
+            def __init__(self, accept=True):
+                super().__init__()
+                self.accept = accept
+
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                self.log.append(("send_chat", chat_id, content, chat, update))
+                return SimpleNamespace(success=self.accept, error=None if self.accept else "refused")
+
+        adapter = StandIn()
+        _wrapped, res = self.deliver(adapter)
+        self.assertTrue(res.success)
+        (kind, chat_id, text, chat, update), = adapter.log
+        self.assertEqual((kind, chat_id, update), ("send_chat", CHANNEL, "alert-k8s-evt-0000abcd"), "the key the alert was posted under")
+        self.assertEqual(chat["headline"], runtime.parse_triage(REPORT)["headline"])
+        self.assertEqual([c["reply"] for c in chat["choices"]],
+                         [f"{c['text']} — apply Option {letter}" for c, letter in zip(chat["choices"], "AB")])
+        self.assertEqual([c.get("primary", False) for c in chat["choices"]], [False, True])
+        self.assertTrue(text.startswith(chat["headline"]))
+        self.assertIs(self.wrap(adapter), adapter, "an alert is edited once")
+        runtime._edited.clear()
+        refused = StandIn(accept=False)
+        self.deliver(refused)
+        self.assertEqual([e[0] for e in refused.log], ["send_chat", "send"])
+
     def test_an_alert_is_edited_once_even_when_no_row_is_stored(self):
         adapter = _Adapter()
         self.deliver(adapter)
