@@ -149,16 +149,22 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 // slot, then added again). The rings hold at most slackUXCap keys, so the
 // scan is bounded.
 func remember(order *[]string, key string, drop func(string)) {
-	for i, k := range *order {
-		if k == key {
-			*order = append((*order)[:i:i], (*order)[i+1:]...)
-			break
-		}
-	}
+	forget(order, key)
 	*order = append(*order, key)
 	if len(*order) > slackUXCap {
 		drop((*order)[0])
 		*order = (*order)[1:]
+	}
+}
+
+// forget retires key's slot from a ring, if it has one, so the ring counts
+// only live entries.
+func forget(order *[]string, key string) {
+	for i, k := range *order {
+		if k == key {
+			*order = append((*order)[:i:i], (*order)[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -241,12 +247,14 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(set...),
 			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
 	}
+	// Refusals wrapped as slackMessageOptions wraps them, so a caller tells
+	// a refused layout from a failed call (ErrLayoutRefused).
 	if utf8.RuneCountInString(text) > slackChatTextMax {
-		return nil, errSlackChatTooLarge
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
 	}
 	layout, err := renderSlackChat(m.Chat, text)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
 	}
 	if n := len(layout.Attachments); n > 0 {
 		last := layout.Attachments[n-1]
@@ -375,6 +383,9 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 	ux := s.uxLocked()
 	p, ok := ux.pending[key]
 	delete(ux.pending, key)
+	// Its slot too, so the cap counts messages still waiting, and a waiting
+	// click is not evicted behind messages already verified.
+	forget(&ux.pendingOrder, key)
 	if !ok {
 		s.mu.Unlock()
 		return

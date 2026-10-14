@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -523,6 +524,38 @@ func TestSlackSessionUntitleableAskGivesWay(t *testing.T) {
 	want := []string{"status C1/40.0 processing", "status C1/40.0 closed", "status C1/40.0 processing", "rename C1/40.0 check prod"}
 	if got := sessions.got(); !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
+// A verified message gives up its pending slot, so a click still waiting
+// survives any number of messages verified after it.
+func TestSlackWaitingClickOutlivesVerifiedMessages(t *testing.T) {
+	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
+	click, ok := a.interactive(clickPayload(t, "U1", "T1", "C1", "40.0", "kage.choice.0", "Option A", "Option A: restart", "60.1"))
+	if !ok {
+		t.Fatal("click is a turn")
+	}
+	for i := 0; i < slackUXCap+10; i++ {
+		m := InboundMessage{Conversation: "slack:C2/1.0", AuthorID: "U1", MessageID: fmt.Sprintf("m-%d", i), Text: "hi"}
+		a.notePending(m)
+		a.InboundVerified(m.Conversation, m.MessageID, true)
+	}
+	a.mu.Lock()
+	_, waiting := a.uxLocked().pending[slackPendingKey(click.Conversation, click.MessageID)]
+	claimed := a.uxLocked().claims["C1/50.0"]
+	a.mu.Unlock()
+	if !waiting || !claimed {
+		t.Errorf("waiting=%v claimed=%v; the queued click lost its record", waiting, claimed)
+	}
+}
+
+// A settle edit over an answered question that the renderer refuses is a
+// refused layout, not a failed call.
+func TestSlackAnsweredOptionsWrapsRefusals(t *testing.T) {
+	big := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "q"}
+	_, err := slackAnsweredOptions(OutMessage{Text: strings.Repeat("x", slackChatTextMax+1), Chat: big}, "✓ A: B")
+	if !errors.Is(err, ErrLayoutRefused) {
+		t.Errorf("err = %v, want ErrLayoutRefused", err)
 	}
 }
 
