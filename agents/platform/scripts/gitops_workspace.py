@@ -1059,11 +1059,15 @@ def _state_key_path(key: str) -> Path:
 
 def _read_state_key(key: str) -> list[dict[str, str]]:
     """Read one repository list from the mounted state file, else from the ConfigMap via kubectl."""
+    return _parse_repos_json(_read_state_text(key), key)
+
+
+def _read_state_text(key: str) -> str:
+    """One key's raw value: the mounted state file, else the ConfigMap via kubectl."""
     state_file = _state_key_path(key)
     if state_file.is_file():
         try:
-            content = state_file.read_text(encoding="utf-8")
-            return _parse_repos_json(content, key)
+            return state_file.read_text(encoding="utf-8")
         except Exception:
             pass
     elif state_file.parent.is_dir():
@@ -1074,7 +1078,7 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
         # to kubectl here would turn it into the unreadable one -- the broker
         # pod has no context of its own to pass, so the fallback fails and every
         # gated call answers 503 instead of refusing the repository.
-        return []
+        return ""
 
     cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
     ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
@@ -1118,8 +1122,24 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
             f"Failed to parse ConfigMap {cfg_name} JSON output: {e}"
         ) from e
 
-    repos_str = (cm.get("data") or {}).get(key, "")
-    return _parse_repos_json(repos_str, key)
+    return str((cm.get("data") or {}).get(key, ""))
+
+
+def managed_repos_registered() -> bool:
+    """Whether `managed_repos` holds anything but an empty list, readable or not.
+
+    `get_managed_repos` answers `[]` for a value it could not parse and for
+    entries it skips (an unserved forge type, no type at all), and neither is
+    an install with nothing registered. Raises like `get_managed_repos` when
+    the value cannot be read at all.
+    """
+    text = _read_state_text(MANAGED_REPOS_KEY).strip()
+    if not text:
+        return False
+    try:
+        return json.loads(text) != []
+    except json.JSONDecodeError:
+        return True
 
 
 def mounted_repo_entries(key: str) -> list[dict[str, str]]:
