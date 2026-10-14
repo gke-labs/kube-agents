@@ -1003,7 +1003,7 @@ read is final.
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -1036,7 +1036,9 @@ incidents carry `reads` (`{project: [what a later scan must read again]}`). `slo
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
-it is set.
+it is set. `near_deadline` is `null` or, on a `GREEN` tick, the near-deadline note
+(`{since, runs, max_s, max_build, deadline_s}`, `docs/ci-health.md`, "Close to the
+deadline").
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
@@ -1311,6 +1313,10 @@ is the same cut for [2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of
 them killed at the deadline with `eval_verdict: null` (#1880, #1894); the
 test asserts the `deadline_kill` OUTAGE from the third kill and a lull
 reading as recovering.
+`testdata_health/near-deadline-2026-09-17.json.gz` is the same cut for
+[2026-09-17 04:00Z, 2026-09-17 16:30Z) — four runs concluding on the afternoon
+a 356-minute run finished with the gate staying GREEN (#2873); the test
+asserts the `near_deadline` note from 16:00Z that day and none at 04:00Z.
 
 `testdata_store/` holds four **real** objects from the evidence store's
 first recording night (2026-09-17, build 2100374258805903360, commit

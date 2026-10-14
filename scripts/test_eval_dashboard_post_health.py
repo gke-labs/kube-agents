@@ -88,6 +88,22 @@ def slow(**note):
     return doc
 
 
+def near_deadline_note(since="2026-09-17T16:00:00+00:00", max_s=356 * 60, runs=14, max_build="183592847291", deadline_s=360 * 60):
+    return {
+        "since": since,
+        "runs": runs,
+        "max_s": max_s,
+        "max_build": max_build,
+        "deadline_s": deadline_s,
+    }
+
+
+def near_deadline(**note):
+    doc = health()
+    doc["near_deadline"] = near_deadline_note(**note)
+    return doc
+
+
 def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:00", **over):
     """health.py's rule-8 note. The default is the #1069 incident's shape: a
     full pool, two runs queued past the limit, and a 22-minute median over the
@@ -763,6 +779,17 @@ class Digest(RunHarness):
         self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
         self.assertNotIn("Slow since", self.opener.texts[2])
 
+    def test_digest_carries_the_near_deadline_line_while_it_lasts(self):
+        self.tick(near_deadline(), T0.replace(hour=7))  # the note itself
+        self.tick(near_deadline(), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "⏱ Close to the deadline since 12:00 PM ET: slowest run 356 min, 4 min of headroom.",
+        )
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
+        self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
+        self.assertNotIn("Close to the deadline since", self.opener.texts[2])
+
 
 # --------------------------------------------------------------------------- #
 # The slow note
@@ -805,6 +832,50 @@ class SlowNote(RunHarness):
         self.tick(slow(), self.at(10, 30))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "🐢"])
         self.assertTrue(self.recorded()["slow"])
+
+
+class NearDeadlineNote(RunHarness):
+    def test_posted_once_per_episode_and_again_after_it_clears(self):
+        # Morning ticks, clear of the 12:40-13:20Z digest window.
+        self.tick(near_deadline(), self.at(10))
+        self.tick(near_deadline(), self.at(10, 15))
+        self.tick(near_deadline(), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 1, "one note for the episode")
+        self.assertTrue(self.recorded()["near_deadline"])
+        self.tick(health(), self.at(10, 45))
+        self.assertEqual(len(self.opener.requests), 1, "clearing is not news")
+        self.assertFalse(self.recorded()["near_deadline"])
+        self.tick(near_deadline(max_s=327 * 60), self.at(15))
+        self.assertEqual(len(self.opener.requests), 2, "a new episode is")
+        self.assertIn("slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout.", self.opener.texts[1])
+
+    def test_a_failed_note_is_retried_next_tick(self):
+        self.tick(health(), T0)
+        rc, err = self.tick(near_deadline(), T0.replace(minute=15), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: near_deadline", err)
+        self.assertFalse(self.recorded()["near_deadline"], "not told yet")
+        self.tick(near_deadline(), T0.replace(minute=30))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertTrue(self.recorded()["near_deadline"])
+
+    def test_a_note_that_vanishes_with_the_state_is_told_again_when_green_returns(self):
+        self.tick(near_deadline(), self.at(10))
+        self.tick(outage(), self.at(10, 15))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏱", "🔴"])
+        self.assertEqual((self.recorded()["state"], self.recorded()["near_deadline"]), ("OUTAGE", False))
+        self.tick(near_deadline(), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "⏱"])
+        self.assertTrue(self.recorded()["near_deadline"])
+
+    def test_render_message(self):
+        self.tick(near_deadline(), self.at(10))
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(
+            lines[0],
+            "⏱ *Smoke gate: close to the deadline* — slowest run 356 min in the last 24h, 4 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
+        )
+        self.assertEqual(lines[1], f"{URL}#view=agent")
 
 
 class PoolNote(RunHarness):

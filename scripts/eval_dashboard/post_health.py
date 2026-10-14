@@ -157,6 +157,7 @@ KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
+KIND_NEAR_DEADLINE = "near_deadline"  # qualifying runs approach the Prow job timeout; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
@@ -463,6 +464,11 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     # digest carries it while it lasts, and "back to normal" is not news.
     if health.get("slow") and not (prev or {}).get("slow"):
         kinds.append(KIND_SLOW)
+
+    # The near_deadline note goes out when the note appears, not when it clears: the
+    # digest carries it while it lasts, and "back to normal" is not news.
+    if health.get("near_deadline") and not (prev or {}).get("near_deadline"):
+        kinds.append(KIND_NEAR_DEADLINE)
 
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
     # not yet named this episode. A breach message also needs a live queue or
@@ -823,6 +829,31 @@ def render_slow(health: dict) -> str:
             dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
+
+
+def near_deadline_text(nd: dict) -> str:
+    max_min = minutes_text(nd.get("max_s"))
+    headroom_min = DEADLINE_MINUTES - int(nd.get("max_s", 0) // 60) if nd.get("max_s") is not None else 0
+    return f"slowest run {max_min} min in the last 24h, {headroom_min} min under the {DEADLINE_MINUTES}-minute Prow timeout"
+
+
+def render_near_deadline(health: dict) -> str:
+    nd = health.get("near_deadline") or {}
+    return "\n".join(
+        [
+            (
+                f"⏱ *Smoke gate: close to the deadline* — {near_deadline_text(nd)}. Not a break."
+                f" Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
+            ),
+            dashboard_link(DASHBOARD_VIEW_AGENT),
+        ]
+    )
+
+
+def near_deadline_digest_line(nd: dict) -> str:
+    max_min = minutes_text(nd.get("max_s"))
+    headroom_min = DEADLINE_MINUTES - int(nd.get("max_s", 0) // 60) if nd.get("max_s") is not None else 0
+    return f"slowest run {max_min} min, {headroom_min} min of headroom"
 
 
 def pool_numbers(pool: dict) -> list[str]:
@@ -1441,6 +1472,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
     if health.get("slow"):
         lines.append(f"🐢 Slow since {clock(parse_iso(health['slow'].get('since')))}: {slow_text(health['slow'])}.")
+    if health.get("near_deadline"):
+        lines.append(f"⏱ Close to the deadline since {clock(parse_iso(health['near_deadline'].get('since')))}: {near_deadline_digest_line(health['near_deadline'])}.")
     ceiling = metrics.get("ceiling_reps") or 0
     if ceiling:
         # Apart from the headline's infra count on purpose: these repetitions
@@ -1479,6 +1512,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_pool_scan(health)
     if kind == KIND_SLOW:
         return render_slow(health)
+    if kind == KIND_NEAR_DEADLINE:
+        return render_near_deadline(health)
     if kind == KIND_POOL:
         return render_pool(health)
     if kind == KIND_POOL_CLEAR:
@@ -1647,6 +1682,7 @@ def run(
     told_fixture = KIND_FIXTURE_SCAN in sent
     told_pool_scan = KIND_POOL_SCAN in sent
     told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
+    told_near_deadline = KIND_NEAR_DEADLINE in sent or KIND_NEAR_DEADLINE not in kinds
     # The pool note records its verdict rather than a bit, because a verdict
     # change inside one episode is its own message (see decide). The clear is
     # held to the same bar: dropping the verdict on a send that failed would
@@ -1739,6 +1775,7 @@ def run(
             pool_state_unknown(health) if told_pool_scan and pool_state_unknown(health) is not None else bool(before.get("pool_state_unknown"))
         ),
         "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
+        "near_deadline": bool(health.get("near_deadline")) if told_near_deadline else bool(before.get("near_deadline")),
         # No artifact is not a reading: clearing the verdict on a blind tick
         # re-posts the same breach once the fetch recovers.
         "pool_verdict": (
