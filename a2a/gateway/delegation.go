@@ -416,7 +416,7 @@ func capAsk(text string) string {
 // and then ended otherwise wakes with those answers, then its reason under
 // wakeEndMarker. With none the body is the result or the reason alone, as
 // before.
-func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string) string {
+func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer bool) string {
 	outcome, completed, body := "completed", true, result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
@@ -442,8 +442,31 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else if body = strings.TrimSpace(body); body != "" {
 		text += "\n" + fenceWakeBody("", body)
 	}
-	return text
+	if fullAnswer {
+		return text + "\n" + wakeReplyGuideFull
+	}
+	return text + "\n" + wakeReplyGuide
 }
+
+// wakeReplyGuide and wakeReplyGuideFull close every wake's text, chosen by
+// whether the person asking has seen the child's result (wakeNeedsFullAnswer).
+// In a chat the relay has already posted the child's whole result, so the
+// wake adds what it means rather than repeating it. A program behind a door
+// receives only the wake's reply as the root's deliverable (spec-chatops-
+// gateway, "To a program behind a door"), and a chat whose child terminal
+// was found by a heal saw only a status card, so there the wake gives the
+// whole answer. Either way the wake's pod has no delegate
+// tool (delegateToolFor): an interim answer such as "still checking, the
+// results will post here" is reported as that, not asked again, which is how
+// a wake used to loop to the depth bound with nothing answered.
+const (
+	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+)
+
+// wakeReplyGuideMax is the longer of the two guides, which the result
+// body's budget reserves room for.
+var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull))
 
 // wakeFollowUpMarker opens each follow-up's answer in a wake body that
 // carries a child's turns, numbered from the first follow-up.
@@ -511,8 +534,10 @@ func fenceWakeBody(earlier, last string) string {
 	last = breakBacktickRuns(last, wakeFenceMax-1)
 	body := earlier + last
 	fence := wakeFence(body)
-	// label \n fence \n body \n fence
-	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3
+	// label \n fence \n body \n fence, then \n and the closing guide
+	// (wakeReplyGuide or wakeReplyGuideFull), which wakeText appends after
+	// this block.
+	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - wakeReplyGuideMax
 	if len(body) > budget {
 		if keep := budget - len(last) - len("…") - len(wakeTruncatedNote); earlier != "" && keep >= 0 {
 			body = truncateRunes(earlier, keep) + wakeTruncatedNote + last
@@ -671,7 +696,7 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 // It reports whether the wake reached the bus, and when it did not, why, in
 // a phrase for the chain root's terminal reason (observeChildEnd). A stop
 // the requester asked for reports false and no reason.
-func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string) (bool, string) {
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string, resultPosted bool) (bool, string) {
 	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
 	// The gateway published a cancel for the child: the human said stop,
 	// and whatever the executor answered with, waking the session would act
@@ -705,7 +730,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 
 	// The delegating turn's request, carried down a longer chain: the
 	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, turns, result, reason)
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted))
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
@@ -779,4 +804,26 @@ func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.T
 		}
 	}
 	g.observeTaskTerminal(rec.Key, child.rootID(), end.State, end.Source, end.Reason)
+}
+
+// wakeNeedsFullAnswer reports whether the wake has to give the whole answer
+// rather than explain one already shown: when the chain's answer goes to a
+// program behind a door, or when the child's result wasn't posted to the
+// conversation (a heal found the terminal and posted only a status card).
+func wakeNeedsFullAnswer(parent *TaskRef, resultPosted bool) bool {
+	return !resultPosted || wakeToDoor(parent)
+}
+
+// wakeToDoor reports whether the chain's answer goes to a program behind a
+// door (the inject door or the A2A door, by the requester's backend) rather
+// than into a chat, where the child's result has already been posted.
+func wakeToDoor(parent *TaskRef) bool {
+	if parent == nil || parent.Requester == nil {
+		return false
+	}
+	switch parent.Requester.Backend {
+	case injectBackend, a2aBackend, a2aGoogleBackend:
+		return true
+	}
+	return false
 }

@@ -216,6 +216,55 @@ class PrOpenedTest(unittest.TestCase):
         self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
         self.assertEqual([("PR #412" in p["text"], "PR #7" in p["text"]) for p in adapter.posts], [(True, False), (False, True)])
 
+    def test_a_gitlab_com_merge_request_posts_with_a_diffs_button(self):
+        adapter = _Adapter()
+        mr = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened MR !12: {mr}/diffs")))
+        post = adapter.posts[0]
+        self.assertIn("I opened merge request !12 in infra.", post["text"])
+        self.assertEqual([b["text"]["text"] for b in _buttons(_shown(post))], ["Open MR ↗", "Files changed ↗"])
+        self.assertEqual([b["url"] for b in _buttons(_shown(post))], [mr, mr + "/diffs"])
+
+    def test_a_self_managed_merge_request_posts_only_on_a_managed_gitlab_host(self):
+        managed = "https://gitlab.example.com/acme/infra/-/merge_requests/7"
+        unmanaged = "https://gitlab.other.example/acme/infra/-/merge_requests/8"
+        with_port = "https://gitlab.example.com:8443/acme/infra/-/merge_requests/3"
+        entries = (
+            '[{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra.git"},'
+            ' {"type": "github", "url": "https://gitlab.other.example/acme/infra"}]'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "managed_repos"
+            state.write_text(entries)
+            adapter = _Adapter()
+            with mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state)}):
+                self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"Opened {unmanaged}")))
+                self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {managed}")))
+                self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {with_port}")))
+        self.assertEqual(
+            [[b["url"] for b in _buttons(_shown(post))] for post in adapter.posts],
+            [[managed, managed + "/diffs"], [with_port, with_port + "/diffs"]],
+        )
+
+    def test_the_managed_list_is_read_only_for_a_text_with_a_merge_request(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime._gitops, "mounted_repo_entries", return_value=[]) as read:
+            self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {PR}")))
+            self.assertFalse(_run(runtime.pr_opened(adapter, SUB, "Checked the limits.")))
+            read.assert_not_called()
+            _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.com/acme/infra/-/merge_requests/7"))
+            read.assert_called_once()
+
+    def test_without_the_managed_list_only_gitlab_com_counts(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "_gitops", None):
+            self.assertFalse(
+                _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.example.com/acme/infra/-/merge_requests/7"))
+            )
+            self.assertTrue(
+                _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.com/acme/infra/-/merge_requests/7"))
+            )
+
     def test_the_announced_map_is_bounded(self):
         adapter = _Adapter()
         with mock.patch.object(runtime, "ANNOUNCED_MAX", 2):
