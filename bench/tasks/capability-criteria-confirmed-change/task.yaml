@@ -151,14 +151,16 @@ verification_spec:
     check:
       type: report_contains
       # The store numbers its first accepted write 1, so a declared line at
-      # revision 0 reports a change that was not written. Bound to the
-      # declared line's prefix: a fresh store reads revision 0, and a worker
-      # that writes its before state in the same `key=N revision=N` shape in
-      # its prose is not declaring a change. Against the normalized text:
-      # underscores are stripped, so the key reads `poolskewcriticalminors`.
+      # revision 0 reports a change that was not written. Anchored to a whole
+      # line, with the lead a bullet, a quote or indentation adds: a fresh
+      # store reads revision 0, and a worker that mentions its before state
+      # inside a sentence ("the before state was CRITERIA ... revision=0") is
+      # not declaring a change, while the prompt says a declared line carries
+      # nothing else. Against the normalized text: underscores are stripped,
+      # so the key reads `poolskewcriticalminors`.
       forbidden_patterns:
         [
-          "criteria security-patch-orchestrator poolskewcriticalminors=\\d+ revision=0\\b",
+          "(?m)^[-*>\\s]*criteria security-patch-orchestrator poolskewcriticalminors=\\d+ revision=0\\s*\\.?\\s*$",
         ]
   - name: the-two-declared-lines-carry-different-revisions
     role: objective
