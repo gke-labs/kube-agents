@@ -7,36 +7,66 @@ audit or skill.
 
 A GKE minor upgrade replaces the control plane and rebuilds every node. Either event can stop an
 application that did not expect it. kube-agents answers two questions for every cluster: will the
-next upgrade succeed, and what did the last upgrade change. Four pieces answer them, each with its
-own document. Some pieces are on main today; this document and the retrospective design specify the
-rest, and each section below credits what exists.
+next upgrade succeed, and what did the last upgrade change. The agent only reads and reports. A
+person decides and upgrades.
 
-The first piece is a catalogue of twenty ways an upgrade fails. Each entry rests on a public
-incident, on provider documentation or on a reproduction on a test cluster. For every entry it names
-the signal that predicts the failure before the upgrade and the signal that confirms it afterwards.
-See [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
+**Before the upgrade: the readiness report.** A daily job grades each cluster for which GKE holds
+a new version, and the agent grades any cluster on request in chat. Each grade is blocked, unknown
+or ready. Each finding names the object and the setting that blocks. This document specifies the
+report; the Scope table below says which parts exist on main.
 
-The second piece is the readiness report, the subject of this document. A daily job grades every
-cluster for which a new GKE version is pending, then once a week while the version stays pending. In
-chat, the agent grades any cluster against a target version on request. Each grade is blocked,
-unknown or ready, and each finding names the object and the setting that blocks. Once
-a week the upgrade audit grades every cluster that is behind its channel. It adds each cluster whose
-upgrade is held or refused to its ledger issue. This document specifies one verdict per cluster
-family, a set of clusters built from the same template: Go, No-Go or Action required.
-
-The third piece is the retrospective. It runs once at install, at the end of each weekend, and soon
-after each upgrade. It reports what each upgrade did, what failed, which catalogue entry the failure
-matches, and the fix to make before the next upgrade. It records each failure it files as a guard,
-and the next readiness report shows the guard, so the fleet learns from every upgrade. See
+**After the upgrade: the retrospective.** A job runs once at install, at the end of each weekend
+and soon after each upgrade. Its report says what each upgrade did, what failed, which catalogue
+entry the failure matches, and the fix to make before the next upgrade. It records each failure as
+a guard, and the next readiness report shows the guard. See
 [`upgrade-retrospective.md`](upgrade-retrospective.md).
 
-The fourth piece is the test fleet. It carries the before-state of each catalogue entry that a
-standing fixture can hold. The catalogue plans one nightly evaluation case per entry, each grading
-whether the agent names it, and its status table says which cases are registered. See
-[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md) for the scripts, the
-fixtures and the evidence.
+**What both rest on: the catalogue and the test fleet.** The catalogue lists twenty ways an
+upgrade fails, each from a public incident, provider documentation or a reproduction. For each it
+names the signal before the upgrade and the signal after it. The test fleet holds the before-state
+of each entry that a standing fixture can hold. One evaluation case per entry grades whether the
+agent names it. See [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md) and
+[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md).
 
-All of it is read-only. The agent reports and recommends; a person decides and upgrades.
+### The twenty scenarios, as the agent reports them
+
+Each case asks the agent one question about the test fleet and grades a fixed-form answer line.
+The line names the cluster, the object and the finding, so a check reads it without a judge. The
+catalogue's status table says which cases run nightly. One answer the agent gave on the test fleet
+for entry 5, a maintenance exclusion that holds a minor upgrade, quoted from the run's record:
+
+```
+seeded-a: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
+seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2027-01-05; holds the automatic minor upgrade: yes
+seeded-c: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
+seeded-d: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
+```
+
+The check graded five objectives on those lines and passed all five. The five objectives: a line
+exists, it states the scope and end date, it says the exclusion holds the upgrade, and no CVE is
+invented.
+
+### The retrospective, as it reports
+
+The collector reads GKE's upgrade operations for the window, the versions before and after, and
+the objects that failed after each one. It matches each failure to a catalogue entry. It writes one
+block per incident: what happened, what failed, how to detect and mitigate it next time, and the
+guard it recorded. One block from a report produced on the test fleet, quoted with its two tables
+left out and the project name replaced:
+
+```
+### 2 — <project>/us-central1-a/seeded-a — `seeded-capacity/Deployment/inference-server`
+
+**What happened.** new (first seen); channel REGULAR; cluster status RUNNING.
+
+**What failed.**
+| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |
+
+**Mitigation set up.**
+- guard `<project>/us-central1-a/seeded-a#failure#2#seeded-capacity/Deployment/inference-server` failure entry 2 (high), first seen 2026-10-14T19:49:58Z, 1 review(s)
+```
+
+That run reviewed seven clusters in 20 seconds, filed 6 errors and 8 warnings, and held 61 guards.
 
 ## The problem, in one paragraph
 
