@@ -47,6 +47,24 @@ broker. Those refusals are the design, not obstacles to route around.
 
 ## Workflow
 
+### Step 0: A stop ends the request
+
+Every "stop" in this skill is the answer, not a reason to look for another
+way in. When one applies, report it in the words given, change nothing,
+and end: on a kanban card with `kanban_block(kind="needs_input")` and the
+stop as the reason. Do not go on to check what you are allowed to create
+(`kubectl auth can-i create ...`), list Secrets, try another identity, or
+search the filesystem for credentials or a repository; a card that says
+"install and verify" is still answered by the stop.
+
+The first stop comes before anything else: the install must have a GitOps
+repository registered. Read `managed_repos` from the agent's GitOps state
+(the `$GITOPS_STATE_CONFIGMAP` ConfigMap, or the file at
+`$GITOPS_STATE_PATH`). Empty or missing: stop with "This install has no
+registered GitOps repository, so `<chart>` cannot be declared for a
+reconciler to install. Register one in the `PlatformAgent`'s
+`spec.integration.repositories`. I have changed nothing."
+
 ### Step 1: Find what syncs the target cluster
 
 Two places hold the answer, and you need both: the repository holds what the
@@ -229,6 +247,8 @@ ends in `kanban_block(kind="needs_input")` with the stop text as the reason, nev
   credential for `helm` or for any other tool.
 - Never install, enable or configure a reconciler, and never change the
   repository's pipeline, to make a chart installable.
+- Never probe for a write path once a stop applies: no `kubectl auth can-i
+create`, no Secret listing, no `--as` impersonation, no other identity.
 - Never commit rendered chart output as plain YAML. It cannot be upgraded by
   version and nothing reconciles it as a chart.
 - Never leave the version unpinned, and never take a chart from a source the
