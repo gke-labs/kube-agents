@@ -31,7 +31,7 @@ Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared
 
 The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene — or, for the one check that asks how the upgrade would go, the held drain or the refused move above. Invoked by the `security-patch-orchestrator` watchdog.
 
-Its thresholds — the node-skew band that counts as critical, the fleet-spread width, the maintenance-exclusion horizon, and the deprecated image types — are read at run time from the capability criteria store rather than fixed in the SOP. Ask the agent in chat to change one; it shows the before/after and what will start and stop being flagged, and once you agree the next run uses the new value, across restarts and upgrades. The mechanism is in [`agents/platform/capabilities/README.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/capabilities/README.md).
+Its thresholds — the node-skew band that counts as critical, the fleet-spread width, the maintenance-exclusion horizon, and the deprecated image types — are read at run time from the capability criteria store rather than fixed in the SOP. Ask the agent in chat to change one; it shows the before/after and what will start and stop being flagged, and once you agree the next run uses the new value, across restarts and upgrades within the bounds the release ships: a value a later release's schema no longer admits stops applying, and the audit's report names it. The mechanism is in [`agents/platform/capabilities/README.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/capabilities/README.md).
 
 ### `fleet_wide_cost_analysis_sop.md`
 

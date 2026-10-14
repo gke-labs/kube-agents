@@ -30,7 +30,9 @@ the shell sandbox, which never receives this tree, so the agent's `get` is how a
 a candidate's severity, and the manifest the collector writes records the values it used. A key a
 release stops shipping stays on the
 volume until the next `set`, which prunes it and says so in the changelog; the schema is what
-declares it gone.
+declares it gone. A stored value a release's schema no longer admits stops applying: the schema
+default stands in, `get` lists the key under `invalid_keys`, the audit's report names it, and the
+next `set` resets it and says so.
 
 `learning.json` gives each key one of three policies. `propose` means the agent must show the
 operator the before/after and record who agreed before the store accepts the write; `autonomous`

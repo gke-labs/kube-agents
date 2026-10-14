@@ -197,7 +197,8 @@ list. A check that needs new procedure is procedure, and the last row governs it
 ### R6 — Durability
 
 - A customized or learned value survives a pod restart and an image upgrade. An upgrade adds new
-  keys with their shipped defaults and never resets a tuned one.
+  keys with their shipped defaults and never resets a tuned one. A tuned value a release's schema
+  no longer admits stops applying and is named in the report, not kept in force.
 - The learning policy is not something an install can loosen and keep against the image: a
   release that tightens a policy reaches every install.
 - Three tiers, and the agent says which one a change landed in:
