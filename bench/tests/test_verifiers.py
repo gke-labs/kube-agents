@@ -7468,7 +7468,7 @@ _GROUP5 = {
         [
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client (CronJob): client kubectl v1.29.0 (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
-            "seeded-a/seeded-shapes/stale-kubectl-client-29384756-abcde: client: kubectl v1.29.0; server: v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client-29384756-tqbn7: client: kubectl v1.29.0; server: v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client registry.k8s.io/kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client image registry.k8s.io/kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
@@ -7476,6 +7476,7 @@ _GROUP5 = {
             "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
         ],
         [
+            "seeded-a/seeded-shapes/stale-kubectl-client-apiserver-egress: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.30.0 (was v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.34.1; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client helm v3.14.0; server v1.34.1-gke.1234000; within supported skew: no",
@@ -7527,6 +7528,7 @@ _GROUP5 = {
             "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
         ],
         [
+            "seeded-a/seeded-shapes/cni-shaped-agent-legacy: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: no (hostNetwork: false); host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
@@ -7640,9 +7642,10 @@ _GROUP2 = {
             "**seeded-b/no-surge-pool**: nodes 1; replacement node first: no; workloads pinned to this pool: deployment pinned-batch-runner (1 replica)",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: 1 (pinned-batch-runner)",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: one workload: pinned-batch-runner",
-            "1. seeded-b (us-central1-a)/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-7d9f8b6c4-abcde and other-worker",
+            "1. seeded-b (us-central1-a)/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-7d9f8b6c4-tqbn7 and other-worker",
         ],
         [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-canary",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: yes; workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: none",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: batch-runner",
@@ -7661,12 +7664,13 @@ _GROUP2 = {
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node-affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2 (2/2 ready); zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1 (us-central1-a); all replicas in one zone: yes; cause: topology-spread-constraint",
-            "seeded-d/seeded-topology/zone-pinned-api-5f6d7c8b9-x1y2z: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api-5f6d7c8b9-tqbn7: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
             "- `seeded-d/seeded-topology/zone-pinned-api`: replicas: 2; zones in use: 1; all replicas in one zone: yes; cause: spread constraint.",
             "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
             "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
         ],
         [
+            "seeded-d/seeded-topology/zone-pinned-api-canary: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2 (us-central1-a, us-central1-b); all replicas in one zone: yes; cause: topology-spread-constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2; all replicas in one zone: yes; cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: no; cause: node affinity",
@@ -7708,6 +7712,7 @@ _GROUP4 = {
             "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
         ],
         [
+            "seeded-a/seeded-shapes/cache-on-emptydir-shadow: node-local volumes queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes none (the queue directory is scratch); survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache (the queue directory); survives a node rebuild: no",
@@ -7725,7 +7730,7 @@ _GROUP4 = {
     "upgrades-deprecated-node-label-selector-named": (
         [
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
-            "seeded-a/seeded-shapes/arch-pinned-worker-7d9f8b6c4-abcde: label: beta.kubernetes.io/arch; deprecated: yes; replacement: kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker-7d9f8b6c4-tqbn7: label: beta.kubernetes.io/arch; deprecated: yes; replacement: kubernetes.io/arch",
             "- `seeded-a/seeded-shapes/arch-pinned-worker`: label `beta.kubernetes.io/arch`; deprecated: yes; replacement `kubernetes.io/arch`.",
             "**seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch**",
             "1. seeded-a (us-central1-a)/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
@@ -7773,13 +7778,14 @@ _GROUP4 = {
     "upgrades-retired-registry-image-named": (
         [
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
-            "seeded-a/seeded-shapes/legacy-registry-pull-6b7c8d9e5-abcde: image: k8s.gcr.io/pause:3.9; registry host: k8s.gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull-6b7c8d9f5-tqbn7: image: k8s.gcr.io/pause:3.9; registry host: k8s.gcr.io; retired: yes",
             "- `seeded-a/seeded-shapes/legacy-registry-pull`: image `k8s.gcr.io/pause:3.9`; registry host `k8s.gcr.io`; retired: yes.",
             "**seeded-a/seeded-shapes/legacy-registry-pull**: image k8s.gcr.io/pause:3.9 (imagePullPolicy Always); registry host k8s.gcr.io; retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io (frozen 2023); retired: yes",
             "1. seeded-a (us-central1-a)/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
         ],
         [
+            "seeded-a/seeded-shapes/legacy-registry-pull-mirror: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host registry.k8s.io (formerly k8s.gcr.io); retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image registry.k8s.io/pause:3.9; registry host registry.k8s.io; retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: no",
@@ -7963,3 +7969,42 @@ def test_a_gloss_after_any_mid_line_value_is_admitted(case):
         glossed = "; ".join(parts[: k + 1]) + " (object gloss); " + "; ".join(parts[k + 1 :])
         verdicts = _verdicts_for_line(case, glossed)
         assert verdicts and all(s == "pass" for s in verdicts.values()), (k, glossed, verdicts)
+
+
+# The framed cases whose object is a workload, so a pod of it names it: not
+# the no-surge pool, the pod-security namespace, the in-tree volume or the
+# drain case's budget.
+_POD_FRAMED_CASES = [
+    "upgrades-zonal-skew-replicas-warned",
+    "upgrades-node-local-state-named",
+    "upgrades-deprecated-node-label-selector-named",
+    "upgrades-containerd-socket-agent-named",
+    "upgrades-retired-registry-image-named",
+    "upgrades-stale-client-skew-named",
+    "upgrades-cgroup-blind-runtime-named",
+    "upgrades-multi-process-oom-group-named",
+    "upgrades-node-image-coupled-agent-named",
+    "upgrades-cuda-pinned-gpu-job-named",
+]
+
+
+@pytest.mark.parametrize("case", _POD_FRAMED_CASES)
+def test_a_pod_name_after_the_object_is_admitted(case):
+    """A pod of the planted workload grades as the workload: a Deployment's
+    hash and suffix, a Job's minute stamp and suffix, a DaemonSet's suffix, all
+    in Kubernetes' vowel-free alphabet."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    for suffix in ("-6kgp9sxz4-tqbn7", "-29384756-tqbn7", "-tqbn7"):
+        verdicts = _group5_verdicts(case, _group5_report(bare.replace(": ", suffix + ": ", 1)))
+        assert verdicts and all(s == "pass" for s in verdicts.values()), (suffix, verdicts)
+
+
+@pytest.mark.parametrize("case", _FRAMED_CASES)
+def test_a_sibling_name_after_the_object_is_refused(case):
+    """`zone-pinned-api-canary` is another object, not a pod of the planted one:
+    a vowel is outside the suffix alphabet, so no word list is needed."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    verdicts = _group5_verdicts(case, _group5_report(bare.replace(": ", "-canary: ", 1)))
+    assert verdicts and any(s != "pass" for s in verdicts.values()), verdicts

@@ -20,6 +20,10 @@
 # outside it is the judge's. The volume's kind may stand before its name
 # (emptyDir queue) or in its parenthetical (queue (emptyDir)).
 #
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the volume. Moving the queue to a claim is the heal
@@ -74,7 +78,7 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
 
   - name: the-declared-line-names-the-queue-volume
     role: objective
@@ -85,9 +89,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*; survives a node rebuild: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?!(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?!(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
 
   - name: the-declared-line-says-the-state-does-not-survive
     role: objective
@@ -98,9 +102,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: no$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?!no$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?!no$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
