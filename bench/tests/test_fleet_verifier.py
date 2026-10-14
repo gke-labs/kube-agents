@@ -918,7 +918,10 @@ def test_every_namespace_a_fleet_check_names_matches_the_catalogs_role():
 
 
 def _fleet_checks():
+    parked = _parked_cases()
     for path, spec in _task_specs():
+        if path.parent.name in parked:
+            continue
         for entry in spec.get("verification_spec") or []:
             check = entry.get("check") or {}
             if check.get("type") == "fleet_resource_property":

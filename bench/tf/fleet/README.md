@@ -147,7 +147,7 @@ request that retires the role: remove it from `fixtures.json` and `docs/designs/
 delete its resources from `defects-a.tf` with a `reconcile-allow.json` entry per address (the
 reconciler refuses a delete it does not list), record the after-state against the entry in
 `docs/designs/upgrade-failure-reproductions.md` and move its catalogue row back to _designed_, and
-park the cases that name the role in `FIXTURE_NOT_READY` in the same change.
+park the cases that name the role in the same change: remove their lines from `hack/eval/nightly-cases.txt` and recount its budget paragraph, move their names from `ADDED_AFTER_THE_MOVE` to `PARKED_AFTER_THE_MOVE` in `scripts/test_eval_rosters.py`, and add each to `FIXTURE_NOT_READY` in `scripts/validate_bench_cases.py` with the retirement issue.
 
 ## Activation timeline
 

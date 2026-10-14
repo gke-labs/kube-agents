@@ -84,6 +84,8 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
+      fixture_roles:
+        - version-laggard
       # Under the fold an underscore between two word characters becomes a
       # hyphen before `_normalize` runs, so NO_MINOR_UPGRADES and
       # no_minor_upgrades both arrive as "no-minor-upgrades"; the optional

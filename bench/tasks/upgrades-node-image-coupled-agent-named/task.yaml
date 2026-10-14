@@ -14,6 +14,9 @@
 # end in one declared line per such agent, in a fixed form; the deterministic
 # objectives read the planted DaemonSet's line and nothing else.
 #
+# An item's parenthetical is graded on its first word only (a negation word
+# there is refused); the rest of a gloss is the judge's to read.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the host-path mount. Dropping it is the heal that
@@ -96,9 +99,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}: host network: (?:yes|no); host paths:? ?(?:(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \((?!\s*(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}: host network: (?:yes|no); host paths:? ?(?:(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*; coupled to the node image: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}: host network: (?:yes|no); host paths:? ?(?!(?:(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \((?!\s*(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}: host network: (?:yes|no); host paths:? ?(?!(?:(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   - name: the-declared-line-says-the-agent-is-coupled
     role: objective
