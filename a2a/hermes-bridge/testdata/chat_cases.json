@@ -636,6 +636,14 @@
     {
       "in": "ſhould we page",
       "kind": "incident"
+    },
+    {
+      "in": "roll bacK now",
+      "kind": "change"
+    },
+    {
+      "in": "oomKilled again",
+      "kind": "investigate"
     }
   ]
 }

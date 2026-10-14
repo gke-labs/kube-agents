@@ -361,8 +361,10 @@ func TestNotifyCarriesAChatMessageAndAnUpdateKey(t *testing.T) {
 		"spaced key":    {"--update", " plan"},
 		"long key":      {"--update", strings.Repeat("k", notifyUpdateMax+1)},
 	} {
-		argv := append([]string{"notify", "--platform", "google_chat"}, append(args, "--", "x")...)
-		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) {
+		// A request that is not refused goes out and, unanswered here, times out as
+		// outcome-unknown; the short timeout keeps that a quick failure.
+		argv := append([]string{"notify", "--platform", "google_chat", "--timeout", "200ms"}, append(args, "--", "x")...)
+		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) || errors.Is(err, errNotifyOutcomeUnknown) {
 			t.Errorf("%s: err = %v, want a usage refusal", name, err)
 		}
 	}

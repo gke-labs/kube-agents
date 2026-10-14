@@ -138,8 +138,9 @@ func isPySpace(r rune) bool { return unicode.IsSpace(r) || (r >= '\x1c' && r <= 
 func pyStrip(s string) string { return strings.TrimFunc(s, isPySpace) }
 
 // pyFolds are the non-ASCII letters Python's re.IGNORECASE matches to an
-// ASCII keyword letter: dotted and dotless i, long s, the Kelvin sign.
-var pyFolds = map[rune]rune{'İ': 'i', 'ı': 'i', 'ſ': 's', 'K': 'k'}
+// ASCII keyword letter: dotted and dotless i, long s, the Kelvin sign (an
+// escape, since a normalising editor turns the raw rune into an ASCII K).
+var pyFolds = map[rune]rune{'İ': 'i', 'ı': 'i', 'ſ': 's', '\u212a': 'k'}
 
 // asciiWords stands in for Python's Unicode \s, \b and case folding, which
 // RE2 spells in ASCII: a space Python's \s takes becomes a space, a letter
