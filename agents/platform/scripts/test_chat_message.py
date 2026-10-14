@@ -37,7 +37,7 @@ class StandaloneTest(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 roots.add(node.module.split(".")[0])
         self.assertEqual(
-            roots - {"__future__", "re", "collections", "typing", "chat_notify", "slack_moments", "slack_presenter",
+            roots - {"__future__", "re", "unicodedata", "urllib", "collections", "typing", "chat_notify", "slack_moments", "slack_presenter",
                      "slack_status"},
             set(),
         )
@@ -142,6 +142,19 @@ class ChoicesTest(unittest.TestCase):
         ])
         self.assertIsNone(cm.triage_message(triage, "x" * (cm.FOLD_TEXT_MAX + 1)))
         self.assertTrue(cm.triage_text(triage, "report").startswith("Down.\nRoll back — apply Option A\n"))
+
+    def test_a_link_whose_label_names_another_host_is_dropped(self):
+        # The validator refuses the whole message for it; the composer drops the one link.
+        chat = cm.report_message("x", links=[
+            ("https://grafana.example/d/x", "https://console.cloud.google.com/a"),
+            ("**https**://console.cloud.google.com", "https://console.cloud.google.com/b"),
+            ("Read https://console.CLOUD.google.com.", "https://console.cloud.google.com:443/c"),
+            ("https://good.example@evil.example", "https://evil.example/d"),
+            ("Dashboard", "https://grafana.example/e"),
+        ])
+        self.assertEqual([link["url"] for link in chat["links"]], [
+            "https://console.cloud.google.com/b", "https://console.cloud.google.com:443/c", "https://grafana.example/e",
+        ])
 
     def test_failure_offers_try_again_only_when_asked(self):
         self.assertEqual(cm.failure_message("It failed. Retry?", True)["choices"], [{"text": "Try again"}])

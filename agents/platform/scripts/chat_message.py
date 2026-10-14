@@ -27,8 +27,10 @@ button. The shared cases in ``tests/conformance/chat/`` are the contract;
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import chat_notify as _notify
 import slack_moments as _moments
@@ -60,6 +62,13 @@ PLAN_RESULT_MAX = 256
 PLAN_ID_MAX = 64
 #: A ``severity`` or ``mark`` token: 1-16 characters of ``[a-z0-9-]``.
 TOKEN = re.compile(r"[a-z0-9-]{1,16}")
+#: A URL a link's label carries, and the marks that do not render, as the
+#: validator reads them (``a2a/lib/chattext/links.go``, RE2's ASCII ``\s``); a label whose URL
+#: names another host is refused, and with it the whole message.
+LABEL_URL = re.compile(r"https?://[^\t\n\f\r /?#&<>|'\")]*", re.IGNORECASE)
+LABEL_MARKS = frozenset("*_`")
+LABEL_HOST_TRAILING = ".,;!"
+FORMAT_CATEGORY = "Cf"
 
 #: ``slack_presenter.arrival_reaction``'s emoji names, as ``mark.ask`` tokens.
 ASK_BY_REACTION = {
@@ -211,10 +220,37 @@ def _choice(label: str, reply: str = "", primary: bool = False) -> dict | None:
     return choice
 
 
+def _label_misnames_host(label: str, url: str) -> bool:
+    """Whether ``label`` carries a URL whose host is not ``url``'s, which the validator refuses.
+
+    Reads no more loosely than the validator: a claim that does not parse, has no
+    host or carries userinfo misnames, so a link kept here is never the one that
+    drops the message.
+    """
+    rendered = "".join(c for c in label if c not in LABEL_MARKS and unicodedata.category(c) != FORMAT_CATEGORY)
+    claims = LABEL_URL.findall(rendered)
+    if not claims:
+        return False
+    try:
+        dest = (urlsplit(url).hostname or "").lower()
+        for claim in claims:
+            parts = urlsplit(claim.rstrip(LABEL_HOST_TRAILING))
+            if parts.username is not None or not parts.hostname or parts.hostname.lower() != dest:
+                return True
+    except ValueError:
+        return True
+    return not dest
+
+
 def _links(pairs: Iterable[Any], primary_first: bool = False) -> list[dict]:
-    """``(label, url)`` pairs as links, refused urls dropped as today drops them, the first maybe primary."""
+    """``(label, url)`` pairs as links, refused urls dropped as today drops them, the first maybe primary.
+
+    A link whose label names another host is dropped too: the spec refuses the
+    whole message for it, where today draws the button.
+    """
     out = []
-    for label, url in _presenter._link_pairs(pairs)[:LINKS_MAX]:
+    kept = [(label, url) for label, url in _presenter._link_pairs(pairs) if not _label_misnames_host(_line(label), url)]
+    for label, url in kept[:LINKS_MAX]:
         link: dict = {"text": _presenter._clip(_line(label), _presenter.BUTTON_TEXT_MAX), "url": url}
         if primary_first and not out:
             link["primary"] = True
