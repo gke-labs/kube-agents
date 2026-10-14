@@ -212,6 +212,27 @@ def test_an_allowance_does_not_excuse_a_pull_request_the_reply_did_not_name(env,
     assert res.raw["unrequested"] and res.raw["requested"] == []
 
 
+def test_a_link_on_a_mistyped_repository_is_named_in_the_verdict(env, github):
+    """#3048: the reply links its own pull request under a misspelled repository.
+    That names nothing for the allowance, so the write stays unrequested, and the
+    verdict says why instead of leaving the reader to chase another write."""
+    owner, name = REPO.split("/")
+    typo = f"{owner}/{name}s"
+    stash(final_message=f"Fix proposed: https://github.com/{typo}/pull/39")
+    route_listing(github, "pulls-requested-only.json")
+    res = check(requested_pull_requests=1).verify(5.0)
+    assert res.status == "pass"
+    assert res.raw["requested"] == []
+    assert f"the reply links #39 on {typo}, not on {REPO}" in res.reason
+
+
+def test_no_note_when_the_reply_links_the_configured_repository(env, github):
+    stash(final_message=f"Fix proposed: {PR39_URL}")
+    route_listing(github, "pulls-requested-only.json")
+    res = check(requested_pull_requests=1).verify(5.0)
+    assert "the reply links" not in res.reason
+
+
 def test_a_second_write_beyond_the_allowance_is_unrequested(env, github):
     stash(final_message=f"Fix proposed: {PR39_URL}")
     listing = fixture("pulls-unrequested.json")

@@ -646,6 +646,22 @@ def proposal_numbers_named(
     of the other forge, names nothing here."""
     return {n for path, n in proposal_refs(text, forge, environ) if path.lower() == repo.lower()}
 
+def proposal_refs_elsewhere(
+    text: str, repo: str, forge: str, environ: dict[str, str] | None = None
+) -> dict[int, list[str]]:
+    """Pull request numbers ``text`` links on a repository other than ``repo``.
+
+    Number to the other repositories named, for a verdict to say so: a reply that
+    links its own pull request under a mistyped repository (#3048) names nothing
+    for the allowance, and without this the reader is left to find why.
+    """
+    elsewhere: dict[int, list[str]] = {}
+    for path, n in proposal_refs(text, forge, environ):
+        if path.lower() != repo.lower() and path not in elsewhere.get(n, []):
+            elsewhere.setdefault(n, []).append(path)
+    return elsewhere
+
+
 def parse_github_time(value: Any) -> datetime | None:
     """A GitHub API timestamp (``2026-09-25T17:32:18Z``) as an aware datetime, or None."""
     if not isinstance(value, str) or not value.strip():
