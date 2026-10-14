@@ -1208,13 +1208,10 @@ def describe_rules(hook: dict) -> list[str]:
 
 def _pinned_reasons(finding: dict) -> str:
     """Why the server sends the finding's pinned rules nothing, one clause per kind of pair they
-    name: the served pairs pinned to an unserved version (`version_pinned`; the pinned rules
-    themselves when a record carries no labels) and the pairs served at no version
-    (`unserved_pairs`)."""
+    name: the served pairs pinned to an unserved version (`version_pinned`) and the pairs served
+    at no version (`unserved_pairs`); every pinned rule has a label in one list or the other."""
     served = finding.get("version_pinned") or []
     unserved = finding.get("unserved_pairs") or []
-    if not served and not unserved:
-        served = finding.get("pinned_rules") or []
     reasons = []
     if served:
         reasons.append(PINNED_SERVED_REASON.format(pinned=LIST_SEPARATOR.join(served), served=VERSION_V1))
@@ -1239,7 +1236,7 @@ def describe_webhook_finding(finding: dict) -> str:
         matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, reasons=reasons)
     else:
         verdicts = []
-        if live or not (pinned or unknown):
+        if live:
             verdicts.append(RULES_LIVE_ALL if not (pinned or unknown) else RULES_LIVE_SOME.format(live=LIST_SEPARATOR.join(live)))
         if pinned:
             verdicts.append(RULES_PINNED_SOME.format(reasons=reasons, pinned_rules=LIST_SEPARATOR.join(pinned)))
