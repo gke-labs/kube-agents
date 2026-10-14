@@ -1564,6 +1564,10 @@ def load_json(path: Path, default: dict, *, version: int | None = None, now: dat
             loaded = json.load(handle)
     except FileNotFoundError:
         return default
+    except PermissionError:
+        # A file this uid cannot read is an ownership problem, not a crash record: it stays where
+        # it is, and the caller's handler prints the store's denied line with the owner named.
+        raise
     except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError and a non-UTF-8 byte
         _set_aside(path, f"is unreadable ({exc})", now, move_aside)
     if not isinstance(loaded, dict):
@@ -6373,8 +6377,9 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc) + exit_tail, file=sys.stderr)
         return EXIT_USAGE
     except PermissionError as exc:
-        # A store path this uid cannot write, met at the lock or at a write:
-        # one line, with the projects for the recovery `finish`, no traceback.
+        # A store path this uid cannot write or read, met at the lock, at a
+        # write or at a state file's open: one line, with the projects for the
+        # recovery `finish`, no traceback, and nothing moved aside.
         print(store_denied_line(exc) + exit_tail, file=sys.stderr)
         return EXIT_USAGE
     finally:

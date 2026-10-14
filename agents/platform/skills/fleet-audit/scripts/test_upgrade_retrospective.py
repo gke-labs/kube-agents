@@ -323,10 +323,12 @@ class OperationsTest(unittest.TestCase):
         fleet = FakeFleet()
         ops, error = ur.list_operations(PROJECT, datetime(2026, 10, 7, tzinfo=timezone.utc), run=fleet)
         self.assertIsNone(error)
+        # The filter keeps the fixture's upgrade operations; an `all` over an emptied list would hold.
+        self.assertTrue(ops)
         self.assertTrue(all(o["operationType"] in ur.UPGRADE_OPERATION_TYPES for o in ops))
         # Bounded by end, never by start: an operation that ended inside the window counts whatever
         # its start, and one still in flight has no end to bound.
-        self.assertTrue(all(ur.parse_ts(o["endTime"]) >= datetime(2026, 10, 7, tzinfo=timezone.utc) for o in ops))
+        self.assertTrue(all(o.get("endTime") is None or ur.parse_ts(o["endTime"]) >= datetime(2026, 10, 7, tzinfo=timezone.utc) for o in ops))
         self.assertIn("--filter", fleet.calls[0])
         self.assertIn("UPGRADE_MASTER OR UPGRADE_NODES", " ".join(fleet.calls[0]))
         self.assertIn("endTime>=2026-10-07T00:00:00Z OR status!=DONE", " ".join(fleet.calls[0]))
@@ -2112,8 +2114,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         second, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=later, cluster=[SEEDED])
         after = {g["id"] for g in second["guards"] if g["cluster"] == SEEDED}
         # Every guard is kept; the partial review's event rows (no pod list to collapse them into)
-        # add event-only unclassified guards of their own.
+        # add event-only unclassified guards of their own, so the set grows: an `all` over the
+        # new guards alone would hold on an empty set.
         self.assertTrue(before <= after)
+        self.assertTrue(after - before)
         self.assertTrue(all(g["entry"] is None and g["source"] == ur.GUARD_SOURCE_EVENT for g in second["guards"] if g["cluster"] == SEEDED and g["id"] not in before))
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertEqual(ledger["clusters"][SEEDED]["last_run"], "2026-10-08T18:00:00Z")
@@ -2131,6 +2135,29 @@ class LedgerAndGuardsTest(unittest.TestCase):
         fourth, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "storage"), ("seeded-a", "workloads")]), now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
         self.assertEqual({g["id"] for g in fourth["guards"] if g["cluster"] == SEEDED}, before)
         self.assertTrue(fourth["reviews"][0]["reviewed"])
+
+    def test_a_state_file_this_uid_cannot_read_is_reported_not_set_aside(self):
+        # A permission problem is an ownership problem, not corruption: the file stays where it is,
+        # the run stops with the store's denied line naming the path, and no crash record is written.
+        self.collect()
+        ledger = self.home / ur.LEDGER_FILENAME
+        real_open = open
+
+        def deny(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)) and Path(path) == ledger:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", deny):
+            with self.assertRaises(PermissionError):
+                ur.load_json(ledger, {}, now=NOW)
+            with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+        self.assertIn(f"{ledger}: Permission denied", err.getvalue())
+        self.assertNotIn("unreadable", err.getvalue())
+        self.assertTrue(ledger.exists())
+        self.assertEqual(list(self.home.glob("*.unreadable-*")), [])
 
     def test_corrupt_or_foreign_state_is_set_aside_and_the_run_refused(self):
         (self.home / ur.LEDGER_FILENAME).write_text(json.dumps({"version": 99, "clusters": {"keep": {}}}))
@@ -3143,9 +3170,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
             # keeps it rather than moving it aside; the tick's stale file is another uid's from root's
             # side too, replaced by a fresh one rather than written through.
             kc.write_text("the tick's")
-            # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
-            # exercised whoever runs the suite, root included; the log shows no move-aside.
-            with mock.patch.object(os, "geteuid", return_value=fleet_collect.ROOT_UID), owned_by(kc.parent, fleet_collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
+            # The directory's owner and the stale file's owner are the test's own facts (uid 1), so
+            # the keep branch and the replacement are the ones exercised whoever runs the suite, root
+            # included, for whom the real file would be its own and writable; the log shows no move-aside.
+            with mock.patch.object(os, "geteuid", return_value=fleet_collect.ROOT_UID), owned_by(kc.parent, fleet_collect.ROOT_UID + 1), owned_by(kc, fleet_collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
             self.assertNotIn("moved aside", err.getvalue())
             self.assertEqual((kc.exists(), stat.S_IMODE(kc.parent.stat().st_mode), len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")])), (False, fleet_collect.KUBECONFIG_DIR_MODE, 1))
