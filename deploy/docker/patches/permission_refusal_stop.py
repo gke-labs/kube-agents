@@ -151,6 +151,10 @@ _COUNT_ATTR = "_kube_permission_refusals"
 #: mutating verb: a refused write chained before a read does, a ``cat`` or
 #: ``kubectl logs`` whose output happens to carry the shim's lines does not.
 _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
+# Where one command ends and the next begins, and the Python list punctuation an argv
+# literal carries, for reading each kubectl command's own argv out of a call's text.
+_SEPARATOR_RE = re.compile(r"\|\||&&|[;|&\n]")
+_LIST_PUNCT_RE = re.compile(r"[\[\],'\"()]")
 # ``kubectl auth can-i <verb> …`` names a verb in a read's arguments; the phrase is
 # dropped before the word test.
 _CAN_I_RE = re.compile(r"(?<![\w-])kubectl(?:[ \t]+[^\s;|&]+)*?[ \t]+auth[ \t]+can-i\b[^;|&\n]*")
@@ -164,10 +168,9 @@ WARN_MESSAGE = (
     "end the run."
 )
 ADVISORY_WARN_MESSAGE = (
-    "The command policy refused this command. If it would change cluster or cloud state, that "
-    "change is refused however it is attempted: do not retry it through another command, tool, "
-    "flag or identity; report it, and propose it as a pull request only if one was asked for. "
-    "If it only reads, use a spelling the policy allows or report the gap; do not work around it."
+    "The command policy refused this command; its notice above is the rule. A refused change is "
+    "not retried another way: report it, and propose it as a pull request only if one was asked "
+    "for. A refused read is respelled as the policy allows, or reported."
 )
 API_WARN_MESSAGE = (
     "Permission denied by the API (403). Treat it as final for this action: do not retry it "
@@ -200,12 +203,41 @@ def verb_is_mutating(verb_words: list[str]) -> bool:
     return head in MUTATING_VERBS
 
 
+def _kubectl_verbs(command: str):
+    """The verb tuple of each kubectl command in the text, read the way the policy reads
+    an argv (``tools.command_policy``, the module the image ships), or ``None`` when that
+    module is not importable. Each piece between separators is read from its ``kubectl``
+    word on, quotes and Python list punctuation as spaces, so an argv literal, a quoted
+    argument and a bare word all read as their words."""
+    try:
+        from tools.command_policy import _kubectl_verb_and_flag
+    except ImportError:
+        return None
+    verbs = []
+    for piece in _SEPARATOR_RE.split(command):
+        first = _KUBECTL_WORD_RE.search(piece)
+        if first is None:
+            continue
+        # Quotes and list punctuation read as spaces: an argv literal, a quoted
+        # argument and a bare word all read as their words.
+        argv = _LIST_PUNCT_RE.sub(" ", piece[first.start():]).split()
+        verb, _ = _kubectl_verb_and_flag(argv) if argv else (None, None)
+        if verb:
+            verbs.append(list(verb))
+    return verbs
+
+
 def names_a_write(command) -> bool:
-    """Whether the call's own text names kubectl and, after its first ``kubectl`` word, a
-    mutating verb (a word test, used only to tell a refused write chained before an exit-0
-    read from a read that echoed a refusal; a ``set -e`` prologue is before the word)."""
+    """Whether the call's own text runs a kubectl command whose verb is mutating (used only
+    to tell a refused write chained before an exit-0 read from a read that echoed a
+    refusal). The verb is kubectl's first subcommand as the policy reads it, so a verb word
+    elsewhere in the text (a namespace, a ``grep`` argument, ``auth can-i <verb>``) is not
+    one; without the policy module a word test over the text after ``kubectl`` stands in."""
     if not isinstance(command, str):
         return False
+    verbs = _kubectl_verbs(command)
+    if verbs is not None:
+        return any(verb_is_mutating(v) for v in verbs)
     text = _CAN_I_RE.sub("", command)
     first = _KUBECTL_WORD_RE.search(text)
     if first is None:
@@ -228,12 +260,15 @@ def refusal_blocks(result: str) -> list[tuple[str, list[str], bool]]:
     return blocks
 
 
+def definitive_blocks(result: str) -> list[list[str]]:
+    """The verb words of each block that is a refused write (rule, mutating verb, not a local render)."""
+    return [words for rule, words, render in refusal_blocks(result) if rule == DEFINITIVE_RULE and verb_is_mutating(words) and not render]
+
+
 def definitive_block(result: str):
-    """The first block that is a refused write (rule, mutating verb, not a local render), or ``None``."""
-    for rule, words, render in refusal_blocks(result):
-        if rule == DEFINITIVE_RULE and verb_is_mutating(words) and not render:
-            return rule, words, render
-    return None
+    """The first refused write's verb words, or ``None``."""
+    blocks = definitive_blocks(result)
+    return blocks[0] if blocks else None
 
 
 def echoes_refusal(command, result) -> bool:
@@ -245,8 +280,7 @@ def echoes_refusal(command, result) -> bool:
     if not isinstance(command, str) or not command:
         return False
     blocks = refusal_blocks(result)
-    definitive = [(rule, words) for rule, words, render in blocks if rule == DEFINITIVE_RULE and not render and verb_is_mutating(words)]
-    lines = [_VERB_LINE_PREFIX + " ".join(words) for _, words in definitive] or [
+    lines = [_VERB_LINE_PREFIX + " ".join(words) for words in definitive_blocks(result)] or [
         (_VERB_LINE_PREFIX + " ".join(words) if words else "policy rule: " + rule) for rule, words, _ in blocks
     ]
     return bool(lines) and all(line in command for line in lines)

@@ -588,15 +588,15 @@ while kb is not None and queue:
         # nobody here filed. The walk follows both; a lineage follows the
         # first alone.
         fanned_out = []
+        fanned_out_at = {}
         if has_table(kb, "kanban_worker_children"):
-            fanned_out = [
-                r["child_id"]
-                for r in kb.execute(
-                    "SELECT child_id FROM kanban_worker_children WHERE creator_id = ? "
-                    "ORDER BY created_at, child_id",
-                    (tid,),
-                )
-            ]
+            for r in kb.execute(
+                "SELECT child_id, created_at FROM kanban_worker_children WHERE creator_id = ? "
+                "ORDER BY created_at, child_id",
+                (tid,),
+            ):
+                fanned_out.append(r["child_id"])
+                fanned_out_at[r["child_id"]] = r["created_at"]
         children = list(fanned_out) + [
             r["child_id"]
             for r in kb.execute(
@@ -615,6 +615,7 @@ while kb is not None and queue:
         "runs": len(runs),
         "children": list(dict.fromkeys(children)),
         "fanned_out": list(dict.fromkeys(fanned_out)),
+        "fanned_out_at": fanned_out_at,
         "sessions": [],
     }
     cards[tid] = card
@@ -721,6 +722,24 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
             continue
         for child in card.get("fanned_out") or []:
             found.setdefault(str(child), str(card.get("task") or ""))
+    return found
+
+
+def created(summary: dict[str, Any] | None) -> dict[str, float] | None:
+    """Each fanned-out card to the epoch second its creator filed it (``fanned_out_at``, the
+    creator table's ``created_at``); ``None`` when the read did not run. A capture that
+    predates the field yields an empty map, and the ordered checks then count every card."""
+    if not isinstance(summary, dict):
+        return None
+    found: dict[str, float] = {}
+    for card in summary.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        for child, at in (card.get("fanned_out_at") or {}).items():
+            try:
+                found.setdefault(str(child), float(at))
+            except (TypeError, ValueError):
+                continue
     return found
 
 

@@ -704,7 +704,7 @@ _NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config", "init"})
 
 #: The two spellings gcloud accepts for a documentation read; the same pair is in
 #: _GCLOUD_BOOLEAN_FLAGS so the words walker steps over them.
-_GCLOUD_HELP_FLAGS = frozenset({"--help", "-h"})
+_GCLOUD_HELP_FLAGS = _HELP_FLAGS  # the same two words, read by the gcloud surface walk
 
 #: gcloud's release-track words, which precede the surface rather than being one.
 #:

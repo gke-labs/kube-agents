@@ -30,6 +30,14 @@ _spec = importlib.util.spec_from_file_location("command_policy_under_test", _POL
 command_policy = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = command_policy
 _spec.loader.exec_module(command_policy)
+# The runtime reads kubectl's verb through ``tools.command_policy``, the module the image
+# ships; register the same module under that name so the test runs the image's path.
+import types  # noqa: E402
+
+_tools = sys.modules.get("tools") or types.ModuleType("tools")
+_tools.command_policy = command_policy
+sys.modules["tools"] = _tools
+sys.modules["tools.command_policy"] = command_policy
 
 
 def _result(output, exit_code=77):
@@ -215,6 +223,15 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop.classify_refusal("kubectl scale deploy/kube-dns -n kube-system --replicas=3 || true; kubectl auth can-i scale deployments", _result(lines, 0), failed=False), "policy")
         self.assertEqual(stop.classify_refusal("kubectl scale deploy/kube-dns -n kube-system --replicas=3\nkubectl auth can-i get deploy -n kube-system\nkubectl get deploy kube-dns -n kube-system", _result(lines, 0), failed=False), "policy")
         self.assertEqual(stop.classify_refusal("kubectl auth can-i scale deployments -n kube-system; kubectl scale deploy/kube-dns -n kube-system --replicas=3 || true", _result(lines, 0), failed=False), "policy")
+        # The verb is kubectl's first subcommand: a verb word elsewhere in the text is not one.
+        for command in (
+            "kubectl get pods -n run; cat /tmp/refusal.txt",
+            "kubectl logs deploy/api -c debug; cat /tmp/refusal.txt",
+            "kubectl describe deploy kube-dns -n kube-system | grep -i scale; cat /tmp/refusal.txt",
+            "kubectl get events -A | grep -E 'create|delete'; cat /tmp/refusal.txt",
+        ):
+            self.assertEqual(stop.classify_refusal(command, _result(lines, 0), failed=False), "advisory", command)
+        self.assertEqual(stop.classify_refusal("kubectl -n kube-system scale deploy/kube-dns --replicas=3 || true; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "policy")
         # A shell prologue's ``set`` is before the kubectl word, so it is not the verb.
         self.assertEqual(stop.classify_refusal("set -euo pipefail; kubectl get deploy kube-dns -n kube-system -o yaml > /tmp/c.yaml; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
 
@@ -307,7 +324,7 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual((decision.action, decision.code, decision.count), ("warn", stop.API_WARN_CODE, 0))
         gcloud = observe(controller, GCLOUD_REFUSAL, args={"command": "gcloud artifacts docker tags list x"})
         self.assertEqual((gcloud.action, gcloud.code, gcloud.count), ("warn", stop.ADVISORY_WARN_CODE, 0))
-        self.assertIn("use a spelling the policy allows", gcloud.message)
+        self.assertIn("respelled as the policy allows", gcloud.message)
         read = observe(controller, refusal("kubectl", "config", "view"), args={"command": "kubectl config view"})
         self.assertEqual((read.action, read.code, read.count), ("warn", stop.ADVISORY_WARN_CODE, 0))
         self.assertIsNone(controller.halt_decision)
