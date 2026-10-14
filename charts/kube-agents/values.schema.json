@@ -987,9 +987,6 @@
                 "homeChannel": {
                   "type": "string"
                 },
-                "serviceUrl": {
-                  "type": "string"
-                },
                 "adaptiveCards": {
                   "type": "boolean"
                 }
