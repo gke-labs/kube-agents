@@ -67,6 +67,9 @@ SKILL_OVERLAY_MODULE_NAME = "kube_agents_skill_overlay"
 # The same, for the Slack click handler imported by path.
 SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
 
+# The same, for the image build's config merge.
+MERGE_CONFIGS_MODULE_NAME = "kube_agents_merge_configs"
+
 # The published site's content tree. A directory rather than a file, so it is
 # not a Source: D2's assertion is about every page, and a registry would need
 # editing for each page added. site_pages() below answers for the empty set
@@ -587,6 +590,33 @@ SOURCES: dict[str, Source] = {
             "func run(",
         ),
     ),
+    # --- the agent's MCP servers ------------------------------------------
+    # B1 reads the `gke` server's tool filter from the config each profile runs
+    # with. The Platform Agent's is built by merging the shared defaults with
+    # its overlay, and the Cluster Agent's template is copied as it is; the
+    # Dockerfile anchors pin that model of the build, so the test cannot keep
+    # asserting against a merge the image no longer does.
+    "shared_defaults_config": Source(
+        "deploy/shared/defaults/config.yaml",
+        ("mcp_servers:", "container.googleapis.com/mcp"),
+    ),
+    "platform_config": Source(
+        "agents/platform/config.yaml",
+        ("mcp_servers:", "container.googleapis.com/mcp"),
+    ),
+    "cluster_config": Source(
+        "agents/cluster/config.yaml",
+        ("mcp_servers:", "container.googleapis.com/mcp"),
+    ),
+    "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
+    "dockerfile_profile_configs": Source(
+        "deploy/docker/Dockerfile",
+        (
+            "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
+            "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
+            "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+        ),
+    ),
     # --- supply chain -----------------------------------------------------
     # The tool that keeps the mirrored gke-* skills, and the CI step that runs
     # its offline check. C4 reads the pin and the checksum from the first and
@@ -800,6 +830,16 @@ def skill_overlay_module():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(SKILL_OVERLAY_MODULE_NAME, path_of("skill_sync"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def merge_configs_module():
+    """The merge the image build runs on profile configs, imported by path."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(MERGE_CONFIGS_MODULE_NAME, path_of("merge_configs"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

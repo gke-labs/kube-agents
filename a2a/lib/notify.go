@@ -31,7 +31,9 @@ var NotifySubjects = map[string]string{
 
 // NotifyRequest is the body of a chat.notify request.
 type NotifyRequest struct {
-	// Text is the message, chunked under the backend cap on the way out.
+	// Text is the message, chunked under the backend cap on the way out,
+	// except on a conversation request with an Update key, which is one
+	// message (an edit reaches one) and is cut to one chunk.
 	Text string `json:"text"`
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there. On Google Chat it

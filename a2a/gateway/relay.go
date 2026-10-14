@@ -127,6 +127,10 @@ type relayState struct {
 	// ErrTextOnly: its edits are text from then on, and a change to the
 	// progress chat message alone costs no backend edit.
 	lineTextOnly bool
+	// lineRefused is the lineKey of the layout the backend last refused for
+	// this line (an API refusal, or one too large for it), so the same
+	// layout is not re-sent on every later artifact.
+	lineRefused string
 }
 
 // relayFor is the task's render state, created on first use.
@@ -280,7 +284,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		if ask == "" {
 			ask = "the task needs input to continue"
 		}
-		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: question.Message})
+		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
 		g.markFrom(rec, taskID, question)
 		g.updateRollingLine(rec, taskID, rs)
 	default:
@@ -311,7 +315,11 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		// A chat message here is the live message's whole state, so one
 		// without it returns the line to text.
 		progress := g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts)
-		rs.lineChat = progress.Message
+		rs.lineChat = layoutOf(progress)
+		if rs.lineChat != nil && rs.lineRefused != "" && lineKey("", rs) == rs.lineRefused {
+			// The backend refused this very layout already.
+			rs.lineChat = nil
+		}
 		// The mark is state whatever the batch renders.
 		g.markFrom(rec, taskID, progress)
 		if render {
@@ -343,7 +351,7 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		// message and its answer: to every backend, the console included,
 		// since it is not the deliverable the console reads off TASKS.
 		notice := g.readChat(rec.Key, taskID, chatmsg.Notice, a.Artifact.Parts)
-		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: notice.Message})
+		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: layoutOf(notice)})
 		g.markFrom(rec, taskID, notice)
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
@@ -457,7 +465,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			answer.Text = completedNonTextResult
 		} else if !isConsoleConversation(rec.Key) {
 			answerChat = g.resultChat(rec.Key, taskID, rs, replayedResult)
-			answer.Chat = answerChat.Message
+			answer.Chat = layoutOf(answerChat)
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
@@ -681,7 +689,7 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState, taskID string) {
 	rs.turnAnswers = append(rs.turnAnswers, text)
 	if text != "" && !isConsoleConversation(rec.Key) {
 		turn := g.readChatArtifact(rec.Key, taskID, chatmsg.Turn, chunks)
-		g.postMessage(rec.Key, OutMessage{Text: text, Chat: turn.Message})
+		g.postMessage(rec.Key, OutMessage{Text: text, Chat: layoutOf(turn)})
 		g.markFrom(rec, taskID, turn)
 	}
 }

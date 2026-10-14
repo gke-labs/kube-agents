@@ -1,7 +1,7 @@
 {
   "name": "kanban-result-line-is-plain",
   "source": "deploy/docker/patches/test_kanban_progress_lines.py::ResultLineTest",
-  "notes": "result_line: the completed event's summary, first line, markdown dropped, clipped as a note.",
+  "notes": "result_line: the completed event's summary, first line, markdown dropped. Today's result_line clips it to a note's 300; the emitter clips it to 256, the result cap.",
   "input": {
     "rows": [
       {

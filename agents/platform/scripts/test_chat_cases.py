@@ -114,6 +114,12 @@ class CheckCaseTest(unittest.TestCase):
             with self.assertRaisesRegex(cc.CaseError, "not the file's name"):
                 cc.load(Path(tmp))
 
+    def test_load_sorts_by_name_where_a_name_prefixes_another(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a-case-twice", "a-case"):
+                Path(tmp, f"{name}.json").write_text(json.dumps({**_case(), "name": name}))
+            self.assertEqual([c["name"] for c in cc.load(Path(tmp))], ["a-case", "a-case-twice"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,9 +32,9 @@ The persona runs inside the Platform Agent Deployment on top of the [Hermes runt
 | --------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`          | Session and agent-internal ops (chat ingress now lives with the Planning Agent).   |
 | `developer_knowledge` | Remote via `mcp-remote` → `developerknowledge.googleapis.com/mcp` | Authoritative Google Cloud and GKE documentation, API schemas, and best practices. |
-| `gke`                 | Remote via `mcp-remote` → `container.googleapis.com/mcp`          | Kubernetes/GKE cluster access (read-scoped by default).                            |
+| `gke`                 | Remote via `mcp-remote` → `container.googleapis.com/mcp`          | Kubernetes/GKE cluster reads; the server's write tools are not offered.            |
 
-The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster reads/writes go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`.
+The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster reads go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`. Only the server's read tools are registered; changes go through a pull request.
 
 ### Toolsets
 

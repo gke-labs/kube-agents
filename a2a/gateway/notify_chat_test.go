@@ -176,6 +176,20 @@ func TestNotifyUpdateKeysAreBounded(t *testing.T) {
 	}
 }
 
+// Eviction is least recently used: a key edited all along (a plan) outlives
+// the keys created after it.
+func TestNotifyUpdateKeyInUseIsNotEvicted(t *testing.T) {
+	n, conv := newChatNotifier(t, false)
+	serveJSON(t, n, lib.NotifyRequest{Text: "plan", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	for i := 0; i < notifyUpdateKeysMax; i++ {
+		serveJSON(t, n, lib.NotifyRequest{Text: "q", Update: fmt.Sprintf("q%d", i), Conversation: testConversation, ContextID: testContext})
+		serveJSON(t, n, lib.NotifyRequest{Text: "plan, later", Update: "plan", Conversation: testConversation, ContextID: testContext})
+	}
+	if len(conv.posts) != notifyUpdateKeysMax+1 || len(conv.edits) != notifyUpdateKeysMax {
+		t.Fatalf("posts = %d, edits = %d; want the plan edited every time", len(conv.posts), len(conv.edits))
+	}
+}
+
 // An update key edits only what it posted in the same conversation.
 func TestNotifyUpdateKeyIsPerConversation(t *testing.T) {
 	const other = "gchat:spaces/OTHER/threads/T8"
@@ -194,5 +208,22 @@ func TestNotifyRefusesAnOverlongUpdateKey(t *testing.T) {
 		Conversation: testConversation, ContextID: testContext})
 	if got.Error == "" || len(conv.posts) != 0 {
 		t.Fatalf("reply = %+v, posts = %d; want a refusal", got, len(conv.posts))
+	}
+}
+
+// A keyed chat edit that fails because the message cannot be edited at all
+// (gone, the API failing) is no layout refusal: nothing is counted refused,
+// and the request posts anew, laid out.
+func TestNotifyKeyedEditOfAGoneMessageCountsNoRefusal(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	n.metrics = NewMetrics()
+	serveJSON(t, n, lib.NotifyRequest{Text: "plan", Chat: notifyChat(t, testPlan), Update: "plan", Conversation: testConversation, ContextID: testContext})
+	conv.failEdits = true
+	serveJSON(t, n, lib.NotifyRequest{Text: "plan, later", Chat: notifyChat(t, testPlan), Update: "plan", Conversation: testConversation, ContextID: testContext})
+	if got := counterValue(t, n.metrics.chatMessages.WithLabelValues(chatRefused)); got != 0 {
+		t.Fatalf("refused = %v, want 0", got)
+	}
+	if got := counterValue(t, n.metrics.chatMessages.WithLabelValues(chatRendered)); got != 2 || len(conv.posts) != 2 {
+		t.Fatalf("rendered = %v, posts = %d; want the second request posted anew, laid out", got, len(conv.posts))
 	}
 }

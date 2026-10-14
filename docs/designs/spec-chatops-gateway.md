@@ -1707,7 +1707,8 @@ chunk, a progress artifact, a `notice` artifact (one message of its own, posted 
 message of an `input-required` status, and a terminal status, whose chat message is its `mark`
 alone. A chat message that breaks a rule is dropped whole, logged with the rule it broke and
 counted (`chat_messages_total{outcome="invalid"}`, under Metrics), and its text posts as it
-would have; a bad `mark` drops alone. What survives reaches the adapter as a message value,
+would have; a bad `mark` drops alone, and a chat message that carries only a `mark` lays
+nothing out. A result recovered by replaying the stream after a restart arrives folded, which loses the chunk a chat message rode on, so the last-chunk rule is not applied to it. What survives reaches the adapter as a message value,
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, Google Chat, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
@@ -1724,7 +1725,8 @@ The Slack adapter lays a chat message out as Block Kit, in the spec's fixed orde
 notification and a thread read-back carry it): the headline bold with the note after it on the
 same line, as one `rich_text` block; the detail under it; the rows between two dividers, each led
 by its severity as inline code; the `after` lines; the fold as a collapsible `container`,
-collapsed, its text as escaped mrkdwn sections sent `verbatim` and its table as a native `table`
+collapsed (a fold with neither text nor a table is omitted), its text as escaped mrkdwn sections
+sent `verbatim`, cut smaller where escaping would take one past Slack's cap, and its table as a native `table`
 block whose first row is the column names; then the buttons, choices before links, five to an
 `actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
@@ -1743,12 +1745,15 @@ reach, makes the message one the adapter will not send (`blocksMention`, the not
 check). The blocks go on the wire as the renderer wrote them, not through slack-go's types.
 The live message shows the newest progress chat message under every display mode, and keeps it
 when the task ends, its text turning to the terminal line; a progress artifact without one turns
-the message back to text. A click on a choice button is a message from the clicker whose text
-is the button's `value` (Reactions, clicks and Agent Sessions, above); a link button opens its
-url and its click is only acked. That is the exception to the notify route's refusal of
-interactive blocks: a raw `blocks` request is the sender's layout and the gateway cannot vouch
-for what a click sends, while a chat message's buttons are the gateway's own, built from
-validated choices whose click text the gateway reads as an ordinary message. The fold's text goes through
+the message back to text. A layout the backend refuses is not offered again until the progress
+chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
+so a live message laid out before a gateway restart does not keep a stale plan. A click on a
+choice button is a message from the clicker whose text is the button's `value` (Reactions,
+clicks and Agent Sessions, above); a link button opens its url and its click is only acked.
+That is the exception to the notify route's refusal of interactive blocks: a raw `blocks`
+request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat
+message's buttons are the gateway's own, built from validated choices whose click text the
+gateway reads as an ordinary message. The fold's text goes through
 `toMrkdwn`, the translation the text path uses, so markdown the text path leaves raw (a heading,
 a bullet) shows raw there too. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
 message the shared cases in `tests/conformance/chat/` expect, checked on every run.
@@ -1759,9 +1764,10 @@ the text elsewhere. The first request with an `update` key posts one message, it
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or an edit that fails posts anew.
-A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the oldest forgotten
-first. A notify's `mark` is drawn once its post lands, on the ask of the conversation's latest
-chain (Reactions, clicks and Agent Sessions, above).
+A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
+forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
+`mark` is drawn once its post lands, on the ask of the conversation's latest chain (Reactions,
+clicks and Agent Sessions, above).
 
 ## The console adapter (added 9/23)
 

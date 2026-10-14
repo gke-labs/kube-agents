@@ -162,6 +162,7 @@ currently fails.
 | B1  | every kubectl write verb refused                                           | 1        | `test_B1_kubectl_write_verbs_are_refused`                                           | `kubectl delete namespace prod` reaching the sidecar and running                                                                                                                                                                                         |
 | B1  | ordinary reads still work                                                  | 1        | `test_B1_ordinary_reads_still_work`                                                 | an over-strict gate that gets globally disabled                                                                                                                                                                                                          |
 | B1  | gcloud write commands refused                                              | 1        | `test_B1_gcloud_write_commands_are_refused`                                         | —                                                                                                                                                                                                                                                        |
+| B1  | the `gke` MCP server offers each profile read tools only                   | 1        | `test_B1_the_gke_mcp_server_offers_no_write_tool`                                   | a hosted MCP write on the pod's Workload Identity credential, outside the broker: `create_cluster` with no pull request on a `custom` role set, and `patch_k8s_resource` on a fleet cluster                                                              |
 | B1  | the sandbox image ships no credentialed CLI                                | 1        | `test_B1_the_sandbox_image_ships_no_credentialed_cli`                               | a gate in a stage the agent image does not derive from                                                                                                                                                                                                   |
 | B1  | the shipped denylist refuses credential disclosure                         | 1        | `test_B1_the_shipped_denylist_refuses_credential_disclosure`                        | `gcloud auth print-access-token`, `gh auth token`, `kubectl config view --raw`                                                                                                                                                                           |
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
@@ -358,8 +359,8 @@ suite once at the end: a run that ends red says so and exits non-zero.
 
 ## `chat/` holds data, not tests
 
-Each file in `chat/` pairs an input from a `today` presenter test with the
-`kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
+Each file in `chat/` pairs an input, lifted from a `today` presenter test or
+built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
 spec gives its chat message assertions (27 and 28) this directory as their
 home, but they are wire-format rules rather than security invariants, so
 `run.py` and the self-check never read these files. The Go tests in

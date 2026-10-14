@@ -47,7 +47,9 @@ var specExample = chatmsg.Message{
 //	SLACK_LIVE_BOT_TOKEN=xoxb-… SLACK_LIVE_CHANNEL=C… \
 //	go test ./gateway -run TestLiveSlackChatCases -v -count=1
 //
-// SLACK_LIVE_CASES, a comma-separated list of case names, posts only those.
+// SLACK_LIVE_CASES, a comma-separated list of case names, posts only those;
+// SLACK_LIVE_EDIT set also edits the spec example back to text with Edit,
+// which sends the blocks and side bar cleared.
 func TestLiveSlackChatCases(t *testing.T) {
 	botToken := os.Getenv("SLACK_LIVE_BOT_TOKEN")
 	channel := os.Getenv("SLACK_LIVE_CHANNEL")
@@ -76,6 +78,13 @@ func TestLiveSlackChatCases(t *testing.T) {
 			t.Errorf("%s: Slack refused the layout: %v", liveSpecExample, err)
 		} else {
 			t.Logf("%s posted as %s", liveSpecExample, ts)
+			// A text Edit of a laid-out message, as the rolling line's after
+			// a gateway restart: Slack must take the cleared blocks.
+			if os.Getenv("SLACK_LIVE_EDIT") != "" {
+				if err := a.Edit(conv, ts, liveSpecExample+" edited back to text"); err != nil {
+					t.Errorf("%s: Slack refused the text edit that clears the layout: %v", liveSpecExample, err)
+				}
+			}
 		}
 	}
 	paths, err := filepath.Glob(filepath.Join(chatCasesDir, "*.json"))

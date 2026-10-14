@@ -151,7 +151,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      chatMessagesName,
-			Help:      "kube-agents.chat/v1 messages the gateway read, by outcome: rendered (laid out by the backend), text_only (a backend that renders none posted the fallback), refused (the backend could not hold it or its API refused it; the fallback posted), invalid (it broke a rule and was dropped; the fallback posted, or for a bad mark alone the mark was dropped).",
+			Help:      "kube-agents.chat/v1 messages the gateway handed a chat adapter or dropped, counted per hand-over, by outcome: rendered (laid out by the backend), text_only (a backend that renders none posted the fallback), refused (the backend could not hold it or its API refused it; the fallback posted), invalid (it broke a rule and was dropped; the fallback posted, or for a bad mark alone the mark was dropped).",
 		}, []string{labelOutcome}),
 	}
 	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages)

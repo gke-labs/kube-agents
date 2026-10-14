@@ -1,8 +1,10 @@
 """Reader for the shared kube-agents.chat/v1 cases in ``tests/conformance/chat/``.
 
-Each case is one JSON file: an ``input`` lifted from a today presenter test
-(``source`` names it) and the ``expected`` chat messages the next-mode emitter
-owes for it, one per output in order. ``a2a/lib/chatmsg`` checks every expected
+Each case is one JSON file: an ``input`` and the ``expected`` chat messages the
+next-mode emitter owes for it, one per output in order. ``source`` names the
+today test the case comes from: the test its input was lifted from, or, where
+the input was built to show a rule (a window past its cap, say), the test that
+pins that rule; ``notes`` says where the two differ. ``a2a/lib/chatmsg`` checks every expected
 message against the full validator; this reader checks the files' shape so the
 Python presenters can be run against them (``spec-a2a-payloads.md``, "Chat
 messages"). A case with ``input.events`` has one ``expected`` entry per event,
@@ -139,7 +141,8 @@ def check_case(case: Any, stem: str, root: Path = REPO_ROOT) -> None:
 
 def load(cases_dir: Path = CASES_DIR) -> list[dict]:
     """Every case under ``cases_dir``, checked, sorted by name. Raises on an empty directory."""
-    paths = sorted(cases_dir.glob(CASE_GLOB))
+    # By stem, not path: "pr-opened.json" sorts after "pr-opened-twice.json", "pr-opened" before it.
+    paths = sorted(cases_dir.glob(CASE_GLOB), key=lambda path: path.stem)
     if not paths:
         raise CaseError(f"no cases under {cases_dir}")
     cases = []

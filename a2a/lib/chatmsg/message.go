@@ -315,6 +315,11 @@ func Part(c Carrier, m Message) (lib.Part, error) {
 	if m.Schema == "" {
 		m.Schema = Schema
 	}
+	// A renderer reads a terminal's mark alone, so layout there would ride
+	// with no fallback and vanish unread (assertion 27).
+	if c == Terminal && !m.MarkOnly() {
+		return lib.Part{}, &RuleError{Field: "layout", Rule: "a terminal status-update carries mark alone; use MarkPart"}
+	}
 	if layout, mark := Validate(m, c); layout != nil {
 		return lib.Part{}, layout
 	} else if mark != nil {
