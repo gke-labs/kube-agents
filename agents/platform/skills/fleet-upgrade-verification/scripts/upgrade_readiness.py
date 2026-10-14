@@ -1040,6 +1040,20 @@ def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
             and all(_resource_parent(spec) in _graded_resource_names(targets) for spec in specs))
 
 
+def _rule_versioned_off_lists(rule: dict, targets: tuple) -> bool:
+    """Whether this rule names only a version other than `*` and `VERSION_V1`, on named groups
+    and resources none of which is graded: the reader cannot say whether the server still serves
+    that version, so the outage cell does not assert that the webhook fails anything now."""
+    versions = set(rule.get("apiVersions") or [])
+    groups = rule.get("apiGroups") or []
+    specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
+    if not versions or {WILDCARD, VERSION_V1} & versions or not groups or not specs:
+        return False
+    if WILDCARD in groups or any(_resource_parent(spec) == WILDCARD for spec in specs):
+        return False
+    return not any(_resource_parent(spec) in _graded_resource_names(targets) for spec in specs)
+
+
 def version_pinned_rules(hook: dict) -> list[dict]:
     """The rules of this webhook the server sends nothing (`_rule_version_pinned`), judged
     against every graded row whatever the selector admits: the served version is the server's."""
@@ -1093,12 +1107,11 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 continue
             matches = upgrade_path_matches(hook) + kube_system_write_matches(hook)
             pinned = [] if matches else version_pinned_rules(hook)
-            # Every rule names a version other than `*` and the served `v1`, and none is on a
-            # graded list: whether the server still serves them is not this reader's to say.
-            versioned_off_lists = not matches and not pinned and all(
-                (rule.get("apiVersions") or []) and WILDCARD not in rule["apiVersions"] and VERSION_V1 not in rule["apiVersions"]
-                and WILDCARD not in (rule.get("apiGroups") or []) and WILDCARD not in (rule.get("resources") or [])
-                for rule in _rules(hook)
+            # Every rule is pinned to a version other than `*` and the served `v1` on groups
+            # and resources wholly off the graded lists: whether the server still serves them
+            # is not this reader's to say.
+            versioned_off_lists = not matches and not pinned and bool(_rules(hook)) and all(
+                _rule_versioned_off_lists(rule, GRADED_TARGETS) for rule in _rules(hook)
             )
             finding = {
                 "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
