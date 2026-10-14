@@ -7256,6 +7256,7 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: n/a — Endpoints is still served",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas, not endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: there are none, though kube-system still writes endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints,none of the others",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: neither, endpoints is only kube-system's",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
         ],
@@ -7707,3 +7708,27 @@ def test_group3_removed_api_refuses_a_long_and_joined_list_at_once():
     verdicts = _group3_verdicts(case, _group3_report(case, line))
     assert time.monotonic() - started < 2.0
     assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
+
+
+def test_group3_removed_api_refuses_a_long_comma_joined_list_at_once():
+    import time
+
+    case = "upgrades-removed-api-callers-distinguished"
+    items = ", ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
+    line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
+    started = time.monotonic()
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
+
+
+def test_group2_no_surge_refuses_nested_unclosed_parentheticals_at_once():
+    import time
+
+    case = "upgrades-no-surge-pool-recreate-warned"
+    items = " and ".join(f"worker{i} (note{i}" for i in range(20))
+    line = f"seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: {items}"
+    started = time.monotonic()
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["the-declared-line-names-the-pinned-workload"] != "pass", verdicts

@@ -296,8 +296,8 @@
 # takes 600s (one maintenance-policy read per cluster, 257-571s measured).
 # About 750 serial minutes at three repetitions, none of it on a lock.
 # Counted from the lists rather than the paragraphs above (which lag the
-# list): eighty-seven cases (261 units) here, of a one-hundred-and-one-case,
-# 303-unit matrix with the presubmit file's fourteen. The eleven on the
+# list): eighty-eight cases (264 units) here, of a one-hundred-and-two-case,
+# 306-unit matrix with the presubmit file's fourteen. The eleven on the
 # seeded-a shapes (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20) read
 # fixtures #2916 plants: they enter the nightly only after the postsubmit
 # reconcile that follows #2916's merge has applied the shapes to every pool

@@ -115,9 +115,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?:(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^,;\n?!])+(?:, ?|,? and ))*(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^,;\n?!])+)*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?:(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^ ,;\n?!])(?:(?! and )[^,;\n?!])*(?:, ?|,? and ))*(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^ ,;\n?!])(?:(?! and )[^,;\n?!])*)*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!(?:(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^,;\n?!])+(?:, ?|,? and ))*(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^,;\n?!])+)*$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!(?:(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^ ,;\n?!])(?:(?! and )[^,;\n?!])*(?:, ?|,? and ))*(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1|\.v1| api| \(core/v1(?:\)|$)| \(v1(?:\)|$))?(?: \([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n/?a|nil|zero|0|not|nope|neither)\b|[-\u2014\u2013])(?:(?! and )[^ ,;\n?!])(?:(?! and )[^,;\n?!])*)*$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
