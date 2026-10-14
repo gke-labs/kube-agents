@@ -1219,6 +1219,13 @@ _MAX_NAMED_COMMANDS = 5
 _SHELL_OPERATOR_CHARS = frozenset("&|;()")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 _SHELL_COMMENT_CHAR = "#"
+_SHELL_QUOTE_CHARS = frozenset("'\"")
+_SHELL_SINGLE_QUOTE = "'"
+_SHELL_ESCAPE_CHAR = "\\"
+_SHELL_LINE_END = "\n"
+# A `#` opens a comment only where a word opens: at the start of the line, after whitespace or
+# after an operator character. Bash then drops the rest of the line, operators included.
+_SHELL_WORD_OPENERS = frozenset(" \t\n\r\f\v") | _SHELL_OPERATOR_CHARS
 _USAGE_FLAGS = ("-h", "--help")
 
 
@@ -1250,13 +1257,48 @@ class WorkerRun(BaseModel):
         return flags
 
 
+def _strip_shell_comments(command: str) -> str:
+    """The command line with its comments removed, as bash reads them: a ``#`` outside quotes
+    that opens a word (at the start of the line, after whitespace or after an operator
+    character) comments out the rest of its line, operators included, so nothing after it runs.
+    A ``#`` inside a word (``readiness-#2.json``, ``$#``), inside quotes (``'#1.json'``) or
+    escaped is part of the word. Read on the raw line, before the quotes come off, because
+    afterwards a quoted ``#1.json`` and a bare one look the same."""
+    kept: list[str] = []
+    quote: str | None = None
+    escaped = False
+    commented = False
+    previous = _SHELL_LINE_END
+    for char in command:
+        if commented:
+            if char != _SHELL_LINE_END:
+                continue
+            commented = False
+        elif escaped:
+            escaped = False
+        elif char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            escaped = True
+        elif quote is not None:
+            if char == quote:
+                quote = None
+        elif char in _SHELL_QUOTE_CHARS:
+            quote = char
+        elif char == _SHELL_COMMENT_CHAR and previous in _SHELL_WORD_OPENERS:
+            commented = True
+            continue
+        kept.append(char)
+        previous = char
+    return "".join(kept)
+
+
 def _shell_words(command: str) -> list[str]:
     """The command line as the shell's words, quotes honoured and removed, operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
-    quotes do not balance is split on whitespace instead. The lexer's ``#`` commenter is off, as
-    in ``shlex.split``: bash reads ``#`` as a comment only at the start of a word, which
-    :func:`_shell_argvs` honours, and a ``#`` inside a word (``readiness-#2.json``) is part of
-    the word."""
+    quotes do not balance is split on whitespace instead. Comments come off first
+    (:func:`_strip_shell_comments`), so the lexer's own ``#`` commenter is off, as in
+    ``shlex.split``: it would cut a word at a ``#`` inside it (``readiness-#2.json``), which
+    bash does not."""
+    command = _strip_shell_comments(command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -1267,26 +1309,18 @@ def _shell_words(command: str) -> list[str]:
 
 
 def _shell_argvs(command: str) -> list[list[str]]:
-    """Each segment of a command line as an argv: the line is tokenised first, so a quoted path
-    is one word and a quoted sentence one word whatever it contains, then split where the shell
-    starts a new command. A shell program anywhere on a segment (``bash -c``, under ``timeout``,
-    ``nohup`` or an ``env``) carries a command line in the word after its ``-c``-style flag,
-    which is read the same way and yields its own argvs."""
+    """Each segment of a command line as an argv: comments come off and the line is tokenised
+    first, so a quoted path is one word and a quoted sentence one word whatever it contains,
+    then split where the shell starts a new command. A shell program anywhere on a segment
+    (``bash -c``, under ``timeout``, ``nohup`` or an ``env``) carries a command line in the word
+    after its ``-c``-style flag, which is read the same way and yields its own argvs."""
     argvs: list[list[str]] = []
     argv: list[str] = []
-    commented = False
     for word in [*_shell_words(command), ";"]:
         if word and set(word) <= _SHELL_OPERATOR_CHARS:
             if argv:
                 argvs.append(argv)
             argv = []
-            commented = False
-            continue
-        if commented:
-            continue
-        if word.startswith(_SHELL_COMMENT_CHAR):
-            # A word opening with `#` starts a comment that runs to the segment's end, as bash reads it.
-            commented = True
             continue
         argv.append(word)
     for argv in list(argvs):
