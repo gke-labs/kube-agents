@@ -9,43 +9,22 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from _seams import SCRIPTS_DIR
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from credential_proxy import CredentialProxyHandler
-
-
-class FakeTeamsRelay:
-    def __init__(self):
-        self.events = []
-        self.settled = []
-        self.api_error = None
-        self._receipts = {"r-live": True}
-
-    def enqueue_event(self, event):
-        self.events.append(event)
-        return True
-
-    def pull(self, timeout_seconds: int = 20):
-        return {"event": self.events.pop(0), "receipt": "r-live"} if self.events else None
-
-    def settle(self, receipt, acknowledge):
-        if receipt not in self._receipts:
-            return False
-        self.settled.append((receipt, acknowledge))
-        return True
-
-    def api_call(self, service_url, path, method="POST", payload=None):
-        if self.api_error is not None:
-            raise self.api_error
-        return {"status": "ok", "serviceUrl": service_url, "endpoint": path}
+from credential_proxy import CredentialProxyHandler, TeamsRelay
 
 
 class TeamsEndpointsSeamTest(unittest.TestCase):
     def setUp(self):
-        self.relay = FakeTeamsRelay()
+        self.relay = TeamsRelay(
+            app_id="app-id-123",
+            app_password="secret-password",
+            tenant_id="tenant-allowed-1",
+        )
         CredentialProxyHandler.teams_relay = self.relay
         CredentialProxyHandler.max_request_bytes = 65536
         CredentialProxyHandler.teams_max_request_bytes = 65536
@@ -70,26 +49,68 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.status, json.load(exc)
 
-    def test_inbound_webhook_event_enqueues_and_returns_accepted(self):
+    def test_inbound_event_enqueues_on_valid_tenant_and_rejects_unauthorized_tenant_with_403(self):
         status, body = self._call(
-            "/api/v1/teams/events",
-            {"type": "message", "text": "status check"},
+            "/v1/chat/teams/events",
+            {
+                "type": "message",
+                "text": "status check",
+                "channelData": {"tenant": {"id": "tenant-allowed-1"}},
+            },
             method="POST",
         )
         self.assertEqual(status, 202)
         self.assertEqual(body.get("status"), "accepted")
-        self.assertEqual(len(self.relay.events), 1)
 
-    def test_pull_returns_event_and_receipt(self):
-        self.relay.events.append({"type": "message", "text": "audit cluster"})
+        # Mismatched tenant -> 403 Forbidden
+        status, _ = self._call(
+            "/v1/chat/teams/events",
+            {
+                "type": "message",
+                "text": "forged",
+                "channelData": {"tenant": {"id": "other-tenant"}},
+            },
+            method="POST",
+        )
+        self.assertEqual(status, 403)
+
+        # Absent tenant when TEAMS_TENANT_ID is configured -> 403 Forbidden
+        status, _ = self._call(
+            "/v1/chat/teams/events",
+            {"type": "message", "text": "missing tenant"},
+            method="POST",
+        )
+        self.assertEqual(status, 403)
+
+        # Malformed activity field or untrusted serviceUrl -> 400 Bad Request
+        status, _ = self._call(
+            "/v1/chat/teams/events",
+            {
+                "type": "message",
+                "serviceUrl": "https://attacker.trafficmanager.net/",
+                "channelData": {"tenant": {"id": "tenant-allowed-1"}},
+            },
+            method="POST",
+        )
+        self.assertEqual(status, 400)
+
+    def test_pull_and_settle_ack_and_nack(self):
+        self._call(
+            "/v1/chat/teams/events",
+            {
+                "type": "message",
+                "text": "audit cluster",
+                "conversation": {"id": "c-1", "tenantId": "tenant-allowed-1"},
+            },
+            method="POST",
+        )
         status, body = self._call("/v1/chat/teams/events", method="GET")
         self.assertEqual(status, 200)
         self.assertEqual(body["event"]["event"]["text"], "audit cluster")
-        self.assertEqual(body["event"]["receipt"], "r-live")
+        receipt = body["event"]["receipt"]
 
-    def test_settle_ack_and_nack(self):
         status, body = self._call(
-            "/v1/chat/teams/events/ack", {"receipt": "r-live"}, method="POST"
+            "/v1/chat/teams/events/ack", {"receipt": receipt}, method="POST"
         )
         self.assertEqual(status, 200)
         self.assertTrue(body["settled"])
@@ -100,19 +121,54 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertFalse(body["settled"])
 
-    def test_api_forwarding(self):
-        status, body = self._call(
+    def test_api_forwarding_and_method_or_host_restrictions(self):
+        self.relay._token = "cached-bot-token"
+        self.relay._token_expires_at = 9999999999.0
+
+        with mock.patch.object(
+            TeamsRelay,
+            "_open_url",
+        ) as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"id": "activity-42"}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+
+            status, body = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["response"]["id"], "activity-42")
+
+        # Destructive method or non-activity endpoint -> 400 Bad Request
+        status, _ = self._call(
             "/v1/chat/teams/api",
             {
                 "serviceUrl": "https://smba.trafficmanager.net/teams/",
-                "endpoint": "v3/conversations/123/activities",
-                "method": "POST",
-                "payload": {"type": "message", "text": "reply"},
+                "endpoint": "v3/conversations/123/activities/456",
+                "method": "DELETE",
             },
             method="POST",
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(body["response"]["status"], "ok")
+        self.assertEqual(status, 400)
+
+        status, _ = self._call(
+            "/v1/chat/teams/api",
+            {
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                "endpoint": "v3/conversations/123/members",
+                "method": "GET",
+            },
+            method="POST",
+        )
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

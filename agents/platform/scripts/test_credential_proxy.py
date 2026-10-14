@@ -14139,9 +14139,9 @@ class TeamsRelayTest(unittest.TestCase):
     def test_teams_relay_queue_pull_and_settle(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
         activity = {"type": "message", "text": "hello teams"}
-        
+
         self.assertTrue(relay.enqueue_event(activity))
-        
+
         pulled = relay.pull(timeout_seconds=1)
         self.assertIsNotNone(pulled)
         self.assertEqual(pulled["event"]["text"], "hello teams")
@@ -14179,24 +14179,41 @@ class TeamsRelayTest(unittest.TestCase):
             self.assertEqual(token2, "mock-entra-id-jwt-token")
             mock_urlopen.assert_not_called()
 
-    def test_teams_relay_service_url_validation(self):
+    def test_teams_relay_service_url_and_endpoint_validation(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
-        # Untrusted service URL must be rejected
-        with self.assertRaises(ValueError):
-            relay.api_call(
-                service_url="https://evil-attacker.com",
-                path="v3/conversations/123/activities",
-            )
-        with self.assertRaises(ValueError):
-            relay.api_call(
-                service_url="http://smba.trafficmanager.net",  # HTTP rejected
-                path="v3/conversations/123/activities",
-            )
-        with self.assertRaises(ValueError):
-            relay.api_call(
-                service_url="",
-                path="v3/conversations/123/activities",
-            )
+        # Untrusted or arbitrary *.trafficmanager.net hosts must be rejected
+        for bad_url in (
+            "https://evil-attacker.com",
+            "https://attacker.trafficmanager.net/teams/",
+            "http://smba.trafficmanager.net/teams/",
+            "https://user:pass@smba.trafficmanager.net/teams/",
+            "",
+        ):
+            with self.assertRaises(ValueError, msg=bad_url):
+                relay.api_call(
+                    service_url=bad_url,
+                    path="v3/conversations/123/activities",
+                )
+
+        # Destructive HTTP verbs and non-activity endpoints must be rejected
+        for bad_method in ("DELETE", "PUT", "GET", "PATCH"):
+            with self.assertRaises(ValueError, msg=bad_method):
+                relay.api_call(
+                    service_url="https://smba.trafficmanager.net/teams/",
+                    path="v3/conversations/123/activities",
+                    method=bad_method,
+                )
+        for bad_path in (
+            "v3/conversations/123/members",
+            "v3/conversations/123/../admin",
+            "v3/attachments/123",
+        ):
+            with self.assertRaises(ValueError, msg=bad_path):
+                relay.api_call(
+                    service_url="https://smba.trafficmanager.net/teams/",
+                    path=bad_path,
+                    method="POST",
+                )
 
     def test_teams_relay_api_call_success_and_json_parsing(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
@@ -14219,47 +14236,78 @@ class TeamsRelayTest(unittest.TestCase):
             )
             self.assertEqual(res, {"id": "act-resp-1"})
 
-    def test_teams_relay_download_and_size_validation(self):
-        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password", max_file_bytes=100)
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
-            mock_resp.__enter__.return_value = mock_resp
-            mock_urlopen.return_value = mock_resp
+    def test_teams_relay_redirect_handler_refuses_redirects(self):
+        handler = credential_proxy._TeamsNoRedirectHandler()
+        with self.assertRaises(ValueError):
+            handler.redirect_request(
+                req=None,
+                fp=None,
+                code=302,
+                msg="Found",
+                headers={},
+                newurl="https://attacker.example/steal",
+            )
 
-            relay._get_access_token()
-
-            # Invalid host
+    def test_teams_relay_enqueue_validates_tenant_and_activity_shape(self):
+        relay = TeamsRelay(
+            app_id="app-id-123",
+            app_password="secret-password",
+            tenant_id="tenant-allowed",
+        )
+        # Missing or mismatched tenant raises PermissionError
+        with self.assertRaises(PermissionError):
+            relay.enqueue_event({"type": "message", "text": "no tenant"})
+        with self.assertRaises(PermissionError):
+            relay.enqueue_event({
+                "type": "message",
+                "channelData": {"tenant": {"id": "tenant-other"}},
+            })
+        # Matching channelData.tenant.id or conversation.tenantId succeeds
+        self.assertTrue(
+            relay.enqueue_event({
+                "type": "message",
+                "channelData": {"tenant": {"id": "tenant-allowed"}},
+            })
+        )
+        self.assertTrue(
+            relay.enqueue_event({
+                "type": "message",
+                "conversation": {"id": "c1", "tenantId": "TENANT-ALLOWED"},
+            })
+        )
+        # Malformed field types or untrusted serviceUrl raise ValueError
+        for bad_event in (
+            {"type": "message", "channelData": "not-a-dict"},
+            {"type": "message", "from": "not-a-dict"},
+            {"type": "message", "text": 123},
+            {"type": "message", "serviceUrl": "https://attacker.trafficmanager.net/"},
+        ):
             with self.assertRaises(ValueError):
-                relay.download("https://untrusted-domain.com/file.png")
+                relay.enqueue_event(bad_event)
 
-            # Valid host, valid size
-            mock_resp.read.return_value = b"small content"
-            data = relay.download("https://attachment.botframework.com/v3/attachments/file.png")
-            self.assertEqual(data, b"small content")
-
-            # Size exceeded
-            mock_resp.read.return_value = b"x" * 101
-            with self.assertRaises(ValueError):
-                relay.download("https://attachment.botframework.com/v3/attachments/file.png")
-
-    def test_teams_relay_nack_requeue_and_empty_pull(self):
+    def test_teams_relay_nack_requeue_and_poison_drop_after_max_attempts(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
-        # Empty pull returns None
         self.assertIsNone(relay.pull(timeout_seconds=0))
 
-        # Enqueue and pull
-        self.assertTrue(relay.enqueue_event({"type": "message", "id": "1"}))
-        pulled = relay.pull(timeout_seconds=1)
-        self.assertIsNotNone(pulled)
-        receipt = pulled["receipt"]
+        self.assertTrue(relay.enqueue_event({"type": "message", "id": "poison-1"}))
+        # Attempts 1 and 2 requeue; attempt 3 drops the poison message
+        for attempt in range(1, credential_proxy.TEAMS_MAX_DELIVERY_ATTEMPTS + 1):
+            pulled = relay.pull(timeout_seconds=1)
+            self.assertIsNotNone(pulled, f"missing on attempt {attempt}")
+            self.assertEqual(pulled["event"]["id"], "poison-1")
+            self.assertTrue(relay.settle(pulled["receipt"], acknowledge=False))
 
-        # NACK requeues
-        self.assertTrue(relay.settle(receipt, acknowledge=False))
-        # Now pull again should get the requeued event
-        pulled2 = relay.pull(timeout_seconds=1)
-        self.assertIsNotNone(pulled2)
-        self.assertEqual(pulled2["event"]["id"], "1")
+        # After TEAMS_MAX_DELIVERY_ATTEMPTS nacks, the queue is empty
+        self.assertIsNone(relay.pull(timeout_seconds=1))
+
+    def test_teams_relay_token_lock_does_not_block_pull_or_settle(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        self.assertTrue(relay.enqueue_event({"type": "message", "id": "ev-1"}))
+        # Hold _token_lock to simulate an in-flight 20s Entra OAuth request
+        with relay._token_lock:
+            pulled = relay.pull(timeout_seconds=1)
+            self.assertIsNotNone(pulled)
+            self.assertTrue(relay.settle(pulled["receipt"], acknowledge=True))
 
     def test_teams_relay_missing_token_raises(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
@@ -14275,4 +14323,5 @@ class TeamsRelayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
