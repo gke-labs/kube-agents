@@ -991,6 +991,13 @@ class IndexCopy(unittest.TestCase):
         self.assertEqual([{"build_id": "2110431553740869632",
                            "error": pp.INDEX_POINTER_VANISHED}], vanished)
 
+    def test_progress_dots_glued_to_the_error_line_do_not_hide_it(self):
+        # gcloud's progress dots land at the start of about one line in
+        # eighty, the error line included.
+        entries, err, vanished = self._copy(1, "....." + self.VANISHED + "\n")
+        self.assertIsNone(err)
+        self.assertEqual(["2110431553740869632"], [v["build_id"] for v in vanished])
+
     def test_any_other_error_still_fails_the_copy(self):
         denied = "ERROR: (gcloud.storage.cp) HTTPError 403: caller does not have storage.objects.get"
         entries, err, vanished = self._copy(1, self.VANISHED + "\n" + denied + "\n")
@@ -1034,6 +1041,15 @@ class IndexCopy(unittest.TestCase):
                                pp.Source(error="not read"), pp.Source(error="not read"))
         self.assertEqual([gone], summary["trend"]["unreadable"])
         self.assertIn("2110431553740869632", pp.render(summary))
+        # A replay of a past window does not report a pointer that vanished
+        # today: the build was never in the window it describes.
+        past = as_of - timedelta(days=30)
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=({build: "p"}, None, [gone])), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", return_value=wait):
+            replay = pp.collect_waits(past - timedelta(days=1), past)
+        self.assertEqual([], replay.value.unreadable)
 
 
 class LogHead(unittest.TestCase):

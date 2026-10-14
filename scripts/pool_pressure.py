@@ -82,6 +82,7 @@ GCS_BUILD_INDEX_GLOB = f"{GCS_BUILD_INDEX}/[0-9]*{BUILD_INDEX_SUFFIX}"
 # the Copying lines (2 of 30 runs on 2026-10-14). That build is reported
 # unreadable and the hour is still measured; any other error still fails it.
 GCS_CP_ERROR_PREFIX = "ERROR: "
+GCS_CP_PROGRESS_DOT = "."
 GCS_OBJECT_NOT_FOUND = re.compile(r"^ERROR: (gs://\S+) not found: 404\.?$")
 INDEX_POINTER_VANISHED = "index pointer rewritten during the copy (404)"
 
@@ -883,11 +884,10 @@ def _index_entries_from_gcs(
     )
     if rc == 0:
         return _index_entries_from_dir(dest), None, []
-    vanished, other = _vanished_pointers(err)
-    entries = _index_entries_from_dir(dest) if vanished and not other else {}
+    vanished, errors = _gcloud_errors(err)
+    entries = _index_entries_from_dir(dest) if vanished and len(errors) == len(vanished) else {}
     if not entries:
         # The error lines alone: the stderr is thousands of Copying lines.
-        errors = [line for line in err.splitlines() if line.startswith(GCS_CP_ERROR_PREFIX)]
         reason = "; ".join(errors) or err.strip() or f"exit {rc}"
         return {}, f"could not read the build index: {reason}", []
     return entries, None, [
@@ -895,23 +895,24 @@ def _index_entries_from_gcs(
     ]
 
 
-def _vanished_pointers(stderr: str) -> Tuple[List[str], List[str]]:
-    """The build IDs whose index pointer gcloud reported missing, and every
-    other error line, so a caller can tell the race from a real failure."""
+def _gcloud_errors(stderr: str) -> Tuple[List[str], List[str]]:
+    """gcloud's error lines, and among them the build IDs whose index pointer
+    it reported missing; the two lengths differ when any other error is in."""
     vanished: List[str] = []
-    other: List[str] = []
-    for line in stderr.splitlines():
+    errors: List[str] = []
+    prefix = f"{GCS_BUILD_INDEX}/"
+    for raw in stderr.splitlines():
+        # Progress dots land at the start of about one line in eighty.
+        line = raw.lstrip(GCS_CP_PROGRESS_DOT)
         if not line.startswith(GCS_CP_ERROR_PREFIX):
             continue
+        errors.append(line)
         match = GCS_OBJECT_NOT_FOUND.match(line)
         name = urllib.parse.unquote(match.group(1)) if match else ""
-        prefix = f"{GCS_BUILD_INDEX}/"
         stem = name[len(prefix) : -len(BUILD_INDEX_SUFFIX)]
         if name.startswith(prefix) and name.endswith(BUILD_INDEX_SUFFIX) and stem.isdigit():
             vanished.append(stem)
-        else:
-            other.append(line)
-    return vanished, other
+    return vanished, errors
 
 
 def _index_entries_from_dir(dest: str) -> Dict[int, str]:
@@ -1050,8 +1051,9 @@ class Sweep:
         self.elapsed_seconds = elapsed_seconds
         self.window_start = window_start
         self.truncated = truncated
-        # Builds whose read raised, each as {"build_id", "error"}; counted in
-        # builds_read, left out of waits.
+        # Builds whose read raised (counted in builds_read) or whose index
+        # pointer vanished mid-copy (never read, so not counted), each as
+        # {"build_id", "error"}; left out of waits.
         self.unreadable = unreadable or []
 
 
@@ -1090,9 +1092,17 @@ def collect_waits(
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
         # A vanished pointer is a build the sweep never saw: named with the
-        # unreadable builds, left out of the numbers, and not counted against
-        # the newest-builds share below, which judges the reader, not Prow.
-        unreadable: List[Dict[str, str]] = list(vanished)
+        # unreadable builds when its ID falls in the window (with the same
+        # slack as below; a replay of a past day does not report today's),
+        # left out of the numbers, and not counted against the newest-builds
+        # share below, which judges the reader, not Prow.
+        unreadable: List[Dict[str, str]] = [
+            gone
+            for gone in vanished
+            if window_start - SNOWFLAKE_SLACK
+            <= snowflake_time(int(gone["build_id"]))
+            <= window_end + SNOWFLAKE_SLACK
+        ]
 
         candidates: Dict[str, List[int]] = {}
         for build_id in entries:
