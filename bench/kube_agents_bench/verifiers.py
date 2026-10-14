@@ -1841,7 +1841,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=(
                 f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
-                f"required pattern(s) matched, none of {len(self.forbidden_patterns)} forbidden"
+                f"required pattern(s) matched, none of {len(self.forbidden_patterns) + len(self.forbidden_result_patterns)} forbidden"
                 + window
             ),
         )

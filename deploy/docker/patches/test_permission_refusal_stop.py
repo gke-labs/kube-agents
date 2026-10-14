@@ -183,6 +183,13 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop.classify_refusal(retry, _result(lines, 77), failed=True), "policy")
         self.assertIsNone(stop.classify_refusal("echo '" + lines + "'", _result(lines, 0), failed=False))
 
+    def test_an_echoed_block_beside_a_fresh_refusal_of_another_verb_is_not_an_echo(self):
+        scale = shim_lines(SCALE)
+        patch = shim_lines(["kubectl", "patch", "deploy/kube-dns", "-n", "kube-system", "-p", "{}"])
+        command = "tee /tmp/notes.md <<'EOF'\nfirst attempt:\n" + scale + "\nEOF\nkubectl patch deploy/kube-dns -n kube-system -p '{}' || true"
+        self.assertEqual(stop.classify_refusal(command, _result(scale + "\n" + patch, 0), failed=False), "policy")
+        self.assertIsNone(stop.classify_refusal("cat <<'EOF'\n" + scale + "\n" + patch + "\nEOF", _result(scale + "\n" + patch, 0), failed=False))
+
     def test_several_refusals_in_one_result_count_if_any_is_a_write(self):
         render_then_apply = _result(
             shim_lines(["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml"])

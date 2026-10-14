@@ -54,6 +54,14 @@ For every tool result :func:`classify_refusal` returns:
   result then carries nothing but an exit code, which is 77 from the shim
   and has arrived as 126 through the exec path, so it is not read; the
   bench's window has the same blind spot.
+* Reflowed: both readers anchor on the shim's line breaks, so a refusal the
+  shell printed onto one line (``echo $out`` unquoted, a ``sed``/``awk``
+  prefix, ``tail -1``) is not read at all, not even as guidance.
+* An echo that fails: the echo test runs on calls that did not fail, since a
+  failed retry that pastes the earlier block is byte-identical to a report
+  of it; a report that quotes the block and fails for another reason
+  (``tee pr.md <<EOF … EOF && gh pr create …`` with ``gh`` failing) is
+  counted. Writing the report with ``cat >`` leaves nothing to echo.
 * Seen when it should not be: the result is the only evidence, so whoever
   writes what a tool prints (a script in a checked-out repository, a response
   a failing ``jq -e`` echoes) can write the shim's lines and halt the turn.
@@ -230,15 +238,18 @@ def definitive_block(result: str):
 
 def echoes_refusal(command, result) -> bool:
     """Whether the call's own text carries the result's refusal lines: a report, not a refusal.
-    Keyed to the verb line the result carries, so a comment quoting an earlier
-    ``policy rule:`` beside a fresh write does not pass as an echo."""
+    Keyed to the verb line of every definitive block the result carries, so a
+    comment quoting an earlier ``policy rule:`` beside a fresh write, or an
+    echoed block beside a fresh refusal of another verb, does not pass as an
+    echo."""
     if not isinstance(command, str) or not command:
         return False
-    for rule, words, _ in refusal_blocks(result):
-        line = _VERB_LINE_PREFIX + " ".join(words) if words else "policy rule: " + rule
-        if line in command:
-            return True
-    return False
+    blocks = refusal_blocks(result)
+    definitive = [(rule, words) for rule, words, render in blocks if rule == DEFINITIVE_RULE and not render and verb_is_mutating(words)]
+    lines = [_VERB_LINE_PREFIX + " ".join(words) for _, words in definitive] or [
+        (_VERB_LINE_PREFIX + " ".join(words) if words else "policy rule: " + rule) for rule, words, _ in blocks
+    ]
+    return bool(lines) and all(line in command for line in lines)
 
 
 def classify_refusal(command, result, *, failed=True) -> str | None:
