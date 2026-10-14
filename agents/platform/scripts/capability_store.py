@@ -54,6 +54,9 @@ from profile_scaffold import write_json_atomic  # noqa: E402
 
 CAPABILITIES_DIR_ENV = "KUBE_AGENTS_CAPABILITIES_DIR"
 HERMES_HOME_ENV = "HERMES_HOME"
+# What the operator sets on the container; the entrypoint exports HERMES_HOME from it for its own
+# process tree, which a `kubectl exec` shell is not in.
+PLATFORM_AGENT_HOME_ENV = "PLATFORM_AGENT_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 # Where the Platform Agent's store sits relative to the machine home. The tool
 # runs with HERMES_HOME already at the profile home; the operator CLI usually
@@ -163,13 +166,16 @@ def capabilities_root(hermes_home: Path | str | None = None) -> Path:
 
     The env override exists for tests and for a process whose HERMES_HOME is not
     the profile home; otherwise the store sits beside the profile's cron/ and
-    skills/, which is what profile_scaffold.py seeds.
+    skills/, which is what profile_scaffold.py seeds. The home is read in the
+    entrypoint's own order: HERMES_HOME, else the home the operator set on the
+    container, else the documented default; a shell on the gateway carries the
+    second and not the first.
     """
     override = os.environ.get(CAPABILITIES_DIR_ENV)
     if override:
         return Path(override)
-    home = Path(hermes_home) if hermes_home else Path(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME))
-    return home / CAPABILITIES_DIRNAME
+    home = hermes_home or os.environ.get(HERMES_HOME_ENV) or os.environ.get(PLATFORM_AGENT_HOME_ENV) or DEFAULT_HERMES_HOME
+    return Path(home) / CAPABILITIES_DIRNAME
 
 
 def _read_json(path: Path) -> Any:

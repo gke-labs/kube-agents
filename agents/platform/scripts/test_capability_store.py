@@ -334,6 +334,9 @@ class StoreTest(unittest.TestCase):
         seed(store)
         with patch.dict(os.environ, {cs.HERMES_HOME_ENV: str(machine_home)}, clear=True):
             self.assertEqual(cs.cli_root(), store)
+        # A `kubectl exec` shell carries PLATFORM_AGENT_HOME and not HERMES_HOME; the same store.
+        with patch.dict(os.environ, {cs.PLATFORM_AGENT_HOME_ENV: str(machine_home)}, clear=True):
+            self.assertEqual(cs.cli_root(), store)
         (machine_home / cs.CAPABILITIES_DIRNAME).mkdir()
         with patch.dict(os.environ, {cs.HERMES_HOME_ENV: str(machine_home)}, clear=True):
             self.assertEqual(cs.cli_root(), machine_home / cs.CAPABILITIES_DIRNAME, "an existing home store wins")
@@ -357,6 +360,10 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(cs.CapabilityError) as ctx:
             cs.load(self.root, "nope")
         self.assertIn("demo", str(ctx.exception))
+        # A root that does not exist is named, so a shell that looked in the wrong place can tell.
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.load(self.root / "missing", "demo")
+        self.assertIn(str(self.root / "missing"), str(ctx.exception))
         with self.assertRaises(cs.CapabilityError):
             cs.apply_changes(self.root, "nope", {"threshold": 4}, reason="x", confirmed_by="ops")
         for bad in ("", "../demo", "a/b", ".hidden"):
@@ -383,6 +390,12 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(cs.capabilities_root(), Path("/x/y"))
         with patch.dict(os.environ, {cs.HERMES_HOME_ENV: "/opt/data/profiles/platform"}, clear=True):
             self.assertEqual(cs.capabilities_root(), Path("/opt/data/profiles/platform/capabilities"))
+        with patch.dict(os.environ, {cs.PLATFORM_AGENT_HOME_ENV: "/var/agent"}, clear=True):
+            self.assertEqual(cs.capabilities_root(), Path("/var/agent/capabilities"))
+        with patch.dict(os.environ, {cs.HERMES_HOME_ENV: "/h", cs.PLATFORM_AGENT_HOME_ENV: "/var/agent"}, clear=True):
+            self.assertEqual(cs.capabilities_root(), Path("/h/capabilities"), "HERMES_HOME wins when both are set")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(cs.capabilities_root(), Path(cs.DEFAULT_HERMES_HOME) / cs.CAPABILITIES_DIRNAME)
 
 
 class ShippedTemplatesTest(unittest.TestCase):

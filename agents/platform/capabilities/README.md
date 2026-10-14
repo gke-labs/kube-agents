@@ -45,7 +45,9 @@ there.
 ## Reading the store from a shell
 
 `capability_store.py` doubles as a read-only CLI for an operator on the gateway,
-which is how you read the audit trail after the fact:
+which is how you read the audit trail after the fact. It finds the store through
+`HERMES_HOME`, else `PLATFORM_AGENT_HOME` (what a `kubectl exec` shell on the container
+carries), else `/opt/data`, and looks one profile down for the Platform Agent's store:
 
 ```bash
 python3 /opt/defaults/scripts/capability_store.py list
