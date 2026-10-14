@@ -271,6 +271,10 @@ LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; waited {
 # held for no time, reading and writing nothing; the held line shares
 # `LOCK_HELD_TEXT`'s form so one match reads both.
 LOCK_PROBE_FREE_TEXT = "{path} is free; no retrospective run holds it"
+# The probe is the step every route runs before `start`: it names a pending
+# reset, so the SOP runs the baseline as the no-repository route, without
+# `start`, and leaves no in-flight note standing.
+LOCK_PROBE_RESET_PENDING_FORMAT = "{line}; a reset is pending ({marker}): the next full run is a baseline the SOP files nothing from, run without start"
 LOCK_PROBE_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing started"
 PROBE_LOCK_WITH_OTHERS_TEXT = "--probe-lock takes no other mode flag: it tests the lock and nothing else"
 PROBE_LOCK_EXCLUSIVE = ("full", "after_upgrade", "cluster", "since", "dry_run", "reset_ledger", "report", "output", "manifest_file", "no_report")
@@ -296,7 +300,12 @@ LOCK_WAIT = timedelta(minutes=2)
 # `fleet_waste.py`'s `PROJECT_READ_DEADLINE_S` bounds only when a project's
 # reads start; this one bounds each read.
 RUN_DEADLINE_S = 480
-BUDGET_READ_TEXT = "the read budget ({seconds} s) was spent before this read"
+# A read the deadline refused outright, and one it ended part-way (given the
+# time left rather than its own timeout): both carry the budget's prefix, so
+# the cut counts and the report name the budget rather than a hung read.
+BUDGET_PREFIX_FORMAT = "the read budget ({seconds} s)"
+BUDGET_READ_TEXT = BUDGET_PREFIX_FORMAT + " was spent before this read"
+BUDGET_CUT_TEXT = BUDGET_PREFIX_FORMAT + " ended this read after {given} s"
 BUDGET_SPENT_TEXT = "{cluster}: not read this run; the read budget ({seconds} s) was spent after {count} cluster(s); ledger entry and guards kept unchanged, read first next run"
 BUDGET_SPENT_REASON = "not read this run: the read budget ({seconds} s) was spent; held, read first next run"
 RECHECK_DEFERRED_TEXT = "the read budget ({seconds} s) was spent before its re-check started"
@@ -5445,7 +5454,13 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         remaining = RUN_DEADLINE_S - (clock() - run_started)
         if remaining <= 0:
             return Run(argv, TIMEOUT_RC, "", BUDGET_READ_TEXT.format(seconds=RUN_DEADLINE_S), 0.0)
-        return base_run(argv, timeout=min(timeout, remaining), env=env)
+        result = base_run(argv, timeout=min(timeout, remaining), env=env)
+        if result.rc == TIMEOUT_RC and remaining < timeout:
+            # The deadline fell inside this read: the budget ended it, not
+            # the read's own timeout, and the error says so.
+            own = result.stderr.strip()
+            return result._replace(stderr=BUDGET_CUT_TEXT.format(seconds=RUN_DEADLINE_S, given=round(remaining)) + (f"; {own}" if own else ""))
+        return result
 
     run = bounded_run
 
@@ -5755,7 +5770,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # inside a review or a re-check was refused for it, or when the clock
     # says so after the last pool: the last cluster's reads are where it
     # falls on a fleet that nearly fits, with nothing queued behind them.
-    budget_text = BUDGET_READ_TEXT.format(seconds=RUN_DEADLINE_S)
+    budget_text = BUDGET_PREFIX_FORMAT.format(seconds=RUN_DEADLINE_S)
     cut_reviews = sorted(r["cluster"] for r in reviews if any(budget_text in e for e in r["read_errors"]))
     cut_rechecks = sorted(r["cluster"] for r in rechecks if any(budget_text in e for e in r.get("errors") or []) and not r.get("deferred"))
     budget_spent = bool(deferred or deferred_rechecks or cut_reviews or cut_rechecks) or not budget_left()
@@ -6015,7 +6030,17 @@ def probe_lock(path: Path) -> tuple[int, str]:
     for any time and without writing. A lock file that does not exist is
     free and is not created; an existing one is opened read-only and tried
     with a non-blocking flock that is released at once. Exit 0 with the
-    free line, or `EXIT_LOCK_HELD` with the holder line."""
+    free line, or `EXIT_LOCK_HELD` with the holder line; either line names
+    a pending reset (`RESET_MARKER_FILENAME` beside the lock), since the
+    probe is what the SOP runs before `start`."""
+    rc, line = _probe_lock_state(path)
+    marker = path.parent / RESET_MARKER_FILENAME
+    if rc != EXIT_USAGE and os.path.lexists(marker):
+        line = LOCK_PROBE_RESET_PENDING_FORMAT.format(line=line, marker=marker)
+    return rc, line
+
+
+def _probe_lock_state(path: Path) -> tuple[int, str]:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -6039,10 +6064,16 @@ def read_reset_marker(path: Path) -> dict | None:
     baseline; None when there is none, an empty record when it cannot be
     read (the marker still holds)."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            loaded = json.load(handle)
+        # Without following: a symlink planted at the marker's name holds
+        # the marker as unreadable, and nothing is read through it.
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return None
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            loaded = json.load(handle)
     except (OSError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
@@ -6095,11 +6126,27 @@ def main(argv: list[str] | None = None) -> int:
         print(line)
         return rc
     if args.reset_ledger:
+        # The reset writes the store, so it holds the lock as a run does and
+        # yields with the lock-held line while a run is in flight; the dry
+        # run only reads, and takes none.
+        reset_lock = None
         try:
+            if not args.dry_run:
+                lock_path = data_dir() / LOCK_FILENAME
+                reset_lock = acquire_lock(lock_path)
+                if reset_lock is None:
+                    print(lock_held_line(lock_path, LOCK_WAIT))
+                    return EXIT_LOCK_HELD
             print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None, move=not args.dry_run))
         except PermissionError as exc:
             print(store_denied_line(exc), file=sys.stderr)
             return EXIT_USAGE
+        except StateUnreadable as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+        finally:
+            if reset_lock is not None:
+                reset_lock.close()
         return 0
     # The projects this run resolves for its route, before the lock: an exit
     # after `start` without a manifest names them, so the SOP's recovery

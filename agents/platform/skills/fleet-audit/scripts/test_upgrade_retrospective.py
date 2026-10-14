@@ -2271,6 +2271,21 @@ class LedgerAndGuardsTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ur.main(["--probe-lock"]), 0)
         self.assertEqual(out.getvalue().strip(), ur.LOCK_PROBE_FREE_TEXT.format(path=lock_path))
+        # A pending reset is named on the line, free or held: the probe is what the SOP runs before
+        # `start`, and the baseline runs without one.
+        marker = self.home / ur.RESET_MARKER_FILENAME
+        marker.write_text("{}")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ur.main(["--probe-lock"]), 0)
+        self.assertEqual(out.getvalue().strip(), ur.LOCK_PROBE_RESET_PENDING_FORMAT.format(line=ur.LOCK_PROBE_FREE_TEXT.format(path=lock_path), marker=marker))
+        held_by_us = ur.acquire_lock(lock_path)
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--probe-lock"]), ur.EXIT_LOCK_HELD)
+            self.assertEqual(out.getvalue().strip(), ur.LOCK_PROBE_RESET_PENDING_FORMAT.format(line=ur.lock_probe_held_line(lock_path), marker=marker))
+        finally:
+            held_by_us.close()
+        marker.unlink()
         for argv in (["--probe-lock", "--full", "--scope-projects", PROJECT], ["--probe-lock", "--after-upgrade"], ["--probe-lock", "--dry-run"], ["--probe-lock", "--reset-ledger"], ["--probe-lock", "--cluster", SEEDED]):
             with self.subTest(argv=argv):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
@@ -3502,6 +3517,39 @@ class LedgerAndGuardsTest(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
             self.assertIn(ur.RESET_LEDGER_NOTHING_TEXT, out.getvalue())
+
+    def test_reset_ledger_takes_the_lock_and_yields_to_a_running_tick(self):
+        # The reset moves the state files and writes the marker, so it holds the lock as a run does:
+        # while a run holds it, the reset waits the (patched) budget, prints the lock-held line, exits
+        # 1 and moves nothing; the dry run only reads and needs no lock; once the lock is free the reset
+        # proceeds and holds the lock while it works.
+        self.collect()
+        (self.home / ur.LEDGER_FILENAME).write_text("{broken")
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+            [record] = list(self.home.glob(ur.CRASH_RECORD_GLOB))
+            lock_path = self.home / ur.LOCK_FILENAME
+            held = ur.acquire_lock(lock_path)
+            try:
+                with mock.patch.object(ur, "LOCK_WAIT", timedelta(seconds=0.05)), mock.patch.object(ur, "LOCK_POLL_INTERVAL", timedelta(seconds=0.01)):
+                    with redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(ur.main(["--reset-ledger"]), ur.EXIT_LOCK_HELD)
+                    self.assertTrue(out.getvalue().startswith(ur.lock_held_line(lock_path, timedelta(seconds=0.05))), out.getvalue())
+                    self.assertEqual((record.exists(), (self.home / ur.RESET_MARKER_FILENAME).exists(), (self.home / ur.ARCHIVE_SUBDIR).exists()), (True, False, False))
+                    with redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(ur.main(["--reset-ledger", "--dry-run"]), 0)
+                    self.assertIn("would archive 2 file(s)", out.getvalue())
+            finally:
+                held.close()
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--reset-ledger"]), 0)
+            self.assertIn("archived 2 file(s)", out.getvalue())
+            self.assertEqual((record.exists(), (self.home / ur.RESET_MARKER_FILENAME).exists()), (False, True))
+            # The lock was released on the way out.
+            again = ur.acquire_lock(lock_path, wait=timedelta(0))
+            self.assertIsNotNone(again)
+            again.close()
 
     def test_an_absent_guards_file_beside_a_live_ledger_is_a_crash_record(self):
         # Every run writes the guards and then the ledger, so a live ledger beside no guards file is a
@@ -5449,7 +5497,9 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(len([c for c in fleet.calls if c[0] == "kubectl"]), 1)
         gemma = next(r for r in result["reviews"] if r["cluster"] == GEMMA)
         self.assertEqual((gemma["reviewed"], gemma["answered"], gemma["partial"]), (False, [], list(ur.CORE_READS)))
-        self.assertTrue(any(e.startswith("pods: kubectl get pods rc=124: timed out") for e in gemma["read_errors"]), gemma["read_errors"])
+        # The read the deadline fell inside carries the budget as its error, the hang's own text after
+        # it, so the operator reads a spent budget rather than a hung API server.
+        self.assertTrue(any(e.startswith("pods: kubectl get pods rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out") for e in gemma["read_errors"]), gemma["read_errors"])
         self.assertTrue(any(e.startswith("nodes: kubectl get nodes rc=124: " + ur.BUDGET_READ_TEXT.format(seconds=1)) for e in gemma["read_errors"]), gemma["read_errors"])
         self.assertEqual((result["deferred"], result["budget_spent"]), ([SEEDED], True))
         manifest = json.loads(Path(result["manifest_path"]).read_text())
@@ -5460,6 +5510,30 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(manifest["partial"])
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["partial_read"], "2026-10-08T18:00:00Z")
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_a_cut_last_read_counts_the_review_and_the_recheck_as_cut(self):
+        # When the deadline falls inside the last read a review or a re-check makes, no later read is
+        # refused outright; the cut read itself carries the budget's prefix, so the review (and on the
+        # next run the re-check) is counted as cut mid-read and its limitation names the budget.
+        last = ur.KUBECTL_READS[-1][0]
+        fleet = FakeFleet(clusters=[cluster_doc("gemma-gpu-upgraded")], stall={("gemma-gpu-upgraded", last): 30.0})
+        with mock.patch.object(ur, "RUN_DEADLINE_S", 1), redirect_stderr(io.StringIO()):
+            result = ur.collect(args(manifest_file=str(self.home / "manifest.json")), run=fleet, now=NOW, max_workers=1, clock=fleet.clock)
+        [review] = result["reviews"]
+        # The last read is an Info-only one (endpoint slices), so the review stays complete on its core
+        # reads; the cut is still counted and named under "Reads that failed".
+        self.assertEqual((result["budget_spent"], result["budget"]["cut"], result["budget"]["cut_rechecks"], review["partial"]), (True, 1, 0, []))
+        self.assertEqual([e for e in review["read_errors"] if ur.BUDGET_PREFIX_FORMAT.format(seconds=1) in e], [f"{last}: kubectl get {ur.KUBECTL_READS[-1][1][2]} rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out"])
+        self.assertTrue(any(ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) in line for line in result["failed_reads"]), result["failed_reads"])
+        # The next run re-checks the cluster for its guards; the re-check's one read cut the same way
+        # counts as a re-check cut mid-read, not as a hung read.
+        fleet = FakeFleet(clusters=[cluster_doc("gemma-gpu-upgraded")], stall={("gemma-gpu-upgraded", "pods"): 30.0})
+        with mock.patch.object(ur, "RUN_DEADLINE_S", 1), redirect_stderr(io.StringIO()):
+            second = ur.collect(args(manifest_file=str(self.home / "manifest.json")), run=fleet, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), max_workers=1, clock=fleet.clock)
+        [recheck] = second["rechecks"]
+        self.assertEqual((second["budget_spent"], second["budget"]["cut"], second["budget"]["cut_rechecks"], recheck.get("deferred", False)), (True, 0, 1, False))
+        self.assertTrue(any(ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) in e for e in recheck["errors"]), recheck["errors"])
+        self.assertIn(ur.INFO_BUDGET_SPENT.format(seconds=1, reviewed=0, rechecked=1, cut=0, cut_rechecks=1, deferred=0, deferred_rechecks=0), ur.render_report(second))
 
     def test_a_budget_spent_inside_the_last_review_is_said_on_the_report(self):
         # With nothing queued behind it, a read cut inside the last review deferred nothing, yet the
