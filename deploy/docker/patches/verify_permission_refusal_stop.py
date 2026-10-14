@@ -184,7 +184,7 @@ def main() -> int:
         nudge = guardrail_halt_nudge(build_kanban_stop_nudge, messages=[], attempts=0, decision=second)
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
-    if not nudge or "permission" not in nudge.lower() or "kanban_block" not in nudge:
+    if not nudge or "refused this change" not in nudge or "kanban_block" not in nudge:
         return fail(f"the halt nudge does not name the refusal: {nudge!r}")
 
     print("verify_permission_refusal_stop: ok")

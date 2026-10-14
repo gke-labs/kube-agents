@@ -1423,7 +1423,7 @@ _NO_WORKER_COMMANDS_REASON = (
 _NO_WORKER_TERMINAL_CALLS_REASON = (
     "no delegated worker's terminal or execute_code calls are in the trajectory: no card was "
     "delegated, the worker-trajectory capture did not run, or the pod withheld the "
-    "calls' arguments, so after_result_pattern has no ordered commands and results to read"
+    "calls' arguments, so the ordered read has no commands and results"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "

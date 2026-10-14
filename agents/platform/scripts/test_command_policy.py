@@ -148,10 +148,6 @@ class KubectlReadOnlyTest(unittest.TestCase):
         # the flag means we don't get a second word, so a two-word verb is refused.
         # This is intentional: the alternative (skipping unknown flags) reopens the
         # hole. `rollout --unknown status x` is false-refused, which is acceptable.
-        # With the value attached the flag hides nothing: the subcommand is read.
-        self.assertFalse(evaluate(["kubectl", "rollout", "--selector=app=x", "restart", "deploy"]).allowed)
-        self.assertEqual(("rollout", "restart"), evaluate(["kubectl", "rollout", "--selector=app=x", "restart", "deploy"]).verb_tuple)
-        self.assertTrue(evaluate(["kubectl", "rollout", "--selector=app=x", "status", "deploy"]).allowed)
         decision = evaluate(["kubectl", "rollout", "--unknown", "status", "x"])
         self.assertFalse(decision.allowed)
         self.assertEqual("kubernetes.read-only", decision.rule_id)

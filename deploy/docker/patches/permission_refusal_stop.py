@@ -54,6 +54,12 @@ For every tool result :func:`classify_refusal` returns:
   result then carries nothing but an exit code, which is 77 from the shim
   and has arrived as 126 through the exec path, so it is not read; the
   bench's window has the same blind spot.
+* A sub-verb hidden by a flag: the policy stops reading at an unknown flag
+  before ``rollout``/``auth``/``certificate``'s second word (``rollout
+  --selector=app=x restart``), refuses the command under the same rule and
+  prints ``policy verb: rollout`` alone, which is guidance here, not a halt.
+  The conformance suite holds the policy to that stop; the respelled retry
+  (``rollout restart --selector=…``) prints the full verb and halts.
 * Reflowed: both readers anchor on the shim's line breaks, so a refusal the
   shell printed onto one line (``echo $out`` unquoted, a ``sed``/``awk``
   prefix, ``tail -1``) is not read at all, not even as guidance.
