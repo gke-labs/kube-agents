@@ -235,7 +235,13 @@ REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcl
 # for a role that exists unbound, and a bare `roles create` would then exit
 # non-zero on the existing id. The describe guard skips the create in that
 # case and the binding runs either way.
+# The leading undelete converges the third state, a role soft-deleted and
+# unbound (what turning the switch off on a Terraform-provisioned project
+# leaves for seven days): describe exits 0 on a soft-deleted role, so the
+# guard alone would skip the create and bind a dead role. On a live or absent
+# role the undelete is an error the `;` swallows.
 REPAIR_CALENDAR_MODE_ROLE = (
+    "gcloud iam roles undelete {role_id} --project={project_id} >/dev/null 2>&1; "
     "gcloud iam roles describe {role_id} --project={project_id} >/dev/null 2>&1 "
     "|| gcloud iam roles create {role_id} --project={project_id} "
     '--title="Kube-Agents calendar-mode advice (read-only)" --permissions={permission} --stage=GA; '
@@ -384,6 +390,13 @@ REPAIR_CALENDAR_MODE_ROLE_PERMISSIONS = (
 )
 REPAIR_CALENDAR_MODE_ROLE_UNDELETE = (
     "gcloud iam roles undelete {role_id} --project={project_id} "
+    "# docs/ci-pool-projects.md section 3"
+)
+# A disabled role is bound and grants nothing, like a soft-deleted one.
+ROLE_STAGE_DISABLED = "DISABLED"
+ROLE_STAGE_LIVE = "GA"
+REPAIR_CALENDAR_MODE_ROLE_ENABLE = (
+    "gcloud iam roles update {role_id} --project={project_id} --stage=" + ROLE_STAGE_LIVE + " "
     "# docs/ci-pool-projects.md section 3"
 )
 # Findings a leased run passes with. Every finding outside this set reds the
@@ -1829,6 +1842,19 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         FINDING_PLATFORM_CALENDAR_MODE_ROLE,
                         f"{calendar_mode_role} on {project_id} is soft-deleted",
                         REPAIR_CALENDAR_MODE_ROLE_UNDELETE.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID, project_id=project_id
+                        ),
+                    ))
+                elif role_doc.get("stage") == ROLE_STAGE_DISABLED:
+                    passed = False
+                    details.append(
+                        f"{calendar_mode_role} on {project_id} is disabled (stage {ROLE_STAGE_DISABLED}), so the binding grants nothing. "
+                        "The nightly's obtainability-window-planning-probe fails on this project for want of it"
+                    )
+                    findings.append(Finding(
+                        FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+                        f"{calendar_mode_role} on {project_id} is disabled",
+                        REPAIR_CALENDAR_MODE_ROLE_ENABLE.format(
                             role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID, project_id=project_id
                         ),
                     ))

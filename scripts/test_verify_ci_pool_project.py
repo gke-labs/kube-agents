@@ -3273,13 +3273,13 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
 
 
 
-def _calendar_role(project_id="kube-agents-evals-3", permissions=None, deleted=False):
+def _calendar_role(project_id="kube-agents-evals-3", permissions=None, deleted=False, stage="GA"):
     """`gcloud iam roles describe` of the calendar-mode advice role: the one
-    permission unless a test says otherwise."""
+    permission, live, unless a test says otherwise."""
     doc = {
         "name": f"projects/{project_id}/roles/{checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_ID}",
         "title": "Kube-Agents calendar-mode advice (read-only)",
-        "stage": "GA",
+        "stage": stage,
         "includedPermissions": sorted(
             {checker.PLATFORM_GSA_CALENDAR_MODE_PERMISSION} if permissions is None else permissions
         ),
@@ -3764,7 +3764,9 @@ class IamGrantsTest(unittest.TestCase):
         self.assertNotIn("kube-agents-evals-3", finding.id)
         self.assertIn(role, finding.observed)
         member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id="kube-agents-evals-3")
-        # Idempotent: an existing role skips the create and the binding still runs.
+        # Idempotent across the three states: a soft-deleted role is undeleted
+        # first, an existing one skips the create, and the binding always runs.
+        self.assertTrue(finding.repair.startswith("gcloud iam roles undelete kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 >/dev/null 2>&1; "), finding.repair)
         self.assertIn("gcloud iam roles describe kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 >/dev/null 2>&1 || gcloud iam roles create kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3", finding.repair)
         self.assertIn("--permissions=compute.advice.calendarMode", finding.repair)
         self.assertIn(f'; gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
@@ -3829,6 +3831,23 @@ class IamGrantsTest(unittest.TestCase):
         finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
         self.assertIn("soft-deleted", finding.observed)
         self.assertTrue(finding.repair.startswith("gcloud iam roles undelete kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3"), finding.repair)
+
+    def test_a_disabled_calendar_mode_role_is_reported_as_missing_with_the_enable(self):
+        # stage DISABLED keeps the permission list and drops the grant: the
+        # third field that decides whether the binding is live.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(stage="DISABLED")),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertIn("disabled", finding.observed)
+        self.assertTrue(finding.repair.startswith("gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --stage=GA"), finding.repair)
 
     def test_a_refused_calendar_mode_role_read_is_unchecked_not_failed(self):
         # Like every other read: a 403 on the describe names what went
