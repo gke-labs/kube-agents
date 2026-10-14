@@ -126,6 +126,8 @@ ERROR_EXCERPT_CHARS = 300
 # argparse's exit status for a command line it refuses, kept when the refusal is written as a
 # manifest so a caller reading the status sees the number it always has.
 USAGE_EXIT_CODE = 2
+# The manifest's indentation on stdout, as the SOP's redirect stores it.
+JSON_INDENT = 2
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # How many cluster names the closing summary spells out per check before it
 # counts the rest.
@@ -2399,7 +2401,7 @@ def main(argv: list[str] | None = None) -> int:
         # every other failure is written.
         print(parser.format_usage(), end="", file=sys.stderr)
         log(f"ERROR: {exc}")
-        print(json.dumps(refused_manifest(str(exc)), indent=2))
+        print(json.dumps(refused_manifest(str(exc)), indent=JSON_INDENT))
         return USAGE_EXIT_CODE
     declared_scope.set(args.scope_projects, args.scope_unread)
     manifest = collect_fleet(args.project, criteria=criteria)
