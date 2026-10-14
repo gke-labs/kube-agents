@@ -750,6 +750,7 @@ CHECK_SYMPTOM_TENTATIVE = "upgrade-symptom-tentative"
 CHECK_SYMPTOM_UNCLASSIFIED = "upgrade-symptom-unclassified"
 CHECK_SYMPTOM_PREDATES = "symptom-predates-upgrade"
 OPERATIONS_READ = "operations"
+OPERATIONS_LIST_FAILED_TEXT = OPERATIONS_READ + " list failed"
 CHECK_READS = (
     (CHECK_OPERATION_FAILED, OPERATIONS_READ),
     (CHECK_BROKE_WORKLOAD, "pods"),
@@ -1254,6 +1255,10 @@ AFTER_UPGRADE_WITH_SINCE_TEXT = "--after-upgrade selects by the ledger's reviewe
 AFTER_UPGRADE_SCOPE_TEXT = "--after-upgrade reviews the clusters with an upgrade operation not yet reviewed"
 AFTER_UPGRADE_REASON_FORMAT = "{count} upgrade operation(s) not yet reviewed, ended by {floor}"
 AFTER_UPGRADE_QUIET_LOG = "after-upgrade: no settled operation awaits review; nothing written"
+# A wake whose operations listing failed cannot know whether anything settled:
+# blind, not quiet, so the run goes on with nothing to review and writes the
+# failure where the SOP reads it.
+AFTER_UPGRADE_BLIND_LOG = "after-upgrade: the operations listing failed for {projects}; nothing settled can be found, and the failure is written for the recovery"
 AFTER_UPGRADE_HELD_LOG = "after-upgrade: nothing settled is reviewable yet; nothing written"
 # The route diffs against a baseline a full run established; without one it
 # says so and writes nothing, so an install that predates the job gets its
@@ -2568,12 +2573,28 @@ def _tolerates(tolerations: list[dict], taint: dict) -> bool:
 def _placeable_pools(symptom: dict, ctx: Context) -> set[str] | None:
     """The pools the scheduler could place the pod on, pins aside: those with
     a node whose taints the pod tolerates and that offers every extended
-    resource it requests. None without a nodes read."""
+    resource it requests -- or, the upgrade's own mechanism (entry 18) having
+    taken the resource out of allocatable on the nodes it rebuilt, whose
+    taints say what the pool is: a taint keyed by the requested resource
+    (GKE's `nvidia.com/gpu=present`) or one the pod tolerates by name. An
+    upgraded pool with no node left (scaled to zero in a failed surge) has
+    nothing to judge and counts as touched. None without a nodes read."""
     if ctx.pool_nodes is None:
         return None
     tolerations = symptom.get("tolerations") or []
     requested = set(symptom.get("extended_resources") or [])
-    return {pool for pool, nodes in ctx.pool_nodes.items() if any(all(_tolerates(tolerations, taint) for taint in taints) and requested <= offered for taints, offered in nodes)}
+    named = {t.get("key") for t in tolerations if t.get("key")}
+
+    def placeable(taints: list[dict], offered: set[str]) -> bool:
+        if not all(_tolerates(tolerations, taint) for taint in taints):
+            return False
+        if requested <= offered:
+            return True
+        keys = {taint.get("key") for taint in taints if (taint.get("effect") or "") in BLOCKING_TAINT_EFFECTS}
+        return bool(requested) and (requested <= keys or bool(named & keys))
+
+    pools = {pool for pool, nodes in ctx.pool_nodes.items() if any(placeable(taints, offered) for taints, offered in nodes)}
+    return pools | {pool for pool in ctx.upgraded_pools if pool not in ctx.pool_nodes}
 
 
 def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_pins: list[dict[str, list[str]]], pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
@@ -3628,7 +3649,10 @@ def _symptom_group_check(symptoms: list[dict], upgrade_context: bool) -> tuple[s
     under: the one rule `triage` applies per incident and `guards_for`
     records per guard, so a held guard's candidate keeps its finding's
     identity. `upgrade_context` is whether the review saw an upgrade (the
-    status or an operation), without which "predates" means nothing."""
+    status or an operation), without which "predates" means nothing. The
+    flag is the group's verdict: once a symptom that does not predate wins
+    the Error, the incident does not predate, whatever its other rows say
+    (each row's `since` still says which predates)."""
     severity, predates = SEVERITY_WARNING, False
     for symptom in symptoms:
         symptom_predates = bool(symptom.get("predates_upgrade")) and upgrade_context
@@ -3636,7 +3660,7 @@ def _symptom_group_check(symptoms: list[dict], upgrade_context: bool) -> tuple[s
         if _symptom_severity(symptom) == SEVERITY_ERROR and not symptom_predates and not symptom.get("recreated_only"):
             severity = SEVERITY_ERROR
     if severity == SEVERITY_ERROR:
-        return (CHECK_NODE_BROKEN if any(s["category"] == CATEGORY_NODE for s in symptoms) else CHECK_BROKE_WORKLOAD), severity, predates
+        return (CHECK_NODE_BROKEN if any(s["category"] == CATEGORY_NODE for s in symptoms) else CHECK_BROKE_WORKLOAD), severity, False
     if predates:
         return CHECK_SYMPTOM_PREDATES, severity, predates
     if all(c["entry"] is None for s in symptoms for c in s["classifications"]):
@@ -5275,6 +5299,13 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
         entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": reason[:ERROR_EXCERPT_CHARS]})
+    # A project whose operations listing failed and that no entry carries
+    # (the after-upgrade wake lists nothing else): its own gate-failed entry,
+    # so the manifest says the wake was blind rather than idle.
+    carried = {e.get("project") for e in entries}
+    blind = sorted(project for project in operations_unread if project not in carried)
+    for project in blind:
+        entries.append({"name": PROJECT_TARGET_PREFIX + project, "project": project, "location": UNENUMERATED_TARGET_LOCATION, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": (listing_errors.get(project) or OPERATIONS_LIST_FAILED_TEXT)[:ERROR_EXCERPT_CHARS]})
     manifest = {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
@@ -5283,7 +5314,7 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         "finished_at": finished_at,
         "scoped": result["scoped"],
         AFTER_RESET_KEY: bool(result.get(AFTER_RESET_KEY)),
-        "partial": any(run_limiting_failure(line) for line in result["failed_reads"]) or any(r.get("partial") for r in result["reviews"]) or bool(result["upgrading"]) or bool(result.get("scope_note")),
+        "partial": any(run_limiting_failure(line) for line in result["failed_reads"]) or any(r.get("partial") for r in result["reviews"]) or bool(result["upgrading"]) or bool(result.get("scope_note")) or bool(blind),
         "clusters": entries,
         "still_flagged": sorted(still_flagged, key=lambda h: (h["cluster"], h["check"], h["namespace"], h["object"])),
         "fleet": result.get("fleet") or [],
@@ -5742,7 +5773,13 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         kept = {s.key for s in selected} | {row["cluster"] for row in upgrading}
         clusters = [c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) in kept]
         unchanged = []
-        if not selected:
+        if not selected and operations_unread:
+            # A listing that failed is a blind wake, not a quiet one: the run
+            # goes on with nothing to review and writes the failure where the
+            # SOP reads it (Reads that failed, the manifest's gate-failed
+            # project entry, `partial`).
+            log(AFTER_UPGRADE_BLIND_LOG.format(projects=", ".join(sorted(operations_unread))))
+        elif not selected:
             # A held cluster is why nothing was written: say so, and name it.
             held_lines = [_upgrading_line(row, str) for row in upgrading]
             for line in [AFTER_UPGRADE_HELD_LOG if held_lines else AFTER_UPGRADE_QUIET_LOG] + held_lines + failed_reads:

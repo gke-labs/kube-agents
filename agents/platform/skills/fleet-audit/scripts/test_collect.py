@@ -12562,7 +12562,7 @@ class PrepareKubeconfigTest(unittest.TestCase):
             kc.write_text("the tick's")
             # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
             # exercised whoever runs the suite, root included; the log shows no move-aside.
-            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), owned_by(kc, collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(collect.prepare_kubeconfig(kc))
             self.assertNotIn("moved aside", err.getvalue())
             self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))

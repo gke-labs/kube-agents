@@ -1145,7 +1145,9 @@ class PrepareKubeconfigTest(unittest.TestCase):
             os.mkdir(shared, 0o755)
             with open(path, "w", encoding="utf-8") as f:
                 f.write("the tick's")
-            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            # The file's owner is the test's own fact as the directory's is, so the replace branch is the
+            # one exercised whoever runs the suite, root included.
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), owned_by(path, report.ROOT_UID + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
             self.assertNotIn("moved aside", err.getvalue())
             self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))

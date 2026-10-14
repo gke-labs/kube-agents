@@ -8134,7 +8134,7 @@ class PrepareKubeconfigTest(unittest.TestCase):
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
             kc.write_text("the tick's")
-            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1):
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1), owned_by(kc, 1):
                 path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 

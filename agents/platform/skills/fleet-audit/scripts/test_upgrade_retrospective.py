@@ -703,6 +703,28 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
         [row] = self.classify(pods=[gpu_pod], nodes=nodes, ops=gpu_pool_only)
         self.assertEqual(entries(row), {(18, ur.HIGH)})
+        # Entry 18's own mechanism takes the resource out of allocatable on the nodes the upgrade rebuilt
+        # (the device plugin never registers): the pool still says what it is through a taint the pod
+        # tolerates by name, so the GPU pool's upgrade keeps the gate open while the CPU pool's still
+        # does not; a pool scaled to zero in a failed surge has no node to judge and counts as touched;
+        # GKE's `nvidia.com/gpu=present` taint keys the resource itself.
+        stripped = copy.deepcopy(nodes)
+        del next(n for n in stripped if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "pinned-inference-pool")["status"]["allocatable"]["nvidia.com/gpu"]
+        [row] = self.classify(pods=[gpu_pod], nodes=stripped, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        [row] = self.classify(pods=[gpu_pod], nodes=stripped, ops=cpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        gone = [n for n in nodes if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] != "pinned-inference-pool"]
+        [row] = self.classify(pods=[gpu_pod], nodes=gone, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        gke_gpu = copy.deepcopy(stripped)
+        next(n for n in gke_gpu if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "pinned-inference-pool")["spec"]["taints"] = [{"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}]
+        gke_pod = copy.deepcopy(gpu_pod)
+        gke_pod["spec"]["tolerations"] = [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
+        [row] = self.classify(pods=[gke_pod], nodes=gke_gpu, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        [row] = self.classify(pods=[gke_pod], nodes=gke_gpu, ops=cpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
         # Without a nodes read nothing narrows the fallback: any upgraded pool opens the gate, as before.
         [row] = symptoms_of("seeded-a", reads={"pods": [cpu_pod], "events": [], "pdbs": []}, ops=gpu_pool_only)
         self.assertEqual(entries(row), {(2, ur.HIGH)})
@@ -4013,6 +4035,52 @@ class LedgerAndGuardsTest(unittest.TestCase):
         nope = f"{PROJECT}/{LOCATION}/nope"
         missing, _ = self.collect(fleet, now=later, cluster=[nope])
         self.assertEqual([line for line in missing["failed_reads"] if nope in line], [f"{nope}: named by --cluster but not listed in its project"])
+
+    def test_an_after_upgrade_wake_whose_operations_listing_failed_is_recorded_not_quiet(self):
+        # The wake's only selection input is the operations listing: when it fails the wake is blind,
+        # not quiet. It says so, goes on with nothing to review, and writes what the SOP reads: the
+        # listing error under Reads that failed, a gate-failed `project/<id>` entry in the manifest and
+        # `partial` true; the ledger does not advance. A wake whose listing answered and found nothing
+        # settled stays quiet and writes nothing (test_probe_lock_reports_free_or_held_and_touches_nothing).
+        self.collect()
+        before = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        manifest_path = self.home / "after.json"
+        with redirect_stderr(io.StringIO()) as err:
+            result = ur.collect(args(full=False, after_upgrade=True, manifest_file=str(manifest_path)), run=FakeFleet(ops_fail=[PROJECT]), now=later)
+        self.assertFalse(result.get("quiet"))
+        self.assertIn(ur.AFTER_UPGRADE_BLIND_LOG.format(projects=PROJECT), err.getvalue())
+        self.assertEqual((result["reviews"], result["unchanged"], result["operations_unread"]), ([], [], [PROJECT]))
+        [line] = [l for l in result["failed_reads"] if l.startswith(f"{PROJECT}: ")]
+        manifest = json.loads(manifest_path.read_text())
+        [entry] = manifest["clusters"]
+        self.assertEqual((entry["name"], entry["outcome"], entry["error"], manifest["partial"], manifest.get("error")), (ur.PROJECT_TARGET_PREFIX + PROJECT, ur.MANIFEST_OUTCOME_GATE_FAILED, line.split(": ", 1)[1], True, None))
+        self.assertIn(f"- {line}", ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
+        self.assertTrue(Path(result["report_path"]).name.endswith("-scoped.md"))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"], before["clusters"])
+
+    def test_an_error_incident_does_not_say_it_predates_the_upgrade(self):
+        # One object, two rows: a replica crash-looping since before the window (predates) and a
+        # replacement the drain displaced, Pending on Insufficient cpu inside it (entry 2, high). The
+        # Error wins and the incident's flag is the group's verdict: neither the report nor the candidate
+        # says the Error was graded a Warning; the rows' own Since column still says which predates.
+        # Still restarting (a termination this hour keeps the row in the window); its onset is its start.
+        crashing = pod("api-aaaaa", namespace="seeded-capacity", owner="ReplicaSet", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "startedAt": "2026-10-08T16:55:00Z", "finishedAt": "2026-10-08T17:00:00Z"}}, "restartCount": 400}])
+        crashing["metadata"]["creationTimestamp"] = crashing["status"]["startTime"] = "2026-09-20T00:00:00Z"
+        displaced = pod("api-bbbbb", namespace="seeded-capacity", owner="ReplicaSet", scheduled_message="0/4 nodes are available: 4 Insufficient cpu. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.")
+        displaced["metadata"]["creationTimestamp"] = "2026-10-07T04:10:00Z"
+        displaced["status"]["conditions"][0]["lastTransitionTime"] = "2026-10-07T04:10:00Z"
+        for p in (crashing, displaced):
+            p["metadata"]["ownerReferences"][0]["name"] = "api-7d9f8b6c5"
+        obj = "seeded-capacity/ReplicaSet/api-7d9f8b6c5"
+        reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [crashing, displaced]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            result, _ = self.collect(manifest_file=str(self.home / "manifest.json"))
+        [incident] = [i for i in result["sections"]["errors"] if i["object"] == obj]
+        self.assertEqual((incident["check"], incident["predates_upgrade"], sorted(s["predates_upgrade"] for s in incident["symptoms"])), (ur.CHECK_BROKE_WORKLOAD, False, [False, True]))
+        self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, ur.render_report(result).split(f"`{obj}`")[1].split("### ")[0])
+        [candidate] = [c for cl in result["manifest"]["clusters"] for c in cl.get("candidates", []) if c["object"].endswith("/api-7d9f8b6c5")]
+        self.assertEqual((candidate["severity"], ur.PREDATES_UPGRADE_TEXT in candidate["impact"]), ("major", False))
 
     def test_newly_displaced_replicas_make_an_already_recorded_row_new(self):
         # A StatefulSet carries no dated failure condition, so its pods are dated by their own evidence.
