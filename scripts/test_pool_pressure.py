@@ -887,7 +887,7 @@ class SweepDeadline(unittest.TestCase):
     STRADDLING_BUILD = 2092904488661684225
     STRADDLING_CREATED = datetime(2026, 8, 26, 22, 0, tzinfo=timezone.utc)
 
-    def _sweep(self, clock):
+    def _sweep(self, clock, vanished=()):
         """collect_waits over two days, with monotonic() reading from `clock`."""
         builds = (self.OLD_BUILD, self.NEW_BUILD, self.STRADDLING_BUILD)
         entries = {build: str(build) for build in builds}
@@ -902,12 +902,24 @@ class SweepDeadline(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None, [])), \
+                                           return_value=(entries, None, list(vanished))), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for), \
                 unittest.mock.patch.object(pp.time, "monotonic", side_effect=clock):
             return pp.collect_waits(
                 self.AS_OF - timedelta(days=2), self.AS_OF, deadline_seconds=10
             )
+
+    def test_a_vanished_pointer_on_an_unread_day_is_not_named(self):
+        """The report says the days the deadline cut are missing, not empty;
+        a pointer that vanished on one of them is not listed beside the
+        builds from the days that were read."""
+        gone = [{"build_id": str(self.OLD_BUILD + 1), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": str(self.NEW_BUILD + 2), "error": pp.INDEX_POINTER_VANISHED}]
+        full = self._sweep([0, 0, 0, 5], gone).value
+        self.assertEqual(gone, full.unreadable)
+        cut = self._sweep([0, 0, 99, 99], gone).value
+        self.assertTrue(cut.truncated)
+        self.assertEqual(gone[1:], cut.unreadable)
 
     def test_a_sweep_inside_the_deadline_covers_the_window_it_was_asked_for(self):
         sweep = self._sweep([0, 0, 0, 5]).value
@@ -1023,6 +1035,12 @@ class IndexCopy(unittest.TestCase):
         entries, err, vanished = self._copy(-9, self.VANISHED)
         self.assertEqual({}, entries)
         self.assertIn("could not read the build index", err)
+        # The message says what decided it, not only the 404 the hour survives.
+        self.assertIn("exit -9", err)
+        # With no error line, the last line of stderr stands in, not all of it.
+        _, err, _ = self._copy(-9, "Copying a\nCopying b\nCopying c\n")
+        self.assertIn("exit -9", err)
+        self.assertEqual(1, err.count("Copying"))
 
     def test_more_vanished_pointers_than_the_limit_fail_the_copy(self):
         lines = [self.VANISHED.replace("2110431553740869632", f"21104315537408696{i:02d}")
@@ -1030,6 +1048,7 @@ class IndexCopy(unittest.TestCase):
         entries, err, vanished = self._copy(1, "\n".join(lines))
         self.assertEqual({}, entries)
         self.assertIn("could not read the build index", err)
+        self.assertIn(f"{pp.VANISHED_POINTER_LIMIT + 1} vanished pointers, over the ceiling", err)
         entries, err, vanished = self._copy(1, "\n".join(lines[:-1]))
         self.assertIsNone(err)
         self.assertEqual(pp.VANISHED_POINTER_LIMIT, len(vanished))
@@ -1054,6 +1073,7 @@ class IndexCopy(unittest.TestCase):
         entries, err, vanished = self._copy(1, self.VANISHED, landed=())
         self.assertEqual({}, entries)
         self.assertIn("could not read the build index", err)
+        self.assertIn("nothing landed", err)
 
     def test_a_failed_exit_with_no_error_line_still_fails(self):
         entries, err, vanished = self._copy(124, "timed out after 300s: gcloud storage cp")

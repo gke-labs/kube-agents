@@ -904,8 +904,17 @@ def _index_entries_from_gcs(
     )
     entries = _index_entries_from_dir(dest) if partial else {}
     if not entries:
-        # The error lines alone: the stderr is thousands of Copying lines.
-        reason = "; ".join(errors) or err.strip() or f"exit {rc}"
+        # What decided the refusal, then the error lines, or the last line
+        # when there is none: the stderr is thousands of Copying lines, and a
+        # 404 line alone would read as the case the hour survives.
+        facts = [f"exit {rc}"]
+        if len(vanished) > VANISHED_POINTER_LIMIT:
+            facts.append(f"{len(vanished)} vanished pointers, over the ceiling of {VANISHED_POINTER_LIMIT}")
+        if partial:
+            facts.append("nothing landed")
+        tail = err.strip().splitlines()
+        detail = "; ".join(errors) or (tail[-1] if tail else "")
+        reason = ", ".join(facts) + (f": {detail}" if detail else "")
         return {}, f"could not read the build index: {reason}", []
     return entries, None, [
         {"build_id": str(build), "error": INDEX_POINTER_VANISHED} for build in vanished
@@ -1117,10 +1126,11 @@ def collect_waits(
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
         # A vanished pointer is a build the sweep never saw: named with the
         # unreadable builds when its ID falls in the window (with the same
-        # slack as below; a replay of a past day does not report today's),
-        # left out of the numbers, and not counted against the newest-builds
-        # share below, which judges the reader, not Prow.
-        unreadable: List[Dict[str, str]] = [
+        # slack as below; a replay of a past day does not report today's)
+        # and on a day the sweep finished, left out of the numbers, and not
+        # counted against the newest-builds share below, which judges the
+        # reader, not Prow.
+        vanished_in_window = [
             gone
             for gone in vanished
             if window_start - SNOWFLAKE_SLACK
@@ -1139,10 +1149,13 @@ def collect_waits(
                 candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(build_id)
         if not candidates:
             return Source(
-                value=Sweep([], 0, time.monotonic() - began, window_start, False, unreadable)
+                value=Sweep(
+                    [], 0, time.monotonic() - began, window_start, False, vanished_in_window
+                )
             )
 
         collected: List[Wait] = []
+        unreadable: List[Dict[str, str]] = []
         read = 0
         done: List[str] = []
         truncated = False
@@ -1174,6 +1187,14 @@ def collect_waits(
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]
+    # A vanished pointer from a day the deadline left unread is not named
+    # beside the days that were, as the report says those days are missing.
+    unreadable = [
+        gone
+        for gone in vanished_in_window
+        if not truncated
+        or snowflake_time(int(gone["build_id"])).strftime(DATE_FORMAT) in done
+    ] + unreadable
     sweep = Sweep(
         waits, read, time.monotonic() - began, measured_start, truncated, unreadable
     )
