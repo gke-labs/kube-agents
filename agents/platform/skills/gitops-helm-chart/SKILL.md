@@ -59,7 +59,7 @@ search the filesystem for credentials or a repository; a card that says
 
 The first stop comes before anything else: the install must have a GitOps
 repository registered, and it must be reachable. One command answers both,
-the same one `SOUL.md` names, and its one line is final:
+and its one line is final:
 
 ```bash
 python3 "$HERMES_HOME"/scripts/gitops_preflight.py
