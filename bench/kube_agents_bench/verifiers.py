@@ -1365,12 +1365,16 @@ class WorkerCommandsVerifier(BaseVerifier):
     segments does, and the reason names the segment. A case grading what a
     worker RAN, rather than what its call text contains, wants
     ``segments``, so its patterns can anchor on ``^kubectl`` instead of
-    describing shell.
+    describing shell. ``segments`` reads the workers' tagged ``terminal``
+    and ``execute_code`` calls in the trajectory (what ``after_result_pattern``
+    reads), so an ``execute_code`` body is program text here too; ``command``
+    reads the card logs, which hold terminal one-liners only.
 
     ``after_result_pattern`` makes the forbidden set order-aware: it applies
     only to the commands a worker issued AFTER its first command whose result
-    matched the pattern and whose command matched ``after_command_pattern``,
-    or, without one, its first FAILED command whose result matched. The
+    matched the pattern and whose command matched ``after_command_pattern``
+    (one pattern, or a list any of which may match: the routes a first
+    attempt can take), or, without one, its first FAILED command whose result matched. The
     window is per delegated card together with the cards its worker fanned
     out (``transcript.worker_card_parents``, the creator-of edges alone,
     read as an undirected graph so no cycle splits a lineage): a card in
@@ -1422,7 +1426,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
-    after_command_pattern: str | None = None
+    after_command_pattern: str | list[str] | None = None
     match: Literal["command", "segments"] = "command"
 
     @field_validator("required_patterns", "forbidden_patterns")
@@ -1434,10 +1438,16 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     @field_validator("after_result_pattern", "after_command_pattern")
     @classmethod
-    def _window_pattern_compiles(cls, pattern: str | None) -> str | None:
-        if pattern is not None:
-            re.compile(pattern)
+    def _window_pattern_compiles(cls, pattern: str | list[str] | None) -> str | list[str] | None:
+        for one in ([pattern] if isinstance(pattern, str) else pattern or []):
+            re.compile(one)
         return pattern
+
+    @property
+    def _opener_patterns(self) -> list[str]:
+        if self.after_command_pattern is None:
+            return []
+        return [self.after_command_pattern] if isinstance(self.after_command_pattern, str) else list(self.after_command_pattern)
 
     @model_validator(mode="after")
     def _command_pattern_needs_result_pattern(self) -> WorkerCommandsVerifier:
@@ -1457,16 +1467,20 @@ class WorkerCommandsVerifier(BaseVerifier):
             return [(kind == _PYTHON_SEGMENT, text) for kind, text in _typed_segments(command)]
         return [(False, command)]
 
+    @staticmethod
+    def _applies(pattern: str, is_program: bool) -> bool:
+        """Whether ``pattern`` is tried against this kind of text: one opening with
+        ``(?#program)`` reads program text only, one opening with ``(?#shell)`` shell only."""
+        if pattern.startswith(_PROGRAM_ONLY):
+            return is_program
+        if pattern.startswith(_SHELL_ONLY):
+            return not is_program
+        return True
+
     def _hit(self, pattern: str, command: str) -> str | None:
-        """The text of ``command`` that ``pattern`` matched, or ``None``. A pattern opening
-        with ``(?#program)`` is tried against program text only, one opening with
-        ``(?#shell)`` against shell segments only."""
+        """The text of ``command`` that ``pattern`` matched, or ``None``."""
         for is_program, text in self._texts(command):
-            if pattern.startswith(_PROGRAM_ONLY) and not is_program:
-                continue
-            if pattern.startswith(_SHELL_ONLY) and is_program:
-                continue
-            if re.search(pattern, text):
+            if self._applies(pattern, is_program) and re.search(pattern, text):
                 return text
         return None
 
@@ -1481,7 +1495,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         window = ""
-        if self.after_result_pattern is None:
+        reads_trajectory = self.after_result_pattern is not None or self.match == "segments"
+        if not reads_trajectory:
             if snap.worker_commands is None:
                 return VerificationResult(
                     success=False,
@@ -1502,7 +1517,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             commands = [command for _, _, command, _, _ in calls]
             untimed = [command for _, at, command, _, _ in calls if at is None]
-            if untimed:
+            if untimed and self.after_result_pattern is not None:
                 shown = "; ".join(repr(c.replace(_PROGRAM_TEXT, "")[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
                 return VerificationResult(
                     success=False,
@@ -1514,14 +1529,16 @@ class WorkerCommandsVerifier(BaseVerifier):
             def _opens(command: str, result: str, failed: bool) -> bool:
                 if not re.search(self.after_result_pattern, result):
                     return False
-                if self.after_command_pattern is None:
+                if not self._opener_patterns:
                     return failed
-                return self._hit(self.after_command_pattern, command) is not None
+                return any(self._hit(p, command) is not None for p in self._opener_patterns)
 
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
             graded = []
             opened: list[str] = []
-            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls):
+            if self.after_result_pattern is None:
+                graded = commands
+            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls) if self.after_result_pattern is not None else ():
                 own = [call for call in calls if lineage[call[0]] == root]
                 opener = next((i for i, (_, _, command, result, failed) in enumerate(own) if _opens(command, result, failed)), None)
                 if opener is None:
@@ -1537,7 +1554,13 @@ class WorkerCommandsVerifier(BaseVerifier):
                     # sits. The opener is the first shell segment the write pattern
                     # matches, in walk order.
                     segs = _typed_segments(own[opener][2])
-                    k = next((n for n, (kind, t) in enumerate(segs) if kind != _PYTHON_SEGMENT and re.search(self.after_command_pattern, t)), None)
+                    k = next(
+                        (
+                            n for n, (kind, t) in enumerate(segs)
+                            if any(self._applies(p, kind == _PYTHON_SEGMENT) and re.search(p, t) for p in self._opener_patterns)
+                        ),
+                        None,
+                    )
                     if k is not None:
                         after = [
                             (_PROGRAM_TEXT if kind == _PYTHON_SEGMENT else _SEGMENT_TEXT) + t
@@ -1545,12 +1568,14 @@ class WorkerCommandsVerifier(BaseVerifier):
                         ] + after
                 graded.extend(after)
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
-            if not opened:
+            if self.after_result_pattern is None:
+                pass
+            elif not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
                     + (
-                        f" of a command matching {self.after_command_pattern!r})"
-                        if self.after_command_pattern is not None
+                        f" of a command matching {self._opener_patterns!r})"
+                        if self._opener_patterns
                         else " of a failed command)"
                     )
                     + ", so no command is after it and the forbidden pattern(s) graded nothing"
@@ -1570,7 +1595,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
-        partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        partial = reads_trajectory and snap.worker_capture_gaps
         if hits or (missing and not partial):
             parts = []
             if missing:

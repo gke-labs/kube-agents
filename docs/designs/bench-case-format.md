@@ -226,11 +226,11 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it; with `match: segments` each pattern is tried against every simple command inside a
+purges it; with `match: segments` the source is the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, and each pattern is tried against every simple command inside a
 call as a shell runs it, behind joins, lines and `$(...)`, in `sh -c` strings and executed heredocs,
 wrapper words and assignments stripped, comments and content heredocs yielding nothing, and quoted text opening no segment of its own, so only a pattern anchored on the command word is shielded from a quoted argument; a pattern opening with `(?#program)` is tried against Python text only (an `execute_code` body; a `-c` string, an executed Python heredoc or written script inside a call), one opening with `(?#shell)` against shell segments only; with `after_result_pattern` the forbidden set applies only to the commands
 a worker issued after its first call whose result matched and whose command matched
-`after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` and `execute_code` calls in the
+`after_command_pattern` (one pattern or a list, any of which), or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` and `execute_code` calls in the
 trajectory, which carry results as the record stores them, a JSON string with newlines
 escaped; a trajectory with no tagged `terminal` or `execute_code` call, a call with no numeric time, or a capture with gaps and no hit, is then
 `status: "error"` where the log path would grade an empty list), `worker_agents` (regular expressions every one of which must match the
