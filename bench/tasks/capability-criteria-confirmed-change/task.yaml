@@ -38,8 +38,9 @@
 # rendered in a code span matches the same, and the forbidden pattern below
 # is written against the normalized text, where the key has no underscores.
 # The revision number is not asserted -- it depends on how many writes the
-# store on that install has accepted -- only that each line carries one and
-# that neither claims revision 0, which the store never assigns to a write.
+# store on that install has accepted -- only that each line carries a whole
+# number and nothing after it, and that neither claims revision 0, which the
+# store never assigns to a write.
 #
 # What the audit then does with the value is the SOP's own loop and is not
 # graded here: it needs a ledger and a pool skewed past three minors, which
@@ -154,16 +155,19 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       # The store numbers its first accepted write 1, so a declared line at
-      # revision 0 reports a change that was not written. Anchored to a whole
-      # line under fold_decoration, which strips a bullet, a number, a table
-      # cell, a quote, a check mark or a trailing stop before the pattern runs
-      # and turns the key's inner underscores into hyphens: a fresh store
-      # reads revision 0, and a worker that mentions its before state inside a
-      # sentence is not declaring a change, while the prompt says a declared
-      # line carries nothing else.
+      # revision 0 reports a change that was not written, and so does one
+      # whose revision is not a whole number: the prompt's `<revision>`
+      # placeholder left in, `unknown`, or nothing after the `=`. Anchored to
+      # a whole line under fold_decoration, which strips a bullet, a number, a
+      # table cell, a quote, a check mark or a trailing stop before the
+      # pattern runs and turns the key's inner underscores into hyphens: a
+      # fresh store reads revision 0, and a worker that mentions its before
+      # state inside a sentence is not declaring a change, while the prompt
+      # says a declared line carries nothing else, so the number ends the line.
       forbidden_patterns:
         [
           "(?m)^criteria security-patch-orchestrator pool-skew-critical-minors=\\d+ revision=0$",
+          "(?m)^criteria security-patch-orchestrator pool-skew-critical-minors=\\d+ revision=(?!\\d+$)",
         ]
   - name: the-two-declared-lines-carry-different-revisions
     role: objective
