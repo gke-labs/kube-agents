@@ -3455,6 +3455,19 @@ class CriteriaTest(unittest.TestCase):
                         pr.main(["--project", "acme", "--deprecated-image-types", value])
                 self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset(expected))
 
+    def test_a_token_no_image_type_can_match_is_refused_by_name(self):
+        # The store returns the list as a JSON array; pasted as is, the brackets and quotes make
+        # tokens no pool's imageType equals, and nothing would be flagged. Refused, naming them.
+        for value in ('["COS","UBUNTU"]', "cos, ubu-ntu", "'COS'"):
+            with self.subTest(value=value):
+                err = io.StringIO()
+                with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exc:
+                        pr.main(["--project", "acme", "--deprecated-image-types", value])
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn("--deprecated-image-types", err.getvalue())
+                collect.assert_not_called()
+
     def test_no_flags_is_the_shipped_criteria(self):
         with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):

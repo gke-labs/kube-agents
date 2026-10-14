@@ -199,6 +199,9 @@ LONG_FREEZE_DAYS = 30
 LONG_FREEZE = timedelta(days=LONG_FREEZE_DAYS)
 # The widest horizon the check's own arithmetic holds; past it `timedelta(days=...)` raises.
 MAX_FREEZE_HORIZON_DAYS = timedelta.max.days
+# What an image type is spelled as, once upper-cased: a token outside this is a JSON array's
+# bracket or quote pasted into the flag, which no pool's `imageType` can ever equal.
+IMAGE_TYPE_TOKEN_RE = re.compile(r"^[A-Z0-9_]+$")
 # How `--deprecated-image-types` separates its entries.
 IMAGE_TYPE_LIST_SEPARATOR = ","
 # §3.8's escalation: a freeze beside a critical or major version finding.
@@ -2314,6 +2317,12 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     # the one the scope flags on this same command line use, commas or
     # whitespace with each entry once, so one command line has one grammar.
     deprecated = frozenset(item.upper() for item in fleet_scope_args.parse_scope_projects(args.deprecated_image_types))
+    malformed = sorted(item for item in deprecated if not IMAGE_TYPE_TOKEN_RE.match(item))
+    if malformed:
+        parser.error(
+            f"--deprecated-image-types: {', '.join(malformed)}: an image type is letters, digits and underscores; "
+            f"pass the store's entries comma-separated, not as a JSON array"
+        )
     return Criteria(
         pool_skew_critical_minors=args.pool_skew_critical_minors,
         fleet_spread_min_minors=args.fleet_spread_min_minors,
