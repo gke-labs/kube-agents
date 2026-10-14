@@ -200,7 +200,7 @@ Two things to verify on the cluster, neither of which the operator can check for
 
 At that point the allowlist covers DNS (selector peers, the resolved cluster DNS ClusterIP, and the Cloud DNS resolver — the same ladder the gateway policy renders), the broker, LiteLLM, the OTel collector, the Hindsight memory API and (under the unsupported `mode: next` toggle) the A2A NATS pods, and everything the agent container reaches on its own would go away:
 
-- DuckDuckGo web search, which `deploy/shared/defaults/config.yaml` turns on for every profile (`web.backend: ddgs`), and the `browser` toolset, which only the Chat Agent disables;
+- DuckDuckGo web search, which `deploy/shared/defaults/config.yaml` turns on for every profile (`web.backend: ddgs`), and the `browser` toolset on any profile that does not disable it (the Chat, Platform and Cluster Agents all do, through `agent.disabled_toolsets`);
 - `github.com` reached directly from the sandbox — not the version-control verbs, which go through the broker;
 - the metadata lookup in `cluster_agent_reconcile.py`, which is how that script finds the management project (`RECONCILE_PROJECT`, the old override, is pinned empty in the managed `.env`; a project other than the pod's belongs in `spec.scope.projects`). It fails soft after a five-second timeout and falls back to `gcloud config get-value project`, a broker call that is on the allowlist, so the cost is the timeout on each tick, provided the broker's configured project is the pod's own: a fallback answer that differs from the previous run's management project is treated as unresolved rather than as a changed management project.
 
