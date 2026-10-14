@@ -486,6 +486,11 @@ ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMA
 # reuses the exec route's outcome words.
 VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
+# Proposals this install opened that the forge reports merged, counted once
+# each per broker process as the broker's reads show them
+# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# `status.usage.remediationsMergedTotal` from. No labels.
+VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -7164,6 +7169,10 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
+        # Looked up at call time: the handler's registry is a class attribute
+        # a test replaces per case, and this broker outlives none of them.
+        merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -7627,6 +7636,7 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
+        self._merged = 0
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -7716,11 +7726,16 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
+    def record_merged(self, count: int) -> None:
+        with self._lock:
+            self._merged += count
+
     def render(self) -> str:
         with self._lock:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
+            merged = self._merged
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
@@ -7794,6 +7809,11 @@ class ProxyMetrics:
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
             )
+        lines += [
+            f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
+            f"# TYPE {VCS_MERGED_METRIC} counter",
+            f"{VCS_MERGED_METRIC} {merged}",
+        ]
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",

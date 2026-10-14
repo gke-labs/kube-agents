@@ -5,7 +5,8 @@ success and error outcomes (the commands it ran and the requests it rejected or
 failed on before running) and the event watcher's injected-event counter, and
 reads process_start_time_seconds from both, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
-counter under one verb and status into remediationsProposedTotal. Each series name, the status label
+counter under one verb and status into remediationsProposedTotal, and its
+merged-proposals counter whole into remediationsMergedTotal. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -61,6 +62,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         match = re.search(r"^VCS_VERBS = frozenset\(\s*\{(.*?)\}\s*\)", vcs_broker, re.M | re.S)
         self.assertIsNotNone(match, "VCS_VERBS not found")
         self.assertIn(verb, set(re.findall(r'"([^"]+)"', match.group(1))))
+
+    def test_the_brokers_merged_counter_is_the_one_the_poller_sums(self):
+        self.assertEqual(_py_const("VCS_MERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsMergedSeries"))
 
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))

@@ -51,7 +51,7 @@ const (
 	// it, so that an older document is migrated where the layout allows
 	// (migrateUsageDocument) and re-seeded rather than read wrong otherwise.
 	// Version 2 keys the pod entries by pod UID and counter, since the broker
-	// pod feeds two counters from one body; version 1 keyed them by pod UID.
+	// pod feeds several counters from one body; version 1 keyed them by pod UID.
 	usageDocumentVersion         = 2
 	usageDocumentVersionPodKeyed = 1
 
@@ -60,6 +60,7 @@ const (
 	usageCounterToolExecutions       = "toolExecutionsTotal"
 	usageCounterEventsIngested       = "eventsIngestedTotal"
 	usageCounterRemediationsProposed = "remediationsProposedTotal"
+	usageCounterRemediationsMerged   = "remediationsMergedTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
 	usagePodEntryKeySeparator = "/"
@@ -69,9 +70,9 @@ var (
 	// usageGatewayCounters and usageBrokerCounters are the counters each pod
 	// group's body feeds, in the order the stub source hands samples out.
 	usageGatewayCounters = []string{usageCounterEventsIngested}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
 )
 
 // usagePodEntryKey is the document key of one pod's entry for one counter.
@@ -132,9 +133,10 @@ type usageDocument struct {
 	LastMoved *metav1.Time `json:"lastMoved,omitempty"`
 	// Pods is the baseline, keyed by pod UID and counter (usagePodEntryKey).
 	Pods map[string]*usagePodEntry `json:"pods"`
-	// migrated is set by migrateUsageDocument on a document read at an older
-	// layout, so the poll writes it back at the current one even when the fold
-	// changed nothing. Not serialised.
+	// migrated is set by migrateUsageDocument on a document it changed on read,
+	// so the poll writes it back even when the fold changed nothing; rekeyed
+	// says the change was the layout, not only a counter the document predated.
+	// Not serialised.
 	migrated bool
 	// Unfolded names the counters migrateUsageDocument added to Totals at
 	// zero and no pod has been recorded for since: the status carried nothing
@@ -148,6 +150,7 @@ type usageDocument struct {
 	// it counted before the upgrade. A counter leaves the set in the poll
 	// that first records a pod for it.
 	Unfolded []string `json:"unfolded,omitempty"`
+	rekeyed  bool
 }
 
 // usageUnfolded reports whether counter is in doc's unfolded set.
@@ -155,51 +158,60 @@ func usageUnfolded(doc *usageDocument, counter string) bool {
 	return slices.Contains(doc.Unfolded, counter)
 }
 
-// migrateUsageDocument brings a version-1 document, entries keyed by pod UID
-// with no PodUID and no entry for a counter that did not exist, to the current
-// layout in place: the keys gain their counter, the entries their pod, the
-// totals the counters they lacked. Nothing is lost, which a re-seed cannot
-// say: a re-seed starts from the status, which a pruning CRD leaves empty, and
-// re-baselines every pod at its current sample, so whatever the listeners
-// counted since the last poll is never added. A total the layout lacked
-// starts at its floor, the status value the read-back holds every total to,
-// rather than at zero: an operator that wrote the newer field, was rolled
-// back to one that kept a version-1 document, and came back again finds the
-// status still carrying what it wrote, and a zero under that floor would have
-// usageDocumentInvalid refuse the document and re-seed it, losing the
-// interval's counts on every counter. What the listeners counted during the
-// rollback is not recovered: the pods are baselined at their samples, and
-// only a counter whose floor is zero, so that none of any sample can be in
-// the total, is recorded in Unfolded for foldUsage to add whole, on this poll
-// or on the first that reads the pod. Any other version is left for
-// usageDocumentInvalid to refuse.
+// migrateUsageDocument brings a document an earlier release wrote to the
+// current layout in place. A version-1 document, entries keyed by pod UID with
+// no PodUID, has its keys gain their counter and its entries their pod; a
+// document of either version that predates a counter gains that counter's
+// total, since a release that adds a counter does not change the layout.
+// Nothing is lost, which a re-seed cannot say: a re-seed starts from the
+// status, which a pruning CRD leaves empty, and re-baselines every pod at its
+// current sample, so whatever the listeners counted since the last poll is
+// never added. A total the document lacked starts at its floor, the status
+// value the read-back holds every total to, rather than at zero: an operator
+// that wrote the newer field, was rolled back to one that kept a document
+// without it, and came back again finds the status still carrying what it
+// wrote, and a zero under that floor would have usageDocumentInvalid refuse
+// the document and re-seed it, losing the interval's counts on every counter.
+// What the listeners counted during the rollback is not recovered: the pods
+// are baselined at their samples, and only a counter whose floor is zero, so
+// that none of any sample can be in the total, is recorded in Unfolded for
+// foldUsage to add whole, on this poll or on the first that reads the pod.
+// Any other version is left for usageDocumentInvalid to refuse.
 func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
-	if doc.Version != usageDocumentVersionPodKeyed || doc.Pods == nil || doc.Totals == nil {
+	if doc.Pods == nil || doc.Totals == nil {
 		return
 	}
-	rekeyed := make(map[string]*usagePodEntry, len(doc.Pods))
-	for key, entry := range doc.Pods {
-		if entry == nil {
-			continue
+	switch doc.Version {
+	case usageDocumentVersionPodKeyed:
+		rekeyed := make(map[string]*usagePodEntry, len(doc.Pods))
+		for key, entry := range doc.Pods {
+			if entry == nil {
+				continue
+			}
+			if entry.PodUID == "" {
+				entry.PodUID = key
+			}
+			rekeyed[usagePodEntryKey(entry.PodUID, entry.Counter)] = entry
 		}
-		if entry.PodUID == "" {
-			entry.PodUID = key
-		}
-		rekeyed[usagePodEntryKey(entry.PodUID, entry.Counter)] = entry
+		doc.Pods = rekeyed
+		doc.Version = usageDocumentVersion
+		doc.migrated = true
+		doc.rekeyed = true
+	case usageDocumentVersion:
+	default:
+		return
 	}
-	doc.Pods = rekeyed
 	for _, counter := range usageCounters {
 		if _, ok := doc.Totals[counter]; ok {
 			continue
 		}
 		doc.Totals[counter] = floors[counter]
+		doc.migrated = true
 		if floors[counter] == 0 && !usageUnfolded(doc, counter) {
 			doc.Unfolded = append(doc.Unfolded, counter)
 		}
 	}
 	slices.Sort(doc.Unfolded)
-	doc.Version = usageDocumentVersion
-	doc.migrated = true
 }
 
 // usagePodEntry is one pod's baseline for one counter, keyed by
