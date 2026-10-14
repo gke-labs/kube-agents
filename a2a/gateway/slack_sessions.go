@@ -244,6 +244,13 @@ func (s *SlackAdapter) renameSession(ctx context.Context, api slackSessionsAPI, 
 	}
 	title := slackSessionTitle(ask)
 	if title == "" {
+		// Nothing of it survives the sanitiser (an ask of emoji or a bare
+		// link): let the thread's next verified ask title it instead.
+		s.mu.Lock()
+		if st.askText == ask {
+			st.askText = ""
+		}
+		s.mu.Unlock()
 		return
 	}
 	if err := api.RenameSession(ctx, channel, thread, title); err != nil {

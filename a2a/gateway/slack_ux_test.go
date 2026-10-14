@@ -511,6 +511,21 @@ func TestSlackSessionRenameRetriesUntilItLands(t *testing.T) {
 	}
 }
 
+// A first ask that sanitises to nothing gives way to the next one.
+func TestSlackSessionUntitleableAskGivesWay(t *testing.T) {
+	a, sessions := newUXSlackAdapter(&fakeSlackAPI{})
+	conv := "slack:C1/40.0"
+	a.noteAsk(conv, "<https://example.com/x>")
+	a.TaskStarted(conv, "t1")
+	a.noteAsk(conv, "check prod")
+	a.TaskTerminal(conv, "t1", lib.StateCompleted, TerminalFromExecutor, "")
+	a.TaskStarted(conv, "t2")
+	want := []string{"status C1/40.0 processing", "status C1/40.0 closed", "status C1/40.0 processing", "rename C1/40.0 check prod"}
+	if got := sessions.got(); !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
 func TestSlackSuggestedPrompts(t *testing.T) {
 	api := &fakeSlackAPI{}
 	a, _ := newUXSlackAdapter(api)
