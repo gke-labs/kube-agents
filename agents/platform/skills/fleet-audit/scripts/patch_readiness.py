@@ -123,6 +123,9 @@ MAX_WORKERS = 4
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300
+# argparse's exit status for a command line it refuses, kept when the refusal is written as a
+# manifest so a caller reading the status sees the number it always has.
+USAGE_EXIT_CODE = 2
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # How many cluster names the closing summary spells out per check before it
 # counts the rest.
@@ -2340,8 +2343,41 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     )
 
 
+class CommandLineRefused(Exception):
+    """A command line the collector refuses; the message becomes the manifest's `error`."""
+
+
+class ManifestArgumentParser(argparse.ArgumentParser):
+    """An argparse that hands a usage error back instead of exiting.
+
+    The SOP runs the collector as `patch_readiness.py … > manifest_…json`, so the shell has
+    truncated the manifest before the process starts, and an exit with nothing on stdout leaves
+    a 0-byte file that is not JSON: not the empty-fleet manifest §3 knows, not a collected one,
+    and one `finish --manifest-file` rejects. A refused flag is written as the error manifest
+    every other failure is, so §3's `error` branch carries it.
+    """
+
+    def error(self, message: str):  # type: ignore[override]
+        raise CommandLineRefused(message)
+
+
+def refused_manifest(message: str) -> dict:
+    """The manifest a refused command line is written as: `error`, no clusters, no `criteria`
+    (no run used any)."""
+    now = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
+    return {
+        "version": MANIFEST_VERSION,
+        "checks_revision": CHECKS_REVISION,
+        "audit": AUDIT_ID,
+        "started_at": now,
+        "finished_at": now,
+        "error": f"the collector's command line was refused and nothing was collected: {message}"[:ERROR_EXCERPT_CHARS],
+        "clusters": [],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = ManifestArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
     # One flag per criteria key, defaulting to the shipped value; the SOP's §3
@@ -2354,9 +2390,18 @@ def main(argv: list[str] | None = None) -> int:
     # argparse would otherwise refuse as a flag missing its argument. Omitting the flag is the
     # shipped list.
     parser.add_argument("--deprecated-image-types", nargs="?", const=EMPTY_IMAGE_TYPE_LIST, default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated as --scope-projects is; \"\" or the bare flag is an emptied list, and omitting the flag is the shipped list (criteria.deprecated_image_types)")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+        criteria = criteria_from_args(parser, args)
+    except CommandLineRefused as exc:
+        # Usage and the refusal on stderr, as argparse prints them; the manifest on stdout, as
+        # every other failure is written.
+        print(parser.format_usage(), end="", file=sys.stderr)
+        log(f"ERROR: {exc}")
+        print(json.dumps(refused_manifest(str(exc)), indent=2))
+        return USAGE_EXIT_CODE
     declared_scope.set(args.scope_projects, args.scope_unread)
-    manifest = collect_fleet(args.project, criteria=criteria_from_args(parser, args))
+    manifest = collect_fleet(args.project, criteria=criteria)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         log(f"WARNING: {manifest['error']}")

@@ -3496,18 +3496,38 @@ class CriteriaTest(unittest.TestCase):
                         pr.main(["--project", "acme", "--deprecated-image-types", value])
                 self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset(expected))
 
+    def refused(self, argv):
+        """Run `main` on a command line the collector refuses. The SOP redirects stdout into the
+        manifest before the process starts, so the refusal is written as the error manifest §3
+        already answers (no clusters, no `criteria`), with argparse's exit status and the usage
+        line and refusal on stderr; nothing is collected. Returns (error, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(out):
+            rc = pr.main(["--project", "acme", *argv])
+        collect.assert_not_called()
+        self.assertEqual(rc, pr.USAGE_EXIT_CODE)
+        manifest = json.loads(out.getvalue())
+        self.assertEqual(manifest["clusters"], [])
+        self.assertNotIn("criteria", manifest)
+        self.assertEqual((manifest["version"], manifest["audit"]), (pr.MANIFEST_VERSION, pr.AUDIT_ID))
+        self.assertIn("refused", manifest["error"])
+        self.assertIn("usage:", err.getvalue())
+        return manifest["error"], err.getvalue()
+
     def test_a_token_no_image_type_can_match_is_refused_by_name(self):
         # The store returns the list as a JSON array; pasted as is, the brackets and quotes make
         # tokens no pool's imageType equals, and nothing would be flagged. Refused, naming them.
         for value in ('["COS","UBUNTU"]', "cos, ubu-ntu", "'COS'"):
             with self.subTest(value=value):
-                err = io.StringIO()
-                with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as exc:
-                        pr.main(["--project", "acme", "--deprecated-image-types", value])
-                self.assertEqual(exc.exception.code, 2)
-                self.assertIn("--deprecated-image-types", err.getvalue())
-                collect.assert_not_called()
+                error, err = self.refused(["--deprecated-image-types", value])
+                self.assertIn("--deprecated-image-types", error)
+                self.assertIn("--deprecated-image-types", err)
+
+    def test_a_flag_argparse_refuses_is_written_as_the_error_manifest_too(self):
+        # The one refusal that is argparse's own rather than criteria_from_args's: the same
+        # manifest, so a mistyped flag on a hand-run leaves a file §3 can read.
+        error, _ = self.refused(["--pool-skew-critical-minors", "four"])
+        self.assertIn("--pool-skew-critical-minors", error)
 
     def test_no_flags_is_the_shipped_criteria(self):
         with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
@@ -3532,24 +3552,15 @@ class CriteriaTest(unittest.TestCase):
         caller passed what the store accepted."""
         for value in ("2", "0", "-1"):
             with self.subTest(value=value):
-                err = io.StringIO()
-                with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as exc:
-                        pr.main(["--project", "acme", "--pool-skew-critical-minors", value])
-                self.assertEqual(exc.exception.code, 2)
-                self.assertIn("overlap", err.getvalue())
-                collect.assert_not_called()
+                error, err = self.refused(["--pool-skew-critical-minors", value])
+                self.assertIn("overlap", error)
+                self.assertIn("overlap", err)
 
     def test_a_horizon_past_what_timedelta_holds_is_refused_by_name(self):
         # Otherwise `timedelta(days=...)` raises inside every project's collection and the
         # manifest reads as the whole fleet failing `clusters list`.
-        err = io.StringIO()
-        with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit) as exc:
-                pr.main(["--project", "acme", "--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS + 1)])
-        self.assertEqual(exc.exception.code, 2)
-        self.assertIn("--blocking-exclusion-min-days", err.getvalue())
-        collect.assert_not_called()
+        error, _ = self.refused(["--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS + 1)])
+        self.assertIn("--blocking-exclusion-min-days", error)
         with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect, redirect_stdout(io.StringIO()):
             pr.main(["--project", "acme", "--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS)])
         self.assertEqual(collect.call_args.kwargs["criteria"].blocking_exclusion_min_days, pr.MAX_FREEZE_HORIZON_DAYS)
@@ -3557,10 +3568,8 @@ class CriteriaTest(unittest.TestCase):
     def test_a_width_or_horizon_under_one_is_refused(self):
         for flag in ("--fleet-spread-min-minors", "--blocking-exclusion-min-days"):
             with self.subTest(flag=flag):
-                with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        pr.main(["--project", "acme", flag, "0"])
-                collect.assert_not_called()
+                error, _ = self.refused([flag, "0"])
+                self.assertIn(flag, error)
 
 if __name__ == "__main__":
     unittest.main()
