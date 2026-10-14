@@ -66,7 +66,14 @@ class PreflightAnswersInOneLine(unittest.TestCase):
 
     def test_other_spellings_of_a_registered_name_are_the_same_repository(self):
         answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
-        for spelling in ("Acme/Fleet", "github.com/acme/fleet", "https://github.com/acme/fleet/"):
+        for spelling in (
+            "Acme/Fleet",
+            "github.com/acme/fleet",
+            "https://github.com/acme/fleet/",
+            "https://github.com/acme/fleet.git",
+            "git@github.com:acme/fleet.git",
+            "https://GitHub.com/Acme/Fleet",
+        ):
             with self.subTest(spelling=spelling), _StateDir(entries=ENTRY), patch(
                 "subprocess.run", return_value=answered
             ):
@@ -93,6 +100,27 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertTrue(line.startswith(f"REPO_UNREACHABLE: {REPO}: "), line)
         self.assertIn("403 Forbidden", line)
 
+    def test_a_broker_or_forge_that_cannot_answer_is_broker_unavailable(self):
+        answers = {
+            "rate limited": json.dumps({"error": "slow down", "code": "FORGE_RATE_LIMITED"}),
+            "broker down": json.dumps({"error": "the broker at http://x could not be reached: refused. Retry shortly."}),
+        }
+        for desc, stdout in answers.items():
+            failed = subprocess.CompletedProcess([], 1, stdout=stdout, stderr="")
+            with self.subTest(desc), _StateDir(entries=ENTRY), patch("subprocess.run", return_value=failed):
+                code, line = gitops_preflight.preflight(REPO)
+            self.assertEqual(gitops_preflight.EXIT_BROKER_UNAVAILABLE, code, line)
+            self.assertTrue(line.startswith("BROKER_UNAVAILABLE: "), line)
+            self.assertIn("not a registration problem", line)
+
+    def test_entries_that_are_all_unusable_are_named_not_called_missing(self):
+        unusable = [{"type": "github", "url": "https://github.example.com:8443/acme/fleet"}]
+        with _StateDir(entries=unusable):
+            code, line = gitops_preflight.preflight()
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertIn("not usable", line)
+        self.assertIn("github.example.com:8443/acme/fleet", line)
+
     def test_a_reachable_registered_repository_is_registered(self):
         answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
         with _StateDir(entries=ENTRY), patch("subprocess.run", return_value=answered):
@@ -114,8 +142,9 @@ class PreflightAnswersInOneLine(unittest.TestCase):
             gitops_preflight.EXIT_NO_REGISTERED_REPO,
             gitops_preflight.EXIT_REPO_UNREACHABLE,
             gitops_preflight.EXIT_STATE_UNREADABLE,
+            gitops_preflight.EXIT_BROKER_UNAVAILABLE,
         }
-        self.assertEqual(4, len(codes))
+        self.assertEqual(5, len(codes))
         self.assertEqual(0, gitops_preflight.EXIT_REGISTERED)
 
 
@@ -135,6 +164,15 @@ class ListingShowsBothRegistries(unittest.TestCase):
             code, text = gitops_preflight.listing()
         self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
         self.assertEqual(f"MANAGED: {REPO}\nCONTEXT: github.com/acme/tf-live@prod", text)
+
+    def test_a_context_entry_with_a_refused_ref_says_it_is_not_searched(self):
+        context = [{"type": "github", "url": "https://github.com/acme/tf-live", "ref": "-evil"}]
+        with _StateDir(entries=ENTRY) as state_file:
+            (state_file.parent / "context_repos").write_text(json.dumps(context), encoding="utf-8")
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
+        self.assertIn("ref-refused", text)
+        self.assertIn("not-searched", text)
 
     def test_userinfo_in_a_context_url_is_never_printed(self):
         context = [{"type": "github", "url": "https://x-access-token:s3cret@github.com/acme/tf-live"}]
