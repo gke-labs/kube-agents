@@ -1042,12 +1042,12 @@ it is set.
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
 threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
-held_by_hand, cause, max_concurrency}` when
+no_build_id, cause, max_concurrency}` when
 `verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
 refused a project in the periodic's recent window of `lease_failures_hours`
-hours, and `held_by_hand` how many projects are leased under an owner that is
+hours, and `no_build_id` how many projects are leased under an owner that is
 neither a Prow run nor a known job's fixed owner; `lease_failures` and
-`held_by_hand` are `null` from an
+`no_build_id` are `null` under these names from an
 artifact written before the
 periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue
@@ -1077,9 +1077,10 @@ refusal breached; `over_threshold` counts the queued runs and `lease_failures`
 the refused ones. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
-`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
-`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
-headline and on the last-24-hours view.
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `waiting_now`,
+`waiting_since`, `over_threshold`, `threshold_p50_s`, `threshold_p95_s`,
+`lease_failures` and `lease_failures_hours` for one sentence on the Brief's
+healthy headline and on the last-24-hours view.
 `metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
 `null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
 the artifact was there at all. Nothing else answers that: `pool` is `null` for a
