@@ -269,3 +269,22 @@ func TestSlackLayoutErrorClassifies(t *testing.T) {
 		t.Error("nil error wrapped")
 	}
 }
+
+// A fold of multi-byte text at the spec's 12,000-character cap fits: the
+// chunk budget is scaled to characters, so CJK text is not cut into three
+// times the sections ASCII is.
+func TestSlackChatMultibyteFoldAtTheCapFits(t *testing.T) {
+	m := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: strings.Repeat("集", 12000)}}
+	if layout, err := chatmsg.Validate(m, chatmsg.Result); layout != nil || err != nil {
+		t.Fatalf("the fixture is not a valid message: %v %v", layout, err)
+	}
+	layout, err := renderSlackChat(&m, "t")
+	if err != nil {
+		t.Fatalf("a valid multi-byte fold at the cap was refused: %v", err)
+	}
+	for _, c := range layout.Blocks[0]["child_blocks"].([]map[string]any) {
+		if n := len([]rune(c["text"].(map[string]any)["text"].(string))); n > slackChatSectionMax {
+			t.Fatalf("a section of %d characters, over Slack's cap", n)
+		}
+	}
+}
