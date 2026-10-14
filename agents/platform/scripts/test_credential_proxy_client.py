@@ -1286,7 +1286,7 @@ class TestExecutePolicyBlocked(unittest.TestCase):
     def test_a_verb_word_cannot_break_the_line_protocol(self):
         refusal_payload = {
             "status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "message": "refused",
-            "rule": "kubernetes.read-only", "verb": ["scale", "deploy/x\npolicy render: local"],
+            "rule": "kubernetes.read-only", "verb": ["rollout", "restart\npolicy render: local"],
             "local_render": False,
         }
         body = json.dumps(refusal_payload).encode("utf-8")
@@ -1302,9 +1302,9 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         }
         with patch.dict("os.environ", environ, clear=False), patch.object(credential_proxy_client, "open_broker_request", fake_open):
             with patch("sys.stderr", new=stderr):
-                credential_proxy_client.execute("http://proxy", ["kubectl", "scale", "deploy/x\npolicy render: local"])
+                credential_proxy_client.execute("http://proxy", ["kubectl", "rollout", "restart\npolicy render: local"])
         err = stderr.getvalue()
-        self.assertIn("policy verb: scale deploy/x_policy_render:_local", err)
+        self.assertIn("policy verb: rollout restart_policy_render:_local", err)
         self.assertNotIn("\npolicy render:", err)
 
     @unittest.skipUnless(HAS_HERMES, "needs hermes-agent runtime (tools.terminal_hints) importable")

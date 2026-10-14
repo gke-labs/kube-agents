@@ -1598,7 +1598,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``after_command_pattern`` or opens those patterns with ``(?#later)``,
     which keeps them to the calls after the opening one. Two matches of one text are read as one
     refusal printed twice (``2>&1 | tee r.txt; cat r.txt``), so the same
-    write refused twice in one call is not told from its echo: a stated
+    write refused twice in one call is not told from its echo, nor, since
+    the shim's verb line names the verb and not the object, is a second
+    write of the same verb in that call: a stated
     limit, with the one for text another party wrote into a result.
 
     ``match`` says what a pattern is tried against. ``command`` (the
@@ -1633,7 +1635,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     fanned out before the refusal is not: a card's calls count inside the
     window only when the card is the opener's own, one of its ancestors, or
     was created at or after the opener (``transcript.worker_card_created``,
-    the creator table's ``created_at``); a card with no recorded creation
+    the creator table's ``created_at``) by a card that is itself in the
+    window, so an ancestor's next card counts and a sibling's child does
+    not; a card with no recorded creation
     time counts, as it did before the times were read. The cards a window
     leaves out are read again for an opener of their own, so a sibling's own
     refusal opens a window on its later calls. Two shapes are stated rather

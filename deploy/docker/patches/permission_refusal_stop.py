@@ -23,7 +23,7 @@ beside the rule (``credential_proxy_client.py``)::
 
     <the policy's message, ending in the action boundary notice>
     policy rule: kubernetes.read-only
-    policy verb: scale deploy/kube-dns
+    policy verb: scale
     policy render: local          (a local render: a client dry-run in any of kubectl's
                                    spellings, --local, --list, apply view-last-applied, -h/--help)
 
@@ -161,9 +161,7 @@ _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
 # literal carries, for reading each kubectl command's own argv out of a call's text.
 _SEPARATOR_RE = re.compile(r"\|\||&&|[;|&\n]")
 _LIST_PUNCT_RE = re.compile(r"[\[\],'\"()]")
-# A bracketed list literal, read before the separator split so one broken across
-# lines (a formatter's argv) is one argv.
-_BRACKET_LIST_RE = re.compile(r"\[[^\[\]]*\]")
+
 
 WARN_MESSAGE = (
     "Permission refused. This is a boundary, not an error to work around: the change is "
@@ -212,26 +210,40 @@ def verb_is_mutating(verb_words: list[str]) -> bool:
 def _kubectl_verbs(command: str):
     """The verb tuple of each kubectl command in the text, read the way the policy reads
     an argv (``tools.command_policy``, the module the image ships), or ``None`` when that
-    module is not importable. Each piece between separators is read from its ``kubectl``
-    word on, quotes and Python list punctuation as spaces, so an argv literal, a quoted
-    argument and a bare word all read as their words."""
+    module is not importable. A newline inside square brackets is a space (a formatter's
+    argv list spans lines); each piece between separators is read from each of its
+    ``kubectl`` words to the next, quotes and Python list punctuation as spaces, so an argv
+    literal, a quoted argument, a bare word and a list of command strings all read as
+    their words."""
     try:
         from tools.command_policy import _kubectl_verb_and_flag, local_render
     except ImportError:
         return None
     verbs = []
-    command = _BRACKET_LIST_RE.sub(lambda m: m.group(0).replace("\n", " "), command)
-    for piece in _SEPARATOR_RE.split(command):
-        first = _KUBECTL_WORD_RE.search(piece)
-        if first is None:
-            continue
-        # Quotes and list punctuation read as spaces: an argv literal, a quoted
-        # argument and a bare word all read as their words.
-        argv = _LIST_PUNCT_RE.sub(" ", piece[first.start():]).split()
-        verb, _ = _kubectl_verb_and_flag(argv) if argv else (None, None)
-        if verb and not local_render(argv):  # a client render or a help read is not a write
-            verbs.append(list(verb))
+    for piece in _SEPARATOR_RE.split(_join_bracketed_lines(command)):
+        starts = [m.start() for m in _KUBECTL_WORD_RE.finditer(piece)]
+        for start, end in zip(starts, starts[1:] + [len(piece)]):
+            # Quotes and list punctuation read as spaces: an argv literal, a quoted
+            # argument and a bare word all read as their words.
+            argv = _LIST_PUNCT_RE.sub(" ", piece[start:end]).split()
+            verb, _ = _kubectl_verb_and_flag(argv) if argv else (None, None)
+            if verb and not local_render(argv):  # a client render or a help read is not a write
+                verbs.append(list(verb))
     return verbs
+
+
+def _join_bracketed_lines(text: str) -> str:
+    """``text`` with each newline inside square brackets replaced by a space, nesting
+    counted, so a list literal broken across lines is one piece whatever it holds."""
+    out = []
+    depth = 0
+    for char in text:
+        if char == "[":
+            depth += 1
+        elif char == "]" and depth:
+            depth -= 1
+        out.append(" " if char == "\n" and depth else char)
+    return "".join(out)
 
 
 def names_a_write(command) -> bool:

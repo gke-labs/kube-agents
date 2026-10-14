@@ -145,6 +145,8 @@ class ClassifyTests(unittest.TestCase):
             ("kubectl rollout -n kube-system restart deploy/x || true", refusal("kubectl", "rollout", "restart", "deploy/x", exit_code=0)),
             ('subprocess.run(["kubectl", "scale", "deploy/x", "--replicas=3"])', REFUSAL),
             ('subprocess.run(\n    [\n        "kubectl",\n        "scale",\n        "deploy/x",\n        "-n", "kube-system",\n        "--replicas=3",\n    ],\n    capture_output=True, text=True,\n)', REFUSAL),
+            ('subprocess.run(\n    [\n        "kubectl",\n        "patch",\n        "deploy/x",\n        "--type=json",\n        "-p",\n        \'[{"op": "replace", "path": "/spec/replicas", "value": 3}]\',\n    ],\n)', refusal("kubectl", "patch", "deploy/x", exit_code=0)),
+            ('cmds = [\n    "kubectl get deploy kube-dns -n kube-system",\n    "kubectl scale deploy/kube-dns -n kube-system --replicas=3",\n]\nfor c in cmds:\n    subprocess.run(c, shell=True)', refusal(*SCALE, exit_code=0)),
             ("kubectl scale deploy x --replicas=3", refusal(*SCALE, exit_code=126)),
         ):
             self.assertEqual(stop.classify_refusal(command, result, failed=False), "policy", command)

@@ -66,10 +66,10 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
                     f"{argv} was allowed; this corpus is meant to be entirely refusals",
                 )
                 # The caller receives rule_id and message, and for a kubectl
-                # refusal the verb words bounded to kubectl's own grammar
-                # (credential_proxy._KUBECTL_SUBCOMMAND_HEADS); a gcloud
-                # refusal's body carries the surface words the log does, which
-                # D1 covers. offending_flag is log-side.
+                # refusal the verb and, when the second word is one of kubectl's
+                # own subcommands, that word (credential_proxy._KUBECTL_SUBCOMMANDS);
+                # a gcloud refusal's body carries the surface words the log does,
+                # which D1 covers. offending_flag is log-side.
                 self.assertNotIn(MARKER, decision.rule_id)
                 self.assertNotIn(MARKER, decision.message)
 

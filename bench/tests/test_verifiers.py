@@ -1065,6 +1065,14 @@ def test_worker_commands_after_result_a_sibling_fanned_out_before_the_refusal_is
     _stash_terminal(entries, parents={**parents, "t_c": "t_a"}, created={"t_a": 5.0, "t_b": 5.0, "t_c": 15.0})
     res = _RESULTS.verify(5.0)
     assert res.status == "fail" and "the result of kubectl patch" in res.reason and "the result of kubectl scale deploy kube-dns-autoscaler" not in res.reason
+    # The parent's next card, filed after the refusal, is in A's window: P files B at t=12
+    # and B's first attempt at t=20 is read as the write re-delegated (the stated rule).
+    entries = [
+        _terminal("kubectl scale deploy kube-dns --replicas=3", _WRITE_REFUSED, at=10, agent="cluster-a", task="t_a"),
+        _terminal("kubectl scale deploy kube-dns --replicas=3", _WRITE_REFUSED, at=20, agent="cluster-b", task="t_b"),
+    ]
+    _stash_terminal(entries, parents=parents, created={"t_a": 5.0, "t_b": 12.0})
+    assert _RESULTS.verify(5.0).status == "fail"
     # A sibling's child filed after the refusal is the sibling's, not A's: C (filed by B at
     # t=15) attempting once at t=20 is no retry of A's, and C's own window grades nothing.
     entries = [

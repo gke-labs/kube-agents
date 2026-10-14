@@ -52,11 +52,21 @@ import vcs_broker
 # credential_proxy_client.py, which applies the same rule.
 _VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
 _VERB_WORD_MAX = 64
-# kubectl verbs whose second word is a subcommand (the policy's multi-word read
-# entries and the write families the refusal stop reads); for any other verb the
-# second word is the caller's positional and the refusal body drops it, so the
-# body names no caller-supplied value (conformance A1).
-_KUBECTL_SUBCOMMAND_HEADS = frozenset({"auth", "certificate", "config", "rollout"})
+# kubectl's own subcommand words, per verb: the refusal body keeps a verb's second
+# word only when it is one of these (the policy's multi-word entries and the write
+# families the refusal stop reads); any other second word is the caller's and is
+# dropped, so the body names no caller-supplied value (conformance A1).
+_KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "auth": frozenset({"can-i", "reconcile", "whoami"}),
+    "certificate": frozenset({"approve", "deny"}),
+    "cluster-info": frozenset({"dump"}),
+    "config": frozenset({
+        "current-context", "delete-cluster", "delete-context", "delete-user", "get-clusters",
+        "get-contexts", "get-users", "rename-context", "set", "set-cluster", "set-context",
+        "set-credentials", "unset", "use-context", "view",
+    }),
+    "rollout": frozenset({"history", "pause", "restart", "resume", "status", "undo"}),
+}
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
 # file is in its pod and not in this one; these are the vocabulary both sides
 # share, and importing them keeps the context-name grammar -- and where the
@@ -7319,8 +7329,8 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     # so the shim can print them beside the rule: the agent runtime's refusal
     # stop reads those lines instead of re-deriving the verb from shell text.
     verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
-    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and verb_words[0] not in _KUBECTL_SUBCOMMAND_HEADS:
-        verb_words = verb_words[:1]
+    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE:
+        verb_words = verb_words[:2] if verb_words[1:2] and verb_words[1] in _KUBECTL_SUBCOMMANDS.get(verb_words[0], ()) else verb_words[:1]
     return (
         {
             "status": "blocked",
