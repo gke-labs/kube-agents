@@ -4044,7 +4044,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         hostile["metadata"]["name"] = "evil`-abcde"
         reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [hostile], "events": [event("FailedCreate", 'failed calling webhook "gate|x"\n## Errors', kind="ReplicaSet", name="inference-server-778b78fdb8", namespace="seeded-capacity")]}
         with mock.patch.dict(READS, {"seeded-a": reads}):
-            result, _ = self.collect()
+            result, _ = self.collect(manifest_file=str(self.home / "manifest.json"))
         report = ur.render_report(result)
         lines = report.splitlines()
         self.assertEqual([line for line in lines if line == "## Errors"], ["## Errors"])
