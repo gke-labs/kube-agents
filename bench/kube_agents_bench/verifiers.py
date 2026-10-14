@@ -1275,7 +1275,12 @@ def _strip_shell_comments(command: str) -> str:
                 continue
             commented = False
         elif escaped:
+            # An escaped character never opens a word, so a `#` after it is part of the word
+            # (`readiness\ #1.json`), as bash reads it; it records as the escape, not as itself.
             escaped = False
+            kept.append(char)
+            previous = _SHELL_ESCAPE_CHAR
+            continue
         elif char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
             escaped = True
         elif quote is not None:
@@ -1294,7 +1299,8 @@ def _strip_shell_comments(command: str) -> str:
 def _shell_words(command: str) -> list[str]:
     """The command line as the shell's words, quotes honoured and removed, operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
-    quotes do not balance is split on whitespace instead. Comments come off first
+    quotes do not balance is one bash refuses and runs nothing of, so it yields no words, and
+    neither a run nor a mention is credited from it. Comments come off first
     (:func:`_strip_shell_comments`), so the lexer's own ``#`` commenter is off, as in
     ``shlex.split``: it would cut a word at a ``#`` inside it (``readiness-#2.json``), which
     bash does not."""
@@ -1305,7 +1311,7 @@ def _shell_words(command: str) -> list[str]:
     try:
         return list(lexer)
     except ValueError:
-        return command.split()
+        return []
 
 
 def _shell_argvs(command: str) -> list[list[str]]:
@@ -1374,8 +1380,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
     are read, never the router's; and a command the shell resolved through an
-    alias appears as typed. Fails closed like its siblings -- a run with no
-    captured worker commands is ``status="error"``, not a pass.
+    alias appears as typed. ``required_runs`` reads each flag as the exact
+    word, so a script a case names this way is built with ``allow_abbrev=False``
+    (argparse's default lets ``--readi`` run ``--readiness``), as
+    ``fleet_upgrade_report.py`` is; and a line bash refuses (an unclosed quote)
+    yields no words, so nothing on it is credited or forbidden. Fails closed
+    like its siblings -- a run with no captured worker commands is
+    ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]

@@ -7017,8 +7017,12 @@ def _run_objective(command: str) -> str:
         (f"echo done # python3 {_SCRIPT_PATH} --readiness", False),
         (f"# run the readiness report; python3 {_SCRIPT_PATH} --readiness", False),
         (f"echo done # see below && python3 {_SCRIPT_PATH} --readiness", False),
-        # a quoted `#` is part of the word, as bash reads it
+        # a quoted or escaped `#` is part of the word, as bash reads it
         (f"python3 {_SCRIPT_PATH} --readiness --output '/opt/data/scratch/#1.json'", True),
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/readiness\\ #1.json --readiness", True),
+        # a line whose quotes do not balance is one bash refuses: nothing on it ran
+        ('echo "run fleet_upgrade_report.py --readiness', False),
+        (f"python3 {_SCRIPT_PATH} --readiness --output 'unbalanced", False),
     ],
 )
 def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
@@ -7052,7 +7056,11 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     # a wrapped shell is unwrapped wherever it stands
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]
-    assert _shell_argvs("python3 f.py --readiness --output 'unbalanced") == [["python3", "f.py", "--readiness", "--output", "'unbalanced"]]
+    # a line bash refuses (an unclosed quote) yields no words at all
+    assert _shell_argvs("python3 f.py --readiness --output 'unbalanced") == []
+    # an escaped character never opens a word, so a `#` after an escaped space is part of it
+    assert _shell_argvs("python3 f.py --output r\\ #1.json --readiness") == [["python3", "f.py", "--output", "r #1.json", "--readiness"]]
+    assert _shell_argvs("echo \\ #x") == [["echo", " #x"]]
     # a script is a bare name and a flag one word, refused at case load otherwise
     for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
         with pytest.raises(ValueError):

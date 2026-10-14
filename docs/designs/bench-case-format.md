@@ -228,7 +228,7 @@ case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it, or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
-it, so a quoted mention of the invocation is one word and not a run), `worker_agents` (regular expressions every one of which must match the
+it, so a quoted mention of the invocation is one word and not a run; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), and `reply_is_silent`
