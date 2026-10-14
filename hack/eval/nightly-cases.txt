@@ -268,7 +268,7 @@
 # 2026-10-13 adds helm-chart-no-reconciler-stops (#2938): one probe-shaped
 # case, deployer: noop, unhinted at the 200s default, about 10 serial minutes
 # at three repetitions. Counted from the lists with it, the last entry below:
-# seventy-two cases (216 units) here, of an eighty-six-case, 258-unit matrix.
+# seventy-three cases (219 units) here, of an eighty-seven-case, 261-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -816,6 +816,13 @@
 # the ledger objectives need an install with a GitHub ledger (a token minter
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
+
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
 
 # A request to install a third-party Helm chart where nothing renders charts
 # from the GitOps repository: the agent stops, names the missing reconciler or

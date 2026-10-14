@@ -32,8 +32,8 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
    reproduced; `scenarios/02.sh`; `readiness-surge-blocked` on seeded-b.
 3. [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node):
    reproduced; `scenarios/03.sh`; the three `zonal-skew-*` roles on seeded-d.
-4. [Data on the node is gone](#4-data-on-the-node-is-gone): reproduced; `scenarios/04.sh`; no role
-   on `main`.
+4. [Data on the node is gone](#4-data-on-the-node-is-gone): reproduced; `scenarios/04.sh`;
+   `node-local-state` on seeded-a.
 5. [Maintenance window too short, or an exclusion ends
    mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll): partial;
    `scenarios/05.sh`; covering exclusion on `main`.
@@ -43,34 +43,35 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
 7. [A fail-closed webhook whose backend is not
    up](#7-a-fail-closed-webhook-whose-backend-is-not-up): reproduced; `scenarios/07.sh`; `readiness-failclosed-webhook` on seeded-b.
 8. [A default changes in the new minor](#8-a-default-changes-in-the-new-minor): reproduced;
-   `scenarios/08.sh`; no role on `main`.
+   `scenarios/08.sh`; `moving-admission-default` on seeded-a.
 9. [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served): no break
    (as expected); `scenarios/09.sh`; `deprecated-api-caller` on `main`.
-10. [Add-on and client skew](#10-add-on-and-client-skew): partial; `scenarios/10b.sh`; no role on
-    `main`.
+10. [Add-on and client skew](#10-add-on-and-client-skew): partial; `scenarios/10b.sh`;
+    `stale-client-skew` on seeded-a.
 11. [The control plane is unreachable for minutes on a zonal
     cluster](#11-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster): not reproduced;
     `scenarios/11b.sh`; no role needed.
 12. [A node label is removed](#12-a-node-label-is-removed): reproduced (GKE form);
-    `scenarios/12.sh`; no role on `main`.
+    `scenarios/12.sh`; `deprecated-label-selector` on seeded-a.
 13. [The container runtime changes](#13-the-container-runtime-changes): reproduced;
-    `scenarios/13b.sh`; no role on `main`.
+    `scenarios/13b.sh`; `containerd-socket-agent` on seeded-a.
 14. [cgroup v2 under a runtime that cannot read
     it](#14-cgroup-v2-under-a-runtime-that-cannot-read-it): reproduced (GKE form);
-    `scenarios/14c.sh`; no role on `main`.
+    `scenarios/14c.sh`; `cgroup-blind-runtime` on seeded-a.
 15. [The OOM killer starts killing the whole
     container](#15-the-oom-killer-starts-killing-the-whole-container): symptom reproduced;
-    `scenarios/15.sh`; no role on `main`.
+    `scenarios/15.sh`; `multi-process-container` on seeded-a.
 16. [The network dataplane changes](#16-the-network-dataplane-changes): reproduced (GKE form);
     `scenarios/16.sh`; seeded-a holds the before-state, no named role.
 17. [A node networking agent fails on the new
-    image](#17-a-node-networking-agent-fails-on-the-new-image): partial; `scenarios/17.sh`; no role
-    on `main`.
-18. [GPU driver mismatch](#18-gpu-driver-mismatch): partial; `scenarios/18k.sh`; no role on `main`.
+    image](#17-a-node-networking-agent-fails-on-the-new-image): partial; `scenarios/17.sh`;
+    `node-image-coupled-agent` on seeded-a.
+18. [GPU driver mismatch](#18-gpu-driver-mismatch): partial; `scenarios/18k.sh`;
+    `cuda-pinned-gpu-job` on seeded-a.
 19. [In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path): reproduced (GKE
-    form); `scenarios/19c.sh`; no role on `main`.
+    form); `scenarios/19c.sh`; `intree-pd-volume` on seeded-a.
 20. [Images on a retired registry](#20-images-on-a-retired-registry): reproduced;
-    `scenarios/20d.sh`; no role on `main`.
+    `scenarios/20d.sh`; `retired-registry-image` on seeded-a.
 
 ## The entries
 
@@ -130,7 +131,9 @@ Harness: `scenarios/04.sh` (`upg-04b`); `bash run.sh 04`. Reproduced: an emptyDi
 control-plane upgrade and was replaced after the node rebuild, and nothing reported the loss; only
 emptyDir was tested, not hostPath or Local SSD.
 
-Fleet: no role on `main`. An `emptyDir` stamp would not hold, since the fleet's own node rebuilds erase it; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `node-local-state` on seeded-a (`cache-on-emptydir`, one replica whose queue is an `emptyDir`)
+carries the shape; the stamp it writes is what a node rebuild erases, so the fixture is the
+dependency, not the stamp.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/04.sh`, evidence
 `bench/upgrade-scenarios/evidence/04/node-data.txt`, and item 4 of the harness README. Detection,
@@ -186,8 +189,10 @@ where to look, mitigation and what reads it today: [catalogue entry
 Harness: `scenarios/08.sh` and the hold `08h`; `bash run.sh 08`. Reproduced: the 1.33 kubelet
 refused the gitRepo volume with FailedMount on the new node.
 
-Fleet: no role on `main`. The `gitRepo` shape the harness planted is version-bound (it needs a kubelet
-below 1.33, which only the EXTENDED channel offers); a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `moving-admission-default` on seeded-a (the `seeded-defaults` namespace, Pod Security `baseline`
+pinned to version `latest`, with a compliant worker) carries the shape without a version bound: the
+rule set changes under the namespace at every minor. The gitRepo reproduction itself is version-bound: the before-state needs a kubelet below 1.33, which only
+the EXTENDED channel offers.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/08.sh`, evidence
 `bench/upgrade-scenarios/evidence/08/default-change.txt`, and item 8 of the harness README.
@@ -214,8 +219,9 @@ Partial: GKE let a 1.35 control plane run over 1.31 nodes, four minors apart, wi
 a new pod, its logs and exec kept working; the add-on half was not planted and kubectl's skew
 warning was not captured.
 
-Fleet: no role on `main`; seeded-b's pool takes its control plane's pin on purpose, so the skew
-cannot be planted there; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `stale-client-skew` on seeded-a (`stale-kubectl-client`, `kubectl` v1.29.0 against the control
+plane every ten minutes) carries the client half; seeded-b's pool takes its control plane's pin on purpose, so the node skew
+cannot be planted there.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/10b.sh` (after `10.sh` on the same cluster),
 evidence `bench/upgrade-scenarios/evidence/10b/skew.txt`, and item 10 of the harness README.
@@ -241,7 +247,10 @@ Harness: `scenarios/12.sh` (`upg-12b`); `bash run.sh 12`. Reproduced in GKE's fo
 a label set by hand stayed Pending after the rebuilt node came back without it, and GKE reported
 DONE; whether a minor still drops a standard label was not checked.
 
-Fleet: no role on `main`. A hand-set node label would not hold through the node rebuild GKE's own patch upgrades perform; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `deprecated-label-selector` on seeded-a (`arch-pinned-worker`, a `nodeSelector` on
+`beta.kubernetes.io/arch`, deprecated and still set) carries the built-in-label form rather than the
+GKE form: the hand-set label of the reproduction would not survive a node rebuild, while the deprecated
+built-in label does until a node image stops setting it.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/12.sh`, evidence
 `bench/upgrade-scenarios/evidence/12/label.txt`, and item 12 of the harness README. Detection, where
@@ -254,8 +263,9 @@ Harness: `scenarios/13.sh` and `13b.sh`; `bash run.sh 13b`. Reproduced: a patch-
 inside 1.31 moved containerd from 1.7.34 to 2.0.10 and a v1alpha2 CRI client broke; run 13 found the
 newest 1.31 patch already on containerd 2.0, so the runtime moves with a patch, not a minor.
 
-Fleet: no role on `main`. The REGULAR clusters already run containerd 2, so a runtime-version fixture
-could hold only the wreckage; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `containerd-socket-agent` on seeded-a (`node-runtime-probe`, a DaemonSet mounting the
+containerd socket read-only) carries the agent shape; the REGULAR clusters already run containerd 2,
+so the fixture is the dependency a future runtime change breaks, not the wreckage.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/13b.sh`, evidence
 `bench/upgrade-scenarios/evidence/13b/runtime.txt`, and item 13 of the harness README. Detection,
@@ -270,7 +280,7 @@ pool can still be created on a 1.34 cluster, GKE refused its 1.35 upgrade with a
 the migration to v2 first, and after the migration the old JVM was OOMKilled five times while a
 fixed JVM stayed up.
 
-Fleet: no role on `main`. A cgroup v1 pool would not hold for long (GKE migrates one to v2 at 1.33 and refuses v1 at 1.35); a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `cgroup-blind-runtime` on seeded-a (`cgroup-blind-jvm`, the eclipse-temurin 8u302 image under a memory limit, with a sleep as the container process) carries the runtime half, which no node change heals; a cgroup v1 pool would not hold, since GKE migrates one to v2 at 1.33 and refuses v1 at 1.35.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/14c.sh` (`14.sh` is the symptom alone), evidence
 `bench/upgrade-scenarios/evidence/14c/cgroup.txt`, and item 14 of the harness README. Detection,
@@ -284,8 +294,8 @@ three-process container over its limit was killed whole and crash-looped, and th
 with singleProcessOomKill true kept running; no upgrade crossed the 1.28 boundary, so only the
 symptom is shown.
 
-Fleet: no role on `main`. The symptom needs a multi-process container over its limit, which no
-standing fixture should run; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `multi-process-container` on seeded-a (`multi-process-worker`, two forked workers under one 32Mi limit) carries the shape without the symptom; the symptom needs a multi-process container over its limit, which no
+standing fixture should run.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/15.sh`, evidence
 `bench/upgrade-scenarios/evidence/15/group-oom.txt`, and item 15 of the harness README. Detection,
@@ -299,7 +309,7 @@ default-deny NetworkPolicy sat unenforced, switching enforcement on changed noth
 pool upgrade rebuilt the node with calico and cut traffic; the trigger is the enforcement switch
 applied at the rebuild, not a version change.
 
-Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in five of its eight seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-stall`, `seeded-token`; `seeded-security` and `seeded-intent` have none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
+Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in eight of its eleven seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-stall`, `seeded-token`, `seeded-headroom`, `seeded-shapes`, `seeded-defaults`; `seeded-security` and `seeded-intent` have none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/16.sh`, evidence
 `bench/upgrade-scenarios/evidence/16/dataplane.txt`, and item 16 of the harness README. Detection,
@@ -313,7 +323,7 @@ only where a hand-set label was, the rebuilt node lacked the label, the DaemonSe
 the client on the new node got Connection refused, with the operation DONE; GKE's own node agents
 cannot be broken from outside.
 
-Fleet: no role on `main`. A hand-set label the DaemonSet selects on is what a node rebuild drops, so that shape would turn into the after-state; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `node-image-coupled-agent` on seeded-a (`cni-shaped-agent`, host networking plus `/etc/cni/net.d` mounted read-only) carries the coupling without a hand-set label, which a node rebuild would drop and so turn the fixture into the after-state.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/17.sh`, evidence
 `bench/upgrade-scenarios/evidence/17/node-agent.txt`, and item 17 of the harness README. Detection,
@@ -331,7 +341,7 @@ forward-compatibility libraries a planted pod forced (Error 803). The upgrade re
 catalogue's condition rather than creating it, and two runs lost their only GPU node to a stockout
 mid-upgrade while the operation read DONE.
 
-Fleet: no role on `main`, and the fleet carries no accelerator, so nothing GPU-bound can run; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `cuda-pinned-gpu-job` on seeded-a (`cuda-pinned-trainer`, a suspended CronJob requesting one GPU with a CUDA 12.2 image) carries the manifest; the fleet has no accelerator, so the job never runs.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/18k.sh` (`18m.sh` repeats it in another zone; both
 source `18.sh`; the forward-compatibility round is `bench/upgrade-scenarios/compat-probe.sh`),
@@ -347,7 +357,9 @@ upgrade drained it, and the replacement stayed Pending on PersistentVolume node 
 failing at attach; re-enabling the driver brought it back 22 minutes after it went down. The 1.22
 crossing itself cannot be built.
 
-Fleet: no role on `main`; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `intree-pd-volume` on seeded-a (`intree-pd`, an in-tree `gcePersistentDisk` PersistentVolume over
+the fleet's own disk, bound by a claim in `seeded-shapes` and mounted by `intree-pd-reader`) carries the
+volume half of the before-state; the PD CSI driver stays on, so the attach goes through migration.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/19c.sh` (sources `19.sh`), evidence
 `bench/upgrade-scenarios/evidence/19c/csi.txt`, and item 19 of the harness README. Detection, where
@@ -362,7 +374,9 @@ registry; the pod restarted from the node's image cache on the old node and went
 with not found on the rebuilt one. No hostname was retired and the egress-allowlist variant was not
 tested.
 
-Fleet: no role on `main`; a standing shape that holds is designed in the catalogue's [How each failure is tested](upgrade-failure-catalogue.md#how-each-failure-is-tested) section.
+Fleet: `retired-registry-image` on seeded-a (`legacy-registry-pull`, `k8s.gcr.io/pause:3.9` with
+`imagePullPolicy: Always`) carries the before-state: a retired hostname that answers by redirect
+today.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/20d.sh` (sources `20.sh`), evidence
 `bench/upgrade-scenarios/evidence/20d/registry.txt`, and item 20 of the harness README. Detection,

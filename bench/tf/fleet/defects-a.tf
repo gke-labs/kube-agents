@@ -688,6 +688,8 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
     token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
     headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+    shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+    defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.
@@ -702,6 +704,20 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     pod_selector {}
     policy_types = ["Ingress", "Egress"]
   }
+}
+
+# The shape namespaces' policies were first declared as two standalone
+# resources, and a project applied from that branch holds them under those
+# addresses. Without these blocks the rename plans as a delete and a create,
+# which the reconciler refuses (reconcile-allow.json); with them it is a no-op.
+moved {
+  from = kubernetes_network_policy_v1.seeded_shapes_default_deny
+  to   = kubernetes_network_policy_v1.default_deny["shapes"]
+}
+
+moved {
+  from = kubernetes_network_policy_v1.seeded_defaults_default_deny
+  to   = kubernetes_network_policy_v1.default_deny["defaults"]
 }
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
@@ -1133,4 +1149,703 @@ resource "kubernetes_job_v1" "legacy_endpoints_writer_first_run" {
     kubernetes_endpoints_v1.legacy_endpoints_lane,
     kubernetes_network_policy_v1.deprecation_apiserver_egress_only,
   ]
+}
+
+# Upgrade-failure shapes on seeded-a: five before-states from the catalogue
+# (docs/designs/upgrade-failure-catalogue.md entries 4, 12, 13, 19 and 20)
+# that a node rebuild would turn into an outage, planted as the SHAPE of a
+# workload rather than as a running fault. Each block names the catalogue
+# role that addresses it; renaming an object here breaks that role's probes
+# and state assertions in fixtures.json. Nothing here is broken today: the
+# pods run, the volume is bound, the image pulls. What each carries is the
+# dependency the next node image or minor removes, which is what a
+# pre-upgrade read is meant to find.
+#
+# All five sit in one namespace with the same default-deny policy the other
+# seeded namespaces carry, so the compliance audit's network-policy check has
+# nothing new to say about them. The DaemonSet's host socket mount is the
+# planted property the compliance audit raises on its own (2.3
+# `hostpath-mount`); the README's accepted-findings table names it.
+
+resource "kubernetes_namespace_v1" "seeded_shapes" {
+  metadata {
+    name   = "seeded-shapes"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+# Defect (entry 4, role node-local-state): state that lives on the node. The
+# queue directory is an emptyDir, so a rebuilt node starts the pod with an
+# empty queue; the stamp the container writes at start is what a rebuild
+# loses. One replica, so there is no second copy to rebuild it from.
+resource "kubernetes_deployment_v1" "cache_on_emptydir" {
+  metadata {
+    name      = "cache-on-emptydir"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "cache-on-emptydir" }
+    }
+    template {
+      metadata {
+        labels = { app = "cache-on-emptydir" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "queue"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "date -u > /var/cache/queue/stamp && tail -f /dev/null"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+          volume_mount {
+            name       = "queue"
+            mount_path = "/var/cache/queue"
+          }
+        }
+        volume {
+          name = "queue"
+          empty_dir {}
+        }
+      }
+    }
+  }
+
+  # Set on every shape Deployment and DaemonSet. They run today, and the
+  # designed end of several is a pod that cannot (arch-pinned-worker once a
+  # node image drops the beta label, legacy-registry-pull once the k8s.gcr.io
+  # redirect goes; README.md, recovery notes). A project that first creates
+  # the object after that end would otherwise block the apply on a rollout
+  # that cannot finish, and the scheduled reconcile would read as a
+  # provisioning failure. The apply confirms presence; the hourly
+  # fixture-state scan reads the pod's state.
+  wait_for_rollout = false
+}
+
+# Defect (entry 12, role deprecated-label-selector): a nodeSelector on a label
+# the kubelet still sets but has deprecated since 1.14 in favour of
+# kubernetes.io/arch. The pod schedules today; the day a node image stops
+# setting the beta label it can never schedule again.
+resource "kubernetes_deployment_v1" "arch_pinned_worker" {
+  metadata {
+    name      = "arch-pinned-worker"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "arch-pinned-worker" }
+    }
+    template {
+      metadata {
+        labels = { app = "arch-pinned-worker" }
+      }
+      spec {
+        automount_service_account_token = false
+        node_selector                   = { "beta.kubernetes.io/arch" = "amd64" }
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "worker"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "tail -f /dev/null"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 13, role containerd-socket-agent): a node agent that talks to
+# the container runtime over its socket. The mount is what a containerd major
+# change or a CRI API removal breaks; the agent itself only holds the socket
+# open. Read-only, on the default pool only (no tolerations, so the tainted
+# pools are not touched).
+resource "kubernetes_daemon_set_v1" "node_runtime_probe" {
+  metadata {
+    name      = "node-runtime-probe"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    selector {
+      match_labels = { app = "node-runtime-probe" }
+    }
+    template {
+      metadata {
+        labels = { app = "node-runtime-probe" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "probe"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "test -S /run/containerd/containerd.sock; tail -f /dev/null"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+          volume_mount {
+            name       = "sock"
+            mount_path = "/run/containerd/containerd.sock"
+            read_only  = true
+          }
+        }
+        volume {
+          name = "sock"
+          host_path {
+            path = "/run/containerd/containerd.sock"
+            type = "Socket"
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 19, role intree-pd-volume): a PersistentVolume written against
+# the in-tree gcePersistentDisk plugin, bound by a claim and mounted by one
+# pod. The attach goes through CSI migration to the PD CSI driver, the only
+# path every supported minor has for an in-tree source, so a cluster whose
+# PD CSI driver is off leaves it unattachable. The disk is the fleet's own,
+# so the volume binds and stays bound; the reader pod is what makes the
+# attach happen today, and what keeps the claim from reading as unconsumed
+# to the cost audit.
+resource "google_compute_disk" "seeded_a_intree_pd" {
+  name    = "${var.cluster_prefix}-a-intree-pd"
+  project = var.project_id
+  zone    = var.zone
+  type    = "pd-standard"
+  size    = 10
+  labels  = local.fleet_labels
+}
+
+resource "kubernetes_persistent_volume_v1" "intree_pd" {
+  metadata {
+    name = "intree-pd"
+  }
+  spec {
+    capacity                         = { storage = "10Gi" }
+    access_modes                     = ["ReadWriteOnce"]
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name               = "intree"
+    persistent_volume_source {
+      gce_persistent_disk {
+        pd_name = google_compute_disk.seeded_a_intree_pd.name
+        fs_type = "ext4"
+      }
+    }
+  }
+}
+
+resource "kubernetes_persistent_volume_claim_v1" "intree_pd" {
+  metadata {
+    name      = "intree-pd"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    access_modes       = ["ReadWriteOnce"]
+    storage_class_name = "intree"
+    volume_name        = kubernetes_persistent_volume_v1.intree_pd.metadata[0].name
+    resources {
+      requests = { storage = "10Gi" }
+    }
+  }
+  wait_until_bound = true
+}
+
+resource "kubernetes_deployment_v1" "intree_pd_reader" {
+  metadata {
+    name      = "intree-pd-reader"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    # Single-writer volume: a surge pod cannot attach the RWO disk while the
+    # old one holds it, so replace in place, as the stack's StatefulSet does.
+    strategy {
+      type = "Recreate"
+    }
+    selector {
+      match_labels = { app = "intree-pd-reader" }
+    }
+    template {
+      metadata {
+        labels = { app = "intree-pd-reader" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          fs_group        = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "reader"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "tail -f /dev/null"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+          volume_mount {
+            name       = "data"
+            mount_path = "/data"
+            read_only  = true
+          }
+        }
+        volume {
+          name = "data"
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim_v1.intree_pd.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 20, role retired-registry-image): an image pulled from a
+# registry hostname that is retired and served only by redirect. k8s.gcr.io
+# stopped receiving images in 2023 and answers through registry.k8s.io; the
+# pull works today on every node and stops the day the redirect does, or the
+# day a node image or registry policy refuses the old host. A rebuilt node
+# has an empty image cache and pulls again whatever the policy; Always-pull
+# adds a pull on every container restart on the same node, so the dependency
+# is exercised between rebuilds too.
+resource "kubernetes_deployment_v1" "legacy_registry_pull" {
+  metadata {
+    name      = "legacy-registry-pull"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "legacy-registry-pull" }
+    }
+    template {
+      metadata {
+        labels = { app = "legacy-registry-pull" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name              = "pause"
+          image             = "k8s.gcr.io/pause:3.9"
+          image_pull_policy = "Always"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 8, role moving-admission-default): a default that changes
+# with the minor. Pod Security Admission's `*-version: latest` labels pin a
+# namespace to whichever rule set the running minor ships, so the rules
+# applied to its workloads change at every upgrade without anyone editing
+# them; a pod the current `baseline` admits can be refused by the next
+# minor's. The worker here is baseline-compliant, so nothing is rejected
+# today, and the pin is the before-signal. Its own namespace, because
+# seeded-shapes carries a host-network agent `baseline` would refuse.
+resource "kubernetes_namespace_v1" "seeded_defaults" {
+  metadata {
+    name = "seeded-defaults"
+    labels = merge(local.fleet_labels, {
+      "pod-security.kubernetes.io/enforce"         = "baseline"
+      "pod-security.kubernetes.io/enforce-version" = "latest"
+      "pod-security.kubernetes.io/warn"            = "baseline"
+      "pod-security.kubernetes.io/warn-version"    = "latest"
+    })
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "baseline_edge_worker" {
+  metadata {
+    name      = "baseline-edge-worker"
+    namespace = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "baseline-edge-worker" }
+    }
+    template {
+      metadata {
+        labels = { app = "baseline-edge-worker" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "worker"
+          image = "registry.k8s.io/pause:3.10"
+          resources {
+            requests = { cpu = "5m", memory = "8Mi" }
+            limits   = { memory = "16Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 10, role stale-client-skew): a client outside the supported
+# version skew. A CronJob runs kubectl v1.29 against a control plane several
+# minors ahead of it (kubectl supports one minor either side); the call
+# succeeds today because /version is served to any authenticated caller and
+# the skew policy is a support statement, not a refusal. The image tag is the
+# before-signal. The account has no grants, and the policy below opens egress
+# to the API server only, the same shape as seeded-deprecation's writer.
+resource "kubernetes_service_account_v1" "stale_kubectl_client" {
+  metadata {
+    name      = "stale-kubectl-client"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+}
+
+resource "kubernetes_network_policy_v1" "stale_kubectl_client_apiserver_egress" {
+  metadata {
+    name      = "stale-kubectl-client-apiserver-egress"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    pod_selector {
+      match_labels = { app = "stale-kubectl-client" }
+    }
+    policy_types = ["Egress"]
+    egress {
+      ports {
+        port     = "443"
+        protocol = "TCP"
+      }
+      to {
+        ip_block {
+          cidr = "${cidrhost(google_container_cluster.seeded_a.services_ipv4_cidr, 1)}/32"
+        }
+      }
+      to {
+        ip_block {
+          cidr = "${google_container_cluster.seeded_a.endpoint}/32"
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_cron_job_v1" "stale_kubectl_client" {
+  metadata {
+    name      = "stale-kubectl-client"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    schedule                      = "*/10 * * * *"
+    concurrency_policy            = "Forbid"
+    successful_jobs_history_limit = 1
+    failed_jobs_history_limit     = 1
+    job_template {
+      metadata {
+        labels = { app = "stale-kubectl-client" }
+      }
+      spec {
+        backoff_limit              = 0
+        active_deadline_seconds    = 300
+        ttl_seconds_after_finished = "900"
+        template {
+          metadata {
+            labels = { app = "stale-kubectl-client" }
+          }
+          spec {
+            restart_policy       = "Never"
+            service_account_name = kubernetes_service_account_v1.stale_kubectl_client.metadata[0].name
+            security_context {
+              run_as_non_root = true
+              run_as_user     = 65534
+              seccomp_profile {
+                type = "RuntimeDefault"
+              }
+            }
+            container {
+              name    = "kubectl"
+              image   = "registry.k8s.io/kubectl:v1.29.0"
+              command = ["kubectl", "version"]
+              resources {
+                requests = { cpu = "10m", memory = "32Mi" }
+                limits   = { memory = "64Mi" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Defect (entry 14, role cgroup-blind-runtime): a Java runtime from before
+# cgroup v2 support (JDK 8 reads it from 8u372; this is 8u302) under a memory
+# limit. On a cgroup v1 node such a JVM sizes its heap from the limit; on a
+# cgroup v2 node it reads the machine's memory instead and is OOM-killed once
+# it grows. The image's JDK version is the dependency and the before-signal:
+# the container prints `java -version` at start and then runs `sleep`, so no
+# JVM is resident and the pod runs on either cgroup mode.
+resource "kubernetes_deployment_v1" "cgroup_blind_jvm" {
+  metadata {
+    name      = "cgroup-blind-jvm"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "cgroup-blind-jvm" }
+    }
+    template {
+      metadata {
+        labels = { app = "cgroup-blind-jvm" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "jvm"
+          image   = "docker.io/library/eclipse-temurin:8u302-b08-jre"
+          command = ["sh", "-c", "java -version && exec sleep infinity"]
+          resources {
+            requests = { cpu = "10m", memory = "64Mi" }
+            limits   = { memory = "192Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 15, role multi-process-container): several processes under one
+# memory limit. A shell supervisor forks two workers and waits; on a cgroup v1
+# node the OOM killer takes the one process that grew, on a cgroup v2 node
+# with a 1.28+ kubelet it kills the whole group. Nothing here allocates, so
+# the pod runs; the shape (one container, several processes, one limit) is the
+# before-signal, read with a process listing inside the container.
+resource "kubernetes_deployment_v1" "multi_process_worker" {
+  metadata {
+    name      = "multi-process-worker"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "multi-process-worker" }
+    }
+    template {
+      metadata {
+        labels = { app = "multi-process-worker" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "supervisor"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "sleep infinity & sleep infinity & wait"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 17, role node-image-coupled-agent): a per-node agent in the
+# shape of a network plugin, using the node's own network namespace and
+# mounting the CNI configuration directory from the node, read-only. That is
+# the coupling a node image change breaks (a moved directory, a renamed
+# interface, a kernel module that is gone). The compliance audit's 2.2 and 2.3
+# findings on it are accepted in README.md. Default pool only: no tolerations.
+resource "kubernetes_daemon_set_v1" "cni_shaped_agent" {
+  metadata {
+    name      = "cni-shaped-agent"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    selector {
+      match_labels = { app = "cni-shaped-agent" }
+    }
+    template {
+      metadata {
+        labels = { app = "cni-shaped-agent" }
+      }
+      spec {
+        host_network                    = true
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "agent"
+          image = "registry.k8s.io/pause:3.10"
+          volume_mount {
+            name       = "cni-conf"
+            mount_path = "/host/etc/cni/net.d"
+            read_only  = true
+          }
+          resources {
+            requests = { cpu = "5m", memory = "8Mi" }
+            limits   = { memory = "16Mi" }
+          }
+        }
+        volume {
+          name = "cni-conf"
+          host_path {
+            path = "/etc/cni/net.d"
+            type = "Directory"
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
+# Defect (entry 18, role cuda-pinned-gpu-job): a GPU job that pins a CUDA
+# major and selects an accelerator pool. Suspended, so it never creates a Job,
+# never waits for a GPU the fleet does not have and costs nothing; its
+# manifest is the before-signal (the CUDA version against the driver the
+# target node image ships).
+resource "kubernetes_cron_job_v1" "cuda_pinned_trainer" {
+  metadata {
+    name      = "cuda-pinned-trainer"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    schedule                      = "0 3 * * *"
+    suspend                       = true
+    concurrency_policy            = "Forbid"
+    successful_jobs_history_limit = 1
+    failed_jobs_history_limit     = 1
+    job_template {
+      metadata {
+        labels = { app = "cuda-pinned-trainer" }
+      }
+      spec {
+        backoff_limit = 0
+        template {
+          metadata {
+            labels = { app = "cuda-pinned-trainer" }
+          }
+          spec {
+            restart_policy                  = "Never"
+            automount_service_account_token = false
+            node_selector                   = { "cloud.google.com/gke-accelerator" = "nvidia-l4" }
+            toleration {
+              key      = "nvidia.com/gpu"
+              operator = "Exists"
+              effect   = "NoSchedule"
+            }
+            security_context {
+              run_as_non_root = true
+              run_as_user     = 65534
+              seccomp_profile {
+                type = "RuntimeDefault"
+              }
+            }
+            container {
+              name    = "trainer"
+              image   = "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"
+              command = ["nvidia-smi"]
+              resources {
+                requests = { cpu = "100m", memory = "256Mi", "nvidia.com/gpu" = "1" }
+                limits   = { memory = "512Mi", "nvidia.com/gpu" = "1" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }

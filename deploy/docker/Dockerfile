@@ -785,12 +785,15 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # handlers by gateway/slack_ux_clicks.py; with the flag off nothing is
 # registered. Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_clicks.py.
 #
-# Slack: with KAGE_SLACK_UX on, a PR a card opened and a question a card is
-# blocked on (kind needs_input) each post as a message of their own, with url
-# or choice buttons. kanban_progress_lines calls gateway/slack_ux_moments.py,
+# Slack: with KAGE_SLACK_UX on, a PR a card opened (or a GitLab merge request,
+# on gitlab.com or on the host of a GitLab entry in managed_repos) and a question
+# a card is blocked on (kind needs_input) each post as a message of their own,
+# with url or choice buttons. kanban_progress_lines calls gateway/slack_ux_moments.py,
 # and the notifier's wake notes a posted question so the Planning Agent does not
 # ask it again (apply_slack_ux_moments.py; the wake is unchanged with the flag
-# off). slack_moments.py is staged for the verifier as slack_presenter.py is.
+# off). slack_moments.py is staged for the verifier as slack_presenter.py is;
+# gitops_workspace.py and repo_ref.py are not, so the verifier runs the
+# gitlab.com-only path, with no self-managed hosts read.
 # Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_moments.py.
 #
 # Slack: with KAGE_SLACK_UX on, an incident's triage report edits its alert in
@@ -1309,6 +1312,16 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # exit used to clear it), and a foreground ssh exit 255 without the cwd marker
 # carries a hint when upstream attached none. See the module docstring in
 # deploy/docker/patches/apply_ssh_shared_master.py.
+#
+# cluster_dns_not_local rides it too: is_local_endpoint() calls any host ending
+# in .local an mDNS LAN box, so the agent's own model endpoint,
+# inference-gateway.<ns>.svc.cluster.local, got local-server handling. That
+# meant, wherever no timeouts are configured, a 900s stream stale detector, an
+# 1800s read timeout and no non-stream stale detector, and always local-server
+# probes the gateway 404s and an uncached /models fetch. Kubernetes service DNS
+# (.svc, .cluster.local) now classifies as a cloud endpoint; a real .local host
+# stays local. The configs' providers.custom block sets the timeouts. See the module docstring in
+# deploy/docker/patches/apply_cluster_dns_not_local.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1326,6 +1339,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_api_failure_reason_header.py \
      deploy/docker/patches/apply_ssh_shared_master.py \
      deploy/docker/patches/verify_ssh_shared_master.py \
+     deploy/docker/patches/apply_cluster_dns_not_local.py \
+     deploy/docker/patches/verify_cluster_dns_not_local.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
@@ -1336,6 +1351,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cluster_dns_not_local.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1348,6 +1364,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
     grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
     grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
+    grep -q 'kube-agents patch: cluster-dns-not-local' /opt/hermes/agent/model_metadata.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1355,6 +1372,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cluster_dns_not_local.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
@@ -1469,7 +1487,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # records which running card created which child (kanban_worker_children), and
 # kanban_complete refuses — once, never wedging — to close a card whose
 # recorded children are neither settled nor gated on it, telling the worker to
-# wait and synthesize instead. Must run AFTER apply_kanban_result_required.py
+# wait and synthesize instead. kanban_block also refuses kind="dependency" on a
+# card with nothing unfinished to wait on, which upstream re-queues to a fresh
+# worker that can't see the first one's work (#2704's duplicate PR). Must run
+# AFTER apply_kanban_result_required.py
 # (earlier stage): its completion anchor is text that patch introduced,
 # deliberately, because the site it needs only exists in the patched tree. The
 # create hook anchors on upstream's own line, so apply_kanban_auto_subscribe.py
@@ -1477,6 +1498,18 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # here again solely so the applier can import the anchor constant; the module
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
+#
+# kanban_wake_guard: a wake turn in a gateway conversation can't file a card.
+# When a card finishes, Hermes runs a synthetic turn in the session that filed
+# it (the wake self-post in gateway/wake.py), with every tool. On the next lane
+# a front-door session's wake turn filed a card acting on the worker's proposed
+# fix, and that card opened a pull request nobody asked for (#2610). The
+# self-post now marks its request, the API server's chat-completions handler
+# marks the turn for a front-door (a2a-ctx-*) session, _run_agent carries the
+# mark onto the turn's executor thread, and kanban_create refuses on a marked
+# turn, as does kanban_unblock (the person's answer can unblock). The wake
+# turn can still answer.
+# See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
@@ -1488,7 +1521,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # "stuck" when every slot is busy; the notifier claims `queued` (TERMINAL_KINDS,
 # never _WAKE_KINDS) and delivers it as the first line of the card's rolling
 # progress message. Runs after wake_nudge, whose two dispatcher anchors bracket
-# the stuck counter this edits, and after the four kanban_tools.py appliers
+# the stuck counter this edits, and after the five kanban_tools.py appliers
 # above, whose lines it does not share. The _WAKE_KINDS grep repeats the one in
 # the kanban-progress stage: a queued notice must never cost an LLM turn.
 # See the module docstring in deploy/docker/patches/kanban_priority.py.
@@ -1537,6 +1570,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/kanban_wake_guard.py \
+     deploy/docker/patches/apply_kanban_wake_guard.py \
+     deploy/docker/patches/verify_kanban_wake_guard.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
@@ -1598,6 +1634,13 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
+    cp /tmp/latency-patches/kanban_wake_guard.py /opt/hermes/tools/kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_guard.py /opt/hermes && \
+    grep -qF '_kanban_refuse_create_on_wake()' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '_kanban_refuse_unblock_on_wake()' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
+    grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
+    grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -1627,6 +1670,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_chat_notify.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \

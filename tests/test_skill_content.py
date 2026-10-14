@@ -23,15 +23,15 @@ HELM_CHART_SKILL = REPO_ROOT / "agents/platform/skills/gitops-helm-chart/SKILL.m
 
 class ClusterWorkloadSecuritySkillTest(unittest.TestCase):
     def test_teaches_two_step_network_policy_enforcement(self):
-        # GKE rejects --enable-network-policy until the addon is on, and gcloud rejects both
-        # flags in one call, so the skill checks the dataplane and enables in two steps.
+        # GKE rejects node enforcement until the addon is on, so the skill checks the
+        # dataplane and proposes the two changes in order (the Cluster Agent is read-only).
         content = CLUSTER_WORKLOAD_SECURITY.read_text(encoding="utf-8")
         for text in (
-            "--enable-network-policy",
-            "--update-addons=NetworkPolicy=ENABLED",
+            "spec.addonsConfig.networkPolicyConfig.disabled: false",
+            "spec.networkPolicy.enabled: true",
             "networkConfig.datapathProvider",
             "--location <location>",
-            "node pools may be recreated; this can take several minutes",
+            "node pools may be recreated, which can take several minutes",
         ):
             self.assertIn(text, content)
 
