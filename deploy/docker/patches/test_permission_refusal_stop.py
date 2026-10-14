@@ -129,7 +129,8 @@ class ClassifyTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=none"],
         ):
             self.assertEqual(stop.classify_refusal("whatever the shell said", refusal(*argv)), "policy", argv)
-        # The shell text is not read: a chained write exits 0, a heredoc or a Python call wrapped it.
+        # The verdict is the result's: a chained write that exits 0, a heredoc or a Python call that
+        # wrapped it. On the exit-0 path the text is consulted once, by the word test, which each satisfies.
         for command, result in (
             ("kubectl scale deploy x --replicas=3; kubectl get deploy x", refusal(*SCALE, exit_code=0)),
             ("bash <<'EOF'\nkubectl scale deploy x --replicas=3\nEOF", REFUSAL),

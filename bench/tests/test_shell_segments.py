@@ -364,6 +364,26 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     )
 
 
+def test_kubectl_boolean_global_flags_are_the_policys():
+    import importlib.util
+    from pathlib import Path
+
+    from kube_agents_bench import shell_segments
+
+    import sys
+
+    scripts = Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts"
+    sys.path.insert(0, str(scripts))
+    try:
+        module = importlib.import_module("command_policy")
+    finally:
+        sys.path.remove(str(scripts))
+    assert shell_segments._KUBECTL_BOOLEAN_FLAGS == module._KUBECTL_BOOLEAN_FLAGS
+    assert "curl -k https://10.0.0.1/apis/apps/v1" in segments(
+        "kubectl --insecure-skip-tls-verify exec -n kube-system deploy/x -- curl -k https://10.0.0.1/apis/apps/v1"
+    )
+
+
 def test_typed_segments_type_python_text_wherever_it_ran():
     from kube_agents_bench.shell_segments import typed_segments
 

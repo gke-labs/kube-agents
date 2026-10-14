@@ -66,6 +66,12 @@ _WRAPPERS = frozenset(
      "taskset", "watch", "timeout", "xargs", "command", "builtin", "exec",
      "if", "!", "while", "until", "then", "else", "elif", "do", "{"}
 )
+# kubectl's boolean global flags, which take no value token: a copy of the command
+# policy's ``_KUBECTL_BOOLEAN_FLAGS`` (agents/platform/scripts/command_policy.py),
+# which the segmenter suite compares it with.
+_KUBECTL_BOOLEAN_FLAGS = frozenset(
+    {"-h", "--help", "--insecure-skip-tls-verify", "--disable-compression", "--match-server-version", "--warnings-as-errors"}
+)
 # ``find … -exec <command> {} \;`` runs its argument for every match.
 _FIND_EXEC_OPTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _FIND_EXEC_END = frozenset({";", "\;", "+"})
@@ -232,7 +238,8 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
 
 
 def _kubectl_verb(rest: list[tuple[int, int, str]]) -> str | None:
-    """kubectl's first subcommand: the first argument past the global flags and their values."""
+    """kubectl's first subcommand: the first argument past the global flags and their values
+    (a boolean global flag takes none; the table is the policy's ``_KUBECTL_BOOLEAN_FLAGS``)."""
     i = 0
     while i < len(rest):
         token = rest[i][2]
@@ -240,7 +247,7 @@ def _kubectl_verb(rest: list[tuple[int, int, str]]) -> str | None:
             return None
         if token.startswith("-"):
             i += 1
-            if "=" not in token and i < len(rest) and not rest[i][2].startswith("-"):
+            if token not in _KUBECTL_BOOLEAN_FLAGS and "=" not in token and i < len(rest) and not rest[i][2].startswith("-"):
                 i += 1
             continue
         return _unquote(token)

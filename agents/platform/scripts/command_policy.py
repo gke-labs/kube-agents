@@ -103,7 +103,7 @@ _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # attempted against the cluster, so the agent's runtime does not count it as a
 # refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
 # a help flag is (the verb's usage text, nothing attempted).
-_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list", "-h", "--help"})
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list"})
 # kubectl's ``--dry-run`` strategy reaches the server for these two values only;
 # ``client``, the bare flag's ``unchanged``, the ParseBool true spellings, an empty
 # or unknown value all end on the client (a render, or an error before any request).
