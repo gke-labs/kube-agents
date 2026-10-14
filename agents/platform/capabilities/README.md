@@ -49,8 +49,8 @@ there.
 
 `capability_store.py` doubles as a read-only CLI for an operator on the gateway,
 which is how you read the audit trail after the fact. It finds the store through
-`HERMES_HOME`, else `PLATFORM_AGENT_HOME` (what a `kubectl exec` shell on the container
-carries), else `/opt/data`, and looks one profile down for the Platform Agent's store:
+the `KUBE_AGENTS_CAPABILITIES_DIR` override, else `HERMES_HOME`, else `PLATFORM_AGENT_HOME` (what a
+`kubectl exec` shell on the container carries), else `/opt/data`, and looks one profile down for the Platform Agent's store:
 
 ```bash
 python3 /opt/defaults/scripts/capability_store.py list
@@ -65,4 +65,6 @@ agent, so the changelog answers "what changed and what was claimed", not "who
 authenticated".
 
 Writes do not go through the CLI. The only write path is the `capability_criteria`
-tool, which is where the learning policy is enforced.
+tool, which is where the learning policy is enforced. That holds because the file tools write in
+the shell sandbox, which carries no copy of this tree; the gateway's file-tool guard covers `skills/`
+and `scripts/`, not this tree, so an image run with a local shell backend is where the premise ends.

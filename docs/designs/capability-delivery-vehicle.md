@@ -49,7 +49,7 @@ value written into either lasts until the next restart, which is exactly the los
 out. The criteria have a tree of their own, `capabilities/<name>/criteria.json`, with the
 image-owned schema and learning policy beside it. The start-up merge treats that file the other way
 round from everything else it syncs (the volume's keys win; a key it lacks reads the schema's default), and the
-sandbox never receives the tree at all, so the only path to it is the tool R7 requires.
+sandbox never receives the tree at all — and the file tools write there — so the only path to it is the tool R7 requires.
 [`agents/platform/capabilities/README.md`](../../agents/platform/capabilities/README.md) is
 canonical for the files and the merge. The first two capabilities to be specified for the
 vehicle are the upgrade-readiness and fleet-anomaly-detection checks, proposed separately in
@@ -222,7 +222,9 @@ follow-up once that foundation exists; nothing in this document rules it out.
 ### R7 — Safety of the write path
 
 - Criteria are read and written only through a path the harness controls, never by the agent's
-  shell, so a policy cannot be bypassed by editing a file.
+  shell, so a policy cannot be bypassed by editing a file (today the file tools hold because they
+  write in the sandbox, which has no copy of the tree; the gateway's file-tool guard does not yet
+  cover it).
 - A change is validated against the capability's declared keys and bounds before it is written; an
   unknown key or an out-of-range value is refused with a message that names the defined keys.
 - The write path enforces the learning policy in code: a "never" key is refused; a "propose only"

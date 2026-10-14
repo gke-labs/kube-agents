@@ -1113,7 +1113,9 @@ the template declares and the live file has lost are restored, keys it already h
 alone. Its overlay merges after that back-fill as it always did. Everything else the image owns in
 that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/`,
 `capabilities/` — still force-syncs either way (`cron/` and `capabilities/` as merges: the image
-wins the roster's keys, the volume wins the criteria's).
+wins the roster's keys, the volume wins the criteria's;
+[`agents/platform/capabilities/README.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/capabilities/README.md)
+is canonical for the latter).
 
 A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
 stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
