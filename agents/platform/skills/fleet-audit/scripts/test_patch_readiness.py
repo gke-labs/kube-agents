@@ -3352,6 +3352,17 @@ class CriteriaTest(unittest.TestCase):
         for key, spec in schema["properties"].items():
             shipped = pr.DEFAULT_CRITERIA.record()[key]
             self.assertEqual(sorted(spec["default"]) if isinstance(shipped, list) else spec["default"], shipped, key)
+        # The schema's ceilings are the collector's too, by name.
+        for key, ceiling in (("pool_skew_critical_minors", pr.POOL_SKEW_CRITICAL_MINORS_MAX), ("fleet_spread_min_minors", pr.FLEET_SPREAD_MIN_MINORS_MAX), ("blocking_exclusion_min_days", pr.BLOCKING_EXCLUSION_MIN_DAYS_MAX)):
+            self.assertEqual(schema["properties"][key]["maximum"], ceiling, key)
+        # And each key has its flag: a field added to Criteria without one would read as the
+        # default on every run while the manifest recorded the default too.
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as exc:
+            pr.main(["--help"])
+        self.assertEqual(exc.exception.code, 0)
+        for key in schema["properties"]:
+            self.assertIn(f"--{key.replace('_', '-')}", out.getvalue(), key)
 
     def test_an_image_type_entry_is_held_to_the_schemas_pattern(self):
         # One pattern for an entry: the store's schema at write time, this flag at parse time,
@@ -3563,14 +3574,18 @@ class CriteriaTest(unittest.TestCase):
                 self.assertIn("overlap", error)
                 self.assertIn("overlap", err)
 
-    def test_a_horizon_past_what_timedelta_holds_is_refused_by_name(self):
-        # Otherwise `timedelta(days=...)` raises inside every project's collection and the
-        # manifest reads as the whole fleet failing `clusters list`.
-        error, _ = self.refused(["--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS + 1)])
-        self.assertIn("--blocking-exclusion-min-days", error)
-        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect, redirect_stdout(io.StringIO()):
-            pr.main(["--project", "acme", "--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS)])
-        self.assertEqual(collect.call_args.kwargs["criteria"].blocking_exclusion_min_days, pr.MAX_FREEZE_HORIZON_DAYS)
+    def test_a_value_past_the_schemas_ceiling_is_refused_by_name(self):
+        # The flag is composed in the agent's shell, so it is held to the schema's maximum as a
+        # `set` is; the ceiling value itself is accepted. The schema's 365-day horizon is far
+        # inside what `timedelta` holds, so the overflow of earlier rounds is covered too.
+        for flag, ceiling in (("--pool-skew-critical-minors", pr.POOL_SKEW_CRITICAL_MINORS_MAX), ("--fleet-spread-min-minors", pr.FLEET_SPREAD_MIN_MINORS_MAX), ("--blocking-exclusion-min-days", pr.BLOCKING_EXCLUSION_MIN_DAYS_MAX)):
+            with self.subTest(flag=flag):
+                error, _ = self.refused([flag, str(ceiling + 1)])
+                self.assertIn(flag, error)
+                self.assertIn("maximum", error)
+                with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(pr.main(["--project", "acme", flag, str(ceiling)]), 0)
+                self.assertEqual(collect.call_args.kwargs["criteria"].record()[flag[2:].replace("-", "_")], ceiling)
 
     def test_a_width_or_horizon_under_one_is_refused(self):
         for flag in ("--fleet-spread-min-minors", "--blocking-exclusion-min-days"):

@@ -202,8 +202,12 @@ DEFAULT_EXCLUSION_SCOPE = "NO_UPGRADES"
 # §3.8's "ends more than 30 days from now": time left, not the freeze's length.
 LONG_FREEZE_DAYS = 30
 LONG_FREEZE = timedelta(days=LONG_FREEZE_DAYS)
-# The widest horizon the check's own arithmetic holds; past it `timedelta(days=...)` raises.
-MAX_FREEZE_HORIZON_DAYS = timedelta.max.days
+# The schema's `maximum` for each integer key (criteria.schema.json; CriteriaTest pins them).
+# The store refuses a value past these, and so does the flag: the command line is composed in
+# the agent's shell and may not carry what the store returned.
+POOL_SKEW_CRITICAL_MINORS_MAX = 10
+FLEET_SPREAD_MIN_MINORS_MAX = 10
+BLOCKING_EXCLUSION_MIN_DAYS_MAX = 365
 # What an image type is spelled as, letters, digits and underscores: the pattern the store's
 # schema holds each `deprecated_image_types` entry to at write time (criteria.schema.json
 # carries the same string; CriteriaTest pins the two), checked again here because the flag may
@@ -250,8 +254,8 @@ class Criteria(NamedTuple):
     whose tool call failed collects on those rather than on nothing. This
     script runs in the shell sandbox, which never sees the criteria tree, so
     the flags are the only way a tuned value reaches a candidate's severity.
-    The store enforces the schema's bounds; `criteria_from_args` refuses only
-    a value this file's own arithmetic cannot take.
+    `criteria_from_args` holds each flag to the schema's bounds as the store
+    holds a `set`, since the flag is composed in the agent's shell.
     """
 
     pool_skew_critical_minors: int = POOL_SKEW_CRITICAL_MINORS
@@ -2305,29 +2309,32 @@ def candidate_summary(manifest: dict) -> list[str]:
 
 def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Criteria:
     """The run's `Criteria` from the parsed flags, or `parser.error` on a value
-    the checks cannot take.
+    the store would refuse or the checks cannot take.
 
-    Only the floors are checked here, plus the one ceiling that is this
-    file's arithmetic rather than policy. The schema's ceilings are the
-    store's to refuse; a flag is read as what the tool returned, and this
-    script is not the place for a second copy of that policy. The floors are
-    different: a critical rung at or below GKE's ceiling makes two of §3.2's
-    rungs claim the same pool, and a spread width or horizon under one has no
-    reading at all. A horizon past what `timedelta` holds would raise inside
-    every project's collection and read as the whole fleet failing
-    `clusters list`, so it is refused here by name.
+    The floors are this file's own: a critical rung at or below GKE's ceiling
+    makes two of §3.2's rungs claim the same pool, and a spread width or
+    horizon under one has no reading at all. The ceilings are the schema's,
+    pinned here by test: the flag is composed in the agent's shell, so it is
+    held to the bound the store holds a `set` to rather than read as what the
+    tool returned. (The schema's 365-day horizon is far inside what
+    `timedelta` holds, so the overflow that once raised inside every project's
+    collection cannot be reached.)
     """
     if args.pool_skew_critical_minors < POOL_SKEW_CRITICAL_MINORS:
         parser.error(
             f"--pool-skew-critical-minors must be at least {POOL_SKEW_CRITICAL_MINORS}: GKE's skew ceiling is "
             f"{SKEW_CEILING_MINORS} minors, and a critical rung at or below it would overlap §3.2's fixed major rung"
         )
+    if args.pool_skew_critical_minors > POOL_SKEW_CRITICAL_MINORS_MAX:
+        parser.error(f"--pool-skew-critical-minors must be at most {POOL_SKEW_CRITICAL_MINORS_MAX}, the schema's maximum")
     if args.fleet_spread_min_minors < 1:
         parser.error("--fleet-spread-min-minors must be at least 1")
+    if args.fleet_spread_min_minors > FLEET_SPREAD_MIN_MINORS_MAX:
+        parser.error(f"--fleet-spread-min-minors must be at most {FLEET_SPREAD_MIN_MINORS_MAX}, the schema's maximum")
     if args.blocking_exclusion_min_days < 1:
         parser.error("--blocking-exclusion-min-days must be at least 1")
-    if args.blocking_exclusion_min_days > MAX_FREEZE_HORIZON_DAYS:
-        parser.error(f"--blocking-exclusion-min-days must be at most {MAX_FREEZE_HORIZON_DAYS}: a longer horizon is not a span of days the check can hold")
+    if args.blocking_exclusion_min_days > BLOCKING_EXCLUSION_MIN_DAYS_MAX:
+        parser.error(f"--blocking-exclusion-min-days must be at most {BLOCKING_EXCLUSION_MIN_DAYS_MAX}, the schema's maximum")
     # Compared case-insensitively, as §3.9 reads image types; an empty flag is
     # an operator who emptied the list, not the default. The list grammar is
     # the one the scope flags on this same command line use, commas or
