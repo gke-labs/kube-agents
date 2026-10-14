@@ -1084,12 +1084,6 @@ def _rule_served_class(rule: dict, targets: tuple) -> str:
     return RULE_UNKNOWN if versions else RULE_LIVE
 
 
-def version_pinned_rules(hook: dict) -> list[dict]:
-    """The rules of this webhook the server sends nothing (`_rule_version_pinned`), judged
-    against every graded row whatever the selector admits: the served version is the server's."""
-    return [rule for rule in _rules(hook) if _rule_version_pinned(rule, GRADED_TARGETS)]
-
-
 def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict], namespaces: list[dict] | None = None) -> dict:
     """Fail-closed webhooks whose backend is unreachable, split by whether they break an upgrade.
 
