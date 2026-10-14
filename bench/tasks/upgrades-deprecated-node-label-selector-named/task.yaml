@@ -63,7 +63,7 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-beta-arch-label
     role: objective
@@ -74,9 +74,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?beta\.kubernetes\.io/arch; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?(?!beta\.kubernetes\.io/arch;)[^ :;\n][^;\n]*; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch;)[^ :;\n][^;\n]*; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-it-is-deprecated-and-names-the-replacement
     role: objective
@@ -87,9 +87,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?[^ :;\n][^;\n]*; deprecated: yes; replacement:? ?kubernetes\.io/arch$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes; replacement:? ?kubernetes\.io/arch$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes; replacement:? ?kubernetes\.io/arch$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes; replacement:? ?kubernetes\.io/arch$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

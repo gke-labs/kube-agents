@@ -68,7 +68,7 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source:? ?[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
 
   - name: the-declared-line-says-the-source-is-in-tree
     role: objective
@@ -79,9 +79,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source:? ?in-tree gcepersistentdisk; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?in-tree gcepersistentdisk; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source:? ?(?!in-tree gcepersistentdisk;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!in-tree gcepersistentdisk;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
 
   - name: the-declared-line-names-the-claim-and-the-migration
     role: objective
@@ -92,9 +92,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source:? ?[^ :;\n][^;\n]*; bound by:? ?seeded-shapes/intree-pd; attaches through csi migration: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?seeded-shapes/intree-pd; attaches through csi migration: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!seeded-shapes/intree-pd; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!seeded-shapes/intree-pd; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

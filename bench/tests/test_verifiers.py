@@ -7276,6 +7276,8 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, policy/v1beta1/podsecuritypolicies",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowschemas.flowcontrol.apiserver.k8s.io",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: /apis/flowcontrol.apiserver.k8s.io/v1beta3/flowschemas, v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: /api/v1/endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, /api/v1/componentstatuses",
             "seeded-a: next minor v1.36; removed apis still called: none; deprecated but still served: core/v1 Endpoint",
             "seeded-a: next minor 1.36.4-gke.1391000; removed apis still called: none; deprecated but still served: endpoints (core/v1)",
             "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
@@ -7303,6 +7305,8 @@ _GROUP3 = {
         [
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane: legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; network policy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; network-policy enforcement: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability (default-deny), seeded-debug (default-deny), seeded-capacity (default-deny), seeded-deprecation (apiserver-egress-only), seeded-shapes (default-deny, stale-kubectl-client-apiserver-egress), seeded-defaults (default-deny)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 namespaces (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation)",
@@ -7819,3 +7823,19 @@ def test_a_parked_case_drops_out_of_the_tables():
         assert case not in _live(_GROUP4)
         assert len(_live(_GROUP4)) == len(_GROUP4) - 1
         assert set(_live(_GROUP3)) == set(_GROUP3)
+
+
+_FRAMED_CASES = [
+    c for c in [*_GROUP2, *_GROUP4, *_GROUP5] if c != "upgrades-exclusion-end-date-named"
+]
+
+
+@pytest.mark.parametrize("case", [c for c in _FRAMED_CASES if c not in _parked_cases()])
+def test_a_gloss_after_the_object_is_admitted(case):
+    """The frame admits a parenthetical after the cluster and after the object
+    alike: `seeded-b/no-surge-pool (e2-medium): ...` grades as the bare line."""
+    table = {**_GROUP2, **_GROUP4, **_GROUP5}
+    bare = table[case][0][0]
+    glossed = bare.replace(": ", " (object gloss, one node): ", 1)
+    verdicts = _group5_verdicts(case, _group5_report(glossed))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts

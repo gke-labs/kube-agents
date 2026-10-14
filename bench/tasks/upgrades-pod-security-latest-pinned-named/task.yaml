@@ -69,7 +69,7 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-level-is-baseline
     role: objective
@@ -80,9 +80,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?baseline; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?baseline; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?(?!baseline;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?!baseline;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-version-is-latest
     role: objective
@@ -93,9 +93,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?latest; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?latest; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!latest;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!latest;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-rule-set-moves
     role: objective
@@ -106,9 +106,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
