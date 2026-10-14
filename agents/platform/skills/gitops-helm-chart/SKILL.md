@@ -58,20 +58,20 @@ search the filesystem for credentials or a repository; a card that says
 "install and verify" is still answered by the stop.
 
 The first stop comes before anything else: the install must have a GitOps
-repository registered. The registry is mounted in your shell at
-`/etc/gitops/managed_repos`, one file, the same one `SOUL.md` names. One read
-answers it:
+repository registered, and it must be reachable. One command answers both,
+the same one `SOUL.md` names, and its one line is final:
 
 ```bash
-cat /etc/gitops/managed_repos
+python3 "$HERMES_HOME"/scripts/gitops_preflight.py
+python3 "$HERMES_HOME"/scripts/gitops_preflight.py --repo "<owner>/<repo>"
 ```
 
-A missing file, an empty file or an empty list is the answer:
-nothing is registered. Do not look for a repository anywhere else (the
-filesystem, `git`, Cloud Source Repositories, the source code). Stop with "This install has no
-registered GitOps repository, so `<chart>` cannot be declared for a
-reconciler to install. Register one in the `PlatformAgent`'s
-`spec.integration.repositories`. I have changed nothing."
+Run the first form before anything else, and the second once you know which
+repository the change goes to. `REGISTERED: ...` (exit 0) means go on. Any
+other line (`NO_REGISTERED_REPO`, `REPO_UNREACHABLE`, `STATE_UNREADABLE`)
+is the stop: block with that line as the reason and change nothing. Do not
+read the registry another way, check it again, or look for a repository
+anywhere else.
 
 ### Step 1: Find what syncs the target cluster
 
