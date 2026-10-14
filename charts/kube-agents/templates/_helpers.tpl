@@ -454,7 +454,8 @@ Takes a dict of field name to value.
 
 {{/*
 The LiteLLM gateway config, mirroring
-k8s-operator/config/integrations/litellm/base/config.yaml.
+k8s-operator/config/integrations/litellm/base/config.yaml and its provider
+overlays.
 
 Defined once and consumed twice — as the ConfigMap body and as the input to the
 Deployment's checksum annotation — because those two must not be able to
@@ -470,7 +471,7 @@ absent renders no max_tokens).
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render stays byte-identical to the kustomize base
+  otherwise, so the default render matches the kustomize base
   (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
   no such key on purpose. One value for all three aliases: they are one
   upstream model, and the budget is the backend's property, not the alias's.
@@ -527,11 +528,17 @@ model_list:
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching. Kept identical to the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml) — see that file
-  for why the breakpoints live here rather than in the agent's own config, and
-  why non-Anthropic backends are unaffected.
+  Prompt caching, for Anthropic-family models only: the same $claude gate as
+  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Vertex explicit context caching: a cachedContents list before every call,
+  and a create whenever the cached prefix is new. A create that Vertex holds
+  past its request credential's life fails the whole turn (a 401 after a
+  ten-minute stall in the incident that found this), and Gemini's
+  implicit caching needs no markers. The kustomize base carries the same block
+  only in its anthropic overlay; see that file for why the breakpoints live
+  here rather than in the agent's own config.
 */}}
+{{- if $claude }}
 router_settings:
   default_litellm_params:
     cache_control_injection_points:
@@ -544,6 +551,7 @@ router_settings:
         index: -3
       - location: message
         index: -1
+{{- end }}
 {{- end }}
 
 {{/*
@@ -683,6 +691,27 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
 {{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $secret) -}}
+{{- end -}}
+{{- $caMap := ($f.caBundleRef | default dict).name | default "" -}}
+{{- /* A caBundleRef with no name renders nothing, so the CA would be silently missing: the CRD requires the name, and so does the chart. */ -}}
+{{- if and $f.caBundleRef (not $caMap) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef needs a name: the Secret that holds the CA" $i) -}}
+{{- end -}}
+{{- if $caMap -}}
+{{- if ne $provider "gitlab" -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a gitlab forge; provider %s does not read a CA bundle" $i $provider) -}}
+{{- end -}}
+{{- /* gitlab.com presents a certificate the public CAs sign: a private CA must never vouch for it. */ -}}
+{{- if or (not $host) (has (lower $host) (list "gitlab.com" "www.gitlab.com")) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com uses the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
+{{- end -}}
+{{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
+{{- end -}}
+{{- $caKey := ($f.caBundleRef | default dict).key | default "" -}}
+{{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey)) (eq $caKey ".") (hasPrefix ".." $caKey)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a Secret key" $i $caKey) -}}
+{{- end -}}
 {{- end -}}
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
@@ -1487,7 +1516,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
 */}}
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
-      "requests" (dict "cpu" "500m" "memory" "512Mi")
+      "requests" (dict "cpu" "500m" "memory" "1Gi")
       "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
    | toJson -}}
 {{- end }}

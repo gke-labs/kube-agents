@@ -125,7 +125,9 @@ package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two release
 release two behind reports a different set of findings than CI.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
-place, and the comment above the target says why.
+place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
+place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
+fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
@@ -604,17 +606,20 @@ not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
 `/override`, and the command is silently ignored.
 
-**Branch protection is not the gate and reads as though there is none.** `main` requires ten
+**Branch protection is not the gate and reads as though there is none.** `main` requires these
 contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
-`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`, and
-`Agent instructions cite assets that exist` — and conversation resolution, but **zero** approving
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`,
+`Agent instructions cite assets that exist`, and `Run A2A Module Tests` — and conversation
+resolution, but **zero** approving
 reviews, because approval is Tide's business rather than GitHub's. A reader who checks the
 repository settings for the review requirement therefore finds nothing and concludes wrongly.
 
-The last four joined the set on 2026-09-02; before that, a pull request they had not run on could
-merge without them.
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
+`Agent instructions cite assets that exist` joined the set on 2026-09-02, and
+`Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
+could merge without it.
 
-Those ten are not the whole required set either. Tide also requires every Prow presubmit not marked
+Those contexts are not the whole required set either. Tide also requires every Prow presubmit not marked
 `optional`, and those are configured in `oss-test-infra` rather than in branch protection —
 `pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
@@ -714,9 +719,9 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
 re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
-[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) watches the completed
-attempts of the checks its `workflow_run` trigger lists, and when an attempt after the first passes
-on the same commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
+[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
+of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
+commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
 (or Go test, or pytest file) the failed attempts' logs name, falling back to one per failing job and
 step when they name none or name more than a handful, or adds a row to the issue that class already
 has. The tree did not change
@@ -724,8 +729,10 @@ between the attempts, so the code was not the cause; the issue is where the occu
 until someone
 reads them together. It never closes an issue, because every green run of a flaky check looks like a
 fix from the outside; close it when the cause is fixed, and a recurrence opens a new one that links
-back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header says why
-`Validate PR Title` and `Security Scanning` are left off.
+back. `scripts/notify_flaky_check.py` holds the reasoning and the watched list, and says why
+`Validate PR Title` and `Security Scanning` are left off. The sweep reads runs created in the last
+few days (`SWEEP_WINDOW_DAYS` in the script); a re-run later than that is recorded by dispatching
+the workflow with the run's id and `dry_run` off.
 
 A re-run that fails again records nothing, and neither does a push that happens to go green: only a
 same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke

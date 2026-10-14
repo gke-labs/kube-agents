@@ -686,6 +686,14 @@ PYEOF
 # gets the template's inserted where the template carries it, so the proxy invocation
 # keeps the same shape. Identity, overlays, timeouts, every other arg: untouched.
 #
+# One wider repair rides in the same pass. A server whose template args name the
+# credential proxy's MCP relay (`${KUBE_AGENTS_MCP_RELAY_URL}`) has image-owned args
+# end to end: the URL, its flags and the header all move together with the `env`
+# entry that names the proxy token. The fill above adds that `env` key to a profile
+# scaffolded before the relay existed while leaving its Google URL in place, and that
+# pairing would send the gateway's ServiceAccount token to Google. So for those
+# servers the whole `args` list, and the token entry in `env`, become the template's.
+#
 # A caller reports its own failure, as with the fill: only it knows which profile.
 repair_remote_mcp_user_agent() {
     "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" <<'UAEOF'
@@ -697,6 +705,10 @@ import yaml
 HEADER_FLAG = "--header"
 HEADER_NAME = "user-agent"
 TMP_SUFFIX = ".user-agent.tmp"
+# A template arg starting with this marks a server reached through the credential
+# proxy's MCP relay, whose args and token entry are image-owned whole.
+RELAY_URL_MARKER = "${KUBE_AGENTS_MCP_RELAY_URL}"
+BEARER_FILE_ENV = "MCP_REMOTE_BEARER_FILE"
 
 template_path, live_path = sys.argv[1], sys.argv[2]
 
@@ -727,12 +739,28 @@ if not isinstance(template_servers, dict) or not isinstance(live_servers, dict):
     raise SystemExit(0)
 
 repaired = []
+relayed = []
 for name, template_server in template_servers.items():
     live_server = live_servers.get(name)
     if not isinstance(template_server, dict) or not isinstance(live_server, dict):
         continue
     template_args, live_args = template_server.get("args"), live_server.get("args")
-    if not isinstance(template_args, list) or not isinstance(live_args, list):
+    if not isinstance(template_args, list):
+        continue
+    if any(isinstance(arg, str) and arg.startswith(RELAY_URL_MARKER) for arg in template_args):
+        template_env = template_server.get("env") or {}
+        live_env = live_server.get("env")
+        if not isinstance(live_env, dict):
+            live_env = {}
+        wanted_env = dict(live_env)
+        if BEARER_FILE_ENV in template_env:
+            wanted_env[BEARER_FILE_ENV] = template_env[BEARER_FILE_ENV]
+        if live_args != template_args or live_env != wanted_env:
+            live_server["args"] = list(template_args)
+            live_server["env"] = wanted_env
+            relayed.append(name)
+        continue
+    if not isinstance(live_args, list):
         continue
     template_slot = header_slot(template_args)
     if template_slot is None:
@@ -747,7 +775,7 @@ for name, template_server in template_servers.items():
         live_args[live_slot] = wanted
         repaired.append(name)
 
-if repaired:
+if repaired or relayed:
     # Atomic, for the fill's reason and one more: a torn write of a cluster profile's
     # config.yaml loses `cluster_identity`, and the reconciler then scaffolds a
     # duplicate it can never prune.
@@ -755,7 +783,10 @@ if repaired:
     with open(tmp_path, "w") as fh:
         yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
     os.replace(tmp_path, live_path)
-    print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+    if repaired:
+        print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+    if relayed:
+        print(f"[ENTRYPOINT] MCP relay repair: {live_path} now takes the image's args and proxy token entry on {', '.join(relayed)}")
 UAEOF
 }
 
@@ -1006,15 +1037,14 @@ fi
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
 # bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
-# be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
-# different reason: an install that onboarded before the job existed must never get it. oobe.py
-# skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
-# it is not owed.
+# be reinstalled. .bootstrap_completed is that record. `oobe` and `first-run-quick-value-audit`
+# are seeded on the same record so an install that onboarded before those jobs existed does not
+# start first-run fleet audits on upgrade.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe,first-run-quick-value-audit"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
@@ -1512,11 +1542,14 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # this, every cluster onboarded before an image changed the header keeps
         # sending the old one for the life of the volume, while the platform profile
         # and every newly onboarded cluster send the new one — two header shapes from
-        # one build, on a value the API teams key dashboards on. The helper writes
-        # only when the value differs, so a profile already current is not rewritten.
+        # one build, on a value the API teams key dashboards on. For a server the
+        # template routes through the credential proxy's MCP relay it does more: the
+        # whole args list and the proxy token entry become the template's (see the
+        # helper). It writes only when something differs, so a profile already
+        # current is not rewritten.
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             repair_remote_mcp_user_agent "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
-                || echo "WARN: failed to repair the remote MCP User-Agent in $d/config.yaml; this cluster agent keeps sending the header it was scaffolded with" >&2
+                || echo "WARN: failed to repair the remote MCP entries in $d/config.yaml; this cluster agent keeps the header and server URLs it was scaffolded with, and if the back-fill added MCP_REMOTE_BEARER_FILE beside a Google URL its gke and developer_knowledge calls fail until the repair succeeds" >&2
         fi
         # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
         # cron store if one exists on the PVC.
@@ -1570,13 +1603,14 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
         backfill_config_from_template \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
             || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
-        # The fill leaves lists alone, so the one image-owned value inside one — the
-        # remote MCP User-Agent — is repaired in place, exactly as the cluster loop
-        # above does for its profiles. Force-synced, flag off, the file already
+        # The fill leaves lists alone, so the image-owned values inside one — the
+        # remote MCP User-Agent, and a relayed server's whole args and token entry —
+        # are repaired in place, exactly as the cluster loop above does for its
+        # profiles. Force-synced, flag off, the file already
         # carries it; this is the front door taking the same repair.
         repair_remote_mcp_user_agent \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
-            || echo "WARN: could not repair the remote MCP User-Agent in profiles/platform/config.yaml; the front door keeps sending the header it was scaffolded with" >&2
+            || echo "WARN: could not repair the remote MCP entries in profiles/platform/config.yaml; the front door keeps the header and server URLs it was scaffolded with, and its gke and developer_knowledge calls may fail until the repair succeeds" >&2
     else
         echo "[ENTRYPOINT] profiles/platform/config.yaml is missing; seeding it from the image template." >&2
         cp "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
@@ -1821,6 +1855,21 @@ fi
 # peer uid may refuse the chmod, and that is fine.
 mkdir -p "$TARGET_DIR/scratch"
 chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
+
+# 4.5 Say so loudly when the remote MCP servers cannot start. Every profile's
+# `gke` and `developer_knowledge` entries interpolate KUBE_AGENTS_MCP_RELAY_URL,
+# the credential proxy's MCP relay, which the operator sets on this container.
+# Hermes leaves an unset variable as literal text, mcp-remote cannot parse that as
+# a URL, and every call to those tools fails with nothing here saying why. The
+# usual cause is this image running under an operator from before the relay.
+# Primary only: the dashboard sidecar runs no agent, and is not given the
+# variable. And only with HERMES_MANAGED_DIR set, the operator's marker as for the
+# managed-scope check above: an image started any other way has no relay by
+# design, and an alert on every such boot would make the alarm routine.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -n "${HERMES_MANAGED_DIR:-}" ] \
+    && [ -z "${KUBE_AGENTS_MCP_RELAY_URL:-}" ]; then
+    echo "[ENTRYPOINT] ALERT KUBE_AGENTS_MCP_RELAY_URL is unset, so the gke and developer_knowledge MCP servers will fail on every call. The operator sets it; upgrade the operator to a build that does." >&2
+fi
 
 # 5. Start background microservices (FastAPI proxy)
 #

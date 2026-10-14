@@ -115,14 +115,27 @@ const (
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
-	// 512Mi whatever this line says. The request is declared at that floor
-	// rather than left below it so the manifest the operator writes is the pod
-	// the cluster admits on both Standard and Autopilot: the chart's footprint
-	// file and its quota preflight sum this line, and a namespace quota sized
-	// to a 256Mi footprint would pass the preflight and then refuse the pod on
-	// Autopilot for the 256Mi the admission added.
+	// 512Mi at least whatever this line says; the request is declared on or
+	// above that floor rather than left below it so the manifest the operator
+	// writes is the pod the cluster admits on both Standard and Autopilot: the
+	// chart's footprint file and its quota preflight sum this line, and a
+	// namespace quota sized to a 256Mi footprint would pass the preflight and
+	// then refuse the pod on Autopilot for the 256Mi the admission added.
+	//
+	// Autopilot clamps memory as it clamps CPU: without bursting it sets the
+	// container's limits equal to its requests, so there the broker's limit
+	// is this request, not credentialProxyMemoryLimit, and the budget it
+	// derives from the limit is sized by this line. 1Gi rather than the 512Mi
+	// the band alone would give because 512Mi is under the budget's 672Mi
+	// floor (credentialProxyMinimumMemoryLimitBytes), at which the broker
+	// turns the budget off and admits by slot alone, which is the OOM
+	// exposure the budget exists to remove, on the cluster type a new install
+	// runs on. At 1Gi the budget admits four requests at once there
+	// (TestCredentialProxyBudgetArithmeticAtTheDefaults holds the request to
+	// the floor); 500m/1Gi is 2 GiB per vCPU, inside the band. On Standard
+	// the request is scheduling weight only and the 2Gi limit stands.
 	credentialProxyCPURequest    = "500m"
-	credentialProxyMemoryRequest = "512Mi"
+	credentialProxyMemoryRequest = "1Gi"
 	// The limits. CPU is the ceiling a mint or a listing may burst to on
 	// Standard; memory is what the comment above sizes; ephemeral storage
 	// bounds the content workspace (the broker's own clone of a repository

@@ -656,6 +656,8 @@ spec:
               value: us-central1-a
             - name: KUBE_CONTEXT_NAME
               value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBEAGENTS_SCOPE_DECLARED
+              value: "false"
             - name: SANDBOX_IMAGE_TREES
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
@@ -1092,7 +1094,7 @@ spec:
               memory: 2Gi
             requests:
               cpu: 500m
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1359,6 +1361,8 @@ spec:
             - name: CREDENTIAL_PROXY_URL
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_AGENTS_MCP_RELAY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH

@@ -47,7 +47,7 @@ Run the interactive one-liner installer directly in **Google Cloud Shell** or an
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-_Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+_Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`; a GitLab install needs `0.9.0` or later)._
 
 When running the official release installer (`<RELEASE_VERSION>/install.sh`) or executing inside an official release checkout or unpacked release archive, the release version is baked in and used automatically without prompting. A checkout of a release line (`release/<X.Y>`) that has moved past its latest release still carries that release's baked version but is not that release: run from that checkout, with the release's tag and full history fetched, `install.sh` defaults to the checkout's own commit, as a `main` checkout does, and says so; a clone that lacks the tag, or whose shallow history stops short of the release, is refused and told which fetch to run.
 
@@ -76,7 +76,7 @@ choice is recorded); see the site's
 On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--enable-gvisor=false`.
 Outside cluster adoption, two tasks stay outside Terraform: setting the managed-OTel collection scope
 on freshly created clusters (no Terraform field exists) and the GitHub App private-key import into KMS
-(the PEM must not enter Terraform state). The installer sources
+(the PEM must not enter Terraform state). A GitLab install has no GitHub App, so it has no import. The installer sources
 `scripts/installer/installer_common.sh`, which reads `install.defaults.env`, so its defaults
 (region, cluster name, model provider, registry prefix) and its accepted values live in exactly
 one place; see
@@ -97,10 +97,11 @@ Four behaviours worth knowing before the first run:
   container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
-  reports it. It costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull
-  subscription — and it reaches past the clusters this install manages: the sink exports the
-  admin-activity audit records of every GKE cluster in the project, including clusters this
-  install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
+  reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub
+  topic and a pull subscription — and a sink in each project a declared scope lists, and it reaches
+  past the clusters this install manages: the sinks export the admin-activity audit records of
+  every GKE cluster in those projects, including clusters this install does not manage, and the
+  subscription retains a copy of them for 31 days. Opt out with
   `ENABLE_DRIFT_DETECTOR=false` in `install.env`. A first run records the
   `--enable-drift-detector=false` flag for you, because it is the run that writes that file; over
   an `install.env` that already exists the flag applies to one run and is recorded nowhere, which
@@ -131,7 +132,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave, or the `PLATFORM_AGENT_MODE` a `--mode` gave, that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
-   - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
+   - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and, for GitHub only, Cloud KMS key creation for GitHub App private key signing).
    - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
      ```bash
      cd terraform/examples/full-install
@@ -139,6 +140,13 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
      ```
    - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
+
+On a GitLab install, the checks in step 2 skip the GitHub organization check. Generate-only never
+creates the GitLab token Secret. On a first install it writes the GitLab keys into `install.env`,
+and over an existing `install.env` it does not change them. After `lifecycle.sh apply`, create the
+Secret, as
+[Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
+shows.
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -156,7 +164,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --permission-set="read-only"
 ```
 
-When enabling GitOps pull-request automation, also provide the GitOps repository and GitHub App parameters:
+When enabling GitOps pull-request automation with a repository on GitHub, also provide the GitOps repository and GitHub App parameters. For a repository on GitLab, see [GitOps Repository on GitLab](#gitops-repository-on-gitlab):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -186,7 +194,84 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gcp-project-id="my-gcp-project"
 ```
 
-_Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
+_Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`; a GitLab install needs `0.9.0` or later), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
+
+#### GitOps Repository on GitLab
+
+When the GitOps repository is on GitLab (gitlab.com or a self-managed instance), use the GitLab
+flags in place of the GitHub App flags. GitLab support starts in release 0.9.0. Use 0.9.0 or a later
+release as `<RELEASE_VERSION>`. The latest release is on
+[GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest). A GitLab install has no
+GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path`
+with `--gitops-forge=gitlab`. The Go and Cloud KMS prerequisites of the PEM import do not apply.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only" \
+  --gitops-forge=gitlab \
+  --gitops-host="gitlab.example.com" \
+  --gitops-repo="platform/infra/gitops" \
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
+```
+
+Rules for the agent:
+
+- Ask the operator for the GitLab host and the project's full path. The operator creates the project
+  before the install. The installer does not create it.
+- `--gitops-host` is a lowercase DNS name with at least two labels, such as `gitlab.corp.internal`.
+  It has no scheme, port or path. Do not give it for gitlab.com. The installer refuses a GitHub
+  hostname. The broker connects to the host with HTTPS on port 443.
+- `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
+  its `https://` URL on that host. Do not put the host in the path. `--gitops-org` is not used.
+- The token is a group or project access token with the `api` and `write_repository` scopes and the
+  Developer role. On a GitLab tier without group or project access tokens, it is a personal access
+  token of a dedicated account that is a Developer member of the project. It is never a person's
+  own token.
+- The broker uses the token only for the declared repositories. Another project in the
+  same group gets no token; `inspect-repository` reads it without one, so only a public project
+  is readable. A project outside those groups is refused. For `platform/infra/gitops`, the group
+  is `platform/infra`. The token limits what GitLab lets the broker do. Tell the operator to use the token with the smallest reach. That
+  is a project access token on the GitOps project, or a group access token on `platform/infra`,
+  not on `platform`.
+- Do not ask the operator to paste the token. Do not put the token in a flag value, a variable or
+  the transcript. Use one of these:
+  - Do not give `--gitlab-token-file`. The install completes and prints the command that creates
+    the Secret, and the operator runs it. Until then, every GitLab call answers
+    `FORGE_CREDENTIAL_UNAVAILABLE`. No restart is necessary after the operator creates it.
+  - Give `--gitlab-token-file` a file, or a process substitution such as the `pass` example above.
+    The installer reads the whole source and removes all whitespace from it, newlines inside it
+    too. The source must hold only the token. A `pass` entry with more lines needs `| head -n1`.
+    The operator unlocks `gpg-agent` before the run. `/dev/stdin` works only with `./install.sh`
+    from an unpacked release: under `curl … | bash`, standard input is the script itself.
+- Only when a private CA signed the instance's certificate, add
+  `--gitops-ca-file="$HOME/secure/internal-ca.pem"` to the command above. Do not give it for
+  gitlab.com or for a certificate from a public CA. The installer refuses it without a
+  self-managed `--gitops-host`. It is a regular PEM file with the root CA, and also the
+  intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
+  substitution for it. The installer stores it in the Secret `gitlab-forge-ca`. Only the
+  credential broker trusts the CA, and only for that host. Use a release whose
+  `install.sh --help` lists `--gitops-ca-file`.
+- `--dry-run` and `--generate-only` check that the token source is readable, and stop the run if a
+  regular token file is empty. They store no token, and they do not read `/dev/stdin` or a process
+  substitution. They check the content of a regular CA file. `--generate-only` never creates the
+  Secrets. On a first install it writes the GitLab keys into `install.env`. Over an existing
+  `install.env`, it does not change them, so set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
+  `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` in that file before
+  `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After the apply,
+  the person who runs the install creates the Secrets by hand (Terraform only names them), as
+  [Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
+  shows.
+- Before the install, check the token. On a cluster that already exists, also check the network
+  path before the install, in the `default` namespace, because `kubeagents-system` does not exist
+  yet. On a new cluster, check the network path after the install. After
+  the install, check the connection. [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
+  gives the commands. It also has the network, DNS, certificate, token expiry and rotation rules,
+  the `install.env` keys, and what the install declares.
 
 #### AI-Assisted Installation
 
@@ -212,8 +297,9 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic` or `openai`), and
-   where the model credential comes from:
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic` or `openai`),
+   where the model credential comes from, and, if the operator wants GitOps pull requests, the
+   forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
    ```bash
    gcloud config get-value project
@@ -239,7 +325,9 @@ An agent given that prompt, or reading this file on its own, follows these steps
    starting, so the key stays out of the command line and the agent's transcript; `vertex_ai` needs
    no key, and `gemini` can instead read one from the Secret Manager secret
    `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. Without a key, the
-   installer only warns, and the agent it installs cannot call a model.
+   installer only warns, and the agent it installs cannot call a model. For a GitOps repository on
+   GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
+   [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -291,23 +379,23 @@ Before beginning installation, ensure your environment meets the requirements fo
 - **Method 2 (Manual Kubernetes / Kustomize)**: Advanced manual manifest deployment.
 - **Method 3 (Local Development & Testing)**: Building and running operator binaries and container images locally.
 
-| CLI Tool / Utility              | Required Version                                | Verification Command               | Description                                                                                                                                                                                                            | Applies To                                       |
-| :------------------------------ | :---------------------------------------------- | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
-| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                                                  | **All Methods**                                  |
-| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                           | **All Methods** (GKE)                            |
-| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                               | **All Methods**                                  |
-| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                      | **Methods 0 & 1**                                |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                      | **Methods 0, 1, & 2**                            |
-| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                              | **All Methods**                                  |
-| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
-| **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
-| **`python3`**                   | `3.x`                                           | `python3 --version`                | The installer's state readers, its pre-apply scope check, and `upgrade.sh`'s re-tag values filter use it.                                                                                                              | **Methods 0 & 1**                                |
-| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                     | **All Methods**                                  |
-| **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                             | **Optional (CMEK / Backup Plan lifecycle)**      |
-| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                   | **Method 2 only**                                |
-| **OpenSSH (`ssh-keygen`)**      | Standard                                        | `ssh -V`                           | Mints the shell sandbox SSH keypair in Method 2 Step 2 and in `upgrade.sh`'s backfill; `install.sh` and the Terraform composition mint it without it (`tls_private_key`).                                              | **Method 2 and `upgrade.sh`**                    |
-| **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. | **Methods 2 & 3, or Method 0/1 with PEM import** |
-| **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                     | **Methods 2 & 3 only**                           |
+| CLI Tool / Utility              | Required Version                                | Verification Command               | Description                                                                                                                                                                                                                                             | Applies To                                       |
+| :------------------------------ | :---------------------------------------------- | :--------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------- |
+| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                                                                                   | **All Methods**                                  |
+| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                                                            | **All Methods** (GKE)                            |
+| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                                                                | **All Methods**                                  |
+| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                                                       | **Methods 0 & 1**                                |
+| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                                                       | **Methods 0, 1, & 2**                            |
+| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                                                               | **All Methods**                                  |
+| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation. The installer checks for it on every install, a GitLab install too, and installs it when it is missing.                                                                               | **Methods 0 & 1**                                |
+| **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                                                               | **All Methods**                                  |
+| **`python3`**                   | `3.x`                                           | `python3 --version`                | The installer's state readers, its pre-apply scope check, and `upgrade.sh`'s re-tag values filter use it.                                                                                                                                               | **Methods 0 & 1**                                |
+| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                                                      | **All Methods**                                  |
+| **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                                                              | **Optional (CMEK / Backup Plan lifecycle)**      |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                                                    | **Method 2 only**                                |
+| **OpenSSH (`ssh-keygen`)**      | Standard                                        | `ssh -V`                           | Mints the shell sandbox SSH keypair in Method 2 Step 2 and in `upgrade.sh`'s backfill; `install.sh` and the Terraform composition mint it without it (`tls_private_key`).                                                                               | **Method 2 and `upgrade.sh`**                    |
+| **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. A GitLab install imports no key. | **Methods 2 & 3, or Method 0/1 with PEM import** |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                                                      | **Methods 2 & 3 only**                           |
 
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
@@ -331,9 +419,9 @@ and GitHub minter workloads).
 - **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
 - Drive it through [`lifecycle.sh`](terraform/examples/full-install/lifecycle.sh) rather than bare
   `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete and any Pub/Sub
-  topic or subscription that already exists, `destroy` handles the teardown asymmetries a bare
-  `terraform destroy` trips over, and `plan` reports what an apply would change while creating
-  nothing.
+  topic or subscription that already exists, and an approved `apply` (`-auto-approve`) retries past Cloud
+  KMS's first-enablement 403; `destroy` handles the teardown asymmetries a bare `terraform destroy`
+  trips over; and `plan` reports what an apply would change while creating nothing.
 - The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
   you do **not** need to install it yourself on this path. (You do for
   [Method 2](#method-2-manual-kubernetes-cluster-deployment).) If your pre-existing cluster already
@@ -356,7 +444,7 @@ curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VE
 cd kube-agents-<RELEASE_VERSION>
 ```
 
-Alternatively, if you require a Git repository checkout, clone pinned to an official release tag (for example, `0.4.0`):
+Alternatively, if you require a Git repository checkout, clone pinned to an official release tag (for example, `0.4.0`; a GitLab install needs `0.9.0` or later):
 
 ```bash
 git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
@@ -401,6 +489,15 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
 
+- **GitOps on GitLab**: set `gitops_forge = "gitlab"`, `gitlab_repo` (the project's full path, with
+  nested groups), `gitops_host` for a self-managed instance (empty means gitlab.com), and
+  `gitlab_token_secret_name` (default `gitlab-forge-token`). For an instance behind a private CA,
+  also set `gitlab_ca_secret_name`. Leave `github_repo` and `enable_github_minter` unset: a GitLab
+  install has no token minter. Terraform names the Secrets and does not create them. Create them in
+  the agent's namespace after the apply, as
+  [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) shows, so that the token
+  never enters `terraform.tfvars` or the Terraform state.
+
 - **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and review prerequisites before applying.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
@@ -416,7 +513,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   sets a different one. Terraform takes `platform_agent_mode`,
   the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
   `install.env` and re-run `install.sh` or a full `upgrade.sh`;
-  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key.
+  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key. Before
+  switching an install whose Slack is on and Google Chat off to `next` (the A2A gateway then
+  takes Slack), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
+  `U0123ABCD`, not emails, which match nobody; `SLACK_HOME_CHANNEL`, if set, is a channel ID
+  (`C...` or `G...`), not a DM or a user; `SLACK_BOT_TOKEN` is one workspace's token, not a
+  comma-separated list, with no comma or space left in it. Both front doors refuse a `next` apply that fails any of them. On
+  `today` the allowlist never matched emails either: the Hermes Slack platform compares each
+  sender's member ID exactly, so an email there has never admitted anyone.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
@@ -515,6 +619,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is only `SLACK_HOME_CHANNEL`, a channel ID, and that page's home-channel section says how to set it.
+
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
    - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
@@ -525,7 +631,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
    - If you left `SLACK_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its channel or DM the home channel, where scheduled audits post (step 5).
 3. **Approve Pairing Code (Optional / First-time setup)**:
-   - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
+   - Only if you set the Hermes Slack DM policy to `pairing` yourself: a kube-agents install gates Slack with the allowlist instead, and the A2A gateway under `spec.mode: next` has no pairing. A member the policy does not know gets a one-time code; approve it from the gateway logs:
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve slack <PAIRING_CODE>
      ```
@@ -572,9 +678,10 @@ To add a chat platform later, edit `install.env` and re-run `./install.sh`, then
 
 - Google Chat: set `GOOGLE_CHAT_ENABLED=true` and `ALLOWED_USERS=` to the comma-separated emails
   allowed to use the agent. `./install.sh --menu` edits both for you.
-- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated user IDs or
-  emails, and re-run with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked
-  for them.
+- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated Slack member
+  IDs (for example `U0123ABCD`), not emails or display names: an email matches nobody. To find a
+  member ID, open the person's Slack profile, then the **⋮** menu, then **Copy member ID**. Re-run
+  with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked for them.
 
 The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
 empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,
@@ -624,10 +731,12 @@ helm upgrade kube-agents ./charts/kube-agents \
 
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
-On an install that came from `install.sh`, put the same value in `extra_helm_values` in
-`terraform/examples/full-install/terraform.tfvars` as well. The next `upgrade.sh` or `install.sh`
-re-run regenerates that file from `install.env`, which does not record this setting, and reverts a
-value set only on the Helm release.
+On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead. A
+first install writes it as true, but a file without the key reads as false to `upgrade.sh`, and a
+re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
+`install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
+`agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
+set only on the Helm release or only in `terraform.tfvars` is reverted.
 
 Installing the chart directly with `helm install` gives you a sandbox the agent cannot log into: the
 chart cannot generate an `authorized_keys`-form public key, so `platform-agent-shell-authorized-keys`
@@ -862,6 +971,33 @@ kubectl rollout status deployment -n kubeagents-system
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
+A GitOps repository on GitLab needs no minter: skip `make deploy-github`. Put the GitLab access
+token in a Secret in `kubeagents-system` under the key `token`. Then declare the forge in the
+PlatformAgent CR in Step 6. Add these fields to the sample's `spec.integration` before you apply it:
+
+```yaml
+spec:
+  integration:
+    forges:
+      - name: gitlab # required; repositories refer to the forge by this name
+        provider: gitlab
+        host: gitlab.example.com # omit for gitlab.com
+        credentialsRef:
+          name: gitlab-forge-token # the Secret with the key `token`
+        # For an instance behind a private CA only: the Secret with the key `ca.crt`.
+        caBundleRef:
+          name: gitlab-forge-ca
+    repositories:
+      - forge: gitlab # required: the forge's name
+        repository: platform/infra/gitops # required: the project's full path
+        role: gitops
+```
+
+The
+[PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
+describes the fields, and [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
+describes the token.
+
 `make deploy-github` renders the minter's Kubernetes half and imports nothing, so on this path the GitHub App and the Cloud KMS asymmetric signing key — the latter already holding the imported private key — must exist beforehand (see the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Token minter guide](docs/site/src/content/docs/deploy/token-minter.md)). `install.sh --github-pem-path` performs that import for you; this path has no equivalent.
 
 `GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the installer's preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
@@ -966,8 +1102,12 @@ kubectl get pods -n kubeagents-system
 
 `Ready` means the gateway, the shell sandbox and the credential broker are all up. A first boot can
 take over fifteen minutes. The site's quickstart
-[Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is and
-which startup errors to ignore. If a pod stays unready, see
+[Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is,
+which startup errors to ignore, and how to check that Slack connected. On an install made with
+`--mode=next`, `Ready` also waits for the NATS bus, the auth callout, the bus provisioning Job's
+first run and, with a chat backend, the A2A gateway; run the quickstart's "Verify a
+`spec.mode: next` install" checks as well, for those, the verifier and console it does not wait
+on, the conditions, and the Slack check that applies under `next`. If a pod stays unready, see
 [Troubleshooting & Common FAQ](#troubleshooting--common-faq).
 
 ### After the first chat message: the inventory report
@@ -1009,9 +1149,12 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
   env HERMES_HOME=/opt/data/profiles/platform hermes cron list
 ```
 
-Each audit's report is a ledger issue in the GitOps repository, so the audits need the GitHub
-integration: with no GitOps repository configured, every run fails before it audits anything. A
-run that changed something since the last one also posts a one-line summary linking the issue to
+Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
+there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
+registered (none at all, rather than one the install cannot use), the audits still run: each keeps
+its findings in the report store on the agent's volume, and a run that changed something posts a
+summary to chat that says no forge is configured. With a repository, a
+run that changed something since the last one posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
 `GOOGLE_CHAT_HOME_CHANNEL` from the install), and an audit can open remediation pull requests in the
@@ -1081,9 +1224,10 @@ or the install was made by a release that predates this engine — re-run it wit
 
 ### Manual Local Uninstall
 
-To uninstall the operator controller and CRDs manually:
+To uninstall the operator controller and CRDs manually, delete the `PlatformAgent` first and wait, so the operator is still running to clear its finalizer:
 
 ```bash
+kubectl delete platformagent platform-agent -n kubeagents-system --wait --timeout=180s
 cd k8s-operator
 make undeploy
 make uninstall
@@ -1130,8 +1274,10 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
   - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
-- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Unlisted users are ignored without a reply; an empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md#verify) maps the A2A gateway's log lines to causes and fixes.
 
 **Which logs to read:**
 
@@ -1154,3 +1300,70 @@ When a Slack bot connects or is online in your workspace but never replies to me
     kubectl get platformagent platform-agent -n kubeagents-system -o yaml
     ```
     (The `A2AGateway` condition is present only while the gateway runs nothing: `status: False` with reason `NoChatBackend` when no chat backend is configured, or `WaitingForReplica` while a scaled-up replica comes back. On an install with Slack enabled it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
+
+### 6. Tracing Where a Chat Message Stops
+
+When the checks in the entry above pass and a message still gets no reply, follow it to the component that should answer.
+
+- Find out which component answers chat. An empty result, or `today`, is the default mode; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
+  ```
+- **Default mode.** The credential broker holds the Slack connection, and its startup lines say whether the tokens work. `Slack relay enabled workspaces=N` means the relay is up with N workspaces. `Slack bot token authentication failed` means Slack's `auth.test` rejected one of the bot tokens in `SLACK_BOT_TOKEN`; the relay still starts on the others. `Slack relay initialization failed; retrying` means no bot token authenticated or the Socket Mode connection with the app token failed, and the broker tries again every 30 seconds. A `Slack relay operation failed` line is something else: one Slack call the agent made failed (its `error` field says why, such as `channel_not_found` or `missing_scope`), not the tokens.
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
+  ```
+  On Google Chat, a sender must be on `ALLOWED_USERS` (emails; empty admits everyone), and the Chat app has to publish to the install's Pub/Sub topic ([ChatOps → Google Chat](docs/site/src/content/docs/concepts/chatops.md#google-chat)).
+- **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway (one that already exists is kept at zero replicas), and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system \
+    -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
+  kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
+  ```
+- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
+  ```
+  - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
+  - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
+  - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
+  - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
+  - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn. Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+- **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
+  ```bash
+  kubectl get platformagent platform-agent -n kubeagents-system \
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+  kubectl rollout status deployment/platform-agent-a2a-callout -n kubeagents-system
+  kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system
+  ```
+
+### 7. A Question Gets No Answer Under `spec.mode: next`
+
+The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
+
+- **It stays at `⏳ submitted…`.** Nothing has taken the task. (A line reading `⏳ **queued** — N requests are ahead of yours` is waiting its turn behind other conversations' tasks, which is not this.) Tasks on the `platform` route are run by the `hermes-bridge` container in the agent's pod, which logs `hermes bridge consuming` when it starts and `task accepted` for each task:
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | tail -n 50
+  ```
+  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
+  ```bash
+  kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
+  ```
+- **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. The gateway posts a card's report into the conversation you asked in, on Slack and Google Chat alike. Check each hop:
+  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `"conversations":true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations and logs `chat.notify home posts not armed: … conversation posts are`. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
+     ```bash
+     kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
+     ```
+     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record could not be read (logged first as `notify: session record unreadable`).
+  2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
+     ```bash
+     kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'
+     ```
+  3. The card was addressed to that route. The agent logs a line ending `— a report completed on this card will not reach chat` when it was not:
+     ```bash
+     kubectl exec -n kubeagents-system deploy/platform-agent-gateway -c platform-agent -- \
+       sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
+     ```
+     `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.

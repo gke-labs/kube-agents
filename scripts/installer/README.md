@@ -249,7 +249,7 @@ second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: a
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
 project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
-Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
+Pub/Sub topic and subscription that carry the project's, and each scoped project's, GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it
 means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. Only the run
 that creates `install.env` records the flag it was passed; over a file that is already
@@ -260,7 +260,7 @@ an exported `ENABLE_DRIFT_DETECTOR=false` is just as unrecorded and currently wa
 nothing, so the file is the only opt-out that survives the shell it was typed in.
 Setting it to `false` is still the one boolean `write_tfvars_from_state` omits rather than
 writing, so an install carrying a `TF_VAR_enable_drift_pubsub=true` line keeps its ingress
-and only loses the detector — a written `false` would outrank that line and take the sink,
+and only loses the detector — a written `false` would outrank that line and take the sinks,
 topic and subscription with it, up to 31 days of retained messages included.
 
 `MEMORY` is the only one of the keys above that the generator goes and asks the cluster
@@ -310,11 +310,37 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
+### The GitOps forge
+
+`GITOPS_FORGE` is `github` (the default) or `gitlab`. A GitLab install records these keys:
+
+| Key                   | Value                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`        | `gitlab`                                                                                                     |
+| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                                                   |
+| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                                                           |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`)                                   |
+| `GITOPS_CA_SECRET`    | The name of the Secret that holds a private CA (default `gitlab-forge-ca`); set only with `--gitops-ca-file` |
+
+The token, and the paths of the token file and the CA file, are never recorded.
+`GITLAB_TOKEN_FILE` and `GITOPS_CA_FILE` in the environment act like `--gitlab-token-file` and
+`--gitops-ca-file` for one run, and are never recorded either. One difference: with gitlab.com as
+the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag.
+
+- `install.sh` records these keys on a first install, and on a later run that goes on to the apply
+  with a different forge, host, project or Secret name.
+- A run that you decline, or that ends with `--generate-only`, does not change them in an existing
+  file.
+- A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`. A switch back to
+  GitHub drops the GitLab keys.
+- Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
+  `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
+
 ### Projects, folders, organisations and selectors in scope
 
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
 `SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS`
-are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from
+are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install, and the drift ingress's list of projects to export, from
 the same value: the generator renders them as the composition's `scope` object, the IAM module binds
 the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
 folder and organisation named, and the read roles in every project a Shared VPC host or Metrics
@@ -449,6 +475,23 @@ refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An olde
 the release rollback runbook's route, has no such refusal and drops it with its generic
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates.
+
+When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
+`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
+three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
+
+- a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway
+  matches member IDs exactly.
+- a `SLACK_HOME_CHANNEL` that is not a channel ID (`C` or `G`, then two or more of `A-Z0-9`).
+  Its notify route does not arm.
+- a `SLACK_BOT_TOKEN` that holds more than one comma-separated token, reported by count, or one
+  token with a comma or space left in it. The gateway takes one token, whole.
+
+A token that only the live Secret holds is checked after the generator recovers it. That
+refusal also removes the `terraform.tfvars` just written, and in the menu restores
+`install.env` as it was before the save. `upgrade.sh --plan` and `install.sh --dry-run` warn
+instead of refusing. An interactive `install.sh` asks for these three in the gateway's terms
+and asks again on an answer the gateway cannot use.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the

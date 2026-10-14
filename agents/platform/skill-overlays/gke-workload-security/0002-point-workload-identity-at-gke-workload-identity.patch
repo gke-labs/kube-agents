@@ -1,0 +1,41 @@
+Subject: Point Workload Identity at gke-workload-identity
+
+Why: upstream's Workload Identity split moved WI routing out of gke-workload-security in the skills' descriptions only; the bodies an agent reads after routing still sent it there and taught GSA impersonation as the recommended path, which gke-workload-identity calls legacy. The patch points the bodies at gke-workload-identity.
+Local-Issue: none (#2357)
+Upstream-Issue: none filed yet
+Retire-When: upstream's skill bodies route Workload Identity to gke-workload-identity
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -21,8 +21,8 @@ metadata:
+ > **Routing Note:** For Workload Identity KSA/GSA bindings, open `gke-workload-identity/SKILL.md`. For cluster-level security flags (`--database-encryption-key`, `--security-posture`, RBAC, Shielded Nodes, Binary Authorization), open `gke-platform-security/SKILL.md`.
+ 
+ This skill provides workflows and best practices for securing GKE workloads. It
+-covers security auditing, Identity and Access Management (Workload Identity),
+-Network Security (Network Policies), and Node Security.
++covers security auditing, Network Security (Network Policies), and Node Security.
++For Workload Identity setup, use the `gke-workload-identity` skill.
+ 
+ ## Workflows
+ 
+@@ -50,11 +50,15 @@ script.
+ scripts/audit_cluster.sh <cluster-name> <region> <project-id>
+ ```
+ 
+-### 2. Configure Workload Identity
++### 2. Configure Workload Identity (legacy GSA impersonation)
+ 
+-Workload Identity allows Kubernetes Service Accounts (KSAs) to impersonate
+-Google Service Accounts (GSAs). This is the recommended method for workloads to
+-access Google Cloud APIs.
++Load the `gke-workload-identity` skill first: binding IAM roles to the
++Kubernetes Service Account (KSA) principal directly is the current default, and
++that skill diagnoses both models. Use the impersonation setup below, where a KSA
++impersonates a Google Service Account (GSA), only when a GSA must be the
++identity: an existing GSA already holds the roles the workload needs, or the
++Google Cloud API it calls does not accept Workload Identity Federation
++principals (the GKE documentation lists those limitations).
+ 
+ **Steps:**
+ 

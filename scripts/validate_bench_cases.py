@@ -183,6 +183,14 @@ KNOWN_UNREGISTERED = {
         "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
         "nightly, and its empty trajectory grades every repetition blocked"
     ),
+    # It grades what a chat channel received, and every CI install deploys with
+    # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
+    # relay posts nowhere there and the case can only fail. Run by hand against
+    # an install with a chat platform, as for a relay change's eval loop. The
+    # entry goes when an eval lane has a chat platform.
+    "chat-relay-posts-report-as-written": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -198,6 +206,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "networking-world-open-ingress": (
+        "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
+        "every pool project (fleet re-apply); no pool project has a rule opening a "
+        "management port to the internet"
+    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "
@@ -225,9 +238,23 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "fleet-audit-sweeps-the-declared-scope": (
+        "#1865: needs an install with a declared scope and a third GCP project the "
+        "agent's service account can list but the scope does not declare; the "
+        "evaluation fleet has one project per install today, so no CI tier can run "
+        "it; run it by hand against such an install, substituting the outside "
+        "project's id at the case's two sites: the command check's first forbidden "
+        "pattern and the ledger check's forbidden phrase"
+    ),
+    "fleet-audit-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
-        "service account can read, holding a PSC endpoint its service attachment "
+        "service account can read, declared in the install's spec.scope.projects (or an "
+        "install that declares none), holding a PSC endpoint its service attachment "
         "rejects; the evaluation fleet has one project per install today, so no "
         "CI tier can run it; run it by hand against an install with such a project"
     ),
@@ -255,19 +282,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-    "gitops-drift-noise-filtered-triage": (
-        "#911: needs an audit ingress on the eval install -- a drift-audit "
-        "topic, a subscription and a detector enabled to pull from it, none of "
-        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
-        "classifier and the case files no card at all, which is broken rather "
-        "than red. The umbrella owns it because the gap is the eval install "
-        "not asking for what the composition already builds behind "
-        "enable_drift_pubsub, not a defect anyone has filed separately. The "
-        "case's own header carries the rest: why the sink is the one part of "
-        "the trio it can do without, why #2137 is not a second blocker, and "
-        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
-        "alongside the ingress"
     ),
 }
 
@@ -378,6 +392,12 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    # No field: a bold one-sentence lead, no heading and the length caps are
+    # the assertion, and every field narrows it.
+    "answer_first": (),
+    # No field: "this run's report is in the store" is the assertion, and
+    # `status` and `required_finding_phrases` only narrow it.
+    "audit_report_stored": (),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
@@ -422,6 +442,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading. No field: whether every post a planted
+    # report produced is that report, exactly, is the whole assertion.
+    "relay_posted_as_written": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

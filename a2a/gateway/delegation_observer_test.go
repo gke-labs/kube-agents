@@ -130,12 +130,15 @@ func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
 	for _, tc := range []struct {
 		name, backend, conv string
 		tweak               func(t *testing.T) func(*Config)
+		// The wake's closing guide: a door caller never saw the child's
+		// result, so its wake gives the whole answer; a chat room did.
+		guide string
 	}{
-		{"the A2A door", a2aBackend, "a2a:agent-1001/ctx-one", doorDelegation},
+		{"the A2A door", a2aBackend, "a2a:agent-1001/ctx-one", doorDelegation, wakeReplyGuideFull},
 		{"the inject door", injectBackend, injectKeyPrefix + "case-one", func(t *testing.T) func(*Config) {
 			return func(c *Config) { armInjectMap(t, c) }
-		}},
-		{"a chat backend", "", "discord:g1/t-one", func(*testing.T) func(*Config) { return nil }},
+		}, wakeReplyGuideFull},
+		{"a chat backend", "", "discord:g1/t-one", func(*testing.T) func(*Config) { return nil }, wakeReplyGuide},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, spawn, obs := startObservedRig(t, tc.tweak(t))
@@ -147,6 +150,9 @@ func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
 			waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 			wakeSession := spawn.calls()[1].Session
 			wake := r.awaitTask(t, wakeSession)
+			if text := envText(t, wake); !strings.HasSuffix(text, "\n"+tc.guide) {
+				t.Fatalf("the wake's text ends %q, want the guide %q", text[max(0, len(text)-120):], tc.guide)
+			}
 			wexec := r.execFor(t, wake, wakeSession)
 			_ = wexec.PublishStatus(context.Background(), lib.StateWorking, false)
 			completeTask(t, wexec, "the fleet is healthy")

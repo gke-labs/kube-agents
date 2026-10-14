@@ -1024,6 +1024,66 @@ class PoolNote(RunHarness):
             "*Smoke gate: pool full* — all 30 projects are leased. Consider onboarding a project.",
         )
 
+    def test_a_refusal_breach_posts_with_nothing_queued_and_says_so(self):
+        # The periodic's third trigger: runs asked Boskos for a project and
+        # got none. Every run that would have waited died at the acquire, so
+        # Deck shows no backlog -- and the gate must not read that as nothing
+        # to say. The message names the refusals and the leases with no build ID.
+        note = pool_note(waiting_longest_s=0, waiting_now=False, over_threshold=0,
+                         window_hours=None, p50_s=None, p95_s=None,
+                         lease_failures=2, lease_failures_hours=3, no_build_id=2)
+        self.assertTrue(post_health.pool_advisable(note))
+        self.assertTrue(post_health.pool_advisable(note, drained=True))
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool full* — all 30 projects are leased, 2 with no build ID in the owner."
+            " Consider onboarding a project.",
+        )
+        # The refusal line rides under every header, the UNKNOWN one included:
+        # a Boskos read that failed must not drop the one fact behind the ⏳.
+        self.assertEqual(
+            post_health.pool_numbers(note), ["2 runs refused a project in the last 3h."]
+        )
+        self.assertEqual(
+            post_health.pool_numbers(note | {"cause": "UNKNOWN"}),
+            ["2 runs refused a project in the last 3h."],
+        )
+        self.assertEqual(
+            post_health.pool_digest_line(note),
+            "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
+        )
+        # The Brief now carries the refusals, so this alert links it like
+        # every other breach; and its closing line says what a refusal is,
+        # because "runs still pass" is false for a run that died at the acquire.
+        lines = post_health.render_pool({"pool": note}).split("\n")
+        self.assertEqual(lines[-1], post_health.dashboard_link(post_health.DASHBOARD_VIEW_AGENT))
+        self.assertEqual(lines[-2], "A refused run did not start; retest once the pool has room.")
+        self.assertIn("Runs still pass; /retest makes the queue longer.",
+                      post_health.render_pool({"pool": note | {"lease_failures": None}}))
+        # A live queue beside the refusals is the fact a reader can act on
+        # this morning, so the refusal joins it rather than displacing it.
+        self.assertEqual(
+            post_health.pool_digest_line(note | {"over_threshold": 3, "waiting_now": True}),
+            "⏳ Queue backed up — 3 runs waiting past the 45 min p95 limit;"
+            " 2 runs refused a project in the last 3h.",
+        )
+
+    def test_a_refusal_breach_over_a_drained_pool_does_not_call_it_full(self):
+        # The cause stays CAPACITY for three hours after a refusal, and the
+        # free count is this hour's; "all leased" over seven free is false.
+        note = pool_note(free=7, lease_failures=2, lease_failures_hours=3, waiting_now=False)
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool was full* — 7 of 30 projects are free now. Consider onboarding a project.",
+        )
+        # With a live backlog the clause rides here too: the reader must see
+        # that runs are queuing over free projects, not only the remedy.
+        self.assertEqual(
+            post_health.pool_cause_text(note | {"waiting_now": True}),
+            "*Smoke gate: pool was full* — 7 of 30 projects are free now and runs are queuing."
+            " Consider onboarding a project.",
+        )
+
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
         # The other order. Once the reader has the build cluster, "cannot say
         # whose fault it is" is less than they already have, so an hour of
@@ -1782,13 +1842,13 @@ class FixtureDrift(RunHarness):
         )
         self.assertEqual(
             lines({post: {"build": "7", "finished_at": "2026-09-14T13:10:00+00:00", "passed": False, "summary": "1 refused, 34 converged", "dry_run": False}, "ci-kube-agents-pull-sweep": {"build": "1", "finished_at": "2026-09-14T13:10:00+00:00", "passed": True, "summary": "x"}}),
-            ["🔁 *Seeded-fleet reconcile:* on-merge run at 9:10 AM ET (build 7) failed: 1 refused, 34 converged."],
+            ["🔁 *Seeded-fleet reconcile:* postsubmit run at 9:10 AM ET (build 7) failed: 1 refused, 34 converged."],
         )
         # The postsubmit has no cadence: a run older than a day carries its
         # day, so last month's merge does not read as this morning's run.
         self.assertEqual(
             lines({post: {"build": "7", "finished_at": "2026-09-01T13:10:00+00:00", "passed": True, "summary": "35 visited: 35 converged", "dry_run": False}}),
-            ["🔁 *Seeded-fleet reconcile:* on-merge run on Tue Sep 1 9:10 AM ET (build 7) passed: 35 visited: 35 converged."],
+            ["🔁 *Seeded-fleet reconcile:* postsubmit run on Tue Sep 1 9:10 AM ET (build 7) passed: 35 visited: 35 converged."],
         )
         self.assertEqual(
             lines({daily: {"build": "9", "finished_at": None, "passed": True, "summary": "nothing to do", "dry_run": False}}),
@@ -2090,16 +2150,16 @@ class WatchedPeriodics(RunHarness):
         doc["periodics_read"] = [self.DAILY]
         rendered = post_health.render_digest(doc, T14)
         self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed 9:40 AM ET);", rendered)
-        # A failed on-merge build from weeks ago carries its date in every
+        # A failed postsubmit build from weeks ago carries its date in every
         # digest until the next fleet merge replaces it.
         post = "post-kube-agents-fleet-reconcile"
         old_doc = health("GREEN")
-        old_doc["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", finished="2026-09-01T13:10:00+00:00", stale_after_h=None)}
+        old_doc["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (postsubmit)", finished="2026-09-01T13:10:00+00:00", stale_after_h=None)}
         self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed on Tue Sep 1 9:10 AM ET);", post_health.render_digest(old_doc, T14))
         # A postsubmit build with no finish time is not a job that stopped.
         no_time = health("GREEN")
-        no_time["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", verdict="STALE", finished=None, stale_after_h=None)}
-        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (on merge)'s latest build cannot be placed in time; build 100 finished at a time its finished.json does not give.", post_health.render_digest(no_time, T14))
+        no_time["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (postsubmit)", verdict="STALE", finished=None, stale_after_h=None)}
+        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (postsubmit)'s latest build cannot be placed in time; build 100 finished at a time its finished.json does not give.", post_health.render_digest(no_time, T14))
         self.assertNotIn("has stopped running", post_health.render_digest(no_time, T14))
         # A stale job's last run is by definition more than a day old: dated.
         stale = health("GREEN")

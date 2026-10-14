@@ -1,0 +1,301 @@
+{
+  "name": "plan-window-newest-twenty-cards",
+  "source": "deploy/docker/patches/test_slack_ux_status.py::PlanTest.test_the_cap_drops_settled_rows_before_a_live_one",
+  "notes": "Past 20 cards the oldest settled ones go first (t_10 and t_11 here, as slack_ux_status._prune drops them), then the oldest of the rest (t_0 to t_2), so the window cuts no live card while a settled one stays. The title counts the cards it shows. Steps are the card's notes, unmarked: the renderer draws today's ✓ and ◌ from the item's status (the last step of an in_progress item is the open one).",
+  "input": {
+    "title": null,
+    "rows": [
+      {
+        "task_id": "t_0",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_1",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_2",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_3",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_4",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_5",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_6",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_7",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_8",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_9",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_10",
+        "title": "check payments",
+        "lines": [],
+        "status": "complete",
+        "steps": 0,
+        "result": "done"
+      },
+      {
+        "task_id": "t_11",
+        "title": "check payments",
+        "lines": [],
+        "status": "complete",
+        "steps": 0,
+        "result": "done"
+      },
+      {
+        "task_id": "t_12",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_13",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_14",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_15",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_16",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_17",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_18",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_19",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_20",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_21",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_22",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_23",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      },
+      {
+        "task_id": "t_24",
+        "title": "check payments",
+        "lines": [],
+        "status": "in_progress",
+        "steps": 0
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "20 cards",
+          "items": [
+            {
+              "id": "t_3",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_4",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_5",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_6",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_7",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_8",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_9",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_12",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_13",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_14",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_15",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_16",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_17",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_18",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_19",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_20",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_21",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_22",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_23",
+              "title": "check payments",
+              "status": "in_progress"
+            },
+            {
+              "id": "t_24",
+              "title": "check payments",
+              "status": "in_progress"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}

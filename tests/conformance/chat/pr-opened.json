@@ -1,0 +1,33 @@
+{
+  "name": "pr-opened",
+  "source": "agents/platform/scripts/test_slack_moments.py::PrOpenedTest.test_headline_evidence_and_two_url_buttons",
+  "notes": "On next the PR card is a notify: the turn is over when the card opens it. Posted once per thread per url.",
+  "input": {
+    "url": "https://github.com/acme/fleet-config/pull/412",
+    "repo": "fleet-config",
+    "number": "412",
+    "line": "Opened PR https://github.com/acme/fleet-config/pull/412 raising the limit"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I opened PR #412 in fleet-config. It's yours to review.",
+        "note": "Opened PR #412 raising the limit",
+        "tone": "success",
+        "links": [
+          {
+            "text": "Open PR ↗",
+            "url": "https://github.com/acme/fleet-config/pull/412",
+            "primary": true
+          },
+          {
+            "text": "Files changed ↗",
+            "url": "https://github.com/acme/fleet-config/pull/412/files"
+          }
+        ]
+      }
+    }
+  ]
+}

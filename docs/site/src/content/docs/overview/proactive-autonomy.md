@@ -28,12 +28,12 @@ Nine fleet audits run enabled, each on its own schedule and each maintaining a s
 
 - **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
 - **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
-- **Upgrade & patch readiness** (weekly) — control-plane and node versions against the cluster's release channel, version skew, `autoUpgrade`/`autoRepair` off, missing maintenance windows.
+- **Upgrade & patch readiness** (weekly) — control-plane and node versions against the cluster's release channel, version skew, `autoUpgrade`/`autoRepair` off, missing maintenance windows, and whether a lagging cluster's upgrade would go through cleanly.
 - **Fleet waste** (weekly) — over- and under-provisioned requests against a week of usage, idle workloads, orphaned PersistentVolumes and disks, idle reserved IPs, near-empty node pools, registries that never delete an image. Reported in resource units, not dollars: there is no billing export to price against.
 - **Fleet consistency drift** (weekly) — clusters that diverge from the rest of the fleet on release channel, Shielded Nodes, network policy, logging config and similar facets, and clusters with no environment label at all. The baseline is derived from the fleet itself, so it needs no blueprint to compare against.
 - **AI workload security** (daily) — inference endpoints on external load balancers, model repositories trusted to execute their own code, weights mounted writable under the serving process, unpinned model artifact sources, registry credentials in plaintext environment variables, model-server images on floating tags. It scopes itself to workloads running a known inference runtime or holding a GPU or TPU, and evaluates the deployment, never the model.
 - **Capacity & stockout prevention** (daily) — capacity obtainability, ComputeClass resilience, and single-zone stockouts.
-- **GCP networking fabric** (daily) — subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor.
+- **GCP networking fabric** (daily) — subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor, firewall rules opening management ports to the internet.
 - **GCE compute fleet** (daily) — Compute Engine VMs and MIGs: startup-script failures, stalled MIG convergence, sole-tenant headroom, orphaned snapshots.
 
 Alongside them, `github-repo-watcher` polls the target repo every 10 minutes and hands what it finds to one of two skills. An unaddressed open issue goes to `github-issue-resolver`, which triages it within tight guardrails — the machine-owned ledgers, audit ledgers carrying `agent:audit` and the chat-delivery ledger carrying `agent:delivery-watch`, are excluded from the poll. A review request on one of the agent's own pull requests — a comment that _begins_ with `/agent` or with an @-mention, from someone with write access — goes to [`pr-conversation`](/kube-agents/concepts/declarative-workflow/#answering-a-reviewer-on-the-pr), which answers in the thread or amends the branch under review. The poll itself runs no model: a tick with nothing to do costs an API call and no tokens.
@@ -65,3 +65,4 @@ The design goal: fleet issues stop rotting silently while the on-call queue is q
 - [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) — how cron ticks become tool calls.
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the `submit-suggestion` + Minty PR path.
 - [Governance SOPs](/kube-agents/concepts/governance-sops/) — the playbooks the watchdogs execute.
+- [A day with kube-agents](/kube-agents/overview/day-in-the-life/) — three scenarios from trigger to pull request.

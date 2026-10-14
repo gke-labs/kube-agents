@@ -68,7 +68,7 @@ ownership check, and pinning it would have encoded that gap as an intention.
 
 ## Known violations are expected failures
 
-Twelve assertions currently fail. They are decorated `@known_violation`, which
+Eleven assertions currently fail. They are decorated `@known_violation`, which
 is `unittest.expectedFailure` plus a registration, so CI is green and the gap
 still has a name, a line number and a citation. Fixing the control turns the
 expected failure into an _unexpected success_, which unittest reports as a
@@ -83,7 +83,7 @@ reads with an anchor string that `test_harness_selfcheck.py` verifies. Rename
 a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
-Two sets of inputs are not registered. The group-B workflow tests glob
+Three sets of inputs are not registered. The group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
@@ -99,11 +99,16 @@ digest on a `docker://` ref, and the fork-guard check on every auto-triggered
 credentialed workflow, run under `make test-python` in
 `tests/test_workflow_pins_and_fork_guards.py`.
 
-The other is the site's content tree, which D2 walks for the read-only
+Another is the site's content tree, which D2 walks for the read-only
 switch. `_harness.site_pages()` raises when the tree is missing or holds no
 page, the security reference under it is registered so the self-check names
 the tree when it moves, and the test requires the pages to name the broker's
 other variables before it reads their silence on this one.
+
+The third is the mirrored `gke-*` skills, which C4 globs under
+`agents/platform/skills/` to require an `upstream.lock` beside each one. The
+test asserts the glob is non-empty, and `gke-basics`'s lock is registered and
+required to be in the set, so the self-check names the tree when it moves.
 
 ## Invariant → test → bucket → historical attack
 
@@ -157,11 +162,16 @@ currently fails.
 | B1  | every kubectl write verb refused                                           | 1        | `test_B1_kubectl_write_verbs_are_refused`                                           | `kubectl delete namespace prod` reaching the sidecar and running                                                                                                                                                                                         |
 | B1  | ordinary reads still work                                                  | 1        | `test_B1_ordinary_reads_still_work`                                                 | an over-strict gate that gets globally disabled                                                                                                                                                                                                          |
 | B1  | gcloud write commands refused                                              | 1        | `test_B1_gcloud_write_commands_are_refused`                                         | —                                                                                                                                                                                                                                                        |
+| B1  | the `gke` MCP server offers each profile read tools only                   | 1        | `test_B1_the_gke_mcp_server_offers_no_write_tool`                                   | a hosted MCP write on the pod's Workload Identity credential, outside the broker: `create_cluster` with no pull request on a `custom` role set, and `patch_k8s_resource` on a fleet cluster                                                              |
 | B1  | the sandbox image ships no credentialed CLI                                | 1        | `test_B1_the_sandbox_image_ships_no_credentialed_cli`                               | a gate in a stage the agent image does not derive from                                                                                                                                                                                                   |
 | B1  | the shipped denylist refuses credential disclosure                         | 1        | `test_B1_the_shipped_denylist_refuses_credential_disclosure`                        | `gcloud auth print-access-token`, `gh auth token`, `kubectl config view --raw`                                                                                                                                                                           |
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
 | B1  | the agent cannot force-push                                                | 1 **KV** | `test_B1_the_agent_cannot_merge_or_approve`                                         | `git push --force origin main` matches no denylist rule; the git verb and lease machinery constrain where git writes, not this flag — a watched branch is still rewritable                                                                               |
 | B1  | the Slack relay removes nothing but the bot's own reaction                 | 1        | `test_B1_the_slack_relay_removes_nothing_but_its_own_reaction`                      | a second exemption beside `reactions.remove`, or the exemption case-folded: the workspace bot token deleting a message or a pin nobody can put back                                                                                                      |
+| B1  | the broker refuses every gke MCP write tool                                | 1        | `test_B1_the_broker_refuses_every_gke_mcp_write_tool`                               | `mcp__gke__patch_k8s_resource` or `create_cluster` reaching Google on the broker's credential because the Hermes tool list drifted                                                                                                                       |
+| B1  | no remote MCP server is reached around the broker                          | 1        | `test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential`              | an `mcp-remote` entry pointed straight at `*.googleapis.com`, running on the agent pod's own Google credential with no allowlist                                                                                                                         |
+| B1  | only the gateway reaches the MCP relay                                     | 1        | `test_B1_only_the_gateway_reaches_the_mcp_relay`                                    | the shell sandbox or a session pod gaining a GKE read path through the relay                                                                                                                                                                             |
+| B1  | the operator's relay URL is the route the policy guards                    | 1        | `test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route`                | the route renamed on one side, leaving every `gke` call failing with no policy refusal to read                                                                                                                                                           |
 | B2  | no workflow approves or merges a pull request                              | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                             | a model verdict causing a merge                                                                                                                                                                                                                          |
 | B2  | `pull-requests: write` has exactly six holders                             | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
 | B2  | a certified predicate in a human-only path                                 | **3**    | —                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
@@ -212,7 +222,7 @@ currently fails.
 | C4  | every third-party action is pinned to a commit                             | 1        | `test_C4_every_third_party_action_is_pinned_to_a_commit`                            | a retagged release silently changing what CI runs                                                                                                                                                                                                        |
 | C4  | the agent base image is pinned by digest                                   | 1        | `test_C4_the_agent_base_image_is_pinned_by_digest`                                  | — (the one reference this repo gets right)                                                                                                                                                                                                               |
 | C4  | every hermes plugin install is pinned to a commit                          | 1        | `test_C4_every_hermes_plugin_install_is_pinned_to_a_commit`                         | an upstream default branch shipping a plugin manifest the pinned installer cannot read, breaking every image build                                                                                                                                       |
-| C4  | upstream skills are pinned and verified                                    | 1 **KV** | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
+| C4  | upstream skills are pinned and verified                                    | 1        | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
 | C4  | every shipped image is pinned by digest                                    | 1 **KV** | `test_C4_every_shipped_image_is_pinned_by_digest`                                   | `DefaultPlatformAgentVersion = "latest"`                                                                                                                                                                                                                 |
 | C5  | no minted role grants a write verb                                         | 1        | `test_C5_no_minted_role_grants_a_write_verb`                                        | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                                                                |
 | C5  | the leader role stays confined to coordination                             | 1        | `test_C5_the_leader_role_stays_confined_to_coordination`                            | —                                                                                                                                                                                                                                                        |
@@ -292,7 +302,10 @@ the four `C1-a2a-gateway-*` mutations and the three `B1-slack-*` mutations, all
 KILLED when they were added on 2026-10-06, `B1-slack-method-shape-dropped`, KILLED
 when it was added on 2026-10-07, `A3-agent-answers-its-own-notify` (KILLED) and
 `A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
-they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08;
+they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
+`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
+`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
+`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13;
 re-run the harness rather than trusting these numbers, which is the sentence this
 paragraph exists to make cheap.
 Note that the summary line the harness prints accounts for 113 of the 115: a
@@ -347,3 +360,14 @@ suite once at the end: a run that ends red says so and exits non-zero.
 5. If it fails against current code, decorate it `@known_violation` with the
    invariant and the document that records the finding — and give its class a
    `..._precondition_...` test, which the self-check requires.
+
+## `chat/` holds data, not tests
+
+Each file in `chat/` pairs an input, lifted from a `today` presenter test or
+built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
+spec gives its chat message assertions (27 and 28) this directory as their
+home, but they are wire-format rules rather than security invariants, so
+`run.py` and the self-check never read these files. The Go tests in
+`a2a/lib/chatmsg` validate every expected message, and
+`agents/platform/scripts/test_chat_cases.py` checks the files' shape under
+`make test-python`.

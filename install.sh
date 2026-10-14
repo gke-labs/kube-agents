@@ -331,7 +331,7 @@ bootstrap_install_env() {
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -436,6 +436,15 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# A self-managed GitLab behind a private CA: a FILE the CA is read from, and
+# the Secret it goes into, which install.env records. The file's path is
+# never recorded. GITOPS_CA_FILE in the environment counts as an interview
+# answer, not as the flag (see PARAM_GITOPS_CA_FILE_FROM_FLAG).
+PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
+PARAM_GITOPS_CA_SECRET="${GITOPS_CA_SECRET:-}"
+# Whether the CA file came from --gitops-ca-file rather than the interview: a
+# flag with gitlab.com is refused, an interview answer is cleared.
+PARAM_GITOPS_CA_FILE_FROM_FLAG="false"
 # Whether a value came from a flag rather than install.env: a switch of forge
 # by flag drops what the file recorded for the other forge, but refuses a flag
 # that contradicts it.
@@ -655,9 +664,10 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org for GitOps repo
-  --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
-                                currently gke-fleet-iac)
+  --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
+  --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
+                                DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
+                                project's full path (required, no default)
   --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
                                 For gitlab, --gitops-repo is the project's full path
                                 (group/subgroup/project) and --gitops-org is not used
@@ -668,6 +678,9 @@ Flags for AI Agents & Automation:
                                 non-interactively, leaves the Secret for you to create
   --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
                                 (default: gitlab-forge-token)
+  --gitops-ca-file=PATH         PEM CA that signed a self-managed GitLab's certificate (a private
+                                CA). Read into Secret gitlab-forge-ca after the apply; the
+                                broker trusts it for the GitLab host only
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -783,10 +796,12 @@ Flags for AI Agents & Automation:
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
   --slack-bot-token=TOKENS      Comma-separated Slack bot tokens (xoxb-...), one per
                                 workspace the agent serves. The relay keys each one by
-                                the team it authenticates as
+                                the team it authenticates as. Under --mode=next the
+                                A2A gateway serves one workspace: pass one token
   --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
-  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
-                                agent. Empty allows all users
+  --slack-allowed-users=USERS   Comma-separated Slack member IDs (e.g. U0123ABCD; not
+                                emails) allowed to talk to the agent. Empty allows
+                                every workspace member
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
@@ -971,6 +986,7 @@ parse_args() {
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
+      --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
@@ -1804,7 +1820,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET)
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
@@ -1999,16 +2015,17 @@ record_gitops_forge_keys() {
   [ -z "$recorded" ] && recorded="github"
   [ "$current" = "gitlab" ] || [ "$recorded" != "$current" ] || return 0
   if [ "$recorded" = "gitlab" ] && [ "$current" = "gitlab" ]; then
-    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO
+    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO GITOPS_CA_SECRET
     if [ "$(recorded_install_env_value "$file" GITOPS_HOST)" = "${GITOPS_HOST:-}" ] &&
       [ "$(recorded_install_env_value "$file" GITLAB_TOKEN_SECRET)" = "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}" ] &&
-      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ]; then
+      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_CA_SECRET)" = "${GITOPS_CA_SECRET:-}" ]; then
       return 0
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
   # run's validator would refuse the pair.
-  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -2016,6 +2033,7 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   else
     write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
@@ -2611,6 +2629,7 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
@@ -4462,8 +4481,12 @@ validate_gitops_forge_flags() {
       print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
       PARAM_GITOPS_HOST=""
     fi
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
-      print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded GitLab CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitOps forge is GitHub."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] || [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-host, --gitlab-token-file and --gitops-ca-file apply only with --gitops-forge=gitlab."
       return 1
     fi
     return 0
@@ -4529,8 +4552,96 @@ validate_gitops_forge_flags() {
       print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
       return 1
     fi
+    # A regular file can be read now and again after the apply, so an empty
+    # one stops the run here, before anything is built. A one-shot source
+    # (/dev/stdin, /dev/fd/N, a process substitution) is not read here: a read
+    # can use it up, so create_gitlab_token_secret checks it after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITLAB_TOKEN_FILE"; then
+      local early_token=""
+      IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
+      early_token="$(gitlab_token_strip "$early_token")"
+      if [ -z "$early_token" ]; then
+        print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is empty."
+        return 1
+      fi
+      early_token=""
+    fi
+  fi
+  # A private CA is for a self-managed host only: gitlab.com presents a
+  # certificate the public CAs sign, and a private CA must never vouch for it.
+  if ! gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}"; then
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+      # An interview answer for an earlier host: the user went back and chose
+      # gitlab.com, so the file is not theirs to keep. Refusing it would
+      # repeat on every pass, with no prompt left to clear it.
+      print_info "Dropping the CA file from the earlier answer: gitlab.com uses the public CAs."
+      PARAM_GITOPS_CA_FILE=""
+    fi
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-ca-file is for a self-managed GitLab: give its hostname with --gitops-host. gitlab.com uses the public CAs."
+      return 1
+    fi
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded GitLab CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitLab host is gitlab.com, which uses the public CAs."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+  fi
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    case "$PARAM_GITOPS_CA_FILE" in
+      \~/*) PARAM_GITOPS_CA_FILE="${HOME}/${PARAM_GITOPS_CA_FILE#\~/}" ;;
+    esac
+    if [ ! -r "$PARAM_GITOPS_CA_FILE" ] || [ -d "$PARAM_GITOPS_CA_FILE" ]; then
+      print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' is not readable."
+      # An interview answer is cleared, so the next pass can answer "none":
+      # its prompt offers no default.
+      [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+      return 1
+    fi
+    # A regular file is checked now, before the apply records the Secret's
+    # name in install.env, the tfvars and the CR. /dev/stdin, /dev/fd/N and a
+    # process substitution can be read only once, so they are checked when
+    # they are read, after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
+      local pem_problem
+      pem_problem="$(gitlab_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
+      if [ -n "$pem_problem" ]; then
+        print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+        [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+        return 1
+      fi
+    fi
+    PARAM_GITOPS_CA_SECRET="${PARAM_GITOPS_CA_SECRET:-${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}}"
+  fi
+  # A name from install.env or the environment is held to the rule the CRD,
+  # the chart and Terraform hold it to, here, where the message names the key.
+  if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ] &&
+    { [ "${#PARAM_GITOPS_CA_SECRET}" -gt 253 ] ||
+      ! [[ "$PARAM_GITOPS_CA_SECRET" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+    print_error "GITOPS_CA_SECRET must be a valid Kubernetes Secret name (got '${PARAM_GITOPS_CA_SECRET}')."
+    return 1
   fi
   return 0
+}
+
+# True when HOST is a self-managed GitLab: not empty and not gitlab.com in
+# either spelling. The one definition the interview and the validator share.
+gitlab_host_is_self_managed() {
+  case "${1:-}" in
+    ""|gitlab.com|www.gitlab.com) return 1 ;;
+  esac
+  return 0
+}
+
+# Why PEM text cannot be stored as the GitLab CA, or "" when it can: it holds
+# no certificate, or it holds a private key. A CA's private key never goes in
+# the CA Secret: anyone who can read that Secret could sign with it.
+gitlab_ca_pem_problem() {
+  local pem="$1"
+  if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
+    printf '%s' "holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
+  elif [[ "$pem" == *"PRIVATE KEY"* ]]; then
+    printf '%s' "holds a private key. Give the CA certificate alone; nothing was stored."
+  fi
 }
 
 # Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
@@ -4553,12 +4664,95 @@ apply_gitlab_token_secret() {
   fi
 }
 
+# True when PATH is a file the installer can read now and again later: a
+# regular file that is not a descriptor path (/dev/fd/N, /dev/stdin,
+# /dev/stdout, /dev/stderr, /proc/...), also after symlinks are resolved.
+# /dev/stdin, /dev/fd/N and a process substitution can be a redirected regular
+# file, and `[ -f ]` is then true. On macOS, opening /dev/fd/N shares the
+# descriptor's offset, so an early read moves it to the end and the read after
+# the apply finds nothing. Such a source is read only after the apply.
+gitops_source_is_rereadable() {
+  local path="$1" target="" dir="" hops=0
+  [ -f "$path" ] || return 1
+  # Every hop of a symlink chain is checked, not only its end: on Linux,
+  # /dev/stdin resolves through /proc/self/fd/0 to the redirected file itself.
+  # The directory part is made physical at each hop, so `//dev/fd/9`,
+  # `/./dev/fd/9`, a relative path and a symlinked directory are judged by
+  # where they lead. Only the paths that can share a descriptor's offset are
+  # refused; another file under /dev keeps the early check.
+  while :; do
+    dir="$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)" || return 1
+    path="${dir%/}/$(basename -- "$path")"
+    case "$path" in
+      /dev/fd/* | /dev/stdin | /dev/stdout | /dev/stderr | /proc/* | \
+        //dev/fd/* | //dev/stdin | //dev/stdout | //dev/stderr | //proc/*)
+        return 1
+        ;;
+    esac
+    [ -L "$path" ] || return 0
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 1
+    target="$(readlink -- "$path" 2>/dev/null)" || return 1
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="${dir%/}/$target" ;;
+    esac
+  done
+}
+
 # A token as GitLab issues it is one line; a file or a paste often carries a
 # trailing newline, a CR, or spaces around it. All whitespace goes.
 gitlab_token_strip() {
   local t="$1"
   t="${t//[[:space:]]/}"
   printf '%s' "$t"
+}
+
+# Creates (or replaces) the Secret the GitLab forge's caBundleRef names, from
+# --gitops-ca-file, under the key ca.crt. A CA certificate is public, but it
+# goes in a Secret for its integrity: changing it then needs the same rights as
+# changing the token Secret beside it. Server-side apply, as for the token, so
+# no last-applied copy is kept. The file is read once, here: a process
+# substitution cannot be read twice. It must hold at least one PEM certificate
+# and no private key. Without a file, an existing Secret is kept, and a missing
+# one is named, because until it exists every call to the forge fails on its
+# certificate.
+create_gitlab_ca_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITOPS_CA_SECRET:-}"
+  [ -n "$name" ] || return 0
+  local how="  kubectl create secret generic ${name} -n ${namespace} --context ${context} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+  if [ -z "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    if ! kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+      print_warning "Secret '${name}' with the GitLab CA does not exist, so the agent cannot verify the GitLab host's certificate yet."
+      print_info "Create it; the agent picks it up with no restart:"
+      print_info "$how"
+    fi
+    return 0
+  fi
+  local pem="" pem_problem=""
+  IFS= read -r -d '' pem <"$PARAM_GITOPS_CA_FILE" || true
+  pem_problem="$(gitlab_ca_pem_problem "$pem")"
+  if [ -n "$pem_problem" ]; then
+    # Only a one-shot source (/dev/stdin, a process substitution) reaches
+    # here with bad content: a regular file was checked before the apply. The
+    # apply has named the Secret already, so say how to create it and go on to
+    # the health checks, as a missing token does.
+    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+    print_warning "The agent cannot verify the GitLab host's certificate until Secret '${name}' exists. Create it; the agent picks it up with no restart:"
+    print_info "$how"
+    return 0
+  fi
+  printf '%s' "$pem" | kubectl create secret generic "$name" -n "$namespace" --context "$context" \
+    --from-file=ca.crt=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+      -n "$namespace" --context "$context" -f - >/dev/null 2>&1
+  local rcs=("${PIPESTATUS[@]}")
+  if [ "${rcs[1]}" -ne 0 ] || [ "${rcs[2]}" -ne 0 ]; then
+    print_error "Could not write the GitLab CA Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[1]}, apply ${rcs[2]})."
+    return 1
+  fi
+  print_success "GitLab CA stored in Secret '${name}' (namespace ${namespace})."
 }
 
 # Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
@@ -5183,6 +5377,25 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
+        # from install.env, and if Slack moves to the A2A gateway under next,
+        # the settings it cannot use are refused (and again after the
+        # generator, for a bot token it recovers from the live Secret).
+        refuse_next_slack_gateway_settings_from_env || return 1
+        # Kept until the check after the generator has passed, so that a
+        # refusal there puts install.env back as it was.
+        # The copy holds install.env's credentials, so it is 0600 under a
+        # recognisable name, and an EXIT trap removes it if the arm dies
+        # before either path below does (a generator failure exits through
+        # on_error, and Ctrl-C exits too).
+        local install_env_before=""
+        if [ -f "$INSTALL_ENV_FILE" ]; then
+          install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
+          # Armed before the write, so a failed write leaves no copy either.
+          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
+          trap "rm -f $(printf '%q' "$install_env_before")" EXIT
+          cat "$INSTALL_ENV_FILE" >"$install_env_before"
+        fi
 
         # Into install.env, one key at a time, leaving the operator's comments
         # and ordering alone. This panel is the one place allowed to write
@@ -5239,6 +5452,27 @@ run_menu_system() {
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        # Again for a bot token the generator recovered from the live Secret.
+        # The keys are saved by now, so a refusal restores install.env and
+        # removes the tfvars that render the refused settings.
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          if [ -n "$install_env_before" ]; then
+            # A 0600 replacement (the .tmp is written under umask 077),
+            # moved into place complete, as save_env_var writes it (on_error
+            # removes a half-written .tmp), before the copy is let go.
+            (umask 077; cat "$install_env_before" >"${INSTALL_ENV_FILE}.tmp")
+            mv -f "${INSTALL_ENV_FILE}.tmp" "$INSTALL_ENV_FILE"
+            trap - EXIT
+            rm -f "$install_env_before"
+            print_info "${INSTALL_ENV_FILE} is put back as it was before this Save & Apply."
+          fi
+          rm -f "$(tf_compose_dir "$repo_dir")/terraform.tfvars"
+          return 1
+        fi
+        if [ -n "$install_env_before" ]; then
+          rm -f "$install_env_before"
+          trap - EXIT
+        fi
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -5411,8 +5645,9 @@ main() {
   fi
 
   # The GitOps forge's inputs need nothing but themselves, so they are judged
-  # before any work: a GitLab install handed a GitHub App, a bad host or an
-  # unreadable token source stops here, not after the cluster is built.
+  # before any work: a GitLab install handed a GitHub App, a bad host, an
+  # unreadable token source or an empty token file stops here, not after the
+  # cluster is built.
   validate_gitops_forge_flags || exit 1
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
@@ -5775,13 +6010,71 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
+    # Under next with Chat off the A2A gateway takes Slack (the mode was
+    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
+    # it takes one bot token, member IDs and a channel id. Those prompts say
+    # so and ask again on an answer the gateway cannot use, rather than let
+    # the refusal after this step throw the interview away. A run with nobody
+    # to ask keeps its values, and that refusal is its check.
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" true "$google_chat_enabled"; then
+      _prompt_slack_settings_for_gateway
+      return 0
+    fi
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
-    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+    prompt_read "Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
+    prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
+      slack_home_channel_name "$slack_home_channel_name"
+  }
+
+  # _prompt_slack_settings when the A2A gateway takes Slack. Reads the hints
+  # _prompt_slack_settings set (bash scopes them dynamically).
+  _prompt_slack_settings_for_gateway() {
+    local can_ask=true bad=""
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+        slack_bot_token "$slack_bot_token" true "$bot_hint"
+      bad="$(slack_bot_token_list_count "$slack_bot_token")"
+      if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
+      { [ -n "$bad" ] && $can_ask; } || break
+      if [ "$bad" = stray ]; then
+        print_error "SLACK_BOT_TOKEN holds a comma or space. Under spec.mode next the A2A gateway takes one bot token as it is; enter it without one."
+      else
+        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      fi
+      # Not the re-ask's default: prompt_read prints a default it has no
+      # label for, and this one is the list just typed under read -s.
+      slack_bot_token="" bot_hint=""
+    done
+    prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
+    while :; do
+      prompt_read "Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)" \
+        slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
+      bad="$(slack_allowlist_emails "$slack_allowed_users")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "These look like emails: ${bad}. Under spec.mode next the allowlist matches Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
+      # The refused list stays the default (an empty one would admit
+      # everyone), so the hint shows it rather than a label for another.
+      slack_allowed_hint=""
+    done
+    while :; do
+      prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
+        slack_home_channel "$slack_home_channel"
+      bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+      # Not the re-ask's default: the value is optional, and prompt_read
+      # turns an empty answer into the default, so a bad one could never be
+      # cleared.
+      slack_home_channel=""
+    done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
   }
@@ -5866,7 +6159,7 @@ main() {
     # toggle.
     echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
-    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<member IDs, e.g. U0123ABCD>, re-run with --slack-bot-token and --slack-app-token"
     echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
@@ -5882,6 +6175,7 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
+      print_info "With --mode=next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -5889,6 +6183,16 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
+  # The Slack settings are settled here, whether from a flag, install.env or
+  # an answer. If Slack moves to the A2A gateway under next, the settings it
+  # cannot use (an email in the allowlist, a home channel that is not a
+  # channel id, a list of bot tokens) are refused now, before the generator,
+  # install.env or any apply. A token the generator recovers from the live
+  # Secret is checked after it. A --dry-run applies nothing, so it is warned
+  # there instead, once, with the recovered token included.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+  fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
@@ -6113,9 +6417,14 @@ main() {
       [[ "$github_repo" == */* ]] || github_repo=""
       while true; do
         prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
-        [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
+        gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
         prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
         prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        # Only a self-managed instance can be behind a private CA.
+        # No default: empty must stay a way to answer "none" on every pass.
+        if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+        fi
         PARAM_GITOPS_REPO="$github_repo"
         if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
           github_repo="$PARAM_GITOPS_REPO"
@@ -6251,7 +6560,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped. Scheduled fleet audits need one and fail without it."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits still run and report to chat, but write no ledger issue or pull request without one."
       fi
     fi
   else
@@ -6657,6 +6966,7 @@ main() {
   export GITOPS_FORGE="$PARAM_GITOPS_FORGE"
   export GITOPS_HOST="$PARAM_GITOPS_HOST"
   export GITLAB_TOKEN_SECRET="$PARAM_GITLAB_TOKEN_SECRET"
+  export GITOPS_CA_SECRET="$PARAM_GITOPS_CA_SECRET"
   # One release of overlap: the agent runtime and the chart still speak
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
@@ -6725,6 +7035,18 @@ main() {
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
   require_slack_tokens_after_recovery
+  # Again on the exported keys, for a bot token the generator recovered from
+  # the live Secret (refuse_next_slack_gateway_settings). Still before
+  # install.env and the apply. The tfvars just written render the refused
+  # settings, so a refusal removes them: --generate-only hands that file to
+  # lifecycle.sh apply. A --dry-run warns instead.
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"
+  elif ! refuse_next_slack_gateway_settings_from_env flags; then
+    rm -f "$tfvars_file"
+    print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
+    exit 1
+  fi
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
@@ -7097,6 +7419,9 @@ main() {
     exit 1
   fi
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+    # The CA first: an empty token source stops the run here, and the CA
+    # Secret must exist by then.
+    create_gitlab_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
   fi
   local slow_rollouts=()

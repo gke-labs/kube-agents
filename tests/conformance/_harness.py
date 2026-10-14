@@ -57,14 +57,19 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # invisible precondition that turns into a skipped test later.
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
+import mcp_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+SKILL_OVERLAY_MODULE_NAME = "kube_agents_skill_overlay"
 
 # The same, for the Slack click handler imported by path.
 SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
+
+# The same, for the image build's config merge.
+MERGE_CONFIGS_MODULE_NAME = "kube_agents_merge_configs"
 
 # The published site's content tree. A directory rather than a file, so it is
 # not a Source: D2's assertion is about every page, and a registry would need
@@ -120,6 +125,12 @@ SOURCES: dict[str, Source] = {
             "SLACK_METHOD_SHAPE",
         ),
     ),
+    # B1 imports this module: the per-tool allowlist the broker applies to
+    # every remote MCP call.
+    "mcp_policy": Source(
+        "agents/platform/scripts/mcp_policy.py",
+        ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
         ("/sessions/{session_id}/inject", "trigger_agent_troubleshooter", "_gateway_api_token"),
@@ -158,7 +169,7 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews"),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
@@ -586,10 +597,54 @@ SOURCES: dict[str, Source] = {
             "func run(",
         ),
     ),
+    # --- the agent's MCP servers ------------------------------------------
+    # B1 reads the `gke` server's tool filter from the config each profile runs
+    # with. The Platform Agent's is built by merging the shared defaults with
+    # its overlay, and the Cluster Agent's template is copied as it is; the
+    # Dockerfile anchors pin that model of the build, so the test cannot keep
+    # asserting against a merge the image no longer does.
+    # The same three files are where B1 reads that every remote MCP server
+    # goes through the credential proxy's relay, so the anchor is the relay's
+    # variable rather than a Google URL.
+    "shared_defaults_config": Source(
+        "deploy/shared/defaults/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "platform_config": Source(
+        "agents/platform/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "cluster_config": Source(
+        "agents/cluster/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
+    "dockerfile_profile_configs": Source(
+        "deploy/docker/Dockerfile",
+        (
+            "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
+            "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
+            "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+        ),
+    ),
     # --- supply chain -----------------------------------------------------
+    # The tool that keeps the mirrored gke-* skills, and the CI step that runs
+    # its offline check. C4 reads the pin and the checksum from the first and
+    # that they are enforced from the second.
     "skill_sync": Source(
-        "scripts/sync-upstream-skills.py",
-        ("UPSTREAM_REPO", "--depth"),
+        "scripts/skill_overlay.py",
+        ("def cmd_check(", "def verify_copy(", "def tree_sha256("),
+    ),
+    "validate_workflow": Source(
+        ".github/workflows/validate.yml",
+        ("Mirrored skills match their upstream copy and overlay",),
+    ),
+    "makefile": Source("Makefile", ("skills-check:", "SKILL_OVERLAY :=")),
+    # One member of the mirrored-skill set C4 walks, so the self-check names
+    # the set when the skills or their overlays move.
+    "skill_lock_gke_basics": Source(
+        "agents/platform/skill-overlays/gke-basics/upstream.lock",
+        ("commit:", "sha256:"),
     ),
     "tags_env": Source("tags.env", ("HERMES_AGENT_TAG",)),
     # `repository:` is C4's read. The platformAgent block is D2's: it is
@@ -776,6 +831,26 @@ def gateway_redactor_module():
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
     sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def skill_overlay_module():
+    """The mirrored-skill tool, imported by path for its pure helpers (tree_sha256)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SKILL_OVERLAY_MODULE_NAME, path_of("skill_sync"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def merge_configs_module():
+    """The merge the image build runs on profile configs, imported by path."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(MERGE_CONFIGS_MODULE_NAME, path_of("merge_configs"))
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 

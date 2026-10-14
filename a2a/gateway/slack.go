@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
@@ -17,9 +19,17 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-// slackDMPrefix marks a DM conversation key. The whole DM is the session,
-// like Discord's — "a DM, or a thread in a group space" (gateway design).
+// slackDMPrefix marks a DM conversation key. A Slack DM is threaded like a
+// channel, and each thread in it is its own session: a top-level DM starts
+// one keyed by its own ts, slack:dm/{channel}/{ts}, and a reply inside that
+// thread is the same conversation. The thread-less form, slack:dm/{channel},
+// is what this adapter keyed every DM as before it threaded them; it still
+// parses, and posts top-level, so a record minted under it relays its
+// terminal where its ask was.
 const slackDMPrefix = "slack:dm/"
+
+// slackKeyPrefix begins every Slack conversation key.
+const slackKeyPrefix = "slack:"
 
 // slackSeenCap bounds the at-least-once dedupe ring: Socket Mode redelivers
 // unacked envelopes, so delivered (channel, ts) pairs are remembered and
@@ -113,6 +123,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
+	// the prefix letter and at least two characters after it.
+	slackMinChannelIDLen = 3
 )
 
 // Slack token prefixes, checked at construction so a swapped pair fails at
@@ -214,19 +227,36 @@ var slackLinkRE = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://(?:[^()\s|]|\([^
 // not a session; a thread in it is — and Slack threads are implicit
 // (replying with thread_ts creates one), so a channel mention binds the
 // session to the mention message's own ts as thread root, with no
-// thread-creation failure mode to handle.
+// thread-creation failure mode to handle. A DM is keyed the same way under
+// its own prefix, slack:dm/{channel}/{thread_ts}, so a top-level DM roots a
+// thread on its own ts exactly as a channel mention does; an empty threadTS
+// gives the thread-less DM key, which posts top-level (OpenDirect, and
+// records from before DMs threaded).
 func slackConversationID(channelType, channel, threadTS string) string {
-	if channelType == "im" {
-		return slackDMPrefix + channel
+	if channelType == slackChannelTypeIM {
+		if threadTS == "" {
+			return slackDMPrefix + channel
+		}
+		return slackDMPrefix + channel + "/" + threadTS
 	}
 	return "slack:" + channel + "/" + threadTS
 }
 
+// slackIsDM reports a DM conversation key, threaded or not.
+func slackIsDM(conversation string) bool {
+	return strings.HasPrefix(conversation, slackDMPrefix)
+}
+
 // slackChannelThread inverts slackConversationID for the adapter's own use;
-// threadTS is "" for DMs.
+// threadTS is "" for the thread-less DM key, the one form that posts
+// top-level.
 func slackChannelThread(conversation string) (channel, threadTS string, ok bool) {
 	if dm, found := strings.CutPrefix(conversation, slackDMPrefix); found {
-		return dm, "", dm != ""
+		channel, threadTS, threaded := strings.Cut(dm, "/")
+		if channel == "" || (threaded && (threadTS == "" || strings.Contains(threadTS, "/"))) {
+			return "", "", false
+		}
+		return channel, threadTS, true
 	}
 	rest, found := strings.CutPrefix(conversation, "slack:")
 	if !found {
@@ -239,19 +269,31 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 	return channel, threadTS, true
 }
 
-// toMrkdwn escapes Slack's control characters, then translates the two
-// markdown forms the relay emits (bold pairs, links) into mrkdwn. Escaping
-// first, over the whole text, so the only < and > on the wire are the ones
-// our own deterministic link translation writes, and so a prompt-injected
-// <!channel> inside a code span is as inert as one in prose; the two
-// translations then leave code spans as written, since the task's result is
-// executor output of arbitrary shape and a `**kwargs` or a `**/*.yaml` in
-// it is the answer, not bold. The rules are the ones markdown.go holds for
-// both chat surfaces. Narrow on purpose: full markdown fidelity is
-// presentation polish, and the legacy Hermes path's converter is not this
-// code path's to reuse.
+// toMrkdwn rewrites the line-level markdown Slack cannot show (headings,
+// rules, list markers, tables: rewriteSlackBlocks), escapes Slack's control
+// characters, then translates the two inline markdown forms the relay emits
+// (bold pairs, links) into mrkdwn. Escaping first, over the whole text, so
+// the only < and > on the wire are the ones our own deterministic link
+// translation writes or keeps (below), and so a prompt-injected <!channel>
+// inside a code span is as inert as one in prose; the two translations then
+// leave code spans as written, since the task's result is executor output of
+// arbitrary shape and a `**kwargs` or a `**/*.yaml` in it is the answer, not
+// bold. The rules are the ones markdown.go holds for both chat surfaces.
+// Narrow on purpose: full markdown fidelity is presentation polish, and the
+// legacy Hermes path's converter is not this code path's to reuse.
+//
+// One <url|text> the executor wrote is not escaped: a closed one, in prose,
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
+// text does not name another host (keepChatLinks), which is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground. Its URL and text are escaped as the rest of the text is,
+// and only its own angle brackets stay live. Its URL must start with
+// http(s)://, so a <!channel>, <@U…> or <#C…> is never one, and its text
+// admits no angle bracket, so none rides out inside it.
 func toMrkdwn(text string) string {
-	return rewriteMarkdown(slackEscaper.Replace(text), slackLinkRE)
+	return rewriteMarkdown(keepChatLinks(rewriteSlackBlocks(text), slackEscaper.Replace, func(dest, label string) string {
+		return chatLinkOpen + slackEscaper.Replace(dest) + chatLinkSep + slackEscaper.Replace(label) + chatLinkClose
+	}), slackLinkRE)
 }
 
 var (
@@ -280,12 +322,13 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // it is the only word: a channel ask's own thread becomes a session thread
 // here when the gateway starts the task, the same as a thread someone else
 // rooted, and a mention on its own -- a channel mention from an unverified
-// sender, a bare "<@bot>" from anyone -- records nothing. A DM is the whole
-// session and needs no record. Called on the conversation's inbox worker
-// under the session lock (TaskObserver): record and return.
+// sender, a bare "<@bot>" from anyone -- records nothing. A DM needs no
+// record, threaded or not: a DM carries every message, so its threads never
+// consult the cache. Called on the conversation's inbox worker under the
+// session lock (TaskObserver): record and return.
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
 	channel, threadTS, ok := slackChannelThread(conversation)
-	if !ok || threadTS == "" {
+	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
 	}
 	s.markSessionThread(channel+"/"+threadTS, true)
@@ -316,7 +359,7 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // and return.
 func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
 	channel, threadTS, ok := slackChannelThread(conversation)
-	if !ok || threadTS == "" {
+	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
 	}
 	s.expireMark(channel + "/" + threadTS)
@@ -452,11 +495,16 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// slash_commands and interactive carry a real, non-empty one
 				// that this continue throws away.
 				//
-				// Which is fine only because the app subscribes to neither,
-				// so neither ever arrives. Turning on slash commands or
-				// interactivity means acking them here first: Slack wants the
-				// envelope acked inside three seconds, and an unacked one
-				// redelivers and shows the user a timeout.
+				// The same app serves the legacy consumer under today, which
+				// does answer interactions, so an install may well have
+				// interactivity on and these envelopes do arrive: clicks on
+				// messages posted under today, and on the buttons a chat
+				// message's layout carries (renderSlackChat), which nothing
+				// answers yet. The notify route's raw blocks still carry none
+				// (the agent sends the audit card with its buttons removed).
+				// Answering interactions means acking them here first: Slack
+				// wants the envelope acked inside three seconds, and an
+				// unacked one redelivers and shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -563,19 +611,114 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	return s.sm.RunContext(ctx)
 }
 
-// Post writes into the conversation — threaded for sessions rooted in a
-// channel, plain for DMs — and returns the message ts the rolling line edits.
+// Post writes into the conversation — into its thread for a channel session
+// and a DM session alike, top-level for the thread-less DM key — and returns
+// the message ts the rolling line edits.
 func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// No unfurls: an answer cites console and documentation links, and each
+	// unfurled into a preview card (a console link previews as the Google
+	// sign-in page), three or four under every answer.
+	opts := []slack.MsgOption{
+		slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(),
+		slack.MsgOptionDisableMediaUnfurl(),
+	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
 	return ts, err
+}
+
+// PostNotify writes text into channel, top-level when thread is empty or as a
+// reply on thread (a thread root's ts), and returns the posted message's ts
+// and the thread it landed in: the given one, or the new message's own ts,
+// which is the root a later notify replies on. It is Post for a caller with
+// no conversation key (the chat.notify route, notify.go); it refuses a channel
+// that is not a C/G channel id, and the Notifier is what keeps it to home.
+func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	// No link or media previews: an alert's console links would each unfurl
+	// into a card (Post makes the same choice, #2820).
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// PostNotifyBlocks is PostNotify for a Block Kit message: blocks as given,
+// text as the notification and fallback. The blocks are decoded into
+// slack-go's types to be sent; one it does not know travels as Slack wrote
+// it, and Slack's own refusal (invalid_blocks) comes back as the error.
+func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	var blocks slack.Blocks
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", "", fmt.Errorf("slack: blocks: %w", err)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false), slack.MsgOptionBlocks(blocks.BlockSet...),
+		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl()}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// slackIsHomeChannelID reports a public ("C...") or private ("G...")
+// channel id: a prefix letter and upper-case letters or digits after it. A
+// DM ("D...") is not a home channel.
+func slackIsHomeChannelID(id string) bool {
+	if len(id) < slackMinChannelIDLen || (id[0] != 'C' && id[0] != 'G') {
+		return false
+	}
+	for _, r := range id[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// slackIsTS reports a Slack message ts: digits, one dot, digits.
+func slackIsTS(ts string) bool {
+	secs, frac, ok := strings.Cut(ts, ".")
+	return ok && allDigits(secs) && allDigits(frac)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Edit replaces a previously posted message — the rolling progress line.
@@ -584,8 +727,102 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 	if !ok {
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	_, _, _, err := s.api.UpdateMessage(channel, messageID, slack.MsgOptionText(toMrkdwn(text), false))
+	// The whole message, blocks and side bar cleared: the rolling line may
+	// have been laid out by EditMessage before, in this process or one a
+	// restart replaced, and chat.update keeps whatever it is not sent.
+	opts, _ := slackMessageOptions(OutMessage{Text: text})
+	_, _, _, err := s.api.UpdateMessage(channel, messageID, opts...)
 	return err
+}
+
+// PostMessage posts a message value: a chat message laid out as Block Kit
+// (renderSlackChat) with the text, as mrkdwn, as its notification and
+// fallback, into the conversation's thread as Post does, link and media
+// previews off (its links are buttons). Without a chat message it is Post.
+// A chat message the renderer will not send, or that Slack refuses, is an
+// error and nothing is posted; the gateway posts the text instead.
+func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil {
+		return s.Post(conversation, m.Text)
+	}
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	return ts, slackLayoutError(err)
+}
+
+// slackLayoutRefusals are the chat.postMessage and chat.update errors that
+// refuse what a message carries rather than the call itself.
+var slackLayoutRefusals = map[string]bool{
+	"invalid_blocks": true, "invalid_blocks_format": true, "invalid_attachments": true,
+	"msg_too_long": true, "too_many_attachments": true, "no_text": true,
+}
+
+// slackGoneErrors are the chat.update errors that say the message cannot be
+// edited at all.
+var slackGoneErrors = map[string]bool{
+	"message_not_found": true, "cant_update_message": true, "edit_window_closed": true, "channel_not_found": true,
+}
+
+// slackLayoutError wraps Slack's refusal of a layout in ErrLayoutRefused, and
+// its answer that the message cannot be edited in ErrMessageGone, and leaves
+// any other error (a rate limit, an outage) as it is.
+func slackLayoutError(err error) error {
+	var resp slack.SlackErrorResponse
+	switch {
+	case !errors.As(err, &resp):
+		return err
+	case slackLayoutRefusals[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	case slackGoneErrors[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrMessageGone, err)
+	}
+	return err
+}
+
+// EditMessage replaces a posted message with a message value. Without a chat
+// message the text replaces the layout too: the blocks and the side bar are
+// sent empty, since chat.update keeps whatever it is not sent.
+func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	channel, _, ok := slackChannelThread(conversation)
+	if !ok {
+		return fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return err
+	}
+	_, _, _, err = s.api.UpdateMessage(channel, messageID, opts...)
+	return slackLayoutError(err)
+}
+
+// slackMessageOptions is a message value as chat.postMessage and
+// chat.update options: the text as mrkdwn, and the chat message's layout, or
+// no blocks and no side bar when there is none.
+func slackMessageOptions(m OutMessage) ([]slack.MsgOption, error) {
+	text := toMrkdwn(m.Text)
+	if m.Chat == nil {
+		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(),
+			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
+	}
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
+	}
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	return slackChatOptions(layout, text)
 }
 
 // Roster is the channel's membership. Slack has no per-thread membership,
@@ -608,7 +845,10 @@ func (s *SlackAdapter) Roster(conversation string) ([]string, bool, error) {
 
 // OpenDirect returns the DM conversation for a user — the DM-switch
 // primitive. Shipped, unused: everything posts to the room it came from
-// until the classifier exists.
+// until the classifier exists. The key is the thread-less DM form, so a
+// post to it is a new top-level message, which is what a message the user
+// did not ask for should be; a reply the user types under it roots its own
+// conversation.
 func (s *SlackAdapter) OpenDirect(userID string) (string, error) {
 	ch, _, _, err := s.api.OpenConversation(&slack.OpenConversationParameters{
 		Users: []string{userID}, ReturnIM: true,
@@ -909,7 +1149,9 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 }
 
 // inbound normalizes one message event, or reports it not-a-turn. The
-// affordance rule, deterministic: DMs carry every message; a channel
+// affordance rule, deterministic: DMs carry every message, a top-level one
+// rooting its own thread and a reply in a thread being that thread's
+// conversation; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
 // it mentions the bot or the thread is already a session thread — one the
@@ -940,18 +1182,29 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 	if mentioned {
 		text = stripSlackMention(text, s.botUserID)
 	}
-	if m.ChannelType == "im" {
+	if m.ChannelType == slackChannelTypeIM {
 		if text == "" {
 			// A bare mention has nothing to run, in a DM as in a channel.
 			return InboundMessage{}, false
 		}
+		// Each DM question is its own conversation, answered in its own
+		// thread, and a reply inside that thread stays in it: the thread
+		// root's ts is the key either way, the message's own ts when it is
+		// top-level (Slack threads are implicit, as for a channel ask).
+		// No session-thread rule here, unlike a channel thread: a DM
+		// carries every message, in a thread or not.
+		threadTS := m.ThreadTimeStamp
+		if threadTS == "" {
+			threadTS = m.TimeStamp
+		}
 		return InboundMessage{
-			Conversation: slackConversationID(m.ChannelType, m.Channel, ""),
+			Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 			Kind:         "dm",
 			AuthorID:     m.User,
 			MessageID:    m.TimeStamp,
+			TopLevel:     m.ThreadTimeStamp == "",
 			// Decoding also changes what the affordance matchers see. That is
-			// intended, and it is not obvious: normalize (text.go) strips
+			// intended, and it is not obvious: chattext.Normalize strips
 			// every non-alphanumeric, so a typed "<stop>" — on the wire as
 			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
 			// nothing, and decoded first it normalizes to "stop" and is a

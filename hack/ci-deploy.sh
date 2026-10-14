@@ -688,7 +688,8 @@ export SLACK_ENABLED="false"
 # out of the gitops-state ConfigMap — the fleet-audit streams do it in `audit_report.py
 # start`, before anything else happens. The operator seeds that entry from
 # spec.integration.github.gitRepo on the PlatformAgent CR; with the field unset
-# no repository is registered and those scenarios stop at step 0 with nothing to clone.
+# no repository is registered, so a fleet audit runs with no forge and writes no ledger
+# or pull request for those scenarios to grade.
 #
 # CI supplies the value and deliberately does NOT lean on the chart default.
 # On the presubmit path everything this job deploys — chart, operator, agent —
@@ -756,6 +757,11 @@ gitops_repo_for_project() {
     kube-agents-evals-33) echo "gke-agentic/kube-agents-evals-33-infra" ;;
     kube-agents-evals-34) echo "gke-agentic/kube-agents-evals-34-infra" ;;
     kube-agents-evals-35) echo "gke-agentic/kube-agents-evals-35-infra" ;;
+    kube-agents-evals-36) echo "gke-agentic/kube-agents-evals-36-infra" ;;
+    kube-agents-evals-37) echo "gke-agentic/kube-agents-evals-37-infra" ;;
+    kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
+    kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
+    kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -802,6 +808,11 @@ gitlab_project_for_project() {
     kube-agents-evals-33) echo "gke-agentic/kube-agents-evals-33-infra" ;;
     kube-agents-evals-34) echo "gke-agentic/kube-agents-evals-34-infra" ;;
     kube-agents-evals-35) echo "gke-agentic/kube-agents-evals-35-infra" ;;
+    kube-agents-evals-36) echo "gke-agentic/kube-agents-evals-36-infra" ;;
+    kube-agents-evals-37) echo "gke-agentic/kube-agents-evals-37-infra" ;;
+    kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
+    kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
+    kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -1562,10 +1573,11 @@ fi
 # reds as an agent triage failure with nothing in this log saying the install
 # was wrong -- which is what this gate is for.
 #
-# Deliberately not a check that records are arriving. A project onboarded
-# before the ingress existed reaches the marker and then fails its pulls, and
-# failing the deploy for that would red the whole matrix over a gap only a
-# drift case cares about (docs/ci-pool-projects.md).
+# Deliberately not a check that records are arriving. A project without the
+# ingress reaches the marker and then fails its pulls, and failing the deploy
+# for that would red the whole matrix over a gap only a drift case cares
+# about. Section 3 of docs/ci-pool-projects.md says which projects those are;
+# it is not every older one, and the set is not re-checked between leases.
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying drift-detector startup ==="
 drift_detector_started=false
 # `grep -F ... >/dev/null` rather than `grep -qF`, and the difference is the

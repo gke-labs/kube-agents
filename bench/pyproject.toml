@@ -52,6 +52,8 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 # to override an upstream type, only to add one. Hence a distinct name rather
 # than a drop-in replacement.
 [project.entry-points."devops_bench.verifiers"]
+answer_first = "kube_agents_bench.verifiers:AnswerFirstVerifier"
+audit_report_stored = "kube_agents_bench.verifiers:AuditReportStoredVerifier"
 bootstrap_delivered = "kube_agents_bench.verifiers:BootstrapDeliveredVerifier"
 bootstrap_fanout = "kube_agents_bench.verifiers:BootstrapFanoutVerifier"
 bootstrap_findings = "kube_agents_bench.verifiers:BootstrapFindingsVerifier"
@@ -63,6 +65,7 @@ fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVeri
 github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
 oobe_audits_started = "kube_agents_bench.oobe:OobeAuditsStartedVerifier"
+relay_posted_as_written = "kube_agents_bench.relay:RelayPostedAsWrittenVerifier"
 pull_request_opened = "kube_agents_bench.verifiers:PullRequestOpenedVerifier"
 replay_card = "kube_agents_bench.verifiers:ReplayCardVerifier"
 reply_is_silent = "kube_agents_bench.verifiers:ReplyIsSilentVerifier"

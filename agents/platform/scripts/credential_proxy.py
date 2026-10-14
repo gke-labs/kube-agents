@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import mcp_policy
 import providers
 import repo_ref
 import scoped_sa_pool
@@ -177,8 +178,10 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # did before the budget existed: a listing phase that cannot run two at once
 # is slower than the OOM exposure the budget prevents, and the case is real --
 # GKE Autopilot without bursting sets a container's limits equal to its
-# requests, so the proxy's limit there is its 512Mi request. The operator's
-# sizing test holds the limit to the same floor
+# requests, so the proxy's limit there is its memory request, which a CR
+# override can set under this floor (the operator's own default is 1Gi,
+# above it, so that the budget runs there). The operator's sizing test holds
+# the limit and the default request to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
@@ -302,6 +305,33 @@ API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token",
 # two. Every header the caller sent is dropped.
 API_RELAY_ACCEPT = "application/json"
 API_RELAY_UPSTREAM_PORT = 443
+# The method the MCP relay forwards with. The Cloud API relay never sends it.
+API_RELAY_POST = "POST"
+
+# The remote MCP relay, `POST /v1/mcp/<server>`. `mcp_policy` decides what is
+# relayed; it shares the Cloud API relay's credential, connect timeout,
+# deadline and response cap, which bound how.
+#
+# The body the upstream receives is the broker's own re-serialisation of the
+# message it evaluated, never the caller's bytes, so no parser difference
+# between this process and Google's front end can make the two read different
+# requests.
+MCP_RELAY_CONTENT_TYPE = "application/json"
+# The headers forwarded beyond `Authorization`, `Accept`, `Content-Type` and
+# `Content-Length`, each only when the caller's value has this shape. Every
+# other header the caller sent is dropped, `Mcp-Session-Id` included: the
+# servers in the table are stateless and never issue one.
+#
+# `User-Agent` is what the API teams key their dashboards on; the agent's
+# configs set it (deploy/shared/defaults/config.yaml carries the reason).
+# Printable ASCII and bounded, so the value cannot fold or inject a header.
+MCP_RELAY_USER_AGENT = "User-Agent"
+MCP_RELAY_USER_AGENT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+MCP_RELAY_PROTOCOL_VERSION = "MCP-Protocol-Version"
+MCP_RELAY_PROTOCOL_VERSION_SHAPE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+# The quota project, from the broker's own credential. The agent's mcp-remote
+# used to send it from its own ADC lookup; it no longer has one.
+MCP_RELAY_USER_PROJECT = "X-Goog-User-Project"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -427,6 +457,18 @@ ADMISSION_BOUNDS = frozenset(
 # and is counted by ADMISSION_REFUSALS_METRIC instead. The top bucket holds
 # the waits that were answered just under it.
 ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
+# The version-control route's counter, by verb and outcome: the series the
+# operator reads `status.usage.remediationsProposedTotal` from, as
+# `verb="proposal-create",status="success"`. The verb label is the route
+# table's vocabulary (vcs_broker.VCS_VERBS) or LABEL_OTHER; the status label
+# reuses the exec route's outcome words.
+VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
+VCS_VERB_LABEL = "verb"
+# Proposals this install opened that the forge reports merged, counted once
+# each per broker process as the broker's reads show them
+# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# `status.usage.remediationsMergedTotal` from. No labels.
+VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -451,6 +493,12 @@ TOOL_STATUS_BUSY = "busy"
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
 LABEL_OTHER = "other"
+# The outcomes the version-control counter distinguishes, in the exec route's
+# words: success (the forge answered), error (the forge or git failed, or the
+# request could not be read), blocked (refused at the route: an unknown verb,
+# a repository this install does not manage), busy (no command slot for the
+# wait) and abandoned (the caller hung up before the answer).
+VCS_STATUSES = frozenset({TOOL_STATUS_SUCCESS, TOOL_STATUS_ERROR, TOOL_STATUS_BLOCKED, TOOL_STATUS_BUSY, TOOL_STATUS_ABANDONED})
 # `subcommand` when the argv names the tool and nothing after it.
 SUBCOMMAND_NONE = "none"
 # The `subcommand` vocabularies the policy tables do not already supply. The
@@ -472,7 +520,9 @@ GCLOUD_EXTRA_SURFACES = frozenset({"components", "iam", "init", "resource-manage
 # content_workspace.WORKSPACE_GIT_SUBCOMMANDS, and the git vocabulary is the
 # union of those two, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's
 # list is labelled by name without a second edit here.
-GIT_READ_SUBCOMMANDS = frozenset({"blame", "describe", "log", "ls-files", "show", "status"})
+GIT_READ_SUBCOMMANDS = frozenset(
+    {"blame", "cat-file", "describe", "log", "ls-files", "rev-list", "show", "status", "version"}
+)
 FORGE_CLI_SUBCOMMANDS = frozenset(
     {
         "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -885,6 +935,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # _role_permits then admits every role, so a prefix spelled twice is a
     # rename away from opening the relay to the gateway.
     (API_RELAY_PREFIX, (CALLER_ROLE_SHELL,)),
+    # The remote MCP relay belongs to the gateway, where Hermes runs the
+    # mcp-remote children; the sandbox has no MCP client. Session pods are not
+    # admitted here yet: that is a new read path for them, argued in the change
+    # that wires them, not by default.
+    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -2173,7 +2228,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             response_started = True
-            while chunk := response.read(64 * 1024):
+            # read1, not read: read(n) on a chunked body waits for n bytes or
+            # the end of the body, which holds a streamed turn (SSE) until it
+            # finishes. read1 returns what has arrived.
+            while chunk := response.read1(64 * 1024):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (ConnectionError, TimeoutError, OSError, http.client.HTTPException):
@@ -2232,8 +2290,10 @@ class GoogleApiRelay:
     route answers 503 rather than the process refusing to come up.
 
     `AuthorizedSession` is deliberately not used. The upstream request is built
-    by hand in `fetch` so that exactly two headers leave this process and no
-    header the caller sent can ride along.
+    by hand in `fetch` so that the Cloud API relay sends exactly two headers and
+    no header the caller sent can ride along. The MCP relay passes `fetch` the
+    extra headers it chose itself (`_handle_mcp_relay` names them and the shape
+    each caller value must have); nothing is copied from the request wholesale.
 
     `connection` is the seam a test replaces with a plain HTTPConnection to a
     fake upstream; everything above it -- the header set, the deadline, the
@@ -2244,6 +2304,7 @@ class GoogleApiRelay:
 
     def __init__(self) -> None:
         self._credentials: Any = None
+        self._project_id = ""
         self._lock = threading.Lock()
         # Built once: create_default_context loads the CA bundle, and a
         # context is safe to share across connections.
@@ -2255,12 +2316,23 @@ class GoogleApiRelay:
             if self._credentials is None:
                 import google.auth
 
-                self._credentials, _ = google.auth.default(scopes=list(self.SCOPES))
+                self._credentials, project_id = google.auth.default(scopes=list(self.SCOPES))
+                self._project_id = project_id or ""
             if not self._credentials.valid:
                 from google.auth.transport.requests import Request
 
                 self._credentials.refresh(Request())
             return f"Bearer {self._credentials.token}"
+
+    def project_id(self) -> str:
+        """The project `google.auth.default()` resolved with the credential, or "".
+
+        Read after `authorization_header`, which is what resolves it. The MCP
+        relay sends it as `X-Goog-User-Project`, the header the agent's
+        mcp-remote used to send from its own ADC lookup.
+        """
+        with self._lock:
+            return self._project_id
 
     def connection(self, host: str) -> http.client.HTTPConnection:
         """A fresh TLS connection to `host`, with the connect bounded."""
@@ -2278,14 +2350,26 @@ class GoogleApiRelay:
             raise TimeoutError("the relay deadline passed")
         return remaining
 
-    def fetch(self, host: str, target: str, authorization: str) -> ApiRelayResponse:
-        """One `GET https://{host}{target}` on the broker's credential.
+    def fetch(
+        self,
+        host: str,
+        target: str,
+        authorization: str,
+        *,
+        body: bytes | None = None,
+        headers: tuple[tuple[str, str], ...] = (),
+    ) -> ApiRelayResponse:
+        """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
         `TimeoutError` when API_RELAY_DEADLINE_S passes at any point, and lets
         `OSError` and `http.client.HTTPException` through for the handler to
         answer 502; redirects are not followed, the 3xx comes back as a status.
+
+        `body` and `headers` are the MCP relay's: a POST of a body the broker
+        re-serialised itself, with the extra headers it chose. The Cloud API
+        relay passes neither, and its request is byte-for-byte what it was.
         """
         deadline = time.monotonic() + API_RELAY_DEADLINE_S
         connection = self.connection(host)
@@ -2308,10 +2392,15 @@ class GoogleApiRelay:
             sock.settimeout(self._remaining(deadline))
             # `skip_accept_encoding`: without it http.client adds a third
             # header of its own. `Host` is added, because HTTP/1.1 requires it.
-            connection.putrequest("GET", target, skip_accept_encoding=True)
+            method = API_RELAY_POST if body is not None else api_policy.API_READ_METHOD
+            connection.putrequest(method, target, skip_accept_encoding=True)
             connection.putheader("Authorization", authorization)
             connection.putheader("Accept", API_RELAY_ACCEPT)
-            connection.endheaders()
+            for name, value in headers:
+                connection.putheader(name, value)
+            if body is not None:
+                connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body)
             response = connection.getresponse()
             chunks: list[bytes] = []
             received = 0
@@ -3157,6 +3246,55 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
     }
 )
 
+# Keys permitted to be written via repository-local `git config`. Only committer
+# identity configuration is needed by GitOps workspace setup; writing aliases,
+# filters, or execution hooks is refused.
+ALLOWED_GIT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
+
+# Actions that make a `git config` invocation a read-only query.
+# Must appear in option position (before the first positional argument).
+GIT_CONFIG_QUERY_ACTIONS = frozenset(
+    {
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--list",
+        "-l",
+        "--get-color",
+        "--get-colorbool",
+    }
+)
+
+# Mutation actions that write or unset configuration keys.
+GIT_CONFIG_WRITE_ACTIONS = frozenset(
+    {
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+        "--edit",
+        "-e",
+    }
+)
+
+# Options that take a separate argument before positional parameters.
+GIT_CONFIG_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "--default",
+        "--type",
+        "-t",
+        "--blob",
+        "--comment",
+        "--value",
+        "--url",
+        "--file",
+        "-f",
+    }
+)
+
 # git's own global options, split by whether they consume the next argument.
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
 # audit_report issues) without mistaking a flag for a verb. Includes options
@@ -3166,14 +3304,14 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {
         "-C",
         "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--exec-path",
-        "--super-prefix",
         "--attr-source",
         "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
         "--shallow-file",
+        "--super-prefix",
+        "--work-tree",
     }
 )
 
@@ -3257,6 +3395,29 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "update-ref",
     }
 )
+
+
+def _allowed_git_subcommands() -> frozenset[str]:
+    from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
+
+    return (
+        GIT_MUTATING_SUBCOMMANDS
+        | GIT_READ_SUBCOMMANDS
+        | VCS_GIT_SUBCOMMANDS
+        | WORKSPACE_GIT_SUBCOMMANDS
+        | frozenset({"config"})
+    )
+
+
+# The closed set of subcommands the product and its skills issue: the union of
+# the four git verb sets this module already tracks (`GIT_MUTATING_SUBCOMMANDS`,
+# `GIT_READ_SUBCOMMANDS`, `VCS_GIT_SUBCOMMANDS`, and `WORKSPACE_GIT_SUBCOMMANDS`)
+# plus `config` (whose own `_git_config_violation` gate restricts writes to
+# `ALLOWED_GIT_CONFIG_KEYS`). A verb outside this union is refused. On the
+# `/v1/exec` path the check runs after `resolve_git_command` has expanded a
+# repository-local alias, so an alias is judged by what it expands to rather
+# than refused for being one.
+ALLOWED_GIT_SUBCOMMANDS = _allowed_git_subcommands()
 
 # Where a credential refresh helper is staged. A forge's helper is found by its
 # own name under this directory, which is how the generic route reaches a
@@ -3356,6 +3517,72 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
 )
 
 
+def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
+    """git config that trusts each forge's own CA on that forge's hosts only.
+
+    For every configured forge that names a `caFile`: `http.https://<host>/.sslCAInfo`,
+    and `followRedirects=false` for the same host, so a redirect cannot carry
+    the CA to another host. git matches the key's URL against the remote's, so the
+    file is the CA bundle for that host and nothing else: github.com and
+    gitlab.com go on using the system bundle. This works with git built on
+    either OpenSSL or GnuTLS, which `SSL_CERT_FILE` does not.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in entries or ():
+        ca_file = str(entry.get("ca_file") or "").strip()
+        host = str(entry.get("host") or "").strip().lower()
+        if not ca_file or not host:
+            continue
+        # Measured in the broker image (git 2.47, libcurl-gnutls): the file
+        # is trusted beside the system bundle, not in place of it, as the API
+        # client's context is.
+        pairs.append((f"http.https://{host}/.sslCAInfo", ca_file))
+        # curl keeps the CA file on the handle across a redirect, so a hop
+        # would carry this host's CA to another host. GitLab answers a moved
+        # project in-band ("remote: Project ... was moved"), and its clone URLs
+        # end in .git, so none of its git traffic needs a redirect.
+        pairs.append((f"http.https://{host}/.followRedirects", "false"))
+    return tuple(pairs)
+
+
+def forge_ca_sources(entries) -> dict[str, str]:
+    """Each forge host that names a CA, mapped to where the CA comes from."""
+    return {
+        str(entry.get("host") or "").strip().lower(): str(entry.get("ca_source") or "")
+        for entry in entries or ()
+        if str(entry.get("ca_file") or "").strip()
+    }
+
+
+def _ca_reading_entries(entries) -> tuple[dict[str, str], ...]:
+    """`{host, ca_file, ca_source}` for each built forge that reads a CA file.
+
+    A configuration the forges refuse yields none: the registry reads the same
+    file when the broker is built and refuses to start with its own message.
+    """
+    try:
+        forges = providers.build_forges({"forges": list(entries or ())}) if entries else ()
+    except ValueError:
+        return ()
+    return tuple(
+        {"host": forge.hosts[0], "ca_file": forge.ca_file, "ca_source": forge.ca_source}
+        for forge in forges
+        if forge.ca_file and forge.hosts
+    )
+
+
+def _configured_forge_entries():
+    """The forge configuration's entries, or () when there is none or it is unreadable.
+
+    Unreadable is not refused here: the forge registry reads the same file
+    when the broker is built and refuses to start with its own message.
+    """
+    try:
+        return providers.load_forge_entries() or ()
+    except ValueError:
+        return ()
+
+
 def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
     """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
 
@@ -3396,6 +3623,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--attr-source": "reads gitattributes from a tree-ish which can select caller-named filters or diff drivers",
     "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
@@ -3519,16 +3747,14 @@ _GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
 # executes <payload> in the credential container, as do
 # `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
 #
-# **This is a denylist over a set that is not closed, and it is the weakest
-# thing in this file.** git keeps a command in configuration for `difftool`,
-# `mergetool`, `web--browse`, `instaweb`, `help`, and the `p4`/`svn`
-# bridges, and a new one can arrive in any release. The structurally correct
-# fix is to allowlist the ~20 subcommands the product actually issues and fail
-# closed on the rest, which is a change to the denylist-not-allowlist decision
-# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
-# unknown *read* verb failing closed against a concurrency race, and was not
-# weighing it against arbitrary code execution. Revisit it with that evidence
-# rather than treating this list as sufficient.
+# **Named-reason denylist paired with `ALLOWED_GIT_SUBCOMMANDS`.** git keeps a
+# command in configuration for `difftool`, `mergetool`, `web--browse`,
+# `instaweb`, `help`, and the `p4`/`svn` bridges, and a new one can arrive in
+# any release. `ALLOWED_GIT_SUBCOMMANDS` fails closed on the subcommand slot
+# resolved by `_git_plan` for any verb outside the product's four verb sets plus
+# `config`, while this table scans every token in `argv` so these dangerous
+# built-ins are refused with their specific explanation even if a future git
+# release adds a value-taking global option not yet in `_GIT_GLOBAL_WITH_VALUE`.
 _GIT_REFUSED_SUBCOMMANDS = {
     "bisect": "runs a command the caller names (`bisect run`)",
     "difftool": "runs a command the caller names (`--extcmd`)",
@@ -3566,14 +3792,11 @@ _GIT_REFUSED_SUBCOMMANDS = {
     # containing a bare `help` (checked across `agents/`, `k8s-operator/` and
     # `scripts/`), and the refusal is loud and names the rule.
     #
-    # Matching the subcommand *slot* instead would remove the collision and was
-    # considered. It is not done, and the reason is measurable: git has
-    # value-taking global options this file does not know about, so resolving
-    # the slot is a guess about git's parser. `git --attr-source HEAD help -m
-    # git` executes the payload, while `_git_plan` reports the subcommand as
-    # `HEAD` — a position-aware check would allow it. Scanning every token
-    # cannot disagree with git about where the subcommand is, and over-refusing
-    # a commit message is the direction this is meant to fail in.
+    # Kept as an whole-argv token check alongside `ALLOWED_GIT_SUBCOMMANDS`
+    # (which checks the subcommand slot resolved by `_git_plan`, with
+    # `--attr-source` in `_GIT_GLOBAL_WITH_VALUE` and refused outright) so a
+    # future value-taking global option not yet listed in `_GIT_GLOBAL_WITH_VALUE`
+    # cannot hide `help` behind its argument value.
     "help": "runs a caller-named viewer command (`help -m`, `help -w`)",
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
@@ -3906,19 +4129,16 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
     return None
 
 
-def git_argument_violation(argv: list[str]) -> str | None:
+def git_argument_violation(argv: list[str], *, check_subcommand: bool = True) -> str | None:
     """Why this git argv may not run, or None if it may.
 
-    Matched across the whole argv rather than only the global-option region
-    before the subcommand, which is the only place git honours these. That is
-    deliberate: a check that has to agree with git about where the options end
-    is a *guess* about git's parser, and every serious defect found in this
-    policy layer so far was a checker and an executor parsing the same input
-    differently. Scanning everything cannot disagree with git about scope.
-
-    The cost is refusing a git command with a literal `-c` somewhere in its
-    arguments — a commit message, a pathspec. Nothing shipped does that, and
-    refusing something harmless is the direction this is meant to fail in.
+    Refused flags and `_GIT_REFUSED_SUBCOMMANDS` are matched across the whole
+    argv rather than only the global-option region before the subcommand, so a
+    flag or refused verb cannot slip past a parser disagreement about where the
+    options end. `_git_plan` then resolves the subcommand slot (after skipping
+    `_GIT_GLOBAL_WITH_VALUE`) and enforces `ALLOWED_GIT_SUBCOMMANDS` (when
+    `check_subcommand` is True) and `_git_config_violation` (when the subcommand
+    is `config`).
     """
     if not argv or Path(argv[0]).name != "git":
         return None
@@ -3957,20 +4177,116 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
-    if "config" in rest:
-        for argument in rest:
-            clean = argument.split("=", 1)[0].strip().lower()
-            if (
-                clean.startswith("alias.")
-                or clean == "alias"
-                or clean.startswith("include.")
-                or clean.startswith("includeif.")
-                or clean == "include"
-            ):
-                return (
-                    "`git config` configuring an alias or config include is refused: "
-                    "git aliases and includes cannot be configured through the credential proxy."
-                )
+    subcommand, _ = _git_plan(argv)
+    if check_subcommand and subcommand is not None and subcommand not in ALLOWED_GIT_SUBCOMMANDS:
+        return f"`git {subcommand}` is refused: subcommand is not supported by the credential proxy."
+    if subcommand == "config":
+        config_violation = _git_config_violation(argv)
+        if config_violation is not None:
+            return config_violation
+    return None
+
+
+def _git_config_option_positionals(args: list[str]) -> tuple[set[str], list[str]]:
+    """Walk `git config` options using PARSE_OPT_STOP_AT_NON_OPTION and prefix resolution."""
+    actions: set[str] = set()
+    positionals: list[str] = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if not arg.startswith("-") or arg == "--":
+            if arg == "--":
+                idx += 1
+            positionals = args[idx:]
+            break
+        name = arg.split("=", 1)[0]
+        is_long_prefix = name.startswith("--") and len(name) > 2
+        matched_writes = {
+            w for w in GIT_CONFIG_WRITE_ACTIONS
+            if w == name or (is_long_prefix and w.startswith(name))
+        }
+        matched_queries = {
+            q for q in GIT_CONFIG_QUERY_ACTIONS
+            if q == name or (is_long_prefix and q.startswith(name))
+        }
+        if matched_writes:
+            actions.update(matched_writes)
+        elif matched_queries:
+            actions.update(matched_queries)
+        consumes_value = name in GIT_CONFIG_OPTIONS_WITH_VALUE or (
+            is_long_prefix
+            and any(o.startswith(name) for o in GIT_CONFIG_OPTIONS_WITH_VALUE if o.startswith("--"))
+        )
+        if consumes_value and "=" not in arg:
+            idx += 1
+        idx += 1
+    return actions, positionals
+
+
+def _git_config_violation(argv: list[str]) -> str | None:
+    """Why this git config argv may not run, or None if it may.
+
+    Git parses `git config` options using PARSE_OPT_STOP_AT_NON_OPTION: options
+    must precede the first positional argument.
+
+    Query actions (--get, --list, get, list, etc.) are non-mutating reads and are
+    allowed. Configuration writes (implicit set with >= 2 positionals, git >= 2.46
+    set/unset subcommands, or write actions like --add, --replace-all, --unset and
+    their parse-options abbreviations) are restricted to case-insensitive author
+    identity keys (user.name, user.email). Any attempt to write or unset other keys
+    is refused.
+    """
+    config_index = _find_subcommand_index(argv)
+    if config_index is None or argv[config_index] != "config":
+        return None
+
+    actions, positionals = _git_config_option_positionals(argv[config_index + 1:])
+    if not actions and positionals and positionals[0] in {
+        "list", "get", "set", "unset", "rename-section", "remove-section", "edit"
+    }:
+        subverb = positionals[0]
+        _, sub_positionals = _git_config_option_positionals(positionals[1:])
+        if subverb == "list":
+            if not sub_positionals:
+                return None
+            return "`git config list` with extra arguments is refused."
+        if subverb == "get":
+            if len(sub_positionals) == 1:
+                return None
+            return "`git config get` requires exactly one configuration key."
+        if subverb in {"rename-section", "remove-section", "edit"}:
+            return (
+                f"`git config {subverb}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
+        actions = {"--add" if subverb == "set" else "--unset"}
+        positionals = sub_positionals
+
+    if actions & {"--rename-section", "--remove-section"}:
+        return (
+            "`git config` section mutation is refused: only author identity configuration "
+            "(user.name, user.email) and query options are permitted."
+        )
+
+    if actions & {"--edit", "-e"}:
+        return (
+            "`git config --edit` is refused: only author identity configuration "
+            "(user.name, user.email) and query options are permitted."
+        )
+
+    if actions and not (actions & GIT_CONFIG_WRITE_ACTIONS) and (actions & GIT_CONFIG_QUERY_ACTIONS):
+        return None
+
+    is_write = bool(actions & GIT_CONFIG_WRITE_ACTIONS) or len(positionals) >= 2
+    if is_write:
+        if not positionals:
+            return "`git config` write is refused: missing configuration key."
+        target_key = positionals[0]
+        if target_key.lower() not in ALLOWED_GIT_CONFIG_KEYS:
+            return (
+                f"`git config {target_key}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
     return None
 
 
@@ -4798,6 +5114,18 @@ class CommandExecutor:
             name: shutil.which(name, path=trusted_path)
             for name in self.ALLOWED_EXECUTABLES
         }
+        # The CA each self-managed forge names, as URL-scoped git config: git
+        # trusts it for that forge's host and for no other. In the forced
+        # layer rather than in a credential's config, because a context
+        # repository on such a forge is cloned with no credential at all and
+        # still needs the trust.
+        # From the built forges, not the raw file: only a forge that reads its
+        # CA in its API client gets git pinned to it, so the two clients never
+        # disagree about a host's certificate.
+        entries = _ca_reading_entries(_configured_forge_entries())
+        self.forge_ca_config = forge_ca_git_config(entries)
+        self.forge_ca_sources = forge_ca_sources(entries)
+        self.forge_ca_files = {entry["host"]: entry["ca_file"] for entry in entries}
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -4866,7 +5194,11 @@ class CommandExecutor:
             "GIT_EDITOR": "false",
             "GIT_SEQUENCE_EDITOR": "false",
             **_git_forced_config_environment(
-                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
+                (
+                    *self.forge_ca_config,
+                    ("core.hooksPath", str(self.git_hooks_dir)),
+                    *GIT_FORCED_CONFIG,
+                )
             ),
         }
         # Forward only variables required by supported credential clients. Chat
@@ -5443,14 +5775,17 @@ class CommandExecutor:
             #
             # Do not read that as "kubectl is the only way to reach a Kubernetes
             # object." It is not, and the difference matters. The `gke` remote
-            # MCP server in every profile's config.yaml proxies to
-            # container.googleapis.com/mcp from the *agent* container, on the
-            # ambient Workload Identity credential, with no part of this file in
-            # the path. Nothing here scopes it and nothing here can.
+            # MCP server in every profile's config.yaml reaches
+            # container.googleapis.com/mcp through this process's `/v1/mcp/`
+            # relay, on the broker's own credential and not on any pool member:
+            # `mcp_policy` bounds it per tool, and this kubeconfig selection
+            # plays no part. What a permitted read returns is bounded by the
+            # broker identity's grant.
             #
-            # What scopes it is the size of the agent's own grant — which is why
-            # taking roles/container.viewer off that identity is not a tidy-up
-            # alongside this work but the half of it that covers this door.
+            # And the gateway pod still runs as the Workload Identity-annotated
+            # ServiceAccount it shares with this pod, so the agent's own grant
+            # still bounds anything there that reaches the metadata server.
+            # Splitting the two identities is the change that closes that.
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
@@ -5539,6 +5874,19 @@ class CommandExecutor:
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
             )
+
+    def tls_refusal(self, output: str):
+        """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
+
+        A CA file git could not load is named by the Secret and key it comes
+        from, as missing or as unloadable by whether the file is there, as the
+        API client names it. Redacted: the one line kept can quote the remote's
+        URL.
+        """
+        refusal = providers.tls_refusal(output, self.forge_ca_sources, self.forge_ca_files)
+        if refusal is not None and "detail" in refusal.fields:
+            refusal.fields["detail"] = redact_credentials(str(refusal.fields["detail"]))
+        return refusal
 
     def execute_vcs_git(
         self,
@@ -6575,7 +6923,11 @@ class CommandExecutor:
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
+            command_environment.pop("KUBECONFIG", None)
+            command_environment.pop("CLOUDSDK_CONFIG", None)
             command_environment.update(self.git_identity)
+        elif argv and Path(argv[0]).name == "kubectl":
+            command_environment.pop("GH_CONFIG_DIR", None)
         if extra_config:
             # Rebuilt rather than appended to, because the count and the keys
             # have to move together. The caller's pairs go first so the forced
@@ -6585,6 +6937,7 @@ class CommandExecutor:
                 _git_forced_config_environment(
                     (
                         *extra_config,
+                        *self.forge_ca_config,
                         ("core.hooksPath", str(self.git_hooks_dir)),
                         *GIT_FORCED_CONFIG,
                     )
@@ -6712,6 +7065,7 @@ def build_workspace_store(
         # it, which composes the URL; a bare `owner/name` stays GitHub's.
         locate=_workspace_locate,
         pinned_bases=pinned_bases,
+        tls_refusal=executor.tls_refusal,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
@@ -6749,6 +7103,11 @@ def build_vcs_broker(
         http_max_bytes=executor.max_output_bytes,
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
+        tls_refusal=executor.tls_refusal,
+        # Looked up at call time: the handler's registry is a class attribute
+        # a test replaces per case, and this broker outlives none of them.
+        merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -7014,6 +7373,16 @@ def strip_credential_query_keys(query: str) -> str:
     return "&".join(kept)
 
 
+def _vcs_verb_label(verb: str) -> str:
+    """The ``verb`` label a version-control request is counted under.
+
+    The route table's vocabulary, or LABEL_OTHER for anything else: the verb
+    comes off the path, which is caller text, and a label that carried it would
+    let one caller mint a series per request.
+    """
+    return verb if verb in vcs_broker.VCS_VERBS else LABEL_OTHER
+
+
 def _endpoint_label(path: str) -> str:
     """The route family ``path`` falls in, for the request counter.
 
@@ -7201,6 +7570,8 @@ class ProxyMetrics:
         self._lock = threading.Lock()
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
+        self._vcs: dict[tuple[str, str], int] = {}
+        self._merged = 0
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -7285,10 +7656,21 @@ class ProxyMetrics:
         with self._lock:
             self._requests[key] = self._requests.get(key, 0) + 1
 
+    def record_vcs(self, verb: str, status: str) -> None:
+        key = (verb, status)
+        with self._lock:
+            self._vcs[key] = self._vcs.get(key, 0) + 1
+
+    def record_merged(self, count: int) -> None:
+        with self._lock:
+            self._merged += count
+
     def render(self) -> str:
         with self._lock:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
+            vcs = sorted(self._vcs.items())
+            merged = self._merged
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
@@ -7353,6 +7735,20 @@ class ProxyMetrics:
                     f"# TYPE {CHILD_MEMORY_BUDGET_METRIC} gauge",
                     f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
                 ]
+        lines += [
+            f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb and outcome.",
+            f"# TYPE {VCS_REQUESTS_METRIC} counter",
+        ]
+        for (verb, status), count in vcs:
+            lines.append(
+                f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
+                f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
+            f"# TYPE {VCS_MERGED_METRIC} counter",
+            f"{VCS_MERGED_METRIC} {merged}",
+        ]
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -7524,6 +7920,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # control is not behind a switch, because it is the only way the sandbox
     # reaches a repository at all.
     vcs: vcs_broker.VcsBroker | None = None
+    # Set by _repository_is_permitted on a refusal: the status it answered.
+    repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
     # Unix socket is the access control, behaving as it did before there was an
     # authenticator at all.
@@ -7612,6 +8010,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         An unreadable list refuses rather than allows, and says which of the two
         it was in the log: an authorization check that fails open is not one.
         """
+        # The status this method answered with on a refusal, for a caller that
+        # counts refusals apart from faults (the version-control counter).
+        self.repository_refusal_status = None
         try:
             permitted = repository_is_managed(repository, forge)
         except Exception as exc:
@@ -7620,6 +8021,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "could not be read type=%s",
                 type(exc).__name__,
             )
+            self.repository_refusal_status = HTTPStatus.SERVICE_UNAVAILABLE
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -7630,6 +8032,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return False
         if permitted:
             return True
+        self.repository_refusal_status = HTTPStatus.FORBIDDEN
         LOGGER.warning(
             "refused a repository this install does not manage repository=%s",
             _sanitize_for_logging(repository),
@@ -7651,6 +8054,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()
+            return
+        if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
+            # The optional server-to-client SSE channel. None of the relayed
+            # servers streams, and the spec's answer for that is 405.
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.send_header("Allow", API_RELAY_POST)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
@@ -7713,6 +8124,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # `gcp.api.method`, named in the audit line, rather than a 404
             # that reads as "no such route". The body is never read.
             self._handle_api_relay()
+            return
+        if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
+            self._handle_mcp_relay()
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
@@ -7917,7 +8331,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # over anything argv can say; this refuses the flags that would
         # otherwise re-enable git's hook execution, and it refuses them before
         # the lease check because it does not depend on the working directory.
-        violation = git_argument_violation(argv)
+        has_resolver = hasattr(self.executor, "resolve_git_command")
+        violation = git_argument_violation(argv, check_subcommand=not has_resolver)
         if violation is not None:
             LOGGER.warning(
                 "git argument refused request_id=%s", request_id,
@@ -7944,7 +8359,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # request ends with a response and the trail with a terminal
             # record rather than an exception out of the handler.
             try:
-                if hasattr(self.executor, "resolve_git_command"):
+                if has_resolver:
                     violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
                 else:
                     violation = self.executor.git_lease_violation(argv, cwd)
@@ -7973,6 +8388,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+
+            if has_resolver:
+                arg_violation = git_argument_violation(exec_argv)
+                if arg_violation is not None:
+                    LOGGER.warning(
+                        "git argument refused request_id=%s", request_id,
+                        extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
+                    )
+                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "status": "blocked",
+                            "code": "SECURITY_POLICY_BLOCKED",
+                            "rule": RULE_GIT_ARGUMENT_REFUSED,
+                            "message": arg_violation,
+                        },
+                    )
+                    return
 
             # Runs after the credential denylist above, so rules like
             # `kubernetes.token-disclosure` keep their own ids and messages rather
@@ -8141,6 +8575,134 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+    def _relay_authorization(self, label: str, request_id: str) -> str | None:
+        """The broker's own `Authorization` value, or None after answering 503.
+
+        Shared by the Cloud API relay and the MCP relay; `label` is the first
+        word of their audit lines.
+        """
+        try:
+            return self.api_relay.authorization_header()
+        except Exception as exc:
+            # The type and not the message: google-auth's messages can name
+            # the credential file it looked for.
+            LOGGER.warning(
+                "%s credential unavailable request_id=%s type=%s",
+                label,
+                request_id,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the credential proxy could not obtain its own credential",
+                    "code": "RELAY_CREDENTIAL_UNAVAILABLE",
+                },
+            )
+            return None
+
+    def _relay_fetch(
+        self,
+        label: str,
+        request_id: str,
+        host: str,
+        target: str,
+        authorization: str,
+        **kwargs: Any,
+    ) -> ApiRelayResponse | None:
+        """`GoogleApiRelay.fetch`, or None after answering the upstream failure.
+
+        Every failure answers the way the Cloud API relay always has, with the
+        same codes; `label` is the first word of the audit line. `kwargs` go to
+        `fetch` unchanged.
+        """
+        try:
+            return self.api_relay.fetch(host, target, authorization, **kwargs)
+        except ApiRelayConnectTimeout:
+            LOGGER.warning(
+                "%s upstream connect timeout request_id=%s host=%s connect_timeout_s=%d",
+                label,
+                request_id,
+                host,
+                API_RELAY_CONNECT_TIMEOUT_S,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return None
+        except TimeoutError:
+            LOGGER.warning(
+                "%s upstream timeout request_id=%s host=%s deadline_s=%d",
+                label,
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            self._json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {
+                    "error": "the upstream did not answer within the relay deadline",
+                    "code": "UPSTREAM_TIMEOUT",
+                },
+            )
+            return None
+        except (UnicodeError, http.client.InvalidURL) as exc:
+            # Belt to the query check's braces: what putrequest raises for a
+            # target it will not send -- a non-ASCII byte, a control character
+            # -- is the caller's text, and a 400 that names it beats a
+            # traceback and a closed connection. UnicodeError and not
+            # ValueError: ssl.SSLCertVerificationError is a ValueError too, and
+            # a TLS fault is the upstream's, answered 502 below.
+            LOGGER.warning(
+                "%s rejected request_id=%s code=%s reason=%s",
+                label,
+                request_id,
+                API_RELAY_BAD_QUERY,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "the request could not be placed on an upstream request line",
+                    "code": API_RELAY_BAD_QUERY,
+                },
+            )
+            return None
+        except http.client.IncompleteRead as exc:
+            # The upstream closed before delivering what it announced. Its own
+            # code, so an operator can tell a page cut short from a host that
+            # never answered; nothing of the partial body is relayed.
+            LOGGER.warning(
+                "%s upstream truncated request_id=%s host=%s received=%d expected=%d",
+                label,
+                request_id,
+                host,
+                len(exc.partial),
+                len(exc.partial) + (exc.expected or 0),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "the upstream closed before sending the whole response",
+                    "code": "UPSTREAM_TRUNCATED",
+                },
+            )
+            return None
+        except (OSError, http.client.HTTPException) as exc:
+            LOGGER.warning(
+                "%s upstream unreachable request_id=%s host=%s type=%s",
+                label,
+                request_id,
+                host,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return None
+
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
 
@@ -8207,107 +8769,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        try:
-            authorization = self.api_relay.authorization_header()
-        except Exception as exc:
-            # The type and not the message: google-auth's messages can name
-            # the credential file it looked for.
-            LOGGER.warning(
-                "api credential unavailable request_id=%s type=%s",
-                request_id,
-                type(exc).__name__,
-            )
-            self._json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {
-                    "error": "the credential proxy could not obtain its own credential",
-                    "code": "RELAY_CREDENTIAL_UNAVAILABLE",
-                },
-            )
+        authorization = self._relay_authorization("api", request_id)
+        if authorization is None:
             return
         query = strip_credential_query_keys(parts.query)
         target = f"/{path}?{query}" if query else f"/{path}"
         started = time.monotonic()
-        try:
-            upstream = self.api_relay.fetch(host, target, authorization)
-        except ApiRelayConnectTimeout:
-            LOGGER.warning(
-                "api upstream connect timeout request_id=%s host=%s connect_timeout_s=%d",
-                request_id,
-                host,
-                API_RELAY_CONNECT_TIMEOUT_S,
-            )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
-            )
-            return
-        except TimeoutError:
-            LOGGER.warning(
-                "api upstream timeout request_id=%s host=%s deadline_s=%d",
-                request_id,
-                host,
-                API_RELAY_DEADLINE_S,
-            )
-            self._json(
-                HTTPStatus.GATEWAY_TIMEOUT,
-                {
-                    "error": "the upstream did not answer within the relay deadline",
-                    "code": "UPSTREAM_TIMEOUT",
-                },
-            )
-            return
-        except (UnicodeError, http.client.InvalidURL) as exc:
-            # Belt to the query check's braces: what putrequest raises for a
-            # target it will not send -- a non-ASCII byte, a control character
-            # -- is the caller's text, and a 400 that names it beats a
-            # traceback and a closed connection. UnicodeError and not
-            # ValueError: ssl.SSLCertVerificationError is a ValueError too, and
-            # a TLS fault is the upstream's, answered 502 below.
-            LOGGER.warning(
-                "api rejected request_id=%s code=%s reason=%s",
-                request_id,
-                API_RELAY_BAD_QUERY,
-                type(exc).__name__,
-            )
-            self._json(
-                HTTPStatus.BAD_REQUEST,
-                {
-                    "error": "the request could not be placed on an upstream request line",
-                    "code": API_RELAY_BAD_QUERY,
-                },
-            )
-            return
-        except http.client.IncompleteRead as exc:
-            # The upstream closed before delivering what it announced. Its own
-            # code, so an operator can tell a page cut short from a host that
-            # never answered; nothing of the partial body is relayed.
-            LOGGER.warning(
-                "api upstream truncated request_id=%s host=%s received=%d expected=%d",
-                request_id,
-                host,
-                len(exc.partial),
-                len(exc.partial) + (exc.expected or 0),
-            )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {
-                    "error": "the upstream closed before sending the whole response",
-                    "code": "UPSTREAM_TRUNCATED",
-                },
-            )
-            return
-        except (OSError, http.client.HTTPException) as exc:
-            LOGGER.warning(
-                "api upstream unreachable request_id=%s host=%s type=%s",
-                request_id,
-                host,
-                type(exc).__name__,
-            )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
-            )
+        upstream = self._relay_fetch("api", request_id, host, target, authorization)
+        if upstream is None:
             return
         duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
         if upstream.over_cap:
@@ -8363,6 +8832,169 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(upstream.body)))
         self.end_headers()
         self.wfile.write(upstream.body)
+
+    def _handle_mcp_relay(self) -> None:
+        """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.
+
+        The agent's `mcp-remote` children point here instead of at Google, so
+        every `mcp__gke__*` call reaches the upstream on the broker's
+        credential, after `mcp_policy` has read it. In order: the body, bounded
+        by `max_request_bytes`; the decision; for a refusal, a reply the model
+        can read; otherwise the upstream POST of the broker's re-serialisation
+        of the message, and the passthrough of status and body, with
+        `tools/list` cut down to the table. Two audit lines per request, as the
+        Cloud API relay writes them.
+
+        A refusal of a request with an id answers HTTP 200. mcp-remote's SDK
+        throws away the body of any non-2xx reply, so a 403 would reach the
+        model as a transport error with no rule id in it.
+        """
+        principal = self.principal
+        request_id = str(uuid.uuid4())
+        server_name = urllib.parse.urlsplit(self.path).path[len(mcp_policy.MCP_RELAY_PREFIX) :]
+        entry = mcp_policy.server(server_name)
+        LOGGER.info(
+            "mcp request_id=%s principal=%s server=%s",
+            request_id,
+            _sanitize_for_logging(
+                principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
+            ),
+            _sanitize_for_logging(server_name),
+        )
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            # The two answers /v1/exec gives: 400 for a length that is not a
+            # number, 413 for one out of range.
+            LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+            return
+        if content_length <= 0 or content_length > self.max_request_bytes:
+            # Nothing to drain: a body over the cap is one drain_request_body
+            # declines, and an empty length announces none.
+            LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
+            self._json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "MCP request is empty or exceeds the configured size limit"},
+            )
+            return
+        message = mcp_policy.parse(self.rfile.read(content_length))
+        decision = mcp_policy.evaluate(server_name, message)
+        if not decision.allowed:
+            LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            reply = mcp_policy.refusal(message, decision) if entry is not None else None
+            if reply is None:
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": decision.rule_id,
+                        "message": decision.message,
+                    },
+                )
+                return
+            self._json(HTTPStatus.OK, reply)
+            return
+        # From here on `server_name` is a table entry and `decision.rule_id` is
+        # one of mcp_policy.RELAYED_METHODS, so both are logged as-is.
+        if self.api_relay is None:
+            LOGGER.warning("mcp disabled request_id=%s method=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
+            )
+            return
+        authorization = self._relay_authorization("mcp", request_id)
+        if authorization is None:
+            return
+        headers = [("Content-Type", MCP_RELAY_CONTENT_TYPE)]
+        for name, shape in (
+            (MCP_RELAY_USER_AGENT, MCP_RELAY_USER_AGENT_SHAPE),
+            (MCP_RELAY_PROTOCOL_VERSION, MCP_RELAY_PROTOCOL_VERSION_SHAPE),
+        ):
+            value = self.headers.get(name)
+            if value is not None and shape.match(value):
+                headers.append((name, value))
+        project_id = self.api_relay.project_id()
+        if re.fullmatch(api_policy.PROJECT, project_id):
+            headers.append((MCP_RELAY_USER_PROJECT, project_id))
+        body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        started = time.monotonic()
+        upstream = self._relay_fetch(
+            "mcp",
+            request_id,
+            entry.host,
+            entry.path,
+            authorization,
+            body=body,
+            headers=tuple(headers),
+        )
+        if upstream is None:
+            return
+        duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
+        refused: tuple[str, str] | None = None
+        if upstream.over_cap:
+            refused = ("UPSTREAM_RESPONSE_TOO_LARGE", "the upstream response exceeded the relay cap")
+        elif HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
+            refused = (
+                "UPSTREAM_REDIRECTED",
+                "the upstream answered with a redirect, which the relay does not follow",
+            )
+        elif upstream.status == HTTPStatus.UNAUTHORIZED:
+            # Google refusing the broker's own credential. Passed through, it would
+            # read to mcp-remote as its own token refused and send it after an
+            # OAuth login; the caller's token is the broker's to judge, and it did.
+            refused = (
+                "UPSTREAM_UNAUTHORIZED",
+                "the upstream refused the credential proxy's own credential",
+            )
+        elif upstream.body and not upstream.content_type.lower().startswith(
+            MCP_RELAY_CONTENT_TYPE
+        ):
+            # text/event-stream included: a stream cannot be read whole, so
+            # tools/list could not be filtered, and no server here sends one.
+            refused = (
+                "UPSTREAM_NOT_JSON",
+                "the upstream answered with something other than one JSON message",
+            )
+        reply_body = upstream.body
+        if (
+            refused is None
+            and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
+            and upstream.status < HTTPStatus.MULTIPLE_CHOICES
+        ):
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body)
+            if filtered is None:
+                refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
+            else:
+                reply_body = filtered
+        if refused is not None:
+            code, reason = refused
+            LOGGER.warning(
+                "mcp upstream refused request_id=%s server=%s status=%d code=%s",
+                request_id,
+                server_name,
+                upstream.status,
+                code,
+            )
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": reason, "code": code})
+            return
+        LOGGER.info(
+            "mcp forwarded request_id=%s server=%s method=%s status=%d bytes=%d duration_ms=%d",
+            request_id,
+            server_name,
+            decision.rule_id,
+            upstream.status,
+            len(reply_body),
+            duration_ms,
+        )
+        self.send_response(upstream.status)
+        if reply_body:
+            self.send_header("Content-Type", MCP_RELAY_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(reply_body)))
+        self.end_headers()
+        self.wfile.write(reply_body)
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.
@@ -8650,6 +9282,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
 
+        Counts the request under its verb and outcome once the dispatch has
+        answered, whichever exit it took; the verb label is the route table's
+        vocabulary or LABEL_OTHER, never the path.
+        """
+        # Hyphens and underscores reach the same route. A caller that guessed
+        # the punctuation wrong should not get a 404 that reads as though the
+        # verb does not exist.
+        verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+        status = self._dispatch_vcs_post(verb)
+        self.metrics.record_vcs(_vcs_verb_label(verb), status)
+
+    def _dispatch_vcs_post(self, verb: str) -> str:
+        """Answer one version-control request and return its outcome label.
+
         A separate namespace rather than more verbs on an existing one, because
         they are a different protocol: every route here stands alone, holds
         nothing across calls and leaves nothing behind, so there is no handle
@@ -8663,15 +9309,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "VCS_UNAVAILABLE",
                 },
             )
-            return
-        # Hyphens and underscores reach the same route. A caller that guessed
-        # the punctuation wrong should not get a 404 that reads as though the
-        # verb does not exist.
-        verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+            return TOOL_STATUS_ERROR
         route = vcs_broker.route_table(self.vcs).get(verb)
         if route is None:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
-            return
+            return TOOL_STATUS_BLOCKED
         body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
             # One slot for the whole request: the body, which may carry a
@@ -8696,12 +9338,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         )
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                    return
+                    return TOOL_STATUS_ERROR
                 except OSError as exc:
                     LOGGER.warning(
                         "request body not received verb=%s type=%s", verb, type(exc).__name__
                     )
-                    return
+                    return TOOL_STATUS_ERROR
                 # The managed-repository control, on the same footing as
                 # `require_managed_workspace` on the content routes: the broker
                 # holds the forge credential, so "is this a repository we act
@@ -8719,16 +9361,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     try:
                         forge, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:
+                        # A repository this install serves no credential for
+                        # (`ForgeUnsupported`, a 501) or one an allowlist declines
+                        # (a 403) is a refusal; a repository field that cannot be
+                        # read is a request the broker could not use.
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                        return
+                        refused = exc.status == HTTPStatus.FORBIDDEN or isinstance(exc, providers.ForgeUnsupported)
+                        return TOOL_STATUS_BLOCKED if refused else TOOL_STATUS_ERROR
                     if not self._repository_is_permitted(repository, forge):
-                        return
+                        # Refused on the managed list, or the list itself could
+                        # not be read: the first is a refusal, the second a fault.
+                        if self.repository_refusal_status == HTTPStatus.SERVICE_UNAVAILABLE:
+                            return TOOL_STATUS_ERROR
+                        return TOOL_STATUS_BLOCKED
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
+                return TOOL_STATUS_SUCCESS
         except CallerHungUp as exc:
             # The exception names what the request was queued for.
             LOGGER.info("vcs %s abandoned: %s", verb, exc)
-            return
+            return TOOL_STATUS_ABANDONED
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
             # `refresh_forge_credential` raises it: the credential strategy asks
@@ -8743,10 +9395,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "REPOSITORY_NOT_MANAGED",
                 },
             )
-            return
+            return TOOL_STATUS_BLOCKED
         except providers.WorkspaceError as exc:
             self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-            return
+            return TOOL_STATUS_ERROR
         except subprocess.CalledProcessError as exc:
             # git's stderr can carry the remote URL with a credential in it, so
             # it goes to the log through the same redactor the exec path uses
@@ -8757,11 +9409,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 exc.returncode,
                 redact_credentials(str(exc.stderr or "")[:2000]),
             )
+            # A certificate that does not verify is answered by name: the one
+            # matching line, redacted, and no other part of stderr.
+            refusal = self.executor.tls_refusal(str(exc.stderr or "")) if self.executor else None
+            if refusal is not None:
+                self._json(HTTPStatus(refusal.status), _redacted_fields(refusal))
+                return
             self._json(
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
             )
-            return
+            return TOOL_STATUS_ERROR
         except CommandSlotUnavailable as exc:
             # Raised before the body was read, so nothing is left half-done --
             # and the body is drained before the answer, or a caller still
@@ -8770,13 +9428,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             LOGGER.warning("command queued too long verb=%s: %s", verb, exc)
             drain_request_body(self, body_limit)
             self._busy(exc)
-            return
+            return TOOL_STATUS_BUSY
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
-            return
+            return TOOL_STATUS_ERROR
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))

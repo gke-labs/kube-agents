@@ -1455,6 +1455,9 @@ class PoolNote(unittest.TestCase):
                 "threshold_p95_s": 2700,
                 "free": 0,
                 "total": 30,
+                "lease_failures": None,
+                "lease_failures_hours": None,
+                "no_build_id": None,
                 "cause": "CAPACITY",
                 "max_concurrency": 30,
             },
@@ -1464,6 +1467,33 @@ class PoolNote(unittest.TestCase):
             " 0 of 30 projects free",
             result["evidence"],
         )
+
+    def test_refused_acquires_are_the_breach_evidence_and_the_holds_are_counted(self):
+        # The periodic's third trigger: runs asked Boskos for a project and
+        # got none, on an afternoon too thin to judge and with nothing queued
+        # -- every run that would have waited died at the acquire instead.
+        recent = {"hours": 3, "runs": 1, "lease_failures": 2, "judged": False,
+                  "p50_minutes": None, "p95_minutes": None, "worst_minutes": None}
+        result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None,
+                        recent=recent, no_build_id={"hangdng-rebuild": 2})
+        note = result["pool"]
+        self.assertEqual((note["lease_failures"], note["lease_failures_hours"]), (2, 3))
+        self.assertEqual(note["no_build_id"], 2)
+        self.assertIsNone(note["p50_s"])
+        self.assertEqual(
+            health.pool_measurement(note), "2 runs refused a project in the last 3h"
+        )
+        self.assertIn(
+            "backed-up pool: 2 runs refused a project in the last 3h;"
+            " 0 of 30 projects free, 2 leased with no build ID in the owner",
+            result["evidence"],
+        )
+
+    def test_a_note_from_an_older_artifact_has_no_refusals_or_holds_rather_than_a_crash(self):
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0)["pool"]
+        self.assertIsNone(note["lease_failures"])
+        self.assertIsNone(note["no_build_id"])
+        self.assertNotIn("no build ID", health.pool_evidence(note))
 
     def test_the_recent_stretch_beats_the_worst_day_when_the_periodic_judged_it(self):
         # The verdict lasts a week, so Monday's row is still the worst day on
@@ -1600,6 +1630,13 @@ class PoolNote(unittest.TestCase):
         note = health.pool_note(artifact, T0, None)
         measured = health.parse_iso(note["measured_at"])
         self.assertEqual(health.parse_iso(note["waiting_since"]), measured - timedelta(minutes=40))
+        # The waits are measured against the moment Deck was read, which on a
+        # live run comes after the sweep that window_end was fixed before; the
+        # queue block says when, and the backlog is dated from that clock, or
+        # it would read as starting before its oldest run was created.
+        artifact["queue"]["read_at"] = health.iso(measured + timedelta(minutes=3))
+        later = health.pool_note(artifact, T0, None)
+        self.assertEqual(health.parse_iso(later["waiting_since"]), measured + timedelta(minutes=3) - timedelta(minutes=40))
         # Nothing to date: no backlog, and no reading of the queue at all.
         artifact["queue"]["waiting_runs"] = [{"minutes": 9, "pull": 2}]
         self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])
@@ -1675,8 +1712,9 @@ class PoolNote(unittest.TestCase):
         self.assertEqual(note["p95_s"], 18000)
 
     def test_a_breach_with_no_bad_day_quotes_the_runs_queued_right_now(self):
-        # pool_pressure.py breaches on `breached_days or live_breach`, so one
-        # run stuck past p95 breaches a week that has no bad day in it at all.
+        # pool_pressure.py breaches on `breached_days or live_breach or
+        # recent_failed`, so one run stuck past p95 breaches a week that has
+        # no bad day in it at all.
         result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None, over_threshold=3)
         note = result["pool"]
         self.assertIsNone(note["day"])

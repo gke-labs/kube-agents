@@ -161,6 +161,110 @@ reasons, spec paths and event messages are text a tenant writes; the Cluster
 Agent reads that text again when it runs the skill, and its read-only skill and
 preflight bound what it does with it.
 
+## `upgrade-readiness-watch` reports before anyone asks
+
+The `fleet-upgrade-verification` skill's readiness report grades every cluster
+on what would stop its next upgrade. Until this job it ran only when a user
+asked in chat. `upgrade_readiness_watch.py` runs once a day and asks the cheap
+half first: it runs the skill's version table, with no readiness read, and
+collects the target version each cluster's release channel offers and which
+clusters sit below it. A version a cluster is below is pending; a pending
+version the job's ledger has never seen earns the full readiness report at
+once, and a version already reported is refreshed every seven days while any
+cluster is still pending it. A version no cluster is pending any more is
+retired from the ledger with one line. A tick with nothing due prints nothing,
+so a quiet day costs no message.
+
+Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS`
+when set, otherwise the management project and every project a Cluster Agent
+profile's identity names, the roster `stall-watch` follows; with neither, the
+sandbox's configured project; and with nothing at all the tick fails closed,
+because the report script's own fallback is every project the credential can
+list. Within those projects the report script
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
+Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+for the version table and, on a report day, one `get-credentials` and one
+`kubectl get pdb,deploy,statefulset -A` per cluster for the readiness grade;
+the budget names those objects in the saved report, which is tenant-written
+text, so the entry declares `risk: high` as `stall-watch` does. A project
+spelled by its number is keyed by the id `gcloud projects describe` resolves,
+learned on its first table run. A number the credential cannot resolve is
+never a key, so its clusters earn no report until it resolves: when nothing
+was read under a key (it is the only project, or every other is an unresolved
+number too), the tick fails with the reason and the remedy, posted once and
+kept in `last-failure.txt` until the next clean tick posts the recovery;
+beside projects that were keyed, the table is partial, posted once with the
+reason, and the ledger's `table_errors` keeps it. The remedy is
+`resourcemanager.projects.get` on the credential (every read role the install
+binds carries it, as `cluster_agent_reconcile.py` relies on, so a credential
+without it is a custom grant) or the project id in place of the number
+(`spec.harness.projectId` has to be the id; `UPGRADE_READINESS_PROJECTS` for a
+hand run).
+
+It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
+are read from the agent image's `/opt/platform-template/skills/` copy and
+handed to `python3 -I -` in the sandbox on stdin, behind a loader that
+registers `upgrade_readiness` before running `fleet_upgrade_report.main`. The
+loader gives the report a private `tempfile.mkdtemp` directory for its JSON
+output and rollout record, so nothing the model can write to is on the path
+the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
+not this pod's, so the loader prints the report back as JSON and the job
+writes the files on this side, under `<agent home>/upgrade-readiness/`:
+`ledger.json`, and one dated `.md` and `.json` per report under
+`reports/<version>/`, with `latest.md` pointing at the newest, the ten newest
+kept per version and a retired version's directory removed with it. Each run starts
+from an empty rollout record, so a saved report's progress table is a
+first-run baseline, not a week-over-week comparison. Its stdout, one line per
+report with the pending clusters, the blocked ones, and the file's path on the
+gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
+sandbox and cannot open that path, which is why the line carries the verdicts.
+`--dry-run` prints what a tick would do and changes nothing, the failure
+marker included.
+
+Daily at 10:10 UTC, after the morning audits and before the US day; the
+version table is a handful of `gcloud` list calls and the readiness report
+runs only on the day a version appears or its week comes round, once per
+project that holds a pending cluster with its own timeout, so one project the
+sandbox cannot finish leaves only its own clusters ungraded and the others'
+versions still reported. The whole tick keeps to forty-five minutes of the
+hour Hermes gives a `no_agent` script: the version table and the readiness
+runs go project by project, the table within the first fifteen minutes and the
+readiness runs with the rest, each run gets what its share has left, a project
+the budget cannot reach or finish is left unread and named: the partial-table
+line names each project with a read error and its reason (the budget, the
+sandbox's error, a failed listing, an unresolved project number), the
+ledger's `table_errors` keeps the last tick's, and a version's own line names
+the project whose readiness run was not started or was cut short (a version
+none of whose projects ran is not recorded and is retried tomorrow),
+and each sweep runs the projects least recently run first, so a budget that
+never reaches the end of the list does not leave the same project unread
+twice, whichever versions are due. Three guards
+keep the ledger honest: a version is
+retired only when the version table read every project, or read every project
+that still pended it and none does, or a readiness run (which lists every
+cluster of its project, reached by the table or not) showed every cluster
+pending it as no longer below it, a report that
+graded none of a version's pending clusters is written but not recorded (the
+chat line says "none graded" and the version is tried again tomorrow), and the
+weekly comparison carries ten minutes of slack so the tick's own drift cannot
+push a refresh to day eight. A partial table, an ungraded version or a failed
+tick is announced once, not daily: the ledger keeps what was announced (the
+kinds of read error for a partial table; each project and how it went
+ungraded for a version, never the error text, which an outage rewords from
+one run to the next), a
+failed tick (which writes nothing to the ledger) keeps its line in
+`last-failure.txt` beside it, and the next line is the recovery. A version
+none of whose clusters can be read is retried
+three days running and then recorded, so an unreachable cluster costs its
+project one readiness sweep a week rather than one a day; a `blocked` verdict
+the script grades from cluster metadata stands even when the kubectl read
+failed. A hand run in the container finds the ticker's ledger under the
+platform profile, as `feedback-prompt` does, rather than starting a second one
+at the gateway's home. The three
+environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
+`_WATCH_HOME`) are for a run started by hand in the pod; the operator's
+`spec.deployment.env` allowlist does not carry them.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
@@ -173,9 +277,18 @@ path that works. `docs/designs/agent-shell-sandboxing.md` has the account.
 
 It reports nothing on a clean run and only on a run it could not finish, which
 is the same contract `github-repo-watcher` keeps. What it removed goes to
-stderr, where the scheduler logs it: a job announcing its own housekeeping every
+`logs/kanban_workspace_gc.log` in the agent home, which fluent-bit ships to
+Cloud Logging, and not to chat: a job announcing its own housekeeping every
 night is a job the room learns to skip, and the message that must not be skipped
-is the failure.
+is the failure. (Not stderr, which the scheduler keeps nowhere for a zero-exit
+script; see `feedback-prompt` below.)
+
+The same log gets an inventory of the sandbox's profile homes, so that loose
+files a worker leaves there can be seen without exec'ing into the sandbox: each
+home's top-level entries that the product doesn't create, and any home the agent
+pod no longer has a profile for, such as a cluster dropped from scope. That's an
+inventory only: nothing is moved or deleted, and a failure to take it is logged
+there too rather than posted.
 
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
@@ -219,8 +332,9 @@ agent handing out both when asked. `feedback_prompt.py` is the one place the
 product asks, and it does so once per install: a fixed message in the home
 chat channel carrying the form's short link, the form's disclosure that a
 submission becomes a public issue, and a line saying a reply in the thread
-reaches the agent. `deliver: "chat"` is what makes that last line true; the
-Chat Agent posts the message and owns the thread.
+reaches the agent. `deliver: "chat"` is what makes that last line true: the
+relay stores the message against its thread, so a reply there reaches the Chat
+Agent with it attached.
 
 It is a daily cron entry that fires once, not a Hermes one-shot, and the
 reason is this roster's merge. A shipped entry cannot carry an absolute
@@ -251,8 +365,8 @@ job fails in the direction of at most once: a post the scheduler recorded as
 undelivered is a lost request, which `chat-delivery-watch` counts like any
 other failed delivery, and which an operator sends again by removing
 `.feedback_prompt_sent` from the profile home, after which the next tick
-claims afresh. One Chat Agent composition is all the job ever costs, on the
-one tick that prints. The clock starts at the first
+claims afresh. One post is all the job ever costs, on the one tick that
+prints. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets
@@ -318,7 +432,7 @@ with the run still recording `ok`. `check_cron_delivery` in
 `CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
 the typo fails the pull request instead.
 
-## `deliver: "chat"` — reporting through the Chat Agent
+## `deliver: "chat"` — reports the Chat Agent can answer for
 
 `"all"` gets the words into a channel. It does not make them answerable: the
 process that produced them has exited, and the Chat Agent — which is who the
@@ -329,8 +443,10 @@ where that leaves it another platform to post to; on an install where the cron
 child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
-`deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
-it and thereby owns the thread the user replies in. It is a delivery mode, not a
+`deliver: "chat"` hands the run's report to the relay instead, which posts it as
+written (on Slack, a fleet-audit report is replaced by a headline linking its
+ledger issue) and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
@@ -347,8 +463,8 @@ that Hermes registers like any other. So it is one target among several — a jo
 on `"chat,slack"` relays _and_ posts, and an unreachable relay records
 `last_delivery_error` rather than falling back. Note that `"all"` now expands to
 include the relay, so `"all"` and `"chat"` together deliver once, not twice, but
-`"all"` alone relays too. The full rationale — why the Chat Agent composes but
-does not send, why the session is per job per day, why a mode rather than an
+`"all"` alone relays too. The full rationale — why the report is posted as the
+job wrote it, why the thread is per job per day, why a mode rather than an
 instruction, and what the plugin route costs — is
 [`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
 

@@ -252,6 +252,18 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 // more than these posts.
 func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations func(gateway.Adapter) gateway.NotifyConversations,
 	log *slog.Logger) *gateway.Notifier {
+	if slack, ok := backend.(*gateway.SlackAdapter); ok {
+		if cfg.SlackHomeChannel == "" {
+			log.Info("chat.notify home posts not armed: no Slack home channel configured; conversation posts are")
+		}
+		n, err := gateway.NewSlackNotifier(slack, cfg.SlackHomeChannel, log)
+		if err != nil {
+			log.Error("chat.notify route not armed", "err", err)
+			return nil
+		}
+		n.SetConversations(conversations(slack))
+		return n
+	}
 	gchat, ok := backend.(*gateway.GoogleChatAdapter)
 	if !ok {
 		return nil

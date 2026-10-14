@@ -949,8 +949,10 @@ const (
 	scopeDir        = "/etc/kube-agents"
 	scopeFileName   = "scope.json"
 
-	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is. One
-	// reader, by design; a second code site naming this key is a review comment.
+	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is, and
+	// the platform MCP server's fleet_scope tool (fleet_scope_targets.py), which reads
+	// it when no reconcile snapshot answers that a boundary is in force. Two readers,
+	// by design; a third code site naming this key is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
@@ -3050,6 +3052,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// Unconditional and in both modes, unlike the chat relay URLs: the remote
+	// MCP servers are in every profile that runs here, and mcp-remote presents
+	// the token above to reach them. A plugin cannot redirect it; the operator
+	// always emits the name.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  mcpRelayURLEnvVar,
+		Value: mcpRelayURL(agent),
+	})
 	// The A2A bus, under `next` only: the address, and the name this container
 	// authenticates as. There is no password here since A5. The credential is
 	// the projected ServiceAccount token mounted below, the callout resolves it
@@ -3108,6 +3118,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// count Chat as a platform to post to ahead of Slack.
 	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
+	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+		// Slack's half of the same rule: the Hermes slack platform is off
+		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
+		// the single-backend gateway, so at most one platform is routed.
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
+		// The agent's own idea of the Slack home channel, as under today: the
+		// audit relay gates its report card on knowing a channel and records
+		// it on the incident's routing row. The Hermes slack platform is off
+		// here, so this arms nothing on the agent but those readers.
+		envVars = append(envVars, corev1.EnvVar{Name: "SLACK_HOME_CHANNEL", Value: a2aSlackHomeChannel(agent)})
+	}
+	// A kanban card's report back to the gateway conversation it was filed
+	// in rides the same route whenever the gateway arms it, home channel or
+	// not; only the kanban notifier reads this.
+	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
+	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in rides the same route whenever the gateway arms it, home channel or
@@ -4622,6 +4650,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Harness messages: the harness's own Slack messages (the
 	//     scheduled-report wrapper, the heartbeat, restart and shutdown
 	//     notices, command and system replies) are reworded or left out.
+	//   - Finished answers: a completed card's answer posts as its first
+	//     sentence in bold with the rest in a collapsed "why" fold and a
+	//     closing question below it, in the same thread, with the same text.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's

@@ -1,91 +1,11 @@
 package gateway
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestIsStatusQuery(t *testing.T) {
-	// Exact phrases are the affordance everywhere - including narrow mode,
-	// the posture for executors that run follow-ups.
-	exact := []string{
-		"what is it doing", "What's it doing?", "status", "Status?",
-		"how's it going", "how is it going", "whats going on",
-		"any progress", "any updates?", "progress", "where are we",
-	}
-	// Interrogative shapes match only under the wide posture, where the
-	// executor refuses follow-ups (no-resume) and a false positive costs
-	// nothing.
-	wideOnly := []string{
-		"what is the agent doing",
-		"what is kage doing",
-		"any update on the rollout",
-	}
-	// Steers the wide rule mistakes for status asks - the documented cost
-	// of the width bias, and why executors that run follow-ups get narrow.
-	wideCost := []string{
-		"any update to the config should be reverted",
-		"how about doing the upgrade instead",
-	}
-	never := []string{
-		"also check the memory limits",
-		"stop",
-		"what is the memory limit on the nats pod and can you also check its restarts", // long compound: steer
-		// Status-ish and interrogative, so only the wideMatchLenCap guard
-		// keeps it a steer: past the cap it is a composed instruction.
-		"what is the agent doing about the memory limit on the nats pod and its restarts",
-		"delete the deployment",
-	}
-	for _, s := range exact {
-		if !isStatusQuery(s, false) || !isStatusQuery(s, true) {
-			t.Errorf("expected status query in both modes: %q", s)
-		}
-	}
-	for _, s := range append(wideOnly, wideCost...) {
-		if !isStatusQuery(s, true) {
-			t.Errorf("expected wide status query: %q", s)
-		}
-		if isStatusQuery(s, false) {
-			t.Errorf("expected narrow mode to forward as a steer: %q", s)
-		}
-	}
-	for _, s := range never {
-		if isStatusQuery(s, true) || isStatusQuery(s, false) {
-			t.Errorf("expected NOT a status query in any mode: %q", s)
-		}
-	}
-}
-
-func TestIsDelegate(t *testing.T) {
-	yes := map[string]string{
-		"Delegate: write a haiku about message buses": "write a haiku about message buses",
-		"delegate write a haiku":                      "write a haiku",
-		"DELEGATE - check the fleet, then report":     "check the fleet, then report",
-		"  delegate,  summarize #930  ":               "summarize #930",
-		"Delegate:\nmultiline task":                   "multiline task",
-	}
-	for in, want := range yes {
-		got, ok := isDelegate(in)
-		if !ok || got != want {
-			t.Errorf("isDelegate(%q) = (%q, %v), want (%q, true)", in, got, ok, want)
-		}
-	}
-	no := []string{
-		"delegate",
-		"delegate:",
-		"Delegated tasks are neat",
-		"can you delegate this",
-		"delegation is the demo",
-		"what is it doing",
-		"",
-	}
-	for _, in := range no {
-		if got, ok := isDelegate(in); ok {
-			t.Errorf("isDelegate(%q) = (%q, true), want false", in, got)
-		}
-	}
-}
 
 // TestChatChunksKeepFencesBalanced: the adapters translate each chunk alone,
 // so a cut inside a fenced block must close the block at the end of the
@@ -353,38 +273,45 @@ func TestChatChunksDoNotRepeatTheOpenersLine(t *testing.T) {
 	}
 }
 
-func TestIsSessionCommand(t *testing.T) {
-	yes := map[string]string{
-		"/session":                             "",
-		"/session off":                         "off",
-		"/SESSION Off":                         "Off",
-		"  /session what is running in ns x  ": "what is running in ns x",
-		"/session\nmultiline first turn":       "multiline first turn",
-		"/session\toff":                        "off",
+// TestChatChunksCarryATableHeadAcrossACut: a pipe table cut across chunks
+// gets its header and delimiter rows again at the head of the next chunk, so
+// each chunk renders (toMrkdwn) as a table rather than raw rows; nothing else
+// is added, and text without a table running across the cut splits as before.
+func TestChatChunksCarryATableHeadAcrossACut(t *testing.T) {
+	head := "| Pod | Status | Restarts |\n| --- | --- | --- |"
+	var rows strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&rows, "\n| pod-%03d | Running | %d |", i, i%7)
 	}
-	for in, want := range yes {
-		got, ok := isSessionCommand(in)
-		if !ok || got != want {
-			t.Errorf("isSessionCommand(%q) = (%q, %v), want (%q, true)", in, got, ok, want)
+	text := "## Pods\n\n" + head + rows.String() + "\n\nAll pods listed."
+	chunks := chatChunks(text, discordChunk)
+	if len(chunks) < 3 {
+		t.Fatalf("got %d chunks, want the table cut at least twice", len(chunks))
+	}
+	var joined strings.Builder
+	for i, c := range chunks {
+		if len(c) > discordChunk {
+			t.Errorf("chunk %d is %d bytes, over the cap", i, len(c))
 		}
-	}
-	no := []string{
-		"/sessions", "/sessionoff", "/ session", "session", "session off",
-		"delegate: /session", "/help", "/", "", "please /session",
-	}
-	for _, in := range no {
-		if got, ok := isSessionCommand(in); ok {
-			t.Errorf("isSessionCommand(%q) = (%q, true), want false", in, got)
+		if i > 0 && strings.Contains(c, "| pod-") {
+			if !strings.HasPrefix(c, head+"\n") {
+				t.Errorf("chunk %d holds table rows without the carried head: %q", i, c[:min(len(c), 60)])
+			}
+			if !strings.Contains(toMrkdwn(c), "Pod     | Status  | Restarts") {
+				t.Errorf("chunk %d does not render as a table: %q", i, toMrkdwn(c)[:min(len(toMrkdwn(c)), 80)])
+			}
+			joined.WriteString(strings.TrimPrefix(c, head))
+			continue
 		}
+		joined.WriteString(c)
 	}
-	for _, rest := range []string{"off", "OFF", " off ", "off.", "off!", "Off,"} {
-		if !isSessionOff(rest) {
-			t.Errorf("isSessionOff(%q) = false, want true", rest)
-		}
+	if joined.String() != text {
+		t.Errorf("chunks, with the carried heads removed, are not the original text")
 	}
-	for _, rest := range []string{"", "offline", "turn off", "on"} {
-		if isSessionOff(rest) {
-			t.Errorf("isSessionOff(%q) = true, want false", rest)
-		}
+
+	// A table that ends before the cut, with prose running across it, carries nothing.
+	prose := head + "\n| a | b | c |\n\n" + strings.Repeat("prose line | with a pipe in it\n", 200)
+	if got := strings.Join(chatChunks(prose, discordChunk), ""); got != prose {
+		t.Errorf("a table that ended before the cut changed the split")
 	}
 }

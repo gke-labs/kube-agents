@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -27,6 +28,14 @@ const sessionProfile = "chat"
 // sessionKindDM is the SessionRecord.Kind of a direct message, the one Slack
 // surface that carries every message without a mention.
 const sessionKindDM = "dm"
+
+// topLevelNothingRunningNotice answers a "stop" or a status question typed
+// in a message the adapter marked TopLevel: one that roots a conversation of
+// its own (a top-level Slack DM), so nothing is running in it and the task
+// the user means is in another thread. The notice says where to send it. A
+// thread with nothing running, a question refused at the session cap among
+// them, gets the plain reply: the user is already in the right place.
+const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
@@ -179,7 +188,7 @@ type Gateway struct {
 	// gateway was a no-resume refusal - an executor that cannot continue a
 	// session, the bridge's cli executor - under mu, and cleared by a
 	// queued notice from it. routeTurn gives such an addressee the wide
-	// status matcher (isStatusQuery says why). The gateway cannot see the
+	// status matcher (chattext.IsStatusQuery says why). The gateway cannot see the
 	// executor, so the first follow-up to one is acknowledged and refused
 	// before this is learned.
 	steersRefusedBy map[string]bool
@@ -806,9 +815,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
 	// its text says.
-	sessionRest, sessionCmd := isSessionCommand(msg.Text)
+	sessionRest, sessionCmd := chattext.IsSessionCommand(msg.Text)
 	if sessionCmd && g.spawner != nil && g.cfg.DefaultAddressee == RouteSession &&
-		sessionRest != "" && !isSessionOff(sessionRest) {
+		sessionRest != "" && !chattext.IsSessionOff(sessionRest) {
 		// Post-flip, every conversation is a session already, so
 		// "/session <text>" is <text>: the ordinary turn it would have been
 		// without the prefix, not a confirmation that drops the ask.
@@ -818,7 +827,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
 	// above, so a post-flip "/session stop" is the stop it unwraps to.
-	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
+	stopping := msg.Intent == IntentCancel || chattext.IsStop(msg.Text)
 	// A program holds a delegation chain's root id only (observedAs), so a
 	// cancel naming the root while the chain runs is a cancel of the task
 	// that is running: the child, or the wake. Published at the root's own
@@ -845,8 +854,14 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
+	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
+	case msg.Intent == "" && msg.TopLevel && active == nil && chattext.IsStatusQuery(msg.Text, false):
+		// A status question that roots its own conversation has no task to
+		// report on and must not become one that reads "any update?".
+		// chattext.IsStatusQuery is a phrase set, so a real question such
+		// as "how is the deploy doing" still starts a task.
+		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -858,9 +873,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// task that literally reads "stop": the impatient second "stop"
 		// (cancel sent, terminal pending) and a bare "stop" with nothing
 		// running both land here, answered deterministically.
-		if active != nil {
+		switch {
+		case active != nil:
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
-		} else {
+		case msg.TopLevel:
+			g.post(rec.Key, topLevelNothingRunningNotice)
+		default:
 			g.post(rec.Key, "🤷 nothing is running")
 		}
 	case active != nil && !active.Detached:
@@ -872,7 +890,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			"addressee", rec.Addressee, "taskAge", time.Since(active.SubmittedAt).Round(time.Second))
 		g.steerTask(ctx, rec, msg, backend, authority)
 	default:
-		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {
+		if rest, ok := chattext.IsDelegate(msg.Text); ok && g.spawner != nil {
 			// The Delegate flow (W4 amendment): this ONE task goes to a
 			// freshly spawned session worker - the addressee is the new
 			// session name, the rest of the text is the task. On a
@@ -1155,7 +1173,8 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason); !woken {
+			// false: the heal's status card above carries no result text.
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1559,7 +1578,7 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // when the turn was refused part-way (the cap, or a previous task that could
 // not be closed) and the in-memory route change must not persist.
 func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority Authority) bool {
-	off := isSessionOff(rest)
+	off := chattext.IsSessionOff(rest)
 	// The way back is answered even with no spawner: a record left
 	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
 	// shape) would otherwise publish every ask to an addressee nothing
@@ -1580,6 +1599,13 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
 	if off {
+		// A top-level message in a Slack DM roots a conversation of its own,
+		// so a top-level /session off cannot reach the thread the user routed.
+		// Say where it goes instead of answering for the fresh conversation.
+		if msg.TopLevel && !rec.SessionRouted {
+			g.post(rec.Key, topLevelSessionOffNotice)
+			return true
+		}
 		if !rec.SessionRouted {
 			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
 			return true
@@ -1607,7 +1633,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		g.post(rec.Key, "ℹ️ already on the session route")
 		return true
 	}
-	if isStop(rest) {
+	if chattext.IsStop(rest) {
 		// "/session stop" is almost certainly the way back misspelled. It
 		// must never become a task whose text reads "stop" - the same rule
 		// the stopping case below enforces for a bare "stop".
@@ -1647,14 +1673,24 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	return true
 }
 
+// topLevelSessionOffNotice answers a /session off typed at the top of a
+// Slack DM, where it roots a fresh conversation rather than reaching the
+// thread whose session the user means.
+const topLevelSessionOffNotice = "ℹ️ `/session off` acts on the thread it's typed in — reply `/session off` in that question's thread"
+
 // sessionOnAck is the reply to a bare /session. It promises what the backend
 // will deliver: the Slack adapter forwards an unmentioned channel-thread
 // reply only once the gateway has started a task in that thread, and a
 // /session binding starts none, so in a Slack channel the next message needs
-// the mention. DMs carry every message; the other backends route the next
+// the mention. A Slack DM carries every message, but each top-level DM is a
+// conversation of its own, so the binding holds only for replies in the
+// thread the /session was typed in. The other backends route the next
 // message on their own rules.
 func sessionOnAck(backend, kind, defaultAddressee string) string {
-	if backend == slackBackend && kind != sessionKindDM {
+	if backend == slackBackend && kind == sessionKindDM {
+		return "🧵 session route on — reply in this thread to open a session pod; `/session off` returns to `" + defaultAddressee + "`"
+	}
+	if backend == slackBackend {
 		return "🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); `/session off` returns to `" + defaultAddressee + "`"
 	}
 	return "🧵 session route on — your next message opens a session pod; `/session off` returns to `" + defaultAddressee + "`"

@@ -269,9 +269,9 @@ def test_parse_node_builds_the_case_objective() -> None:
 def test_the_stack_arms_and_disarms_the_jobs_the_delivery_script_names() -> None:
     script, stack = DELIVERY.read_text(), STACK.read_text()
     assert 'SCAN_JOB_ID = "bootstrap-inventory-scan"' in script
-    assert 'DELIVERY_JOB_ID = "bootstrap-inventory-delivery"' in script
+    assert 'OOBE_JOB_ID = "oobe"' in script
     assert 'scan_job     = "bootstrap-inventory-scan"' in stack
-    assert 'delivery_job = "bootstrap-inventory-delivery"' in stack
+    assert 'delivery_job = "oobe"' in stack
     # Arming is the last step of the create, and the destroy undoes it.
     create, destroy = stack.split("when        = destroy", 1)
     assert create.rindex("base64encode(local.arm_py)") > create.index("# ---- 5.")

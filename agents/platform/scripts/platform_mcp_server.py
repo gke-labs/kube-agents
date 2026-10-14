@@ -32,6 +32,7 @@ from cluster_agent_profile import (
 )
 from gke_endpoint import dns_endpoint_args
 from profile_scaffold import profiles_base
+import fleet_scope_targets
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -42,9 +43,9 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 DEFAULT_AGENT_HOME = "/opt/data"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
-# synchronously — it creates the session, runs a whole Chat Agent turn (its own
-# 300s ceiling) and blocks on `hermes send` before answering — so this has to
-# outlast the work, not just a connect stall. Deliberately the same 360s the
+# synchronously — it blocks on `hermes send` to every enabled platform, and on a
+# Slack audit headline's ledger read, before answering — so this has to outlast
+# the work, not just a connect stall. Deliberately the same 360s the
 # delivery plugin uses (`RELAY_TIMEOUT_SECONDS`,
 # deploy/docker/plugins/chat/adapter.py), for the same reason and with the same
 # ordering: the server's verdict must be what the caller records.
@@ -426,6 +427,63 @@ def _cluster_agent_roster() -> list[dict]:
             log(f"Warning: could not read the cluster identity of {home.name}: {e}")
         roster.append(entry)
     return roster
+
+
+@mcp.tool()
+def fleet_scope() -> str:
+    """
+    The install's declared scope, resolved: which GCP projects a fleet audit
+    sweeps, and the arguments to hand its collector.
+
+    Reads the reconcile's snapshot (fleet_scope.json at the data volume's
+    root). Returns JSON:
+      {"declared": true, "resolved_at": "...", "projects": [...],
+       "unread": [{"project": ..., "outcome": ...}], "collector_args": "...",
+       "source": "<the snapshot's path>"}
+    `projects` is the sweep: every project the scope resolved to that this
+    install could read (its Kubernetes Engine API off included; the collectors
+    count such a project empty), plus the management project whatever the
+    tick read of it, since the collectors read it themselves. `unread` names each declared project the
+    install could not read (denied, unreachable, over-cap), or has not
+    resolved yet (`unresolved`); the collectors record them as a coverage gap.
+    One entry, `declared-scope=unresolved`, is not a project: it rides when
+    the reconcile has not resolved the declaration (before its first tick, or
+    on a tick that could not read the render while a folder, organisation or
+    selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
+    a collector command verbatim (`--scope-projects ... --scope-unread ...`);
+    when nothing is readable it carries `--scope-unread` alone, and the
+    collector then reports that and sweeps nothing. When no snapshot answers
+    that a boundary is in force (before the reconcile's first tick, or when
+    the last tick wrote `boundary: false`) the answer comes from the
+    operator's render: the management project alone, with a `note` saying so. `{"declared": false, "note":
+    "..."}` means the install declares no scope: the collectors then enumerate
+    every project the identity can list, as before scopes existed. A spec.scope block that
+    is present with empty lists is a declared scope of the management project
+    alone, not the absence of one. The collectors cannot read the snapshot
+    themselves: they run in the shell sandbox, whose data volume is not this
+    pod's.
+    """
+    try:
+        targets = fleet_scope_targets.declared_scope_targets()
+    except fleet_scope_targets.ScopeRenderUnreadable as e:
+        # Not "no scope": the operator always writes the render, so an
+        # unreadable one is a fault, and the SOPs' declared: false branch
+        # would list every visible project on an install that declares one.
+        return f"ERROR: the operator's scope render could not be read, so the scope is unknown; do not enumerate projects: {e}"
+    except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
+        return f"ERROR: Could not read the scope snapshot: {e}"
+    if targets is None:
+        return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
+                           "note": "no declared scope: the collectors enumerate every project the identity can list"}, indent=2)
+    return json.dumps({
+        "declared": True,
+        "resolved_at": targets.resolved_at,
+        "projects": list(targets.projects),
+        "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
+        "collector_args": targets.collector_args(),
+        **({"note": targets.note} if targets.note else {}),
+        "source": targets.path,
+    }, indent=2)
 
 
 @mcp.tool()
@@ -949,12 +1007,13 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     Send a report from a SCHEDULED (cron) job to the user's chat channel mid-run.
 
     You usually do NOT need this. A job created with deliver='chat' has its final
-    response relayed to the Chat Agent automatically, with nothing to call and
-    nothing to remember. Use this tool only when that is not enough: to report
+    response relayed to chat automatically, with nothing to call and nothing to
+    remember. Use this tool only when that is not enough: to report
     partway through a long run, or to send something other than your final answer.
 
     Having called it, return exactly `[SILENT]` so the same finding is not also
-    delivered as the run's result. The Chat Agent presents what you pass, so write
+    delivered as the run's result. What you pass is posted as written (on Slack a
+    fleet-audit report is shown as a headline linking its ledger issue), so write
     `report` as the finished message for a human reader, not as notes to yourself.
 
     Prefer this over send_notification for scheduled work: send_notification posts
@@ -1002,15 +1061,15 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # fan-out that reached some platforms and not others, and says which in
     # `relay` and `undelivered`. Reading both here is the difference between the
     # agent knowing what actually happened to its report and it believing the
-    # Chat Agent framed it for everyone. The relay adapter — the other caller of
+    # report reached everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
     #
     # `relay_detail` is the route's own wording for the degradation, so this
-    # end stops hard-coding it: `degraded` has one cause today (the Chat Agent
-    # turn did not compose the report; a leg that never landed keeps `relay:
-    # ok` and shows up in `undelivered` instead). Older routes do not send it;
-    # the sentence they used to get is the fallback.
+    # end does not hard-code it. A current route never sends `degraded`; an
+    # older one did when its Chat Agent turn over the report failed, and its
+    # sentence is the fallback for a route too old to send a detail. A leg that
+    # never landed keeps `relay: ok` and shows up in `undelivered` instead.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":
@@ -1044,7 +1103,7 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
         )
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {session}). "
-        "The Chat Agent posts it; do not also call send_notification for this report."
+        "It is posted to chat; do not also call send_notification for this report."
     )
 
 

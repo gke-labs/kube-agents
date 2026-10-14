@@ -19,8 +19,9 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
-one when they stop ([below](#a-backed-up-pool)), plus, for the watched Prow
+([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+are refused a project and one when they stop ([below](#a-backed-up-pool)),
+plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
 ([below](#the-watched-periodics)).
 The digest also carries one line on last night's run of the nightly tier
@@ -189,8 +190,10 @@ also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the GitLab lane's runs too
-(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): the same matrix
-against a pool project's GitLab repository, listed in the Brief's "GitLab
+(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): on a pull request the
+forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones; the GitLab
+nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
+section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
 history or digest line.
 
@@ -294,9 +297,10 @@ Runs still pass; /retest makes the queue longer.
 ```
 
 Those are the numbers the verdict was reached on. The periodic breaches on a
-day's row or on runs queued past p95 right now, never on the seven-day window,
-which one bad day leaves inside its own limit. A breach on only one of the two
-carries only that line.
+day's row, on runs queued past p95 right now, or on a run refused a project by
+Boskos in the last three hours; never on the seven-day window, which one bad
+day leaves inside its own limit. A breach on only one of the three carries only
+that line.
 
 The stretch quoted is the last three hours, not the worst day, which a
 week-long verdict leaves up to six days older than the incident. The three
@@ -305,9 +309,11 @@ day's row needs; otherwise the worst day is what is left to show, and the label
 says which it was.
 
 A ⏳ also needs a run that has been waiting past the p50 limit at the moment of
-the reading. Not the p95 limit, because a pool full all afternoon with every
-run waiting half an hour is the case this message is for; and not any queued
-run at all, because one triggered seconds ago is not a backlog. The remedy is
+the reading, or a refused acquire in the last three hours, which is a backlog
+that has already cost a run and leaves nothing queued to see. Not the p95
+limit, because a pool full all afternoon with every run waiting half an hour is
+the case this message is for; and not any queued run at all, because one
+triggered seconds ago is not a backlog. The remedy is
 recomputed hourly from a live count of leased projects while the verdict stands
 for a week, so a pool that filled on Monday and drained by Tuesday would
 otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
@@ -320,12 +326,17 @@ queue read too: it means the pool looked fine so Prow must be at fault, which
 holds only while something is queued. Unread, the message gives the free count
 and apportions no blame. `pool full` keeps its remedy either way and drops "and
 runs are queuing" whenever Deck did not see a backlog — the leased count is this
-hour's, the queue is Deck's.
+hour's, the queue is Deck's. A refusal keeps the cause for three hours, so once
+the pool has drained the header reads `pool was full` with the free count
+instead of calling the projects leased — unless a run is waiting past the p50
+limit with projects free, when the live diagnosis wins and the refusal is a
+line under it.
 
 A drained queue also ends what the jam said. The verdict holds for a week, so a
 pool that fills every afternoon would otherwise be announced on Monday and
 silent for the rest of it; the causes already named are forgotten on a reading
-that shows nothing waiting, and the next jam is news again — a next jam that has
+that shows nothing waiting and no refusal in the last three hours, and the next
+jam is news again — a next jam that has
 to be measured, since an hour Deck could not be read has seen no queue at all.
 The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
@@ -434,8 +445,8 @@ build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
-was told about passes again, on a reading only, or, for the on-merge
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on. The failed and stopped
+was told about passes again, on a reading only, or, for the postsubmit
+reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines under its
 second: a headline naming where and what stopped happening ("Eval GitOps repos:
 leftover pull requests from eval runs are not being cleaned up"); the job, what
@@ -635,7 +646,7 @@ the top of every hour (`0 * * * *`, a second cron in the same workflow; the
 `github.event.schedule` guards send each run to one job) it runs
 `scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
 temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
-`hack/fleet-fixture-state.py --wait 0 --report`, seven projects at a time, and
+`hack/fleet-fixture-state.py --wait 0 --report`, eight projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
 and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
@@ -759,7 +770,7 @@ the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 `verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,gitops_default_branch,token_minter_kms --report`
-against every pool project, seven at a time, and publishes
+against every pool project, eight at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
 `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
@@ -849,7 +860,7 @@ mean "retest" by that word, and this one has nothing to retest for.
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
 past which it starts no check and cuts every command short, so a stall costs the reads it
 hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
-scan's own ceiling (1620 s: five waves of seven projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
+scan's own ceiling (1620 s: five waves of eight projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
 laptop as whoever is logged in.

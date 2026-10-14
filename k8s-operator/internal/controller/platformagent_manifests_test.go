@@ -1499,13 +1499,14 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	// whatever the builder renders, so a request that drifted back down would
 	// otherwise pass every test. 500m is what lets a mint finish inside its
 	// five-second timeouts while an evicted pod's replacement warms up, and
-	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
-	// rendered request is the admitted one on both cluster modes.
+	// 1Gi is the memory the child memory budget needs when Autopilot without
+	// bursting makes the request the limit: above the 512Mi the CPU:memory
+	// band would admit a 500m pod at, and above the budget's 672Mi floor.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
-		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
+	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
+		t.Errorf("expected a 1Gi memory request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Limits.Cpu().String(); got != "1" {
 		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
@@ -4437,6 +4438,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "KUBE_AGENTS_MCP_RELAY_URL", Value: "http://attacker.invalid/v1/mcp"},
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
@@ -4464,6 +4466,13 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// leave the plugin as the only writer.
 	if value, ok := env["CREDENTIAL_PROXY_URL"]; !ok || value != "" {
 		t.Errorf("plugin must not be able to set CREDENTIAL_PROXY_URL, got %q (present=%v)", value, ok)
+	}
+
+	// KUBE_AGENTS_MCP_RELAY_URL is appended after the merge too. A plugin that
+	// could set it would point every mcp-remote child at a listener of its own,
+	// which would then receive the projected token mcp-remote presents.
+	if value := env["KUBE_AGENTS_MCP_RELAY_URL"]; value != mcpRelayURL(agent) {
+		t.Errorf("plugin must not be able to set KUBE_AGENTS_MCP_RELAY_URL, got %q", value)
 	}
 
 	// PATH is appended by the same mechanism and for the same reason, and it is

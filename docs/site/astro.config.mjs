@@ -98,6 +98,7 @@ export default defineConfig({
             { label: 'Introduction', link: '/' },
             { label: 'What is kube-agents', link: '/overview/what-is-kube-agents/' },
             { label: 'Proactive autonomy', link: '/overview/proactive-autonomy/' },
+            { label: 'A day with kube-agents', link: '/overview/day-in-the-life/' },
             { label: 'Architecture', link: '/overview/architecture/' },
           ],
         },
@@ -106,6 +107,7 @@ export default defineConfig({
           items: [
             { label: 'Prerequisites', link: '/install/prerequisites/' },
             { label: 'Quick start (GKE)', link: '/install/quickstart-gke/' },
+            { label: 'Slack app setup', link: '/install/slack-app/' },
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },
             { label: 'GitLab as the GitOps forge', link: '/install/gitlab/' },

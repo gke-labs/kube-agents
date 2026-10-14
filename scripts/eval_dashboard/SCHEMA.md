@@ -568,6 +568,14 @@ what the renderer does with them.
   record) is the same note, and any other failure is the refusal line, as
   it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
   the refusal line either way, as for the nightly.
+- `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
+  periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
+  night), read as `--nightly-prefix` is (the prefix is its index, `pr`
+  null, `log_url` set, the nightly's rule on a listing that fails) but
+  tagged `tier: "gitlab"`, above the nights' own watermark: the lane's
+  pull-request builds and its nights are two sources of one tier, told
+  apart by `pr`. Given without a value it is
+  `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/`.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -889,17 +897,21 @@ and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
-`gitlab` is `{job, runs[], running[], counts{on_record, green, red}}` from
-`forge_lane.py`: the GitLab lane's runs (`runs[].tier == "gitlab"`) **newest
+`gitlab` is `{job, runs[], running[], counts{on_record, green, red},
+nightly_job, nights[], night_counts{...}}` from `forge_lane.py`: the GitLab
+lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
 first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
-project, started, finished, duration_s, result, eval_verdict, green,
-tasks{pass, fail, infra}}` (`green` is Prow's `SUCCESS`; `tasks` counts the
+project, log_url, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}`; `nights[]` the same shape for the lane's nightly
+runs (`pr` null, `log_url` the periodic's Spyglass page), `nightly_job` the
+newest night's job else the default, `night_counts` over every night on
+record (`green` is Prow's `SUCCESS`; `tasks` counts the
 run's task rows by result); `running[]` the lane's `pending_builds` as
 `{build, first_seen}`, only those first seen inside `RUNNING_MAX_AGE` (8 h,
 the presubmit's ceiling plus upload time) of the reference time, as the Grid's
 columns and the nightly's `running[]` are bounded; `counts` over every lane
-run on record. `job` is the
-name the newest lane run carries, else the default. The Brief's "GitLab
+pull-request run on record. `job` is the
+name the newest lane pull-request run carries, else the default. The Brief's "GitLab
 lane" section is this block and nothing else reads it: the lane's runs are
 in no gate number, no case history and no digest line.
 
@@ -1029,15 +1041,22 @@ it is set.
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
-threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
-`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
+no_build_id, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
+refused a project in the periodic's recent window of `lease_failures_hours`
+hours, and `no_build_id` how many projects are leased under an owner that is
+neither a Prow run nor a known job's fixed owner; `lease_failures` and
+`no_build_id` are `null` under these names from an
+artifact written before the
+periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue
 and `null` when Deck was not read; `over_threshold` is the count already past
 the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
 live backlog — and `null` when Deck was unread or no limit was given. A verdict
 lasts a week, so every present-tense reader asks it: the alert is withheld on
-`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
-Brief go past tense on either. `waiting_since` dates the backlog from its
+`false` unless `lease_failures` is non-zero, `CONTROL_PLANE` drops its
+diagnosis on `null`, and the digest and Brief go past tense on either. `waiting_since` dates the backlog from its
 oldest queued run, and is `null` when there is none; the Brief's present-tense
 sentence prefers it to `since`, which can be days older.
 `breach_seen` says whether the open episode has ever measured a breach, and
@@ -1045,20 +1064,23 @@ sentence prefers it to `since`, which can be days older.
 a stretch that only ever said the queue could not be read. `metrics` carries
 both across a tick that read no artifact, as `pool_since` and
 `pool_breach_seen`. The two
-figures are never the seven-day window's — the periodic breaches on a day's row
-or on runs queued past p95 right now, and the window sits back inside its own
-limit after one bad day. Exactly one of `window_hours` and `day` says which
+figures are never the seven-day window's — the periodic breaches on a day's row,
+on runs queued past p95 right now, or on a run refused a project in its recent
+window, and the seven-day window sits back inside its own limit after one bad
+day. Exactly one of `window_hours` and `day` says which
 stretch they cover: the periodic's recent window when it had the runs to judge
 it and went over a limit, the worst breached day otherwise. A verdict lasts a
 week, so the recent window comes first — a Thursday incident evidenced by
 Monday reads as a contradiction — but a compliant stretch is the same
-contradiction, only newer. Both are `null` when only the live queue breached;
-`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+contradiction, only newer. Both are `null` when only the live queue or only a
+refusal breached; `over_threshold` counts the queued runs and `lease_failures`
+the refused ones. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
-`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
-`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
-headline and on the last-24-hours view.
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `waiting_now`,
+`waiting_since`, `over_threshold`, `threshold_p50_s`, `threshold_p95_s`,
+`lease_failures` and `lease_failures_hours` for one sentence on the Brief's
+healthy headline and on the last-24-hours view.
 `metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
 `null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
 the artifact was there at all. Nothing else answers that: `pool` is `null` for a
@@ -1107,7 +1129,8 @@ finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
 when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
-over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them);
+over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
+from before #2645 carry the git tree id of `bench/tf/fleet` instead);
 `main_check_error` is set when the moved-check could
 not read main; outcomes are applied, converged, unchanged, planned, busy,
 refused, failed, interrupted, not_reached); the sweep's,
@@ -1124,9 +1147,10 @@ reading arrived for this tick, whether or not they are noted; the poster clears
 a told job on a reading that shows it clean, or when `periodics_superseded`
 marks it recovered. That map is `{job: {build, recovery[, by]}}` for the jobs
 whose latest failed build a later build of the job that supersedes them (the
-daily, for the on-merge reconcile) has dealt with: `recovery` true when the
+daily, for the postsubmit reconcile) has dealt with: `recovery` true when the
 daily passed having reached every project the failed build named, at the same
-`fleet_tree` (a project a whole pass no longer lists has left the pool and
+`fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
+is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
 failed itself, so its own note is the current story and nothing clears; `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,

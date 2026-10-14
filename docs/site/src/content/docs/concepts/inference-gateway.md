@@ -85,7 +85,7 @@ The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets
 
 ### Prompt caching
 
-Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in the shipped `config.yaml`:
+Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so when the default model is an Anthropic-family one (`MODEL_PROVIDER=anthropic`, or `vertex_ai` with a `claude-` model), the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in its `config.yaml`:
 
 ```yaml
 router_settings:
@@ -106,7 +106,13 @@ The agent cannot do this itself, and that is the point of putting it here. It as
 
 The system prompt takes the 1h tier because it is the largest static span, every profile and cron tick shares it, and a read refreshes the TTL — so a half-hourly cron schedule keeps it warm instead of missing a 5-minute window every time. The two rolling points ride the conversation tail on the default 5-minute tier. Anthropic allows four breakpoints per request; LiteLLM counts any the caller supplied and never overwrites them, so a client with its own layout still wins.
 
-Nothing here is provider-specific. Non-Anthropic backends drop the markers in their provider transforms — Gemini and Gemma routes answer normally with unchanged token counts — and Gemini's own implicit caching, which needs no markers at all, is unaffected. Leaving the block in place on a Gemini install costs nothing and means switching to `MODEL_PROVIDER=anthropic` doesn't quietly switch caching off.
+Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into Vertex explicit context caching: before every model call it lists the project's cached contents, and it creates a new cache whenever the cached prefix is new. A create that Vertex is slow to finish fails the whole turn: in one case it surfaced as a 401 after a stall of more than ten minutes. Gemini's implicit caching needs no markers and still serves a repeated prefix from cache. The chart applies the same rule as it does to the sampling keys above, so switching `MODEL_PROVIDER` re-renders the breakpoints with it. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
+
+### Replayed thinking on Gemini
+
+A client that turns thinking on, as Claude Code does in the session pods of an install on the unsupported `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM passes that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini reads its earlier thought summaries as things it said and opens its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reaches that text.
+
+Both the chart and the kustomize base therefore load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`.
 
 ### Redaction at the gateway
 

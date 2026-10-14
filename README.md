@@ -28,6 +28,8 @@ Each of these is a single chat message. The agent answers in the thread from rea
 4. **"Something in the `payments` namespace on `prod-east` stopped making progress without erroring. Find it."** — The work is delegated to the Cluster Agent for that cluster, which looks for controllers whose `observedGeneration` lags, progress conditions that stopped advancing, repeating warning events, and references to objects that do not exist. ([`gke-stall-detection`](agents/cluster/skills/gke-stall-detection/SKILL.md))
 5. **"`checkout` on `prod-east` has been crash-looping since this morning. What happened?"** — The Cluster Agent for that cluster fixes the time window, reads the container's exit codes and the events around them, tells an OOM kill from an application crash, and proposes the manifest correction without applying it. ([`gke-workload-troubleshooting`](agents/cluster/skills/gke-workload-troubleshooting/SKILL.md))
 
+On an install running the unsupported `spec.mode: next`, the agent still answers these in the thread, with a few differences in how the answer is delivered; [how a chat question is answered under `next`](https://gke-labs.github.io/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through each step.
+
 ---
 
 ## ⚡ Try it now
@@ -38,7 +40,7 @@ The fastest, zero-friction way to install `kube-agents` in **Google Cloud Shell*
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-_Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+_Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`; a GitLab install needs `0.9.0` or later)._
 
 This interactive installer (recommended for initial setup) guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials. Sensible defaults are detected from your `gcloud` context, requiring minimal input.
 
@@ -66,7 +68,7 @@ and credential with me. Run install.sh with --dry-run and show me its printed su
 Only run the real install after I say yes.
 ```
 
-The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation). An assistant working in a checkout of this repository also picks up the [`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill, which covers the same install.
+The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation). The GitOps repository can be on GitHub or on GitLab (gitlab.com or a self-managed instance); [INSTALL.md](INSTALL.md#non-interactive--ai-agent-execution-mode) gives the flags for each. An assistant working in a checkout of this repository also picks up the [`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill, which covers the same install.
 
 Prefer to drive the engine by hand? Unpack `kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended), or clone the repository at an official release tag if a Git checkout is needed:
 
@@ -95,6 +97,8 @@ The harness runs co-located agents in a single operator-deployed pod: the **Plan
 - ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/platform/cron/jobs.json`](agents/platform/cron/jobs.json) that keep the fleet honest without human prompting. Ticking belongs to the Planning Agent's gateway, the only running one, so a job on its roster advances the Platform Agent's schedule once a minute. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
 
 The runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
+
+For three scenarios from trigger to pull request (a scheduled audit, a crash loop alert, and a chat question), see [A day with kube-agents](https://gke-labs.github.io/kube-agents/overview/day-in-the-life/).
 
 ---
 

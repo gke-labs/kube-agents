@@ -12,7 +12,8 @@ owns both ends of that lifecycle.
 ## The store
 
 `/opt/data/fleet-audit/reports/<audit-id>/<owner>/<name>/`, one directory per stream and GitOps
-repository — a stream publishes one ledger per managed repository:
+repository — a stream publishes one ledger per managed repository. On an install with no forge
+configured, the repository directory is `no_forge/local`:
 
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
@@ -22,11 +23,13 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`.
+`document`, and sometimes `ledger_document`, `inspect_s`, `publish_s` and `collect_s`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
-- `status` is `OPENED`, `UPDATED`, `CLEAN`, or `HELD`. `ledger_held_open` true means a `CLEAN` or
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, or `NO_FORGE`. `NO_FORGE` means no forge is
+  configured: the run wrote no ledger issue, `issue_number` and `issue_url` are null, and the
+  envelope is the only record of what it found. `ledger_held_open` true means a `CLEAN` or
   `HELD` run left the issue open (partial, or over findings it did not account for) without
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
   run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `streams`, `show` and
@@ -39,6 +42,9 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   key existed lack it; read their counts as they are. `streams` and `show` carry it.
 - `current_ids` is exactly what the body's hidden block published: the findings the body rendered
   plus the ids the collector held. Derive this run's full set from `document`.
+- `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
+  publish, and for the collector to run. An envelope has only the ones `finish` could measure.
+  `show` gives them, with null for the others; `streams` does not carry them.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
   run, not something to answer from. No subcommand returns it.
 
@@ -91,8 +97,8 @@ object per call.
   `not_applicable_matched`, `not_applicable_returned` and `not_applicable_truncated`; `diff` caps
   `added` and `resolved` independently and reports `added_total`, `resolved_total`, `unchanged` and
   `truncated` — quote `added_total`, not the length of `added`. Findings sort severity-first, so a
-  cap drops only the least severe; `checks` keeps the document's order, so a capped answer lines up
-  with the issue's table.
+  cap drops only the least severe; `checks` keeps the document's order, one row per cluster and
+  check, while the issue's table groups clusters that ran the same command into one row.
 - `--root` overrides the store root. In the pod, leave it alone.
 
 ## The four questions this gets asked
@@ -108,7 +114,7 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance
 delta counts and `issue_url`; name the criticals from `findings`. When `ledger_held_open` is true,
 this run found nothing but the issue still carries the previous run's findings — say both, and point
 at the issue. Always hand back the issue URL — the store is where you read, the ledger is where a
-human acts.
+human acts — except on a `NO_FORGE` run, which has no issue: the store is the only record.
 
 **"What changed since the last run?"**
 
@@ -170,7 +176,7 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
   hand: either way it is not the open ledger. Check the issue's state, or say
   the findings are as of that run.
   **No stored run means unknown, not clean** — say the store has no record, and read the ledger
-  issue.
+  issue if the install has a forge.
 
 ## Red lines
 

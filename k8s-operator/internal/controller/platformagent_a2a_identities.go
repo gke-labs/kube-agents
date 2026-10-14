@@ -212,6 +212,7 @@ const (
 	// reads grants out of this file's source and resolves a literal, not an
 	// expression.
 	a2aNotifySubjectGchat  = "chat.notify.gchat"
+	a2aNotifySubjectSlack  = "chat.notify.slack"
 	a2aNotifyReplySubjects = "chat.notify.reply.agent.>"
 
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
@@ -469,8 +470,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"$KV.session-state.>",
 			"chat.console.*.in",
 			// Proactive posts from the agent to the home channel, and a
-			// card's report back to its conversation.
+			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
+			a2aNotifySubjectSlack,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -717,7 +719,7 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	// task plane: a notify mints no capability and starts no executor, and
 	// the gateway posts it to the home channel or to a conversation it holds a
 	// live session record for, and nowhere else.
-	publish = append(publish, a2aNotifySubjectGchat)
+	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{

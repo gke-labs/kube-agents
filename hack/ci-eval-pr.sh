@@ -27,20 +27,23 @@ set -euo pipefail
 # start-by bound when BUILD_ID does not give one (job_started_epoch).
 EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
 
-# The eval rosters, three files beside this script under hack/eval/ (#1546):
-# what every pull request runs, what can red one on a graded failure, and
-# what the nightly adds. Section 6 reads the first and third into TASKS and
-# NIGHTLY_TASKS; the BOOTSTRAP_ADMITTED export reads the second. Files rather
-# than arrays here so OWNERS can put the eval-crew rule on the presubmit
-# pair alone. Relative to this script's directory.
+# The eval rosters, four files beside this script under hack/eval/ (#1546):
+# what every pull request runs, what can red one on a graded failure, what
+# the nightly adds, and what the GitLab lane runs on a pull request (#2394).
+# Section 6 reads the first and third into TASKS and NIGHTLY_TASKS and, under
+# EVAL_FORGE=gitlab, the fourth in place of the first; the BOOTSTRAP_ADMITTED
+# export reads the second. Files rather than arrays here so OWNERS can put
+# the eval-crew rule on the presubmit pair alone. Relative to this script's
+# directory.
 readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
-# A fourth file, read beside them and applied on one lane only (#2039): the
+readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
+# A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
-# A fifth, applied on the same lane (#2079): the safeguards every case the
+# A sixth, applied on the same lane (#2079): the safeguards every case the
 # lane runs carries beside its own -- today the one that fails a repetition
 # on a GitHub write the case did not request. Appended to a copy of each
 # task file before devops-bench reads it (bench/kube_agents_bench/lane.py);
@@ -628,7 +631,9 @@ report_partial_verdict() {
 # was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
 # follows it: a pod replaced mid-run starts a fresh gateway log, and the
 # pod and event watch it stops, the previous containers and the restart
-# record are what say why.
+# record are what say why. collect_litellm_log follows those: the
+# thinking-replay hook's per-request line is in the LiteLLM log alone, so a
+# green run without it cannot say whether the hook touched its traffic.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -649,6 +654,7 @@ profile_and_dump_on_exit() {
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
+  collect_litellm_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -1119,10 +1125,10 @@ ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omit
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (each of the ten audit cases
-# carries one; two consistency cases share fleet-consistency-drift, two
+# ledger_issue_contains checks in task.yaml (each of the twelve audit cases
+# carries one; three consistency cases share fleet-consistency-drift, three
 # patch cases share security-patch-orchestrator and two obtainability cases
-# share obtainability-audit, and the reset is per stream, so each pair
+# share obtainability-audit, and the reset is per stream, so each group
 # retires one ledger). Empty for a case that writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
@@ -1203,6 +1209,36 @@ reset_audit_ledgers() { # <label> [audit-id]
   return 0
 }
 
+# The ledger-path probe (kube-agents#2920). No case in the GitLab lane grades a
+# ledger issue, so at lease time the harness proves the path itself: one
+# ledger-shaped issue opened with the agent token, read back with the ledger
+# token (the labels and footer the bench reads, the title and author the
+# reset needs), closed through the same reset that retires real ledgers, the
+# close read back. A fault stops the run here, as a
+# dead token stops it at preflight: a lane that cannot publish or read a
+# ledger has nothing to say about the agent. GitHub runs grade ledgers through
+# the compliance case and skip this. Tokens ride in the one process's
+# environment, never on argv.
+probe_gitlab_ledger_path() { # <label>
+  local label="$1" out rc=0
+  [ "${EVAL_FORGE:-github}" = "gitlab" ] || return 0
+  if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
+    echo "Ledger probe (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitLab project (gitlab_project_for_project in hack/ci-deploy.sh)"
+    return 0
+  fi
+  if [ -z "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || [ -z "${BENCH_GITLAB_TOKEN:-}" ]; then
+    echo "ERROR: Ledger probe (${label}): the pool's token pair is not in hand (read_gitlab_tokens at preflight); not running without the probe." >&2
+    return 1
+  fi
+  out="$(GITLAB_PROBE_TOKEN="${EVAL_GITLAB_AGENT_TOKEN}" GITLAB_PROBE_LEDGER_TOKEN="${BENCH_GITLAB_TOKEN}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" probe-ledger --path "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" --host "${GITLAB_FORGE_HOST}" 2>&1)" || rc=$?
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger probe (${label}): /"
+  if [ "${rc}" -ne 0 ]; then
+    echo "ERROR: Ledger probe (${label}): the GitLab ledger path is broken in ${EVAL_LEDGER_REPO} (the lines above say which step); a ledger the agent published could not be graded here, so this run stops (kube-agents#2920, docs/ci-pool-projects.md 5.6)." >&2
+    return 1
+  fi
+  return 0
+}
+
 # ─── Empty repository: the agent's pull requests and branches go too ─────────
 # A remediation case opens a pull request in the leased repository and nothing
 # closed it before the next lease or the next repetition, so the next agent
@@ -1278,8 +1314,8 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
 # repetition whose worker dies between the two -- max_turns, a pod restart,
 # a dispatcher that never served the card's retry -- leaves the note, and
 # inside one run the next repetition of the case starts inside that TTL
-# and is refused at `start`; on a stream two cases share (the
-# consistency pair, the patch pair) so is the sibling case's first
+# and is refused at `start`; on a stream several cases share (the
+# consistency trio, the three patch cases) so is a sibling case's first
 # repetition, which waits on the stream lock and starts right after. That is
 # a 0/3 that reads as agent failure and was the harness's. The note is the
 # run's, not the ledger's, so the ledger reset above cannot clear it; this
@@ -1443,6 +1479,7 @@ else
 fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
+probe_gitlab_ledger_path "lease" || exit 1
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -1649,9 +1686,11 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: five files under hack/eval/, read here at
+# The matrix is data, not code: six files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
-# runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
+# runs (TASKS), gitlab-cases.txt is what the GitLab lane runs in
+# its place under EVAL_FORGE=gitlab (#2394, at the tier switch),
+# nightly-cases.txt is what EVAL_TIER=nightly appends
 # (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
 # a pull request on a graded failure (BOOTSTRAP_ADMITTED),
 # inject-lane-exclusions.txt, read after the tier switch, is what the inject
@@ -1675,6 +1714,7 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
+GITLAB_CASES_FILE="${SCRIPT_DIR}/${EVAL_GITLAB_CASES_FILE}"
 
 # One roster file's entries, one per line: `#` to end of line is a comment,
 # blank lines are skipped, surrounding whitespace is trimmed. Called inside a
@@ -1774,11 +1814,58 @@ done
 # both. Anything else is a typo that would silently run the wrong matrix,
 # so it stops the job before it spends a cluster.
 EVAL_TIER="${EVAL_TIER:-presubmit}"
+# The GitLab lane (kube-agents#2394): under EVAL_FORGE=gitlab both tiers run
+# hack/eval/gitlab-cases.txt instead of the catalogue -- the cases that grade
+# the forge, each a registered case (presubmit or nightly file), sized by
+# that file's BUDGET note against the job's deadline. The presubmit names the
+# lane left out are kept in GITLAB_LANE_DROPPED for the BOOTSTRAP_ADMITTED
+# export, as the nightly part's are. The GitLab nightly is the same list once
+# a night on its own leased project (oss-test-infra: ci-kube-agents-eval-
+# nightly-gitlab); it never appends to the evidence store (the recorder
+# decision below the matrix says why).
+GITLAB_LANE_DROPPED=""
+gitlab_lane_matrix() { # <tier word, for the log line>
+  GITLAB_LANE_ENTRIES="$(roster_entries "${GITLAB_CASES_FILE}")"
+  GITLAB_LANE_TASKS=()
+  while IFS= read -r ENTRY; do
+    if [ -n "${ENTRY}" ]; then GITLAB_LANE_TASKS+=("${ENTRY}"); fi
+  done <<< "${GITLAB_LANE_ENTRIES}"
+  if [ "${#GITLAB_LANE_TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: ${GITLAB_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
+    exit 1
+  fi
+  # Every entry must be a registered case, a presubmit or nightly entry,
+  # which check_case_entries has already proven to be a case path with a
+  # directory behind it; the lane picks from the catalogue, it does not
+  # register.
+  for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
+    if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+      echo "ERROR: ${GITLAB_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the GitLab lane runs registered cases only." >&2
+      exit 1
+    fi
+  done
+  for ENTRY in "${TASKS[@]}"; do
+    if ! grep -qxF -- "${ENTRY}" <<< "${GITLAB_LANE_ENTRIES}"; then
+      GITLAB_LANE_DROPPED="${GITLAB_LANE_DROPPED}$(basename "$(dirname "${ENTRY}")")
+"
+    fi
+  done
+  TASKS=("${GITLAB_LANE_TASKS[@]}")
+  echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} case(s) on the $1 tier (${EVAL_GITLAB_CASES_FILE}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
+}
 case "${EVAL_TIER}" in
-  presubmit) ;;
+  presubmit)
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      gitlab_lane_matrix presubmit
+    fi
+    ;;
   nightly)
-    TASKS+=("${NIGHTLY_TASKS[@]}")
-    echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      gitlab_lane_matrix nightly
+    else
+      TASKS+=("${NIGHTLY_TASKS[@]}")
+      echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
+    fi
     ;;
   *)
     echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
@@ -1801,6 +1888,10 @@ case "${EVAL_NIGHTLY_PART}" in
   main | writers)
     if [ "${EVAL_TIER}" != "nightly" ]; then
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
+      exit 1
+    fi
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} is the GitHub nightly's split; the GitLab nightly runs ${EVAL_GITLAB_CASES_FILE} whole. Unset it, or set it to 'all'." >&2
       exit 1
     fi
     ;;
@@ -2304,6 +2395,10 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
 fi
 BLOCKING_ROSTER_DEFAULT=""
 BLOCKING_ROSTER_ON_LANE=""
+# Set when the inject lane's exclusion list drops a ROSTER case: what the
+# every-roster-case-excluded guard below tests, since an empty
+# BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
+INJECT_LANE_DROPPED_ROSTER=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
@@ -2318,6 +2413,13 @@ while IFS= read -r NAME; do
   # names no graded case" banner on every run of the lane, and that banner
   # exists to catch a misspelled roster entry.
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
+    INJECT_LANE_DROPPED_ROSTER="true"
+    continue
+  fi
+  # A roster case outside the GitLab lane's list (GITLAB_LANE_DROPPED, empty
+  # off that lane) leaves the export too, and is not "on the lane" for the
+  # guard below: the GitHub presubmit grades it.
+  if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
     continue
   fi
   BLOCKING_ROSTER_ON_LANE="true"
@@ -2339,9 +2441,21 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # environment, empty included, is the stated way to mean it, and wins below.
 # Read before the nightly part's drop, which empties the export by design
 # when the part holds no roster case, and is not the lane's doing.
-if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
-  echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  if [ -n "${GITLAB_LANE_DROPPED:-}" ]; then
+    echo "ERROR: every blocking-roster case in ${EVAL_GITLAB_CASES_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  else
+    echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  fi
   exit 1
+fi
+
+# The GitLab lane's list may hold no roster case (its first two seats are
+# held out), which empties the export by design, like a nightly part: said
+# in the log, not stopped. After the inject guard, so a lane the guard stops
+# does not also hear this.
+if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  echo "EVAL_FORGE=gitlab: no blocking-roster case is in the GitLab lane, so rung 4 is disarmed on this lane (rungs 1-3 still red it); a forge-grading case arms it by earning a roster seat."
 fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
@@ -2396,6 +2510,13 @@ esac
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
+# The GitLab lane never appends: a case's record in the store is per case
+# and version key, not per forge, so a GitLab night would pool its evidence
+# with the GitHub nights' under the same key. The lane reads the store like
+# a presubmit; a record of its own is a decision for later (#2832).
+if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
@@ -2442,6 +2563,13 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Another of the same shape: infra lock, a plant that publishes a burst and
+    # then waits out the human record's card, then an agent turn that is a
+    # board read. Priced at the band rather than at the 566-677s its
+    # dev-install repetitions measured, because those met a quiet board and the
+    # nightly's is shared. hack/eval/nightly-cases.txt's 2026-10-13 paragraph
+    # carries the measurements and the budget arithmetic.
+    gitops-drift-noise-filtered-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev
@@ -2470,7 +2598,10 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
-    upgrades-master-behind-offered-elsewhere) echo 900 ;;
+    # Tofu too: a plant of a few kubectl execs and one drift collector run,
+    # then the same full drift audit as consistency-drift-outlier. Unmeasured.
+    fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
+    upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
@@ -2575,7 +2706,8 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
-    upgrades-master-behind-offered-elsewhere) echo 3000 ;;
+    fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
+    upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
@@ -2652,8 +2784,9 @@ STATE_DIR="$(mktemp -d)"
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
 #   per stream -- units that grade ONE audit stream never overlap, across
-#                 tasks: consistency-drift-outlier and
-#                 consistency-no-environment-label both write the
+#                 tasks: consistency-drift-outlier,
+#                 consistency-no-environment-label, and
+#                 fleet-audit-unchanged-finding-keeps-wording write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
 #                 whichever unit opened it. Without this, one lane's ledger
@@ -2962,8 +3095,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     return 0
   fi
   # A ledger-writing unit also holds the stream lock from here until its
-  # state files are written, released with the task lock below: two cases on
-  # one stream (the consistency pair, the patch pair, the obtainability pair)
+  # state files are written, released with the task lock below: cases on
+  # one stream (the consistency trio, the three patch cases, the obtainability pair)
   # must not reset and rewrite each other's ledger mid-run. A unit holds every
   # stream task_streams names, in its sorted order, the declared ones too,
   # and then waits out a run the install started on one of them.
@@ -3455,7 +3588,11 @@ job_started_epoch() {
 # round trip, and the diagnostics collector is re-armed under a prefix
 # before it starts: whatever ends the run after that (a pass, a failure, the
 # deadline's TERM), the EXIT trap stops the watch, whose tails then cover
-# the flip, and writes a rollback-* snapshot beside the eval's.
+# the flip, and writes a rollback-* snapshot beside the eval's. The LiteLLM
+# log is not taken here: the flip patches spec.mode, which leaves
+# deployment/litellm alone (the operator only reads it), so the trap's
+# capture still holds the eval's lines, with the round trip's single-turn
+# requests after them.
 #
 # The round trip runs in the background and is waited on, so a SIGTERM (the
 # job's deadline) reaches this script's trap during the wait rather than

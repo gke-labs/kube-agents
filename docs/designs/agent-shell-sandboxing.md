@@ -1792,7 +1792,7 @@ wrong thing for a reviewer to find even though it is inert there. So the image g
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
 `stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import. `inventory_findings.py extract` and `select`
+plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
 prioritization SOP answers that exit by going on to `select` and writing the report.
@@ -1814,9 +1814,13 @@ database and is named by its SOP for a hand run. Each gets a stub at its path in
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod. `platform_mcp_server.py` carries the two reads, `list_cluster_profiles` and
-`get_cluster_profile_name`, which is how the agent finds a kanban assignee; creating and
-deleting a profile still has no tool.
+pod. `platform_mcp_server.py` carries the reads of that volume, `list_cluster_profiles` and
+`get_cluster_profile_name`, which is how the agent finds a kanban assignee, and `fleet_scope`, which
+hands the fleet audits the reconcile's scope snapshot they cannot read from here; creating and
+deleting a profile still has no tool. What this pod does know about the scope is one bit the operator
+sets on its container, `KUBEAGENTS_SCOPE_DECLARED`: whether the CR carries a block at all, so that a
+collector run here without the tool's flags refuses to enumerate projects rather than sweep past the
+boundary it cannot see.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
@@ -2127,6 +2131,21 @@ as a fact about the cluster, and a `.bashrc` that hijacked its `rm` would be doi
 uid 1000's own files what uid 1000 can already do. The commands are `/bin/ls` and
 `/bin/rm` by absolute path, which that file cannot shadow — a bash function name cannot
 contain a slash, and a non-interactive shell does not expand aliases.
+
+The same job takes an inventory of each sandbox profile home (#2989). Hermes cron runs
+start in the profile home, so a worker's loose files land beside the skills and config
+on a volume nothing sweeps, and a later session that lists the home cannot tell them
+from what the product put there. Every top-level entry the product doesn't create in that
+kind of home (the mirror's skeleton everywhere; the image-staged trees and database
+placeholders in the platform home; the identity and kubeconfig in a cluster home), checked
+by name and type, goes to `logs/kanban_workspace_gc.log` on the
+agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
+profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
+kubeconfig there. Inventory only, no moves: whether to move anything waits for data from
+the test fleet after cron runs get a working directory of their own. The listing runs as
+`hermes`, the default principal, because its output is believed, under the sandbox's own
+`workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
+name cannot forge a row.
 
 #### The agent pod gives up cluster tooling entirely
 

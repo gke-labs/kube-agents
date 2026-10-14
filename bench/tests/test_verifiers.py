@@ -3238,6 +3238,60 @@ def test_assert_mode_timeout_is_floored_before_the_http_call(token, monkeypatch)
 # --- registration --------------------------------------------------------
 
 
+def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
+    """One slow forge read must not red a run on rung 2: a timeout or a reset
+    is retried, an HTTP answer is not, and the retries give up after the
+    configured count with the last failure."""
+    calls = {"n": 0}
+    pauses = []
+    monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b'{"number": 7}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FlakyOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise TimeoutError("The read operation timed out")
+            return _Response()
+
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _FlakyOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (200, {"number": 7})
+    assert calls["n"] == 3
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * 2
+
+    class _DeadOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise verifiers.urllib.error.URLError("Connection reset by peer")
+
+    calls["n"] = 0
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _DeadOpener())
+    with pytest.raises(OSError, match="Connection reset"):
+        verifiers._http_get_json(_api(), "tok", 30.0)
+    assert calls["n"] == verifiers._FORGE_READ_ATTEMPTS
+
+    class _AnsweringOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise verifiers.urllib.error.HTTPError(_api(), 404, "Not Found", {}, None)
+
+    calls["n"] = 0
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _AnsweringOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0)[0] == 404
+    assert calls["n"] == 1, "an HTTP answer is an observation and is not retried"
+
+
 def test_the_ledger_verifier_is_published_as_an_entry_point():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
@@ -3508,6 +3562,442 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+# ---- content: what the pull request writes, read at its head
+
+_CLUSTER_DIR = "clusters/substrate-a/provisioning"
+_CLUSTER_YAML = """apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: substrate-a
+spec:
+  location: us-central1
+  enableK8sBetaApis:
+    enabledApis:
+      - certificates.k8s.io/v1beta1/podcertificaterequests
+      - certificates.k8s.io/v1beta1/clustertrustbundles
+  workloadIdentityConfig:
+    workloadPool: proj.svc.id.goog
+---
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: substrate-pool
+spec:
+  nodeConfig:
+    machineType: c3-standard-4
+    labels:
+      ate.dev/substrate-version: v0.4.0-gke.0
+"""
+_BETA_API = "certificates.k8s.io/v1beta1/podcertificaterequests"
+
+
+def _added_patch(text: str) -> str:
+    """What `/pulls/{n}/files` carries as the patch of a file the pull request adds."""
+    lines = text.rstrip("\n").split("\n")
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + line for line in lines)
+
+
+def _content_routes(
+    github, files: dict[str, str], *, statuses: dict[str, str] | None = None, patches: bool = True
+) -> None:
+    """The file listing, with each added file's patch when `patches`, as
+    GitHub returns it."""
+    statuses = statuses or {}
+    entries = []
+    for path, text in files.items():
+        entry = {"filename": path, "status": statuses.get(path, "added")}
+        if patches and entry["status"] == "added":
+            entry["patch"] = _added_patch(text)
+        entries.append(entry)
+    _pr_files_route(github, *entries)
+
+
+def _content_pr(github, files: dict[str, str], **kw):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=len(files))
+    _content_routes(github, files, **kw)
+
+
+def _beta_api_check(**kw):
+    return {"paths": [f"{_CLUSTER_DIR}/*.yaml"], "kind": "ContainerCluster",
+            "field": "spec.enableK8sBetaApis.enabledApis", "op": "contains", "value": _BETA_API, **kw}
+
+
+def test_content_passes_when_the_cluster_carries_the_beta_api(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_content_fails_when_the_beta_api_is_missing(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML.replace(_BETA_API, "x/v1/y")})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "ContainerCluster.spec.enableK8sBetaApis.enabledApis contains" in res.reason
+    assert f"{_CLUSTER_DIR}/cluster.yaml#0" in res.reason
+
+
+def test_content_fails_when_no_such_object_was_written(token, github):
+    """A pull request that never wrote the cluster fails rather than passing vacuously."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/bucket.yaml": "kind: StorageBucket\nmetadata: {name: b}\n"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "adds no such document" in res.reason
+
+
+def test_not_matches_catches_an_e2_pool_among_good_ones(token, github):
+    e2 = _CLUSTER_YAML + "---\nkind: ContainerNodePool\nmetadata: {name: extra}\nspec:\n  nodeConfig:\n    machineType: e2-standard-4\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": e2})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "#2" in res.reason
+    # With `any`, one good pool is enough; `all` is what a "no E2" rule needs.
+    assert _pr_check(content=[{**check, "quantifier": "any"}]).verify(5.0).status == "pass"
+
+
+def test_matches_reads_a_label_key_with_dots_and_slashes(token, github):
+    """A label key holds dots, so the label map is read whole and matched as text."""
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.labels", "op": "matches", "value": r"ate\.dev/substrate-version.*v0\.4\.0"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_absent_fails_on_a_forbidden_chart_anywhere(token, github):
+    fork = "kind: RootSync\nmetadata: {name: substrate, namespace: config-management-system}\nspec:\n  helm:\n    repo: oci://ghcr.io/kagent-dev/substrate/helm\n"
+    check = {"paths": ["clusters/**", "clusters/*/*/*", "clusters/*/*/*/*"], "op": "absent", "value": "",
+             "field": "spec.helm.repo"}
+    files = {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML,
+             "clusters/substrate-a/namespaces/config-management-system/substrate.yaml": fork}
+    _content_pr(github, files)
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "substrate.yaml#0" in res.reason
+    # And the same check passes when no document has the field.
+    github.routes.clear()
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_text_contains_reads_a_terraform_file_raw(token, github):
+    hcl = 'resource "google_container_cluster" "a" {\n  enable_k8s_beta_apis {\n    enabled_apis = ["%s"]\n  }\n}\n' % _BETA_API
+    check = {"paths": ["clusters/*/provisioning/*.tf"], "op": "contains", "value": _BETA_API}
+    _content_pr(github, {"clusters/substrate-a/provisioning/main.tf": hcl})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_removed_file_is_not_read(token, github):
+    """A file the pull request deletes is not at the head, so it neither satisfies nor trips a check."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "removed"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail" and "no such document" in res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_not_matches_needs_the_field_to_be_there(token, github):
+    """A pool with no machine type gets GKE's default, which may be E2."""
+    bare = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig: {}\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/pool.yaml": bare})
+    assert _pr_check(content=[check]).verify(5.0).status == "fail"
+
+
+def test_scalars_compare_as_the_file_wrote_them(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableAutopilot: false\n  minMasterVersion: 1.30\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    checks = [
+        {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.enableAutopilot",
+         "op": "contains", "value": "false"},
+        {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.minMasterVersion",
+         "op": "contains", "value": "1.30"},
+    ]
+    res = _pr_check(content=checks).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_bracketed_key_reads_a_label_with_dots(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": 'spec.nodeConfig.labels["ate.dev/substrate-version"]', "op": "contains",
+             "value": "v0.4.0-gke.0"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+    assert _pr_check(content=[{**check, "value": "v0.3.0"}]).verify(5.0).status == "fail"
+
+
+def test_absent_fails_closed_on_a_file_that_does_not_parse(token, github):
+    broken = "kind: ContainerNodePool\nmetadata: {name: p}\nspec: [unclosed\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/pool.yaml": broken})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_an_alias_is_refused_not_expanded(token, github):
+    """A document built to expand on read is not parsed: absence fails closed, and an
+    op that needs the object finds none."""
+    bomb = "kind: ConfigMap\nmetadata: {name: m}\ndata:\n  a: &a [x, x]\n  b: [*a, *a]\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": bomb})
+    absent = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "op": "absent"}
+    exists = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "field": "data", "op": "exists"}
+    assert _pr_check(content=[absent]).verify(5.0).status == "fail"
+    assert _pr_check(content=[exists]).verify(5.0).status == "fail"
+
+
+def test_a_merge_key_is_refused_so_absent_fails_closed(token, github):
+    merged = ("kind: RootSync\nmetadata: {name: s}\nspec:\n  <<: {helm: {repo: oci://ghcr.io/kagent-dev/x}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "field": "spec.helm.repo", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/s.yaml": merged})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_bare_scalar_document_is_text_a_text_check_still_sees(token, github):
+    """A scalar document beside an object is read as text: it is no RootSync, so
+    absence of one holds, but a text check over the file sees it."""
+    mixed = "kind: ConfigMap\nmetadata: {name: m}\n---\noci://ghcr.io/kagent-dev/substrate\n"
+    no_rootsync = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "absent", "kind": "RootSync"}
+    no_fork_text = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "not_matches", "value": "ghcr\\.io/kagent-dev"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": mixed})
+    assert _pr_check(content=[no_rootsync]).verify(5.0).status == "pass"
+    assert _pr_check(content=[no_fork_text]).verify(5.0).status == "fail"
+
+
+def test_a_file_that_parses_to_nothing_is_not_a_parse_failure(token, github):
+    """An empty or comment-only file is not a YAML error, so absence over it holds."""
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/.keep.yaml": "# placeholder\n"})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_root_list_of_objects_is_read_object_by_object(token, github):
+    listed = "- kind: RootSync\n  metadata: {name: a}\n  spec: {helm: {repo: oci://ghcr.io/kagent-dev/x}}\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/l.yaml": listed})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "l.yaml#0.0" in res.reason
+
+
+def test_an_anchored_regex_sees_every_line_of_a_map(token, github):
+    doc = ("kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: c3-standard-4\n"
+           "    labels: {env: prod, ate.dev/substrate-version: v0.4.0-gke.0}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "field": "spec.nodeConfig.labels",
+             "op": "matches", "value": "^ate\\.dev/substrate-version: v0\\.4"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_document_text_is_as_written_not_requoted(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableAutopilot: false\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "op": "contains",
+             "value": "enableAutopilot: false"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_value_on_a_presence_op_is_refused():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "exists", "field": "a", "value": "c3-standard-4"}])
+
+
+def test_an_empty_value_is_still_a_present_key(token, github):
+    doc = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: \"\"\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    absent = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "field": "spec.nodeConfig.machineType", "op": "absent"}
+    not_e2 = {**absent, "op": "not_matches", "value": "^e2-"}
+    assert _pr_check(content=[absent]).verify(5.0).status == "fail"
+    # An empty machine type is GKE's default too, so "not E2" is not shown.
+    assert _pr_check(content=[not_e2]).verify(5.0).status == "fail"
+
+
+def test_a_patch_ending_without_a_newline_is_rebuilt():
+    entry = {"status": "added", "patch": "@@ -0,0 +1,2 @@\n+kind: A\n+x: 1\n\\ No newline at end of file"}
+    assert verifiers._added_file_text(entry) == "kind: A\nx: 1\n"
+    entry = {"status": "added", "patch": "@@ -0,0 +1,1 @@\n+kind: A\n"}
+    assert verifiers._added_file_text(entry) == "kind: A\n"
+    assert verifiers._added_file_text({"status": "added"}) is None
+    assert verifiers._added_file_text({"status": "modified", "patch": "@@\n+a"}) is None
+
+
+def test_a_field_path_is_checked_when_the_case_loads():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "exists", "field": 'a.["unclosed'}])
+
+
+def test_an_added_file_is_read_from_the_listing_alone(token, github):
+    """The grading credential has no `contents: read`; a file the pull request
+    adds is whole in its patch, so nothing else is fetched."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_a_modified_file_under_a_glob_is_unevaluable_and_names_the_permission(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "modified"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error"
+    assert "cluster.yaml (modified)" in res.reason and "contents: read" in res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_an_added_file_without_a_patch_is_unevaluable(token, github):
+    """GitHub leaves the patch out for a large or binary file."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/big.yaml": _CLUSTER_YAML}, patches=False)
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error" and "big.yaml (added)" in res.reason
+
+
+def test_a_malformed_field_path_is_refused_at_load():
+    for bad in ('spec.helm."repo"', 'labels["ate.dev/x"]version', 'a..b', 'a.', '.a', 'a[b]'):
+        with pytest.raises(ValueError):
+            _pr_check(content=[{"paths": ["x"], "op": "exists", "field": bad}])
+    assert verifiers._field_keys('spec.nodeConfig.labels["ate.dev/x"]') == ["spec", "nodeConfig", "labels", "ate.dev/x"]
+    assert verifiers._field_keys('a["b.c"].d') == ["a", "b.c", "d"]
+
+
+def test_an_empty_list_is_still_a_present_key(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableK8sBetaApis:\n    enabledApis: []\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    field = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.enableK8sBetaApis.enabledApis"}
+    assert _pr_check(content=[{**field, "op": "exists"}]).verify(5.0).status == "pass"
+    assert _pr_check(content=[{**field, "op": "absent"}]).verify(5.0).status == "fail"
+
+
+def test_a_null_machine_type_is_not_shown_to_avoid_e2(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    for spelling in ("null", "~", "Null"):
+        github.routes.clear()
+        doc = f"kind: ContainerNodePool\nmetadata: {{name: p}}\nspec:\n  nodeConfig:\n    machineType: {spelling}\n"
+        _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+        assert _pr_check(content=[check]).verify(5.0).status == "fail", spelling
+
+
+def test_deep_nesting_is_unparsed_not_a_crash(token, github):
+    deep = "kind: ConfigMap\ndata:\n  x: " + "[" * 3000 + "]" * 3000 + "\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/deep.yaml": deep})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_an_unparsed_file_fails_every_scoped_op_not_only_absent(token, github):
+    """An E2 pool hidden behind an alias in a second file cannot let "not E2" pass."""
+    hidden = "kind: ContainerNodePool\nmetadata: {name: e2}\nspec:\n  nodeConfig: &n {machineType: e2-standard-4}\n  x: *n\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/hidden.yaml": hidden})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "hidden.yaml" in res.reason
+
+
+def test_a_trailing_document_marker_adds_no_document(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "field": "metadata.name", "op": "exists"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": _CLUSTER_YAML + "---\n---\n"})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_document_text_is_the_file_slice_with_its_quoting(token, github):
+    doc = 'kind: CronJob\nmetadata: {name: j}\nspec:\n  schedule: "*/5 * * * *"\n'
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains",
+             "value": 'schedule: "*/5 * * * *"'}
+    _content_pr(github, {f"{_CLUSTER_DIR}/j.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_an_empty_added_file_reads_as_empty(token, github):
+    """GitHub carries no patch for an empty new file; it is read as empty, not unevaluable."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/.keep", "status": "added", "additions": 0, "changes": 0,
+                             "sha": verifiers._EMPTY_BLOB_SHA})
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+    # A binary file also has no patch and zero line counts; only the empty blob is known empty.
+    github.routes.clear()
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/blob.bin", "status": "added", "additions": 0, "changes": 0,
+                             "sha": "0" * 40})
+    assert _pr_check(content=[check]).verify(5.0).status == "error"
+
+
+def test_a_terraform_file_is_raw_text_and_scoped_checks_fail_closed(token, github):
+    """A .tf file reads as one YAML plain scalar; it is kept raw, and a kind-scoped
+    check over it is not shown rather than passing."""
+    hcl = 'resource "google_container_cluster" "a" {\n  name = "a"\n}\n'
+    _content_pr(github, {"clusters/substrate-a/provisioning/main.tf": hcl})
+    raw = {"paths": ["clusters/*/provisioning/*.tf"], "op": "contains", "value": '{\n  name = "a"'}
+    scoped = {"paths": ["clusters/*/provisioning/*.tf"], "kind": "RootSync", "op": "absent"}
+    assert _pr_check(content=[raw]).verify(5.0).status == "pass"
+    assert _pr_check(content=[scoped]).verify(5.0).status == "fail"
+
+
+def test_a_kind_list_wrapper_does_not_hide_an_e2_pool(token, github):
+    wrapped = ("apiVersion: v1\nkind: List\nitems:\n  - kind: ContainerNodePool\n    metadata: {name: e2}\n"
+               "    spec:\n      nodeConfig: {machineType: e2-standard-4}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/pool.yaml": wrapped})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "pool.yaml#0.items.0" in res.reason
+
+
+def test_nested_and_typed_lists_are_unwrapped_all_the_way(token, github):
+    nested = ("kind: List\nitems:\n  - kind: ConfigMapList\n    items:\n      - kind: ContainerNodePool\n"
+              "        metadata: {name: e2}\n        spec: {nodeConfig: {machineType: e2-standard-4}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/n.yaml": nested})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "n.yaml#0.items.0.items.0" in res.reason
+
+
+def test_a_list_wrapper_with_a_repeated_items_key_is_refused(token, github):
+    doubled = ("kind: List\nitems:\n  - {kind: ConfigMap, metadata: {name: ok}}\n"
+               "items:\n  - kind: ContainerNodePool\n    spec: {nodeConfig: {machineType: e2-standard-4}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/d.yaml": doubled})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_root_list_item_keeps_its_quoting(token, github):
+    listed = '- kind: CronJob\n  metadata: {name: j}\n  spec: {schedule: "*/5 * * * *"}\n'
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains", "value": 'schedule: "*/5 * * * *"'}
+    _content_pr(github, {f"{_CLUSTER_DIR}/l.yaml": listed})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_duplicate_key_is_refused_so_the_first_spelling_cannot_hide(token, github):
+    doc = ("kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n"
+           "    machineType: e2-standard-4\n    machineType: c3-standard-4\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_quantifier_on_absent_is_refused():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "absent", "quantifier": "any"}])
+
+
+def test_a_content_check_needs_a_value_for_its_op():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "contains"}])
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "matches", "value": "("}])
 
 
 def test_a_previous_reps_pull_request_is_a_fail(token, github):

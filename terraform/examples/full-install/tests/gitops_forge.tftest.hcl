@@ -107,6 +107,75 @@ run "gitlab_on_gitlab_com_names_no_host" {
   }
 }
 
+run "gitlab_with_a_private_ca_names_its_secret" {
+  command = plan
+  variables {
+    gitops_forge          = "gitlab"
+    gitops_host           = "gitlab.example.com"
+    gitlab_repo           = "platform/infra/gitops"
+    gitlab_ca_secret_name = "gitlab-forge-ca"
+  }
+  assert {
+    condition = local.gitlab_forges == [{
+      name           = "gitlab", provider = "gitlab", host = "gitlab.example.com",
+      credentialsRef = { name = "gitlab-forge-token" }, caBundleRef = { name = "gitlab-forge-ca" }
+    }]
+    error_message = "gitlab forge: ${jsonencode(local.gitlab_forges)}"
+  }
+}
+
+run "gitlab_without_a_ca_names_none" {
+  command = plan
+  variables {
+    gitops_forge = "gitlab"
+    gitlab_repo  = "g/p"
+  }
+  assert {
+    condition     = !contains(keys(local.gitlab_forges[0]), "caBundleRef")
+    error_message = "a forge with no CA carries caBundleRef: ${jsonencode(local.gitlab_forges)}"
+  }
+}
+
+run "a_gitlab_ca_needs_the_gitlab_forge" {
+  command = plan
+  variables {
+    gitlab_ca_secret_name = "gitlab-forge-ca"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "a_gitlab_ca_needs_a_self_managed_host" {
+  command = plan
+  variables {
+    gitops_forge          = "gitlab"
+    gitlab_repo           = "g/p"
+    gitlab_ca_secret_name = "gitlab-forge-ca"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "a_gitlab_ca_is_refused_for_gitlab_com_by_name" {
+  command = plan
+  variables {
+    gitops_forge          = "gitlab"
+    gitops_host           = "gitlab.com"
+    gitlab_repo           = "g/p"
+    gitlab_ca_secret_name = "gitlab-forge-ca"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "the_ca_secret_name_is_a_kubernetes_name" {
+  command = plan
+  variables {
+    gitops_forge          = "gitlab"
+    gitops_host           = "gitlab.example.com"
+    gitlab_repo           = "g/p"
+    gitlab_ca_secret_name = "Not_A_Name"
+  }
+  expect_failures = [var.gitlab_ca_secret_name]
+}
+
 run "gitlab_refuses_a_minter" {
   command = plan
   variables {

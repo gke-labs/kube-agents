@@ -27,9 +27,9 @@ Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 
 ### `security_patch_orchestrator_sop.md`
 
-Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against every version `gcloud container get-server-config` still offers at the cluster's location, and against its release channel's default, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
+Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against every version `gcloud container get-server-config` still offers at the cluster's location, and against its release channel's default, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications. For a cluster found behind, it also runs the `fleet-upgrade-verification` readiness grade and reports the upgrade as blocked when a drain-blocking PodDisruptionBudget would hold it — GKE holds each node's drain for up to an hour and then evicts the workload anyway — or node-pool skew would stop it from completing.
 
-The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
+The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene — or, for the one check that asks how the upgrade would go, the held drain or the refused move above. Invoked by the `security-patch-orchestrator` watchdog.
 
 ### `fleet_wide_cost_analysis_sop.md`
 
@@ -57,7 +57,7 @@ It deliberately does **not** evaluate the model. Prompt-injection resistance, ja
 
 ### `gcp_networking_fabric_sop.md`
 
-GCP Networking Fabric & VPC IPAM, daily. Checks VPC subnet IP exhaustion risks, Cloud NAT port exhaustion, PSC routing deadlocks, MTU packet fragmentation, and Cloud Armor false-positive rates.
+GCP Networking Fabric & VPC IPAM, daily. Checks VPC subnet IP exhaustion risks, Cloud NAT port exhaustion, PSC routing deadlocks, MTU mismatches across VPC peerings, Cloud Armor policy anomalies, and management ports open to the whole internet.
 
 Invoked by the `gcp-networking-fabric-audit` watchdog.
 

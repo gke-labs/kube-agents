@@ -81,20 +81,33 @@ updates:
     # agents/platform/scripts/test_mcp_package_contract.py, which fails by name
     # rather than falling back to a stub.
     #
-    # admin_console/requirements.txt caps websockets below 17 because Streamlit
-    # does: 1.62.0, the newest release, still requires websockets<17,>=12.0.0.
-    # Raising the floor past that cap does not go merely untested -- it makes
-    # the file unresolvable. #830 hit it and restored the cap; #1002 proposed
+    # admin_console/requirements.txt caps websockets below 17. The cap was
+    # Streamlit's: 1.62.0 required websockets<17,>=12.0.0, and raising the
+    # floor past it did not go merely untested -- it made the file
+    # unresolvable. #830 hit it and restored the cap; #1002 proposed
     # `websockets>=17.0.1,<18` anyway and pip answered ResolutionImpossible,
-    # taking the Python unit tests with it. `versions` and
-    # not `update-types`: a semver-major comparison needs a resolved current
-    # version, and the cap is a bare range rather than an `==` pin, so there is
-    # none. Remove this rule and lift the pin in one change when Streamlit
-    # lifts its own.
+    # taking the Python unit tests with it. Streamlit 1.65.0, the console's
+    # floor, allows websockets<18, so the cap is now ours and its lift is a
+    # change of its own, with a run of the console's proxy on the 17 line;
+    # until then the rule stays. `versions` and not `update-types`: a
+    # semver-major comparison needs a resolved current version, and the cap is
+    # a bare range rather than an `==` pin, so there is none. Remove this rule
+    # and lift the pin in one change.
+    #
+    # admin_console/requirements.txt also caps streamlit below 1.66.0: that
+    # release keeps AppTest page state between runs and the console's
+    # connect-job UI tests fail on it, so a grouped bump that reaches it drags
+    # the whole python group red. Same `versions` form as above, since this
+    # cap is a bare range too. Remove this rule and that cap in one change,
+    # once the console's tests pass on the new line; that lift is independent
+    # of the websockets one.
     ignore:
       - dependency-name: "websockets"
         versions:
           - ">=17"
+      - dependency-name: "streamlit"
+        versions:
+          - ">=1.66"
     groups:
       python:
         patterns:
@@ -120,11 +133,11 @@ updates:
         patterns:
           - "*"
 
-  # These two directories hold the literal FROM pins that images.json does not
-  # cover. The gke-app-onboarding one is a `node` tag, and
-  # deploy/docker/Dockerfile copies agents/platform/skills/ wholesale into the
-  # published platform image, so it ships. The other is an `alpine` tag in an
-  # e2e fixture.
+  # This directory holds a literal FROM pin that images.json does not cover:
+  # an alpine base in an e2e fixture. The gke-app-onboarding skill's Dockerfile
+  # also has a literal pin, but it is generated from google/skills plus a patch
+  # (scripts/skill_overlay.py), so a bump there edits that patch; a Dependabot
+  # PR against the generated file would fail `make skills-check`.
   #
   # Every other Dockerfile is either out of reach or excluded on purpose. The
   # images this repository builds interpolate two ARGs each
@@ -133,11 +146,10 @@ updates:
   # agentplugins Dockerfiles are `FROM busybox:musl@sha256:…`, a literal digest
   # the updater could move, and are left out because images.json owns that pin
   # (its `busybox` entry) and `make images-check` holds the three copies in
-  # step; a bump lands in all of them at once, by hand. Naming the two
-  # directories, rather than globbing, is what keeps this from recreating #763.
+  # step; a bump lands in all of them at once, by hand. Naming the
+  # directory, rather than globbing, is what keeps this from recreating #763.
   - package-ecosystem: "docker"
     directories:
-      - "/agents/platform/skills/gke-app-onboarding/assets"
       - "/tests/e2e/operator/templates/plugin_src"
     schedule:
       interval: "weekly"

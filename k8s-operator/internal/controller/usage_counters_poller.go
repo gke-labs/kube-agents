@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,9 @@ import (
 )
 
 const (
+	// usageNewerFieldGauges names the two cluster gauges' shared pruning
+	// record: they arrived in one release and a CRD serves both or neither.
+	usageNewerFieldGauges = "clustersRegistered and clustersMonitored"
 	// usageCountersPollInterval is how often the poller reads the listeners
 	// and, when a total moved, writes the status: the interval the controller
 	// already uses for the RBAC re-probe and the pruned-status re-probe, on
@@ -80,6 +84,9 @@ const (
 	// owner when its instance label is absent.
 	usageOwnerKindPlatformAgent = "PlatformAgent"
 	usagePollerLogName          = "usage-counters"
+	// usageStatusFieldPrefix is the path a counter projects to, as the Warning
+	// names it.
+	usageStatusFieldPrefix = "status.usage."
 	// The two sentences the Warning event can end with; usageScrapeGuidance
 	// picks one by the failure's class.
 	usageScrapeConnectGuidance  = "Check that the pod's NetworkPolicy admits the operator's pods on the metrics port and that the listener is up."
@@ -94,8 +101,10 @@ const (
 )
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
-// eventsIngestedTotal and lastActiveTime on every PlatformAgent, and the two
-// cluster gauges, from the broker's and the watcher's metrics listeners, as a
+// eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal and
+// lastActiveTime on every
+// PlatformAgent, and the two cluster gauges, from the broker's and the
+// watcher's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
 // the design; the rules the counters follow are in usage_counters_fold.go, the
 // scrape in usage_counters_scrape.go. This file is the loop and the two
@@ -118,15 +127,19 @@ type UsageCounterPoller struct {
 	// line.
 	mu      sync.Mutex
 	streaks map[types.UID]*usageScrapeStreak
-	// prunedGauges records, per CR, the last poll in which the two cluster
-	// gauges were written as a reading, zero included, and came back absent: a served CRD at the
-	// previous schema, which has the counters and not the gauges. Its own
-	// record rather than the counters' shared one, because that record
-	// suppresses every status.usage write for the interval and the counters
-	// such a CRD does serve should keep landing. Fresh for
-	// usageStatusReprobeInterval, then the gauges are probed again. In memory
-	// only, like streaks; keyed like the cursor.
-	prunedGauges map[string]time.Time
+	// prunedNewerFields records, per CR and per newer field -- the cluster
+	// gauges as one, remediationsMergedTotal -- the last poll in which that
+	// field was written and came back absent: a served CRD at a previous
+	// schema, which has the three first counters (every CRD with status.usage
+	// has carried remediationsProposedTotal) and not every later field. A
+	// record per field rather than the counters' shared one, or one for all
+	// the newer fields, because each record suppresses the writes it covers
+	// for the interval and the fields such a CRD does serve should keep
+	// landing: a CRD from between the gauges and the merged counter serves
+	// the gauges and prunes the counter. Fresh for usageStatusReprobeInterval,
+	// then that field is probed again. In memory only, like streaks; keyed
+	// like the cursor, then by field.
+	prunedNewerFields map[string]map[string]time.Time
 	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
 	// replica's body was read while the watcher is on: listeners failing, pods
 	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
@@ -160,13 +173,14 @@ type usageScrapeStreak struct {
 	count int
 }
 
-// usageTarget is a running pod whose listener the poll reads.
+// usageTarget is a running pod whose listener the poll reads, and the counters
+// its body feeds.
 type usageTarget struct {
-	uid     types.UID
-	name    string
-	created time.Time
-	counter string
-	addr    string
+	uid      types.UID
+	name     string
+	created  time.Time
+	counters []string
+	addr     string
 }
 
 // NewUsageCounterPoller returns the poller for r's PlatformAgents, reading
@@ -198,42 +212,45 @@ func (p *UsageCounterPoller) Start(ctx context.Context) error {
 	}
 }
 
-// gaugesPruned reports whether the CR's gauge pruning record is fresh, dropping
-// it once it has expired.
-func (p *UsageCounterPoller) gaugesPruned(agent *agentv1alpha1.PlatformAgent) bool {
+// newerFieldPruned reports whether the CR's pruning record for field is
+// fresh, dropping it once it has expired.
+func (p *UsageCounterPoller) newerFieldPruned(agent *agentv1alpha1.PlatformAgent, field string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := usagePollKey(agent)
-	recorded, ok := p.prunedGauges[key]
+	recorded, ok := p.prunedNewerFields[key][field]
 	if !ok {
 		return false
 	}
 	if p.now().Sub(recorded) >= usageStatusReprobeInterval {
-		delete(p.prunedGauges, key)
+		delete(p.prunedNewerFields[key], field)
 		return false
 	}
 	return true
 }
 
-// noteGaugeEcho is the gauges' own echo record: echoed false is a write whose
-// gauge fields came back absent, recorded with the poll's time and logged once
-// per record; echoed true clears it.
-func (p *UsageCounterPoller) noteGaugeEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, echoed bool) {
+// noteNewerFieldEcho is one newer field's own echo record: echoed false is a
+// write whose field came back absent, recorded with the poll's time and
+// logged once per record, naming the field; echoed true clears it.
+func (p *UsageCounterPoller) noteNewerFieldEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, field string, echoed bool) {
 	key := usagePollKey(agent)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.prunedGauges == nil {
-		p.prunedGauges = map[string]time.Time{}
+	if p.prunedNewerFields == nil {
+		p.prunedNewerFields = map[string]map[string]time.Time{}
 	}
 	if echoed {
-		delete(p.prunedGauges, key)
+		delete(p.prunedNewerFields[key], field)
 		return
 	}
-	_, fresh := p.prunedGauges[key]
-	p.prunedGauges[key] = p.now()
+	if p.prunedNewerFields[key] == nil {
+		p.prunedNewerFields[key] = map[string]time.Time{}
+	}
+	_, fresh := p.prunedNewerFields[key][field]
+	p.prunedNewerFields[key][field] = p.now()
 	if !fresh {
-		logf.FromContext(ctx).Info("the served CRD does not serve status.usage's cluster gauges; apply this release's CRD to get clustersRegistered and clustersMonitored, which are probed again after the interval",
-			"platformagent", key, "reprobeAfter", usageStatusReprobeInterval.String())
+		logf.FromContext(ctx).Info("the served CRD does not serve a status.usage field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
+			"platformagent", key, "field", field, "reprobeAfter", usageStatusReprobeInterval.String())
 	}
 }
 
@@ -256,15 +273,15 @@ func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAge
 	return p.gatewayMisses[key] >= usageScrapeFailureEventStreak
 }
 
-// forgetDepartedGaugeRecords drops the gauge records and gateway-miss counts of
-// CRs outside swept, the CRs a completed sweep reached, so the maps do not keep
+// forgetDepartedNewerFieldRecords drops the newer-fields records and gateway-miss
+// counts of CRs outside swept, the CRs a completed sweep reached, so the maps do not keep
 // an entry per deleted CR for the life of the process.
-func (p *UsageCounterPoller) forgetDepartedGaugeRecords(swept map[string]bool) {
+func (p *UsageCounterPoller) forgetDepartedNewerFieldRecords(swept map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for key := range p.prunedGauges {
+	for key := range p.prunedNewerFields {
 		if !swept[key] {
-			delete(p.prunedGauges, key)
+			delete(p.prunedNewerFields, key)
 		}
 	}
 	for key := range p.gatewayMisses {
@@ -377,7 +394,7 @@ func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 	}
 	if p.sweepComplete(ordered) {
 		p.forgetDepartedStreaks(p.sweepSeen)
-		p.forgetDepartedGaugeRecords(p.sweptKeys)
+		p.forgetDepartedNewerFieldRecords(p.sweptKeys)
 		p.sweepSeen = map[string]bool{}
 		p.sweptKeys = map[string]bool{}
 	}
@@ -419,7 +436,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
 	for _, target := range targets {
-		reading, err := p.source.Scrape(ctx, target.addr, target.counter)
+		reading, err := p.source.Scrape(ctx, target.addr, target.counters)
 		if err != nil {
 			if ctx.Err() != nil {
 				// A poll cut short by shutdown, a leader change, or the poll
@@ -433,15 +450,19 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			continue
 		}
 		p.noteScrapeRecovery(log, target)
-		scraped = append(scraped, usageScrapedPod{
-			UID:       string(target.uid),
-			Name:      target.name,
-			Created:   target.created,
-			Counter:   target.counter,
-			Sample:    reading.Sample,
-			StartTime: reading.StartTime,
-			Clusters:  reading.Clusters,
-		})
+		// One body, one entry per counter it feeds: the fold keeps a baseline
+		// per pod and counter.
+		for _, counter := range target.counters {
+			scraped = append(scraped, usageScrapedPod{
+				UID:       string(target.uid),
+				Name:      target.name,
+				Created:   target.created,
+				Counter:   counter,
+				Sample:    reading.Samples[counter],
+				StartTime: reading.StartTime,
+				Clusters:  reading.Clusters,
+			})
+		}
 	}
 	// Whether any gateway replica's body was read this poll: a watcher body
 	// always carries a cluster reading, zero or not, and no other body does.
@@ -488,7 +509,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 		return err
 	}
 	result := foldUsage(doc, string(agent.UID), usageStatusSeed(agent, now), live, scraped, now)
-	if result.Changed {
+	if result.Changed || (doc != nil && doc.migrated) {
 		if fault, err := p.writeDocument(ctx, agent, existing, result.Document); err != nil {
 			// The write failed: fold the ConfigMap cause, if any, into the CR's
 			// one Warning beside the scrape cause rather than recording a second.
@@ -568,13 +589,13 @@ func (p *UsageCounterPoller) reader() client.Reader {
 func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]usageTarget, map[string]bool, error) {
 	groups := []struct {
 		selector  map[string]string
-		counter   string
+		counters  []string
 		container string
 		port      string
 		read      bool
 	}{
-		{gatewayPodSelector(agent), usageCounterEventsIngested, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
-		{credentialProxySelector(agent), usageCounterToolExecutions, credentialProxyContainerName, credentialProxyMetricsPortName, true},
+		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
+		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -607,11 +628,11 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				continue
 			}
 			targets = append(targets, usageTarget{
-				uid:     pod.UID,
-				name:    pod.Name,
-				created: pod.CreationTimestamp.Time,
-				counter: group.counter,
-				addr:    net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
+				uid:      pod.UID,
+				name:     pod.Name,
+				created:  pod.CreationTimestamp.Time,
+				counters: group.counters,
+				addr:     net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
 			})
 		}
 	}
@@ -681,9 +702,18 @@ func (p *UsageCounterPoller) readDocument(ctx context.Context, log logr.Logger, 
 		log.Info("the usage counters document does not parse; re-seeding from the status", "configmap", cm.Name)
 		return cm, nil, nil
 	}
+	migrateUsageDocument(&doc, usageStatusSeed(agent, now).Totals)
 	if reason := usageDocumentInvalid(&doc, cm, agent, now); reason != "" {
 		log.Info("the usage counters document failed a read-back bound; re-seeding from the status", "configmap", cm.Name, "reason", reason)
 		return cm, nil, nil
+	}
+	// After the bounds, so that a migrated document the bounds refuse logs
+	// the re-seed alone: "nothing lost" is only true of one that passed.
+	switch {
+	case doc.rekeyed:
+		log.Info("the usage counters document was at the previous layout; migrated in place, nothing lost", "configmap", cm.Name)
+	case doc.migrated:
+		log.Info("the usage counters document predates a counter this operator keeps; the counter's total was added at its status floor, nothing lost", "configmap", cm.Name)
 	}
 	return cm, &doc, nil
 }
@@ -727,12 +757,20 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 			return "a total is below the status it projects to"
 		}
 	}
-	for _, entry := range doc.Pods {
+	for _, counter := range doc.Unfolded {
+		if !slices.Contains(usageCounters, counter) || doc.Totals[counter] != 0 {
+			return "an unfolded counter is not a counter at zero"
+		}
+	}
+	for key, entry := range doc.Pods {
 		if entry == nil || entry.Sample < 0 || entry.Marker.IsZero() {
 			return "a pod entry is outside its bounds"
 		}
-		if entry.Counter != usageCounterToolExecutions && entry.Counter != usageCounterEventsIngested {
+		if !slices.Contains(usageCounters, entry.Counter) {
 			return "a pod entry names no counter"
+		}
+		if entry.PodUID == "" || key != usagePodEntryKey(entry.PodUID, entry.Counter) {
+			return "a pod entry is not keyed by its pod and counter"
 		}
 		if entry.StartTime != nil && (math.IsNaN(*entry.StartTime) || math.IsInf(*entry.StartTime, 0) || *entry.StartTime < 0) {
 			return "a pod entry's start time is outside its bounds"
@@ -750,8 +788,10 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 // poll refuses, re-seeding the CR, and adding nothing, on every poll.
 func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSeed {
 	seed := usageSeed{Totals: map[string]int64{
-		usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
-		usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
+		usageCounterToolExecutions:       usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
+		usageCounterEventsIngested:       usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
+		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
+		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
 		seed.LastMoved = last.DeepCopy()
@@ -888,17 +928,28 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 // the gauge fields as they are. Skipped while the served CRD is recorded as pruning status.usage, so an
 // operator ahead of its CRD costs one probe per interval across both writers;
 // the ConfigMap is current throughout, and the patch after the CRD lands
-// carries everything accumulated since. A gauge difference alone is likewise
-// skipped while the gauges' own pruning record is fresh, the served CRD at the
-// previous schema, so the counters that CRD serves keep landing every poll.
+// carries everything accumulated since. A difference in a newer field alone, a
+// gauge or a later counter, is likewise skipped while the newer-fields record
+// is fresh, the served CRD at a previous schema, so the first counters that
+// CRD serves keep landing every poll.
 func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
+	proposed := doc.Totals[usageCounterRemediationsProposed]
+	merged := doc.Totals[usageCounterRemediationsMerged]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
-	gaugesMoved := gaugesKnown && !p.gaugesPruned(agent) &&
+	// The first three counters are in every served CRD that has status.usage;
+	// the gauges and the merged counter arrived later, each at its own
+	// release, and a CRD at a previous schema prunes one or both, so a
+	// difference in one of them alone waits while that field's record is
+	// fresh rather than re-patching every poll, and the other keeps landing.
+	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
+	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
+	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || gaugesMoved ||
+	newerBehind := !mergedPruned && usage.RemediationsMergedTotal < merged
+	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || newerBehind || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
 		return nil
@@ -906,6 +957,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	base := agent.DeepCopy()
 	usage.ToolExecutionsTotal = tool
 	usage.EventsIngestedTotal = events
+	usage.RemediationsProposedTotal = proposed
+	usage.RemediationsMergedTotal = merged
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
@@ -916,17 +969,22 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if err := p.r.Status().Patch(ctx, agent, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("patching status.usage: %w", err)
 	}
-	// The echoes: counters written non-zero that come back absent are the
-	// pruning of status.usage, recorded in the record the Ready writer shares;
-	// gauges written as a reading, a zero one included since a pointer to zero
-	// serialises, that come back absent are the gauges' own record, since a
-	// CRD at the previous schema prunes them and serves the counters. A patch
-	// that wrote only a time, or cleared the gauges, says nothing either way.
-	if tool > 0 || events > 0 {
-		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events)
+	// The echoes: the first three counters written non-zero that come back
+	// absent are the pruning of status.usage, recorded in the record the Ready
+	// writer shares; a newer field written -- a gauge reading, a zero one
+	// included since a pointer to zero serialises, or the merged counter
+	// non-zero -- that comes back absent is that field's own record, since a
+	// CRD at a previous schema prunes one or both and serves the first
+	// counters. A patch that wrote only a time, or cleared the gauges, says
+	// nothing either way.
+	if tool > 0 || events > 0 || proposed > 0 {
+		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events && agent.Status.Usage.RemediationsProposedTotal == proposed)
 	}
 	if gauges != nil {
-		p.noteGaugeEcho(ctx, agent, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
+		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
+	}
+	if merged > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterRemediationsMerged, agent.Status.Usage.RemediationsMergedTotal == merged)
 	}
 	return nil
 }
@@ -966,9 +1024,9 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarg
 	detail := usageScrapeDetail(err)
 	if count == 1 {
 		log.Info("a metrics listener could not be read; this pod is not counted and its baseline is not advanced until it recovers",
-			"pod", target.name, "counter", target.counter, "error", detail)
+			"pod", target.name, "counters", strings.Join(target.counters, ","), "error", detail)
 	}
-	return usageScrapeFailure{name: target.name, counter: target.counter, detail: detail, err: err}, count >= usageScrapeFailureEventStreak
+	return usageScrapeFailure{name: target.name, counter: usageStatusFieldList(target.counters), detail: detail, err: err}, count >= usageScrapeFailureEventStreak
 }
 
 // recordStandingFailures records at most one Warning on the CR for this poll,
@@ -999,6 +1057,16 @@ func (p *UsageCounterPoller) recordStandingFailures(agent *agentv1alpha1.Platfor
 	}
 }
 
+// usageStatusFieldList names the status fields a pod's counters project to,
+// for the Warning: "status.usage.a, status.usage.b".
+func usageStatusFieldList(counters []string) string {
+	fields := make([]string, 0, len(counters))
+	for _, counter := range counters {
+		fields = append(fields, usageStatusFieldPrefix+counter)
+	}
+	return strings.Join(fields, ", ")
+}
+
 // usageScrapeFailureMessage is the body of the Warning the CR gets for the
 // listeners that failed this poll past their streak, naming each pod and ending
 // with the distinct guidance their kinds point at. It is byte-stable across
@@ -1013,7 +1081,7 @@ func usageScrapeFailureMessage(failures []usageScrapeFailure) string {
 	perPod := make([]string, 0, len(failures))
 	picked := map[string]bool{}
 	for _, f := range failures {
-		perPod = append(perPod, fmt.Sprintf("pod %s (status.usage.%s): %s", f.name, f.counter, f.detail))
+		perPod = append(perPod, fmt.Sprintf("pod %s (%s): %s", f.name, f.counter, f.detail))
 		picked[usageScrapeGuidance(f.err)] = true
 	}
 	var guidance []string
@@ -1047,7 +1115,7 @@ func (p *UsageCounterPoller) noteScrapeRecovery(log logr.Logger, target usageTar
 	delete(p.streaks, target.uid)
 	p.mu.Unlock()
 	if streak != nil {
-		log.Info("a metrics listener is readable again", "pod", target.name, "counter", target.counter, "failedPolls", streak.count)
+		log.Info("a metrics listener is readable again", "pod", target.name, "counters", strings.Join(target.counters, ","), "failedPolls", streak.count)
 	}
 }
 

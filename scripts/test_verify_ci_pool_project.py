@@ -3962,6 +3962,7 @@ FLEET_RESOURCE_ROLES = {
     "google_container_cluster": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
     "google_container_node_pool": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
     "google_compute_disk": {"roles/compute.storageAdmin"},
+    "google_compute_firewall": {"roles/compute.securityAdmin", "roles/compute.viewer"},
     "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
     "google_service_account": {"roles/iam.serviceAccountAdmin"},
     "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
@@ -3993,7 +3994,9 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # neither demands a role nor keeps one accounted for.
     _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
     _READ_BLOCKS = {"resource", "data"}
-    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals"}
+    # moved renames a state address and declares no resource: the type it
+    # names is read from the resource block it points at.
+    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals", "moved"}
 
     @staticmethod
     def _tokenizer():

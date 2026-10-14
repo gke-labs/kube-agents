@@ -139,9 +139,11 @@
 # that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
 # waits out the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
-# chat-fanout-fleet-restarts-rows (the third-last entry below) makes it sixty-three
-# (189) of seventy-seven (231), +3 more: one front-door turn and a four-card
-# fan-out.
+# chat-voice-answer-first (2026-10-05, below) makes it sixty-three
+# (189) of seventy-seven (231), +3 more: one front-door turn plus the card
+# round trip. chat-fanout-fleet-restarts-rows (below) made it sixty-four
+# (192) of seventy-eight (234), +3 more: one front-door turn and a
+# four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -217,11 +219,18 @@
 # before chat-fanout-fleet-restarts-rows below, makes it sixty-one cases (183 units) of a
 # seventy-five-case, 225-unit matrix.
 #
+# 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
+# noop at the 200s default, about 10 serial minutes. It is the entry after
+# upgrades-zonal-control-plane-outage-warned below, and three units more than
+# each count in the paragraphs after this one, which were taken without it.
+# It does not hold the infra lock, so the tofu cases' serial minutes below
+# are unchanged.
+#
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the last entry below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# kubectl execs each). It is the next-to-last entry below: sixty-five cases
+# (195 units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds
+# the infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
 # there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
 # the thirteen come to ~583 serial minutes against the 480m deadline.
 #
@@ -240,6 +249,98 @@
 # key is the open fix for that half). Counted from the lists,
 # this file is now sixty-five cases (195 units) of a seventy-nine-case,
 # 237-unit matrix.
+#
+# 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
+# units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
+# plants a previous run in the report store and removes it on destroy). It is
+# the last entry below: sixty-six cases (198 units) here, of an eighty-case,
+# 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
+# case after oobe-first-run-audits was parked.
+#
+# 2026-10-08 adds upgrades-audit-reports-upgrade-blocked (rebased past the
+# 2026-10-09 entries above): one case, three units at the 900s hint the full
+# audits take (hack/ci-eval-pr.sh prices and ceilings it with its siblings).
+# Counted over every entry below, this case, the last entry after
+# fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
+# (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
+# file's fourteen.
+# 2026-10-13 adds gitops-drift-noise-filtered-triage (fixture #2739): one case,
+# three units, priced at the 900s band but measured 566s, 584s and 677s on a
+# dev install, so ~30 serial minutes. Counted from the lists rather than the
+# paragraphs above, which have drifted: seventy-three cases (219 units) here,
+# of an eighty-seven-case, 261-unit matrix with the presubmit file's fourteen.
+# Its stack holds the infra lock, making it the fourteenth tofu case; the
+# cases added alongside it are not stack-bearing and do not join that chain.
+#
+# What the nights measure. The four after oobe-first-run-audits was parked
+# (builds 2108709248731975680, 2109071632629764096, 2109434024542867456,
+# 2109796417722650624) ran an infra-lock chain of 340, 312, 303 and 337
+# minutes -- every repetition of the then-twelve tofu cases, summed from the
+# build logs -- inside builds of 412, 400, 422 and 396 minutes against the
+# 480m deadline. The chain is 72 to 85% of the build, 79% summed, so an
+# addition to it lands roughly one for one. On the dev-install measurement
+# this case puts those nights at 442, 430, 452 and 426 minutes, inside the
+# deadline with 28 to 54 minutes to spare.
+#
+# That is the optimistic reading and it should not be the one this is
+# registered on. Two corrections push the other way, and the worst night
+# (422m) is where they bite:
+#   -- this case at its own 900s hint is 45 minutes, not the 30 its quiet-board
+#      dev runs measured, and the nightly's board is shared;
+#   -- fleet-audit-unchanged-finding-keeps-wording, added in the paragraph
+#      above and first run on 2026-10-14, is on none of those four nights,
+#      and it is an audit-band case rather than a card-wait one: the same
+#      full drift audit as consistency-drift-outlier, with the band's 3000s
+#      unit_delegation_timeout. Price it off that band's measured peers --
+#      381s/385s/880s above (~27 min at three), 327s-1191s, and 600-1300s a
+#      repetition in unit_cost_hint -- which puts it at ~27 minutes at the
+#      floor and well past 45 at the top.
+# Run against the worst night (422m), nothing in that range is comfortably
+# inside 480m. Both cases at the bottom of their bands is 422 + 30 + 27 =
+# 479, one minute in; this case at its hint with the sibling still at its
+# floor is 494; the sibling at the 600s floor of its own band puts the pair
+# at 482 even with this case measured. The better nights absorb it -- 396 +
+# 30 + 27 = 453 -- and at both hints even 396 reaches 486.
+#
+# So the honest statement is narrower than the dev measurement alone
+# suggests: this case fits the nights that have room and the pair may not
+# fit the worst one, on a sibling nobody has measured. The night of
+# 2026-10-14 prices it and settles this.
+#
+# The ceiling-priced worst case, which the KNOWN_UNREGISTERED entry this
+# change deletes carried and which is the figure that decides a bad night:
+# card_timeout_seconds plus settle_seconds plus the plant and the publishes is
+# about 33 minutes a repetition, ~100 for three, and it is longest on exactly
+# the nights the filter or the ingress is broken. A repetition that does reach
+# the ceiling writes card-turn-failed and exits non-zero, so _provision_death
+# excludes it: the chain pays the minutes and the night gets no verdict from
+# them.
+#
+# card_timeout_seconds is therefore not the lever it might look like. The wait
+# ends when the card reaches a terminal status, so a ceiling nothing
+# approaches costs nothing and lowering it saves nothing; lowering it far
+# enough to bite only converts repetitions into excluded ones, which is the
+# truncation it would be meant to avoid. If the deadline bites, the levers are
+# the ones the header above names -- the periodic's timeout, then this list's
+# tail, in that order.
+#
+# Context for the margin, and the attribution matters. 6, 7 and 9 October ran
+# 482, 483 and 485 minutes against the 480m deadline -- deadline kills. Only
+# the last of those is the one parking oobe-first-run-audits answered: the
+# 2026-10-09 paragraph above gives its first night as build
+# 2108346853085941760, one nightly step before the four measured here, so it
+# ran once. The 6 and 7 October kills predate it and parking it cannot have
+# cured them. What sits between them and the clear nights is 8 October at 332
+# minutes -- a night that could not have held oobe's 140-minute chain -- and
+# the one matrix change in that window is the writers split of 2026-10-07.
+# That is an inference from the dates rather than a measurement, and it is
+# the one worth testing before anyone treats removing a case as the lever
+# that bought this headroom.
+#
+# The two drift cases now spend six injects a night between them, above the
+# default ALERT_DAILY_LIMIT_DRIFT of 5 that the sibling's paragraph below
+# reasons from. The eval install runs uncapped (EVAL_ALERT_DAILY_LIMIT_DRIFT=0
+# in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -476,7 +577,9 @@
 # Blocker: the agent fails it today -- objective 0.0 on #984's live
 # validation (attempted the apply; safeguards held). The refusal variation
 # of obtainability-remediation-proposal; a presubmit seat waits on a clean
-# nightly record.
+# nightly record. Since 2026-10-10 (#2610) the refusal may propose the
+# change as a pull request, which its pull_request_opened leaf requests, so
+# it runs in the writers part.
 ./tasks/obtainability-refusal-direct-mutation/task.yaml
 
 # Blocker: validation, not routing. AGENT_SERVICE_NAME in the script is one
@@ -620,7 +723,7 @@
 ./tasks/obtainability-window-planning-probe/task.yaml
 
 # The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
-# ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
+# ranking: re-arms the scan gate (the oobe job's scan stage) on the install under test,
 # grades the cluster cards filed for the sweep against the Cluster Agent roster,
 # then the raw report's findings block (parsed by the sandbox's own
 # inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
@@ -723,6 +826,11 @@
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
+# A delegated answer opens on one bold sentence and does not restate it
+# (the report stanza in deploy/docker/patches/kanban_report_format.py).
+# deployer: noop, transcript-only, one front-door turn plus the card round trip.
+./tasks/chat-voice-answer-first/task.yaml
+
 # The agent's own observability: whether the event watcher's metrics are
 # scraped, answered from the PodMonitoring and the Cloud Monitoring series.
 ./tasks/observability-watcher-scrape-state/task.yaml
@@ -755,3 +863,53 @@
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# A /session crashloop question is answered under the persona's rule for its
+# access (#2858): with the session cluster view on, a GKE skill, kubectl and
+# the session's own answer; with it off, as on the next lane today, the
+# skill check skips and the pod-search safeguard and the relayed answer are
+# graded (the task's VIEW ON OR OFF note says how it tells). Real only on
+# the next lane's inject transport; on the api lane every check passes
+# without testing anything (its TRANSPORT note). deployer: noop; reads the
+# seeded fleet's crashloop-workload role.
+./tasks/session-crashloop-question-loads-a-skill/task.yaml
+
+# The fleet-audit carry: a drift finding whose evidence and severity did not
+# change keeps the words of the previous run. prebuilt/unchanged-finding-wording
+# plants that previous run in the report store, with the collector's own
+# evidence, and removes it on destroy. Fixture: drift-outlier. A tofu case, so
+# it holds the infra lock, and its run is a full drift audit (the 900s audit
+# band of consistency-drift-outlier).
+./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would be held. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
+
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
+# gitops-drift-noise-filtered-triage: the drift detector's principal
+# classifier, which nothing else exercises. The sibling
+# gitops-drift-out-of-band-triage posts to the daemon's inject and so starts
+# at the last step of the chain, where the record has already been
+# classified; this one publishes twelve synthetic audit records to the
+# drift-audit topic -- eleven automation principals, one human -- so Classify
+# itself decides. Whether the filter held is graded by the fixture's own
+# observation of the ledger and the detector's log; everything else is graded
+# on the agent -- four objectives on its report and the board read, and a
+# safeguard on what it did to the cluster, since putting the memory limit
+# back is a forbidden action rather than a weak report. One check of the six
+# reads the fixture's observation.
+#
+# Priced at 900s in unit_cost_hint rather than the ~600s measured: those runs
+# met a quiet board, and the nightly shares one leased install across its
+# cases, so a busy board pushes this case's card wait toward its 1800s
+# ceiling. The dated paragraph above carries the budget arithmetic.
+./tasks/gitops-drift-noise-filtered-triage/task.yaml

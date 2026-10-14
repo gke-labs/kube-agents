@@ -35,8 +35,10 @@ called `.gitconfig` are all inert as long as nothing materialises them into a
 working copy beside the token. Objects and refs are data; a checkout is what
 turns them into behaviour.
 
-The routes are stateless. There is no handle, nothing survives a request, and
-two concurrent requests share nothing but the lock the HTTP layer holds.
+The routes are stateless to their callers. There is no handle, no answer depends
+on an earlier request, and two concurrent requests share nothing but the lock the
+HTTP layer holds and the merged-proposal count's own, which guards a metric and
+never an answer.
 
 This file names no forge, and a test enforces that. Everything a forge decides
 is behind `providers`; everything here is true whatever forge the URL named.
@@ -66,6 +68,8 @@ import os
 import re
 import subprocess
 import threading
+import datetime
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -79,6 +83,7 @@ from providers import (
     Transport,
     pinned_base,
     short_branch,
+    tls_refusal as tls_refusal_default,
     validate_branch,
     validate_revision,
 )
@@ -127,6 +132,12 @@ LS_REMOTE_NO_MATCH_EXIT_CODE = 2
 # `platform-agent/<change>-<target>`; a branch outside it is a person's, or
 # another tool's, whatever its history says.
 AGENT_BRANCH_PREFIX = "platform-agent/"
+# The neutral proposal state a forge reports once a proposal has merged
+# (`providers/*/translate.py` maps every forge's spelling to it), and the
+# spelling of UTC `datetime.fromisoformat` did not accept before Python 3.11.
+MERGED_PROPOSAL_STATE = "merged"
+ISO_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
 
 # How many of a branch's proposals `branch-delete` reads. It needs all of them:
 # the one that carried the tip, and every other, since a branch any of them
@@ -214,6 +225,22 @@ def _base_branch_missing(repo: str, base: str) -> WorkspaceError:
     )
 
 
+def _iso_timestamp(value: Any) -> float | None:
+    """An ISO-8601 instant as seconds since the epoch, or None for anything else."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith(ISO_UTC_SUFFIX):
+        text = text[: -len(ISO_UTC_SUFFIX)] + ISO_UTC_OFFSET
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
 def _login_key(login: str) -> str:
     """One spelling for two sources that mark an automation differently.
 
@@ -293,9 +320,11 @@ class VcsBroker:
     """The verbs, each one request long.
 
     `scratch_root` is on the broker's own volume. Nothing under it outlives a
-    request, which is what makes these routes stateless: there is no handle to
-    leak, no tree to collide with another caller's, and no cleanup an
-    interrupted client can skip.
+    request, which is what makes these routes stateless to their callers: there
+    is no handle to leak, no tree to collide with another caller's, and no
+    cleanup an interrupted client can skip. What the process keeps across
+    requests is the merged-proposal count's seen set and the identity cache
+    beside it (`_count_merges`), which no answer depends on.
     """
 
     def __init__(
@@ -310,8 +339,30 @@ class VcsBroker:
         http_opener: Callable[..., Any] | None = None,
         request_deadline: Callable[[], float | None] | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
+        merge_observer: Callable[[int], None] | None = None,
+        started_at: float | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None, for the git runs that read a failure themselves rather than
+        # raising it. The broker hands its own, which names a forge's CA
+        # Secret; without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or tls_refusal_default
+        # The merged-proposal count (`_count_merges`): called with how many
+        # proposals of this install's own a read just showed merged for the
+        # first time in this process. None counts nothing. `started_at` is the
+        # process start the count is bounded by, so a restart counts no merge
+        # the previous process could have counted.
+        self.merge_observer = merge_observer
+        self.started_at = time.time() if started_at is None else started_at
+        self._merged_seen: set[tuple[str, str, Any]] = set()
+        self._merged_lock = threading.Lock()
+        # The credential's login per (forge, repository), asked once per process
+        # and only when a merge could count: the lookup is a forge call. A
+        # lookup that raised is not remembered, so an outage is asked again.
+        self._merged_viewer: dict[tuple[str, str], str] = {}
+        self._merged_nameless_logged = False
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         self._git_runner = git_runner
         self.base_branch = (base_branch or "").strip()
@@ -382,6 +433,8 @@ class VcsBroker:
                 whoami_route=forge.whoami_route,
                 opener=self._http_opener,
                 outer_deadline=self._request_deadline,
+                ca_file=forge.ca_file,
+                ca_source=forge.ca_source,
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
@@ -1131,6 +1184,9 @@ class VcsBroker:
         if listed.returncode == 2:
             return ""
         if listed.returncode != 0:
+            refusal = self._tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
             raise WorkspaceError(
                 f"could not read {branch} from the remote: "
                 f"{(listed.stderr or '').strip() or 'git exited ' + str(listed.returncode)}",
@@ -1236,7 +1292,7 @@ class VcsBroker:
         one and `branch-delete` refuses to remove one.
         `root` must already have `origin`.
         """
-        default = self._default_branch_of_remote(git, root)
+        default = self._default_branch_of_remote(git, root, self._tls_refusal)
         protected_branches = {"main", "master", "production"}
         if default:
             protected_branches.add(default.casefold())
@@ -1265,16 +1321,25 @@ class VcsBroker:
             )
 
     @staticmethod
-    def _default_branch_of_remote(git: Callable, root: Path) -> str:
+    def _default_branch_of_remote(
+        git: Callable,
+        root: Path,
+        tls_refusal: Callable[[str], WorkspaceError | None] = tls_refusal_default,
+    ) -> str:
         """The branch the remote's HEAD points at, or "" if it says nothing.
 
         `ls-remote --symref` prints `ref: refs/heads/<name>\tHEAD` first when
         the remote advertises a symbolic HEAD. A remote that advertises none --
         an empty repository, or a server that hides it -- yields "", and the
         caller treats that as "no default to protect" rather than as a
-        refusal, because there is nothing to compare against.
+        refusal, because there is nothing to compare against. A certificate
+        that fails is not "says nothing": it is raised by its cause.
         """
         listed = git(root, "ls-remote", "--symref", "origin", "HEAD", check=False)
+        if getattr(listed, "returncode", 0) != 0:
+            refusal = tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
         for line in (listed.stdout or "").splitlines():
             if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
                 return line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
@@ -1396,7 +1461,11 @@ class VcsBroker:
             return ""
 
     def _forge_verb(
-        self, verb: str, payload: dict[str, Any], pinned_target: bool = False
+        self,
+        verb: str,
+        payload: dict[str, Any],
+        pinned_target: bool = False,
+        observe: Callable[[Binding, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         bound = self._bind(payload)
         if pinned_target:
@@ -1406,16 +1475,126 @@ class VcsBroker:
             if base is not None:
                 payload = {**payload, "target": base}
         method = getattr(bound.forge, verb.replace("-", "_"))
-        return bound.stamp(method(bound.api, bound.repo, payload))
+        result = bound.stamp(method(bound.api, bound.repo, payload))
+        if observe is not None:
+            # A reader of the answer, never a party to it: whatever it does
+            # or fails to do, the caller gets the forge's answer.
+            observe(bound, result)
+        return result
 
     def proposal_create(self, payload):
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
     def proposal_list(self, payload):
-        return self._forge_verb("proposal-list", payload)
+        return self._forge_verb("proposal-list", payload, observe=self._observe_merged_list)
 
     def proposal_view(self, payload):
-        return self._forge_verb("proposal-view", payload)
+        return self._forge_verb("proposal-view", payload, observe=self._observe_merged_view)
+
+    # -- the merged-proposal count -----------------------------------------
+    #
+    # The agent never merges: a merge is a person's act on the forge, and the
+    # broker learns of it only when a later read shows the proposal in the
+    # merged state. The count therefore rides on the reads the agent already
+    # makes of its proposals, under three rules that keep it from counting a
+    # merge twice without a store: the proposal is this install's own (its
+    # author is the credential's login), it merged no earlier than this process
+    # started (a merge before that was the previous process's to count, or is
+    # lost with it), and each proposal is counted once per process. A merge
+    # this process never reads is not counted: the count under-counts rather
+    # than over-counts, like the operator's totals it feeds.
+
+    def _observe_merged_list(self, bound: Binding, result: dict[str, Any]) -> None:
+        proposals = result.get("proposals")
+        self._count_merges(bound, proposals if isinstance(proposals, list) else [])
+
+    def _observe_merged_view(self, bound: Binding, result: dict[str, Any]) -> None:
+        proposal = result.get("proposal")
+        self._count_merges(bound, [proposal] if isinstance(proposal, dict) else [])
+
+    def _count_merges(self, bound: Binding, proposals: list) -> None:
+        if self.merge_observer is None:
+            return
+        try:
+            # The free rules first -- merged, not before this process started,
+            # not already counted -- so the identity lookup, a forge call, runs
+            # only when something could count, and never for a history of old
+            # merges a `state=all` listing carries on every read.
+            with self._merged_lock:
+                candidates = [
+                    p for p in proposals
+                    if isinstance(p, dict)
+                    and p.get("state") == MERGED_PROPOSAL_STATE
+                    and (closed := _iso_timestamp(p.get("closed"))) is not None
+                    and closed >= self.started_at
+                    and self._merged_key(bound, p.get("number")) not in self._merged_seen
+                ]
+            if not candidates:
+                return
+            viewer = self._merged_viewer_for(bound)
+            if not viewer:
+                return
+            count = 0
+            with self._merged_lock:
+                for proposal in candidates:
+                    if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
+                        continue
+                    key = self._merged_key(bound, proposal.get("number"))
+                    if key in self._merged_seen:
+                        continue
+                    self._merged_seen.add(key)
+                    count += 1
+            if count:
+                self.merge_observer(count)
+        except Exception as exc:  # noqa: BLE001 -- the count never fails the read
+            LOGGER.debug("merged-proposal count skipped type=%s", type(exc).__name__)
+
+    @staticmethod
+    def _merged_scope(forge: Forge) -> str:
+        """What the merged count and its identity cache are keyed on besides
+        the repository: the forge's canonical host, as `_pinned_base` keys the
+        pins, since one provider serves several hosts (two forges of one
+        provider on different hosts carry the same `name` and may carry the
+        same path) and the same path on another host is another repository
+        with its own credential."""
+        return forge.hosts[0] if forge.hosts else forge.name
+
+    @classmethod
+    def _merged_key(cls, bound: Binding, number: Any) -> tuple[str, str, Any]:
+        """The seen-set key: forge host, repository and number. The repository
+        is casefolded, since a caller may spell `Acme/Infra` and `acme/infra`
+        for the one repository the forge resolves them to, and the count is per
+        proposal, not per spelling."""
+        return (cls._merged_scope(bound.forge), bound.repo.casefold(), number)
+
+    def _merged_viewer_for(self, bound: Binding) -> str:
+        """The credential's login for the count, remembered per repository,
+        keyed the way the seen set is: the login is the credential's, not the
+        spelling's.
+
+        "" is a real answer, a credential that cannot name itself, and is
+        remembered too, with one INFO line per process so that a flat
+        `remediationsMergedTotal` on such an install is explained in the log;
+        a lookup that raises is left to the caller's guard and asked again next
+        time.
+        """
+        key = (self._merged_scope(bound.forge), bound.repo.casefold())
+        with self._merged_lock:
+            if key in self._merged_viewer:
+                return self._merged_viewer[key]
+        viewer = self._viewer(bound)
+        with self._merged_lock:
+            self._merged_viewer[key] = viewer
+            announce = not viewer and not self._merged_nameless_logged
+            if announce:
+                self._merged_nameless_logged = True
+        if announce:
+            LOGGER.info(
+                "merged-proposal count is off for %s: the credential cannot name itself, "
+                "so no proposal can be told to be this install's own",
+                self._merged_scope(bound.forge),
+            )
+        return viewer
 
     def proposal_comment(self, payload):
         return self._forge_verb("proposal-comment", payload)
@@ -1536,6 +1715,36 @@ WRITE_VERBS = frozenset(
 # accident of one forge.
 UNGATED_VERBS = frozenset({"capabilities"})
 
+# Every verb `route_table` serves, as a constant: the closed vocabulary the
+# broker's version-control counter labels a request under, so a caller's path
+# never names a series. `test_the_verb_vocabulary_is_the_route_table` holds the
+# two in step.
+VCS_VERBS = frozenset(
+    {
+        "capabilities",
+        "clone",
+        "publish",
+        "proposal-create",
+        "proposal-list",
+        "proposal-view",
+        "proposal-comment",
+        "issue-create",
+        "issue-list",
+        "issue-view",
+        "issue-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-commits",
+        "proposal-acknowledge",
+        "issue-update",
+        "issue-close",
+        "label-ensure",
+        "identity",
+        "branch-view",
+        "branch-delete",
+    }
+)
+
 
 def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
     """The verbs `POST /v1/vcs/<verb>` dispatches to.
@@ -1572,6 +1781,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
 __all__ = [
     "Binding",
     "VcsBroker",
+    "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
     "UNGATED_VERBS",
     "WRITE_VERBS",
