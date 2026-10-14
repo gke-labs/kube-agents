@@ -17,6 +17,8 @@
 # and moves with the fleet, so the line carries it for the judge and the
 # patterns accept any value there.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the client image. Moving its tag within one minor of
@@ -88,9 +90,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?(?: \([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   - name: the-declared-line-says-the-client-is-outside-the-skew
     role: objective

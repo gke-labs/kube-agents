@@ -12,6 +12,8 @@
 # line per such workload, in a fixed form; the deterministic objectives read
 # the planted workload's line and nothing else.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the image reference. Repointing it at registry.k8s.io
@@ -74,9 +76,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io(?: \([^)\n;]*\))?; retired: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-says-the-host-is-retired
     role: objective
