@@ -798,12 +798,24 @@ var slackLayoutRefusals = map[string]bool{
 	"msg_too_long": true, "too_many_attachments": true, "no_text": true,
 }
 
-// slackLayoutError wraps Slack's refusal of a layout in ErrLayoutRefused and
-// leaves any other error as it is.
+// slackGoneErrors are the chat.update errors that say the message cannot be
+// edited at all.
+var slackGoneErrors = map[string]bool{
+	"message_not_found": true, "cant_update_message": true, "edit_window_closed": true, "channel_not_found": true,
+}
+
+// slackLayoutError wraps Slack's refusal of a layout in ErrLayoutRefused, and
+// its answer that the message cannot be edited in ErrMessageGone, and leaves
+// any other error (a rate limit, an outage) as it is.
 func slackLayoutError(err error) error {
 	var resp slack.SlackErrorResponse
-	if errors.As(err, &resp) && slackLayoutRefusals[resp.Err] {
+	switch {
+	case !errors.As(err, &resp):
+		return err
+	case slackLayoutRefusals[resp.Err]:
 		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	case slackGoneErrors[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrMessageGone, err)
 	}
 	return err
 }

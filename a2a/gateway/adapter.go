@@ -203,6 +203,11 @@ var ErrTextOnly = errors.New("this backend posts text only")
 // such rather than counted or remembered as a refusal.
 var ErrLayoutRefused = errors.New("the backend refused this layout")
 
+// ErrMessageGone wraps a backend's answer that the message an edit names
+// cannot be edited at all (deleted, or past the backend's edit window), as
+// distinct from a failure a retry may clear.
+var ErrMessageGone = errors.New("the message can no longer be edited")
+
 // postTextOnly is PostMessage for a backend that renders no chat message.
 func postTextOnly(post func(conversation, text string) (string, error), conversation string, m OutMessage) (string, error) {
 	if m.Chat != nil {

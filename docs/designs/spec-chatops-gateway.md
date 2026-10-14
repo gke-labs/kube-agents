@@ -1765,7 +1765,7 @@ The `chat` object, with the request's `text` as its fallback, is laid out on Sla
 the text elsewhere. The first request with an `update` key posts one message, its text cut to one
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
-(another conversation's, one forgotten, one lost to a restart) or an edit that fails posts anew.
+(another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.
 A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
 forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
 `mark` is drawn once its post lands, on the ask of the conversation's latest chain (Reactions,

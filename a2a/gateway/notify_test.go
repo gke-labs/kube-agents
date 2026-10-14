@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -530,9 +531,11 @@ type fakeConversations struct {
 	err      error
 	posts    []notifyPost
 	// rendersChat, edits and chats: see PostMessage. failEdits fails
-	// every EditMessage.
-	rendersChat bool
-	failEdits   bool
+	// every EditMessage as a message that is gone; transientEdits fails the
+	// next N as a rate limit would.
+	rendersChat    bool
+	failEdits      bool
+	transientEdits int
 	// failPosts fails every Post (and so every PostMessage).
 	failPosts bool
 	edits     []notifyPost
@@ -585,7 +588,11 @@ func (f *fakeConversations) EditMessage(conversation, messageID string, m OutMes
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failEdits {
-		return errors.New("fake edit failure")
+		return fmt.Errorf("%w: fake", ErrMessageGone)
+	}
+	if f.transientEdits > 0 {
+		f.transientEdits--
+		return errors.New("fake transient failure")
 	}
 	f.edits = append(f.edits, notifyPost{thread: messageID, text: m.Text})
 	f.chats = append(f.chats, m.Chat)
