@@ -22,7 +22,11 @@ gating: `managed_repos` (swept, audited, sent pull requests) and
 `context_repos` (read for declared intent only, never written):
 
     MANAGED: <repo> ... | MANAGED: none
-    CONTEXT: <repo>[@<ref>] ... | CONTEXT: none      exit 0, or 5 if unreadable
+    CONTEXT: <host/path>[@<ref>] ... | CONTEXT: none exit 0, or 5 if unreadable
+
+MANAGED uses the names the verbs accept (bare owner/name on a GitHub-only
+install); CONTEXT uses host/path, because context repositories are only ever
+read, never passed to a verb. Userinfo in a URL is never printed.
 
 With --repo, the named repository (any spelling gitops_workspace.qualify
 accepts) must be registered and must answer a read the broker serves with
@@ -51,6 +55,7 @@ REACH_TIMEOUT_SECONDS = 60
 VCS_SCRIPT = Path(__file__).resolve().parents[1] / "skills" / "version-control" / "scripts" / "vcs.py"
 REACH_PROBE_LIMIT = "1"
 URL_SCHEME_SEPARATOR = "://"
+USERINFO_SEPARATOR = "@"
 NONE = "none"
 
 REGISTRATION_STEPS = (
@@ -103,7 +108,9 @@ def _context_names(entries: list[dict[str, str]]) -> list[str]:
     """`host/path`, with `@ref` when the entry pins one, for each context entry."""
     names = []
     for entry in entries:
-        name = entry["url"].split("://", 1)[-1].rstrip("/")
+        name = entry["url"].split(URL_SCHEME_SEPARATOR, 1)[-1].rstrip("/")
+        # A URL can carry credentials as userinfo; never echo them.
+        name = name.rsplit(USERINFO_SEPARATOR, 1)[-1]
         ref = entry.get(gitops_workspace.CONTEXT_REF_KEY)
         names.append(f"{name}@{ref}" if ref else name)
     return names

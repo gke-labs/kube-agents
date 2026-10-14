@@ -136,6 +136,14 @@ class ListingShowsBothRegistries(unittest.TestCase):
         self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
         self.assertEqual(f"MANAGED: {REPO}\nCONTEXT: github.com/acme/tf-live@prod", text)
 
+    def test_userinfo_in_a_context_url_is_never_printed(self):
+        context = [{"type": "github", "url": "https://x-access-token:s3cret@github.com/acme/tf-live"}]
+        with _StateDir(entries=ENTRY) as state_file:
+            (state_file.parent / "context_repos").write_text(json.dumps(context), encoding="utf-8")
+            code, text = gitops_preflight.listing()
+        self.assertNotIn("s3cret", text)
+        self.assertNotIn("x-access-token", text)
+
     def test_an_unreadable_context_registry_is_state_unreadable(self):
         with _StateDir(entries=ENTRY), patch.object(
             gitops_preflight.gitops_workspace, "get_context_repo_entries", side_effect=RuntimeError("boom")
