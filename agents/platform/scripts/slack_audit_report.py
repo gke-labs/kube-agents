@@ -184,7 +184,7 @@ SEVERITY_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:critical|major|minor)\b"
 ZERO_FINDING_RUN = re.compile(r"\b(?:clean|held|carried|nothing\s+reproduced)\b", re.IGNORECASE)
 #: A last line that is only a URL, the ledger wrapped onto a line of its own.
 BARE_URL_LINE = re.compile(r"\A[<(\[]*https?://\S+\Z")
-#: The line that carries a composed report's counts, when its last line is only the link.
+#: The line that carries a report's counts, when its last line is only the link.
 COUNTS_DIGIT = re.compile(r"\d")
 #: The coverage the line states: "across 3 clusters", "across 2 of 7 clusters".
 COVERAGE = re.compile(r"(?<![\w.,-])across\s+(\d{1,9})(?:\s+of\s+(\d{1,9}))?\s+clusters?\b", re.IGNORECASE)
@@ -712,8 +712,8 @@ def _ledger_line(report: str) -> str:
 def headline_fallback(report: str, ref: LedgerRef) -> str | None:
     """The report's ledger line in bold with the ledger link, for when the issue could not be read.
 
-    The ledger line is the report's last, the SOPs' one line; a sentence the
-    relay turn put above it is not the headline. A last line that is only the
+    The ledger line is the report's last, the SOPs' one line; a sentence above
+    it is not the headline. A last line that is only the
     link falls back to the audit line above it (:func:`_ledger_line` says
     which); with none, there is no headline and the report goes out unchanged.
     """

@@ -522,3 +522,35 @@ def test_github_url_shapes_are_mains():
     assert forges.issue_refs("https://github.com/_a/b/issues/1", "github") == []
     assert forges.proposal_refs("https://github.com/a/.b/pull/2", "github") == []
     assert forges.issue_refs("https://gitlab.com/_a/b/-/issues/1", "gitlab") == [("_a/b", 1)]
+
+
+# --- the eval harness's ledger-path probe writes what this check parses -------
+#
+# hack/ci_gitlab_forge.py (``probe-ledger``, kube-agents#2920) opens one
+# ledger-shaped issue per GitLab run and parses it back with a copy of
+# ``_LEDGER_FOOTER_RE`` (private here, and hack/ has no import path into this
+# package). Pinned equal, and the probe's body is run through this module's own
+# parser, so a footer change that reaches one copy and not the other fails here
+# rather than leaving the probe green on a body the grader would not read.
+
+
+def _hack_forge_module():
+    import importlib.util
+    import sys
+
+    hack = Path(__file__).resolve().parents[2] / "hack"
+    if str(hack) not in sys.path:
+        sys.path.insert(0, str(hack))
+    spec = importlib.util.spec_from_file_location("ci_gitlab_forge", hack / "ci_gitlab_forge.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_probe_footer_regex_is_this_modules_and_its_body_parses_here():
+    forge = _hack_forge_module()
+    assert forge.PROBE_FOOTER_RE.pattern == verifiers._LEDGER_FOOTER_RE.pattern
+    stamp = datetime(2026, 10, 13, 18, 0, 0, tzinfo=timezone.utc)
+    body = forge.PROBE_FOOTER.format(audit=forge.PROBE_AUDIT_ID, stamp=stamp.isoformat())
+    assert verifiers._parse_footer(body) == (forge.PROBE_AUDIT_ID, stamp)
+    assert forge.PROBE_MAX_SKEW_SECONDS == LedgerIssueContainsVerifier.model_fields["max_clock_skew_sec"].default
