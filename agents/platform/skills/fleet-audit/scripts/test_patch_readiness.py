@@ -3521,11 +3521,14 @@ class CriteriaTest(unittest.TestCase):
     def test_a_token_no_image_type_can_match_is_refused_by_name(self):
         # The store returns the list as a JSON array; pasted as is, the brackets and quotes make
         # tokens no pool's imageType equals, and nothing would be flagged. Refused, naming them.
-        for value in ('["COS","UBUNTU"]', "cos, ubu-ntu", "'COS'"):
+        long_list = '["COS_CONTAINERD","UBUNTU_CONTAINERD","WINDOWS_LTSC_CONTAINERD","ONE_MORE","AND_ANOTHER","AND_A_SIXTH"]'
+        for value in ('["COS","UBUNTU"]', "cos, ubu-ntu", "'COS'", long_list):
             with self.subTest(value=value):
                 error, err = self.refused(["--deprecated-image-types", value])
                 self.assertIn("--deprecated-image-types", error)
                 self.assertIn("--deprecated-image-types", err)
+                # The advice survives a long list: the refusal is not cut at the gcloud excerpt cap.
+                self.assertIn("for an emptied list", error)
 
     def test_a_flag_argparse_refuses_is_written_as_the_error_manifest_too(self):
         # The one refusal that is argparse's own rather than criteria_from_args's: the same

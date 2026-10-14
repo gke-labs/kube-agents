@@ -2376,7 +2376,9 @@ def refused_manifest(message: str) -> dict:
         "audit": AUDIT_ID,
         "started_at": now,
         "finished_at": now,
-        "error": f"the collector's command line was refused and nothing was collected: {message}"[:ERROR_EXCERPT_CHARS],
+        # Not cut at the gcloud excerpt cap: this is the collector's own refusal, bounded by the
+        # command line, and its tail is the advice that says what to type instead.
+        "error": f"the collector's command line was refused and nothing was collected: {message}",
         "clusters": [],
     }
 
