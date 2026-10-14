@@ -419,12 +419,15 @@ def _restore_volume_wins(
     write on this start. A file the template does not ship — a capability the
     image dropped, or one an operator added by hand — needs nothing.
 
+    A file the merge leaves equal to the volume's is not rewritten: the image
+    added nothing, so the volume's file stands as it is.
+
     Known limit: this runs outside the store's per-capability lock, so at
     availability.replicas > 1 on one RWX volume a `set` committed by a running
     replica between a starting replica's snapshot and its restore is lost (the
-    changelog line survives). Same class as the roster's documented
-    multi-replica window in docker-entrypoint.sh; single-replica installs are
-    unaffected.
+    changelog line survives) on the one start that writes, the one where the
+    image ships a new key. Same class as the roster's documented multi-replica
+    window in docker-entrypoint.sh; single-replica installs are unaffected.
     """
     for relative, previous in prior.items():
         parts = relative.split("/")
@@ -435,6 +438,10 @@ def _restore_volume_wins(
             continue
         destination = home.joinpath(*parts)
         merged = merge_volume_wins(read_json(source), previous)
+        if merged == previous:
+            # The image added nothing, so the volume's file stands as it is; rewriting it
+            # here is the window in which a `set` another replica commits is overwritten.
+            continue
         try:
             write_json_atomic(destination, merged, sort_keys=True)
         except OSError as exc:

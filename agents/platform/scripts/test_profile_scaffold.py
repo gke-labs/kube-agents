@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import unittest.mock
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -519,6 +520,17 @@ class CapabilityCriteriaMergeTest(unittest.TestCase):
         write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7, "_revision": 4}))
         self.overlay()
         self.assertEqual(self.read("criteria.json"), {"threshold": 7, "_revision": 4, "new_key": "shipped"})
+
+    def test_a_volume_file_the_merge_leaves_equal_is_not_rewritten(self):
+        # The rewrite is the window in which a `set` another replica commits is lost; when the
+        # image adds nothing, the volume's file stands untouched.
+        tuned = {"threshold": 7, "new_key": "tuned", "_revision": 4}
+        write(self.home / self.CAP / "criteria.json", json.dumps(tuned))
+        with patch.object(ps, "write_json_atomic", wraps=ps.write_json_atomic) as writes:
+            self.overlay()
+        criteria_writes = [c for c in writes.call_args_list if str(c.args[0]).endswith("criteria.json")]
+        self.assertEqual(criteria_writes, [], "an equal file is not rewritten")
+        self.assertEqual(self.read("criteria.json"), tuned)
 
     def test_the_learning_policy_is_the_images_to_tighten(self):
         # A volume-wins learning.json would let a loosened policy outlive every
