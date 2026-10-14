@@ -11,6 +11,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // The bridge's chat messages (docs/designs/spec-a2a-payloads.md, "Chat
@@ -202,6 +203,11 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 	}
 	rest := pyStrip(strings.Join(body, "\n\n"))
 	msg := chatmsg.Message{Schema: chatmsg.Schema, Headline: headline}
+	if runeLen(rest) <= chatFoldTextMax {
+		if offered, ok := offerChat(msg, rest); ok {
+			return offered, true
+		}
+	}
 	switch n := runeLen(rest); {
 	case n > chatFoldTextMax:
 		return chatmsg.Message{}, false
@@ -209,6 +215,40 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 		msg.Fold = &chatmsg.Fold{Title: chatmsg.DefaultFoldTitle, Text: rest}
 	default:
 		msg.Detail = rest
+	}
+	return msg, true
+}
+
+// offerChat is answer_message's layout for an answer that ends by asking
+// which of its options to take (answerChoices): the detail is its opening
+// paragraph, each option's shown line and the question, the rest goes under
+// "why", and the options are choices. False when it asks none, when a label
+// is one the gateway would act on as a command, or when the detail is past
+// its cap, and the answer keeps the plain layout.
+func offerChat(msg chatmsg.Message, rest string) (chatmsg.Message, bool) {
+	offer, ok := answerChoices(rest)
+	if !ok {
+		return chatmsg.Message{}, false
+	}
+	for _, option := range offer.options {
+		text := clipRunes(strings.Join(strings.Fields(option.label), " "), buttonTextMax)
+		if text == "" || chattext.IsCommand(text) {
+			return chatmsg.Message{}, false
+		}
+		msg.Choices = append(msg.Choices, chatmsg.Choice{Text: text, Primary: option.primary})
+	}
+	var parts []string
+	for _, part := range []string{offer.shown, offer.question} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	msg.Detail = strings.Join(parts, "\n\n")
+	if runeLen(msg.Detail) > chatDetailMax {
+		return chatmsg.Message{}, false
+	}
+	if offer.folded != "" {
+		msg.Fold = &chatmsg.Fold{Title: chatmsg.DefaultFoldTitle, Text: offer.folded}
 	}
 	return msg, true
 }
@@ -671,6 +711,15 @@ func splitAnswer(md string) (string, []string) {
 	held, spans := holdCode(joined)
 	sentence, remainder := firstSentence(held)
 	sentence, remainder = restoreCode(sentence, spans, false), restoreCode(remainder, spans, false)
+	if runeLen(plainLine(sentence)) > chatHeadlineMax {
+		if head, overflow, ok := clauseCut(sentence); ok {
+			sentence = head
+			if remainder != "" {
+				overflow += " " + remainder
+			}
+			remainder = overflow
+		}
+	}
 	headline := clipRunes(plainLine(sentence), chatHeadlineMax)
 	var tailParts []string
 	for _, part := range []string{remainder, strings.Trim(moreLines, "\n")} {

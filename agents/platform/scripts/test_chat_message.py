@@ -57,7 +57,11 @@ class BridgeCasesTest(unittest.TestCase):
         for case in cases["ask_kind"]:
             with self.subTest(ask=case["in"]):
                 self.assertEqual(cm.ask_kind(case["in"]), case["kind"])
+        for case in cases["answer_chat"]:
+            with self.subTest(answer=case["in"][:40]):
+                self.assertEqual(cm.answer_message(case["in"]), case["chat"])
         self.assertGreater(len(cases["split_answer"]), 0)
+        self.assertGreater(len(cases["answer_chat"]), 0)
 
 
 class CommandWordTest(unittest.TestCase):

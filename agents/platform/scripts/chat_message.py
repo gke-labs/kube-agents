@@ -380,6 +380,12 @@ def answer_message(markdown: str) -> dict | None:
     ``slack_presenter.split_answer``'s rules. A rest longer than a detail holds
     goes under "why" instead. None when today posts it plain: no headline (an
     answer that opens on a code fence) or a rest past :data:`FOLD_TEXT_MAX`.
+
+    An answer that ends by asking which of its options to take
+    (``slack_moments.answer_choices``) offers them as choices instead: the
+    detail is its opening paragraph, each option's shown line and the question,
+    and the rest goes under "why". A choice the gateway would read as a command,
+    or a detail past :data:`DETAIL_MAX`, keeps the layout above.
     """
     headline, body = _presenter.split_answer(markdown)
     if not headline:
@@ -387,6 +393,14 @@ def answer_message(markdown: str) -> dict | None:
     text = "\n\n".join(body).strip()
     if len(text) > FOLD_TEXT_MAX:
         return None
+    offered = _moments.answer_choices(text)
+    if offered is not None:
+        shown, folded, question, options = offered
+        choices = [_choice(label, primary=primary) for label, primary in options]
+        detail = "\n\n".join(part for part in (shown, question) if part)
+        if all(choices) and len(detail) <= DETAIL_MAX:
+            fold = {"title": FOLD_TITLE_DEFAULT, "text": folded} if folded else None
+            return message(headline=headline, detail=detail, fold=fold, choices=choices)
     if len(text) > DETAIL_MAX:
         return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text})
     return message(headline=headline, detail=text)

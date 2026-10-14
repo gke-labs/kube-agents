@@ -54,9 +54,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 try:
+    import slack_moments as _moments
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
-    _presenter = None
+    _moments = _presenter = None
 
 #: The Slack plugin's markdown renderer, beside this module's ``gateway/``
 #: directory. It imports only ``re`` and ``typing``, so it loads by path.
@@ -99,6 +100,8 @@ BOLD_LABEL = re.compile(
 LABEL_LINE = re.compile(r"^\S+(?: \S+){0,2}:\s+\S")
 #: A quote or a table row: lines the presenter reads as text that are not a prose sentence either.
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
+#: The choice buttons' action-id prefix: ``<prefix>.choice.<n>``, which ``slack_ux_clicks`` answers.
+ACTION_PREFIX = "kage_answer"
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -166,14 +169,20 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
         return _refuse("it opens with a heading, a list item, a code fence, a quote or a table row")
     if BOLD_LABEL.match(opener):
         return _refuse("it opens with a bold label, not a sentence")
-    lead, _body = _presenter.split_lead(answer)
+    lead, _body = _presenter.split_lead(answer, cut=False)
     if LOSES_CONTENT.search(lead):
         return _refuse("the first sentence holds a link or a mention")
     headline = _headline_runs(lead)
     if not headline:
         return _refuse("it does not open with a sentence")
+    overflow = ""
     if sum(len(text) for text, _code in headline) > _presenter.HEADLINE_MAX:
-        return _refuse("the first sentence is longer than HEADLINE_MAX")
+        # split_lead's cut: the headline is the sentence up to a clause, and the rest of it leads the fold.
+        clause = _presenter.clause_cut(lead)
+        if clause is None:
+            return _refuse("the first sentence is longer than HEADLINE_MAX and no clause of it fits")
+        cut, overflow = clause
+        headline = _headline_runs(cut)
     # The rest is cut from the answer as written, so its line breaks reach block_kit as they
     # would upstream; split_lead's body joins a first paragraph's lines into one.
     first_line, _, after = answer.strip().partition("\n")
@@ -186,7 +195,9 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
             break
     if not first_line.startswith(written):
         return _refuse("the first sentence runs onto a second line")
-    tail = first_line[len(written):].strip()
+    if overflow and reopen:
+        return _refuse("the first sentence was cut inside an emphasis run")
+    tail = " ".join(part for part in (overflow, first_line[len(written):].strip()) if part)
     rest = "\n".join(part for part in (tail, after) if part).strip()
     if not rest:
         return _refuse("nothing follows the first sentence")
@@ -239,11 +250,28 @@ def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     return blocks
 
 
+def choice_blocks(options: list[tuple[str, bool]]) -> list[dict]:
+    """``slack_moments.answer_choices``'s options as choice buttons, the primary one drawn as Slack's
+    primary; each button's value is its label, so a click answers with what the button says."""
+    return _presenter._actions([
+        _presenter._button(
+            label, f"{ACTION_PREFIX}.{_presenter.CHOICE_ACTION}.{i}", value=label,
+            style=_presenter.PRIMARY_STYLE if primary else None,
+        )
+        for i, (label, primary) in enumerate(options)
+    ])
+
+
 def blocks_answer(
-    headline: list[tuple[str, bool]], fold_blocks: list[dict], question_blocks: list[dict] = ()
+    headline: list[tuple[str, bool]],
+    fold_blocks: list[dict],
+    question_blocks: list[dict] = (),
+    detail_blocks: list[dict] = (),
+    action_blocks: list[dict] = (),
 ) -> list[dict]:
-    """``headline`` in bold, its code runs as code too, ``fold_blocks`` folded under :data:`FOLD_TITLE`,
-    then ``question_blocks`` unfolded. No fold when ``fold_blocks`` is empty."""
+    """``headline`` in bold, its code runs as code too, ``detail_blocks`` unfolded, ``fold_blocks``
+    folded under :data:`FOLD_TITLE`, then ``question_blocks`` unfolded and ``action_blocks``. No fold
+    when ``fold_blocks`` is empty."""
     bold = [
         {"type": "text", "text": text, "style": {"bold": True, "code": True} if code else {"bold": True}}
         for text, code in headline
@@ -257,8 +285,10 @@ def blocks_answer(
     }
     return [
         {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": bold}]},
+        *detail_blocks,
         *([fold] if fold_blocks else []),
         *question_blocks,
+        *action_blocks,
     ]
 
 
@@ -302,10 +332,19 @@ class _AnswerFolder:
         headline, rest = parts
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
-        rest, question = trailing_question(rest)
+        offered = _moments.answer_choices(rest)
+        if offered is not None:
+            # An answer asking which of its options to take: the opening paragraph and the
+            # options' shown lines stay in sight, the rest folds, and the options are buttons.
+            shown, rest, question, options = offered
+            detail_blocks = render_fold(shown, mrkdwn_fn) if shown else []
+            action_blocks = choice_blocks(options)
+        else:
+            rest, question = trailing_question(rest)
+            detail_blocks, action_blocks = [], []
         fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
         question_blocks = render_fold(question, mrkdwn_fn) if question else []
-        if fold_blocks is None or question_blocks is None:
+        if fold_blocks is None or question_blocks is None or detail_blocks is None:
             return None
         if adapter._outbound_blocked(self._chat_id, OUTBOUND_LABEL):
             # Upstream's send refuses it as well, and says so in its result.
@@ -325,7 +364,9 @@ class _AnswerFolder:
         response = await adapter._client_for(channel, metadata).chat_postMessage(
             channel=channel,
             text=mrkdwn_fn(content) if callable(mrkdwn_fn) else content,
-            blocks=adapter._append_feedback_block(blocks_answer(headline, fold_blocks, question_blocks)),
+            blocks=adapter._append_feedback_block(
+                blocks_answer(headline, fold_blocks, question_blocks, detail_blocks, action_blocks)
+            ),
             **kwargs,
         )
         ts = str(response.get("ts") or "")
