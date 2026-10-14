@@ -13,6 +13,8 @@
 # such namespace, in a fixed form; the deterministic objectives read the
 # planted namespace's line and nothing else.
 #
+# A parenthetical after a graded value is ungraded: the judge reads it.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the enforce-version label. Pinning it to a named minor
@@ -80,9 +82,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?baseline; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?baseline(?: \([^)\n;]*\))?; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?!baseline;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?!baseline(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-version-is-latest
     role: objective
@@ -93,9 +95,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?latest; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?latest(?: \([^)\n;]*\))?; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!latest;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!latest(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-rule-set-moves
     role: objective

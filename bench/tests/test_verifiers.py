@@ -7374,6 +7374,8 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability (default-deny), seeded-debug (default-deny), seeded-capacity (default-deny) and seeded-deprecation (apiserver-egress-only)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 namespaces: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four — seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation",
             "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom and seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
         ],
@@ -7444,6 +7446,7 @@ _GROUP5 = {
     "upgrades-pod-security-latest-pinned-named": (
         [
             "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline (warn baseline); enforce-version latest (not pinned); rule set changes at the next minor: yes",
             "seeded-a/seeded-defaults: enforce: baseline; enforce-version: latest; rule set changes at the next minor: yes",
             "- `seeded-a/seeded-defaults`: enforce baseline; enforce-version `latest`; rule set changes at the next minor: yes.",
             "**seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes**",
@@ -7460,6 +7463,7 @@ _GROUP5 = {
     "upgrades-stale-client-skew-named": (
         [
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client (CronJob): client kubectl v1.29.0 (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client-29384756-abcde: client: kubectl v1.29.0; server: v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client registry.k8s.io/kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
@@ -7468,6 +7472,7 @@ _GROUP5 = {
             "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
         ],
         [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.30.0 (was v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.34.1; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client helm v3.14.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
@@ -7622,6 +7627,8 @@ _GROUP2 = {
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: Deployment pinned-batch-runner, DaemonSet node-exporter",
             "- `seeded-b/no-surge-pool`: nodes: 1; replacement node first: no; workloads pinned to this pool: seeded-upgrade/pinned-batch-runner.",
             "**seeded-b/no-surge-pool**: nodes 1; replacement node first: no; workloads pinned to this pool: deployment pinned-batch-runner (1 replica)",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: 1 (pinned-batch-runner)",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: one workload: pinned-batch-runner",
             "1. seeded-b (us-central1-a)/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-7d9f8b6c4-abcde and other-worker",
         ],
         [
@@ -7641,12 +7648,14 @@ _GROUP2 = {
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2/2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node-affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2 (2/2 ready); zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1 (us-central1-a); all replicas in one zone: yes; cause: topology-spread-constraint",
             "seeded-d/seeded-topology/zone-pinned-api-5f6d7c8b9-x1y2z: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
             "- `seeded-d/seeded-topology/zone-pinned-api`: replicas: 2; zones in use: 1; all replicas in one zone: yes; cause: spread constraint.",
             "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
             "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
         ],
         [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2 (us-central1-a, us-central1-b); all replicas in one zone: yes; cause: topology-spread-constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2; all replicas in one zone: yes; cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: no; cause: node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: capacity",
@@ -7754,9 +7763,11 @@ _GROUP4 = {
             "seeded-a/seeded-shapes/legacy-registry-pull-6b7c8d9e5-abcde: image: k8s.gcr.io/pause:3.9; registry host: k8s.gcr.io; retired: yes",
             "- `seeded-a/seeded-shapes/legacy-registry-pull`: image `k8s.gcr.io/pause:3.9`; registry host `k8s.gcr.io`; retired: yes.",
             "**seeded-a/seeded-shapes/legacy-registry-pull**: image k8s.gcr.io/pause:3.9 (imagePullPolicy Always); registry host k8s.gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io (frozen 2023); retired: yes",
             "1. seeded-a (us-central1-a)/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
         ],
         [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host registry.k8s.io (formerly k8s.gcr.io); retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image registry.k8s.io/pause:3.9; registry host registry.k8s.io; retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: no",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host gcr.io; retired: yes",
