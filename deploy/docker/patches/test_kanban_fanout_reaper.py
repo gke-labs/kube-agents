@@ -32,12 +32,16 @@ class Fixture(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(str(Path(tempfile.mkdtemp()) / "kanban.db"))
         self.conn.executescript(SCHEMA)
+        # The coordinator: a platform card, whose worker fans out.
+        self.conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee) VALUES (?, ?, 'running', 'platform')",
+            (PARENT, "Find checkout-gateway"))
         self.killed, self.completed = [], []
         self.addCleanup(self.conn.close)
 
     def card(self, tid, title, *, started_ago, child=True, lock=HOST + "1",
              status="running", run_started_ago=None, pid=4242, assignee=None,
-             creator=PARENT, result=None):
+             creator=PARENT, result=None, created_ago=0):
         if assignee is None:
             assignee = f"cluster-kube-agents-evals-13-{title}-us-central1-a"
         run = len(self.conn.execute("SELECT id FROM task_runs").fetchall()) + 1
@@ -52,7 +56,7 @@ class Fixture(unittest.TestCase):
         )
         if child:
             self.conn.execute(
-                "INSERT INTO kanban_worker_children VALUES (?, ?, ?)", (tid, creator, NOW))
+                "INSERT INTO kanban_worker_children VALUES (?, ?, ?)", (tid, creator, NOW - created_ago))
         self.conn.commit()
 
     def sibling(self):
@@ -86,19 +90,23 @@ class TestTheBound(Fixture):
 
     def test_a_child_inside_the_bound_is_left_alone(self):
         self.card(CHILD, "seeded-b", started_ago=reaper.FANOUT_CHILD_MAX_SECONDS - 60)
+        self.sibling()
         self.assertEqual(self.reap(), [])
 
     def test_runtime_is_measured_from_the_active_run(self):
         """A retried child's first start is old; the bound is per attempt."""
         self.card(CHILD, "seeded-b", started_ago=OVER, run_started_ago=60)
+        self.sibling()
         self.assertEqual(self.reap(), [])
 
     def test_a_child_that_is_not_running_is_left_alone(self):
         self.card(CHILD, "seeded-b", started_ago=OVER, status="blocked")
+        self.sibling()
         self.assertEqual(self.reap(), [])
 
     def test_another_hosts_worker_is_left_to_its_own_dispatcher(self):
         self.card(CHILD, "seeded-b", started_ago=OVER, lock="other-pod:1")
+        self.sibling()
         self.assertEqual(self.reap(), [])
         self.assertEqual(self.killed, [])
 
@@ -147,6 +155,22 @@ class TestOnlyPerClusterFanout(Fixture):
         self.card("t_audit2", "Run the upgrade audit", started_ago=OVER, assignee="platform")
         self.assertEqual(self.reap(), [])
 
+    def test_delegations_filed_minutes_apart_are_not_a_fanout(self):
+        """A deep RCA on seeded-b, then a quick check on seeded-c twenty
+        minutes later: two single delegations, not one burst."""
+        self.card(CHILD, "seeded-b", started_ago=OVER, created_ago=1500)
+        self.card("t_seeded_c", "seeded-c", started_ago=60, created_ago=300)
+        self.assertEqual(self.reap(), [])
+
+    def test_a_cluster_agents_own_child_cards_are_left_alone(self):
+        """A Cluster Agent may split its investigation into its own cards."""
+        self.conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee) VALUES ('t_rca', 'RCA', 'running', ?)",
+            ("cluster-kube-agents-evals-13-seeded-a-us-central1-a",))
+        self.card("t_sub1", "seeded-a", started_ago=OVER, creator="t_rca")
+        self.card("t_sub2", "seeded-a", started_ago=60, creator="t_rca")
+        self.assertEqual(self.reap(), [])
+
     def test_siblings_from_another_creator_do_not_count(self):
         self.card(CHILD, "seeded-b", started_ago=OVER)
         self.card("t_other", "seeded-c", started_ago=60, creator="t_someone_else")
@@ -166,8 +190,11 @@ class TestFailOpen(Fixture):
 
     def test_a_missing_host_prefix_reaps_nothing(self):
         self.card(CHILD, "seeded-b", started_ago=OVER)
+        self.sibling()
+        reached = []
 
         def boom():
+            reached.append(True)
             raise RuntimeError("no claimer id")
 
         original = reaper._default_host_prefix
@@ -178,6 +205,7 @@ class TestFailOpen(Fixture):
                 complete=lambda c, t, x, p: True), [])
         finally:
             reaper._default_host_prefix = original
+        self.assertEqual(reached, [True], "the host-prefix lookup was never reached")
 
     def test_settle_text_names_this_cluster_when_untitled(self):
         self.assertIn("on this cluster", reaper.settle_text(""))

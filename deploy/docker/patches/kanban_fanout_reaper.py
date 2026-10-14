@@ -37,8 +37,12 @@ one only when all of these hold, so a worker's other cards are left alone:
 - it's assigned to a Cluster Agent (``cluster-*``);
 - it has no ``parents``, which is how the fan-out guidance files per-cluster
   cards. A follow-up queued with ``parents=[<own card>]`` is excluded;
-- the worker that created it fanned out at least two such cards. A single
-  delegation, one deep RCA on one cluster, is excluded.
+- a platform worker created it, as part of a burst: at least one other such
+  card from the same creator within :data:`FANOUT_BURST_SECONDS` of it. The
+  fan-out guidance has a platform worker file every per-cluster card up front,
+  in one burst. So a single delegation (one deep RCA on one cluster), two
+  delegations filed minutes apart, a retried creator's separate attempts, and a
+  Cluster Agent's own child cards are all excluded.
 
 The card is ended like this: its worker is stopped the way
 upstream stops one past its max runtime (SIGTERM, a short grace, SIGKILL), and
@@ -69,6 +73,11 @@ logger = logging.getLogger(__name__)
 #: not a setting: it bounds a failure, it isn't a tuning knob.
 FANOUT_CHILD_MAX_SECONDS = 30 * 60
 
+#: How close together a platform worker's per-cluster cards must be created to
+#: count as one fan-out. The guidance files them in one burst, seconds apart;
+#: a second delegation decided on later is minutes away.
+FANOUT_BURST_SECONDS = 120
+
 #: The attribution table ``kanban_children_settled`` owns.
 CHILDREN_TABLE = "kanban_worker_children"
 
@@ -84,8 +93,12 @@ _OVERDUE_SQL = (
     "  AND t.assignee LIKE 'cluster-%' "
     "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
     "  AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.child_id = t.id) "
-    f"  AND (SELECT COUNT(*) FROM {CHILDREN_TABLE} s JOIN tasks st ON st.id = s.child_id "
-    "       WHERE s.creator_id = c.creator_id AND st.assignee LIKE 'cluster-%') >= 2"
+    "  AND EXISTS (SELECT 1 FROM tasks p WHERE p.id = c.creator_id AND p.assignee = 'platform') "
+    f"  AND EXISTS (SELECT 1 FROM {CHILDREN_TABLE} s JOIN tasks st ON st.id = s.child_id "
+    "       WHERE s.creator_id = c.creator_id AND s.child_id <> c.child_id "
+    "         AND st.assignee LIKE 'cluster-%' "
+    "         AND NOT EXISTS (SELECT 1 FROM task_links sl WHERE sl.child_id = s.child_id) "
+    f"         AND ABS(s.created_at - c.created_at) <= {FANOUT_BURST_SECONDS})"
 )
 
 

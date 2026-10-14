@@ -1511,8 +1511,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
-# kanban_fanout_reaper: a per-cluster card a worker fanned out (to a Cluster
-# Agent, with no parents, beside at least one sibling) that has run 30 minutes
+# kanban_fanout_reaper: a per-cluster card a platform worker fanned out (to a
+# Cluster Agent, with no parents, in one burst with a sibling) that has run 30 minutes
 # is stopped and settled with a result saying it didn't finish on its cluster, so
 # a child waiting on a workload its cluster doesn't have can't hold a worker
 # slot for hours (#2978). Heartbeats don't matter; cards a person filed are
