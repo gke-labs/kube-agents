@@ -163,6 +163,20 @@ type Notifier struct {
 	// counts nothing (a Notifier armed without the gateway's
 	// conversations).
 	metrics *Metrics
+	// marks carries conversation marks to their own worker (drawMarks),
+	// started on the first one: drawing takes the conversation's session
+	// lock, which a turn or a relay batch can hold for a minute, and the
+	// route's one worker must not wait behind it. One worker, so a
+	// conversation's marks draw in the order their posts landed.
+	marks     chan notifyMarkJob
+	marksOnce sync.Once
+}
+
+// notifyMarkJob is one conversation mark waiting to be drawn.
+type notifyMarkJob struct {
+	conversation string
+	mark         MarkState
+	marker       notifyMarker
 }
 
 // NewGchatNotifier builds the Google Chat notifier. home is the configured
@@ -260,8 +274,27 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 	// the answer is in the thread and not when it failed to be.
 	if r.Error == "" && job.mark != nil {
 		if marker, ok := n.conv.(notifyMarker); ok {
-			marker.MarkConversation(job.req.Conversation, *job.mark)
+			n.queueMark(notifyMarkJob{conversation: job.req.Conversation, mark: *job.mark, marker: marker})
 		}
+	}
+}
+
+// queueMark hands a mark to the mark worker without waiting. A full queue
+// drops it, logged: a mark is state, so the conversation's next one restores
+// it, and the route's worker never blocks on a session lock.
+func (n *Notifier) queueMark(job notifyMarkJob) {
+	n.marksOnce.Do(func() {
+		n.marks = make(chan notifyMarkJob, notifyQueueDepth)
+		go func() {
+			for j := range n.marks {
+				j.marker.MarkConversation(j.conversation, j.mark)
+			}
+		}()
+	})
+	select {
+	case n.marks <- job:
+	default:
+		n.log.Warn("notify: mark dropped; the mark queue is full", "conversation", job.conversation)
 	}
 }
 

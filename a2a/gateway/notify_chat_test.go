@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -56,13 +57,25 @@ func TestNotifyConversationMarkIsDrawnAfterThePost(t *testing.T) {
 	if got.Error != "" {
 		t.Fatalf("reply = %+v", got)
 	}
-	if fmt.Sprint(conv.marks) != fmt.Sprint([]string{testConversation + " /done"}) || conv.postsAtMark[0] != 1 {
-		t.Fatalf("marks = %v at posts %v, want the settle drawn after the one post", conv.marks, conv.postsAtMark)
+	// Drawn off the route's worker, so waited for.
+	waitFor(t, "the mark", func() bool {
+		conv.mu.Lock()
+		defer conv.mu.Unlock()
+		return len(conv.marks) == 1
+	})
+	conv.mu.Lock()
+	marks, at := fmt.Sprint(conv.marks), conv.postsAtMark[0]
+	conv.mu.Unlock()
+	if marks != fmt.Sprint([]string{testConversation + " /done"}) || at != 1 {
+		t.Fatalf("marks = %v at posts %v, want the settle drawn after the one post", marks, at)
 	}
 	bad := testReport
 	bad.Mark = &chatmsg.Mark{Ask: "Not A Token"}
 	serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, bad),
 		Conversation: testConversation, ContextID: testContext})
+	time.Sleep(100 * time.Millisecond)
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
 	if len(conv.marks) != 1 || len(conv.chats) != 2 || conv.chats[1] == nil {
 		t.Fatalf("marks %v, chats %d: a bad mark is dropped alone", conv.marks, len(conv.chats))
 	}

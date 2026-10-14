@@ -77,7 +77,7 @@ What the manifest covers, so you can check an existing app instead:
 
 ### Moving an existing app to `next`
 
-An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs, so it keeps its tokens and needs no new install. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
+An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs, unless it was generated with `--no-assistant`, so it keeps its tokens and needs no new install. A `--no-assistant` app lacks `assistant:write`, the assistant view and `assistant_thread_started`: add them as in the manifest above and reinstall, or Working…, the thread titles and the suggested prompts do not appear. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
 
 1. After the switch, open the app's **App Manifest** page.
 2. Delete the `features.slash_commands` block. Leave interactivity on: the gateway answers button clicks.
