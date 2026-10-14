@@ -170,8 +170,9 @@ Closest thing on `main`: `fleet-upgrade-verification --readiness` already emits
 `blocked`/`unknown`/`ready` per cluster from drain-blocking PDBs, fail-closed webhooks with an
 unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role and
 RoleBinding writes, maintenance exclusions and skew.
-Three things are missing — the verdict is per cluster, not per family; it reads four inputs rather
-than every check here; and it runs only when asked, not on the schedule.
+Two things are missing — the verdict is per cluster, not per family, and it reads four inputs rather
+than every check here. The daily `upgrade-readiness-watch` cron job runs it for a cluster below a
+version its release channel offers.
 
 ## Version posture
 
