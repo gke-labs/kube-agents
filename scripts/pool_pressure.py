@@ -225,10 +225,12 @@ BOSKOS_NO_OWNER = ""
 # Prow run, of any job and any lane, carries that run's build ID somewhere in
 # its owner (`<job>-<build>`, `<job>-<build>-gitlab`, ...). A Prow build ID is a
 # snowflake (SNOWFLAKE_* below): 19 digits since 2018 and until the epoch runs
-# out, so the first run of exactly 19 digits is the build. Anchored on both
-# sides so twenty digits are not a build with a digit glued on. Nothing here
-# knows job names or lane suffixes; a new job needs nothing from this file.
-BUILD_ID_IN_OWNER = re.compile(r"(?<!\d)(\d{19})(?!\d)")
+# out, so the first run of exactly 19 digits after a dash is the build: a
+# run's owner joins the build to the job name with one, and anything after
+# it is the lane's. Nothing here knows job names or lane suffixes; a new job
+# needs nothing from this file. A hand hold must not name a build: the check
+# cannot tell a quoted build from a run's own, and the runbook says so.
+BUILD_ID_IN_OWNER = re.compile(r"(?<=-)(\d{19})(?!\d)")
 # How long after Deck's completionTime a lease may still be held while the
 # pod tears down and the wrapper releases the project; in between the lease
 # is releasing, not leaked. On an abort Deck sets the stamp at the abort but
@@ -1159,13 +1161,20 @@ def _collect_waits_from_dir(
     return Source(value=Sweep(waits, read, 0.0, window_start))
 
 
-def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
+def fetch_live_queue(now: Optional[datetime], from_dir: Optional[str] = None) -> Source:
     """Runs that are queued right now and have not been given a pod.
 
     This is the half GCS structurally cannot see. A run waiting in `triggered`
     has written no artifacts, so during a stall the bucket stops gaining samples
     and the trend gets *quieter* as the queue gets longer.
+
+    `now` is the clock the waits and the release grace are measured against:
+    None on a live read, which takes the moment Deck is read, because the GCS
+    sweep before it can run for minutes and a clock from the run's start would
+    make every wait that much shorter and the grace that much longer.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
     if from_dir is not None:
         payload = Path(from_dir, "deck.json")
         if not payload.is_file():
@@ -2298,7 +2307,9 @@ def measure(
         replay = Source(error="not read: --as-of replays a past window, and this is live")
         live, pool = replay, replay
     else:
-        live = fetch_live_queue(window_end, from_dir)
+        # A fixture replay keeps the instant it was captured at; a live read
+        # takes its own clock after the sweep (fetch_live_queue says why).
+        live = fetch_live_queue(window_end if from_dir is not None else None, from_dir)
         pool = fetch_pool_state(boskos_via, context, from_dir)
 
     summary = summarise(

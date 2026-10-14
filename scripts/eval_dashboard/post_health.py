@@ -963,11 +963,18 @@ def render_pool(health: dict) -> str:
         )
     # The agent view, not a scoped one: rule 8 rides beside the state and can
     # start mid-incident, so there is no window to scope to.
+    # A queued run starts late and passes; a refused run died at the acquire,
+    # so the closing line says which.
+    tail = (
+        "A refused run did not start; retest once the pool has room."
+        if pool.get("lease_failures")
+        else "Runs still pass; /retest makes the queue longer."
+    )
     return "\n".join(
         [
             f"⏳ {pool_cause_text(pool)}",
             *pool_numbers(pool),
-            "Runs still pass; /retest makes the queue longer.",
+            tail,
             dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )

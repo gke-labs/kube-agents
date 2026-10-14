@@ -408,8 +408,11 @@ class PoolStateFields(unittest.TestCase):
                          pp.build_of("pull-kube-agents-smoke-test-2108236254767222784"))
         self.assertIsNone(pp.build_of("hangdng-rebuild"))
         self.assertIsNone(pp.build_of("fleet-reconcile"))
-        # Twenty digits are not a snowflake with a digit glued on.
+        # Twenty digits are not a snowflake with a digit glued on, and a number
+        # glued into a word is not a build either: a run's owner joins the
+        # build to the job name with a dash.
         self.assertIsNone(pp.build_of("x-21100177583505448961"))
+        self.assertIsNone(pp.build_of("repair2110017758350544896x"))
         pool = pp.PoolState({"busy": 1}, {"ci-kube-agents-pull-sweep-2110017758350544896-gitlab": 1})
         self.assertEqual({}, pool.no_build_id())
 
@@ -832,6 +835,33 @@ class Percentiles(unittest.TestCase):
     def test_a_run_slow_only_in_the_lease_is_still_an_outlier(self):
         over = pp.outliers([self._wait(1, 50), self._wait(1, 1)], 45)
         self.assertEqual([51.0], [w.minutes for w in over])
+
+
+class LiveClock(unittest.TestCase):
+    def test_a_live_run_reads_deck_against_the_clock_after_the_sweep(self):
+        """The sweep can take minutes; the release grace and the live waits
+        are measured against the moment Deck is read, not the moment the run
+        began, or the grace is fifteen minutes plus the sweep."""
+        calls = []
+        with unittest.mock.patch.object(pp, "collect_waits", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_pool_state", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_live_queue",
+                                           side_effect=lambda now, from_dir=None: calls.append(now) or pp.Source(error="not read")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                pp.measure()
+        self.assertEqual([None], calls, "a live read picks its own clock")
+
+    def test_fetch_live_queue_takes_its_own_clock_when_given_none(self):
+        before = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [{
+                    "metadata": {"creationTimestamp": before.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                    "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 1}]}},
+                    "status": {"state": "triggered"},
+                }]}, fh)
+            queue = pp.fetch_live_queue(None, from_dir=tmp).value
+        self.assertLess(queue.waiting[0].seconds, 60)
 
 
 class SweepDeadline(unittest.TestCase):

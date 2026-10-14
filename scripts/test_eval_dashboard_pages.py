@@ -1254,7 +1254,8 @@ class BrowserTest(unittest.TestCase):
                                      health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "waiting_now": False,
                                                                               "lease_failures": 26, "lease_failures_hours": 3})) / "index.html")
         self.assertIn("Runs were waiting to start since Tue 8:00 AM ET: 26 runs refused a project in the last 3h."
-                      " No backlog right now.", refused)
+                      " No backlog right now. A refused run did not start; retest once the pool has room.", refused)
+        self.assertNotIn("Runs still pass", refused.split("26 runs refused")[1][:200])
         # Beside a live queue the refusals join it rather than displacing it.
         both_kinds = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrefusedqueue", self.data,
                                         health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3,

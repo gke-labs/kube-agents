@@ -328,7 +328,12 @@ function poolSentence(h) {
   const live = p.waiting_now;
   // False is "nothing has waited past the limit", not "the queue is empty".
   const cleared = live === false ? " No backlog right now." : "";
-  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
+  // A queued run starts late and passes; a refused run died at the acquire,
+  // so the tail says which, as post_health.render_pool does.
+  const tail = p.lease_failures
+    ? "A refused run did not start; retest once the pool has room."
+    : "Runs still pass; /retest makes the queue longer.";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} ${tail}`;
 }
 
 /* ---- URL contract ---- */
