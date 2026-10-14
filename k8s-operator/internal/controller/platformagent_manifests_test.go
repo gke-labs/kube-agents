@@ -3145,6 +3145,7 @@ func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 		"helmrepositories": "source.toolkit.fluxcd.io",
 	}
 	readOnly := []string{"get", "list", "watch"}
+	seen := map[string]bool{}
 	for _, rule := range role.Rules {
 		if slices.Contains(rule.Resources, "secrets") {
 			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
@@ -3162,17 +3163,25 @@ func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 			if !ok {
 				continue
 			}
+			// Every rule on a pinned group is checked, not only the first: a
+			// second rule on the same group must not widen it unseen.
+			if seen[group] {
+				t.Errorf("%s: more than one rule; the grant must be exactly %v", group, resources)
+				continue
+			}
+			seen[group] = true
 			if !slices.Equal(rule.Resources, resources) {
 				t.Errorf("%s: resources %v, want %v", group, rule.Resources, resources)
 			}
 			if !slices.Equal(rule.Verbs, readOnly) {
 				t.Errorf("%s: verbs %v, want %v", group, rule.Verbs, readOnly)
 			}
-			delete(want, group)
 		}
 	}
 	for group := range want {
-		t.Errorf("minimal role has no rule for %s", group)
+		if !seen[group] {
+			t.Errorf("minimal role has no rule for %s", group)
+		}
 	}
 }
 
