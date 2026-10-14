@@ -174,6 +174,7 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
+    "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
     "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
     "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
 ]
