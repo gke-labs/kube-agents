@@ -218,8 +218,16 @@ var SensitiveEnvVars = map[string]struct{}{
 // union of the two grant sets, which is the retired `worker` credential rebuilt
 // out of a volumeMount. See a2aStripBusTokenMounts and, for the fifth field,
 // a2aStripBusTokenVolumeMounts.
+//
+// The watchers' broker token is the second member, in either mode: it is
+// projected into the gateway's agent-api-auth container alone, and any other
+// container holding it holds the broker's watcher role (every fleet cluster's
+// events and named objects). The controller's watcherTokenSourceNames strips
+// it, and any volume projecting its audience under another name, at render;
+// this is the name half's admission message. The source half is render-only.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token": {},
+	"a2a-bus-token":                  {},
+	"watcher-credential-proxy-token": {},
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume

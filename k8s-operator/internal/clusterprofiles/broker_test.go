@@ -241,6 +241,39 @@ func TestDiscoverThroughBrokerSkipsAClusterWithNoUsableEndpoint(t *testing.T) {
 	}
 }
 
+// TestDiscoverFailsWhenTheBrokerCannotBeReached keeps a broker that is down
+// from reading as every cluster refusing: discovery runs once, so skipping
+// them all would leave the fleet unwatched until a restart. It fails instead,
+// which the supervisor answers with a restart. An HTTP refusal is still a skip.
+func TestDiscoverFailsWhenTheBrokerCannotBeReached(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	srv := httptest.NewServer(http.NotFoundHandler())
+	unreachable := srv.URL
+	srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeToken(t, tokenFile, "token-1")
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-a", "proj", "a", "us-central1")
+
+	skips := map[string]error{}
+	d := Discoverer{Broker: &Broker{URL: unreachable, TokenFile: tokenFile}, OnSkip: func(p string, err error) { skips[p] = err }}
+	clusters, err := d.Discover(context.Background(), dir)
+	if err == nil || len(clusters) != 0 {
+		t.Fatalf("Discover = %v, %v; want an error and no clusters", clusters, err)
+	}
+	if !strings.Contains(err.Error(), "credential proxy") || len(skips) != 0 {
+		t.Errorf("err = %v, skips = %v; want a credential-proxy error and no skip", err, skips)
+	}
+
+	fb, broker := newFakeBroker(t)
+	fb.status = http.StatusForbidden
+	skips = map[string]error{}
+	d = Discoverer{Broker: broker, OnSkip: func(p string, err error) { skips[p] = err }}
+	if _, err := d.Discover(context.Background(), dir); err != nil || skips["cluster-a"] == nil {
+		t.Errorf("a 403 from the broker: err = %v, skips = %v; want a skip and no error", err, skips)
+	}
+}
+
 // TestBrokerRereadsTheTokenFile covers the kubelet rotating the projected
 // token in place: the next request carries the new one, with no restart.
 func TestBrokerRereadsTheTokenFile(t *testing.T) {

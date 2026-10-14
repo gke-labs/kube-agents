@@ -59,14 +59,16 @@ RULE_K8S_QUERY = "kubernetes.watcher.query"
 PROJECT_ID = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 # A domain-scoped project carries `<domain>:` in front of its id.
 PROJECT = rf"(?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?{PROJECT_ID}"
-# A Pub/Sub path may name the project by id or by number.
-PUBSUB_PROJECT = rf"(?:{PROJECT}|[0-9]{{1,20}})"
+# A Google resource path may name the project by id or by number: Pub/Sub's,
+# GKE's, and so the Kubernetes route's target, which names the same cluster.
+PROJECT_REF = rf"(?:{PROJECT}|[0-9]{{1,20}})"
+PUBSUB_PROJECT = PROJECT_REF
 LOCATION = r"[a-z][a-z0-9-]{1,62}"
 CLUSTER = r"[a-z]([a-z0-9-]{0,38}[a-z0-9])?"
 # A Pub/Sub subscription id: 3 to 255 characters, starting with a letter.
 SUBSCRIPTION = r"[A-Za-z][A-Za-z0-9._~+%-]{2,254}"
 
-_GKE_CLUSTER_GET = re.compile(rf"v1/projects/{PROJECT}/locations/{LOCATION}/clusters/{CLUSTER}")
+_GKE_CLUSTER_GET = re.compile(rf"v1/projects/{PROJECT_REF}/locations/{LOCATION}/clusters/{CLUSTER}")
 _PUBSUB_SUBSCRIPTION = re.compile(
     rf"v1/(?P<sub>projects/{PUBSUB_PROJECT}/subscriptions/{SUBSCRIPTION})(?P<verb>:pull|:acknowledge|:modifyAckDeadline)?"
 )
@@ -76,7 +78,7 @@ PUBSUB_BODIES: dict[str, dict[str, type]] = {
     ":acknowledge": {"ackIds": list},
     ":modifyAckDeadline": {"ackIds": list, "ackDeadlineSeconds": int},
 }
-_TARGET = re.compile(rf"(?P<project>{PROJECT})/(?P<location>{LOCATION})/(?P<cluster>{CLUSTER})")
+_TARGET = re.compile(rf"(?P<project>{PROJECT_REF})/(?P<location>{LOCATION})/(?P<cluster>{CLUSTER})")
 
 # A Kubernetes path segment for a namespace, group, version or resource plural:
 # DNS-1123 labels and subdomains. Nothing here admits a dot segment or an encoding.

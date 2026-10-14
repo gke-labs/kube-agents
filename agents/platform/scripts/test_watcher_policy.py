@@ -95,6 +95,14 @@ class GcpTest(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertIsNone(w.project_cluster(body))
 
+    def test_a_cluster_named_by_project_number_is_read_and_targeted(self):
+        # GKE takes a project number in a cluster's resource name, and a profile
+        # may carry one; the Go side's identity check admits it.
+        self.assertTrue(
+            w.evaluate_gcp("GET", w.GKE_HOST, "v1/projects/123456789012/locations/us-east4/clusters/fleet-a", b"", SUB).allowed
+        )
+        self.assertTrue(w.evaluate_k8s("GET", "123456789012/us-east4/fleet-a/api/v1/events", {}).allowed)
+
     def test_no_other_host(self):
         self.assertEqual(
             w.evaluate_gcp("GET", "iamcredentials.googleapis.com", "v1/x", b"", SUB).rule_id, w.RULE_GCP_ROUTE

@@ -252,7 +252,10 @@ clusters' records still come out `unreachable` and are still injected, thin: the
 them, so they are inside the scope and the hold above does not apply, and the thin cards are how the
 missing grant shows up in chat.
 Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
-on every cluster in the fleet (through the broker, for the kinds its watcher route reads). A cluster where only the second is missing still starts: its records
+on every cluster in the fleet (through the broker, for the kinds its watcher route reads). A record
+about a Secret comes out `failed` on every profile cluster whatever its RBAC: the broker's watcher
+route never reads a Secret (`kubernetes.watcher.secrets`), so that refusal is the broker's policy,
+and no grant on the cluster lifts it. A cluster where only the second is missing still starts: its records
 come out `failed` with the RBAC error, which is the difference between a cluster that was not
 addressed and one that was and refused.
 

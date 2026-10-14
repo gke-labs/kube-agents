@@ -307,10 +307,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
-// volume the operator renders for one specific container of its own. The only
-// member today is the projected bus token; agentv1alpha1.ReservedVolumeNames
-// says what that buys and why the render strips it as well as this rejecting
-// it.
+// volume the operator renders for one specific container of its own: the
+// projected bus token and the watchers' broker token. agentv1alpha1.ReservedVolumeNames
+// says what that buys and why the render strips them as well as this rejecting
+// them.
 // path is the mount LIST's own path, not the container's: the three callers
 // name three different fields (a container's volumeMounts under initContainers
 // or sidecars, and spec.deployment.extraVolumeMounts, which hangs off the

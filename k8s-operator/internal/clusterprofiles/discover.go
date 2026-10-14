@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -408,6 +409,18 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		}
 		described, err := d.describe(ctx, *identity)
 		if err != nil {
+			// A broker that cannot be reached at all is not this cluster's
+			// refusal: it would skip every profile, and discovery runs once,
+			// so the process would watch none of the fleet until a restart. The
+			// broker is a sibling pod that a Recreate rollout leaves without
+			// endpoints for a moment, and the supervisor in start-services.sh
+			// restarts a process that exits, with backoff, so exiting is what
+			// makes the gap self-healing. An answer with an HTTP status, a 403
+			// included, is the cluster's, and is skipped as before.
+			var transport *url.Error
+			if d.Broker != nil && errors.As(err, &transport) {
+				return nil, fmt.Errorf("the credential proxy at %s could not be reached while asking where %s is, so no profile cluster can be: %w", d.Broker.URL, identity, err)
+			}
 			d.skip(e.Name(), fmt.Errorf("asking %s where %s is: %w", d.describedBy(), identity, err))
 			continue
 		}
