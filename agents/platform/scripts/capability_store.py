@@ -26,7 +26,9 @@ cannot be changed here at all, and a key marked ``propose`` is refused unless
 the call names who confirmed it. What it cannot: that the named person actually
 saw the before/after — that round-trip is the agent's instruction
 (agents/platform/AGENTS.md), and the changelog records the name so a reader can
-ask. The validator is a deliberately small subset of JSON Schema (type, enum, pattern,
+ask. A key set to ``null`` is removed from the volume under the same policy: the
+schema default applies again and follows later releases, where a value set
+back by hand would stay pinned. The validator is a deliberately small subset of JSON Schema (type, enum, pattern,
 minimum, maximum, maxLength, items, maxItems, required, additionalProperties) so
 this module stays on the standard library like the scaffolder that seeds it.
 ``pattern`` runs through Python's ``re.search``, so a schema anchors the end of a
@@ -371,7 +373,8 @@ def apply_changes(
 ) -> dict[str, Any]:
     """Validate, authorise, and write `changes` onto a capability's criteria.
 
-    Returns the changelog entry that was appended. Raises CapabilityError with
+    A value of `None` removes the key from the volume, so the schema default
+    applies again and follows later releases. Returns the changelog entry that was appended. Raises CapabilityError with
     a message the caller can relay verbatim when anything is refused; nothing is
     written in that case. `changes` may arrive JSON-encoded; a model that
     serialises the object as a string should not lose a turn over it.
@@ -437,7 +440,19 @@ def _apply_locked(
     if refused:
         raise CapabilityError("refused: " + "; ".join(refused))
 
+    # A `null` value removes the key from the volume: the schema default applies again and
+    # follows later releases, where the old number set back by hand would stay pinned. A key
+    # the volume does not hold has nothing to remove, and saying so beats a silent no-op.
+    unset = sorted(k for k, v in changes.items() if v is None)
+    missing = [k for k in unset if k not in cap.criteria]
+    if missing:
+        raise CapabilityError(
+            f"invalid: {', '.join(missing)}: no stored value to return to the default; the schema default already applies"
+        )
+    sets = {k: v for k, v in changes.items() if v is not None}
+
     before = effective_criteria(cap)
+    defaults = cap.defaults()
     pruned = stale_keys(cap)
     # Every invalid stored value is recorded, including one this call replaces:
     # `before` carries the default that stood in for it, so the changelog is the
@@ -445,9 +460,9 @@ def _apply_locked(
     reset = invalid_keys(cap)
     candidate = {
         k: v for k, v in cap.criteria.items()
-        if k not in STATE_KEYS and k not in pruned and k not in reset
+        if k not in STATE_KEYS and k not in pruned and k not in reset and k not in unset
     }
-    candidate.update(changes)
+    candidate.update(sets)
     errors = validate(cap.schema, candidate)
     if errors:
         raise CapabilityError("invalid: " + "; ".join(errors))
@@ -470,7 +485,8 @@ def _apply_locked(
         "mode": MODE_CONFIRMED if confirmed_by else MODE_AUTONOMOUS,
         "confirmed_by": confirmed_by,
         "reason": reason,
-        "changes": {k: {"before": before.get(k), "after": v} for k, v in changes.items()},
+        "changes": {k: {"before": before.get(k), "after": v} for k, v in sets.items()},
+        "unset": {k: {"before": before.get(k), "after": defaults.get(k)} for k in unset},
         "pruned": {k: cap.criteria[k] for k in pruned},
         "reset": {k: {"value": cap.criteria[k], "error": e} for k, e in reset.items()},
     }

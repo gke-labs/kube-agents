@@ -18,8 +18,9 @@
 # lines anyway is for the judge, against expected_output, not for a check. The revert at a higher revision is the
 # nearest deterministic proxy for two accepted writes.
 #
-# The prompt asks for the change and its revert in one card, so the install
-# is left as it was found (the value back at its shipped 3; only the revision
+# The prompt asks for the change and its return to the default in one card,
+# so the install is left as it was found (the key returned to the shipped
+# default with a `set` to null, so the volume holds no pin; only the revision
 # counter climbs, which is the record) and the mechanism is proven rather
 # than a coincidence: a value distinctly different from the default, then
 # back.
@@ -59,16 +60,20 @@ prompt: >-
   plane as critical; for our fleet that should be four. Change the audit's
   criteria so its next run uses four and the change survives a pod restart --
   you have my confirmation for it, under my name. Once it is in, read it back,
-  then set it back to three with the same confirmation so the fleet is left
-  as you found it. End your answer with one line per change you made, in
-  exactly this form and with nothing else on the line:
+  then return it to the shipped default with the same confirmation, so the
+  fleet is left exactly as you found it: on the default, not pinned at three.
+  End your answer with one line per change you made, in exactly this form and
+  with nothing else on the line, where <value> is the value in effect after
+  the change:
   CRITERIA security-patch-orchestrator pool_skew_critical_minors=<value> revision=<revision>
 expected_output: >-
   The platform specialist reads the security-patch-orchestrator capability's
   criteria, shows the before and after for pool_skew_critical_minors (3 to 4,
   and what starts and stops being flagged), writes the change with Jordan
   Reyes recorded as the confirmer, reads it back at the new revision, then
-  writes it back to 3 under the same confirmation at a higher revision. The
+  returns the key to the shipped default under the same confirmation at a
+  higher revision -- a set to null, which removes the stored value so 3
+  applies again and follows releases, not a typed 3, which would pin it. The
   answer ends with two lines of the form CRITERIA security-patch-orchestrator
   pool_skew_critical_minors=4 revision=N and CRITERIA
   security-patch-orchestrator pool_skew_critical_minors=3 revision=M, with M

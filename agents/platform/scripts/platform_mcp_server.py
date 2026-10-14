@@ -1386,12 +1386,16 @@ def capability_criteria(
                                     any number the procedure quotes.
       set      capability changes reason [confirmed_by]
                                  -> write new values. `changes` maps key -> new
-                                    value; `reason` says what prompted it. A key
-                                    whose policy is "propose" is refused unless
-                                    `confirmed_by` names the operator who agreed
-                                    — show them the before/after first, then
-                                    call again with their name. A "never" key is
-                                    refused outright: it changes through review.
+                                    value, or key -> null to return a key to the
+                                    shipped default, which then follows later
+                                    releases (the old number set back by hand
+                                    stays pinned); `reason` says what prompted
+                                    it. A key whose policy is "propose" is
+                                    refused unless `confirmed_by` names the
+                                    operator who agreed — show them the
+                                    before/after first, then call again with
+                                    their name. A "never" key is refused
+                                    outright: it changes through review.
       history  capability        -> the changelog's last lines, newest last: each
                                     change the store set out to write (a line whose
                                     value write failed stays, at a revision no later

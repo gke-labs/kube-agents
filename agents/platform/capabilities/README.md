@@ -18,7 +18,9 @@ Each directory holds:
 `criteria.json` here ships empty (`{}`), and `test_capability_store.py` holds every directory to
 that. The day-one value of every key is the `default` its schema entry carries, read at use time,
 so a key nobody has tuned is absent from the volume and a release that changes a default reaches
-every install. A populated template would copy every key onto the volume on the first start,
+every install. A key an operator tuned and later returned to the default (a `set` to `null`) is
+removed from the volume the same way; one set back to the old number by hand stays pinned at it.
+A populated template would copy every key onto the volume on the first start,
 after which the merge could not tell a value the operator chose from one the image handed over,
 and no later release could correct a default again. Keep the defaults quiet: a capability's first
 weeks on a fleet are for tuning, and the procedure that reads these values (the governance SOP or

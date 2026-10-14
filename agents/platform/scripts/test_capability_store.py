@@ -182,6 +182,33 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(cs.history(self.root, "fresh"), [only])
         self.assertEqual(torn.read_text(encoding="utf-8").split("\n")[0], fragment)
 
+    def test_a_null_value_returns_a_key_to_the_shipped_default(self):
+        # "Set it back" by hand pins the old number on the volume, where the merge keeps it past
+        # every later release; `null` removes the key, so the schema default applies again and a
+        # release that moves it reaches the install. The same policy gates it as any write.
+        seed(self.root, criteria={"threshold": 5, "names": ["a"]})
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": None}, reason="back to default")
+        self.assertIn("propose", str(ctx.exception))
+        entry = cs.apply_changes(self.root, "demo", {"threshold": None, "names": ["b"]}, reason="back to default", confirmed_by="ops@example")
+        self.assertEqual(entry["unset"], {"threshold": {"before": 5, "after": 3}})
+        self.assertEqual(entry["changes"], {"names": {"before": ["a"], "after": ["b"]}})
+        cap = cs.load(self.root, "demo")
+        self.assertNotIn("threshold", cap.criteria, "the key is gone from the volume, not stored as the default")
+        self.assertEqual(cap.criteria[cs.REVISION_KEY], 1)
+        self.assertEqual(cs.describe(cap)["criteria"]["threshold"], 3)
+        self.assertEqual(cs.history(self.root, "demo"), [entry])
+        # A release that moves the default now reaches the install.
+        moved = json.loads(json.dumps(SCHEMA))
+        moved["properties"]["threshold"]["default"] = 4
+        (self.root / "demo" / cs.SCHEMA_FILENAME).write_text(json.dumps(moved))
+        self.assertEqual(cs.describe(cs.load(self.root, "demo"))["criteria"]["threshold"], 4)
+        # Nothing to remove is said, not silently accepted.
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": None}, reason="again", confirmed_by="ops@example")
+        self.assertIn("no stored value", str(ctx.exception))
+        self.assertEqual(cs.load(self.root, "demo").criteria[cs.REVISION_KEY], 1, "a refused call writes nothing")
+
     def test_a_pattern_on_a_string_is_enforced(self):
         # The flag that carries a list cannot carry an entry with a comma, a space, a quote or a
         # newline, so the schema refuses it at the store and `get`, the flag and the manifest
