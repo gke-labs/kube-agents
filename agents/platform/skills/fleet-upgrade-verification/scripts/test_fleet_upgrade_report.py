@@ -1133,6 +1133,23 @@ class PrepareKubeconfigTest(unittest.TestCase):
             [aside] = [n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]
             self.assertEqual((os.path.exists(os.path.join(root, aside, os.path.basename(path))), os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path)), (True, report.KUBECONFIG_DIR_MODE, False))
 
+    def test_a_symlink_at_the_shared_directory_is_refused_not_followed(self):
+        # As the shared rule: a symlink planted at the default directory's name is refused with a
+        # note and never followed, so a root run neither chmods nor writes into its target.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        elsewhere = os.path.join(root, "elsewhere")
+        os.mkdir(elsewhere, 0o700)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            os.symlink(elsewhere, shared)
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            for euid in (os.geteuid(), report.ROOT_UID):
+                with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                    note = report.prepare_kubeconfig(shared, path)
+                self.assertEqual(note, report.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=shared))
+                self.assertEqual((os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.islink(shared)), (0o700, True))
+
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
     """The declared scope the agent carries from the platform_control fleet_scope

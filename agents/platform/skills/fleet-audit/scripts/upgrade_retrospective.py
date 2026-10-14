@@ -180,7 +180,10 @@ atomically, so a crash leaves at most a report with no ledger advance. A
 ledger or guards file that exists but cannot be read, or carries another
 version, is moved aside as `<name>.unreadable-<ts>` and the run stops: that
 file is a crash record, not a re-baseline, and a run proceeds as a first run
-only when neither file nor a record of it exists. A cluster with an upgrade operation
+only when neither file nor a record of it exists; a guards file absent beside
+a live ledger is refused the same way. `--reset-ledger` archives the records
+and the live files and marks the store, so the next full run is a baseline
+whose manifest carries `after_reset`, which the SOP calls no `finish` for. A cluster with an upgrade operation
 still in flight, or with one that reached DONE less than fifteen minutes
 before the run (the settle floor, on every route), is not reviewed; Info
 lists it as upgrading now or as settling, nothing is read from it and no
@@ -205,6 +208,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -298,6 +302,7 @@ BUDGET_SPENT_REASON = "not read this run: the read budget ({seconds} s) was spen
 RECHECK_DEFERRED_TEXT = "the read budget ({seconds} s) was spent before its re-check started"
 RECHECK_DEFERRED_LINE = "re-check not started, the read budget spent; {guards} guard(s) held"
 INFO_BUDGET_SPENT = "Read budget spent: {seconds} s after {reviewed} review(s) and {rechecked} re-check(s); {cut} review(s) and {cut_rechecks} re-check(s) cut mid-read, {deferred} cluster(s) held for the next run, {deferred_rechecks} re-check(s) not started."
+INFO_AFTER_RESET = "Baseline after --reset-ledger: the store was archived under {archive} at {at}; every cluster is reviewed as new, the manifest carries after_reset, and the SOP files nothing from this run."
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
@@ -315,7 +320,6 @@ REPORT_NAME_RE = re.compile(r"^(\d{8}T\d{6}Z)(-scoped)?\.(md|json)$")
 REPORTS_KEPT = 14
 LATEST_REPORT_LINK = "upgrade-retro-report.md"
 # The report file and its link are swapped in through these.
-REPORT_TEMP_SUFFIX = ".tmp"
 LINK_TEMP_SUFFIX = ".tmp-link"
 # The same kubeconfig directory `collect.py` and the SOPs use, one file per
 # cluster, passed per command rather than exported; `collect.prepare_kubeconfig`
@@ -465,9 +469,9 @@ CONTAINER_FAILURE_REASONS = ("OOMKilled", "CrashLoopBackOff", "ImagePullBackOff"
 CATEGORY_PENDING, CATEGORY_NOT_READY, CATEGORY_NODE, CATEGORY_EVENT, CATEGORY_PDB = "pending", "not-ready", "node", "event", "pdb"
 # Entry 3: a Deployment or StatefulSet every replica of which sat on the
 # drained nodes or in the drained zone and whose availability fell to zero
-# inside one pool operation. Entry 5: a pool two minors from its control
-# plane, or one pool's nodes on two versions, still so a day after the last
-# maintenance window closed or exclusion ended.
+# inside one pool operation. Entry 5: a pool more than one minor behind its
+# control plane, standing `SKEW_STANDING` or longer since the run that first
+# recorded it.
 CATEGORY_UNAVAILABLE, CATEGORY_VERSION_SKEW = "unavailable", "version-skew"
 UNAVAILABLE_REASON = "Available=False"
 SPREAD_KINDS = ("Deployment", "StatefulSet")
@@ -479,28 +483,28 @@ SPREAD_POOL_DETAIL = "every replica sat on the drained pool"
 SPREAD_ZONE_DETAIL = "every replica sat in the drained zone, not all on the drained pool"
 SKEW_REASON = "version skew"
 SKEW_MINORS = 2
-SKEW_GRACE = timedelta(days=1)
+# Entry 5 is graded on the skew's own age: the describe carries no date for
+# the gap, and the control plane's last upgrade is no measure of it (a weekly
+# auto-upgrade would reset it), so the age runs from the run that first
+# recorded the skew in the ledger's stored set (`LEDGER_SKEW_FIRST_SEEN_KEY`).
+# No window arithmetic: a daily window closes every day and a weekly one
+# once, and neither says how long the pool has stood behind. One pool on two
+# kubelet versions is no row: an open operation holds the cluster, and a
+# finished one leaves the pool on one version.
+SKEW_STANDING_DAYS = 7
+SKEW_STANDING = timedelta(days=SKEW_STANDING_DAYS)
 SKEW_CONTROL_PLANE_FORMAT = "pool {pool} at {pool_version}, control plane at {master} ({minors} minors apart)"
-SKEW_WITHIN_POOL_FORMAT = "pool {pool} nodes on {versions}"
-SKEW_REFERENCE_FORMAT = "{what} ended {at}, {hours} h before this run"
-SKEW_WINDOW_WHAT = "the maintenance window"
-SKEW_EXCLUSION_WHAT = "exclusion {name}"
+SKEW_AGE_FORMAT = "standing {days} d since first recorded at {since}"
+SKEW_AGE_FIRST_FORMAT = "first recorded this run"
 WINDOW_OPEN_STATE = "the maintenance window is open now"
 EXCLUSION_ACTIVE_FORMAT = "exclusion {name} ({scope}) is active until {end}"
 SKEW_OPEN_TEXT = "Version skew held: {skews}; {state}, so the roll may still complete; graded on a later run."
-# A daily window closes every day, so "a day after the last close" never
-# comes; a skew is graded instead when it was recorded at the previous full
-# run and still stands, the window having closed in between. The stored
-# symptom set carries every skew seen, graded or not, and a recorded skew
-# re-selects its cluster so the review can grade it.
-SKEW_FIRST_SEEN_TEXT = "Version skew first seen: {skews}; {reference}; graded at the next full run if it still stands."
-SKEW_PERSISTED_FORMAT = "recorded at the previous full run and still standing; {reference}"
-SKEW_NO_REFERENCE_TEXT = "no maintenance window close or exclusion end to measure against"
+SKEW_YOUNG_TEXT = "Version skew: {skews}; {age}; graded once it has stood {limit} d or longer."
 # A cluster with no maintenance policy has no window to be too short: row 5
 # does not hold there, and the skew is the pool-skew reading the readiness
 # watch's shipped rule makes (entry 10); listed, never graded or re-selected.
 SKEW_NO_POLICY_TEXT = "Version skew, no maintenance policy: {skews}; entry 5 needs a window, and the readiness watch's pool-skew rule reads a standing skew before the next upgrade; not graded here."
-SKEW_RESELECT_REASON = "version skew recorded at the previous run; graded now that the window has closed since"
+SKEW_RESELECT_REASON = f"version skew recorded at a previous run; graded once it has stood {SKEW_STANDING_DAYS} d"
 STATUS_NEW, STATUS_UPGRADED, STATUS_FORCED, STATUS_REGRADED = "new", "upgraded", "forced", "re-graded"
 # A symptom against the ledger's baseline from the cluster's last review.
 SINCE_FIRST_SEEN, SINCE_NEW, SINCE_BEFORE = "first seen", "new since the last review", "present before"
@@ -551,15 +555,26 @@ SCOPE_LOG_FORMAT = "scope: the install's declared scope, {count} project(s) from
 FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
 NOT_FULL_TEXT = "no --full: a scoped run"
 LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger entry and guards kept unchanged"
-# A crash record beside no ledger blocks every run until it is archived.
+# A crash record beside no ledger or guards file, or a guards file absent
+# beside a live ledger, blocks every run until the operator restores the
+# file or runs --reset-ledger, which archives the records and the live files
+# and leaves `RESET_MARKER_FILENAME` until a full run has written the
+# baseline: every run until then carries `after_reset` in its manifest, so
+# the SOP calls no `finish` for it.
 UNREADABLE_GLOB_SUFFIX = ".unreadable-*"
+RESET_MARKER_FILENAME = "reset-pending.json"
+RESET_MARKER_VERSION = 1
+AFTER_RESET_KEY = "after_reset"
+LEDGER_SKEW_FIRST_SEEN_KEY = "skews_first_seen"
+GUARDS_ABSENT_TEXT = "{guards} is absent beside a live {ledger}: a crash record, not a re-baseline, since a run that started from no guards would announce every held finding resolved. Restore it from the newest {reports}/<stamp>.json's guards list, or run --reset-ledger to archive the ledger and start a baseline; until then nothing starts from empty. Nothing written."
+LOCK_IS_SYMLINK_TEXT = "{path} is a symbolic link, which the lock may not be; it was not followed and is left as found. Remove it, then rerun. Nothing written."
 CRASH_RECORD_GLOB = LEDGER_FILENAME + UNREADABLE_GLOB_SUFFIX
 GUARDS_RECORD_GLOB = GUARDS_FILENAME + UNREADABLE_GLOB_SUFFIX
 ARCHIVE_SUBDIR = "archive"
 CRASH_RECORD_TEXT = "{path} sits beside no live {name}: a crash record, not a re-baseline. Restore it as {name} or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
-RESET_LEDGER_TEXT = "archived {count} crash record(s) under {archive}; the next run starts fresh."
-RESET_LEDGER_NOTHING_TEXT = "no crash record to archive."
-RESET_LEDGER_DRY_RUN_TEXT = "would archive {count} crash record(s) under {archive}: {names}; nothing moved (--dry-run)."
+RESET_LEDGER_TEXT = "archived {count} file(s) under {archive}: {names}; the next full run is a baseline the SOP files nothing from (after_reset)."
+RESET_LEDGER_NOTHING_TEXT = "nothing to archive: no crash record, and no state file is absent beside the other."
+RESET_LEDGER_DRY_RUN_TEXT = "would archive {count} file(s) under {archive}: {names}; nothing moved (--dry-run)."
 # The full-run refresh of every fleet cluster's symptom set: pods for the
 # symptoms, nodes for the pools, owners so the keys match the review's.
 REFRESH_READS = ("pods", "nodes", "owners")
@@ -1508,13 +1523,15 @@ def empty_guards() -> dict:
     return {"version": GUARDS_VERSION, "updated_at": None, "guards": []}
 
 
-def _adopt_owner(path: Path, owner: os.stat_result) -> None:
-    """Give `path` to `owner`'s uid and gid when this run is root, as
-    `audit_report._adopt_owner` does for the report store: root is the one
-    writer that can hand what it creates to the store's owner, and any other
-    uid creates what it owns."""
+def _adopt_owner(descriptor: int, owner: os.stat_result) -> None:
+    """Give the open file or directory to `owner`'s uid and gid when this run
+    is root, as `audit_report._adopt_owner` does for the report store: root
+    is the one writer that can hand what it creates to the store's owner,
+    and any other uid creates what it owns. Through the descriptor, never
+    the path: a root run must not follow a symlink the agent's own account
+    could plant in the store under a name it can predict."""
     if os.geteuid() == ROOT_UID:
-        os.chown(path, owner.st_uid, owner.st_gid)
+        os.fchown(descriptor, owner.st_uid, owner.st_gid)
 
 
 def make_store_dir(path: Path) -> None:
@@ -1542,10 +1559,19 @@ def make_store_dir(path: Path) -> None:
             directory.mkdir()
         except FileExistsError:
             continue  # a rival run made it, and chose its ownership then
-        with contextlib.suppress(OSError):
-            directory.chmod(STORE_DIR_MODE)
-            if owner is not None:
-                _adopt_owner(directory, owner)
+        # Set through a descriptor opened without following: a name swapped
+        # for a symlink between the mkdir and here is refused, not chased.
+        try:
+            opened = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with contextlib.suppress(OSError):
+                os.fchmod(opened, STORE_DIR_MODE)
+                if owner is not None:
+                    _adopt_owner(opened, owner)
+        finally:
+            os.close(opened)
 
 
 def store_denied_line(exc: PermissionError) -> str:
@@ -1590,10 +1616,12 @@ def write_json_atomically(path: Path, doc: object) -> None:
     writes, stated at the constant); only the directory follows the caller."""
     output_parent(path)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=TEMP_SUFFIX)
-    os.chmod(temporary, STORE_FILE_MODE)
-    _adopt_owner(Path(temporary), path.parent.stat())
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
+            # Mode and owner through the open descriptor: the random name
+            # was made with O_EXCL, and nothing at a path is followed.
+            os.fchmod(out.fileno(), STORE_FILE_MODE)
+            _adopt_owner(out.fileno(), path.parent.stat())
             json.dump(doc, out, indent=2, sort_keys=True)
             out.write("\n")
             out.flush()
@@ -2959,9 +2987,9 @@ def _match_spread(symptom: dict, entry: int, ctx: Context) -> dict | None:
 
 
 def _match_window(symptom: dict, entry: int, ctx: Context) -> dict | None:
-    """Entry 5: a version skew that stands more than a day after the last
-    maintenance window closed or exclusion ended; medium, from the cluster
-    describe and the maintenance policy."""
+    """Entry 5: a pool more than one minor behind its control plane, standing
+    `SKEW_STANDING` or longer since the run that first recorded it; medium,
+    from the cluster describe and the ledger's record."""
     if symptom["category"] != CATEGORY_VERSION_SKEW:
         return None
     return _classification(entry, MEDIUM, symptom.get("message") or "", symptom.get("reference") or "")
@@ -3244,87 +3272,68 @@ def _last_closing(window: dict, now: datetime) -> tuple[bool, datetime | None]:
     return open_now, None
 
 
-def version_skew(cluster: dict, nodes: list[dict], now: datetime) -> dict:
-    """Entry 5's after-signal from the cluster describe and the maintenance
-    policy: a pool two minors from its control plane, or one pool's nodes on
-    two versions. Overdue when the skew stands more than `SKEW_GRACE` after
-    the last window closed or the last exclusion ended; while a window is
-    open or an exclusion active the roll may still complete, which is Info."""
+def version_skew(cluster: dict, now: datetime, first_seen: dict[str, str] | None = None) -> dict:
+    """Entry 5's after-signal from the cluster describe: every pool
+    `SKEW_MINORS` or more minors behind its control plane, each with its age
+    from the ledger's first-seen record (`first_seen`, key to timestamp; a
+    skew not recorded yet is first seen this run). A skew stands once it has
+    been recorded `SKEW_STANDING` or longer; while a maintenance window is
+    open or an exclusion active the roll may still complete, which is Info,
+    and a cluster with no maintenance policy is never graded."""
     versions = versions_of(cluster)
     master = parse_version(versions["control_plane"] or "")
     skews: list[tuple[str, str]] = []
     for pool, version in sorted(versions["node_pools"].items()):
         parsed = parse_version(version or "")
-        if master and parsed and master[0] == parsed[0] and abs(master[1] - parsed[1]) >= SKEW_MINORS:
-            skews.append((pool, SKEW_CONTROL_PLANE_FORMAT.format(pool=pool, pool_version=version, master=versions["control_plane"], minors=abs(master[1] - parsed[1]))))
-    by_pool: dict[str, set[str]] = {}
-    for node in nodes:
-        labels = (node.get("metadata") or {}).get("labels") or {}
-        kubelet = ((node.get("status") or {}).get("nodeInfo") or {}).get("kubeletVersion") or ""
-        if labels.get(NODEPOOL_LABEL) and kubelet:
-            by_pool.setdefault(labels[NODEPOOL_LABEL], set()).add(kubelet.lstrip("v"))
-    for pool, found in sorted(by_pool.items()):
-        if len(found) >= SKEW_MINORS:
-            skews.append((pool, SKEW_WITHIN_POOL_FORMAT.format(pool=pool, versions=", ".join(sorted(found)))))
+        if master and parsed and master[0] == parsed[0] and master[1] - parsed[1] >= SKEW_MINORS:
+            skews.append((pool, SKEW_CONTROL_PLANE_FORMAT.format(pool=pool, pool_version=version, master=versions["control_plane"], minors=master[1] - parsed[1])))
     policy = ((cluster.get("maintenancePolicy") or {}).get("window") or {})
     no_policy = not policy
-    open_now, last_close = _last_closing(policy, now)
+    open_now, _ = _last_closing(policy, now)
     state = WINDOW_OPEN_STATE if open_now else ""
-    last_end: tuple[datetime, str] | None = None
     for name, exclusion in sorted((policy.get("maintenanceExclusions") or {}).items()):
         start, end = parse_ts(exclusion.get("startTime")), parse_ts(exclusion.get("endTime"))
         if start and end and start <= now <= end:
             state = state or EXCLUSION_ACTIVE_FORMAT.format(name=name, scope=((exclusion.get("maintenanceExclusionOptions") or {}).get("scope")) or DEFAULT_EXCLUSION_SCOPE, end=fmt_ts(end))
-        elif end and end <= now and (last_end is None or end > last_end[0]):
-            last_end = (end, name)
-    reference: tuple[datetime, str] | None = None
-    if last_close and (last_end is None or last_close >= last_end[0]):
-        reference = (last_close, SKEW_WINDOW_WHAT)
-    elif last_end:
-        reference = (last_end[0], SKEW_EXCLUSION_WHAT.format(name=last_end[1]))
-    # An exclusion that ended more than a day ago is overdue on its own: a
-    # window that closed since does not reset the hold it released.
-    overdue_refs = [c for c in ((last_end[0], SKEW_EXCLUSION_WHAT.format(name=last_end[1])) if last_end else None, (last_close, SKEW_WINDOW_WHAT) if last_close else None) if c and now - c[0] > SKEW_GRACE]
-    if overdue_refs:
-        reference = overdue_refs[0]
-    reference_text = SKEW_REFERENCE_FORMAT.format(what=reference[1], at=fmt_ts(reference[0]), hours=int((now - reference[0]).total_seconds() // SECONDS_PER_HOUR)) if reference else ""
+    keys = [BASELINE_SEPARATOR.join((_object_ref("", "NodePool", pool), CATEGORY_VERSION_SKEW, SKEW_REASON)) for pool, _ in skews]
+    recorded = {key: parse_ts((first_seen or {}).get(key)) for key in keys}
+    standing = {key: bool(since) and now - since >= SKEW_STANDING for key, since in recorded.items()}
+    ages = {key: SKEW_AGE_FORMAT.format(days=(now - since).days, since=fmt_ts(since)) if since else SKEW_AGE_FIRST_FORMAT for key, since in recorded.items()}
     return {
         "skews": skews,
         "state": state,
-        "reference": reference_text,
-        "overdue": bool(skews) and not state and bool(overdue_refs) and not no_policy,
         "no_policy": no_policy,
-        "keys": [BASELINE_SEPARATOR.join((_object_ref("", "NodePool", pool), CATEGORY_VERSION_SKEW, SKEW_REASON)) for pool, _ in skews],
+        "keys": keys,
+        "standing": standing,
+        "ages": ages,
+        "overdue": bool(skews) and not state and not no_policy and any(standing.values()),
     }
 
 
-def skew_keys(cluster: dict, nodes: list[dict], now: datetime | None) -> list[str]:
+def skew_keys(cluster: dict, now: datetime | None) -> list[str]:
     """The stored symptom set's names for every skew that stands, graded or
-    not, so the next full run can grade one that persisted."""
-    return version_skew(cluster, nodes, now)["keys"] if now is not None else []
+    not, so a later run can grade one that has stood long enough."""
+    return version_skew(cluster, now)["keys"] if now is not None else []
 
 
-def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None, baseline: list[str] | None = None) -> list[dict]:
-    """One row per skewed pool once the skew is overdue -- by an exclusion
-    or a window close more than a day old, or because the previous full run
-    recorded it and it still stands; nothing while a window is open or an
-    exclusion active, and nothing without a clock."""
+def version_skew_symptoms(cluster: dict, now: datetime | None, first_seen: dict[str, str] | None = None) -> list[dict]:
+    """One row per skewed pool once its skew has stood `SKEW_STANDING` or
+    longer since the run that first recorded it; nothing inside that, while
+    a window is open or an exclusion active, on a cluster with no policy, or
+    without a clock."""
     if now is None:
         return []
-    reading = version_skew(cluster, nodes, now)
-    if not reading["skews"] or reading["no_policy"]:
+    reading = version_skew(cluster, now, first_seen)
+    if not reading["skews"] or reading["no_policy"] or reading["state"]:
         # No policy: no window to be too short, so row 5 never holds; the
         # review lists the skew (`SKEW_NO_POLICY_TEXT`) and the stored set
-        # carries it, nothing more.
+        # carries it. An open window or an active exclusion: the roll may
+        # still complete (`SKEW_OPEN_TEXT`).
         return []
-    previous = set(baseline or [])
     rows = []
     for (pool, text), key in zip(reading["skews"], reading["keys"]):
-        # An open window or an active exclusion holds only a skew not yet
-        # recorded: a recorded one has stood across a close already.
-        if key not in previous and (reading["state"] or not reading["overdue"]):
+        if not reading["standing"][key]:
             continue
-        detail = reading["reference"] if reading["overdue"] else SKEW_PERSISTED_FORMAT.format(reference=reading["reference"] or SKEW_NO_REFERENCE_TEXT)
         rows.append({
             "kind": "NodePool",
             "namespace": "",
@@ -3335,7 +3344,7 @@ def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None
             "reason": SKEW_REASON,
             "message": text,
             "onset": None,
-            "reference": detail,
+            "reference": reading["ages"][key],
         })
     return rows
 
@@ -3381,7 +3390,7 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     return failing_pods, failing_objects
 
 
-def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None, gated: list[str] | None = None) -> list[dict]:
+def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None, gated: list[str] | None = None, skew_first_seen: dict[str, str] | None = None) -> list[dict]:
     """Every symptom in the read, each with its classifications, user
     namespaces first."""
     nodes = reads.get("nodes") or []
@@ -3434,7 +3443,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         e.setdefault("tolerations", pod_tolerations(template))
         e.setdefault("extended_resources", pod_extended_resources(template))
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_pins, resolver, ctx.label_pools)
-    symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, nodes, now, baseline)
+    symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, now, skew_first_seen)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
         if symptom.get("pod_count"):
@@ -4153,6 +4162,8 @@ def recheck_operation_guards(guards: list[dict], operations: list[dict], listed:
         if project not in listed:
             continue
         name = str(guard.get("object") or "").split("/", 1)[-1]
+        cluster_parts = str(guard.get("cluster") or "").split(CLUSTER_KEY_SEPARATOR, 2)
+        own_cluster = tuple(cluster_parts[1:3]) if len(cluster_parts) == 3 else ("", "")
         ops = [op for op in operations if op.get("project") == project]
         op = next((o for o in ops if o.get("name") == name), None)
         summary = operation_summary(op) if op is not None else None
@@ -4166,7 +4177,10 @@ def recheck_operation_guards(guards: list[dict], operations: list[dict], listed:
         # The one failure predicate decides the retry too: `DONE` with a
         # `statusMessage` and no `error` object is a failed operation to the
         # guard and the Error, so it is no clean retry here.
-        retries = [o for o in ops if o.get("name") != name and op_type and o.get("operationType") == op_type and target and operation_summary(o)["target"] == target and not _operation_failed(operation_summary(o)) and started is not None and (parse_ts(o.get("startTime")) or started) > started]
+        # The retry is the guard's own cluster's: a same-named pool on another
+        # cluster in the project (GKE's `default-pool`), or another cluster's
+        # control plane, is no retry of this operation.
+        retries = [o for o in ops if o.get("name") != name and op_type and o.get("operationType") == op_type and target and operation_summary(o)["target"] == target and (parse_target_link(o.get("targetLink", "")) or ("", "", None))[:2] == own_cluster and not _operation_failed(operation_summary(o)) and started is not None and (parse_ts(o.get("startTime")) or started) > started]
         if retries:
             retry = operation_summary(sorted(retries, key=lambda o: o.get("startTime") or "")[0])
             result["cleared"].append({"id": guard["id"], "reason": OPERATION_GUARD_RETRIED_FORMAT.format(type=retry["type"], target=retry["target"], name=retry["name"], end=retry["end"] or "?")})
@@ -4215,7 +4229,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     unavailable = set(_unavailable_workloads(reads.get("workloads") or []))
     # A skew that still stands keeps its entry-5 guard, whatever the window
     # is doing at this hour: a guard is cleared only when the skew is gone.
-    skew = version_skew(cluster, reads.get("nodes") or [], now) if now is not None else {"skews": [], "state": "", "keys": []}
+    skew = version_skew(cluster, now) if now is not None else {"skews": [], "state": "", "keys": []}
     skewed = {_object_ref("", "NodePool", pool) for pool, _ in skew["skews"]}
     symptoms = collect_symptoms(cluster, reads, [], EPOCH, now=now)
     if refresh and set(REFRESH_READS) <= answered:
@@ -4415,20 +4429,23 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     gated: list[str] = []
     entry = (ledger.get("clusters") or {}).get(selection.key) or {}
     stored = entry.get("symptoms") if entry.get("last_run") else None
-    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored, gated=gated)
+    skews_first_seen = entry.get(LEDGER_SKEW_FIRST_SEEN_KEY) or {}
+    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored, gated=gated, skew_first_seen=skews_first_seen)
     review["starting"] = starting
     review["gated"] = gated
-    skew = version_skew(cluster, reads.get("nodes") or [], now or now_utc())
+    skew = version_skew(cluster, now or now_utc(), skews_first_seen)
     if skew["skews"] and not any(sym["category"] == CATEGORY_VERSION_SKEW for sym in symptoms):
         skews_text = "; ".join(text for _, text in skew["skews"])
         if skew.get("no_policy"):
             review["skew_notes"] = [SKEW_NO_POLICY_TEXT.format(skews=skews_text)]
+        elif skew["state"]:
+            review["skew_notes"] = [SKEW_OPEN_TEXT.format(skews=skews_text, state=skew["state"])]
         else:
-            review["skew_notes"] = [SKEW_OPEN_TEXT.format(skews=skews_text, state=skew["state"]) if skew["state"] else SKEW_FIRST_SEEN_TEXT.format(skews=skews_text, reference=skew["reference"] or SKEW_NO_REFERENCE_TEXT)]
+            review["skew_notes"] = [SKEW_YOUNG_TEXT.format(skews=skews_text, age="; ".join(skew["ages"][key] for key in skew["keys"]), limit=SKEW_STANDING_DAYS)]
     mark_since(symptoms, stored, first_op)
     review["what_failed"] = symptoms
-    # Every skew seen joins the stored set, graded or not, so the next full
-    # run can grade one that persisted across the window's closes.
+    # Every skew seen joins the stored set, graded or not, so the ledger can
+    # date it (`LEDGER_SKEW_FIRST_SEEN_KEY`) and a later run grade it.
     review["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms} | set(skew["keys"]))
     review["budgets_at_zero"] = sorted(_object_ref((b.get("metadata") or {}).get("namespace", ""), "PodDisruptionBudget", (b.get("metadata") or {}).get("name", "")) for b in reads.get("pdbs") or [] if (b.get("status") or {}).get("disruptionsAllowed") == 0)
     # Workloads still unavailable, for the entry-3 keep rule: the operation
@@ -5096,6 +5113,7 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         "started_at": started_at,
         "finished_at": finished_at,
         "scoped": result["scoped"],
+        AFTER_RESET_KEY: bool(result.get(AFTER_RESET_KEY)),
         "partial": any(run_limiting_failure(line) for line in result["failed_reads"]) or any(r.get("partial") for r in result["reviews"]) or bool(result["upgrading"]) or bool(result.get("scope_note")),
         "clusters": entries,
         "still_flagged": sorted(still_flagged, key=lambda h: (h["cluster"], h["check"], h["namespace"], h["object"])),
@@ -5142,6 +5160,8 @@ def render_report(result: dict) -> str:
         lines += [INFO_SCOPED.format(reason=_cell(info["scoped"])), ""]
     if result.get("scope_note"):
         lines += [INFO_SCOPE_NOTE.format(note=_cell(result["scope_note"])), ""]
+    if result.get(AFTER_RESET_KEY):
+        lines += [INFO_AFTER_RESET.format(archive=_cell(str(result.get("reset_archive") or "?")), at=_cell(str(result.get("reset_at") or "?"))), ""]
     if result.get("budget_spent"):
         budget = result["budget"]
         lines += [INFO_BUDGET_SPENT.format(seconds=budget["seconds"], reviewed=budget["reviewed"], rechecked=budget["rechecked"], cut=budget["cut"], cut_rechecks=budget["cut_rechecks"], deferred=budget["deferred"], deferred_rechecks=budget["deferred_rechecks"]), ""]
@@ -5313,6 +5333,15 @@ def _operations_record(previous: list[dict], fresh: list[dict], seen_at: str, ro
     return sorted(kept, key=lambda o: (o.get("end") or "", o["id"]))
 
 
+def _skews_first_seen(previous: dict | None, symptoms: list[str] | None, seen_at: str) -> dict[str, str]:
+    """When each skew key in the stored set was first recorded: kept while
+    the key stands, dated this run when new, dropped with the key. Entry 5's
+    age (`SKEW_STANDING`)."""
+    previous = previous or {}
+    marker = BASELINE_SEPARATOR + CATEGORY_VERSION_SKEW + BASELINE_SEPARATOR
+    return {key: previous.get(key) or seen_at for key in (symptoms or []) if marker in key}
+
+
 def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None, skip: set[str] | None = None, refreshed: dict[str, list[str]] | None = None, advance: bool = True, attempted: set[str] | None = None, route: str = ROUTE_FULL, since: datetime | None = None, outside: set[str] | None = None) -> dict:
     """Every enumerated cluster's current versions; `last_run` moves only for
     a cluster this run reviewed in full, so a failed or partial read is
@@ -5349,6 +5378,7 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
         if key in entries:
             entries[key]["symptoms"] = symptoms
             entries[key]["symptoms_refreshed"] = seen_at
+            entries[key][LEDGER_SKEW_FIRST_SEEN_KEY] = _skews_first_seen(entries[key].get(LEDGER_SKEW_FIRST_SEEN_KEY), symptoms, seen_at)
     for cluster in clusters:
         key = cluster_key(cluster["project"], cluster["location"], cluster["name"])
         if key in (skip or set()) or key in (outside or set()):
@@ -5377,6 +5407,7 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
                 "last_run": seen_at if key in recorded_in_full else old.get("last_run"),
                 "last_operation": fmt_ts(latest) if latest else old.get("last_operation"),
                 "symptoms": baselines.get(key) if key in recorded_in_full else old.get("symptoms"),
+                LEDGER_SKEW_FIRST_SEEN_KEY: _skews_first_seen(old.get(LEDGER_SKEW_FIRST_SEEN_KEY), baselines.get(key) if key in recorded_in_full else old.get("symptoms"), seen_at),
                 LEDGER_OPERATIONS_KEY: _operations_record(old.get(LEDGER_OPERATIONS_KEY) or [], covered, seen_at, route, floor_of(key)),
             }
         if key in partial:
@@ -5433,13 +5464,20 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
                 # with no guards while the ledger says "unchanged" loses them.
                 raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1], name=state_path.name))
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
+    if ledger_path.exists() and not guards_path.exists():
+        # The write order never leaves this (guards, then ledger, every run):
+        # a hand delete did, and the guards are the memory the hold rule reads.
+        raise StateUnreadable(GUARDS_ABSENT_TEXT.format(guards=guards_path, ledger=ledger_path, reports=REPORTS_SUBDIR))
     guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
+    reset_marker_path = data_dir() / RESET_MARKER_FILENAME
+    reset_marker = read_reset_marker(reset_marker_path)
+    after_reset = reset_marker is not None
     forced = forced_clusters(args)
     after_upgrade = bool(getattr(args, "after_upgrade", False))
     if after_upgrade and not any((entry or {}).get("last_run") for entry in (ledger.get("clusters") or {}).values()):
         # No full run has recorded the fleet: nothing to diff against.
         log(NO_BASELINE_TEXT)
-        return {"generated_at": seen_at, "since": fmt_ts(since), "projects": [], "reviews": [], "unchanged": [], "upgrading": [], "failed_reads": [], "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "no_baseline": True, "report": NO_BASELINE_TEXT + "\n", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
+        return {"generated_at": seen_at, "since": fmt_ts(since), "projects": [], "reviews": [], "unchanged": [], "upgrading": [], "failed_reads": [], "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "no_baseline": True, "report": NO_BASELINE_TEXT + "\n", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run), AFTER_RESET_KEY: after_reset}
 
     failed_reads: list[str] = []
     projects, failed_reads, listing_note = discovery if discovery is not None else discover_fleet(project_override(args) or None, run=run, forced=forced)
@@ -5513,7 +5551,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             held_lines = [_upgrading_line(row, str) for row in upgrading]
             for line in [AFTER_UPGRADE_HELD_LOG if held_lines else AFTER_UPGRADE_QUIET_LOG] + held_lines + failed_reads:
                 log(line)
-            return {"generated_at": seen_at, "since": fmt_ts(since), "projects": projects, "reviews": [], "unchanged": [], "upgrading": upgrading, "failed_reads": failed_reads, "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "report": "", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
+            return {"generated_at": seen_at, "since": fmt_ts(since), "projects": projects, "reviews": [], "unchanged": [], "upgrading": upgrading, "failed_reads": failed_reads, "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "report": "", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run), AFTER_RESET_KEY: after_reset}
     log(f"{len(clusters)} cluster(s) in {len(projects)} project(s); reviewing {len(selected)}, {len(unchanged)} unchanged, {len(upgrading)} upgrading now")
     # One get-server-config per (project, location), in parallel, for every
     # cluster: the next target is printed for unchanged clusters too.
@@ -5768,6 +5806,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         "upgrading": upgrading,
         "scoped": scoped,
         "after_upgrade": after_upgrade,
+        AFTER_RESET_KEY: after_reset,
+        "reset_archive": (reset_marker or {}).get("archive"),
+        "reset_at": (reset_marker or {}).get("reset_at"),
         "scope_reason": "; ".join(scope_reasons),
         "fleet": sorted(new_fleet),
         "outside_fleet": sorted(outside),
@@ -5810,6 +5851,10 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     prune_reports(reports_dir)
     write_json_atomically(guards_path, new_guards)
     write_json_atomically(ledger_path, new_ledger)
+    if after_reset and not scoped:
+        # The baseline is written: the runs from here on file as usual.
+        with contextlib.suppress(FileNotFoundError):
+            reset_marker_path.unlink()
     return result
 
 
@@ -5855,11 +5900,22 @@ def write_report(path: Path, text: str, *, link: bool = True) -> None:
     collector writes. A scoped run writes no link: the link always names a
     fleet-wide report."""
     output_parent(path)
-    temporary = path.with_name(path.name + REPORT_TEMP_SUFFIX)
-    temporary.write_text(text, encoding="utf-8")
-    os.chmod(temporary, STORE_FILE_MODE)
-    _adopt_owner(temporary, path.parent.stat())
-    os.replace(temporary, path)
+    # Staged as the JSON is: a random name made with O_EXCL, the mode and
+    # owner set through the descriptor, so a symlink planted at a predictable
+    # staging name is never opened, truncated, chmodded or chowned.
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=TEMP_SUFFIX)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            os.fchmod(out.fileno(), STORE_FILE_MODE)
+            _adopt_owner(out.fileno(), path.parent.stat())
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
     if not link:
         return
     link = path.parent / LATEST_REPORT_LINK
@@ -5882,7 +5938,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
     parser.add_argument("--manifest-file", help=f"also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against); the SOP passes the harness's path for the stream, {harness_manifest_path()}, where `finish`'s --no-collector-manifest waiver and `start`'s scrub look for this run's manifest")
-    parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
+    parser.add_argument("--reset-ledger", action="store_true", help=f"the second remedy for a crash record, after the restore (the record moved back under the file's name, or the guards from the newest {REPORTS_SUBDIR}/<stamp>.json): archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) and the live ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/<stamp>/ and mark the store, so the next full run is a baseline the SOP files nothing from; does nothing on a store with no record and no file absent beside the other")
     parser.add_argument("--probe-lock", action="store_true", help="test the lock without taking it: a non-blocking flock attempt on .lock, held for no time, reading and writing nothing; exit 0 when free, 1 with the holder line when another run holds it. With no other mode flag")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters (no project when handed the fleet_scope tool's {fleet_scope_args.UNRESOLVED_SCOPE_ROW} row, or when an undeclared install's projects listing failed or did not name the active project: the swept set is then not the fleet), writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full, --cluster or --since")
@@ -5902,13 +5958,20 @@ def acquire_lock(path: Path, *, wait: timedelta | None = None, poll: timedelta |
     # cleared so the file is LOCK_FILE_MODE whoever creates it.
     mask = os.umask(0)
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CREAT, LOCK_FILE_MODE)
+        # O_NOFOLLOW: a symlink planted at the lock's name, which needs no
+        # guessing, is refused rather than opened and handed over.
+        descriptor = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, LOCK_FILE_MODE)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise StateUnreadable(LOCK_IS_SYMLINK_TEXT.format(path=path)) from exc
+        raise
     finally:
         os.umask(mask)
     handle = os.fdopen(descriptor, "r", encoding="utf-8")  # noqa: SIM115 -- held for the run
-    # The lock is the store's too: a root run hands it to the store's owner.
+    # The lock is the store's too: a root run hands it to the store's owner,
+    # through the descriptor it holds.
     with contextlib.suppress(OSError):
-        _adopt_owner(path, path.parent.stat())
+        _adopt_owner(descriptor, path.parent.stat())
     deadline = clock() + wait.total_seconds()
     while True:
         try:
@@ -5927,7 +5990,8 @@ def acquire_lock(path: Path, *, wait: timedelta | None = None, poll: timedelta |
             raise
     # The "since" stamp; a file another uid owns refuses it and keeps its own.
     with contextlib.suppress(OSError):
-        os.utime(path, None)
+        if os.utime in os.supports_fd:
+            os.utime(descriptor, None)
     return handle
 
 
@@ -5953,9 +6017,13 @@ def probe_lock(path: Path) -> tuple[int, str]:
     with a non-blocking flock that is released at once. Exit 0 with the
     free line, or `EXIT_LOCK_HELD` with the holder line."""
     try:
-        descriptor = os.open(path, os.O_RDONLY)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return 0, LOCK_PROBE_FREE_TEXT.format(path=path)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return EXIT_USAGE, LOCK_IS_SYMLINK_TEXT.format(path=path)
+        raise
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -5966,26 +6034,47 @@ def probe_lock(path: Path) -> tuple[int, str]:
         os.close(descriptor)
     return 0, LOCK_PROBE_FREE_TEXT.format(path=path)
 
+def read_reset_marker(path: Path) -> dict | None:
+    """The marker `--reset-ledger` leaves until a full run has written the
+    baseline; None when there is none, an empty record when it cannot be
+    read (the marker still holds)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, guards_path: Path | None = None, move: bool = True) -> str:
-    """Archive the crash records beside the ledger and guards files (the
-    store's, or the paths --ledger/--guards name). The archive keeps them
-    readable; only the operator's choice to run this clears the block. With
-    `move` False (--dry-run) the records are listed and nothing moves."""
+    """The second remedy for a crash record, after the restore: archive the
+    records beside the ledger and guards files (the store's, or the paths
+    --ledger/--guards name) and the live files with them, so the next full
+    run is a baseline, and leave the marker that makes every run until then
+    carry `after_reset`. Nothing happens on a store with no record and no
+    file absent beside the other. With `move` False (--dry-run) what would
+    move is listed and nothing moves."""
     ledger_file = ledger_path or store / LEDGER_FILENAME
     guards_file = guards_path or store / GUARDS_FILENAME
     records = sorted(ledger_file.parent.glob(ledger_file.name + UNREADABLE_GLOB_SUFFIX)) + sorted(guards_file.parent.glob(guards_file.name + UNREADABLE_GLOB_SUFFIX))
-    if not records:
+    guards_absent = ledger_file.exists() and not guards_file.exists()
+    if not records and not guards_absent:
         return RESET_LEDGER_NOTHING_TEXT
+    moving = records + [p for p in (ledger_file, guards_file) if p.exists()]
     archive = store / ARCHIVE_SUBDIR / now.strftime(REPORT_TS_FORMAT)
+    names = ", ".join(p.name for p in moving)
     if not move:
-        return RESET_LEDGER_DRY_RUN_TEXT.format(count=len(records), archive=archive, names=", ".join(r.name for r in records))
+        return RESET_LEDGER_DRY_RUN_TEXT.format(count=len(moving), archive=archive, names=names)
     # The archive root is the store's too: made as one, not as a caller-umask
     # ancestor, or a root hand reset would refuse the next uid's.
     make_store_dir(store / ARCHIVE_SUBDIR)
     make_store_dir(archive)
-    for record in records:
-        shutil.move(str(record), str(archive / record.name))  # across filesystems too
-    return RESET_LEDGER_TEXT.format(count=len(records), archive=archive)
+    for item in moving:
+        shutil.move(str(item), str(archive / item.name))  # across filesystems too
+    write_json_atomically(store / RESET_MARKER_FILENAME, {"version": RESET_MARKER_VERSION, "reset_at": fmt_ts(now), "archive": str(archive), "archived": [p.name for p in moving]})
+    return RESET_LEDGER_TEXT.format(count=len(moving), archive=archive, names=names)
 
 
 def main(argv: list[str] | None = None) -> int:

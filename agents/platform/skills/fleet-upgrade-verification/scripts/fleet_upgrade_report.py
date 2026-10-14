@@ -274,6 +274,7 @@ KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 # A rename that finds the directory already moved (another run's tick in the
 # same second won the move-aside): not a refusal, as the shared rule reads it.
 KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
+KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
 ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
@@ -714,6 +715,10 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
             return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
     else:
         euid = os.geteuid()
+        if os.path.islink(kubeconfig_dir):
+            # Never followed, as the shared rule reads it: a root run would
+            # otherwise chmod and write into whatever it points at.
+            return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=kubeconfig_dir)
         try:
             current = os.stat(kubeconfig_dir)
         except FileNotFoundError:
@@ -749,10 +754,17 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
             except OSError as exc:
                 return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
         if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+            # Through a descriptor opened without following, as the shared rule.
             try:
-                os.chmod(kubeconfig_dir, KUBECONFIG_DIR_MODE)
+                opened = os.open(kubeconfig_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError as exc:
+                return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
+            try:
+                os.fchmod(opened, KUBECONFIG_DIR_MODE)
             except OSError as exc:
                 return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(current.st_mode & KUBECONFIG_DIR_MODE_MASK), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
+            finally:
+                os.close(opened)
     if os.path.exists(path) and not os.access(path, os.W_OK):
         try:
             os.unlink(path)

@@ -1352,58 +1352,53 @@ class ClassifierSignatureTest(unittest.TestCase):
         rows = [s for s in symptoms_of("seeded-a", reads=reads) if s["category"] == ur.CATEGORY_UNAVAILABLE]
         self.assertEqual([(r["object"], entries(r)) for r in rows], [("seeded-stall/Deployment/inventory-api", {(3, ur.HIGH)})])
 
-    def test_entry_5_version_skew_after_the_window_or_exclusion_ended(self):
+    def test_entry_5_a_pool_two_minors_behind_for_seven_days(self):
+        # Row 5 is graded on the skew's own age, from the run that first recorded it, with no window
+        # arithmetic: a daily window grades as a weekly one does; inside seven days, under an open
+        # window or an active exclusion, it is Info; a cluster with no policy is never graded; one
+        # pool on two kubelet versions is no row (an open operation holds the cluster, a finished one
+        # leaves one version).
         gemma = cluster_doc("gemma-gpu-upgraded")
         gemma["nodePools"][0]["version"] = "1.30.5-gke.1000000"  # default-pool two minors behind the control plane
         reads = READS["gemma-gpu-upgraded"]
         skew_text = "pool default-pool at 1.30.5-gke.1000000, control plane at 1.32.13-gke.2427000 (2 minors apart)"
-        # The exclusion is active: the roll is held on purpose; no row, and the reading says so.
-        reading = ur.version_skew(gemma, reads["nodes"], NOW)
-        self.assertEqual((reading["skews"], reading["state"], reading["overdue"]), ([("default-pool", skew_text)], "exclusion hold-gpu-minor (NO_MINOR_UPGRADES) is active until 2026-10-21T00:00:00Z", False))
-        self.assertEqual([s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=NOW) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
-        # The exclusion ended forty-two hours before the run: overdue on its own, whatever the daily
-        # window closed since (the window does not reset the hold the exclusion released).
+        key = "NodePool/default-pool|version-skew|version skew"
+        old = {key: "2026-09-20T18:00:00Z"}
+        # The exclusion is active at NOW: held, whatever the age.
+        reading = ur.version_skew(gemma, NOW, old)
+        self.assertEqual((reading["skews"], reading["state"], reading["standing"][key], reading["overdue"]), ([("default-pool", skew_text)], "exclusion hold-gpu-minor (NO_MINOR_UPGRADES) is active until 2026-10-21T00:00:00Z", True, False))
+        self.assertEqual([s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=NOW, skew_first_seen=old) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        # The exclusion over and the skew recorded 32 days before: a row, medium, with its age.
         later = datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc)
-        reading = ur.version_skew(gemma, reads["nodes"], later)
-        self.assertEqual((reading["state"], reading["overdue"], reading["reference"]), ("", True, "exclusion hold-gpu-minor ended 2026-10-21T00:00:00Z, 42 h before this run"))
-        [row] = [s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=later) if s["category"] == ur.CATEGORY_VERSION_SKEW]
+        [row] = [s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=later, skew_first_seen=old) if s["category"] == ur.CATEGORY_VERSION_SKEW]
         self.assertEqual(entries(row), {(5, ur.MEDIUM)})
-        self.assertEqual((row["object"], row["system"], row["classifications"][0]["evidence"], row["classifications"][0]["detail"]), ("NodePool/default-pool", True, skew_text, "exclusion hold-gpu-minor ended 2026-10-21T00:00:00Z, 42 h before this run"))
-        self.assertEqual(ur.symptom_key(row), "NodePool/default-pool|version-skew|version skew")
-        # The window open now: a skew not yet recorded is held; a recorded one is graded, with the
-        # previous occurrence's close as the reference.
+        self.assertEqual((row["object"], row["system"], row["classifications"][0]["evidence"], row["classifications"][0]["detail"]), ("NodePool/default-pool", True, skew_text, ur.SKEW_AGE_FORMAT.format(days=32, since="2026-09-20T18:00:00Z")))
+        self.assertEqual(ur.symptom_key(row), key)
+        # Inside the open daily window (03:00-07:00) it is held even when old.
         at_open = datetime(2026, 10, 22, 4, 0, tzinfo=timezone.utc)
-        reading = ur.version_skew(gemma, reads["nodes"], at_open)
-        self.assertEqual((reading["state"], reading["reference"]), (ur.WINDOW_OPEN_STATE, "exclusion hold-gpu-minor ended 2026-10-21T00:00:00Z, 28 h before this run"))
-        self.assertEqual([s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=at_open) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
-        [row] = [s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=at_open, baseline=reading["keys"]) if s["category"] == ur.CATEGORY_VERSION_SKEW]
-        self.assertEqual(entries(row), {(5, ur.MEDIUM)})
-        # A daily window alone closes every day, so "a day after the last close" never comes: a skew
-        # first seen is not graded, its key is still stored, and the next full run grades it if it
-        # still stands (the window has closed in between).
-        daily = copy.deepcopy(gemma)
-        daily["maintenancePolicy"]["window"].pop("maintenanceExclusions")
-        reading = ur.version_skew(daily, reads["nodes"], later)
-        self.assertEqual((reading["overdue"], reading["reference"], reading["keys"]), (False, "the maintenance window ended 2026-10-22T07:00:00Z, 11 h before this run", ["NodePool/default-pool|version-skew|version skew"]))
-        self.assertEqual([s for s in ur.collect_symptoms(daily, reads, [], SINCE, now=later) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
-        self.assertEqual(ur.skew_keys(daily, reads["nodes"], later), reading["keys"])
-        [row] = [s for s in ur.collect_symptoms(daily, reads, [], SINCE, now=later, baseline=reading["keys"]) if s["category"] == ur.CATEGORY_VERSION_SKEW]
-        self.assertEqual((entries(row), row["classifications"][0]["detail"]), ({(5, ur.MEDIUM)}, ur.SKEW_PERSISTED_FORMAT.format(reference="the maintenance window ended 2026-10-22T07:00:00Z, 11 h before this run")))
-        # Two versions within one pool under a weekly Saturday window that closed five days ago.
+        self.assertEqual(ur.version_skew(gemma, at_open, old)["state"], ur.WINDOW_OPEN_STATE)
+        self.assertEqual([s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=at_open, skew_first_seen=old) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        # First recorded this run, or six days ago: Info, not graded; at seven days: graded.
+        for first_seen, graded in ((None, False), ({key: "2026-10-16T18:00:00Z"}, False), ({key: "2026-10-15T18:00:00Z"}, True)):
+            with self.subTest(first_seen=first_seen):
+                reading = ur.version_skew(gemma, later, first_seen)
+                self.assertEqual((reading["standing"][key], reading["overdue"]), (graded, graded))
+                self.assertEqual(len([s for s in ur.collect_symptoms(gemma, reads, [], SINCE, now=later, skew_first_seen=first_seen) if s["category"] == ur.CATEGORY_VERSION_SKEW]), int(graded))
+        self.assertEqual(ur.version_skew(gemma, later)["ages"][key], ur.SKEW_AGE_FIRST_FORMAT)
+        self.assertEqual(ur.skew_keys(gemma, later), [key])
+        # Two kubelet versions within one pool is no row: the describe shows one pool version.
         seeded = cluster_doc("seeded-a")
-        seeded["maintenancePolicy"] = {"window": {"recurringWindow": {"recurrence": "FREQ=WEEKLY;BYDAY=SA", "window": {"startTime": "2026-01-03T03:00:00Z", "endTime": "2026-01-03T07:00:00Z"}}}}
         nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
         nodes[0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.34.1-gke.1000000"
-        [row] = [s for s in ur.collect_symptoms(seeded, {**READS["seeded-a"], "nodes": nodes}, ops_for("seeded-a"), SINCE, now=NOW) if s["category"] == ur.CATEGORY_VERSION_SKEW]
-        self.assertEqual((row["name"], row["classifications"][0]["evidence"], row["classifications"][0]["detail"]), ("default-pool", "pool default-pool nodes on 1.34.1-gke.1000000, 1.35.8-gke.1380001", "the maintenance window ended 2026-10-03T07:00:00Z, 131 h before this run"))
-        # No maintenance policy: no window to be too short, so row 5 never holds, on a first
-        # observation or with the skew recorded; the stored set still carries it.
-        bare = cluster_doc("seeded-a")
+        self.assertEqual([s for s in ur.collect_symptoms(seeded, {**READS["seeded-a"], "nodes": nodes}, ops_for("seeded-a"), SINCE, now=NOW) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        self.assertEqual(ur.version_skew(seeded, NOW)["skews"], [])
+        # No maintenance policy: never row 5, however old; the stored set still carries the key.
+        bare = cluster_doc("gemma-gpu-upgraded")
         bare.pop("maintenancePolicy")
-        reading = ur.version_skew(bare, nodes, NOW)
-        self.assertEqual((reading["overdue"], reading["no_policy"], len(reading["skews"]), len(reading["keys"])), (False, True, 1, 1))
-        self.assertEqual([s for s in ur.collect_symptoms(bare, {**READS["seeded-a"], "nodes": nodes}, [], SINCE, now=NOW) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
-        self.assertEqual([s for s in ur.collect_symptoms(bare, {**READS["seeded-a"], "nodes": nodes}, [], SINCE, now=NOW, baseline=ur.skew_keys(bare, nodes, NOW)) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        bare["nodePools"][0]["version"] = "1.30.5-gke.1000000"
+        reading = ur.version_skew(bare, later, old)
+        self.assertEqual((reading["overdue"], reading["no_policy"], reading["keys"]), (False, True, [key]))
+        self.assertEqual([s for s in ur.collect_symptoms(bare, reads, [], SINCE, now=later, skew_first_seen=old) if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
 
     def test_entry_14_gates_on_the_oom_pods_own_pool(self):
         # idle-batch-pool (cgroup v2) was not touched this week; default-pool was. The OOM pod on the untouched pool is medium.
@@ -2024,8 +2019,14 @@ class LedgerAndGuardsTest(unittest.TestCase):
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                # The reset archives the ledger's record and the live (broken) guards file: the next
+                # run is a baseline, both files written together.
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
-                # The broken guards file is met next: set aside, and its record blocks like the ledger's.
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
+                self.assertTrue((self.home / ur.LEDGER_FILENAME).exists() and (self.home / ur.GUARDS_FILENAME).exists())
+                # A broken guards file beside the live ledger is met next: set aside, and its record
+                # blocks like the ledger's.
+                (self.home / ur.GUARDS_FILENAME).write_text("{not json")
                 self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertTrue(list(self.home.glob(ur.GUARDS_RECORD_GLOB)))
                 with redirect_stderr(io.StringIO()) as err2:
@@ -2142,7 +2143,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         # uid-1000 tick writes after a root hand run without a world-writable directory.
         chowns = []
         fresh = self.home / "root-run" / "store"
-        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "chown", side_effect=lambda p, uid, gid: chowns.append((Path(p), uid, gid))):
+        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "fchown", side_effect=lambda fd, uid, gid: chowns.append((os.fstat(fd).st_ino, uid, gid))):
             ur.make_store_dir(fresh)
             ur.write_json_atomically(fresh / "doc.json", {"a": 1})
             ur.write_report(fresh / "r.md", "# r\n", link=False)
@@ -2150,10 +2151,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
             held.close()
         owner = self.home.stat()
         self.assertTrue(chowns and all((uid, gid) == (owner.st_uid, owner.st_gid) for _, uid, gid in chowns), chowns)
-        self.assertEqual({p for p, _, _ in chowns if p.is_dir()}, {self.home / "root-run", fresh})
-        self.assertEqual(sorted(p.name for p, _, _ in chowns if not p.is_dir() and p.name != ur.LOCK_FILENAME and not p.name.startswith(".doc.json.")), ["r.md.tmp"])
-        self.assertTrue(any(p.name.startswith(".doc.json.") for p, _, _ in chowns))
-        self.assertIn(fresh / ur.LOCK_FILENAME, [p for p, _, _ in chowns])
+        # Through the descriptor, never the path: the inodes handed over are the two directories, the
+        # two files (staged under random names and renamed into place) and the lock, nothing else.
+        self.assertEqual({ino for ino, _, _ in chowns}, {p.stat().st_ino for p in (self.home / "root-run", fresh, fresh / "doc.json", fresh / "r.md", fresh / ur.LOCK_FILENAME)})
 
     def test_an_existing_store_directory_is_left_as_found_and_a_denied_store_is_one_line(self):
         # The report store's rule touches only the directories it makes. A store directory that
@@ -2166,13 +2166,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
         opened.mkdir()
         opened.chmod(0o777)
         chowns = []
-        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "chown", side_effect=lambda p, uid, gid: chowns.append((Path(p), uid, gid))):
+        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "fchown", side_effect=lambda fd, uid, gid: chowns.append((os.fstat(fd).st_ino, uid, gid))):
             ur.make_store_dir(opened)
             self.assertEqual((stat.S_IMODE(opened.stat().st_mode), chowns), (0o777, []))
             ur.make_store_dir(opened / "reports")
         owner = opened.stat()
         self.assertEqual((stat.S_IMODE(opened.stat().st_mode), stat.S_IMODE((opened / "reports").stat().st_mode)), (0o777, ur.STORE_DIR_MODE))
-        self.assertEqual(chowns, [(opened / "reports", owner.st_uid, owner.st_gid)])
+        self.assertEqual(chowns, [((opened / "reports").stat().st_ino, owner.st_uid, owner.st_gid)])
         # A store path this uid cannot write is one stderr line, exit 2, nothing on stdout and no
         # traceback, the owner named when it is another uid's and the run's projects at the end for
         # the recovery `finish`; the lock, when it was taken, is released on the way out.
@@ -2194,6 +2194,35 @@ class LedgerAndGuardsTest(unittest.TestCase):
         held = ur.acquire_lock(self.home / ur.LOCK_FILENAME, wait=timedelta(0))
         self.assertIsNotNone(held)
         held.close()
+
+    def test_a_root_run_follows_no_symlink_planted_in_the_store(self):
+        # The store's directories are the uid-1000 agent's, so the agent's own account can plant a
+        # symlink under a name a root hand run would write: the report's staging name, the lock, a
+        # store directory. The report is staged under a random name made with O_EXCL with its mode and
+        # owner set through the descriptor; the lock is opened with O_NOFOLLOW and refused as a symlink;
+        # a directory is set through a descriptor opened without following. The targets stay untouched.
+        target = self.home / "target"
+        target.write_text("root's secret")
+        target.chmod(0o600)
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        elsewhere.chmod(0o700)
+        store = self.home / "store"
+        ur.make_store_dir(store / ur.REPORTS_SUBDIR)
+        (store / ur.REPORTS_SUBDIR / "r.md.tmp").symlink_to(target)
+        (store / ur.LOCK_FILENAME).symlink_to(target)
+        (store / ur.ARCHIVE_SUBDIR).symlink_to(elsewhere)
+        chowned = []
+        with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "fchown", side_effect=lambda fd, uid, gid: chowned.append(os.fstat(fd).st_ino)):
+            ur.write_report(store / ur.REPORTS_SUBDIR / "r.md", "# r\n", link=False)
+            with self.assertRaises(ur.StateUnreadable) as caught:
+                ur.acquire_lock(store / ur.LOCK_FILENAME)
+            ur.make_store_dir(store / ur.ARCHIVE_SUBDIR)
+        self.assertEqual((target.read_text(), stat.S_IMODE(target.stat().st_mode), (store / ur.REPORTS_SUBDIR / "r.md.tmp").is_symlink(), (store / ur.REPORTS_SUBDIR / "r.md").read_text()), ("root's secret", 0o600, True, "# r\n"))
+        self.assertEqual((str(caught.exception), (store / ur.LOCK_FILENAME).is_symlink()), (ur.LOCK_IS_SYMLINK_TEXT.format(path=store / ur.LOCK_FILENAME), True))
+        self.assertEqual((stat.S_IMODE(elsewhere.stat().st_mode), (store / ur.ARCHIVE_SUBDIR).is_symlink()), (0o700, True))
+        self.assertTrue({target.stat().st_ino, elsewhere.stat().st_ino}.isdisjoint(chowned))
+        self.assertEqual(ur.probe_lock(store / ur.LOCK_FILENAME), (ur.EXIT_USAGE, ur.LOCK_IS_SYMLINK_TEXT.format(path=store / ur.LOCK_FILENAME)))
 
     def test_api_disabled_project_is_empty_for_operations_too(self):
         ops, error = ur.list_operations("no-gke-project", SINCE, run=lambda argv, **kw: run_of(1, "", API_OFF_STDERR.format(project="no-gke-project", api="operations")))
@@ -3364,24 +3393,34 @@ class LedgerAndGuardsTest(unittest.TestCase):
 
     def test_version_skew_under_a_daily_window_is_graded_once_it_persists(self):
         # gemma two minors behind on default-pool, a daily window and no exclusion: the first full run
-        # notes the skew and stores its key; the next full run re-selects the cluster on that record
-        # and files entry 5; once the pool catches up the guard clears and the key leaves the set.
+        # notes the skew with its age and records it; a run inside the open window six days on holds
+        # it; the run after seven days re-selects the cluster on the record and files entry 5, under
+        # the daily window as under any other; once the pool catches up the guard clears and the key
+        # and its date leave the ledger.
         gemma = cluster_doc("gemma-gpu-upgraded")
         gemma["nodePools"][0]["version"] = "1.30.5-gke.1000000"
         gemma["maintenancePolicy"]["window"].pop("maintenanceExclusions")
         skew_key = "NodePool/default-pool|version-skew|version skew"
+        skew_text = "pool default-pool at 1.30.5-gke.1000000, control plane at 1.32.13-gke.2427000 (2 minors apart)"
         first, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]))
         review = next(r for r in first["reviews"] if r["cluster"] == GEMMA)
-        self.assertEqual(review["skew_notes"], [ur.SKEW_FIRST_SEEN_TEXT.format(skews="pool default-pool at 1.30.5-gke.1000000, control plane at 1.32.13-gke.2427000 (2 minors apart)", reference="the maintenance window ended 2026-10-08T07:00:00Z, 11 h before this run")])
+        self.assertEqual(review["skew_notes"], [ur.SKEW_YOUNG_TEXT.format(skews=skew_text, age=ur.SKEW_AGE_FIRST_FORMAT, limit=ur.SKEW_STANDING_DAYS)])
         self.assertNotIn(5, {g["entry"] for g in first["guards"]})
-        self.assertIn(skew_key, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["symptoms"])
-        # The next full run lands inside the open 03:00-07:00 window: a recorded skew has stood
-        # across a close already, so the open window holds nothing and the review files entry 5.
-        second, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]), now=datetime(2026, 10, 15, 4, 0, tzinfo=timezone.utc))
+        entry = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]
+        self.assertEqual((skew_key in entry["symptoms"], entry[ur.LEDGER_SKEW_FIRST_SEEN_KEY]), (True, {skew_key: "2026-10-08T18:00:00Z"}))
+        # Six days on, inside the open 03:00-07:00 window: re-selected on the record, held as Info.
+        held, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]), now=datetime(2026, 10, 15, 4, 0, tzinfo=timezone.utc))
+        [review] = [r for r in held["reviews"] if r["cluster"] == GEMMA]
+        self.assertEqual((review["what_happened"]["status"], review["what_happened"]["reasons"]), (ur.STATUS_REGRADED, [ur.SKEW_RESELECT_REASON]))
+        self.assertEqual(review["skew_notes"], [ur.SKEW_OPEN_TEXT.format(skews=skew_text, state=ur.WINDOW_OPEN_STATE)])
+        self.assertEqual([s for s in review["what_failed"] if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA][ur.LEDGER_SKEW_FIRST_SEEN_KEY], {skew_key: "2026-10-08T18:00:00Z"})
+        # Eight days on, the window closed: graded, with the age from the first record.
+        second, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         [review] = [r for r in second["reviews"] if r["cluster"] == GEMMA]
         self.assertEqual((review["what_happened"]["status"], review["what_happened"]["reasons"]), (ur.STATUS_REGRADED, [ur.SKEW_RESELECT_REASON]))
         [row] = [s for s in review["what_failed"] if s["category"] == ur.CATEGORY_VERSION_SKEW]
-        self.assertEqual((entries(row), row["classifications"][0]["detail"]), ({(5, ur.MEDIUM)}, ur.SKEW_PERSISTED_FORMAT.format(reference="the maintenance window ended 2026-10-14T07:00:00Z, 21 h before this run")))
+        self.assertEqual((entries(row), row["classifications"][0]["detail"]), ({(5, ur.MEDIUM)}, ur.SKEW_AGE_FORMAT.format(days=8, since="2026-10-08T18:00:00Z")))
         self.assertEqual(review["skew_notes"], [])
         self.assertIn(f"### 5 — {GEMMA} — `NodePool/default-pool` (system)", ur.render_report(second).split(ur.SECTION_WARNINGS)[1].split(ur.SECTION_INFO)[0])
         guard = ur.guard_id(GEMMA, 5, "NodePool/default-pool")
@@ -3397,19 +3436,22 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(([r["cluster"] for r in rechecked["reviews"]], recheck["cleared"]), ([], []))
         self.assertIn(guard, recheck["refreshed"])
         self.assertIn(skew_key, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["symptoms"])
-        # The pool caught up: reviewed once more on the record, nothing filed, the guard cleared.
+        # The pool caught up: reviewed once more on the record, nothing filed, the guard cleared and
+        # the key's date gone with it.
         gemma["nodePools"][0]["version"] = gemma["currentMasterVersion"]
         third, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
         [review] = [r for r in third["reviews"] if r["cluster"] == GEMMA]
         self.assertEqual([s for s in review["what_failed"] if s["category"] == ur.CATEGORY_VERSION_SKEW], [])
         self.assertNotIn(guard, {g["id"] for g in third["guards"]})
-        self.assertNotIn(skew_key, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["symptoms"])
+        entry = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]
+        self.assertEqual((skew_key in entry["symptoms"], entry[ur.LEDGER_SKEW_FIRST_SEEN_KEY]), (False, {}))
         fourth, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]), now=datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc))
         self.assertEqual([r["cluster"] for r in fourth["reviews"]], [])
 
     def test_crash_record_blocks_until_reset(self):
         self.collect()
         (self.home / ur.LEDGER_FILENAME).write_text("{broken")
+        manifest = str(self.home / "manifest.json")
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
@@ -3419,28 +3461,80 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertIn(f"sits beside no live {ur.LEDGER_FILENAME}", err.getvalue())
             self.assertIn(f"Restore it as {ur.LEDGER_FILENAME}", err.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
-            # --dry-run lists the records and moves none; the block stands.
+            # --dry-run lists what a reset would archive, the record and the live guards file, and
+            # moves none; the block stands.
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger", "--dry-run"]), 0)
             [record] = list(self.home.glob(ur.CRASH_RECORD_GLOB))
-            self.assertIn(f"would archive 1 crash record(s) under {self.home / ur.ARCHIVE_SUBDIR}", out.getvalue())
+            self.assertIn(f"would archive 2 file(s) under {self.home / ur.ARCHIVE_SUBDIR}", out.getvalue())
             self.assertIn(record.name, out.getvalue())
+            self.assertIn(ur.GUARDS_FILENAME, out.getvalue())
             self.assertFalse((self.home / ur.ARCHIVE_SUBDIR).exists())
+            self.assertFalse((self.home / ur.RESET_MARKER_FILENAME).exists())
+            # The reset, the second remedy after the restore: the record and the live guards file go
+            # to the archive and the marker is left, so the next full run is a baseline the SOP files
+            # nothing from.
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
-            self.assertIn("archived 1 crash record(s)", out.getvalue())
-            self.assertEqual(list(self.home.glob(ur.CRASH_RECORD_GLOB)), [])
+            self.assertIn("archived 2 file(s)", out.getvalue())
+            self.assertEqual((list(self.home.glob(ur.CRASH_RECORD_GLOB)), (self.home / ur.GUARDS_FILENAME).exists()), ([], False))
             self.assertTrue(list((self.home / ur.ARCHIVE_SUBDIR).rglob("ledger.json.unreadable-*")))
+            self.assertTrue(list((self.home / ur.ARCHIVE_SUBDIR).rglob(ur.GUARDS_FILENAME)))
+            marker = json.loads((self.home / ur.RESET_MARKER_FILENAME).read_text())
+            self.assertEqual((marker["version"], marker["reset_at"], sorted(marker["archived"])), (ur.RESET_MARKER_VERSION, "2026-10-08T18:00:00Z", sorted([record.name, ur.GUARDS_FILENAME])))
             # The archive root and its stamp are the store's: made at the store's mode by chmod, not
             # left under the caller's umask, so a root hand reset does not refuse the next uid's.
             [stamped] = [d for d in (self.home / ur.ARCHIVE_SUBDIR).iterdir() if d.is_dir()]
             self.assertEqual((stat.S_IMODE((self.home / ur.ARCHIVE_SUBDIR).stat().st_mode), stat.S_IMODE(stamped.stat().st_mode)), (ur.STORE_DIR_MODE, ur.STORE_DIR_MODE))
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
-            self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
+            # The baseline: every cluster new, the manifest and the report saying so, the marker gone
+            # once the ledger is written; the run after it files as usual.
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report", "--manifest-file", manifest]), 0)
+            self.assertTrue((self.home / ur.LEDGER_FILENAME).exists() and (self.home / ur.GUARDS_FILENAME).exists())
+            self.assertEqual(json.loads(Path(manifest).read_text())[ur.AFTER_RESET_KEY], True)
+            self.assertIn("Baseline after --reset-ledger: the store was archived under", out.getvalue())
+            self.assertIn(stamped.name, out.getvalue())
+            self.assertFalse((self.home / ur.RESET_MARKER_FILENAME).exists())
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report", "--manifest-file", manifest]), 0)
+            self.assertEqual(json.loads(Path(manifest).read_text())[ur.AFTER_RESET_KEY], False)
+            self.assertNotIn("Baseline after --reset-ledger", out.getvalue())
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
             self.assertIn(ur.RESET_LEDGER_NOTHING_TEXT, out.getvalue())
+
+    def test_an_absent_guards_file_beside_a_live_ledger_is_a_crash_record(self):
+        # Every run writes the guards and then the ledger, so a live ledger beside no guards file is a
+        # hand delete; the guards are the memory the hold rule reads, and a run that started from none
+        # would announce every held finding resolved. It is refused like a record, naming the file and
+        # the restore; --reset-ledger archives the live ledger and the next full run is the baseline.
+        self.collect()
+        self.assertTrue((self.home / ur.LEDGER_FILENAME).exists() and (self.home / ur.GUARDS_FILENAME).exists())
+        (self.home / ur.GUARDS_FILENAME).unlink()
+        with self.assertRaises(ur.StateUnreadable) as caught:
+            self.collect()
+        self.assertEqual(str(caught.exception), ur.GUARDS_ABSENT_TEXT.format(guards=self.home / ur.GUARDS_FILENAME, ledger=self.home / ur.LEDGER_FILENAME, reports=ur.REPORTS_SUBDIR))
+        self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
+        manifest = str(self.home / "manifest.json")
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+            self.assertEqual(out.getvalue(), "")
+            self.assertTrue(err.getvalue().splitlines()[-1].startswith(f"{self.home / ur.GUARDS_FILENAME} is absent beside a live"), err.getvalue())
+            self.assertTrue(err.getvalue().splitlines()[-1].endswith(ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note="")))
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--reset-ledger", "--dry-run"]), 0)
+            self.assertIn(f"would archive 1 file(s) under {self.home / ur.ARCHIVE_SUBDIR}", out.getvalue())
+            self.assertIn(f": {ur.LEDGER_FILENAME}; nothing moved", out.getvalue())
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--reset-ledger"]), 0)
+            self.assertIn("archived 1 file(s)", out.getvalue())
+            self.assertEqual(((self.home / ur.LEDGER_FILENAME).exists(), len(list((self.home / ur.ARCHIVE_SUBDIR).rglob(ur.LEDGER_FILENAME)))), (False, 1))
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report", "--manifest-file", manifest]), 0)
+            self.assertEqual(json.loads(Path(manifest).read_text())[ur.AFTER_RESET_KEY], True)
+            self.assertTrue((self.home / ur.LEDGER_FILENAME).exists() and (self.home / ur.GUARDS_FILENAME).exists())
+            self.assertFalse((self.home / ur.RESET_MARKER_FILENAME).exists())
 
     def test_reports_are_pruned_to_the_newest_fourteen_of_each_kind(self):
         reports = self.home / ur.REPORTS_SUBDIR
@@ -3776,10 +3870,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertIn(ur.RESET_LEDGER_NOTHING_TEXT, out.getvalue())
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger", "--ledger", str(ledger)]), 0)
-        self.assertIn("archived 1 crash record(s)", out.getvalue())
+        self.assertIn("archived 1 file(s)", out.getvalue())
         self.assertEqual(list(elsewhere.glob("my-ledger.json.unreadable-*")), [])
         result, _ = self.collect(ledger=str(ledger))
-        self.assertFalse(result["scoped"])
+        self.assertEqual((result["scoped"], result[ur.AFTER_RESET_KEY], (self.home / ur.RESET_MARKER_FILENAME).exists()), (False, True, False))
 
     def test_budget_failure_guard_survives_a_master_only_review(self):
         first, _ = self.collect()
@@ -4894,11 +4988,18 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(ur.OPERATION_GUARDS_SUMMARY_FORMAT.format(refreshed=0, held=0, unlisted=1), report)
         self.assertIn("- " + ur.OPERATION_GUARD_HELD_FORMAT.format(id=guard, reason=ur.OPERATION_GUARD_UNLISTED_FORMAT.format(name=bad["name"])), report)
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
-        # A later clean operation of the same type on the same target clears it, the failed one
-        # still unlisted.
         retry = {**copy.deepcopy(bad), "name": "operation-retry", "startTime": "2026-10-20T03:00:00Z", "endTime": "2026-10-20T03:12:00Z"}
         retry.pop("error", None)
         retry.pop("statusMessage", None)
+        # A clean operation of the same type on another cluster's pool of the same name is no retry
+        # of this one: the guard stays held.
+        elsewhere = {**retry, "name": "operation-elsewhere", "targetLink": retry["targetLink"].replace("/clusters/seeded-a/", "/clusters/gemma-gpu-upgraded/")}
+        self.assertNotEqual(elsewhere["targetLink"], retry["targetLink"])
+        other_cluster, _ = self.collect(FakeFleet(operations=without + [elsewhere]), now=datetime(2026, 10, 21, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual((other_cluster["operation_guards"]["cleared"], [u["id"] for u in other_cluster["operation_guards"]["unlisted"]]), ([], [guard]))
+        self.assertIn(guard, {g["id"] for g in other_cluster["guards"]})
+        # A later clean operation of the same type on the same target clears it, the failed one
+        # still unlisted.
         cleared, _ = self.collect(FakeFleet(operations=without + [retry]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
         self.assertEqual([(item["id"], item["reason"]) for item in cleared["operation_guards"]["cleared"]], [(guard, ur.OPERATION_GUARD_RETRIED_FORMAT.format(type="UPGRADE_NODES", target="idle-batch-pool", name="operation-retry", end="2026-10-20T03:12:00Z"))])
         self.assertNotIn(guard, {g["id"] for g in cleared["guards"]})

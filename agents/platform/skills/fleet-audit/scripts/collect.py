@@ -117,6 +117,10 @@ KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 # of this second already holding it). Not a refusal: the thread reads what
 # stands there now and goes on.
 KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
+# A symlink at the shared directory's name, which the agent's own account can
+# plant, is never followed: a root run would otherwise chmod and write into
+# whatever it points at.
+KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
 ROOT_UID = 0
 DEFAULT_TIMEOUT_S = 60
 # How many clusters a sweep reads at once. Every check is a kubectl or gcloud
@@ -808,6 +812,8 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
     could not replace that uid's files in it. A note when none of that is
     possible, naming the owner."""
     euid = os.geteuid()
+    if os.path.islink(directory):
+        return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory)
     try:
         current = directory.stat()
     except FileNotFoundError:
@@ -845,10 +851,18 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
             # copy of this rule and every other refusal here.
             return f"{directory} could not be made ({exc})"
     if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+        # Through a descriptor opened without following, so a symlink swapped
+        # in between the stat and here is refused rather than chased.
         try:
-            directory.chmod(KUBECONFIG_DIR_MODE)
+            opened = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            return f"{directory} could not be opened as a directory ({exc})"
+        try:
+            os.fchmod(opened, KUBECONFIG_DIR_MODE)
         except OSError as exc:
             return f"{directory} is at mode {oct(current.st_mode & KUBECONFIG_DIR_MODE_MASK)}, not {oct(KUBECONFIG_DIR_MODE)}, and could not be changed ({exc})"
+        finally:
+            os.close(opened)
     return None
 
 

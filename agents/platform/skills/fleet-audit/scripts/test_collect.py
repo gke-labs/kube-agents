@@ -12519,6 +12519,21 @@ class PrepareKubeconfigTest(unittest.TestCase):
                 with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
                     self.assertIn("could not be moved aside", collect.prepare_kubeconfig(kc) or "")
 
+    def test_a_symlink_at_the_shared_directory_is_refused_not_followed(self):
+        # The agent's own account can plant `.kubeconfigs` as a symlink; a root hand run must not
+        # chmod or write into whatever it points at. The rule reads the name without following and
+        # refuses it with a note, for root as for the tick; the target is untouched.
+        with TemporaryDirectory() as tmp:
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.symlink_to(elsewhere)
+            for euid in (os.geteuid(), collect.ROOT_UID):
+                with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                    note = collect.prepare_kubeconfig(kc)
+                self.assertEqual(note, collect.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=kc.parent))
+                self.assertEqual((self.mode(elsewhere), kc.parent.is_symlink()), (0o700, True))
+
     def test_a_directory_this_uid_cannot_stat_is_a_note_not_a_raise(self):
         # A parent this uid cannot search, or a file where the directory should be: the note the
         # callers log or report, as for every other refusal; the retrospective's boundary would
