@@ -513,6 +513,63 @@ Mutation(
         "a 404 and the gke tools stop working with no policy refusal to read",
     ),
     Mutation(
+        "C1-gateway-identity-annotated",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: platformagent-gateway-agent\n  namespace: kubeagents-system\n  ownerReferences:\n',
+         '  annotations:\n    iam.gke.io/gcp-service-account: kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com\n'
+         '  name: platformagent-gateway-agent\n  namespace: kubeagents-system\n  ownerReferences:\n'),
+        "test_C1_the_gateway_identity_carries_no_cloud_annotation",
+        "copy the broker's annotation onto the gateway's ServiceAccount so a script "
+        "in the gateway can call a Google API -- the model's pod is back on the "
+        "install's whole IAM grant",
+    ),
+    Mutation(
+        "C1-gateway-identity-gains-a-binding",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: kubeagents:tokenreview:kubeagents-system:platformagent\nsubjects:\n  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n',
+         '  name: kubeagents:tokenreview:kubeagents-system:platformagent\nsubjects:\n  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-gateway-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "bind the gateway to the broker's TokenReview role too -- the agent can then "
+        "validate any bearer token it gets hold of, a grant its own token use never "
+        "asked for",
+    ),
+    Mutation(
+        "C1-broker-keeps-the-leader-binding",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: kubeagents:leader:kubeagents-system:platformagent\nsubjects:\n',
+         '  name: kubeagents:leader:kubeagents-system:platformagent\nsubjects:\n'
+         '  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "leave the broker on the leader Role as well -- at replicas > 1 it carries "
+        "namespace-wide pods get/patch the broker never uses",
+    ),
+    Mutation(
+        "C1-api-token-in-the-agent-container",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('              name: agent-credential-proxy-token\n              readOnly: true\n',
+         '              name: agent-credential-proxy-token\n              readOnly: true\n'
+         '            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount\n'
+         '              name: event-watcher-ksa-token\n'
+         '              readOnly: true\n'),
+        "test_C1_only_agent_api_auth_holds_a_kubernetes_api_token_in_the_gateway",
+        "mount the in-cluster token into platform-agent for a kubectl-free skill -- "
+        "the model's container then holds a Kubernetes API credential with the "
+        "minimal ClusterRole's reads",
+    ),
+    Mutation(
+        "C1-gateway-metadata-rule-restored",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-egress-allowlist.yaml",
+        ('            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n          protocol: TCP\n        - port: 4000\n',
+         '            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n          protocol: TCP\n'
+         '      to:\n        - ipBlock:\n            cidr: 169.254.169.254/32\n'
+         '    - ports:\n        - port: 80\n          protocol: TCP\n        - port: 4000\n'),
+        "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
+        "put the gateway's port-80 metadata rule back for a script that wants the "
+        "project id -- every container in the gateway pod can then fetch a token "
+        "again wherever the pod still has an identity to fetch",
+    ),
+    Mutation(
         "C1-watcher-token-in-the-agent-container",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ('              name: agent-credential-proxy-token\n              readOnly: true\n',

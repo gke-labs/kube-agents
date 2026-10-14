@@ -1,5 +1,5 @@
 {
-  "version": "b51c89426fc12c1f",
+  "version": "06fa98178d9e8737",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -46,7 +46,7 @@
       "narrowing": "pod"
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-gateway-agent",
       "user": "agent",
       "account": "APP",
       "grants": {

@@ -131,15 +131,12 @@ operator's managed values.
 
 ### Limitation
 
-The gateway Pod keeps a cloud identity. It and the broker Pod both run as
-`kubeagents-platform-agent`, whose KSA carries the `iam.gke.io/gcp-service-account`
-annotation, so anything with execution in the gateway can mint the Google service
-account's token from `169.254.169.254`. The Pod that runs code the model wrote cannot,
-which is the property this design is about; what is left is trusted code holding more
-than it needs. Two ways to close it: configure
-`spec.security.workloadIdentityFederation`, which gives the broker a credential source
-that is a file in its own Pod, or give the broker a ServiceAccount of its own and take
-the annotation off the gateway's. Neither ships today.
+Closed: the gateway Pod no longer keeps a cloud identity. The broker runs as the
+annotated ServiceAccount (`kubeagents-platform-agent` by default) and the gateway runs
+as `<agent>-gateway-agent`, which carries no annotation; its NetworkPolicy opens no
+metadata path, and everything in it that called Google goes through the broker.
+`spec.security.workloadIdentityFederation` remains optional hardening for the broker's
+own credential source.
 
 `spec.security.egressPolicy: Allowlist` renders a default-deny egress NetworkPolicy on
 the gateway Pod that leaves the metadata server's credential API off its allowlist — the
@@ -958,8 +955,8 @@ file and never a `.git` it can write into.
 
 - The broker Pod uses the configured PlatformAgent KSA — `spec.security.serviceAccountName`,
   defaulting to the agent's name — for its Workload Identity. The gateway Pod
-  runs under the same one, which is the boundary's remaining gap; the sandbox Pod
-  runs under `<agent>-shell`, annotated with nothing.
+  runs under `<agent>-gateway-agent` and the sandbox Pod under `<agent>-shell`,
+  both annotated with nothing.
 - `automountServiceAccountToken: false` applies to the Pod.
 - The event watcher's projected ServiceAccount token is mounted only by
   `agent-api-auth`, and so is the watchers' broker token (audience

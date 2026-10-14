@@ -2500,7 +2500,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 
-	saName := agentServiceAccountName(agent)
+	// The gateway's own ServiceAccount, not the broker's: see
+	// gatewayServiceAccountName.
+	saName := gatewayServiceAccountName(agent)
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
@@ -5878,11 +5880,12 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 }
 
 // buildLeaderRoleBinding generates the RoleBinding manifest for leader election in the agent namespace
+// buildLeaderRoleBinding binds the leader Role to the gateway's own
+// ServiceAccount alone. Leader election runs in the gateway (leader_elect.py);
+// nothing in the credential broker's Pod touches a Lease or patches a pod, so
+// the broker, which used to share this subject, holds none of it.
 func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := gatewayServiceAccountName(agent)
 
 	return &rbacv1.RoleBinding{
 		TypeMeta: metav1.TypeMeta{
@@ -6257,11 +6260,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		apiPeers = formatCIDRPeers([]string{"10.96.0.1"}, true)
 	}
 
-	// The link-local address a workload actually connects to. Dataplane V2 (eBPF)
-	// evaluates policy pre-NAT, so this peer matches there on the pre-DNAT ports;
-	// Dataplane V1 DNATs first, so its token fetches are matched by rule 3 instead.
-	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
 			From: []networkingv1.NetworkPolicyPeer{
@@ -6330,47 +6328,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: dnsPeers,
 		},
-		// 2. GCP Metadata Server (pre-NAT link-local address). Workloads dial 169.254.169.254
-		//    on port 80 for HTTP metadata / OAuth2 token fetches. On Dataplane V2 (eBPF),
-		//    policy evaluates pre-NAT and this rule admits token fetches directly. Port 8080,
-		//    the pre-NAT ALTS handshaker port, is deliberately absent — rule 3 says why.
-		{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-			},
-			To: linkLocalPeers,
-		},
-	}
-
-	// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-	//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
-	//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
-	//    policy is evaluated pre-NAT at the socket layer and matched by rule 2. If
-	//    profile.MetadataDaemonIP == "", rule 3 is suppressed.
-	//
-	//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
-	//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
-	//    because kube-agents components use standard OAuth2/REST token fetches and no client
-	//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
-	//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
-	//
-	//    That is a deviation from the guidance, which warns that workloads omitting these
-	//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
-	//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
-	//    check: capture the drop's destination port and reopen 987/8080 here if it is one
-	//    of them.
-	if profile.MetadataDaemonIP != "" {
-		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
-		port := profile.MetadataDaemonPort
-		if port == 0 {
-			port = metadataDaemonDefaultPort
-		}
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(port))},
-			},
-			To: metadataDaemonPeers,
-		})
+		// No metadata-server rule. The gateway pod holds no Google identity (its
+		// ServiceAccount carries no Workload Identity annotation; the broker's does),
+		// and everything in it that called Google -- the remote MCP servers, the
+		// event watcher and the drift detector -- goes through the broker. The two
+		// rules that used to sit here admitted the link-local token fetch (port 80
+		// pre-NAT, the WI daemon port post-NAT); without them a token request from
+		// any container in the pod is dropped, which is what the conformance suite's
+		// metadata assertion checks.
 	}
 
 	egressRules = append(egressRules,

@@ -140,6 +140,12 @@ each give the join one cluster's credentials, and with `--project` these two are
 cluster those credentials reach. Omit either and startup refuses the flags rather than joining
 against the wrong cluster.
 
+Startup also tries to confirm that the credentials reach the cluster the flags name. With
+`--in-cluster` it asks the metadata server for the node's project and cluster attributes. Inside the
+gateway Pod that path is closed (the Pod holds no Google identity and its NetworkPolicy does not open
+the metadata server), so the probe times out, the detector logs that the cluster is taken on trust,
+and the join runs on the operator's triple. A kubeconfig run still confirms it from the context name.
+
 **The daemon is loopback-only**, and that decides where this binary can run. `docker-entrypoint.sh`
 starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
 outside the agent Pod's network namespace. For a local run against a real install, forward the port

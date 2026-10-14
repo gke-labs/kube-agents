@@ -10506,7 +10506,7 @@ spec:
                       properties:
                         endpoint:
                           description: |-
-                            Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+                            Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
                             the empty alternative in the pattern is required because the API server
                             validates an explicitly-set "", which omitempty does not suppress.
                           maxLength: 45
@@ -11366,8 +11366,8 @@ spec:
                       type: boolean
                     metadataDaemonIP:
                       description:
-                        MetadataDaemonIP is the post-NAT daemon IP in rule
-                        3, empty when suppressed.
+                        MetadataDaemonIP is the post-NAT daemon IP in the
+                        LiteLLM policy's metadata rule, empty when suppressed.
                       type: string
                     metadataDaemonIPSource:
                       description:
@@ -11377,7 +11377,7 @@ spec:
                       type: string
                     metadataDaemonPort:
                       description: |-
-                        MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+                        MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
                         DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
                       format: int32
                       type: integer

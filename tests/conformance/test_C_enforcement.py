@@ -112,6 +112,88 @@ class C1IsolationIsStructural(unittest.TestCase):
     _WATCHER_TOKEN_VOLUME = "watcher-credential-proxy-token"
     _WATCHER_AUDIENCE = "kubeagents-credential-proxy-watcher"
 
+    def _gateway(self, documents):
+        gateways = [
+            d for d in documents
+            if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-gateway")
+        ]
+        self.assertEqual(len(gateways), 1)
+        return gateways[0]
+
+    def test_C1_the_gateway_identity_carries_no_cloud_annotation(self) -> None:
+        """The gateway Pod runs as a ServiceAccount with no Workload Identity binding.
+
+        GKE resolves Workload Identity by the Pod's ServiceAccount, so this is the
+        whole of what keeps a Google token off the model's Pod; the closed
+        metadata route is the second wall. The WI-bound ServiceAccount is the
+        broker's alone. Checked on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            gateway = self._gateway(documents)
+            name = gateway["spec"]["template"]["spec"]["serviceAccountName"]
+            self.assertTrue(name.endswith("-gateway-agent"), f"{fixture}: the gateway runs as {name}")
+            accounts = [
+                d for d in documents
+                if d.get("kind") == "ServiceAccount" and d["metadata"]["name"] == name
+            ]
+            self.assertEqual(len(accounts), 1, f"{fixture}: the operator renders no {name}")
+            annotations = accounts[0]["metadata"].get("annotations") or {}
+            self.assertNotIn(
+                "iam.gke.io/gcp-service-account", annotations,
+                f"{fixture}: the gateway's ServiceAccount is bound to a Google service account",
+            )
+
+    def test_C1_the_gateway_identity_holds_only_the_audited_bindings(self) -> None:
+        """The gateway ServiceAccount holds the minimal, local and leader grants, nothing else.
+
+        Each is a grant it held before the split, under the shared name, and an
+        audit of its own token use found a user for each: the event watcher and
+        drift detector read the management cluster (minimal), the drift join
+        reads the PlatformAgent an audit record names (local), and leader
+        election takes a Lease (leader). The broker, which runs no leader
+        election, no longer holds leader.
+        """
+        for fixture, documents in h.golden_documents().items():
+            name = self._gateway(documents)["spec"]["template"]["spec"]["serviceAccountName"]
+            held = sorted(
+                d["roleRef"]["name"].split(":")[1]
+                for d in documents
+                if d.get("kind") in ("ClusterRoleBinding", "RoleBinding")
+                and any(
+                    s.get("kind") == "ServiceAccount" and s.get("name") == name
+                    for s in d.get("subjects") or []
+                )
+            )
+            self.assertEqual(held, ["leader", "local", "minimal"], f"{fixture}: the gateway holds {held}")
+            leader_subjects = [
+                s.get("name")
+                for d in documents
+                if d.get("kind") == "RoleBinding" and d["roleRef"]["name"].split(":")[1] == "leader"
+                for s in d.get("subjects") or []
+            ]
+            self.assertEqual(leader_subjects, [name], f"{fixture}: the leader Role is bound to {leader_subjects}")
+
+    def test_C1_only_agent_api_auth_holds_a_kubernetes_api_token_in_the_gateway(self) -> None:
+        """No container the model runs in holds a token the API server accepts.
+
+        A default-audience projected token is a Kubernetes API credential. In the
+        gateway Pod only agent-api-auth mounts one (the watchers' in-cluster
+        reads); the platform-agent container holds the chat-audience broker
+        token, which the API server does not accept.
+        """
+        for fixture, documents in h.golden_documents().items():
+            spec = self._gateway(documents)["spec"]["template"]["spec"]
+            self.assertIs(spec.get("automountServiceAccountToken"), False, fixture)
+            volumes = {v["name"]: v for v in spec.get("volumes", [])}
+            holders = sorted(
+                c["name"]
+                for c in spec.get("containers", []) + spec.get("initContainers", [])
+                for m in c.get("volumeMounts", [])
+                for source in (volumes.get(m["name"], {}).get("projected", {}).get("sources") or [])
+                if "serviceAccountToken" in source and not source["serviceAccountToken"].get("audience")
+            )
+            self.assertEqual(holders, ["agent-api-auth"], f"{fixture}: default-audience tokens in {holders}")
+
     def test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth(self) -> None:
         """The watcher role reaches fleet API servers and Pub/Sub through the broker.
 
@@ -769,29 +851,17 @@ class C1IsolationIsStructural(unittest.TestCase):
             "binding scan above may be reading the wrong file",
         )
 
-    @h.known_violation("C1", "slice-2b/findings.md 1.4 (see gke-labs/kube-agents#676)")
     def test_C1_the_rendered_egress_policy_reaches_no_metadata_address(self) -> None:
-        """KNOWN VIOLATION. The sandbox reaches the metadata server anyway.
+        """No rendered egress rule reaches a metadata address on a credential port.
 
-        This is the invariant `spec.security.egressPolicy: Allowlist` exists to
-        establish, and on this tree it does not hold: the operator-rendered
-        platformagent-gateway-netpol allows 169.254.169.254/32 on TCP 80 -- the
-        metadata server's own ports -- and 169.254.169.252/32 on 988, selecting
-        the same `app: platformagent-gateway` pods that
-        platformagent-sandbox-metadata-deny selects.
+        Closed by the gateway's Workload Identity removal (#2940): the gateway
+        pod holds no Google identity, so its policy carries no metadata rule.
+        The history below is kept because it explains what the assertion guards.
 
-        Two policies over one Pod union their allow-sets, so opting into the
-        allowlist does not subtract what the gateway policy adds.
-
-        The failure is real and the feature does not currently do what its name
-        says. Recorded here rather than repaired because #676 was deliberate:
-        Workload Identity needs the metadata path, and the sidecar layout puts
-        the credential proxy in the Pod that would lose it. Scoping those rules
-        to the broker Pod under splitCredentialBrokerPod is the shape of the
-        fix, and it is a design change to a live-tested slice, not a test edit.
-
-        Deleting this decorator is the signal that the control works: unittest
-        reports the pass as an unexpected success.
+        Until then it was a known violation (#676): platformagent-gateway-netpol
+        allowed 169.254.169.254/32 on TCP 80 and 169.254.169.252/32 on 988 for the
+        gateway's Workload Identity, selecting the same pods the sandbox
+        metadata-deny policy selects, and NetworkPolicies union their allow-sets.
 
         All three metadata addresses, not just the famous one.
 
@@ -839,8 +909,22 @@ class C1IsolationIsStructural(unittest.TestCase):
                     if not block:
                         continue
                     network = ipaddress.ip_network(block["cidr"], strict=False)
+                    # An `except` block is subtracted from the peer, as
+                    # NetworkPolicy subtracts it: the internet rule's
+                    # `0.0.0.0/0 except 169.254.0.0/16` does not reach the
+                    # metadata address, and reading it as if it did kept this
+                    # test red after the real violation was gone.
+                    excepted = [
+                        ipaddress.ip_network(cidr, strict=False)
+                        for cidr in block.get("except") or []
+                    ]
                     for address in addresses:
                         if address.version != network.version:
+                            continue
+                        if any(
+                            address.version == hole.version and address in hole
+                            for hole in excepted
+                        ):
                             continue
                         if dns_only:
                             # The exemption is one address in one role, not a

@@ -239,7 +239,7 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell",
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell",
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
 	}
 	for name, expected := range want {
@@ -916,7 +916,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	want := "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
+	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
 	if got := allowedBrokerCallers(agent); got != want {
 		t.Fatalf("callers = %q, want %q", got, want)
 	}

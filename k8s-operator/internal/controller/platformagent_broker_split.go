@@ -142,27 +142,44 @@ func credentialBrokerName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-credential-proxy"
 }
 
-// agentServiceAccountName is the ServiceAccount both Pods run as.
+// agentServiceAccountName is the credential broker's ServiceAccount: the name
+// the Workload Identity IAM binding (and spec.security.serviceAccountName,
+// and its annotations) refers to.
 //
-// They share one, and this is the weakest joint in the split: the identity the
-// broker verifies is "a Pod running as this ServiceAccount", not "the agent
-// Pod". Good enough to exclude everything else in the cluster, not good enough
-// to tell the two halves of this agent apart.
-//
-// It shares one because both Pods are rendered from this one name and nothing
-// here mints a second. Not because splitting them is impossible: the Workload
-// Identity IAM binding names this ServiceAccount, so the way to split it is to
-// leave the bound name with the *broker* — which is what actually needs the
-// cloud credential once it is split out — and give the agent a new one of its
-// own. That buys per-Pod attribution and takes the cloud credential away from
-// the sandbox's identity at the same time. It also moves which identity holds
-// the cloud credential, which is a bigger decision than a manifest change and
-// belongs with the per-cluster service-account work rather than here.
+// The gateway Pod used to run as it too, which was the weakest joint in the
+// split: the identity the broker verified was "a Pod running as this
+// ServiceAccount", and the model's Pod resolved to the install's Google service
+// account. The split this comment used to propose is done: the bound name stays
+// with the broker, the one Pod that needs the cloud credential, and the gateway
+// runs as gatewayServiceAccountName, minted with no annotation.
 func agentServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		return agent.Spec.Security.ServiceAccountName
 	}
 	return agent.Name
+}
+
+// gatewayServiceAccountSuffix makes the gateway Pod's own ServiceAccount name.
+// It ends in `-agent` because the kube-agents-agent-binding-scope admission
+// policy selects the bindings it governs by that suffix
+// (config/admission/agent-rbac-policy.yaml, binds-agent-sa).
+const gatewayServiceAccountSuffix = "-gateway-agent"
+
+// gatewayServiceAccountName is the ServiceAccount the gateway Pod runs as.
+//
+// The split agentServiceAccountName's comment describes, done the way it
+// describes: the Workload Identity-bound name stays with the broker, the one
+// Pod that needs a Google credential, and the gateway gets a ServiceAccount of
+// its own that the operator mints with no annotation. GKE resolves Workload
+// Identity by the Pod's ServiceAccount, so the gateway's metadata server then
+// has no Google service account to answer for, and its NetworkPolicy no longer
+// opens the metadata path at all.
+//
+// Always operator-owned, whatever spec.security.serviceAccountName says: that
+// field names the identity that carries the cloud binding, which is now the
+// broker's alone.
+func gatewayServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + gatewayServiceAccountSuffix
 }
 
 // credentialProxyBaseURL is where the agent Pod reaches the broker.
@@ -195,7 +212,10 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // name as well as by audience.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	callers := []string{
-		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
+		// The gateway Pod, which presents the chat and watcher tokens. The
+		// broker's own ServiceAccount is not a caller: nothing in the broker Pod
+		// mounts a token for any of these audiences.
+		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, gatewayServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
 	}
 	// The A2A gateway, only while it is a caller: its Google Chat adapter
@@ -281,13 +301,10 @@ func watcherPubsubSubscription(agent *agentv1alpha1.PlatformAgent) string {
 // needs. Deliberately not system:auth-delegator, which also carries
 // SubjectAccessReview.
 //
-// The cost, named rather than hidden: the binding names the ServiceAccount the
-// agent Pod also runs as, so wherever this is applied the agent can validate any
-// bearer token it gets hold of. It has no use for that. Narrowing it means
-// giving the Pods separate ServiceAccounts — see agentServiceAccountName —
-// which is why this is a cost of moving the broker rather than something the
-// move can fix on its own. reconcileCredentialBrokerTokenReviewRBAC applies it
-// on every install, because the broker is always off the agent's Pod.
+// The binding names the broker's ServiceAccount, which the gateway Pod no longer
+// runs as (gatewayServiceAccountName), so the agent cannot use it to validate a
+// bearer token it gets hold of. reconcileCredentialBrokerTokenReviewRBAC applies
+// it on every install, because the broker is always off the agent's Pod.
 func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
@@ -300,4 +317,9 @@ func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *r
 			Verbs:     []string{"create"},
 		}},
 	}
+}
+
+// gatewaySubject is the gateway Pod's ServiceAccount as an RBAC subject.
+func gatewaySubject(agent *agentv1alpha1.PlatformAgent) rbacv1.Subject {
+	return rbacv1.Subject{Kind: "ServiceAccount", Name: gatewayServiceAccountName(agent), Namespace: agent.Namespace}
 }

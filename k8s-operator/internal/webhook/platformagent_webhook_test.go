@@ -562,6 +562,22 @@ func TestPlatformAgentValidation(t *testing.T) {
 		assertFieldError(t, err, "spec.security.serviceAccountName")
 	})
 
+	t.Run("fails if the broker's service account is one the operator mints for another workload", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		for _, name := range []string{"test-agent-gateway-agent", "test-agent-a2a-session", "test-agent-shell"} {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					AgentSpec: agentv1alpha1.AgentSpec{
+						Security: &agentv1alpha1.SecuritySpec{ServiceAccountName: name},
+					},
+				},
+			}
+			_, err := val.ValidateCreate(ctx, agent)
+			assertFieldError(t, err, "spec.security.serviceAccountName")
+		}
+	})
+
 	t.Run("fails if system:admin service account is specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 

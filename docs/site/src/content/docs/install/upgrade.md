@@ -177,6 +177,29 @@ chart's default `platformAgent.name` value.
 
 The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-report.json`.
 
+## The gateway's own ServiceAccount
+
+From the release in which the gateway Pod runs as its own ServiceAccount, an upgrade moves the
+gateway from the agent ServiceAccount (`spec.security.serviceAccountName`, `kubeagents-platform-agent`
+by default) to `<name>-gateway-agent`, which the operator creates with no annotation. The agent
+ServiceAccount, its Workload Identity annotation and its IAM binding stay where they are, with the
+credential broker, so neither Terraform nor IAM changes. The new ServiceAccount is bound to the same
+read-only `kubeagents:minimal` ClusterRole and `kubeagents:leader` Role the gateway already used.
+
+Two things an install may have added by hand do not follow the gateway:
+
+- **RBAC bound to your own ServiceAccount.** If you set `serviceAccountName` and bound extra roles to
+  it expecting the gateway to use them, the gateway no longer runs as it. Bind them to
+  `<name>-gateway-agent` if the gateway needs them; the broker keeps whatever is bound to yours.
+- **IAM granted to the gateway's Kubernetes identity directly.** A `principal://…/subject/ns/<ns>/sa/<sa>`
+  or namespace-wide `principalSet://` grant reaches whichever Pod runs as that ServiceAccount, and the
+  gateway's metadata path is closed, so such a grant no longer reaches the gateway. Anything in the
+  gateway that needs Google goes through the broker.
+
+To check: `kubectl get deployment platform-agent-gateway -n kubeagents-system -o
+jsonpath='{.spec.template.spec.serviceAccountName}'` prints `platform-agent-gateway-agent` for the
+chart's default name.
+
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first three are

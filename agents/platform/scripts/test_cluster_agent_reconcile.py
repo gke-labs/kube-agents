@@ -3072,5 +3072,29 @@ class ScopeTest(HomesMixin):
         self.assertIn(f"`{self.SCOPE}` (denied, 1 project(s))", text)
 
 
+
+class ProjectSourceTest(unittest.TestCase):
+    """The management project comes from the operator before the metadata server.
+
+    The gateway pod reaches no metadata server once its Workload Identity is gone,
+    so the operator's GKE_PROJECT_ID has to answer first, and authoritatively.
+    """
+
+    def test_the_operators_project_answers_without_touching_the_metadata_server(self):
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec, "_metadata", side_effect=AssertionError("metadata read")):
+            self.assertEqual(rec._project_source(), ("mgmt-project", True))
+
+    def test_reconcile_project_still_wins_where_it_is_set(self):
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": "override"}):
+            self.assertEqual(rec._project_source(), ("override", True))
+
+    def test_a_numeric_operator_project_is_not_authoritative(self):
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec, "_metadata", return_value="mgmt-project"):
+            self.assertEqual(rec._project_source(), ("mgmt-project", True))
+
+
 if __name__ == "__main__":
     unittest.main()
+

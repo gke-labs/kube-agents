@@ -1781,9 +1781,9 @@ type NetworkPolicySpec struct {
 	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
 }
 
-// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target in the LiteLLM policy (litellm-policy), the one generated policy that still opens the metadata path; the gateway policy opens none.
 type MetadataDaemonSpec struct {
-	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
 	// the empty alternative in the pattern is required because the API server
 	// validates an explicitly-set "", which omitempty does not suppress.
 	// +kubebuilder:validation:Pattern=`^($|(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
@@ -1950,11 +1950,11 @@ type NetworkPolicyStatus struct {
 	// +optional
 	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
 
-	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// MetadataDaemonIP is the post-NAT daemon IP in the LiteLLM policy's metadata rule, empty when suppressed.
 	// +optional
 	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
 
-	// MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+	// MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
 	// DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
 	// +optional
 	MetadataDaemonPort int32 `json:"metadataDaemonPort,omitempty"`
