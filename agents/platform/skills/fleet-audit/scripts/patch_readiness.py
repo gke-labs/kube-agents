@@ -208,6 +208,15 @@ LONG_FREEZE = timedelta(days=LONG_FREEZE_DAYS)
 POOL_SKEW_CRITICAL_MINORS_MAX = 10
 FLEET_SPREAD_MIN_MINORS_MAX = 10
 BLOCKING_EXCLUSION_MIN_DAYS_MAX = 365
+# The schema's `minimum` for each integer key, pinned the same way. The pool-skew floor is also
+# this file's own reason: a critical rung at or below GKE's ceiling makes two of §3.2's rungs
+# claim the same pool; §3.3 does not flag a one-minor spread.
+POOL_SKEW_CRITICAL_MINORS_MIN = SKEW_CEILING_MINORS + 1
+FLEET_SPREAD_MIN_MINORS_MIN = 2
+BLOCKING_EXCLUSION_MIN_DAYS_MIN = 1
+# The schema's bounds on the list key: how many entries, and how long each may be.
+IMAGE_TYPE_LIST_MAX_ITEMS = 32
+IMAGE_TYPE_MAX_LENGTH = 64
 # What an image type is spelled as, letters, digits and underscores: the pattern the store's
 # schema holds each `deprecated_image_types` entry to at write time (criteria.schema.json
 # carries the same string; CriteriaTest pins the two), checked again here because the flag may
@@ -2311,28 +2320,27 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     """The run's `Criteria` from the parsed flags, or `parser.error` on a value
     the store would refuse or the checks cannot take.
 
-    The floors are this file's own: a critical rung at or below GKE's ceiling
-    makes two of §3.2's rungs claim the same pool, and a spread width or
-    horizon under one has no reading at all. The ceilings are the schema's,
-    pinned here by test: the flag is composed in the agent's shell, so it is
-    held to the bound the store holds a `set` to rather than read as what the
-    tool returned. (The schema's 365-day horizon is far inside what
+    Every bound is the schema's, pinned here by test: the flag is composed in
+    the agent's shell, so it is held to the bounds the store holds a `set` to
+    rather than read as what the tool returned. The pool-skew floor is also
+    this file's own reason: a critical rung at or below GKE's ceiling makes
+    two of §3.2's rungs claim the same pool. (The schema's 365-day horizon is far inside what
     `timedelta` holds, so the overflow that once raised inside every project's
     collection cannot be reached.)
     """
-    if args.pool_skew_critical_minors < POOL_SKEW_CRITICAL_MINORS:
+    if args.pool_skew_critical_minors < POOL_SKEW_CRITICAL_MINORS_MIN:
         parser.error(
-            f"--pool-skew-critical-minors must be at least {POOL_SKEW_CRITICAL_MINORS}: GKE's skew ceiling is "
+            f"--pool-skew-critical-minors must be at least {POOL_SKEW_CRITICAL_MINORS_MIN}: GKE's skew ceiling is "
             f"{SKEW_CEILING_MINORS} minors, and a critical rung at or below it would overlap §3.2's fixed major rung"
         )
     if args.pool_skew_critical_minors > POOL_SKEW_CRITICAL_MINORS_MAX:
         parser.error(f"--pool-skew-critical-minors must be at most {POOL_SKEW_CRITICAL_MINORS_MAX}, the schema's maximum")
-    if args.fleet_spread_min_minors < 1:
-        parser.error("--fleet-spread-min-minors must be at least 1")
+    if args.fleet_spread_min_minors < FLEET_SPREAD_MIN_MINORS_MIN:
+        parser.error(f"--fleet-spread-min-minors must be at least {FLEET_SPREAD_MIN_MINORS_MIN}, the schema's minimum: §3.3 does not flag a one-minor spread")
     if args.fleet_spread_min_minors > FLEET_SPREAD_MIN_MINORS_MAX:
         parser.error(f"--fleet-spread-min-minors must be at most {FLEET_SPREAD_MIN_MINORS_MAX}, the schema's maximum")
-    if args.blocking_exclusion_min_days < 1:
-        parser.error("--blocking-exclusion-min-days must be at least 1")
+    if args.blocking_exclusion_min_days < BLOCKING_EXCLUSION_MIN_DAYS_MIN:
+        parser.error(f"--blocking-exclusion-min-days must be at least {BLOCKING_EXCLUSION_MIN_DAYS_MIN}, the schema's minimum")
     if args.blocking_exclusion_min_days > BLOCKING_EXCLUSION_MIN_DAYS_MAX:
         parser.error(f"--blocking-exclusion-min-days must be at most {BLOCKING_EXCLUSION_MIN_DAYS_MAX}, the schema's maximum")
     # Compared case-insensitively, as §3.9 reads image types; an empty flag is
@@ -2347,6 +2355,11 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
             f"--deprecated-image-types: {', '.join(malformed)}: an image type is letters, digits and underscores; "
             f"pass the store's entries comma-separated, not as a JSON array, and \"\" for an emptied list"
         )
+    if len(entries) > IMAGE_TYPE_LIST_MAX_ITEMS:
+        parser.error(f"--deprecated-image-types: at most {IMAGE_TYPE_LIST_MAX_ITEMS} entries, the schema's maxItems; {len(entries)} given")
+    too_long = sorted(item for item in entries if len(item) > IMAGE_TYPE_MAX_LENGTH)
+    if too_long:
+        parser.error(f"--deprecated-image-types: {', '.join(too_long)}: an entry is at most {IMAGE_TYPE_MAX_LENGTH} characters, the schema's maxLength")
     return Criteria(
         pool_skew_critical_minors=args.pool_skew_critical_minors,
         fleet_spread_min_minors=args.fleet_spread_min_minors,

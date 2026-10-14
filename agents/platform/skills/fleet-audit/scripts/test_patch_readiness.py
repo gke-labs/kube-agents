@@ -3352,9 +3352,13 @@ class CriteriaTest(unittest.TestCase):
         for key, spec in schema["properties"].items():
             shipped = pr.DEFAULT_CRITERIA.record()[key]
             self.assertEqual(sorted(spec["default"]) if isinstance(shipped, list) else spec["default"], shipped, key)
-        # The schema's ceilings are the collector's too, by name.
+        # The schema's bounds are the collector's too, by name: ceilings, floors, and the list's.
         for key, ceiling in (("pool_skew_critical_minors", pr.POOL_SKEW_CRITICAL_MINORS_MAX), ("fleet_spread_min_minors", pr.FLEET_SPREAD_MIN_MINORS_MAX), ("blocking_exclusion_min_days", pr.BLOCKING_EXCLUSION_MIN_DAYS_MAX)):
             self.assertEqual(schema["properties"][key]["maximum"], ceiling, key)
+        for key, floor in (("pool_skew_critical_minors", pr.POOL_SKEW_CRITICAL_MINORS_MIN), ("fleet_spread_min_minors", pr.FLEET_SPREAD_MIN_MINORS_MIN), ("blocking_exclusion_min_days", pr.BLOCKING_EXCLUSION_MIN_DAYS_MIN)):
+            self.assertEqual(schema["properties"][key]["minimum"], floor, key)
+        items = schema["properties"]["deprecated_image_types"]
+        self.assertEqual((items["maxItems"], items["items"]["maxLength"]), (pr.IMAGE_TYPE_LIST_MAX_ITEMS, pr.IMAGE_TYPE_MAX_LENGTH))
         # And each key has its flag: a field added to Criteria without one would read as the
         # default on every run while the manifest recorded the default too.
         out = io.StringIO()
@@ -3587,11 +3591,26 @@ class CriteriaTest(unittest.TestCase):
                     self.assertEqual(pr.main(["--project", "acme", flag, str(ceiling)]), 0)
                 self.assertEqual(collect.call_args.kwargs["criteria"].record()[flag[2:].replace("-", "_")], ceiling)
 
-    def test_a_width_or_horizon_under_one_is_refused(self):
-        for flag in ("--fleet-spread-min-minors", "--blocking-exclusion-min-days"):
+    def test_a_value_under_the_schemas_floor_is_refused_by_name(self):
+        # The floor the store holds a `set` to is the flag's too: a spread width of one would
+        # flag the one-minor spread §3.3 says not to, which `get` can never return.
+        for flag, floor in (("--pool-skew-critical-minors", pr.POOL_SKEW_CRITICAL_MINORS_MIN), ("--fleet-spread-min-minors", pr.FLEET_SPREAD_MIN_MINORS_MIN), ("--blocking-exclusion-min-days", pr.BLOCKING_EXCLUSION_MIN_DAYS_MIN)):
             with self.subTest(flag=flag):
-                error, _ = self.refused([flag, "0"])
-                self.assertIn(flag, error)
+                for value in (floor - 1, 0):
+                    error, _ = self.refused([flag, str(value)])
+                    self.assertIn(flag, error)
+                with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(pr.main(["--project", "acme", flag, str(floor)]), 0)
+                self.assertEqual(collect.call_args.kwargs["criteria"].record()[flag[2:].replace("-", "_")], floor)
+
+    def test_a_list_past_the_schemas_bounds_is_refused_by_name(self):
+        error, _ = self.refused(["--deprecated-image-types", ",".join(f"T{i}" for i in range(pr.IMAGE_TYPE_LIST_MAX_ITEMS + 1))])
+        self.assertIn("maxItems", error)
+        error, _ = self.refused(["--deprecated-image-types", "COS," + "X" * (pr.IMAGE_TYPE_MAX_LENGTH + 1)])
+        self.assertIn("maxLength", error)
+        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(pr.main(["--project", "acme", "--deprecated-image-types", ",".join(f"T{i}" for i in range(pr.IMAGE_TYPE_LIST_MAX_ITEMS))]), 0)
+        self.assertEqual(len(collect.call_args.kwargs["criteria"].deprecated_image_types), pr.IMAGE_TYPE_LIST_MAX_ITEMS)
 
 if __name__ == "__main__":
     unittest.main()
