@@ -704,27 +704,74 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(pods=[gpu_pod], nodes=nodes, ops=gpu_pool_only)
         self.assertEqual(entries(row), {(18, ur.HIGH)})
         # Entry 18's own mechanism takes the resource out of allocatable on the nodes the upgrade rebuilt
-        # (the device plugin never registers): the pool still says what it is through a taint the pod
-        # tolerates by name, so the GPU pool's upgrade keeps the gate open while the CPU pool's still
-        # does not; a pool scaled to zero in a failed surge has no node to judge and counts as touched;
-        # GKE's `nvidia.com/gpu=present` taint keys the resource itself.
+        # (the device plugin never registers). A taint the pod merely tolerates by name says nothing of
+        # what the pool offered, so `dedicated=inference` alone leaves the gate closed under either
+        # pool's operation; what opens it is the pool's own evidence -- GKE's `nvidia.com/gpu=present`
+        # taint, the accelerator label on its nodes, or its accelerator config in the cluster record --
+        # and only for the upgraded pool, so the CPU pool's operation never opens a GPU pod's gate.
+        def pool_of(node):
+            return node["metadata"]["labels"]["cloud.google.com/gke-nodepool"]
+
+        def reads_of(node_list):
+            return {"pods": [gpu_pod], "nodes": node_list, "events": [], "pdbs": [], "owners": [], "workloads": []}
+
         stripped = copy.deepcopy(nodes)
-        del next(n for n in stripped if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "pinned-inference-pool")["status"]["allocatable"]["nvidia.com/gpu"]
-        [row] = self.classify(pods=[gpu_pod], nodes=stripped, ops=gpu_pool_only)
-        self.assertEqual(entries(row), {(18, ur.HIGH)})
-        [row] = self.classify(pods=[gpu_pod], nodes=stripped, ops=cpu_pool_only)
-        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
-        gone = [n for n in nodes if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] != "pinned-inference-pool"]
-        [row] = self.classify(pods=[gpu_pod], nodes=gone, ops=gpu_pool_only)
-        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        del next(n for n in stripped if pool_of(n) == "pinned-inference-pool")["status"]["allocatable"]["nvidia.com/gpu"]
+        for ops in (gpu_pool_only, cpu_pool_only):
+            [row] = self.classify(pods=[gpu_pod], nodes=stripped, ops=ops)
+            self.assertEqual(entries(row), {(18, ur.MEDIUM)})
         gke_gpu = copy.deepcopy(stripped)
-        next(n for n in gke_gpu if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "pinned-inference-pool")["spec"]["taints"] = [{"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}]
+        next(n for n in gke_gpu if pool_of(n) == "pinned-inference-pool")["spec"]["taints"] = [{"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}]
         gke_pod = copy.deepcopy(gpu_pod)
         gke_pod["spec"]["tolerations"] = [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
         [row] = self.classify(pods=[gke_pod], nodes=gke_gpu, ops=gpu_pool_only)
         self.assertEqual(entries(row), {(18, ur.HIGH)})
         [row] = self.classify(pods=[gke_pod], nodes=gke_gpu, ops=cpu_pool_only)
         self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        labelled = copy.deepcopy(stripped)
+        next(n for n in labelled if pool_of(n) == "pinned-inference-pool")["metadata"]["labels"]["cloud.google.com/gke-accelerator"] = "nvidia-l4"
+        [row] = self.classify(pods=[gpu_pod], nodes=labelled, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        [row] = self.classify(pods=[gpu_pod], nodes=labelled, ops=cpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        recorded = cluster_doc("seeded-a")
+        next(p for p in recorded["nodePools"] if p["name"] == "pinned-inference-pool")["config"].update(accelerators=[{"acceleratorType": "nvidia-l4", "acceleratorCount": "1"}], taints=[{"key": "dedicated", "value": "inference", "effect": "NO_SCHEDULE"}])
+        [row] = ur.collect_symptoms(recorded, reads_of(stripped), gpu_pool_only, SINCE)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        [row] = ur.collect_symptoms(recorded, reads_of(stripped), cpu_pool_only, SINCE)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        # A GPU pod that also tolerates a spot CPU pool's taint by name: the spot pool offered no GPU, so
+        # its upgrade alone opens nothing, and the GPU pool's still does.
+        spot = copy.deepcopy(nodes)
+        for n in spot:
+            if pool_of(n) == "default-pool":
+                n.setdefault("spec", {})["taints"] = [{"key": "cloud.google.com/gke-spot", "value": "true", "effect": "NoSchedule"}]
+        spot_pod = copy.deepcopy(gpu_pod)
+        spot_pod["spec"]["tolerations"].append({"key": "cloud.google.com/gke-spot", "operator": "Equal", "value": "true", "effect": "NoSchedule"})
+        [row] = self.classify(pods=[spot_pod], nodes=spot, ops=cpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        [row] = self.classify(pods=[spot_pod], nodes=spot, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        # A pool with no node left counts as a failed surge, not an idle pool: its operation says it had
+        # nodes to upgrade (NODES_TOTAL), the record carries what the pod requests, and the pod tolerates
+        # the record's taints; a CPU pod the record's taint refuses, or an operation that upgraded no
+        # node, opens nothing.
+        gone = [n for n in nodes if pool_of(n) != "pinned-inference-pool"]
+        [row] = self.classify(pods=[gpu_pod], nodes=gone, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        [row] = ur.collect_symptoms(recorded, reads_of(gone), gpu_pool_only, SINCE)
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        [row] = ur.collect_symptoms(recorded, {**reads_of(gone), "pods": [cpu_pod]}, gpu_pool_only, SINCE)
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+        [row] = self.classify(pods=[cpu_pod], nodes=gone, ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        idle = copy.deepcopy(gpu_pool_only)
+        for metric in (m for op in idle for m in op["progress"]["metrics"] if m["name"] == ur.OPERATION_METRIC_NODES_TOTAL):
+            metric["intValue"] = "0"
+        [row] = ur.collect_symptoms(recorded, reads_of(gone), idle, SINCE)
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        [row] = self.classify(pods=[cpu_pod], nodes=gone, ops=idle)
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
         # Without a nodes read nothing narrows the fallback: any upgraded pool opens the gate, as before.
         [row] = symptoms_of("seeded-a", reads={"pods": [cpu_pod], "events": [], "pdbs": []}, ops=gpu_pool_only)
         self.assertEqual(entries(row), {(2, ur.HIGH)})
@@ -4035,6 +4082,23 @@ class LedgerAndGuardsTest(unittest.TestCase):
         nope = f"{PROJECT}/{LOCATION}/nope"
         missing, _ = self.collect(fleet, now=later, cluster=[nope])
         self.assertEqual([line for line in missing["failed_reads"] if nope in line], [f"{nope}: named by --cluster but not listed in its project"])
+
+    def test_a_forced_cluster_of_a_project_whose_listing_failed_is_the_listings_failure(self):
+        # `--cluster` on a project whose `clusters list` failed: the run cannot say the cluster is not
+        # listed, so its line is the listing's failure, as a ledger cluster of an unlisted project gets
+        # on a full run, and the manifest carries the cluster gate-failed with it; the ledger entry and
+        # the guards stay. "named by --cluster but not listed in its project" is for a listing that answered.
+        self.collect()
+        before = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        result, _ = self.collect(FakeFleet(list_rc=1), now=later, cluster=[GEMMA], manifest_file=str(self.home / "forced.json"))
+        [listing] = [line for line in result["failed_reads"] if line.startswith(f"{PROJECT}: ")]
+        self.assertIn("clusters list rc=1", listing)
+        self.assertEqual((result["reviews"], [line for line in result["failed_reads"] if GEMMA in line]), ([], [ur.LISTING_FAILED_TEXT.format(cluster=GEMMA, error=listing.split(": ", 1)[1])]))
+        self.assertNotIn("not listed in its project", "\n".join(result["failed_reads"]))
+        [entry] = [e for e in result["manifest"]["clusters"] if e["name"] == GEMMA]
+        self.assertEqual((entry["outcome"], entry["error"], result["manifest"]["partial"], result["manifest"].get("error")), (ur.MANIFEST_OUTCOME_GATE_FAILED, ur.LISTING_FAILED_TEXT.format(cluster=GEMMA, error=listing.split(": ", 1)[1]).split(": ", 1)[1], True, None))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA], before["clusters"][GEMMA])
 
     def test_an_after_upgrade_wake_whose_operations_listing_failed_is_recorded_not_quiet(self):
         # The wake's only selection input is the operations listing: when it fails the wake is blind,

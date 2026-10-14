@@ -575,6 +575,10 @@ SCOPE_LOG_FORMAT = "scope: the install's declared scope, {count} project(s) from
 FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
 NOT_FULL_TEXT = "no --full: a scoped run"
 LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger entry and guards kept unchanged"
+# A project's own listing line under Reads that failed starts with this
+# after the project; the default stands in when no such line was written.
+CLUSTERS_LIST_PREFIX = "clusters list"
+LISTING_FAILED_DEFAULT = CLUSTERS_LIST_PREFIX + " failed"
 # gcloud exits 0 when a zone did not respond and lists the clusters it
 # reached, warning on stderr (`collect.ZONE_TIMEOUT_MARKER`): the siblings
 # read that as an incomplete listing, and so does this collector, since a
@@ -848,6 +852,16 @@ CONTAINERD_SOCKET_PATH_PREFIXES = ("/run/containerd", "/var/run/containerd")
 STATEFUL_VOLUME_NAME_RE = re.compile(r"(?<![a-z])(?:data|state|db|queue|store|journal|wal|persist)(?![a-z])", re.I)
 LOCAL_SSD_HOSTPATH_PREFIXES = ("/mnt/disks", "/mnt/stateful_partition")
 GPU_RESOURCE = "nvidia.com/gpu"
+TPU_RESOURCE = "google.com/tpu"
+# Evidence a pool carries an extended resource when its nodes' allocatable
+# no longer says so (entry 18: the device plugin never registered after the
+# rebuild) or no node is left: the accelerator label GKE puts on the pool's
+# nodes, and the pool's accelerator config in the cluster record, whose
+# `accelerators` are GPUs. A taint the pod merely tolerates is no evidence.
+ACCELERATOR_LABEL_RESOURCES = {"cloud.google.com/gke-accelerator": GPU_RESOURCE, "cloud.google.com/gke-tpu-accelerator": TPU_RESOURCE}
+# The cluster record writes a taint's effect as the API's enum; the nodes
+# read, and `_tolerates`, use the scheduler's word.
+RECORD_TAINT_EFFECTS = {"NO_SCHEDULE": "NoSchedule", "NO_EXECUTE": "NoExecute", "PREFER_NO_SCHEDULE": "PreferNoSchedule"}
 # A CUDA pin in an image tag (`nvidia/cuda:12.2.0-base`) or an env value.
 CUDA_IMAGE_PIN_RE = re.compile(r"cuda[:/_-]?(\d+\.\d+)", re.I)
 CUDA_ENV_NAME_MARKER = "CUDA"
@@ -1535,6 +1549,23 @@ def versions_of(cluster: dict) -> dict:
 
 def pool_cgroup_modes(cluster: dict) -> dict[str, str]:
     return {p.get("name", ""): ((p.get("config") or {}).get("effectiveCgroupMode") or "") for p in cluster.get("nodePools") or []}
+
+
+def pool_records_of(cluster: dict) -> dict[str, dict]:
+    """Per pool, what the cluster record says of it that a node's allocatable
+    cannot once the resource is gone from it or the node is: the extended
+    resources its config carries (`accelerators` are GPUs; a config taint
+    keyed by a resource name, GKE's `nvidia.com/gpu=present`, names its
+    resource) and its config taints in the scheduler's shape."""
+    out: dict[str, dict] = {}
+    for pool in cluster.get("nodePools") or []:
+        config = pool.get("config") or {}
+        taints = [{"key": t.get("key") or "", "value": t.get("value") or "", "effect": RECORD_TAINT_EFFECTS.get(t.get("effect") or "", t.get("effect") or "")} for t in config.get("taints") or []]
+        resources = {t["key"] for t in taints if RESOURCE_DOMAIN_SEPARATOR in t["key"] and not t["key"].startswith(BUILTIN_RESOURCE_DOMAIN)}
+        if config.get("accelerators"):
+            resources.add(GPU_RESOURCE)
+        out[pool.get("name", "")] = {"resources": resources, "taints": taints}
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -2573,28 +2604,46 @@ def _tolerates(tolerations: list[dict], taint: dict) -> bool:
 def _placeable_pools(symptom: dict, ctx: Context) -> set[str] | None:
     """The pools the scheduler could place the pod on, pins aside: those with
     a node whose taints the pod tolerates and that offers every extended
-    resource it requests -- or, the upgrade's own mechanism (entry 18) having
-    taken the resource out of allocatable on the nodes it rebuilt, whose
-    taints say what the pool is: a taint keyed by the requested resource
-    (GKE's `nvidia.com/gpu=present`) or one the pod tolerates by name. An
-    upgraded pool with no node left (scaled to zero in a failed surge) has
-    nothing to judge and counts as touched. None without a nodes read."""
+    resource it requests. An upgraded pool is placeable too on evidence the
+    resource was there before the upgrade's own mechanism (entry 18) took it
+    out of allocatable: a blocking taint keyed by the resource on the node
+    (GKE's `nvidia.com/gpu=present`), the accelerator label on the pool's
+    nodes, or the pool's accelerator config in the cluster record -- never a
+    taint the pod merely tolerates, which says nothing of what the pool
+    offered, and never for a pool no operation touched, where allocatable
+    still speaks. An upgraded pool with no node left counts when its
+    operation says it had nodes to upgrade (a failed surge, not an idle
+    pool), the record carries what the pod requests and the pod tolerates
+    the record's taints. None without a nodes read."""
     if ctx.pool_nodes is None:
         return None
     tolerations = symptom.get("tolerations") or []
     requested = set(symptom.get("extended_resources") or [])
-    named = {t.get("key") for t in tolerations if t.get("key")}
+    labelled: dict[str, set[str]] = {}
+    for (label, _), pools_with in ctx.label_pools.items():
+        if label in ACCELERATOR_LABEL_RESOURCES:
+            for pool in pools_with:
+                labelled.setdefault(pool, set()).add(ACCELERATOR_LABEL_RESOURCES[label])
 
-    def placeable(taints: list[dict], offered: set[str]) -> bool:
+    def recorded(pool: str) -> dict:
+        return ctx.pool_records.get(pool) or {}
+
+    def carried(pool: str, taints: list[dict]) -> set[str]:
+        keyed = {taint.get("key") for taint in taints if (taint.get("effect") or "") in BLOCKING_TAINT_EFFECTS}
+        return keyed | labelled.get(pool, set()) | set(recorded(pool).get("resources") or ())
+
+    def placeable(pool: str, taints: list[dict], offered: set[str]) -> bool:
         if not all(_tolerates(tolerations, taint) for taint in taints):
             return False
-        if requested <= offered:
-            return True
-        keys = {taint.get("key") for taint in taints if (taint.get("effect") or "") in BLOCKING_TAINT_EFFECTS}
-        return bool(requested) and (requested <= keys or bool(named & keys))
+        return requested <= offered or (pool in ctx.upgraded_pools and requested <= carried(pool, taints))
 
-    pools = {pool for pool, nodes in ctx.pool_nodes.items() if any(placeable(taints, offered) for taints, offered in nodes)}
-    return pools | {pool for pool in ctx.upgraded_pools if pool not in ctx.pool_nodes}
+    pools = {pool for pool, nodes in ctx.pool_nodes.items() if any(placeable(pool, taints, offered) for taints, offered in nodes)}
+    for pool, row in ctx.upgraded_pools.items():
+        if pool in ctx.pool_nodes or not (row.get("nodes") or 0) > 0:
+            continue
+        if requested <= set(recorded(pool).get("resources") or ()) and all(_tolerates(tolerations, taint) for taint in recorded(pool).get("taints") or []):
+            pools.add(pool)
+    return pools
 
 
 def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_pins: list[dict[str, list[str]]], pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
@@ -2741,6 +2790,7 @@ class Context(NamedTuple):
     failing_pods: dict = {}  # (namespace, pod) -> the API-set field that shows it failing
     failing_objects: dict = {}  # owner object -> the API-set field that shows it failing
     pool_versions: dict = {}  # pool -> its version from the cluster describe
+    pool_records: dict = {}  # pool -> what `pool_records_of` returns: the record's resources and config taints
     control_plane: str = ""
 
 
@@ -3543,6 +3593,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         failing_pods=failing_pods,
         failing_objects=failing_objects,
         pool_versions=versions_of(cluster)["node_pools"],
+        pool_records=pool_records_of(cluster),
         control_plane=versions_of(cluster)["control_plane"] or "",
     )
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
@@ -5618,6 +5669,13 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             entries[key].pop("partial_read", None)
     return {"version": LEDGER_VERSION, "updated_at": seen_at, LEDGER_PROJECTS_KEY: ledger.get(LEDGER_PROJECTS_KEY) or [], "clusters": entries}
 
+def _listing_error(project: str, failed_reads: list[str]) -> str:
+    """The error `project`'s own `clusters list` line under Reads that failed
+    carries, for the line a cluster of an unlisted project gets."""
+    line = next((e for e in failed_reads if e.startswith(f"{project}: {CLUSTERS_LIST_PREFIX}")), f"{project}: {LISTING_FAILED_DEFAULT}")
+    return line.split(": ", 1)[-1]
+
+
 def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
     configs, the reviews, the re-checks); the default is the figure the
@@ -5760,7 +5818,15 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         # already, and is not also said to be unlisted.
         missing = forced - enumerated_keys - set(not_running)
         for key in sorted(missing):
-            failed_reads.append(f"{key}: named by --cluster but not listed in its project")
+            project = key.split(CLUSTER_KEY_SEPARATOR)[0]
+            if project in listed_projects:
+                failed_reads.append(f"{key}: named by --cluster but not listed in its project")
+            else:
+                # A project the run could not list, or not wholly, says
+                # nothing of the cluster: the line is the listing's failure,
+                # as a ledger cluster of an unlisted project gets on a full
+                # run, so the manifest carries the cluster gate-failed with it.
+                failed_reads.append(LISTING_FAILED_TEXT.format(cluster=key, error=_listing_error(project, failed_reads)))
 
     selected, unchanged, upgrading = select_clusters(clusters, ledger, operations, since=since, forced=forced, widen=bool(args.since), after_upgrade=after_upgrade, now=now)
     # Reviews in a fixed order, the cluster reviewed longest ago first (one
@@ -5882,8 +5948,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         # A cluster a successful listing no longer names leaves, whatever the scope's state.
         removed |= {key for project, listed in listed_projects.items() for key in (ledger.get("clusters") or {}) if key.startswith(project + CLUSTER_KEY_SEPARATOR) and key not in listed}
         for key in sorted(unlisted_clusters):
-            error = next((e for e in failed_reads if e.startswith(key.split(CLUSTER_KEY_SEPARATOR)[0] + ": clusters list")), "clusters list failed")
-            failed_reads.append(LISTING_FAILED_TEXT.format(cluster=key, error=error.split(": ", 1)[-1]))
+            failed_reads.append(LISTING_FAILED_TEXT.format(cluster=key, error=_listing_error(key.split(CLUSTER_KEY_SEPARATOR)[0], failed_reads)))
     outside = set()
     for review in reviews:
         if review["project"] not in new_fleet:
