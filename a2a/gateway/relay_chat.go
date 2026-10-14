@@ -31,7 +31,14 @@ const lineKeySeparator = "\x00"
 // for one that carries only a mark, which lays nothing out and whose mark
 // is applied, not drawn.
 func layoutOf(r chatmsg.Reading) *chatmsg.Message {
-	if r.Message == nil || r.Message.MarkOnly() {
+	if r.Message == nil {
+		return nil
+	}
+	// A tone colours what is below it and alone colours nothing, so a
+	// message whose only layout field is its tone lays nothing out either.
+	toneless := *r.Message
+	toneless.Tone = ""
+	if toneless.MarkOnly() {
 		return nil
 	}
 	return r.Message
@@ -61,7 +68,7 @@ func (g *Gateway) noteChatProblems(conversation, taskID string, c chatmsg.Carrie
 	}
 	g.metrics.chatMessage(chatInvalid)
 	for _, p := range r.Problems {
-		g.log.Warn("chat message dropped; its text fallback stands",
+		g.log.Warn("chat message broke a rule; the part that broke it is dropped (the whole layout, or a bad mark alone) and any text fallback stands",
 			"conversation", conversation, "taskId", taskID, "carrier", string(c),
 			"rule", truncateRunes(p.Error(), chatProblemMax))
 	}
@@ -120,11 +127,16 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 			// The backend shows text only, and will for the life of the
 			// task: from here the line is the text edit alone.
 			rs.lineTextOnly = true
+		} else {
+			// The backend refused this layout: it is not offered again
+			// until the progress chat message changes (applyArtifact).
+			rs.lineRefused = lineKey("", rs)
+			rs.lineChat = nil
 		}
 		if !rs.lineLaidOut {
-			if rs.lineTextOnly && lineKeyText(rs.lastLine) == line {
+			if lineKeyText(rs.lastLine) == line {
 				// The line already shows this text; only the chat
-				// message changed, and this backend shows none.
+				// message changed, and this backend did not lay it out.
 				return true
 			}
 			return g.editLine(conversation, messageID, line)
@@ -157,7 +169,10 @@ func lineKey(line string, rs *relayState) string {
 
 // resultChat reads the result's chat message: off the chunks this process
 // relayed, or, when the render state had no result and the stream was
-// replayed for it, off the replayed artifact, which arrives folded.
+// replayed for it, off the replayed artifact. That one arrives folded, so
+// which chunk carried the chat message is lost and the last-chunk rule
+// (assertion 27) cannot be applied to it: a chat message an executor put on
+// an earlier chunk drops on the live path and is read on this one.
 func (g *Gateway) resultChat(conversation, taskID string, rs *relayState, replayed []lib.Part) *chatmsg.Message {
 	switch {
 	case replayed != nil:

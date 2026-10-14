@@ -50,6 +50,10 @@ const (
 	// slackChatFoldChunk is the raw-text share of one fold section, under
 	// slackChatSectionMax with room for the escaping toMrkdwn adds.
 	slackChatFoldChunk = 2500
+	// slackChatFoldChunkMin is the smallest share slackFoldSections cuts a
+	// chunk to before it calls the fold too large: 600 bytes escape to at
+	// most 3,000 runes even if every one is an ampersand.
+	slackChatFoldChunkMin = 600
 	// slackChatContainerChildMax is Slack's cap on a container's children.
 	slackChatContainerChildMax = 10
 	// slackChatBlocksMax is Slack's cap on the blocks in one message, the
@@ -124,7 +128,10 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 		blocks = append(blocks, after)
 	}
 	foldAt := -1
-	if m.Fold != nil {
+	if m.Fold != nil && slackChatFoldEmpty(m.Fold) {
+		// A fold with neither text nor a table folds nothing, and a
+		// renderer omits an empty field.
+	} else if m.Fold != nil {
 		fold, err := slackChatFold(m.Fold)
 		if err != nil {
 			return slackChatLayout{}, err
@@ -286,11 +293,11 @@ func slackChatAfter(after []string) map[string]any {
 func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 	var children []map[string]any
 	if strings.TrimSpace(f.Text) != "" {
-		for _, chunk := range chatChunks(f.Text, slackChatFoldChunk) {
-			text := toMrkdwn(chunk)
-			if utf8.RuneCountInString(text) > slackChatSectionMax {
-				return nil, errSlackChatTooLarge
-			}
+		texts, err := slackFoldSections(f.Text, slackChatFoldChunk)
+		if err != nil {
+			return nil, err
+		}
+		for _, text := range texts {
 			children = append(children, map[string]any{
 				"type": "section",
 				"text": map[string]any{"type": slackChatMrkdwn, "text": text, "verbatim": true},
@@ -318,6 +325,38 @@ func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 		"default_collapsed": true,
 		"child_blocks":      children,
 	}, nil
+}
+
+// slackChatFoldEmpty reports a fold with neither text nor a table.
+func slackChatFoldEmpty(f *chatmsg.Fold) bool {
+	return strings.TrimSpace(f.Text) == "" && (f.Table == nil || len(f.Table.Columns) == 0)
+}
+
+// slackFoldSections cuts text into chunks of at most size bytes and renders
+// each as mrkdwn, cutting a chunk smaller again when its escaping (&amp;,
+// &lt;, &gt;) takes it past a section's cap, so text dense with those
+// characters still fits; past slackChatContainerChildMax sections it is too
+// large.
+func slackFoldSections(text string, size int) ([]string, error) {
+	var out []string
+	for _, chunk := range chatChunks(text, size) {
+		rendered := toMrkdwn(chunk)
+		if utf8.RuneCountInString(rendered) <= slackChatSectionMax {
+			out = append(out, rendered)
+		} else if size <= slackChatFoldChunkMin {
+			return nil, errSlackChatTooLarge
+		} else {
+			smaller, err := slackFoldSections(chunk, size/2)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, smaller...)
+		}
+		if len(out) > slackChatContainerChildMax {
+			return nil, errSlackChatTooLarge
+		}
+	}
+	return out, nil
 }
 
 func slackChatTableRow(cells []string) []map[string]any {

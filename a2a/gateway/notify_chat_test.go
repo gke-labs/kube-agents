@@ -174,3 +174,20 @@ func TestNotifyRefusesAnOverlongUpdateKey(t *testing.T) {
 		t.Fatalf("reply = %+v, posts = %d; want a refusal", got, len(conv.posts))
 	}
 }
+
+// A keyed chat edit that fails because the message cannot be edited at all
+// (gone, the API failing) is no layout refusal: nothing is counted refused,
+// and the request posts anew, laid out.
+func TestNotifyKeyedEditOfAGoneMessageCountsNoRefusal(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	n.metrics = NewMetrics()
+	serveJSON(t, n, lib.NotifyRequest{Text: "plan", Chat: notifyChat(t, testPlan), Update: "plan", Conversation: testConversation, ContextID: testContext})
+	conv.failEdits = true
+	serveJSON(t, n, lib.NotifyRequest{Text: "plan, later", Chat: notifyChat(t, testPlan), Update: "plan", Conversation: testConversation, ContextID: testContext})
+	if got := counterValue(t, n.metrics.chatMessages.WithLabelValues(chatRefused)); got != 0 {
+		t.Fatalf("refused = %v, want 0", got)
+	}
+	if got := counterValue(t, n.metrics.chatMessages.WithLabelValues(chatRendered)); got != 2 || len(conv.posts) != 2 {
+		t.Fatalf("rendered = %v, posts = %d; want the second request posted anew, laid out", got, len(conv.posts))
+	}
+}

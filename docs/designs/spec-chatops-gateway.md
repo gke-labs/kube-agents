@@ -1672,7 +1672,7 @@ message of an `input-required` status, and a terminal status, whose chat message
 alone. A chat message that breaks a rule is dropped whole, logged with the rule it broke and
 counted (`chat_messages_total{outcome="invalid"}`, under Metrics), and its text posts as it
 would have; a bad `mark` drops alone, and a chat message that carries only a `mark` lays
-nothing out. What survives reaches the adapter as a message value,
+nothing out. A result recovered by replaying the stream after a restart arrives folded, which loses the chunk a chat message rode on, so the last-chunk rule is not applied to it. What survives reaches the adapter as a message value,
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, Google Chat, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
@@ -1687,7 +1687,8 @@ The Slack adapter lays a chat message out as Block Kit, in the spec's fixed orde
 notification and a thread read-back carry it): the headline bold with the note after it on the
 same line, as one `rich_text` block; the detail under it; the rows between two dividers, each led
 by its severity as inline code; the `after` lines; the fold as a collapsible `container`,
-collapsed, its text as escaped mrkdwn sections sent `verbatim` and its table as a native `table`
+collapsed (a fold with neither text nor a table is omitted), its text as escaped mrkdwn sections
+sent `verbatim`, cut smaller where escaping would take one past Slack's cap, and its table as a native `table`
 block whose first row is the column names; then the buttons, choices before links, five to an
 `actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
@@ -1706,7 +1707,9 @@ reach, makes the message one the adapter will not send (`blocksMention`, the not
 check). The blocks go on the wire as the renderer wrote them, not through slack-go's types.
 The live message shows the newest progress chat message under every display mode, and keeps it
 when the task ends, its text turning to the terminal line; a progress artifact without one turns
-the message back to text. Nothing answers a click yet: a choice button opens nothing, and Slack
+the message back to text. A layout the backend refuses is not offered again until the progress
+chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
+so a live message laid out before a gateway restart does not keep a stale plan. Nothing answers a click yet: a choice button opens nothing, and Slack
 marks a click on any button, a link's included, as failed until the gateway acks interactions.
 That is the exception to the notify route's refusal of interactive blocks below: a raw `blocks`
 request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat

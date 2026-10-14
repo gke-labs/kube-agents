@@ -604,14 +604,25 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 // editKeyed edits a keyed message to m, laid out when the adapter lays it
 // out and as text otherwise, and reports whether an edit landed.
 func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) bool {
+	var layoutErr error
 	if m.Chat != nil {
-		if n.chatOutcome(conversation, n.conv.EditMessage(conversation, message, m)) {
-			return true
+		layoutErr = n.conv.EditMessage(conversation, message, m)
+		if layoutErr == nil || errors.Is(layoutErr, ErrTextOnly) {
+			if n.chatOutcome(conversation, layoutErr) {
+				return true
+			}
 		}
 	}
 	if err := n.conv.EditMessage(conversation, message, text); err != nil {
+		// The message itself cannot be edited (gone, or the API failing):
+		// the layout was not what failed, so nothing is counted refused,
+		// and the request posts anew.
 		n.log.Warn("notify: editing the keyed message failed; posting a new one", "conversation", conversation, "err", err)
 		return false
+	}
+	if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
+		// The text edit landed where the layout did not: a refusal.
+		n.chatOutcome(conversation, layoutErr)
 	}
 	return true
 }

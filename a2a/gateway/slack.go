@@ -708,7 +708,11 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 	if !ok {
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	_, _, _, err := s.api.UpdateMessage(channel, messageID, slack.MsgOptionText(toMrkdwn(text), false))
+	// The whole message, blocks and side bar cleared: the rolling line may
+	// have been laid out by EditMessage before, in this process or one a
+	// restart replaced, and chat.update keeps whatever it is not sent.
+	opts, _ := slackMessageOptions(OutMessage{Text: text})
+	_, _, _, err := s.api.UpdateMessage(channel, messageID, opts...)
 	return err
 }
 

@@ -393,3 +393,38 @@ func TestTerminalMarkReachesAChatMarker(t *testing.T) {
 		}
 	}
 }
+
+// A message whose only layout field is its tone lays nothing out.
+func TestToneOnlyProgressLaysNothingOut(t *testing.T) {
+	r := startRig(t)
+	origin := startChatTask(t, r, "discord:g1/tone-only-progress", true)
+	toneOnly := chatmsg.Message{Schema: chatmsg.Schema, Tone: chatmsg.ToneSuccess}
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "toned"}, chatPart(t, toneOnly)}, false, false)
+	waitFor(t, "the progress edit", func() bool {
+		texts := r.adapter.editTexts()
+		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "toned")
+	})
+	if len(r.adapter.chatEditsCopy()) != 0 || chatCount(t, r, chatRendered) != 0 {
+		t.Fatal("a tone-only message was laid out")
+	}
+}
+
+// A layout the backend refused is not offered again while the progress
+// chat message stays the same; the line carries on as text.
+func TestRefusedProgressLayoutIsNotResent(t *testing.T) {
+	r := startRig(t)
+	r.adapter.mu.Lock()
+	r.adapter.refuseChat = true
+	r.adapter.mu.Unlock()
+	origin := startChatTask(t, r, "discord:g1/refused-not-resent", true)
+	for _, step := range []string{"one", "two", "three"} {
+		publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: step}, chatPart(t, testPlan)}, false, false)
+		waitFor(t, "the "+step+" edit", func() bool {
+			texts := r.adapter.editTexts()
+			return len(texts) > 0 && strings.Contains(texts[len(texts)-1], step)
+		})
+	}
+	if got := chatCount(t, r, chatRefused); got != 1 {
+		t.Fatalf("refused = %v, want the layout offered once", got)
+	}
+}

@@ -127,6 +127,10 @@ type relayState struct {
 	// ErrTextOnly: its edits are text from then on, and a change to the
 	// progress chat message alone costs no backend edit.
 	lineTextOnly bool
+	// lineRefused is the lineKey of the layout the backend last refused for
+	// this line (an API refusal, or one too large for it), so the same
+	// layout is not re-sent on every later artifact.
+	lineRefused string
 }
 
 // relayFor is the task's render state, created on first use.
@@ -310,6 +314,10 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		// A chat message here is the live message's whole state, so one
 		// without it returns the line to text.
 		rs.lineChat = layoutOf(g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts))
+		if rs.lineChat != nil && rs.lineRefused != "" && lineKey("", rs) == rs.lineRefused {
+			// The backend refused this very layout already.
+			rs.lineChat = nil
+		}
 		if render {
 			g.updateRollingLine(rec, taskID, rs)
 		}

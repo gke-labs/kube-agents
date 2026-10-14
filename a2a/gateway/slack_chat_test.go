@@ -214,3 +214,42 @@ func TestSlackChatSideBarOnlyWithBlocksBelowTheHeadline(t *testing.T) {
 		t.Fatalf("layout = %+v err = %v", layout, err)
 	}
 }
+
+// A fold with neither text nor a table folds nothing and is omitted; the
+// rest of the message still lays out.
+func TestSlackChatEmptyFoldIsOmitted(t *testing.T) {
+	m := chatmsg.Message{Schema: chatmsg.Schema, Headline: "h", Fold: &chatmsg.Fold{Title: "why"}}
+	layout, err := renderSlackChat(&m, "t")
+	if err != nil || len(layout.Blocks) != 1 {
+		t.Fatalf("layout = %+v err = %v, want the headline alone", layout, err)
+	}
+}
+
+// Fold text dense with characters escaping lengthens is cut smaller rather
+// than refused: 2,400 '<' escape to 9,600 runes, which fits in four sections.
+func TestSlackChatDenseFoldIsCutSmaller(t *testing.T) {
+	m := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: strings.Repeat("<", 2400)}}
+	layout, err := renderSlackChat(&m, "t")
+	if err != nil {
+		t.Fatalf("a dense fold well under the cap was refused: %v", err)
+	}
+	children := layout.Blocks[0]["child_blocks"].([]map[string]any)
+	for _, c := range children {
+		if n := len([]rune(c["text"].(map[string]any)["text"].(string))); n > slackChatSectionMax {
+			t.Fatalf("a section of %d runes, over the cap", n)
+		}
+	}
+}
+
+// Slack's Edit replaces the whole message, blocks and side bar cleared, so a
+// live message laid out before a gateway restart loses its stale layout.
+func TestSlackEditClearsAnyLayout(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	if err := adapter.Edit("slack:C1/1.0", "2.0", "✅ **completed**"); err != nil {
+		t.Fatal(err)
+	}
+	form := stub.forms[0]
+	if form.Get("text") != "✅ *completed*" || form.Get("blocks") != "[]" || form.Get("attachments") != "[]" {
+		t.Fatalf("form = %v", form)
+	}
+}
