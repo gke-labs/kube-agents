@@ -8,7 +8,19 @@ Retire-When: never; upstream's skill is written for a user who creates clusters 
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md
 +++ b/SKILL.md
-@@ -18,7 +18,7 @@ providing a set of best-practice templates and guiding through mode selection
+@@ -1,8 +1,9 @@
+ ---
+ name: gke-cluster-creation
+ description: >-
+-  Plans and executes GKE cluster creation, provisioning, and production
+-  readiness audits using pre-defined templates (Autopilot, Standard Regional,
++  Plans GKE cluster creation and provisioning as a pull request in the
++  GitOps repository's format, and audits production readiness, using
++  pre-defined templates (Autopilot, Standard Regional,
+   GPU/AI Inference, AI Hypercompute). Use when creating GKE clusters,
+   provisioning GKE environments, selecting cluster modes, or auditing GKE
+   clusters. Don't use for application onboarding or deployment configuration
+@@ -18,7 +19,7 @@ providing a set of best-practice templates and guiding through mode selection
  and customization. The **golden path Autopilot** configuration is the default
  for all new clusters.
  
@@ -17,7 +29,7 @@ diff --git a/SKILL.md b/SKILL.md
  > `list_operations`, `get_operation`
  
  ## Workflow
-@@ -34,10 +34,17 @@ for all new clusters.
+@@ -34,10 +35,17 @@ for all new clusters.
      vs. Availability, Autopilot vs. Standard node management).
  4.  **Configure networking**: auto-create subnet (default) or bring-your-own.
  5.  **Review golden path settings**: present the default configuration block
@@ -39,7 +51,7 @@ diff --git a/SKILL.md b/SKILL.md
  8.  **Verify**: Use `get_cluster` with `readMask="*"` to confirm golden path
      settings applied.
  
-@@ -107,24 +114,7 @@ practices:
+@@ -107,24 +115,7 @@ practices:
  This is the default. All settings match
  `../gke-golden-path/assets/golden-path-autopilot.yaml`.
  
@@ -65,7 +77,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -154,17 +144,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+@@ -154,17 +145,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
  Relaxes some golden path defaults for cost savings and easier access in
  non-production.
  
@@ -84,7 +96,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -185,27 +165,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+@@ -185,27 +166,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
  Best when Autopilot cannot be used (e.g., custom kernel tuning, specific node OS
  requirements). Creates 3 nodes across zones by default.
  
@@ -113,7 +125,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -241,26 +201,19 @@ Best for: AI/ML Inference, small model serving. Can be provisioned via
+@@ -241,26 +202,19 @@ Best for: AI/ML Inference, small model serving. Can be provisioned via
  Autopilot + ComputeClass or via Standard node pool with `g2-standard-4`
  (`nvidia-l4`). *Note: Requires `g2-standard-4` quota.*
  
@@ -144,7 +156,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -289,23 +242,7 @@ Best for: Large-scale LLM / AI model training and hypercompute inference. *Note:
+@@ -289,23 +243,7 @@ Best for: Large-scale LLM / AI model training and hypercompute inference. *Note:
  High hourly cost and strict quota requirements (`a3-highgpu-8g` /
  `nvidia-h100-80gb-hbm3`).*
  
@@ -169,7 +181,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -342,15 +279,13 @@ gcloud container clusters create <CLUSTER_NAME> \
+@@ -342,15 +280,13 @@ gcloud container clusters create <CLUSTER_NAME> \
  -   **EXPLAIN TRADE-OFFS** when presenting templates or mode choices to the user
      if they haven't specified one (e.g., Autopilot vs Standard, Cost vs
      Availability).

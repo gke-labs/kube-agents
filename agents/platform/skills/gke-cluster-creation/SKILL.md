@@ -1,8 +1,9 @@
 ---
 name: gke-cluster-creation
 description: >-
-  Plans and executes GKE cluster creation, provisioning, and production
-  readiness audits using pre-defined templates (Autopilot, Standard Regional,
+  Plans GKE cluster creation and provisioning as a pull request in the
+  GitOps repository's format, and audits production readiness, using
+  pre-defined templates (Autopilot, Standard Regional,
   GPU/AI Inference, AI Hypercompute). Use when creating GKE clusters,
   provisioning GKE environments, selecting cluster modes, or auditing GKE
   clusters. Don't use for application onboarding or deployment configuration
