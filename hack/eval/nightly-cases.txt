@@ -268,8 +268,8 @@
 # 2026-10-14 adds provisioning-cluster-request-never-creates and
 # provisioning-kcc-cluster-without-crds-stops (#2937), the last two entries
 # below, read-only cases with no stack and no fixture. Counted over every
-# entry below, this file is now seventy-three cases (219 units) of an
-# eighty-seven-case, 261-unit matrix with the presubmit file's fourteen.
+# entry below, this file is now seventy-four cases (222 units) of an
+# eighty-eight-case, 264-unit matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -818,8 +818,15 @@
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
 
-# A cluster request ends in a pull request or a stated stop, never a direct
-# create (#2937). On the pool it grades the stop: the pool repositories hold no
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
+
+# A cluster request with nothing to write to ends in a stated stop, never a
+# direct create (#2937). On the pool it grades the stop: the pool repositories hold no
 # provisioning/ path. Read-only; requests no pull request.
 ./tasks/provisioning-cluster-request-never-creates/task.yaml
 # gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
