@@ -124,6 +124,10 @@ _WORD_QUOTING_RE = re.compile(r'\\(.)|[\'"]')
 _HEREDOC_RE = re.compile(r"<<(-?)\s*((?:\$?'[^']*'|\"[^\"]*\"|\\[^\s]|[^\s;&|<>()'\"\\])+)")
 _REDIRECT_TARGET_RE = re.compile(r"(?:^|[\s'\"])>{1,2}\s*(\S+)")
 _ATTACHED_REDIRECT_RE = re.compile(r"^('[^']*'|\"[^\"]*\")>")
+# A redirection standing before the command word (``2>/dev/null curl …``, ``</dev/null cmd``,
+# ``>out 2>&1 cmd``), and the bare operator form whose target is the next token.
+_LEADING_REDIRECT_RE = re.compile(r"^(?:\d*[<>]{1,2}(?:&\d+)?\S*|&>>?\S*)$")
+_BARE_REDIRECT_RE = re.compile(r"^(?:\d*[<>]{1,2}|&>>?)$")
 _DD_TARGET_RE = re.compile(r"(?:^|\s)of=(\S+)")
 # Nesting beyond this is not shell a worker writes; it bounds a pathological
 # input rather than any real one.
@@ -420,6 +424,10 @@ def _command_index(tokens: list[tuple[int, int, str]], keep: frozenset[str] = fr
         word = _unquote(raw)
         if _ASSIGNMENT_RE.match(raw) and not raw.startswith(("'", '"')):
             i += 1
+            continue
+        if _LEADING_REDIRECT_RE.match(raw):
+            # A redirection may precede the command word; a bare operator takes the next token as its target.
+            i += 2 if _BARE_REDIRECT_RE.match(raw) else 1
             continue
         if word.rsplit("/", 1)[-1] in _WRAPPERS and word.rsplit("/", 1)[-1] not in keep:
             name = word.rsplit("/", 1)[-1]

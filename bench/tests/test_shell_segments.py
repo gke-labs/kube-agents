@@ -369,6 +369,17 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     )
 
 
+def test_a_leading_redirection_is_not_the_command_word():
+    for command in (
+        "2>/dev/null kubectl scale deploy x --replicas=3",
+        "</dev/null kubectl scale deploy x --replicas=3",
+        ">out 2>&1 kubectl scale deploy x --replicas=3",
+        "> out kubectl scale deploy x --replicas=3",
+        "&>/dev/null kubectl scale deploy x --replicas=3",
+    ):
+        assert segments(command) == ["kubectl scale deploy x --replicas=3"], command
+
+
 def test_a_partly_quoted_heredoc_tag_is_the_delimiter_bash_reads():
     for tag in ("E'O'F", 'E"O"F', "$'EOF'", "\\EOF", "'EOF'"):
         command = "cat <<" + tag + " > notes.txt\nkubectl scale deploy x --replicas=3 is refused\nEOF\ncurl -k https://10.0.0.1/api/v1"

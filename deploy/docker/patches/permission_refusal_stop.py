@@ -161,8 +161,8 @@ WARN_MESSAGE = (
     "refused however it is attempted, so do not retry it through another command, tool, "
     "flag, identity or API. Stop working on this change now and report what was refused, "
     "quoting the message, with a note that it can be proposed as a pull request; open one "
-    "only if the request asked for a pull request. Further refused changes in this run "
-    "end the run."
+    "only if the request asked for a pull request. Refused changes are counted across this "
+    "run and end it at the configured threshold."
 )
 ADVISORY_WARN_MESSAGE = (
     "The command policy refused this command; its notice above is the rule. A refused change is "

@@ -722,9 +722,10 @@ _GCLOUD_HELP_FLAGS = _HELP_FLAGS  # the same two words, read by the gcloud surfa
 #: only gate.
 _GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
 # How many words of a gcloud argv, past a release track, the refusal's verb tuple
-# keeps: three, so a positional (a disk or cluster name) never reaches the log
-# hint or the shim's verb line. The write surfaces whose verb is the fourth word
-# keep it when that word is one of these, which no positional is named.
+# keeps: three, so a three-word surface's positional (a disk or cluster name)
+# never reaches the log hint or the shim's verb line (a shorter surface's
+# first positional does). The write surfaces whose verb is the fourth word keep
+# it when that word is one of these, which no positional is named.
 _GCLOUD_VERB_WORDS = 3
 _GCLOUD_FOURTH_WORD_VERBS = frozenset(
     {"create", "delete", "update", "patch", "resize", "set-autoscaling", "rolling-action",
