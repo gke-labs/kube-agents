@@ -19,7 +19,7 @@ See [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
 The second piece is the readiness report, the subject of this document. A daily job grades every
 cluster for which a new GKE version is pending, then once a week while the version stays pending. In
 chat, the agent grades any cluster against a target version on request. Each grade is blocked,
-unknown or ready, and each finding names the object that breaks and the change that clears it. Once
+unknown or ready, and each finding names the object and the setting that blocks. Once
 a week the upgrade audit grades every cluster that is behind its channel. It adds each cluster whose
 upgrade is held or refused to its ledger issue. This document specifies one verdict per cluster
 family, a set of clusters built from the same template: Go, No-Go or Action required.
