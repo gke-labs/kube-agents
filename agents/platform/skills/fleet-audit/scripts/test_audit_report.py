@@ -2728,9 +2728,11 @@ class TestAuditCatalogue(unittest.TestCase):
                 # The script, not the first word: the documented invocation
                 # names an interpreter first, and the prompt cites the
                 # collector rather than a runnable command line.
+                # The SOP names it by full path for a kanban worker; a cron
+                # prompt runs in the profile home and may name it from there.
                 script_token = next(
                     token for token in invocation_line.split() if token.endswith(".py")
-                ).lstrip("./")
+                ).removeprefix("/opt/data/profiles/platform/").lstrip("./")
                 self.assertIn(
                     script_token,
                     prompt,
