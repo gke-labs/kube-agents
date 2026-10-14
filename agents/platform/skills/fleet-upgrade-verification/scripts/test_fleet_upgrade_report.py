@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import subprocess
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -524,6 +524,56 @@ class OutputShapeTest(unittest.TestCase):
         self.assertEqual(rc, report.EXIT_PARTIAL)
         self.assertIn(f"read failed for {report.PROJECTS_LIST_ERROR_SCOPE}", stdout.getvalue())
         self.assertIn("PERMISSION_DENIED", stdout.getvalue())
+
+    def test_main_removes_the_previous_output_before_it_reads(self):
+        # A worker is told the --output file is where the answer is. A run that dies before it
+        # writes must leave none there, not the previous question's report.
+        out_path = os.path.join(tempfile.mkdtemp(), "fleet_readiness.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write('{"stale": true}')
+        with patch.object(report, "build_report", side_effect=RuntimeError("killed")), redirect_stderr(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                report.main(["--project", "p1", "--target-version", self.target, "--output", out_path])
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_main_refuses_an_output_it_cannot_clear(self):
+        # The previous file cannot be removed (its directory is read-only): the run refuses
+        # rather than read the fleet and leave that file where the answer is expected.
+        directory = tempfile.mkdtemp()
+        out_path = os.path.join(directory, "fleet_readiness.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write('{"stale": true}')
+        os.chmod(directory, 0o500)
+        self.addCleanup(os.chmod, directory, 0o700)
+        if os.access(out_path, os.W_OK) and os.getuid() == 0:
+            self.skipTest("root removes the file regardless of the directory mode")
+        err = io.StringIO()
+        with patch.object(report, "run_cmd", side_effect=AssertionError("nothing is read")), redirect_stderr(err):
+            rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_path])
+        self.assertEqual(rc, report.EXIT_USAGE)
+        self.assertIn("could not remove the previous", err.getvalue())
+
+    def test_write_json_atomically_leaves_the_previous_file_on_failure(self):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "out.json")
+        report.write_json_atomically(path, {"run": 1}, report.OUTPUT_TMP_PREFIX)
+        with self.assertRaises(TypeError):
+            report.write_json_atomically(path, {"run": object()}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 1})
+        self.assertEqual(os.listdir(directory), ["out.json"])
+        report.write_json_atomically(path, {"run": 2}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 2})
+
+    def test_main_refuses_an_abbreviated_flag(self):
+        # The bench credits a run by the flag's full word; argparse's prefix matching would run
+        # the report on `--readi` and leave the run uncredited.
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+            report.main(["--project", "p1", "--target-version", self.target, "--readi"])
+        self.assertEqual(exc.exception.code, report.EXIT_USAGE)
+        self.assertIn("--readi", err.getvalue())
 
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()

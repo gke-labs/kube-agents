@@ -178,6 +178,10 @@ STATE_FILE_SUFFIX = ".json"
 # runs against one target at once (a chat turn and a delegated card) cannot truncate
 # each other's half-written file; the last rename wins whole.
 STATE_TMP_PREFIX = ".fleet-upgrade-record-"
+# The `--output` document is written the same way, and removed when a run starts, so a run
+# that dies before it writes leaves none rather than the previous run's report at the path a
+# reader was told to read.
+OUTPUT_TMP_PREFIX = ".fleet-upgrade-output-"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -1028,21 +1032,46 @@ def load_state(path: str) -> tuple[dict | None, str | None]:
     return data, None
 
 
-def save_state(path: str, state: dict) -> None:
-    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+def write_json_atomically(path: str, data: dict, tmp_prefix: str) -> None:
+    """Writes `data` as JSON whole: a unique temp file in the same directory, then a rename, so
+    a reader never meets a partial document and a write that fails leaves the previous file or
+    none. Raises what the write raised (OSError, or a serialisation error) after removing the
+    temp file."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=STATE_TMP_PREFIX, suffix=STATE_FILE_SUFFIX, dir=directory)
+    fd, tmp = tempfile.mkstemp(prefix=tmp_prefix, suffix=STATE_FILE_SUFFIX, dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=JSON_INDENT)
+            json.dump(data, f, indent=JSON_INDENT)
         os.replace(tmp, path)
-    except OSError:
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def save_state(path: str, state: dict) -> None:
+    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+    write_json_atomically(path, state, STATE_TMP_PREFIX)
+
+
+def clear_output(path: str) -> str | None:
+    """Removes the `--output` file a previous run left at `path`, before this run reads anything,
+    so a run that dies or is refused leaves no file rather than the previous question's report
+    where a reader was told the answer is. Returns the error to report when a file is there and
+    cannot be removed; None when there is none or it is gone. A directory at the path is left
+    for the write to report, as before."""
+    if os.path.isdir(path):
+        return None
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"could not remove the previous {path}: {e}"
+    return None
 
 
 def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
@@ -1206,7 +1235,9 @@ def render_progress(report: dict, previous: dict | None) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
+    # Exact flags only: the bench reads a worker's run of this script by the flag's full word,
+    # so argparse's prefix matching (`--readi`) would run a report the reader does not credit.
+    parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.", allow_abbrev=False)
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. On an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args; omit to sweep --scope-projects when given, else the fleet's configured projects")
     fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
@@ -1235,6 +1266,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.at or args.kubeconfig_dir:
         sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
         return EXIT_USAGE
+
+    if args.output:
+        clear_error = clear_output(args.output)
+        if clear_error:
+            sys.stderr.write(clear_error + "\n")
+            return EXIT_USAGE
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)
@@ -1271,9 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.output:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=JSON_INDENT)
+            write_json_atomically(args.output, report, OUTPUT_TMP_PREFIX)
             print(f"\nWrote {len(report['members'])} member(s) to {args.output}")
         except OSError as e:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")

@@ -53,7 +53,9 @@ directory use the absolute path, `/opt/data/profiles/platform/skills/fleet-upgra
   location, and the target column says which baseline was used, for example
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
-  status, and the `rollout` block described below.
+  status, and the `rollout` block described below. The file is removed when the run starts and
+  written whole (a temp file, then a rename) when it finishes, so a run that dies leaves none: a
+  missing file means the run did not finish, never that an earlier run's report is current.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
