@@ -7,6 +7,7 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import errno
 import hashlib
 import importlib
 import inspect
@@ -21,6 +22,7 @@ import sys
 import textwrap
 import unittest
 import os
+from contextlib import redirect_stderr
 from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -12475,6 +12477,47 @@ class PrepareKubeconfigTest(unittest.TestCase):
                 note = collect.prepare_kubeconfig(kc)
             self.assertIn("could not be moved aside", note)
             self.assertIn(f"this run is uid {other}", note)
+
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # uid 1000 first, then a root hand run over `kubectl exec`: from root's side the directory is
+        # another uid's, and root keeps it rather than moving the tick's files aside, since root can
+        # write into it. Mocked root shows this branch; the one branch it cannot show is the
+        # `os.access` keep of a stale file root can write, which needs a real root.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, True, [".kubeconfigs"]))
+
+    def test_a_rename_another_thread_won_is_already_moved_not_a_refusal(self):
+        # The first wave's threads start at once on a directory another uid left: each stats it, one
+        # rename wins, and the others' rename finds the source gone (or, across two runs in the same
+        # second, the aside already holding it). The loser reads what stands there now, the winner's
+        # fresh directory, and reports no refusal, so its cluster is read this run.
+        real_rename = Path.rename
+        for errno_lost, reason in ((errno.ENOENT, "No such file or directory"), (errno.ENOTEMPTY, "Directory not empty")):
+            with self.subTest(errno=errno_lost), TemporaryDirectory() as tmp:
+                kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+                kc.parent.mkdir(0o755)
+                kc.write_text("root's")
+                other = kc.parent.stat().st_uid + 1
+
+                def winner_first(path, target, _errno=errno_lost, _reason=reason):
+                    # The winner moved the directory and remade it between this thread's stat and rename.
+                    real_rename(path, target)
+                    path.mkdir(0o755)
+                    raise OSError(_errno, _reason)
+
+                with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", winner_first), redirect_stderr(io.StringIO()) as err:
+                    self.assertIsNone(collect.prepare_kubeconfig(kc))
+                self.assertNotIn("could not be moved aside", err.getvalue())
+                [aside] = [p for p in Path(tmp).iterdir() if p.name.startswith(".kubeconfigs.unusable-")]
+                self.assertEqual(((aside / kc.name).read_text(), self.mode(kc.parent), kc.exists()), ("root's", collect.KUBECONFIG_DIR_MODE, False))
+                # Any other failure of the rename is still the refusal, naming the owner.
+                with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                    self.assertIn("could not be moved aside", collect.prepare_kubeconfig(kc) or "")
 
     def test_a_directory_this_uid_cannot_stat_is_a_note_not_a_raise(self):
         # A parent this uid cannot search, or a file where the directory should be: the note the

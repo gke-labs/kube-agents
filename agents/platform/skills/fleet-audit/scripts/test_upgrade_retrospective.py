@@ -1288,6 +1288,16 @@ class ClassifierSignatureTest(unittest.TestCase):
         # is entry 2, or its budget entry 1); the fixture Deployment has one, so the test gives it two.
         inventory["spec"]["replicas"] = 1
         self.assertEqual([s for s in symptoms_of("seeded-a", reads=reads) if s["category"] == ur.CATEGORY_UNAVAILABLE], [])
+        # Nor is it entry 3 when the drain's evicted pod is still listed beside its Pending replacement
+        # (Terminating under its grace period, or Failed and not yet collected): the floor is the spec's
+        # count, never the pod list's length.
+        leftover = copy.deepcopy(replica)
+        leftover["metadata"]["name"] = replica["metadata"]["name"] + "-old"
+        leftover["metadata"]["deletionTimestamp"] = "2026-10-07T04:05:00Z"
+        leftover["status"]["phase"] = "Failed"
+        pods.append(leftover)
+        self.assertEqual([s for s in symptoms_of("seeded-a", reads=reads) if s["category"] == ur.CATEGORY_UNAVAILABLE], [])
+        pods.remove(leftover)
         inventory["spec"]["replicas"] = 2
         [row] = [s for s in symptoms_of("seeded-a", reads=reads) if s["category"] == ur.CATEGORY_UNAVAILABLE]
         self.assertEqual((row["object"], row["pool"], row["all_in_pool"], row["pods"]), ("seeded-stall/Deployment/inventory-api", "default-pool", True, [replica["metadata"]["name"]]))
@@ -2021,9 +2031,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 with redirect_stderr(io.StringIO()) as err2:
                     self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertIn("guards.json.unreadable-", err2.getvalue())
+                self.assertIn(f"Restore it as {ur.GUARDS_FILENAME}", err2.getvalue())
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
                 rc = ur.main(["--full", "--scope-projects", PROJECT, "--no-report"])
         self.assertEqual(rc, 0)
+        # Both files' records sit in the archive, and neither beside the live files.
+        self.assertEqual(sorted({p.name.split(".unreadable-")[0] for p in (self.home / ur.ARCHIVE_SUBDIR).rglob("*.unreadable-*")}), sorted({ur.GUARDS_FILENAME, ur.LEDGER_FILENAME}))
+        self.assertEqual([p.name for p in self.home.glob("*.unreadable-*")], [])
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["version"], ur.LEDGER_VERSION)
 
     def test_lock_is_waited_for_ten_minutes_polling(self):
@@ -2889,6 +2903,53 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(kc.parent.stat().st_mode), fleet_collect.KUBECONFIG_DIR_MODE)
             with mock.patch.object(fleet_collect, "prepare_kubeconfig", return_value="refused"):
                 self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, "get-credentials: refused"))
+            # A root hand run after the tick: from root's side the directory is another uid's, and root
+            # keeps it rather than moving the tick's files aside (the `os.access` keep of a stale file
+            # root can write is the one branch that needs a real root).
+            kc.write_text("the tick's")
+            with mock.patch.object(os, "geteuid", return_value=fleet_collect.ROOT_UID):
+                self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            self.assertEqual((kc.exists(), stat.S_IMODE(kc.parent.stat().st_mode), len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")])), (True, fleet_collect.KUBECONFIG_DIR_MODE, 1))
+            # The rename race in the worker pool: the thread whose rename finds the directory already
+            # moved (the winner remade it between this thread's stat and rename) reads what stands there
+            # and reports no refusal, so its cluster is read this run.
+            for earlier in [p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")]:
+                earlier.rename(earlier.with_name("earlier-" + earlier.name))
+            real_rename = Path.rename
+
+            def winner_first(path, target):
+                real_rename(path, target)
+                path.mkdir(0o755)
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+            with mock.patch.object(os, "geteuid", return_value=kc.parent.stat().st_uid + 1), mock.patch.object(Path, "rename", winner_first), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            self.assertNotIn("could not be moved aside", err.getvalue())
+            self.assertEqual((len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")]), stat.S_IMODE(kc.parent.stat().st_mode)), (1, fleet_collect.KUBECONFIG_DIR_MODE))
+
+    def test_the_shared_kubeconfig_directory_is_prepared_once_before_the_pools_open(self):
+        # One preparation before any credentials are fetched, so the first wave's threads never race one
+        # another's move-aside of a directory another uid left; the per-cluster call then finds the
+        # directory this run's. With one worker the order is exact: the pre-pool preparation, then each
+        # cluster's own before its `get-credentials`.
+        import collect as fleet_collect  # noqa: PLC0415 -- the shared rule under test
+
+        sequence = []
+        fleet = FakeFleet()
+        real = fleet_collect.usable_kubeconfig_dir
+
+        def prepared(directory):
+            sequence.append("prepare")
+            return real(directory)
+
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                sequence.append("credentials")
+            return fleet(argv, **kwargs)
+
+        with mock.patch.object(fleet_collect, "usable_kubeconfig_dir", prepared), redirect_stderr(io.StringIO()):
+            ur.collect(args(), run=run, now=NOW, max_workers=1)
+        self.assertEqual((sequence[:3], sequence.count("credentials")), (["prepare", "prepare", "credentials"], 2))
 
     def test_a_quiet_after_upgrade_wake_names_what_it_holds(self):
         # A wake that writes nothing says why: nothing settled is reviewable yet, and each held cluster's
@@ -3355,7 +3416,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
             # The ledger is gone and a crash record sits beside its place: every run refuses.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
-            self.assertIn("sits beside no live state file", err.getvalue())
+            self.assertIn(f"sits beside no live {ur.LEDGER_FILENAME}", err.getvalue())
+            self.assertIn(f"Restore it as {ur.LEDGER_FILENAME}", err.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             # --dry-run lists the records and moves none; the block stands.
             with redirect_stdout(io.StringIO()) as out:

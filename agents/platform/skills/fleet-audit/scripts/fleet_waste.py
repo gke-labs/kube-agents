@@ -6355,6 +6355,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         except Exception as exc:  # noqa: BLE001 — see crashed_project_error
             return ProjectCrash(crashed_project_error(p, exc))
 
+    # The shared kubeconfig directory, made usable once before the pool opens
+    # (`collect.usable_kubeconfig_dir`, the one rule): the first wave's threads
+    # would otherwise race one another's move-aside and log it as a refusal.
+    if clusters:
+        from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+        shared_note = usable_kubeconfig_dir(KUBECONFIG_DIR)
+        if shared_note:
+            log(f"{KUBECONFIG_DIR}: {shared_note}")
+
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     prefetched: dict[str, dict[tuple[str, ...], Run] | ProjectCrash | None] = {}
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters) + len(readable), max_workers))) as pool:

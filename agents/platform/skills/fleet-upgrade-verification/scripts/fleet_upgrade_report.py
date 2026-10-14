@@ -31,6 +31,7 @@ optional `--output` JSON.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -270,6 +271,9 @@ KUBECONFIG_MODE_NOT_CHANGED_FORMAT = "{directory} is at mode {mode}, not {wanted
 KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is another uid's and could not be replaced ({error})"
 KUBECONFIG_NOT_PREPARED_FORMAT = "cannot prepare kubeconfig: {note}"
 KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# A rename that finds the directory already moved (another run's tick in the
+# same second won the move-aside): not a refusal, as the shared rule reads it.
+KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
 ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
@@ -723,9 +727,19 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
             try:
                 os.rename(kubeconfig_dir, aside)
             except OSError as exc:
-                return KUBECONFIG_NOT_MOVED_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, euid=euid, error=exc)
-            print(KUBECONFIG_MOVED_ASIDE_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, aside=os.path.basename(aside)), file=sys.stderr)
-            current = None
+                if exc.errno not in KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS:
+                    return KUBECONFIG_NOT_MOVED_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, euid=euid, error=exc)
+                # Another run moved it first: read what stands there now and
+                # go on, as the shared rule does.
+                try:
+                    current = os.stat(kubeconfig_dir)
+                except FileNotFoundError:
+                    current = None
+                except OSError as read_exc:
+                    return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=read_exc)
+            else:
+                print(KUBECONFIG_MOVED_ASIDE_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, aside=os.path.basename(aside)), file=sys.stderr)
+                current = None
         if current is None:
             # Made at the caller's umask and chmodded below: the umask is
             # process-wide, and a toggle here would race the other threads.

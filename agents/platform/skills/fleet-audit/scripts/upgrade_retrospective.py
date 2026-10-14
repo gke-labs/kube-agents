@@ -147,7 +147,7 @@ untouched pool. Row 12 (a node label removed) is decided by the nodes read,
 not the scheduler's message: it holds only when no node carries the pod's
 pinned labels, and is medium unless the label is in `DROPPED_NODE_LABELS`,
 empty until a GKE source names a removal. A crash record beside no ledger
-blocks every run until
+or guards file blocks every run until
 `--reset-ledger` archives it; a run starts from empty only when neither
 exists.
 
@@ -180,7 +180,7 @@ atomically, so a crash leaves at most a report with no ledger advance. A
 ledger or guards file that exists but cannot be read, or carries another
 version, is moved aside as `<name>.unreadable-<ts>` and the run stops: that
 file is a crash record, not a re-baseline, and a run proceeds as a first run
-only when no ledger file existed at all. A cluster with an upgrade operation
+only when neither file nor a record of it exists. A cluster with an upgrade operation
 still in flight, or with one that reached DONE less than fifteen minutes
 before the run (the settle floor, on every route), is not reviewed; Info
 lists it as upgrading now or as settling, nothing is read from it and no
@@ -301,7 +301,7 @@ INFO_BUDGET_SPENT = "Read budget spent: {seconds} s after {reviewed} review(s) a
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
-STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
+STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger or guards file is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
 EXIT_USAGE = 2
 EXIT_LOCK_HELD = 1
 # Reports are named by the run's finish time in UTC; a scoped run (one that
@@ -556,7 +556,7 @@ UNREADABLE_GLOB_SUFFIX = ".unreadable-*"
 CRASH_RECORD_GLOB = LEDGER_FILENAME + UNREADABLE_GLOB_SUFFIX
 GUARDS_RECORD_GLOB = GUARDS_FILENAME + UNREADABLE_GLOB_SUFFIX
 ARCHIVE_SUBDIR = "archive"
-CRASH_RECORD_TEXT = "{path} sits beside no live state file: a crash record, not a re-baseline. Restore it as the ledger or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
+CRASH_RECORD_TEXT = "{path} sits beside no live {name}: a crash record, not a re-baseline. Restore it as {name} or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
 RESET_LEDGER_TEXT = "archived {count} crash record(s) under {archive}; the next run starts fresh."
 RESET_LEDGER_NOTHING_TEXT = "no crash record to archive."
 RESET_LEDGER_DRY_RUN_TEXT = "would archive {count} crash record(s) under {archive}: {names}; nothing moved (--dry-run)."
@@ -1466,8 +1466,9 @@ def pool_cgroup_modes(cluster: dict) -> dict[str, str]:
 
 class StateUnreadable(Exception):
     """A ledger or guards file exists but cannot be used. The run stops: a
-    set-aside ledger is a crash record, not a re-baseline, and a run proceeds
-    as a first run only when no ledger file existed at all."""
+    set-aside ledger or guards file is a crash record, not a re-baseline, and
+    a run proceeds as a first run only when neither file nor a record of it
+    exists."""
 
 
 def _set_aside(path: Path, why: str, now: datetime, move: bool = True) -> None:
@@ -1753,8 +1754,12 @@ def what_happened(selection: Selection, ledger: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def kubeconfig_dir() -> Path:
+    return hermes_home() / KUBECONFIG_SUBDIR
+
+
 def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
-    return hermes_home() / KUBECONFIG_SUBDIR / KUBECONFIG_FILENAME.format(project=project, cluster=cluster, location=location)
+    return kubeconfig_dir() / KUBECONFIG_FILENAME.format(project=project, cluster=cluster, location=location)
 
 
 def fetch_credentials(cluster: dict, *, run: RunFn) -> tuple[Path, str | None]:
@@ -3147,9 +3152,12 @@ def unavailable_symptoms(workloads: list[dict], pods: list[dict], nodes: list[di
     rows = []
     for obj, (onset, message, replicas) in _unavailable_workloads(workloads).items():
         pods_of = owned.get(obj) or []
-        if not pods_of or max(replicas, len(pods_of)) < SPREAD_MIN_REPLICAS:
-            # The catalogue's floor: one replica lost to a drain is entry 2
-            # (its Pending replacement) or 1 (the budget), never 3.
+        if not pods_of or replicas < SPREAD_MIN_REPLICAS:
+            # The catalogue's floor, on the spec's count alone: one replica
+            # lost to a drain is entry 2 (its Pending replacement) or 1 (the
+            # budget), never 3, and the evicted pod still listed beside the
+            # replacement (Terminating, or Failed and not yet collected) does
+            # not make it two.
             continue
         if onset is None:
             # A StatefulSet carries no date: the earliest pod the drain recreated.
@@ -5423,7 +5431,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             if crash_records:
                 # A set-aside guards file blocks like a ledger's: restarting
                 # with no guards while the ledger says "unchanged" loses them.
-                raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1]))
+                raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1], name=state_path.name))
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
     guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
     forced = forced_clusters(args)
@@ -5516,6 +5524,19 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             server_configs[(project, location)] = config
             if error:
                 failed_reads.append(f"{project}/{location}: {error}")
+    # The shared kubeconfig directory, made usable once before the pools
+    # open (`collect.usable_kubeconfig_dir`, the one rule): the first wave's
+    # threads would otherwise race one another's move-aside of a directory
+    # another uid left, and the loser would report the race as its cluster's
+    # error. `fetch_credentials` then finds it this run's and clears a stale
+    # file alone.
+    if clusters:
+        from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory
+
+        shared_note = usable_kubeconfig_dir(kubeconfig_dir())
+        if shared_note:
+            log(f"{kubeconfig_dir()}: {shared_note}")
+
     def review_or_defer(s: Selection) -> dict | None:
         # Checked as each review starts: past the deadline the cluster is
         # held, untouched in the ledger and the guards, for the next run.

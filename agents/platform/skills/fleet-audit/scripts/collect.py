@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import errno
 import hashlib
 import ipaddress
 import json
@@ -110,6 +111,12 @@ KUBECONFIG_DIR_MODE = 0o1777
 KUBECONFIG_DIR_MODE_MASK = 0o7777
 KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
 KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# A rename that finds the directory already moved: another thread of this
+# run, or another collector's tick in the same second, won the move-aside
+# between this thread's stat and its rename (the source gone, or the aside
+# of this second already holding it). Not a refusal: the thread reads what
+# stands there now and goes on.
+KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
 ROOT_UID = 0
 DEFAULT_TIMEOUT_S = 60
 # How many clusters a sweep reads at once. Every check is a kubectl or gcloud
@@ -814,9 +821,19 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
         try:
             directory.rename(aside)
         except OSError as exc:
-            return f"{directory} is owned by uid {current.st_uid} and this run is uid {euid}; it could not be moved aside ({exc})"
-        log(f"{directory}: owned by uid {current.st_uid}, moved aside to {aside.name}; this run makes its own")
-        current = None
+            if exc.errno not in KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS:
+                return f"{directory} is owned by uid {current.st_uid} and this run is uid {euid}; it could not be moved aside ({exc})"
+            # Another thread or run moved it first: read what stands there
+            # now (the winner's fresh directory, or nothing yet) and go on.
+            try:
+                current = directory.stat()
+            except FileNotFoundError:
+                current = None
+            except OSError as read_exc:
+                return f"{directory} could not be read ({read_exc})"
+        else:
+            log(f"{directory}: owned by uid {current.st_uid}, moved aside to {aside.name}; this run makes its own")
+            current = None
     if current is None:
         # Made at the caller's umask and chmodded below: the umask is
         # process-wide, and a toggle here would race the other threads.
@@ -9457,6 +9474,16 @@ def collect_fleet(
     declarations = workload_declarations(workspace) if workspace else {}
     releases = release_declarations(workspace) if workspace else {}
     namespaces = namespace_directories(declarations, releases, workspace)
+
+    # The shared kubeconfig directory, made usable once before the pool
+    # opens: the first wave's threads would otherwise race one another's
+    # move-aside of a directory another uid left, and the losers would log
+    # the race as a refusal. `fetch_credentials` then finds it this run's
+    # and clears a stale file alone.
+    if clusters:
+        shared_note = usable_kubeconfig_dir(KUBECONFIG_DIR)
+        if shared_note:
+            log(f"{KUBECONFIG_DIR}: {shared_note}")
 
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

@@ -8096,5 +8096,17 @@ class PrepareKubeconfigTest(unittest.TestCase):
                 os.umask(mask)
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o1777, os.geteuid() == 0))
 
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # The tick's directory, then a root hand run: from root's side it is another uid's, and root
+        # keeps it rather than moving the tick's files aside. Mocked root shows this branch; the
+        # `os.access` keep of a stale file root can write needs a real root.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0):
+                path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o1777, True, [".kubeconfigs"]))
+
 if __name__ == "__main__":
     unittest.main()

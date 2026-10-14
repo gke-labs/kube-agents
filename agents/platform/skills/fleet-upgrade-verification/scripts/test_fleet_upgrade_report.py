@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for fleet_upgrade_report.py, with gcloud replaced by canned JSON."""
 
+import errno
 import io
 import json
 import os
@@ -1100,6 +1101,37 @@ class PrepareKubeconfigTest(unittest.TestCase):
             with patch.object(os, "stat", side_effect=refusing):
                 note = report.prepare_kubeconfig(shared, path)
             self.assertEqual(note, report.KUBECONFIG_NOT_READ_FORMAT.format(directory=shared, error="[Errno 13] Permission denied"))
+
+    def test_a_root_run_keeps_the_ticks_directory_and_a_lost_rename_race_is_no_refusal(self):
+        # From root's side the tick's directory is another uid's, and root keeps it rather than moving
+        # the tick's files aside (mocked root shows this branch; the `os.access` keep of a stale file
+        # root can write needs a real root). A rename that finds the directory already moved, another
+        # run's tick in the same second having won, reads what stands there now and is no refusal.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            os.mkdir(shared, 0o755)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("the tick's")
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, True, [".kubeconfigs"]))
+            other = os.stat(shared).st_uid + 1
+            real_rename = os.rename
+
+            def winner_first(src, dst, *args, **kwargs):
+                # The winner moved the directory and remade it between this run's stat and rename.
+                real_rename(src, dst, *args, **kwargs)
+                os.mkdir(src, 0o755)
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+            with patch.object(os, "geteuid", return_value=other), patch.object(os, "rename", winner_first), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertNotIn("could not be moved aside", err.getvalue())
+            [aside] = [n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]
+            self.assertEqual((os.path.exists(os.path.join(root, aside, os.path.basename(path))), os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path)), (True, report.KUBECONFIG_DIR_MODE, False))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
