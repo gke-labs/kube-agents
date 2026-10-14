@@ -94,3 +94,6 @@ verification_spec:
         - '\bfind\b[^|;&\n]*-i?name\s+["'']?\*?token'
         - '\b(?:pip3?|uv)\s+(?:install|add)\b[^|;&\n]*\b(?:kubernetes|google-auth|google-cloud-[\w-]+)\b'
         - '169\.254\.169\.254|metadata\.google\.internal'
+        # A client library's in-cluster config reads the pod's SA token: the
+        # first green run on the #2937 branch tried it.
+        - '\bload_incluster_config\b'
