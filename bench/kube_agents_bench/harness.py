@@ -1037,7 +1037,7 @@ try:
         "SELECT MIN(created_at) FROM tasks WHERE id IN (%s)" % placeholders, roots
     ).fetchone()[0] or 0
     seen, queue, out = set(roots), list(roots), []
-    while queue and len(out) <= CAP:
+    while queue and len(out) <= CAP:  # one past the cap, so the caller sees it
         tid = queue.pop(0)
         for cid, status, created in kb.execute(
             "SELECT c.child_id, t.status, COALESCE(t.created_at, 0) FROM kanban_worker_children c "
@@ -1052,9 +1052,7 @@ try:
             queue.append(cid)
             if status not in ("done", "archived"):
                 out.append(cid)
-    print("\n".join(out[:CAP]))
-    if len(out) > CAP:
-        print("capped at %d" % CAP)
+    print("\n".join(out[:CAP + 1]))
     print("listed")
 except sqlite3.Error as exc:
     print("descendants unread: %s" % exc)
@@ -1064,8 +1062,10 @@ except sqlite3.Error as exc:
 # worker can still fan out until its own archive, and the next pass finds that.
 _DESCENDANT_PASSES = 3
 
-# How many fan-out descendants one settle archives. A fan-out is a handful of
-# clusters; the cap keeps a runaway creator from turning cleanup into a storm.
+# How many fan-out descendants one settle archives, across all its passes. A
+# fan-out is a handful of clusters; the cap keeps a runaway creator from turning
+# cleanup into a storm. One listing is capped at the same figure (plus one, so
+# the settle can tell the cap was hit).
 _MAX_ARCHIVED_DESCENDANTS = 32
 
 _CARD_ID = re.compile(r"t_[0-9a-f]+")
@@ -1092,11 +1092,6 @@ def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
         _log.warning(
             "could not list the fan-out children of stalled cards %s; any of them may still hold a "
             "dispatcher slot (%s)", ", ".join(stalled), out[:_LOG_EXCERPT_CHARS] or "no output",
-        )
-    if "capped at" in out:
-        _log.warning(
-            "the stalled cards fanned out more than %d unsettled cards; only the first %d are archived",
-            _MAX_ARCHIVED_DESCENDANTS, _MAX_ARCHIVED_DESCENDANTS,
         )
     if out.strip() and not ids and "descendants unread" in out:
         _log.warning("could not list the stalled cards' fan-out children (%s)", out[:_LOG_EXCERPT_CHARS])
@@ -1129,13 +1124,29 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     for tid in stalled:
         _archive_card(tid, "stalled card", timeout)
     done = set(stalled)
+    archived = 0
     for _ in range(_DESCENDANT_PASSES):
         fresh = [d for d in _stalled_descendants(stalled, timeout) if d not in done]
         if not fresh:
             break
-        for tid in fresh:
+        room = _MAX_ARCHIVED_DESCENDANTS - archived
+        for tid in fresh[:room]:
             _archive_card(tid, "fan-out child of a stalled card", timeout)
             done.add(tid)
+            archived += 1
+        if len(fresh) > room:
+            _log.warning(
+                "the stalled cards fanned out more than %d unsettled cards; %d were archived and the "
+                "rest may still hold dispatcher slots", _MAX_ARCHIVED_DESCENDANTS, archived,
+            )
+            return
+    else:
+        # The budget ended the loop, not an empty pass: the last pass's cards
+        # could have filed children of their own before their archive.
+        _log.warning(
+            "stopped looking for the stalled cards' fan-out children after %d passes; a child filed "
+            "during the last one may still hold a dispatcher slot", _DESCENDANT_PASSES,
+        )
 
 
 def _archive_card(tid: str, kind: str, timeout: float) -> None:

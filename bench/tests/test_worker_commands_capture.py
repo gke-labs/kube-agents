@@ -234,7 +234,8 @@ def test_the_descendants_script_respects_its_cap(tmp_path):
         [sys.executable, "-c", harness._DESCENDANTS_SCRIPT, str(tmp_path), "2", "t_aa"],
         capture_output=True, text=True, check=True,
     ).stdout.split()
-    assert out == ["t_b2", "t_b3", "capped", "at", "2", "listed"]
+    # One past the cap, so the settle can tell the cap was hit.
+    assert out == ["t_b2", "t_b3", "t_b4", "listed"]
 
 
 def test_a_board_without_the_attribution_table_lists_nothing(tmp_path):
@@ -270,11 +271,59 @@ def test_a_listing_that_did_not_finish_is_a_warning(monkeypatch, caplog):
     assert "could not list the fan-out children of stalled cards t_aa" in caplog.text
 
 
-def test_hitting_the_cap_is_a_warning(monkeypatch, caplog):
-    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "t_b2\ncapped at 32\nlisted\n")
+def _archive_names(calls):
+    return [s.split("archive ")[1].split(" ")[0].strip("'") for s in calls if "kanban archive" in s]
+
+
+def test_the_cap_bounds_the_whole_settle_and_warns_once(monkeypatch, caplog):
+    many = ["t_%02x" % i for i in range(70)]
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if "kanban_worker_children" in script:
+            done = set(_archive_names(calls))
+            fresh = [t for t in many if t not in done]
+            return "\n".join(fresh[: harness._MAX_ARCHIVED_DESCENDANTS + 1]) + "\nlisted\n"
+        return "Archived " + script.split("archive ")[1].split(" ")[0].strip("'")
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
-        assert harness._stalled_descendants(["t_aa"], 5.0) == ["t_b2"]
-    assert "only the first 32 are archived" in caplog.text
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    children = [n for n in _archive_names(calls) if n != "t_aa"]
+    assert len(children) == harness._MAX_ARCHIVED_DESCENDANTS
+    assert caplog.text.count("fanned out more than") == 1
+    assert "32 were archived" in caplog.text
+
+
+def test_running_out_of_passes_is_a_warning(monkeypatch, caplog):
+    passes = iter(["t_b1\nlisted\n", "t_c1\nlisted\n", "t_d1\nlisted\n"])
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if "kanban_worker_children" in script:
+            return next(passes)
+        return "Archived x"
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    assert "after 3 passes" in caplog.text
+
+
+def test_an_empty_pass_ends_quietly(monkeypatch, caplog):
+    passes = iter(["t_b1\nlisted\n", "listed\n"])
+
+    def fake_shell(script, timeout):
+        if "kanban_worker_children" in script:
+            return next(passes)
+        return "Archived x"
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    assert "passes" not in caplog.text
 
 
 def test_a_stalled_cards_fanout_children_are_archived_too(monkeypatch, caplog):
