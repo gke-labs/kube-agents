@@ -961,7 +961,7 @@ class TestRegistration(unittest.TestCase):
         )
 
     def test_reports_are_never_chunked(self):
-        """A split report would start one Chat Agent turn per piece."""
+        """A split report would post as several messages, each its own piece."""
         captured = {}
 
         class Ctx:

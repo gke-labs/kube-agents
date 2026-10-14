@@ -132,6 +132,18 @@ def test_delivered_with_nothing_stored_fails(install: Install) -> None:
     assert "stored no post" in reason
 
 
+def test_a_delivered_send_with_no_thread_is_an_error_not_a_fail(install: Install) -> None:
+    """The route answers delivered for a send whose outcome was unknown, and registers no thread."""
+    install.posted()
+    with sqlite3.connect(install.kv_db) as con:
+        con.execute("INSERT INTO session_metadata VALUES (?, ?)", (DAY_SESSION, json.dumps({"platform": "cron-report"})))
+
+    status, reason = relay.verdict(install.read())
+
+    assert status == "error"
+    assert "registered no thread" in reason
+
+
 def test_a_post_from_before_this_run_is_not_read(install: Install) -> None:
     install.posted()
     install.stored("noted.", thread="slack/T0", at=POSTED_AT - timedelta(hours=2))

@@ -54,6 +54,10 @@ SESSION_PREFIX = f"cron-{PROFILE}-{JOB_ID}-"
 TIMEOUT_SECONDS = 400.0
 SQLITE_BUSY_TIMEOUT = 10
 TMP_SUFFIX = ".tmp"
+# How much of a refused route's body the state file keeps, and the apply log shows.
+DETAIL_MAX_CHARS = 2000
+LOG_ANSWER_MAX_CHARS = 300
+ARCHIVED = "archived"
 
 
 def write_state(state):
@@ -80,24 +84,33 @@ def post(report):
         with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
             state["status"], state["answer"] = resp.status, json.loads(resp.read().decode() or "{}")
     except urllib.error.HTTPError as exc:
-        state["status"], state["answer"] = exc.code, {"detail": exc.read().decode(errors="replace")[:2000]}
+        state["status"], state["answer"] = exc.code, {"detail": exc.read().decode(errors="replace")[:DETAIL_MAX_CHARS]}
     write_state(state)
-    print(f"posted {JOB_ID}: HTTP {state['status']} {json.dumps(state['answer'])[:300]}")
+    print(f"posted {JOB_ID}: HTTP {state['status']} {json.dumps(state['answer'])[:LOG_ANSWER_MAX_CHARS]}")
+
+
+def live_cards():
+    """The probe's cards that are not archived, read from the board."""
+    if not os.path.exists(KANBAN_DB):
+        return []
+    con = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
+    try:
+        return [
+            row[0]
+            for row in con.execute(
+                "SELECT id FROM tasks WHERE session_id LIKE ? AND status != ?", (SESSION_PREFIX + "%", ARCHIVED)
+            )
+        ]
+    finally:
+        con.close()
 
 
 def clean():
-    cards = []
-    if os.path.exists(KANBAN_DB):
-        con = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
-        cards = [
-            row[0]
-            for row in con.execute(
-                "SELECT id FROM tasks WHERE session_id LIKE ? AND status != 'archived'", (SESSION_PREFIX + "%",)
-            )
-        ]
-        con.close()
+    cards = live_cards()
     for card in cards:
         subprocess.run([hermes, "kanban", "archive", card], capture_output=True, text=True, check=False)
+    # `hermes kanban archive` can refuse without failing, so the board says what happened.
+    refused = [card for card in live_cards() if card in cards]
     rows = 0
     if os.path.exists(SESSION_KV_DB):
         with sqlite3.connect(SESSION_KV_DB, timeout=SQLITE_BUSY_TIMEOUT) as con:
@@ -115,7 +128,9 @@ def clean():
         os.remove(STATE)
     except FileNotFoundError:
         pass
-    print(f"cleaned: {len(cards)} card(s) archived, {rows} stored post(s) removed")
+    print(f"cleaned: {len(cards) - len(refused)} card(s) archived, {rows} stored post(s) removed")
+    if refused:
+        print(f"could not archive {', '.join(refused)}; the next run tries again", file=sys.stderr)
 
 
 if mode == "post":

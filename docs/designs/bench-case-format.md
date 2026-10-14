@@ -272,7 +272,7 @@ that got going (running, completed, or ended after its start), each starting onl
 `relay_posted_as_written`, in its own module (`bench/kube_agents_bench/relay.py`), reads the
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a
-route that delivered but stored nothing fails.
+route that delivered but stored nothing fails, and one whose send registered no thread (outcome unknown) is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

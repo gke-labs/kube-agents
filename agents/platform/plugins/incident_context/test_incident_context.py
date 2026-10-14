@@ -215,7 +215,7 @@ class UntrustedReportFramingTest(unittest.TestCase):
         text = self.frame("annotation: " + " ".join(t.upper() if i % 2 else t for i, t in enumerate(tokens)))
         body = text.split("<untrusted_report>\n", 1)[1].split("\n</untrusted_report>", 1)[0]
         for token in tokens:
-            self.assertNotIn(token, body.lower(), f"{token!r} survived into the fenced body")
+            self.assertNotIn(token.lower(), body.lower(), f"{token!r} survived into the fenced body")
 
     def test_every_token_session_kv_server_scrubs_is_scrubbed_here_too(self):
         """The two lists are kept in step by hand; this holds the claim.

@@ -77,7 +77,14 @@ class RelayProbeTest(unittest.TestCase):
         self.home.mkdir()
         self.archived = root / "archived"
         self.hermes = root / "hermes"
-        self.hermes.write_text(f'#!/bin/sh\necho "$@" >> "{self.archived}"\n')
+        # Records each call and, unless REFUSE_ARCHIVE is set, archives the card on the board,
+        # as `hermes kanban archive` does.
+        self.hermes.write_text(
+            f'#!/bin/sh\necho "$@" >> "{self.archived}"\n'
+            f'[ -n "$REFUSE_ARCHIVE" ] || {sys.executable} -c "import sqlite3,sys; '
+            f'c=sqlite3.connect(sys.argv[1]); c.execute(\\"UPDATE tasks SET status=\'archived\' WHERE id=?\\", (sys.argv[2],)); c.commit()" '
+            f'"{self.home}/kanban.db" "$3"\n'
+        )
         self.hermes.chmod(self.hermes.stat().st_mode | stat.S_IXUSR)
         Route.status, Route.seen = 200, []
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Route)
@@ -87,8 +94,10 @@ class RelayProbeTest(unittest.TestCase):
         self.report = (STACK / "report.txt").read_text()
         self.kv_db = root / "session_kv.db"
 
-    def probe(self, *args, key=KEY):
-        env = {k: v for k, v in os.environ.items() if k != "SESSION_KV_API_KEY"}
+    def probe(self, *args, key=KEY, refuse_archive=False):
+        env = {k: v for k, v in os.environ.items() if k not in ("SESSION_KV_API_KEY", "REFUSE_ARCHIVE")}
+        if refuse_archive:
+            env["REFUSE_ARCHIVE"] = "1"
         env["SESSION_KV_DB_PATH"] = str(self.kv_db)
         if key:
             env["SESSION_KV_API_KEY"] = key
@@ -147,6 +156,18 @@ class RelayProbeTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse((self.home / ".bench-relay-probe.json").exists())
         self.assertEqual(self.archived.read_text().split(), ["kanban", "archive", "t_mine"])
+        self.assertIn("cleaned: 1 card(s) archived", done.stdout)
+
+    def test_clean_says_when_the_board_refused_an_archive(self):
+        with sqlite3.connect(self.home / "kanban.db") as con:
+            con.execute("CREATE TABLE tasks (id TEXT, session_id TEXT, status TEXT)")
+            con.execute("INSERT INTO tasks VALUES ('t_mine', 'cron-platform-bench-relay-probe-20261013', 'ready')")
+
+        done = self.probe("clean", refuse_archive=True)
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("cleaned: 0 card(s) archived", done.stdout)
+        self.assertIn("could not archive t_mine", done.stderr)
 
     def test_clean_drops_the_probe_from_the_report_index_and_nothing_else(self):
         """A probe row left behind is listed beside every unthreaded message for a day."""

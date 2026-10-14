@@ -20,7 +20,8 @@
 against each thread it posted into, in the ``incidents`` table that ``incident_context``
 replays into replies, so that row is what the channel received. This passes when the
 route delivered and every row stored for the probe's threads since the post is the
-report, exactly.
+report, exactly. A delivered send that registered no thread (its outcome unknown) is an
+error: nothing was stored to grade.
 
 An install with no chat platform (the CI install) posts nothing and stores nothing,
 and that is a fail naming the route's answer: the case grades a channel, and there is
@@ -57,7 +58,7 @@ import json, os, sqlite3, sys
 from datetime import datetime, timezone
 state, kv_db, profile, sentinel = sys.argv[1:5]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"state": None, "posted": [], "error": None}
+out = {"state": None, "posted": [], "routed": 0, "threads": 0, "error": None}
 try:
     out["state"] = json.load(open(state))
 except FileNotFoundError:
@@ -72,8 +73,10 @@ try:
         kv = sqlite3.connect("file:" + kv_db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
         threads = set()
         for (blob,) in kv.execute("SELECT metadata FROM session_metadata WHERE session_id LIKE ?", (prefix + "%",)):
+            out["routed"] += 1
             for entry in (json.loads(blob or "{}").get("platform_threads") or {}).values():
                 threads.add((entry.get("chat_id"), entry.get("thread_id")))
+        out["threads"] = len(threads)
         for chat_id, thread_id in sorted(threads):
             for (text,) in kv.execute(
                     "SELECT report FROM incidents WHERE chat_id = ? AND thread_id = ? AND created_at >= ?",
@@ -117,6 +120,11 @@ def verdict(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     if state.get("status") != 200 or answer.get("status") != DELIVERED:
         return "fail", f"the relay did not deliver the report: HTTP {state.get('status')} {json.dumps(answer)[:EXCERPT_CHARS]}"
     posted = read.get("posted") or []
+    if not posted and read.get("routed") and not read.get("threads"):
+        # relay_cron_report answers delivered for a send whose outcome was unknown
+        # (ALERT_SENT_WITHOUT_THREAD) and registers no thread for it, so the post
+        # may be in the channel with nothing stored to read it back by.
+        return "error", "the relay answered delivered but registered no thread, so what the channel got cannot be read back"
     if not posted:
         return "fail", "the relay answered delivered but stored no post for the report's thread"
     changed = [text for text in posted if text.strip() != report]
