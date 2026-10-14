@@ -2091,5 +2091,35 @@ class TestGroupEntryIsSkipped(unittest.TestCase):
         self.assertIn("names a group or namespace", "\n".join(logs.output))
 
 
-if __name__ == "__main__":  # pragma: no cover
+class TestManagedReposRegistered(unittest.TestCase):
+    """Whether `managed_repos` holds anything, read from the mounted state file."""
+
+    def registered(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / gitops_workspace.MANAGED_REPOS_KEY
+            if text is not None:
+                state.write_text(text, encoding="utf-8")
+            (Path(tmp) / gitops_workspace.CONTEXT_REPOS_KEY).write_text(
+                '[{"type": "github", "url": "https://github.com/acme/context"}]', encoding="utf-8"
+            )
+            with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state)}):
+                return gitops_workspace.managed_repos_registered()
+
+    def test_nothing_registered(self):
+        for text in (None, "", "  \n", "[]"):
+            with self.subTest(text=text):
+                self.assertFalse(self.registered(text))
+
+    def test_anything_else_is_registered(self):
+        for text in (
+            '[{"type": "github", "url": "https://github.com/acme/gitops"}]',
+            '[{"url": "https://github.com/acme/gitops"}]',
+            "[not json",
+            "{}",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self.registered(text))
+
+
+if __name__ == "__main__":
     unittest.main()

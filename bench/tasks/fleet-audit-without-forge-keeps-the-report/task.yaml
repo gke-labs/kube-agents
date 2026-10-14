@@ -1,0 +1,90 @@
+# PARKED -- a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py, in
+# no roster file under hack/eval/, until an eval install runs with no forge
+# (#2419).
+#
+# What this case grades: a fleet audit on an install with no forge still runs
+# its checks and keeps what it found. An install whose PlatformAgent declares
+# no spec.integration registers no GitOps repository, and `audit_report.py
+# start` used to resolve the ledger repository before any check ran: it exited
+# with "Could not resolve the target repository as owner/name", the audit
+# produced no findings, and the report store, which only a `finish` that
+# published to the ledger wrote, stayed empty. `start` and `finish` now run
+# without a forge: the checks run, `finish` keeps the findings document in the
+# store under `no_forge/local` with status NO_FORGE, and the run's answer
+# carries a summary that says no forge is configured.
+#
+# The fixture is an install with no forge: a PlatformAgent with no
+# spec.integration, so the gitops-state ConfigMap holds no managed_repos. The
+# CI eval install always has a GitHub forge (hack/ci-deploy.sh renders
+# platformAgent.integration.github.gitRepo), so the case runs by hand against
+# such an install until the eval pool has one.
+#
+# Domain: fleet-audits.
+# Journey: an operator whose forge kube-agents cannot reach yet (a GitLab or
+# Gitea shop) still gets the daily audits and their findings in chat.
+#
+# Planted defect required: rbac-overgrant (bench/tf/fleet/defects-a.tf), the
+# same ClusterRoleBinding compliance-rbac-overgrant grades through the ledger.
+# Isolation class: cloud-read-only; writes only the install's report store.
+# Eligible tier: nightly (a full compliance audit, 600-1300s).
+id: fleet-audit-without-forge-keeps-the-report
+name: A fleet audit with no forge configured keeps its findings and reports them
+prompt: >-
+  Run the security and RBAC posture audit, following the compliance-audit SOP.
+expected_output: >-
+  The audit runs every check with no forge configured, finds that
+  debug-binding grants cluster-admin to the default ServiceAccount in
+  seeded-security, and keeps the findings in the report store. The closing
+  response summarizes the findings and says that no forge is configured, so no
+  ledger issue or pull request was written.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+fixtures:
+  - rbac-overgrant
+
+verification_spec:
+  # The red: on the pre-change harness `start` exits before any check, so no
+  # envelope for this run exists anywhere in the store.
+  - name: the-report-store-holds-this-run
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: compliance-audit
+      status: NO_FORGE
+      required_finding_phrases: ["debug-binding"]
+  # The answer is the only report an operator on such an install receives, so
+  # it names the planted binding and says why no ledger was written.
+  - name: the-answer-names-the-binding
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["debug-binding"]
+      forbidden_phrases: ["Could not resolve the target repository"]
+  - name: the-answer-says-no-forge-is-configured
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        ['(?i)\bno\s+(?:git\s+)?forge\b', '(?i)\bno\s+gitops\s+repositor']
+  - name: the-planted-defect-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: rbac-overgrant
+      kind: clusterrolebinding
+      resource_name: debug-binding
+      path: roleRef.name
+      op: eq
+      value: cluster-admin

@@ -98,6 +98,8 @@ The harness runs co-located agents in a single operator-deployed pod: the **Plan
 
 The runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
 
+For three scenarios from trigger to pull request (a scheduled audit, a crash loop alert, and a chat question), see [A day with kube-agents](https://gke-labs.github.io/kube-agents/overview/day-in-the-life/).
+
 ---
 
 ## 🛡️ Governance & isolation

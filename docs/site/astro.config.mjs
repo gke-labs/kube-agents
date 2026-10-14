@@ -98,6 +98,7 @@ export default defineConfig({
             { label: 'Introduction', link: '/' },
             { label: 'What is kube-agents', link: '/overview/what-is-kube-agents/' },
             { label: 'Proactive autonomy', link: '/overview/proactive-autonomy/' },
+            { label: 'A day with kube-agents', link: '/overview/day-in-the-life/' },
             { label: 'Architecture', link: '/overview/architecture/' },
           ],
         },
