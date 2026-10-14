@@ -660,9 +660,9 @@ profile_and_dump_on_exit() {
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
+  collect_litellm_log
   # Defined further down; a run that died before then paused nothing.
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
-  collect_litellm_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
