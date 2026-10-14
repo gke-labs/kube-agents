@@ -139,9 +139,10 @@ def expected_entries(profile: str) -> dict[str, str]:
     return SKELETON_ENTRIES
 
 
-# What `sandbox_mirror.push_skeleton` and the sandbox entrypoint rename an
-# expected entry to when they find a file where a directory belongs: the name,
-# this mark, and a `%Y%m%dT%H%M%S` stamp.  Both log those themselves.
+# What `sandbox_mirror.push_skeleton` renames a skeleton directory to when it
+# finds a file where the directory belongs: the name, this mark, and a
+# `%Y%m%dT%H%M%S` stamp.  It logs those itself.  No other product writer
+# displaces an entry inside a home, so only skeleton names are exempt.
 DISPLACED_MARK = ".displaced-"
 DISPLACED_STAMP = re.compile(r"\d{8}T\d{6}")
 
@@ -362,7 +363,7 @@ def _is_expected(row: Row, expected: dict[str, str]) -> bool:
     if expected.get(name) == kind:
         return True
     base, mark, stamp = name.partition(DISPLACED_MARK)
-    return bool(mark) and base in expected and bool(DISPLACED_STAMP.fullmatch(stamp))
+    return bool(mark) and base in SKELETON_ENTRIES and bool(DISPLACED_STAMP.fullmatch(stamp))
 
 
 def _list(path: Path, inv: Inventory) -> list[Row] | None:
@@ -396,9 +397,10 @@ def _list(path: Path, inv: Inventory) -> list[Row] | None:
 def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     """List each sandbox profile home's unexpected entries, and stale homes.
 
-    The profile list comes from the agent pod, as the mirror's does, so the
-    sandbox's own listing can only add a home to the stale list, never decide
-    what is believed about a live one.  Nothing is moved or deleted.
+    The profile list comes from the agent pod, as the mirror's does.  The
+    sandbox's ``profiles/`` listing adds stale homes, and flags a live home
+    that isn't a directory there (a symlink lists as empty under find's
+    default ``-P``, which would read as clean).  Nothing is moved or deleted.
     """
     inv = Inventory()
     try:
@@ -417,6 +419,13 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
                 row for row in present
                 if row[3] == "d" and not row[0].startswith(".") and row[0] not in names
             ]
+            kinds = {row[0]: row[3] for row in present}
+            for name in names:
+                if kinds.get(name, "d") != "d":
+                    inv.problems.append(
+                        f"{remote_profiles / name} is type {kinds[name]!r} in the "
+                        "sandbox, not a directory; its inventory can't be trusted"
+                    )
         for name in names:
             rows = _list(remote_profiles / name, inv)
             expected = expected_entries(name)

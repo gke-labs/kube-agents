@@ -485,6 +485,10 @@ class HomeInventoryTest(unittest.TestCase):
         self.assertFalse(expected(".displaced"))
         self.assertFalse(expected("scratch.displaced-notes.sh"))
         self.assertFalse(expected("scratch.displaced-20261010T000000\n"))
+        # Only the skeleton is ever displaced inside a home.
+        self.assertFalse(expected("skills.displaced-20261010T000000"))
+        self.assertFalse(gc._is_expected(("kubeconfig.yaml.displaced-20261010T000000", 1.0, 1, "f"),
+                                         gc.CLUSTER_HOME_ENTRIES))
 
     def test_skeleton_matches_the_mirror(self):
         # The mirror creates these in every home; if it grows one, the
@@ -510,6 +514,22 @@ class HomeInventoryTest(unittest.TestCase):
                          {n for n, k in gc.PLATFORM_HOME_ENTRIES.items() if n.endswith(".db")})
         roots = re.search(r'SANDBOX_HOME_ROOTS="\$\{SANDBOX_HOME_ROOTS:-([^}]*)\}"', entrypoint)
         self.assertIn(f"profiles/{gc.PLATFORM_PROFILE}", roots.group(1).split())
+
+    def test_a_home_find_cannot_list_is_logged(self):
+        # A profile on the agent pod whose sandbox home is missing: find exits
+        # non-zero, and that is a logged problem, not a clean home.
+        (self.profiles / "cluster-b").mkdir()
+        inv = self.run_inventory(FakeSandbox(self.tree))
+        self.assertEqual(len(inv.problems), 1)
+        self.assertIn("cluster-b in the sandbox exited 1", inv.problems[0])
+        self.assertIn(str(self.remote / "profiles" / "platform"), inv.unexpected)
+
+    def test_a_live_home_that_is_not_a_directory_is_flagged(self):
+        rp = str(self.remote / "profiles")
+        self.tree[rp] = [r if r[0] != "cluster-a" else ("cluster-a", "1.0", "4", "l") for r in self.tree[rp]]
+        inv = self.run_inventory(FakeSandbox(self.tree))
+        self.assertEqual(len(inv.problems), 1)
+        self.assertIn("cluster-a is type 'l'", inv.problems[0])
 
     def test_an_unreadable_home_is_a_problem_not_a_stop(self):
         rp = self.remote / "profiles"
