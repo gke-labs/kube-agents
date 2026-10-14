@@ -913,8 +913,16 @@ class SweepDeadline(unittest.TestCase):
         """The report says the days the deadline cut are missing, not empty;
         a pointer that vanished on one of them is not listed beside the
         builds from the days that were read."""
+        # The second is on the day that was read; the third is on that day
+        # too by the clock but on no day with a landed build (today's first
+        # build, still running): kept, because it is inside the window the
+        # sweep covered, which is the bound, not the days that had reads.
+        quiet = pp.snowflake_time(self.NEW_BUILD) + timedelta(hours=20)
+        quiet_build = (int((quiet.timestamp() * 1000) - pp.SNOWFLAKE_EPOCH_MS)
+                       << pp.SNOWFLAKE_TIMESTAMP_SHIFT)
         gone = [{"build_id": str(self.OLD_BUILD + 1), "error": pp.INDEX_POINTER_VANISHED},
-                {"build_id": str(self.NEW_BUILD + 2), "error": pp.INDEX_POINTER_VANISHED}]
+                {"build_id": str(self.NEW_BUILD + 2), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": str(quiet_build), "error": pp.INDEX_POINTER_VANISHED}]
         full = self._sweep([0, 0, 0, 5], gone).value
         self.assertEqual(gone, full.unreadable)
         cut = self._sweep([0, 0, 99, 99], gone).value
@@ -1049,6 +1057,9 @@ class IndexCopy(unittest.TestCase):
         self.assertEqual({}, entries)
         self.assertIn("could not read the build index", err)
         self.assertIn(f"{pp.VANISHED_POINTER_LIMIT + 1} vanished pointers, over the ceiling", err)
+        # The message quotes a few of the lines, not one per vanished object.
+        self.assertEqual(pp.REFUSAL_ERROR_LINES, err.count("not found: 404"))
+        self.assertIn(f"and {pp.VANISHED_POINTER_LIMIT + 1 - pp.REFUSAL_ERROR_LINES} more", err)
         entries, err, vanished = self._copy(1, "\n".join(lines[:-1]))
         self.assertIsNone(err)
         self.assertEqual(pp.VANISHED_POINTER_LIMIT, len(vanished))

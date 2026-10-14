@@ -93,6 +93,10 @@ GCLOUD_PARTIAL_FAILURE_EXIT = 1
 # copy is something removing index objects in bulk, and the hour is not
 # measured over whatever subset landed.
 VANISHED_POINTER_LIMIT = 10
+# How many of gcloud's error lines a refusal quotes; over the ceiling there
+# is one per vanished object, and the message lands in the JSON, the report
+# and four JUnit cells.
+REFUSAL_ERROR_LINES = 3
 
 # The three artifacts setup time is read from, in the order the run writes
 # them. Only prowjob.json is required: initupload writes it when the pod starts,
@@ -913,7 +917,9 @@ def _index_entries_from_gcs(
         if partial:
             facts.append("nothing landed")
         tail = err.strip().splitlines()
-        detail = "; ".join(errors) or (tail[-1] if tail else "")
+        detail = "; ".join(errors[:REFUSAL_ERROR_LINES]) or (tail[-1] if tail else "")
+        if len(errors) > REFUSAL_ERROR_LINES:
+            detail += f" and {len(errors) - REFUSAL_ERROR_LINES} more"
         reason = ", ".join(facts) + (f": {detail}" if detail else "")
         return {}, f"could not read the build index: {reason}", []
     return entries, None, [
@@ -1187,13 +1193,13 @@ def collect_waits(
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]
-    # A vanished pointer from a day the deadline left unread is not named
-    # beside the days that were, as the report says those days are missing.
+    # A vanished pointer below the window the sweep covered is not named
+    # beside the days that were read, as the report says those days are
+    # missing: the same bound waits are kept by, with the window's slack.
     unreadable = [
         gone
         for gone in vanished_in_window
-        if not truncated
-        or snowflake_time(int(gone["build_id"])).strftime(DATE_FORMAT) in done
+        if snowflake_time(int(gone["build_id"])) >= measured_start - SNOWFLAKE_SLACK
     ] + unreadable
     sweep = Sweep(
         waits, read, time.monotonic() - began, measured_start, truncated, unreadable
