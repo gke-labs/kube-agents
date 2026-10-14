@@ -247,7 +247,7 @@ VERSION_PAIR_SEPARATOR = " / "
 
 # Readiness (`--readiness`). The rules need two kubectl reads per member (PDBs with their
 # Deployments and StatefulSets, then webhook configurations with their Services and
-# EndpointSlices), which need credentials for that member: `get-credentials` writes a
+# EndpointSlices, and the Namespaces), which need credentials for that member: `get-credentials` writes a
 # per-target kubeconfig, passed to all three commands as KUBECONFIG in the subprocess
 # environment rather than through a flag,
 # because the gcloud and kubectl in the agent pod are credential-proxy shims that forward
@@ -288,7 +288,9 @@ NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
 NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out or cut
-# at the proxy's cap, a custom role without webhook-configuration reads) costs the webhook rule
+# at the proxy's cap, a custom role without webhook-configuration or namespace reads; the
+# installer's roles have both, and the name-label fallback in `bootstrap_namespace_labels` is for
+# a read that returns no Namespace object, not for a refused read) costs the webhook rule
 # only, never the PDBs. The webhook read lists every Service, EndpointSlice and Namespace in the
 # cluster though only the referenced Services and the two bootstrap namespaces (whose labels the
 # `namespaceSelector` is judged on) are consulted; a read proportional to the webhooks (the

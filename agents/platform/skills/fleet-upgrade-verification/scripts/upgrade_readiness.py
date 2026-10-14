@@ -3,7 +3,7 @@
 upgrade_readiness.py — the rules behind `fleet_upgrade_report.py --readiness`.
 
 Pure functions over data the report script has already read: the PodDisruptionBudgets,
-workloads, webhook configurations and EndpointSlices of one cluster, its
+workloads, webhook configurations, Services, EndpointSlices and Namespaces of one cluster, its
 `maintenancePolicy`, and its node-pool versions. Nothing
 here runs a command or touches a clock; the caller passes the instant to evaluate at. The
 first three rules are the ones the governance SOPs define in prose; the fourth has no SOP
