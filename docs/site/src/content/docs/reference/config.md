@@ -98,6 +98,12 @@ toolsets:
 
 agent:
   max_turns: 250
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 context_file_max_chars: 100000
 
@@ -149,6 +155,8 @@ Toolsets group MCP servers into named bundles for different Hermes surfaces:
 Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`), and both list `memory`. That entry is a gate, not a tool grant: Hermes only injects the memory provider's tools into a profile that names it, and a specialist reached as a kanban worker resolves its toolsets from `cli` while the API-server path uses `api_server`, so it has to appear on both for the two routes to see the same memory. Which tools it actually yields is decided by the provider — see [`memory`](#memory). `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) is declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at build time.
 
 Note that the two files' toolset lists are **unioned**, not overridden — the build-time merge combines two lists as `list(dict.fromkeys(a + b))`. Removing an entry from `agents/platform/config.yaml` alone has no effect if the shared defaults still list it.
+
+`agent.disabled_toolsets` then removes `browser`, `computer_use`, `image_gen`, `tts` and `vision` from both surfaces, on the Platform Agent and on every Cluster Agent. Hermes applies it last, so it also narrows the toolsets a kanban worker is spawned with. None of the agents' work uses them, and declaring the full set puts Gemini on Vertex on an intermittent slow path before the first token: in a replay of a captured worker request, the 90th-percentile wait fell from 13.7s (up to 57s) to 2.8s once they were gone.
 
 No MCP server exposes an agent-to-agent call tool; delegation between agents is kanban-only.
 

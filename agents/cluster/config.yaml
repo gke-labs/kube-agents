@@ -150,6 +150,16 @@ plugins:
 # to publish a Python-toolchain line that is factually wrong on this image.
 agent:
   environment_probe: false
+  # The same five toolsets agents/platform/config.yaml disables, for the same
+  # reason: declaring the full hermes-cli set puts Gemini on Vertex on an
+  # intermittent slow path before its first token, and a Cluster Agent's work
+  # (reading one cluster) uses none of them.
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt; rationale lives in agents/platform/config.yaml, which pins the same
