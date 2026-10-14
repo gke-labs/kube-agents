@@ -31,7 +31,8 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
 1. **Run without a request, and answer a request.** The review runs once when the agent is
    installed, over every cluster it finds. It runs again at the end of each weekend. It also runs
    for the cluster an upgrade changed, fifteen to thirty minutes after the upgrade ends, plus the
-   job's start time. A user can also ask
+   job's start time. This holds for a cluster in a project the install has resolved; §3.1 names the
+   projects a wake does not reach, which the weekend run reviews. A user can also ask
    for it in their own words, for example "how did the last upgrades go" or "is there anything to
    fix before the next one". The question does not have to name the feature, a cluster or a
    version. If no cluster was upgraded since the last report, the agent answers from that report.
@@ -867,11 +868,15 @@ stands for what `finish` never sees, an install without a repository and the sco
 in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
 advance, and a run that dies between the guards and the ledger leaves the guards' review counts
 one ahead, which the next run's review of the same clusters raises again (the ids and first-seen
-dates are unchanged); a ledger that cannot be parsed is set aside under a dated name and the run stops with that
-as its line. While a dated crash record sits beside no ledger, every run refuses to start from empty
-and repeats that line, so the record is read rather than overwritten, a route that called `start`
-releasing its note with the recovery `finish` above; `--reset-ledger`, run by an
-operator on purpose, archives the record and lets the next run start as a first run. A run starts
+dates are unchanged); a ledger or a `guards.json` that cannot be parsed is set aside under a dated
+name (`<file>.unreadable-<stamp>`) and the run stops with that as its line, naming the file. One
+rule serves both files, because the guards file is the stream's memory across the gap (§3.3): a
+run that started from an empty one would emit no held candidate, so a complete `finish` would
+announce every held finding resolved and a failed upgrade with no retry fixed. While a dated crash
+record of either file sits beside no live copy of it, every run refuses to start from empty and
+repeats that line, so the record is read rather than overwritten, a route that called `start`
+releasing its note with the recovery `finish` above; `--reset-ledger`, run by an operator on
+purpose, archives both files' records and lets the next run start as a first run. A run starts
 from an empty ledger on its own only when neither a ledger nor a crash record exists, and only on a
 route that may: the after-upgrade route with no full run recorded prints its no-baseline line
 instead (§3.2). The readiness watch runs on the gateway pod and reads the file as §3.5 states,
@@ -1069,7 +1074,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   no node carries is row 12; `--probe-lock` exiting 0 when the lock is free and 1 with the holder
   line when it is held, holding it for no time and writing nothing; the lock-held and
   crash-record lines ending with the projects the run resolved, the handed scope or the
-  undeclared listing with its note; the recovery `finish` of a run that lost the lock on a first
+  undeclared listing with its note; an unparseable `guards.json` set aside under a dated name and
+  refused on the next run as the ledger's record is, the line naming the file, and `--reset-ledger`
+  archiving both files' records; the recovery `finish` of a run that lost the lock on a first
   run, with no saved report: `scope.clusters` from the listing of the projects the exit line
   names, admitted by the validator, and the note released; a document whose every cluster the
   collector could not read, carried as `scope.clusters` rows with `checks_run: []` and the
