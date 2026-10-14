@@ -213,7 +213,7 @@ one from the mirror through its own chart's values.
 The agent's baked default model endpoint is
 `http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
-`k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
+`k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
 uses Workload Identity (below); `litellm.modelDefaultName`
@@ -222,7 +222,9 @@ meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
 needs — a request's own `max_tokens` still wins. On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
-([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)).
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
+and only a Claude model gets the prompt-caching breakpoints
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching)).
 Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable

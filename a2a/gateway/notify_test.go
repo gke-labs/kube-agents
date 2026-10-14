@@ -705,3 +705,180 @@ func TestTheGatewaysConversationsReadTheSessionRecord(t *testing.T) {
 		t.Fatalf("ConversationContext(unknown) = %q, %v; want empty", got, err)
 	}
 }
+
+type blockingConversations struct {
+	fakeConversations
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingConversations) ConversationContext(ctx context.Context, key string) (string, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return b.fakeConversations.ConversationContext(ctx, key)
+}
+
+// A slow session record lookup runs in the worker, not on the NATS subscription's
+// delivery goroutine, so it does not hold the acceptance of subsequent requests.
+func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	conv := &blockingConversations{
+		fakeConversations: fakeConversations{contexts: map[string]string{testConversation: testContext}},
+		entered:           entered,
+		release:           release,
+	}
+	poster := &fakeNotifyPoster{}
+	n := newTestNotifier(t, poster)
+	n.SetConversations(conv)
+
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	defer close(release)
+
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+
+	// 1. Send conversation request.
+	convReq, _ := json.Marshal(lib.NotifyRequest{Text: "conv text", Conversation: testConversation, ContextID: testContext})
+	if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"conv", convReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until ConversationContext is entered.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConversationContext was not entered")
+	}
+
+	// 2. While ConversationContext is still blocked, send home request.
+	homeReq, _ := json.Marshal(lib.NotifyRequest{Text: "home text"})
+	if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"home", homeReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert that home request is accepted into n.jobs while release is still unclosed!
+	select {
+	case job := <-n.jobs:
+		if job.req.Text != "home text" {
+			t.Fatalf("queued job text = %q, want %q", job.req.Text, "home text")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("home request was not accepted while ConversationContext was blocked")
+	}
+}
+
+// If Stop runs while ConversationContext is in flight, the post does not start
+// after Stop: when the lookup completes, the job is refused with the stopping
+// refusal and no message is posted into the conversation.
+func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	conv := &blockingConversations{
+		fakeConversations: fakeConversations{contexts: map[string]string{testConversation: testContext}},
+		entered:           entered,
+		release:           release,
+	}
+	poster := &fakeNotifyPoster{}
+	n := newTestNotifier(t, poster)
+	n.SetConversations(conv)
+
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+
+	in, err := agent.SubscribeSync(lib.NotifyReplyPrefix + ">")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	convReq, _ := json.Marshal(lib.NotifyRequest{Text: "conv text", Conversation: testConversation, ContextID: testContext})
+	if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"conv", convReq); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConversationContext was not entered")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		sub.Stop()
+		close(stopped)
+	}()
+
+	// Wait until sub.Stop has marked the notifier stopping; it then waits on
+	// the worker, which is parked in the lookup.
+	waitFor(t, "Stop to mark the notifier stopping", n.isStopping)
+
+	// Release the blocked ConversationContext lookup.
+	releaseOnce.Do(func() { close(release) })
+
+	msg, err := in.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("conversation request not answered: %v", err)
+	}
+	var got lib.NotifyReply
+	if err := json.Unmarshal(msg.Data, &got); err != nil {
+		t.Fatalf("unmarshaling reply: %v", err)
+	}
+	if got.Error != notifyStoppingRefusal {
+		t.Fatalf("reply error = %q, want %q", got.Error, notifyStoppingRefusal)
+	}
+
+	select {
+	case <-stopped:
+	case <-time.After(notifyStopGrace):
+		t.Fatal("Stop did not complete cleanly")
+	}
+
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
+	if len(conv.posts) != 0 {
+		t.Fatalf("conv.posts = %v, want 0 posts after Stop", conv.posts)
+	}
+}
+
+

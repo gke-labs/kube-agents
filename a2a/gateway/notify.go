@@ -340,8 +340,9 @@ func (s *notifierSub) Stop() {
 	})
 }
 
-// handle runs on the subscription's goroutine. It answers a refusal at once
-// and queues an accepted request for the worker, which answers it once the
+// handle runs on the subscription's goroutine. It answers shape, syntax, and
+// queue-full refusals at once and queues accepted requests for the worker, which
+// validates conversation records and answers either a refusal or success once the
 // first post has landed. Posting here instead would hold every later request
 // behind the relay calls of a long report.
 func (n *Notifier) handle(m *nats.Msg) {
@@ -485,14 +486,13 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	return req, nil
 }
 
-// validateConversation admits a request aimed at a conversation only when
-// the gateway holds a session record for it whose context id is the one the
-// request carries: a conversation the agent is working in. The bound is the
-// set of live records, not a secret: the agent principal, the one sender, can
-// read every live conversation's context id (its Hermes sessions are named
-// for them), so this refuses a conversation with no record, a made-up key
-// and a stale route, not a post into another conversation the agent holds a
-// session for. Anything else is refused before any post.
+// validateConversation checks the request's shape before queueing it for
+// the worker. The session record check (ConversationContext) runs in post on
+// the worker goroutine so a slow JetStream KV read does not hold the NATS
+// subscription's delivery goroutine. Note that because the record check is
+// deferred to the worker, invalid or unmatched conversation requests are
+// refused only when the worker processes them, queuing behind earlier jobs
+// and subject to the requester's deadline.
 func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyRequest, *lib.NotifyReply) {
 	refuse := func(reason string) (lib.NotifyRequest, *lib.NotifyReply) {
 		r := n.refuse(reason)
@@ -518,17 +518,6 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 	if !strings.HasPrefix(req.Conversation, n.convPrefix) || len(req.Conversation) == len(n.convPrefix) {
 		return refuse(fmt.Sprintf("conversation %q is not on this route's backend", req.Conversation))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
-	defer cancel()
-	have, err := n.conv.ConversationContext(ctx, req.Conversation)
-	if err != nil {
-		n.log.Warn("notify: session record unreadable", "conversation", req.Conversation, "err", err)
-		return refuse(notifyConversationRefused)
-	}
-	if have == "" || have != req.ContextID {
-		n.log.Warn("notify refused: no live conversation with that context", "conversation", req.Conversation)
-		return refuse(notifyConversationRefused)
-	}
 	return req, nil
 }
 
@@ -537,7 +526,35 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 // not. The remaining chunks follow into the same thread; a failure among them
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
+//
+// For conversation requests, the session record lookup (ConversationContext)
+// executes here on the worker rather than on the subscription delivery
+// goroutine. If the JetStream KV read is slow, this worker (and any subsequent
+// queued posts, including home alerts) is held for up to notifyLookupTimeout (5s).
+// However, request acceptance and queue-full refusals remain non-blocking.
+// If the gateway begins stopping while the session record lookup is in flight,
+// post re-checks isStopping() after the lookup and answers with the stopping
+// refusal rather than initiating new relay calls.
 func (n *Notifier) post(job notifyJob) {
+	if job.req.Conversation != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
+		defer cancel()
+		have, err := n.conv.ConversationContext(ctx, job.req.Conversation)
+		if err != nil {
+			n.log.Warn("notify: session record unreadable", "conversation", job.req.Conversation, "err", err)
+			n.reply(job, n.refuse(notifyConversationRefused))
+			return
+		}
+		if have == "" || have != job.req.ContextID {
+			n.log.Warn("notify refused: no live conversation with that context", "conversation", job.req.Conversation)
+			n.reply(job, n.refuse(notifyConversationRefused))
+			return
+		}
+		if n.isStopping() {
+			n.reply(job, n.refuse(notifyStoppingRefusal))
+			return
+		}
+	}
 	// A conversation request never carries blocks (validateConversation),
 	// and postBlocks posts only into home, so the conversation test goes
 	// first: the order is a second guard, not the only one.

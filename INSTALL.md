@@ -418,9 +418,9 @@ and GitHub minter workloads).
 - **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
 - Drive it through [`lifecycle.sh`](terraform/examples/full-install/lifecycle.sh) rather than bare
   `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete and any Pub/Sub
-  topic or subscription that already exists, `destroy` handles the teardown asymmetries a bare
-  `terraform destroy` trips over, and `plan` reports what an apply would change while creating
-  nothing.
+  topic or subscription that already exists, and an approved `apply` (`-auto-approve`) retries past Cloud
+  KMS's first-enablement 403; `destroy` handles the teardown asymmetries a bare `terraform destroy`
+  trips over; and `plan` reports what an apply would change while creating nothing.
 - The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
   you do **not** need to install it yourself on this path. (You do for
   [Method 2](#method-2-manual-kubernetes-cluster-deployment).) If your pre-existing cluster already
@@ -512,7 +512,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   sets a different one. Terraform takes `platform_agent_mode`,
   the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
   `install.env` and re-run `install.sh` or a full `upgrade.sh`;
-  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key.
+  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key. Before
+  switching an install whose Slack is on and Google Chat off to `next` (the A2A gateway then
+  takes Slack), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
+  `U0123ABCD`, not emails, which match nobody; `SLACK_HOME_CHANNEL`, if set, is a channel ID
+  (`C...` or `G...`), not a DM or a user; `SLACK_BOT_TOKEN` is one workspace's token, not a
+  comma-separated list, with no comma or space left in it. Both front doors refuse a `next` apply that fails any of them. On
+  `today` the allowlist never matched emails either: the Hermes Slack platform compares each
+  sender's member ID exactly, so an email there has never admitted anyone.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
