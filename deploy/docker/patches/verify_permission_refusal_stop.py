@@ -140,9 +140,11 @@ def main() -> int:
     events = controller.after_call("terminal", {"command": "kubectl get events -n tenant"}, EVENTS)
     if events.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):
         return fail(f"a successful read quoting a denial decided {events!r}")
+    # A report that echoes the refusal's own lines decides nothing; one that only
+    # names the command and the rule beside a saved refusal is counted (a stated limit).
     report = controller.after_call(
         "terminal",
-        {"command": "cat <<'EOF' | tee /tmp/pr.md\nkubectl scale deploy x --replicas=3 was refused\npolicy rule: kubernetes.read-only\nEOF"},
+        {"command": "cat <<'EOF' | tee /tmp/pr.md\nkubectl scale deploy x --replicas=3 was refused:\n" + shim_lines(SCALE) + "\nEOF"},
         _result(shim_lines(SCALE), 0),
     )
     if report.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE) or controller.halt_decision is not None:
