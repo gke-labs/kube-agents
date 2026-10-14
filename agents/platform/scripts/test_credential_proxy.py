@@ -2250,6 +2250,8 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual(403, status)
         self.assertEqual(["create", "deployment"], body["verb"])
         self.assertTrue(body["local_render"])
+        status, body = self.post({"argv": ["kubectl", "scale", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
+        self.assertEqual(["scale", "deploy/x_policy_render:_local"], body["verb"])
 
     def test_a_config_flag_comes_back_as_a_policy_block(self):
         # Refused before the lease check, and with its own rule id: an agent

@@ -89,7 +89,8 @@ from kube_agents_bench import (
     onboarding,
     transcript,
 )
-from kube_agents_bench.shell_segments import segments as _shell_segments
+from kube_agents_bench.shell_segments import ordered_segments as _ordered_segments
+from kube_agents_bench.shell_segments import typed_segments as _typed_segments
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -1233,6 +1234,13 @@ _CODE_ARG = "code"
 #: Marks a command string that is program text (an ``execute_code`` body): the
 #: patterns see it whole, never through the shell segmenter.
 _PROGRAM_TEXT = "\x00program-text\x00"
+# Prefix on a shell segment the walk already cut (the opener call's later
+# pieces): read whole, so a heredoc body is not re-cut as shell.
+_SEGMENT_TEXT = "\x00segment-text\x00"
+_PYTHON_SEGMENT = "python"
+#: Regex comments a case puts first to scope a forbidden pattern to one kind of text.
+_PROGRAM_ONLY = "(?#program)"
+_SHELL_ONLY = "(?#shell)"
 _COMMAND_ARG = "command"
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
@@ -1438,17 +1446,27 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("after_command_pattern narrows the window after_result_pattern opens; set both")
         return self
 
-    def _texts(self, command: str) -> list[str]:
-        """What a pattern is tried against for ``command``, per ``match``; program text is one piece."""
+    def _texts(self, command: str) -> list[tuple[bool, str]]:
+        """``(is_program, text)`` for each piece a pattern is tried against, per ``match``.
+        Program text (an ``execute_code`` body, or a Python segment the shell walk cut: a
+        ``-c`` string, an executed Python heredoc or written script) is one piece."""
         if command.startswith(_PROGRAM_TEXT):
-            return [command[len(_PROGRAM_TEXT):]]
+            return [(True, command[len(_PROGRAM_TEXT):])]
+        if command.startswith(_SEGMENT_TEXT):
+            return [(False, command[len(_SEGMENT_TEXT):])]
         if self.match == "segments":
-            return _shell_segments(command) or []
-        return [command]
+            return [(kind == _PYTHON_SEGMENT, text) for kind, text in _typed_segments(command)]
+        return [(False, command)]
 
     def _hit(self, pattern: str, command: str) -> str | None:
-        """The text of ``command`` that ``pattern`` matched, or ``None``."""
-        for text in self._texts(command):
+        """The text of ``command`` that ``pattern`` matched, or ``None``. A pattern opening
+        with ``(?#program)`` is tried against program text only, one opening with
+        ``(?#shell)`` against shell segments only."""
+        for is_program, text in self._texts(command):
+            if pattern.startswith(_PROGRAM_ONLY) and not is_program:
+                continue
+            if pattern.startswith(_SHELL_ONLY) and is_program:
+                continue
             if re.search(pattern, text):
                 return text
         return None
@@ -1511,13 +1529,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                     continue
                 opened_at = own[opener][1]
                 after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
-                if self.match == "segments" and self.after_command_pattern is not None:
-                    # The opener call's own segments behind the one that opened the
-                    # window are after it too: ``kubectl scale … || kubectl patch …``.
-                    texts = self._texts(own[opener][2])
-                    k = next((n for n, t in enumerate(texts) if re.search(self.after_command_pattern, t)), None)
+                if self.match == "segments" and self.after_command_pattern is not None and not own[opener][2].startswith(_PROGRAM_TEXT):
+                    # The opener call's own commands behind the one that opened the
+                    # window are after it too (``kubectl scale … || kubectl patch …``),
+                    # in the order the shell ran them; what the call ran elsewhere
+                    # (a substitution, a written script, a heredoc body) is graded
+                    # with them, since the walk keeps no place for it.
+                    line, elsewhere = _ordered_segments(own[opener][2])
+                    k = next((n for n, (kind, t) in enumerate(line) if kind != _PYTHON_SEGMENT and re.search(self.after_command_pattern, t)), None)
                     if k is not None:
-                        after = texts[k + 1 :] + after
+                        after = [
+                            (_PROGRAM_TEXT if kind == _PYTHON_SEGMENT else _SEGMENT_TEXT) + t
+                            for kind, t in line[k + 1 :] + elsewhere
+                        ] + after
                 graded.extend(after)
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
             if not opened:

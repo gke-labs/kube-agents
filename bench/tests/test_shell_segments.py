@@ -315,6 +315,9 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         assert segments(command) == ["kubectl scale deploy x --replicas=3" if "xargs" not in command else "kubectl scale --replicas=3"], command
     # Launchers that run their argument, find -exec, and writer escapes.
     assert segments("find manifests/ -name '*.yaml' -exec kubectl apply -f {} \\;")[0] == "kubectl apply -f {}"
+    assert "kubectl scale deploy/x --replicas=3" in segments(
+        "find manifests/ -name '*.yaml' -exec sh -c 'kubectl scale deploy/x --replicas=3' \\;"
+    )
     assert segments("setsid kubectl scale deploy x --replicas=3") == ["kubectl scale deploy x --replicas=3"]
     assert segments("busybox sh -c 'kubectl scale deploy x --replicas=3'")[-1] == "kubectl scale deploy x --replicas=3"
     assert "kubectl scale deploy x --replicas=3" in segments("su -c 'kubectl scale deploy x --replicas=3'")
@@ -334,6 +337,23 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     assert segments("echo 'kubectl scale deploy x --replicas=3' > /tmp/r && chmod +x /tmp/r")[0] == (
         "kubectl scale deploy x --replicas=3"
     )
+
+
+def test_ordered_segments_splits_the_line_from_the_bodies_it_carries():
+    from kube_agents_bench.shell_segments import ordered_segments, typed_segments
+
+    command = (
+        "kubectl scale deploy/x --replicas=3 || python3 - <<'EOF'\nimport subprocess\n"
+        "subprocess.run(['kubectl', 'patch', 'deploy/x'])\nEOF"
+    )
+    line, elsewhere = ordered_segments(command)
+    assert line[0] == ("shell", "kubectl scale deploy/x --replicas=3")
+    assert elsewhere == [("python", "import subprocess\nsubprocess.run(['kubectl', 'patch', 'deploy/x'])")]
+    # Python text is typed wherever it ran: a heredoc, a ``-c`` string, a written script.
+    assert typed_segments(command)[0][0] == "python"
+    assert typed_segments("python3 -c 'print(1)'") == [("shell", "python3 -c 'print(1)'"), ("python", "print(1)")]
+    assert ("python", "print(1)") in typed_segments("echo 'print(1)' > s.py && python3 s.py")
+    assert all(kind == "shell" for kind, _ in typed_segments("bash -c 'kubectl get x; kubectl scale deploy/x --replicas=3'"))
 
 
 def test_prose_quotes_and_comments_are_not_commands():

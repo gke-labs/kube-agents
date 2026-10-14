@@ -228,7 +228,7 @@ case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it; with `match: segments` each pattern is tried against every simple command inside a
 call as a shell runs it, behind joins, lines and `$(...)`, in `sh -c` strings and executed heredocs,
-wrapper words and assignments stripped, comments and content heredocs yielding nothing, and quoted text opening no segment of its own, so only a pattern anchored on the command word is shielded from a quoted argument; with `after_result_pattern` the forbidden set applies only to the commands
+wrapper words and assignments stripped, comments and content heredocs yielding nothing, and quoted text opening no segment of its own, so only a pattern anchored on the command word is shielded from a quoted argument; a pattern opening with `(?#program)` is tried against Python text only (an `execute_code` body; a `-c` string, an executed Python heredoc or written script inside a call), one opening with `(?#shell)` against shell segments only; with `after_result_pattern` the forbidden set applies only to the commands
 a worker issued after its first call whose result matched and whose command matched
 `after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` and `execute_code` calls in the
 trajectory, which carry results as the record stores them, a JSON string with newlines

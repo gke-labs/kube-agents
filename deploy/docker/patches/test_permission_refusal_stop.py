@@ -169,10 +169,16 @@ class ClassifyTests(unittest.TestCase):
             "echo 'Refused: `kubectl scale deploy x --replicas=3`:\n" + lines + "' | tee /tmp/pr.md",
             "cat <<'EOF'\n" + lines + "\nEOF",
         ):
-            self.assertIsNone(stop.classify_refusal(command, _result(lines, 0)), command)
+            self.assertIsNone(stop.classify_refusal(command, _result(lines, 0), failed=False), command)
         # A comment quoting an earlier rule line beside a fresh write is the retry, not an echo.
         retry = "# direct scale was refused (policy rule: kubernetes.read-only); patch the autoscaler instead\nkubectl patch configmap kube-dns-autoscaler -n kube-system -p '{}'"
         self.assertEqual(stop.classify_refusal(retry, refusal("kubectl", "patch", "configmap", "kube-dns-autoscaler", "-n", "kube-system", "-p", "{}")), "policy")
+
+    def test_a_failed_retry_that_pastes_the_earlier_refusal_block_still_counts(self):
+        lines = shim_lines(SCALE)
+        retry = "# refused earlier:\n# " + lines.replace("\n", "\n# ") + "\nkubectl scale deploy/kube-dns -n kube-system --replicas=3"
+        self.assertEqual(stop.classify_refusal(retry, _result(lines, 77), failed=True), "policy")
+        self.assertIsNone(stop.classify_refusal("echo '" + lines + "'", _result(lines, 0), failed=False))
 
     def test_several_refusals_in_one_result_count_if_any_is_a_write(self):
         render_then_apply = _result(

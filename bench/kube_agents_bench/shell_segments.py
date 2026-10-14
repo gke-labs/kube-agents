@@ -113,13 +113,43 @@ _MAX_DEPTH = 8
 # How a heredoc body is read once it is known to be executed.
 _KIND_SHELL = "shell"
 _KIND_PYTHON = "python"
+# Prefix the walk puts on a Python segment (a ``-c`` string, an executed Python
+# heredoc or written script); ``segments`` strips it, ``typed_segments`` reads it.
+_PYTHON_MARK = "\x00python\x00"
 
 
 def segments(command: str) -> list[str]:
     """Every simple command in ``command``, each from its command word on."""
+    return [text for _, text in typed_segments(command)]
+
+
+def typed_segments(command: str) -> list[tuple[str, str]]:
+    """``segments`` with each segment's kind: ``"shell"``, or ``"python"`` for Python text."""
     out: list[str] = []
     _walk(command, out, depth=0)
-    return out
+    return [_typed(seg) for seg in out]
+
+
+def _typed(seg: str) -> tuple[str, str]:
+    if seg.startswith(_PYTHON_MARK):
+        return _KIND_PYTHON, seg[len(_PYTHON_MARK):]
+    return _KIND_SHELL, seg
+
+
+def ordered_segments(command: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """``(line, elsewhere)``, typed as ``typed_segments``: the call's own pieces in the order
+    the shell runs them, and every other segment (substitutions, written scripts, heredoc
+    bodies, ``find -exec``), whose place in that order the walk does not keep."""
+    everything: list[str] = []
+    _walk(command, everything, depth=0)
+    line: list[str] = []
+    for piece in _scan(command)[0]:
+        _emit(piece, line, 0)
+    elsewhere = list(everything)
+    for seg in line:
+        if seg in elsewhere:
+            elsewhere.remove(seg)
+    return [_typed(seg) for seg in line], [_typed(seg) for seg in elsewhere]
 
 
 def _walk(text: str, out: list[str], depth: int) -> None:
@@ -169,7 +199,7 @@ def _walk(text: str, out: list[str], depth: int) -> None:
         if kind == _KIND_SHELL:
             _walk(body, out, depth + 1)
         elif kind == _KIND_PYTHON and body.strip():
-            out.append(body.strip())
+            out.append(_PYTHON_MARK + body.strip())
     for piece in pieces:
         _emit(piece, out, depth)
 
@@ -198,7 +228,7 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
             if base in _SHELLS or base == "eval":
                 _walk(script, out, depth + 1)
             elif script.strip():
-                out.append(script.strip())
+                out.append(_PYTHON_MARK + script.strip())
     if base == "kubectl" and _kubectl_verb(rest) in _KUBECTL_PASSTHROUGH:
         for _, token_end, token in rest:
             if token == "--":
@@ -230,7 +260,7 @@ def _emit_written(piece: str, kind: str, out: list[str], depth: int) -> None:
         if kind == _KIND_SHELL:
             _walk(script, out, depth + 1)
         elif script.strip():
-            out.append(script.strip())
+            out.append(_PYTHON_MARK + script.strip())
 
 
 def _writer_scripts(piece: str) -> list[str]:
@@ -277,15 +307,16 @@ def _expand(text: str, expands: bool) -> str:
 
 
 def _find_exec_argv(piece: str) -> str | None:
-    """What a ``find -exec … \;`` runs, as one command string, or ``None``."""
-    found = _command_word(piece)
-    if found is None or found[0].rsplit("/", 1)[-1] != "find":
+    """What a ``find -exec … \;`` runs, as one command string with its quoting kept, or ``None``."""
+    tokens = _tokens(piece)
+    index = _command_index(tokens)
+    if index is None or _unquote(tokens[index][2]).rsplit("/", 1)[-1] != "find":
         return None
-    args = found[1]
-    for k, token in enumerate(args):
+    words = [t for _, _, t in tokens[index + 1 :]]
+    for k, token in enumerate(words):
         if token in _FIND_EXEC_OPTIONS:
             run = []
-            for t in args[k + 1 :]:
+            for t in words[k + 1 :]:
                 if t in _FIND_EXEC_END:
                     break
                 run.append(t)

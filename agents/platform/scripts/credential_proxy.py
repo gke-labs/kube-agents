@@ -42,6 +42,11 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+
+# The verb words go onto a line protocol the agent runtime reads; see
+# credential_proxy_client.py, which applies the same rule.
+_VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
+_VERB_WORD_MAX = 64
 import providers
 import repo_ref
 import scoped_sa_pool
@@ -7248,7 +7253,7 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
             "code": "SECURITY_POLICY_BLOCKED",
             "rule": decision.rule_id,
             "message": decision.message,
-            "verb": list(decision.verb_tuple) if decision.verb_tuple else None,
+            "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in decision.verb_tuple] if decision.verb_tuple else None,
             "local_render": command_policy.local_render(argv),
         },
         log_hint,

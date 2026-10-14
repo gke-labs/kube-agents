@@ -53,6 +53,12 @@ For every tool result :func:`classify_refusal` returns:
   result then carries nothing but an exit code, which is 77 from the shim
   and has arrived as 126 through the exec path, so it is not read; the
   bench's window has the same blind spot.
+* Seen when it should not be: the result is the only evidence, so whoever
+  writes what a tool prints (a script in a checked-out repository, a response
+  a failing ``jq -e`` echoes) can write the shim's lines and halt the turn.
+  The blast radius is the halt, a card closed with a fabricated refusal in
+  front of the operator, never a write. The proxy telling the runtime out of
+  band that it refused a write is the fix for this and the two limits above.
 * ``advisory``: the notice without a definitive verb line: a refused read
   spelling, a local render, a ``gcp.read-only`` refusal, or a shim older
   than this patch that prints no verb. Guidance only, never counted; needs
@@ -231,7 +237,7 @@ def classify_refusal(command, result, *, failed=True) -> str | None:
     if not isinstance(result, str) or not result:
         return None
     if _POLICY_ACTION_RE.search(result):
-        if echoes_refusal(command, result):
+        if not failed and echoes_refusal(command, result):
             return None
         definitive = definitive_block(result) is not None and (failed or names_a_write(command))
         return "policy" if definitive else "advisory"

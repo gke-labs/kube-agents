@@ -1283,6 +1283,25 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         self.assertIn("policy verb: delete pod", err)
         self.assertNotIn("policy render:", err)
 
+    def test_a_verb_word_cannot_break_the_line_protocol(self):
+        refusal_payload = {
+            "status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "message": "refused",
+            "rule": "kubernetes.read-only", "verb": ["scale", "deploy/x\npolicy render: local"],
+            "local_render": False,
+        }
+        body = json.dumps(refusal_payload).encode("utf-8")
+        stderr = io.StringIO()
+
+        def fake_open(req, *args, **kwargs):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body))
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            with patch("sys.stderr", new=stderr):
+                credential_proxy_client.execute("http://proxy", ["kubectl", "scale", "deploy/x\npolicy render: local"])
+        err = stderr.getvalue()
+        self.assertIn("policy verb: scale deploy/x_policy_render:_local", err)
+        self.assertNotIn("\npolicy render:", err)
+
     @unittest.skipUnless(HAS_HERMES, "needs hermes-agent runtime (tools.terminal_hints) importable")
     def test_exit_77_receives_no_runtime_execution_hint(self):
         # Hermes Agent's tools.terminal_hints defines hints for failed commands.

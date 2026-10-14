@@ -1294,7 +1294,8 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # any success, so they never fired. ToolCallGuardrailController.after_call is
 # wrapped (the stock method keeps running first, under a new name) and the
 # wrapper classifies every tool result by the lines the credential-proxy shim
-# printed into it, never by the command's shell text: a definitive policy
+# printed into it (two word tests over the command's text remain for exit-0
+# calls; the module states them): a definitive policy
 # refusal (kubernetes.read-only, the action boundary notice, a `policy verb:`
 # line naming a mutating kubectl verb, no `policy render: local` line) is
 # counted across the turn and halts on the configured one
