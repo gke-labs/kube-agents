@@ -19,7 +19,8 @@
 # its parenthetical), an API path or a dotted group, so a negation standing
 # as an item is refused whatever the word; only the graded token stands bare.
 #
-# A parenthetical after a graded value is ungraded: the judge reads it.
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #

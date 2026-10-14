@@ -7367,6 +7367,7 @@ _GROUP3 = {
     ),
     "upgrades-network-policy-enforcement-stated": (
         [
+            "seeded-a: dataplane legacy; network policies enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no (add-on off); namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane: legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
@@ -7492,6 +7493,8 @@ _GROUP5 = {
             "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
         ],
         [
+            # A gloss may not carry the line's own separator: the slots are read by `;`.
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre (jdk 8; cgroup v2 support came in 8u372); reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes (since 8u372); memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",

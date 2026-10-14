@@ -15,7 +15,8 @@
 # in kube-system also mount the socket; the case does not grade whether the
 # agent lists them.
 #
-# A parenthetical after a graded value is ungraded: the judge reads it.
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
