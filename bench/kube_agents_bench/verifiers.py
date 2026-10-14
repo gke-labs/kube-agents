@@ -1434,10 +1434,14 @@ _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
 # `printf` is text the command prints, wherever the `echo` stands (`nohup echo bash -c ...` is
 # the wrapper running `echo`), and the string after its `-c` is not run.
-_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command"))
+_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command", "xargs", "watch", "flock", "chroot"))
+# A wrapper that takes a positional ahead of the command it runs (`flock <lock> cmd`,
+# `chroot <root> cmd`): that one word is the wrapper's own, whatever it looks like.
+_SHELL_WRAPPER_POSITIONALS = {"flock": 1, "chroot": 1}
 _SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# The interpreters a case's script is run through; `-m <stem>` is read after one of these.
-_INTERPRETER_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?|uv)$")
+# The interpreters a case's script is run through, and the project runners that hand the words
+# after `run` to one (`uv run`, `poetry run`, `pipenv run`); `-m <stem>` is read after one of these.
+_INTERPRETER_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?|uv|poetry|pipenv)$")
 _INTERPRETER_CODE_FLAG = "-c"
 _SHELL_COMMENT_CHAR = "#"
 _SHELL_QUOTE_CHARS = frozenset("'\"")
@@ -1724,13 +1728,15 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
     the wrapper's own words are transparent: a flag, the word after a flag (its value, ``-u user``
     or ``-s KILL``; which flags take one is not tabled, so the word after a bare flag is read as
     its value even when it is a command, the one over-credit this leaves), a duration or count
-    (``timeout 600``), an expansion the reader never resolves (``timeout $T``) and ``--``, which
-    ends its options. The first word that is none of those is the command the wrapper runs: a
+    (``timeout 600``), an expansion the reader never resolves (``timeout $T``), ``--``, which
+    ends its options, and the one positional ``flock`` and ``chroot`` take ahead of their command
+    (``_SHELL_WRAPPER_POSITIONALS``). The first word that is none of those is the command the wrapper runs: a
     shell, an interpreter or the script is returned, and any other word (``ls``, ``echo``,
     ``find``, ``grep``) is a command of its own, behind a wrapper as at the front of the argv,
     and None is returned: nothing it names as an argument runs."""
     after_wrapper = False
     takes_value = False
+    positionals = 0
     for index, word in enumerate(argv):
         base = os.path.basename(word)
         if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
@@ -1740,6 +1746,7 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
             continue
         if base in _SHELL_EXEC_WRAPPERS:
             after_wrapper, takes_value = True, False
+            positionals = _SHELL_WRAPPER_POSITIONALS.get(base, 0)
             continue
         if _is_redirect(word) or (word.isdigit() and index + 1 < len(argv) and _is_redirect(argv[index + 1])):
             # A redirect takes the next word as its target; a bare fd number ahead of one is its own.
@@ -1754,6 +1761,9 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
             continue
         if word.startswith(_SHELL_FLAG_PREFIX):
             takes_value = True
+            continue
+        if positionals:
+            positionals -= 1
             continue
         return None
     return None
@@ -1824,8 +1834,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     (``$((...))`` runs none); a bare operator is one outside quotes only, so a
     quoted ``">"`` or ``';'`` is text; and a reserved word (``if``, ``do``,
     ``!``) stands ahead of the command word; so may an exec wrapper (``timeout``,
-    ``sudo``, ``env``) with its own words -- a flag, the word after a flag, a
-    count, an unresolved expansion, ``--``, and a redirect with its target -- and
+    ``sudo``, ``env``, ``xargs``, ``flock``) with its own words -- a flag, the
+    word after a flag, a count, an unresolved expansion, ``--``, the one positional
+    ``flock`` and ``chroot`` take, and a redirect with its target -- and
     a program behind one that is not the script, a shell or
     an interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a
     run; which flags take a value is not tabled, so the word after a bare flag

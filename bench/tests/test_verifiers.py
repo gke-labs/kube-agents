@@ -7059,6 +7059,12 @@ def _run_objective(command: str) -> str:
         (f"sudo -u hermes 2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
         (f"2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
         (f"timeout $T ls {_SCRIPT_PATH} --readiness", False),
+        # the wrappers the sibling inline-code reader knows, a per-project loop among them; a runner that hands on to an interpreter
+        (f"gcloud projects list --format='value(projectId)' | xargs -I{{}} python3 {_SCRIPT_PATH} --readiness --project {{}}", True),
+        (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
+        (f"flock /tmp/readiness.lock python3 {_SCRIPT_PATH} --readiness", True),
+        (f"poetry run python3 {_SCRIPT_PATH} --readiness", True),
+        (f"xargs ls {_SCRIPT_PATH} --readiness", False),
         # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
         ("sudo -n ls fleet_upgrade_report.py --readiness", True),
         # a program behind a wrapper that is not the script, a shell or an interpreter is the command the wrapper runs
