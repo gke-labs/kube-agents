@@ -152,13 +152,33 @@ class C1IsolationIsStructural(unittest.TestCase):
             "api/v1/namespaces/default/serviceaccounts/x/token",
             "api/v1/namespaces/default/secrets/db",
             "apis/apps/v1/deployments",
-            # The deprecated watch/<resource> paths the API server still
-            # serves: a watch of anything, Secrets included.
-            "api/v1/watch/secrets",
-            "apis/apps/v1/watch/deployments",
         ):
             self.assertFalse(policy.evaluate_k8s("GET", target + path, {}).allowed, f"GET {path} is relayed")
+        # The deprecated watch/<resource> paths the API server still serves: a
+        # watch of anything, Secrets included. Refused by their own rule, not
+        # only because the kind table has no kind called `watch`.
+        for path in ("api/v1/watch/secrets", "apis/apps/v1/watch/deployments"):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_LEGACY, f"GET {path} is not refused as a legacy path")
         self.assertTrue(policy.evaluate_k8s("GET", target + "api/v1/events", {"watch": ["1"]}).allowed)
+        # The named read is a kind table, not "anything but Secrets" (#2990):
+        # a listed kind is read, an unlisted one is not, and a listed plural
+        # under another API group is not either.
+        self.assertTrue(
+            policy.evaluate_k8s("GET", target + "apis/apps/v1/namespaces/default/deployments/web", {}).allowed
+        )
+        for path in (
+            "api/v1/nodes/node-1",
+            "apis/cert-manager.io/v1/namespaces/default/certificates/tls",
+            "apis/example.com/v1/namespaces/default/deployments/web",
+        ):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_KIND, f"GET {path} is relayed")
+        # A Secret is refused by its own rule under any group, not merely by
+        # being absent from a table that a later edit could widen.
+        for path in ("api/v1/namespaces/default/secrets/db", "apis/example.com/v1/namespaces/default/secrets/db"):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_SECRETS, f"GET {path} is not refused as a Secret")
 
     def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
         policy = h.watcher_policy

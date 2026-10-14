@@ -545,6 +545,36 @@ Mutation(
         "as an object called `secrets`",
     ),
     Mutation(
+        "C1-watcher-kind-list-widened",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("", "configmaps"),\n',
+         '        ("", "configmaps"),\n        ("", "nodes"),\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "add nodes to the watcher's kind table so drift on a node label is "
+        "enriched -- every fleet node, its addresses and taints, becomes "
+        "readable on the broker's credential for a kind no person edits",
+    ),
+    Mutation(
+        "C1-watcher-kind-group-ignored",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if (group, match.group("resource")) not in WATCHER_NAMED_READS:\n',
+         '    if match.group("resource") not in {r for _, r in WATCHER_NAMED_READS}:\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "match the table on the plural alone to save a parse -- any CRD that "
+        "names its plural `deployments` or `roles` is then read as if it were "
+        "the built-in kind",
+    ),
+    Mutation(
+        "C1-watcher-secrets-moved-into-the-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('REFUSED_RESOURCES = frozenset({"secrets"})\n',
+         'REFUSED_RESOURCES = frozenset()\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "drop the separate Secrets refusal as redundant now that the kind table "
+        "exists -- it is the only rule that refuses a Secret under a group the "
+        "table may one day list, and the import check leans on it",
+    ),
+    Mutation(
         "C1-watcher-subscription-unpinned",
         "agents/platform/scripts/watcher_policy.py",
         ('        if not subscription or match.group("sub") != subscription:\n',

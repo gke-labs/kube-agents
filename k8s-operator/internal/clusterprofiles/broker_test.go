@@ -27,7 +27,10 @@ import (
 
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -289,6 +292,64 @@ func TestDiscoverThroughBrokerSkips(t *testing.T) {
 			}
 			if requests, _ := fb.seen(); len(requests) != tc.wantReqs {
 				t.Errorf("proxy saw %d requests, want %d: %v", len(requests), tc.wantReqs, requests)
+			}
+		})
+	}
+}
+
+// TestABrokerRefusalReachesTheJoinAsAStatusError pins what the drift detector's
+// join sees when the broker refuses a kind: the credential proxy answers with a
+// metav1.Status (test_a_refusal_is_a_kubernetes_status_naming_the_rule pins the
+// same body on the Python side), and client-go's dynamic client, which the join
+// reads with, turns it into a Forbidden StatusError carrying the rule id. The
+// join forwards the record with that error as its lookup error. The broker's
+// earlier body, which was not a Status, reached the join as a bare Forbidden
+// with the rule id gone; the second case keeps that difference visible.
+func TestABrokerRefusalReachesTheJoinAsAStatusError(t *testing.T) {
+	const rule = "kubernetes.watcher.kind"
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantRule bool
+	}{
+		{
+			name: "status body",
+			body: `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",` +
+				`"message":"SECURITY_POLICY_BLOCKED (` + rule + `): The watcher's Kubernetes route reads only the kinds in its table; the drift record is reported without ownership.",` +
+				`"reason":"Forbidden","details":{"causes":[{"reason":"SECURITY_POLICY_BLOCKED","message":"` + rule + `"}]},"code":403}`,
+			wantRule: true,
+		},
+		{
+			name:     "earlier body",
+			body:     `{"status":"blocked","code":"SECURITY_POLICY_BLOCKED","rule":"` + rule + `","message":"refused"}`,
+			wantRule: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			tokenFile := filepath.Join(t.TempDir(), "token")
+			writeToken(t, tokenFile, "token-1")
+			broker := &Broker{URL: srv.URL, TokenFile: tokenFile}
+			cfg, err := broker.ClientConfig(Identity{Project: "p", Location: "l", Cluster: "c"})
+			if err != nil {
+				t.Fatalf("ClientConfig: %v", err)
+			}
+			client, err := dynamic.NewForConfig(cfg)
+			if err != nil {
+				t.Fatalf("dynamic.NewForConfig: %v", err)
+			}
+			pods := schema.GroupVersionResource{Version: "v1", Resource: "pods"}
+			_, err = client.Resource(pods).Namespace("default").Get(context.Background(), "web-0", metav1.GetOptions{})
+			if !apierrors.IsForbidden(err) {
+				t.Fatalf("Get error = %v, want a Forbidden", err)
+			}
+			if got := strings.Contains(err.Error(), rule); got != tc.wantRule {
+				t.Errorf("rule id in %q = %v, want %v", err.Error(), got, tc.wantRule)
 			}
 		})
 	}
