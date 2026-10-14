@@ -3050,10 +3050,11 @@ class SlackRelay:
 TEAMS_EVENT_QUEUE_MAXSIZE = 500
 TEAMS_MAX_DELIVERY_ATTEMPTS = 3
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
+# Send Activity and Reply to Activity only. ``activities/history`` is Send
+# Conversation History, a transcript upload, so that id is excluded.
 TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
-    r"^v3/conversations/[^/?#]+/activities(?:/[^/?#]+)?$"
+    r"^v3/conversations/[^/?#]+/activities(?:/(?!history$)[^/?#]+)?$"
 )
-_TEAMS_DEFAULT_URLOPEN = urllib.request.urlopen
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -3062,6 +3063,12 @@ def is_trusted_teams_service_url(service_url: str) -> bool:
         return False
     parsed = urllib.parse.urlparse(service_url)
     if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    # api_call appends the checked endpoint to this URL by string
+    # concatenation, so a `?` or `#` here would turn the endpoint into a query
+    # string or a fragment and send the request to whatever path precedes it.
+    # urlparse reports an empty query/fragment for a bare `?`/`#`: test the text.
+    if "?" in service_url or "#" in service_url:
         return False
     host = (parsed.hostname or "").lower()
     return (
@@ -3124,6 +3131,11 @@ class _TeamsNoRedirectHandler(urllib.request.HTTPRedirectHandler):
         newurl: str,
     ) -> Any:
         raise ValueError(f"Teams API redirect refused (HTTP {code})")
+
+
+# Built once at import so refusing redirects does not depend on what
+# ``urllib.request.urlopen`` is bound to; a test stands in for ``.open``.
+_TEAMS_OPENER = urllib.request.build_opener(_TeamsNoRedirectHandler())
 
 
 class TeamsRelay:
@@ -3197,10 +3209,7 @@ class TeamsRelay:
 
     @staticmethod
     def _open_url(req: urllib.request.Request, *, timeout: float) -> Any:
-        if urllib.request.urlopen is not _TEAMS_DEFAULT_URLOPEN:
-            return urllib.request.urlopen(req, timeout=timeout)
-        opener = urllib.request.build_opener(_TeamsNoRedirectHandler())
-        return opener.open(req, timeout=timeout)
+        return _TEAMS_OPENER.open(req, timeout=timeout)
 
     def enqueue_event(self, event: dict[str, Any]) -> bool:
         validate_teams_activity(event)
@@ -8698,7 +8707,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     session_slots: "SessionSlots | None" = None
     max_request_bytes: int
     slack_max_request_bytes: int
-    teams_max_request_bytes: int = 28 * 1024 * 1024
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     # The A2A gateway's relay instance. Two consumers on one subscription
@@ -8754,18 +8762,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _authenticated(self) -> Principal | None:
         """Identify the caller, or answer 401 and return None.
 
-        Only the Unix socket path is unauthenticated: the mount itself is the
-        access control (0600 on a directory shared only with the agent
-        container). When the broker listens on a TCP port -- whether
-        CREDENTIAL_PROXY_ROLE=broker or CREDENTIAL_PROXY_PORT on a sidecar --
-        every request must present a valid Kubernetes ServiceAccount token for
-        a Pod that is allowed to talk to this broker.
+        Everything but /healthz goes through here. /healthz is the readiness
+        probe and reveals nothing, and the probe runs before any token would be
+        available; every other route on this listener either runs a
+        credentialed command or relays through a credentialed client.
+
+        Binding ``self.principal`` is this method's job rather than each
+        route's. The chat relays and the GitHub refresh spend the broker's
+        credentials just as ``/v1/exec`` does, so a seam that were populated on
+        only one of them would be a seam the next change has to fix before it
+        can use it: whoever adds a per-caller check would find the value
+        present on the route they tested and None on the two they did not.
         """
         try:
             self.principal = self.authenticator.authenticate(self.headers)
         except AuthenticationError as exc:
             LOGGER.warning(
-                "credential proxy authentication rejected path=%s error=%s",
+                "rejected an unauthenticated request path=%s reason=%s",
                 _sanitize_for_logging(self.path),
                 exc,
             )
@@ -10777,7 +10790,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            payload = self._read_json_body(self.teams_max_request_bytes)
+            payload = self._read_json_body()
             if self.path == "/v1/chat/teams/events":
                 ok = self.teams_relay.enqueue_event(payload)
                 self._json(

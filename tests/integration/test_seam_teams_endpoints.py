@@ -27,7 +27,6 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         )
         CredentialProxyHandler.teams_relay = self.relay
         CredentialProxyHandler.max_request_bytes = 65536
-        CredentialProxyHandler.teams_max_request_bytes = 65536
         self.addCleanup(setattr, CredentialProxyHandler, "teams_relay", None)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()

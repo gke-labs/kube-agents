@@ -27,6 +27,10 @@ def is_trusted_service_url(service_url: str) -> bool:
     parsed = urllib.parse.urlparse(service_url)
     if parsed.scheme != "https" or parsed.username or parsed.password:
         return False
+    # The broker appends the endpoint to this URL by string concatenation; a
+    # `?` or `#` would turn the endpoint into a query string or a fragment.
+    if "?" in service_url or "#" in service_url:
+        return False
     host = (parsed.hostname or "").lower()
     return (
         host in TEAMS_TRUSTED_SERVICE_HOSTS
@@ -143,7 +147,8 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
         if not stripped:
             continue
 
-        if stripped.startswith("#"):
+        # Markdown needs whitespace after the hashes; `#1040` or `#!/bin/sh` is text.
+        if stripped.startswith("#") and stripped.lstrip("#")[:1] == " ":
             header_level = len(stripped) - len(stripped.lstrip("#"))
             header_text = stripped.lstrip("#").strip()
             size = "Large" if header_level == 1 else "Medium"
@@ -224,83 +229,21 @@ def format_teams_activity_payload(
     }
 
 
-class TeamsSendResult(dict):
-    """SendResult-compatible dict carrying .success, .message_id, .error, and .raw_response."""
-
-    def __init__(
-        self,
-        data: dict[str, Any] | None = None,
-        *,
-        success: bool = True,
-        message_id: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        payload = data if isinstance(data, dict) else {}
-        super().__init__(payload)
-        self.success = success
-        inner = payload.get("response") if isinstance(payload.get("response"), dict) else payload
-        self.message_id = message_id or (
-            str(inner.get("id")) if isinstance(inner, dict) and inner.get("id") else None
-        )
-        self.error = error
-        self.raw_response = payload
-
-
-def _resolve_base_classes() -> tuple[type, Any, Any, Any]:
-    """Return (BasePlatformAdapter, MessageEvent, MessageType, Platform) from gateway or fallback stubs."""
-    try:
-        from gateway.config import Platform
-        from gateway.platforms.base import (
-            BasePlatformAdapter,
-            MessageEvent,
-            MessageType,
-        )
-
-        return BasePlatformAdapter, MessageEvent, MessageType, Platform
-    except Exception:
-
-        class _FallbackBaseAdapter:
-            def __init__(self, config: Any = None, platform: Any = None) -> None:
-                self.config = config
-                self.platform = platform
-                self._message_handler: Callable[[Any], Any] | None = None
-                self._background_tasks: set[asyncio.Task[Any]] = set()
-
-            def set_message_handler(self, handler: Callable[[Any], Any]) -> None:
-                self._message_handler = handler
-
-            def build_source(self, **kwargs: Any) -> dict[str, Any]:
-                return dict(kwargs)
-
-            async def handle_message(self, event: Any) -> Any:
-                if self._message_handler is not None:
-                    return await self._message_handler(event)
-                return None
-
-        class _FallbackMessageEvent:
-            def __init__(self, **kwargs: Any) -> None:
-                for key, value in kwargs.items():
-                    setattr(self, key, value)
-
-        class _FallbackMessageType:
-            TEXT = "text"
-
-        return (
-            _FallbackBaseAdapter,
-            _FallbackMessageEvent,
-            _FallbackMessageType,
-            lambda name: name,
-        )
-
-
 def install() -> None:
     """Install the Teams relay patch onto Hermes PlatformRegistry."""
     relay_url = os.getenv("TEAMS_RELAY_URL", "").rstrip("/")
     if not relay_url:
         return
 
-    base_adapter_cls, message_event_cls, message_type_cls, platform_factory = (
-        _resolve_base_classes()
+    # Imported unconditionally, as the Slack relay patch does: install() only
+    # runs inside a gateway process, and a gateway whose base classes cannot be
+    # imported is a failure to see in the log, not one to paper over.
+    from gateway.config import Platform
+    from gateway.platforms.base import (
+        BasePlatformAdapter,
+        MessageEvent,
+        MessageType,
+        SendResult,
     )
 
     def request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -349,18 +292,13 @@ def install() -> None:
             LOGGER.info("Teams relay is not ready yet; retrying bootstrap")
             await asyncio.sleep(2)
 
-    class TeamsRelayAdapter(base_adapter_cls):  # type: ignore[misc,valid-type]
+    class TeamsRelayAdapter(BasePlatformAdapter):
         """Hermes platform adapter connecting to Microsoft Teams via credential proxy."""
 
         def __init__(self, config: Any = None) -> None:
-            try:
-                try:
-                    plat = platform_factory("teams")
-                except Exception:
-                    plat = "teams"
-                super().__init__(config, plat)
-            except Exception:
-                pass
+            # ``Platform._missing_`` admits a name the platform registry knows,
+            # and install() registers "teams" before anything builds an adapter.
+            super().__init__(config, Platform("teams"))
             self.config = config if config is not None else {}
             if isinstance(self.config, dict):
                 raw_extra = self.config.get("extra")
@@ -389,29 +327,11 @@ def install() -> None:
             self._running = False
             self._relay_task: asyncio.Task[None] | None = None
             self._handler: Callable[[str, str, dict[str, Any]], Any] | None = None
-            if not hasattr(self, "_message_handler"):
-                self._message_handler = None
-            if not hasattr(self, "_background_tasks"):
-                self._background_tasks = set()
 
         def set_handler(
             self, handler: Callable[[str, str, dict[str, Any]], Any]
         ) -> None:
             self._handler = handler
-
-        def set_message_handler(self, handler: Callable[[Any], Any]) -> None:
-            self._message_handler = handler
-
-        async def handle_message(self, event: Any) -> Any:
-            if getattr(self, "_message_handler", None) is not None:
-                return await self._message_handler(event)
-            parent_handle = getattr(super(), "handle_message", None)
-            if callable(parent_handle):
-                return await parent_handle(event)
-            LOGGER.warning(
-                "Teams activity dropped: no message handler installed on adapter"
-            )
-            return None
 
         async def connect(self, *, is_reconnect: bool = False) -> bool:
             del is_reconnect
@@ -440,7 +360,7 @@ def install() -> None:
             thread_id: str | None = None,
             metadata: dict[str, Any] | None = None,
             **kwargs: Any,
-        ) -> TeamsSendResult:
+        ) -> SendResult:
             del kwargs
             meta = metadata if isinstance(metadata, dict) else {}
             default_service_url = os.getenv(
@@ -483,7 +403,15 @@ def install() -> None:
                     "payload": payload,
                 },
             )
-            return TeamsSendResult(raw if isinstance(raw, dict) else {}, success=True)
+            response = raw if isinstance(raw, dict) else {}
+            inner = response.get("response")
+            inner = inner if isinstance(inner, dict) else response
+            message_id = inner.get("id")
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+                raw_response=response,
+            )
 
         async def send_typing(self, chat_id: str, service_url: str) -> None:
             """Send a typing indicator activity to Teams."""
@@ -616,26 +544,17 @@ def install() -> None:
                     await res
                 return
 
-            build_source = getattr(self, "build_source", None)
-            if callable(build_source):
-                source = build_source(
-                    chat_id=conv_id,
-                    chat_name=str(conv.get("name") or conv_id),
-                    chat_type=str(conv.get("conversationType") or "channel"),
-                    user_id=sender_aad_id or sender_id,
-                    user_name=sender_name or sender_id,
-                    thread_id=activity_id or None,
-                )
-            else:
-                source = {
-                    "chat_id": conv_id,
-                    "user_id": sender_aad_id or sender_id,
-                    "user_name": sender_name or sender_id,
-                    "thread_id": activity_id or None,
-                }
-            event = message_event_cls(
+            source = self.build_source(
+                chat_id=conv_id,
+                chat_name=str(conv.get("name") or conv_id),
+                chat_type=str(conv.get("conversationType") or "channel"),
+                user_id=sender_aad_id or sender_id,
+                user_name=sender_name or sender_id,
+                thread_id=activity_id or None,
+            )
+            event = MessageEvent(
                 text=text,
-                message_type=getattr(message_type_cls, "TEXT", "text"),
+                message_type=MessageType.TEXT,
                 source=source,
                 raw_message=activity,
                 message_id=activity_id,
@@ -691,15 +610,17 @@ def install() -> None:
         caption: str | None = None,
         metadata: dict[str, Any] | None = None,
         **_kwargs: Any,
-    ) -> TeamsSendResult:
+    ) -> dict[str, Any]:
+        """Out-of-process delivery (cron); the registry expects a dict back."""
         del media_files, force_document, caption
         adapter = TeamsRelayAdapter(pconfig)
-        return await adapter.send(
+        result = await adapter.send(
             chat_id,
             message,
             thread_id=thread_id,
             metadata=metadata,
         )
+        return {"success": result.success, "message_id": result.message_id}
 
     import gateway.platform_registry as registry_module
     from gateway.platform_registry import PlatformRegistry
@@ -720,17 +641,11 @@ def install() -> None:
         PlatformRegistry.create_adapter = create_adapter
         PlatformRegistry._teams_relay_patched = True
 
-    platform_entry_cls = getattr(registry_module, "PlatformEntry", None)
-    singleton = getattr(registry_module, "platform_registry", None)
-    if platform_entry_cls is not None and singleton is not None:
+    singleton = registry_module.platform_registry
+    if singleton.get("teams") is None:
         try:
-            existing = (
-                singleton.get("teams")
-                if callable(getattr(singleton, "get", None))
-                else None
-            )
-            if existing is None:
-                entry = platform_entry_cls(
+            singleton.register(
+                registry_module.PlatformEntry(
                     name="teams",
                     label="Microsoft Teams",
                     adapter_factory=lambda cfg: TeamsRelayAdapter(cfg),
@@ -738,6 +653,11 @@ def install() -> None:
                     is_connected=lambda _cfg=None: True,
                     standalone_sender_fn=_standalone_send,
                 )
-                singleton.register(entry)
+            )
         except Exception:
-            LOGGER.debug("Teams PlatformEntry registration skipped", exc_info=True)
+            # Without the entry, Platform("teams") cannot resolve and no
+            # adapter is built: say so where an operator reads.
+            LOGGER.warning(
+                "Teams platform registration failed; the adapter is unavailable",
+                exc_info=True,
+            )

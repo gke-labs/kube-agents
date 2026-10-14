@@ -14164,7 +14164,7 @@ class TeamsRelayTest(unittest.TestCase):
             "access_token": "mock-entra-id-jwt-token",
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps(fake_token_response).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -14187,6 +14187,10 @@ class TeamsRelayTest(unittest.TestCase):
             "https://attacker.trafficmanager.net/teams/",
             "http://smba.trafficmanager.net/teams/",
             "https://user:pass@smba.trafficmanager.net/teams/",
+            # A `#` or `?` would make the appended endpoint a fragment or a
+            # query string and send the request to the path before it.
+            "https://smba.trafficmanager.net/teams/v3/conversations#",
+            "https://smba.trafficmanager.net/teams/v3/conversations?",
             "",
         ):
             with self.assertRaises(ValueError, msg=bad_url):
@@ -14207,6 +14211,7 @@ class TeamsRelayTest(unittest.TestCase):
             "v3/conversations/123/members",
             "v3/conversations/123/../admin",
             "v3/attachments/123",
+            "v3/conversations/123/activities/history",
         ):
             with self.assertRaises(ValueError, msg=bad_path):
                 relay.api_call(
@@ -14217,7 +14222,7 @@ class TeamsRelayTest(unittest.TestCase):
 
     def test_teams_relay_api_call_success_and_json_parsing(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -14237,6 +14242,14 @@ class TeamsRelayTest(unittest.TestCase):
             self.assertEqual(res, {"id": "act-resp-1"})
 
     def test_teams_relay_redirect_handler_refuses_redirects(self):
+        # api_call goes through the module's one opener, and that opener
+        # carries the refusing handler.
+        self.assertTrue(
+            any(
+                isinstance(h, credential_proxy._TeamsNoRedirectHandler)
+                for h in credential_proxy._TEAMS_OPENER.handlers
+            )
+        )
         handler = credential_proxy._TeamsNoRedirectHandler()
         with self.assertRaises(ValueError):
             handler.redirect_request(
@@ -14311,7 +14324,7 @@ class TeamsRelayTest(unittest.TestCase):
 
     def test_teams_relay_missing_token_raises(self):
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"error": "invalid_client"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
