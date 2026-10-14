@@ -115,6 +115,7 @@ class PreflightAnswersInOneLine(unittest.TestCase):
             self.assertTrue(line.startswith("BROKER_UNAVAILABLE: "), line)
             self.assertIn("not a registration problem", line)
             self.assertNotIn("retried once", line)
+            self.assertIn("says what to fix", line)
 
     def test_entries_that_are_all_unusable_are_named_not_called_missing(self):
         unusable = [{"type": "github", "url": "https://github.example.com:8443/acme/fleet"}]
@@ -123,6 +124,15 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
         self.assertIn("not usable", line)
         self.assertIn("github.example.com:8443/acme/fleet", line)
+
+    def test_a_repository_the_broker_does_not_manage_is_no_registered_repo(self):
+        refused = subprocess.CompletedProcess(
+            [], 1, stdout=json.dumps({"error": "not managed", "code": "REPOSITORY_NOT_MANAGED"}), stderr=""
+        )
+        with _StateDir(entries=ENTRY), patch("subprocess.run", return_value=refused):
+            code, line = gitops_preflight.preflight(REPO)
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertTrue(line.startswith("NO_REGISTERED_REPO: the broker does not manage"), line)
 
     def test_a_github_browser_url_names_its_repository(self):
         answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
@@ -159,7 +169,7 @@ class PreflightAnswersInOneLine(unittest.TestCase):
 
 
 class ListingShowsBothRegistries(unittest.TestCase):
-    """`--list` is what SOUL.md reads for managed versus context repositories."""
+    """`--list` is for SOUL.md's repository resolution: managed versus context."""
 
     def test_nothing_registered_lists_none_twice_and_exits_zero(self):
         with _StateDir(entries=None):

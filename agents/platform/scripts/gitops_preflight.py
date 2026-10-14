@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Answer, in one line, whether a GitOps pull request can be opened at all.
 
-    python3 "$HERMES_HOME"/scripts/gitops_preflight.py [--repo <owner/name or host/path>]
+    python3 "$HERMES_HOME"/scripts/gitops_preflight.py [--repo <name or URL> | --list]
 
 Prompt rules alone did not hold here: asked to install a chart on an install
 with no registered repository, workers read the registry, found it empty, and
 went on looking for another route until the delegation ceiling. This script
-is the authoritative answer a PR-writing skill runs first. It reads the
-registry through gitops_workspace.get_managed_repos, the list of usable
-entries the verbs accept (the mounted /etc/gitops/managed_repos file, a
-mount without the key as known-empty; a list with no usable entry reads as
-empty), and prints exactly one line:
+is the authoritative answer a PR-writing skill or SOUL.md is to run first. It
+reads the registry through gitops_workspace.get_managed_repos, the list of
+usable entries the verbs accept: the mounted /etc/gitops/managed_repos file,
+a mount without the key as known-empty, and the ConfigMap through kubectl
+when there is no mount. A list with no usable entry reads as empty. It
+prints exactly one line:
 
     REGISTERED: <repo> [<repo> ...]                  exit 0
     NO_REGISTERED_REPO: stop now. ...                exit 3
@@ -18,29 +19,36 @@ empty), and prints exactly one line:
     STATE_UNREADABLE: stop now. ...                  exit 5
     BROKER_UNAVAILABLE: stop now. ...                exit 6  (with --repo)
 
+Only REGISTERED is exit 0. Every other line tells the reader to stop and
+block, because that is the whole point of having one. A malformed command line
+(an empty --repo, --repo with --list) is argparse's exit 2, with no status line.
+
+With --repo, the named repository (a bare path, a clone URL, an scp remote:
+anything repo_ref parses, then spelt as the managed list spells it; a GitHub
+browser URL counts as its first two path segments) must be registered and
+must answer a read the broker serves with the install's forge credential
+(`vcs.py proposal list --limit 1`). A name not in the list, or one the broker
+says it does not manage (REPOSITORY_NOT_MANAGED), is NO_REGISTERED_REPO. The
+forge saying the repository is missing or the credential cannot see it
+(FORGE_NOT_FOUND, FORGE_FORBIDDEN, FORGE_UNAUTHENTICATED) is REPO_UNREACHABLE.
+Every other failure -- a forge or broker outage, a rate limit, an untrusted
+TLS certificate, a broker that does not route the verb, a sandbox missing the
+client -- is BROKER_UNAVAILABLE, with the client's reason in parentheses. A
+registry whose entries were all dropped as unusable says so and names them,
+under NO_REGISTERED_REPO.
+
 With --list it prints both registries instead, for reading rather than
 gating: `managed_repos` (swept, audited, sent pull requests) and
 `context_repos` (read for declared intent only, never written):
 
-    MANAGED: <repo> ... | MANAGED: none
-    CONTEXT: <host/path>[@<ref>] ... | CONTEXT: none exit 0, or 5 if unreadable
+    MANAGED: <repo> ... | none | none usable (<n> registered, unusable: ...)
+    CONTEXT: <host/path>[@<ref>] ... | none           exit 0, or 5 if unreadable
 
 MANAGED uses the names the verbs accept (bare owner/name on a GitHub-only
 install); CONTEXT uses host/path, because context repositories are only ever
-read, never passed to a verb. Userinfo in a URL is never printed.
-
-With --repo, the named repository (a bare path, a clone URL, an scp remote:
-anything repo_ref parses, then spelt as the managed list spells it) must be
-registered and must answer a read the broker serves with the install's forge
-credential (`vcs.py proposal list --limit 1`). A name not in the list is
-NO_REGISTERED_REPO for that name (a GitHub browser URL counts as its first two
-path segments). The forge saying the repository is missing or the credential
-cannot see it (FORGE_NOT_FOUND, FORGE_FORBIDDEN, FORGE_UNAUTHENTICATED) is
-REPO_UNREACHABLE; every other failure -- a forge or broker outage, a rate
-limit, a broker that does not route the verb, a sandbox missing the client --
-is BROKER_UNAVAILABLE, with the reason saying whether to wait or roll an image. A registry whose entries were
-all dropped as unusable says so and names them, under NO_REGISTERED_REPO. Every non-zero line tells the reader to
-stop and block, because that is the whole point of having one.
+read, never passed to a verb. A context entry whose ref was refused prints
+as <host/path>(ref-refused:'<ref>',not-searched). Userinfo in a URL is never
+printed.
 """
 
 import argparse
@@ -66,6 +74,10 @@ EXIT_BROKER_UNAVAILABLE = 6
 # broker that does not route the verb, a sandbox missing the client -- is not
 # the repository's, and says so as BROKER_UNAVAILABLE.
 REPOSITORY_CODES = frozenset({"FORGE_UNAUTHENTICATED", "FORGE_FORBIDDEN", "FORGE_NOT_FOUND"})
+# The broker's own refusal of a repository missing from its registry
+# (credential_proxy.py): the sandbox's mounted list and the broker's can
+# disagree for a moment after a ConfigMap edit.
+NOT_MANAGED_CODE = "REPOSITORY_NOT_MANAGED"
 GITHUB_REPOSITORY_DEPTH = 2
 
 REACH_TIMEOUT_SECONDS = 60
@@ -73,7 +85,7 @@ REACH_TIMEOUT_SECONDS = 60
 # <profile>/skills/version-control/scripts/.
 VCS_SCRIPT = Path(__file__).resolve().parents[1] / "skills" / "version-control" / "scripts" / "vcs.py"
 REACH_PROBE_LIMIT = "1"
-OK, REPOSITORY, BROKER = "ok", "repository", "broker"
+OK, REPOSITORY, BROKER, NOT_MANAGED = "ok", "repository", "broker", "not-managed"
 URL_SCHEME_SEPARATOR = "://"
 USERINFO_SEPARATOR = "@"
 NONE = "none"
@@ -111,6 +123,8 @@ def _reachable(repo: str) -> tuple[str, str]:
         return OK, ""
     code, message = _error_of(result)
     reason = f"{code}: {message}" if code else message
+    if code == NOT_MANAGED_CODE:
+        return NOT_MANAGED, reason
     return (REPOSITORY if code in REPOSITORY_CODES else BROKER), reason
 
 
@@ -229,11 +243,16 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
             f"(registered: {' '.join(repos)}); {STOP} {REGISTRATION_STEPS}"
         )
     outcome, why = _reachable(repo)
+    if outcome == NOT_MANAGED:
+        return EXIT_NO_REGISTERED_REPO, (
+            f"NO_REGISTERED_REPO: the broker does not manage {repo} ({why}); {STOP} "
+            f"{REGISTRATION_STEPS}"
+        )
     if outcome == BROKER:
         return EXIT_BROKER_UNAVAILABLE, (
             f"BROKER_UNAVAILABLE: the broker, the forge or this sandbox could not "
             f"answer for {repo} ({why}); {STOP} This is not a registration problem; "
-            "the reason in parentheses says whether to wait or to roll an image."
+            "the reason in parentheses says what to fix."
         )
     if outcome == REPOSITORY:
         return EXIT_REPO_UNREACHABLE, (
@@ -249,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--repo", help="also require this repository to be registered and reachable")
     mode.add_argument("--list", action="store_true", help="print both registries instead of gating")
     args = parser.parse_args(argv)
+    if args.repo is not None and not args.repo.strip():
+        parser.error("--repo needs a repository name or URL")
     code, line = listing() if args.list else preflight(args.repo)
     print(line)
     return code
