@@ -550,7 +550,7 @@ class PreLlmCallTest(unittest.TestCase):
 
     def test_eval_marker_from_report_needs_a_bench_report_name(self):
         for report in (None, "", plugin.REPORT_NAME, "../INVENTORY.bench-x.md", "/opt/data/INVENTORY.bench-x.md",
-                       "INVENTORY.bench-X.md", ".ssh/id_rsa"):
+                       "INVENTORY.bench-X.md", ".ssh/id_rsa", "INVENTORY.bench-x.md\n"):
             with self.subTest(report=report):
                 extra = {} if report is None else {"report": report}
                 self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, **extra)

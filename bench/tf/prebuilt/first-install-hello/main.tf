@@ -83,8 +83,6 @@ resource "null_resource" "planted_report" {
     host_location     = var.host_cluster_location
     host_project      = var.project_id
     namespace         = var.agent_namespace
-    deployment        = var.agent_deployment
-    container         = var.agent_container
     sandbox_selector  = var.sandbox_selector
     sandbox_container = var.sandbox_container
     report_path       = local.sandbox_report

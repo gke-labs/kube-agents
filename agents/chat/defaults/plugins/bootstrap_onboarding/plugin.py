@@ -93,7 +93,7 @@ EVAL_VARIANT_COMPLETED = "completed"
 EVAL_VARIANT_FROM_REPORT = "from_report"
 EVAL_KEY_REPORT = "report"
 # A bare file name beside the real report that nothing in onboarding reads.
-EVAL_REPORT_NAME = re.compile(r"^INVENTORY\.bench-[a-z0-9-]+\.md$")
+EVAL_REPORT_NAME = re.compile(r"\AINVENTORY\.bench-[a-z0-9-]+\.md\Z")
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
