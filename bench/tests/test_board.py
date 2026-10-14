@@ -669,14 +669,14 @@ def test_read_descendants_skips_card_with_idempotency_key(
     with caplog.at_level(logging.WARNING):
         descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == ["t_private_child"]
-    assert any("skipped 1 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+    assert any("skipped 1 keyed live child card(s)" in r.message for r in caplog.records)
     assert any("and did not walk their subtrees" in r.message for r in caplog.records)
 
 
 def test_read_descendants_skips_terminal_keyed_card_without_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Keyed or pre-dating cards that are already terminal (done/archived) do not
+    # Keyed cards that are already terminal (done/archived) do not
     # hold dispatcher slots and do not increment skipped or log a warning.
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute(
@@ -704,6 +704,45 @@ def test_read_descendants_skips_terminal_keyed_card_without_warning(
     with caplog.at_level(logging.WARNING):
         descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == ["t_child"]
+    assert not any("skipped" in r.message for r in caplog.records)
+
+
+def test_read_descendants_expands_settled_keyed_card_to_archive_live_children(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Review finding: a settled keyed card's live fan-out must not be pruned.
+    # While live keyed cards are skipped to protect parallel runs waiting on them,
+    # a settled (done/failed) keyed card's worker is gone, so its live fan-out children
+    # must be traversed and returned for archiving to avoid leaking worker slots.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER, idempotency_key TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status, created_at, idempotency_key) VALUES (?, ?, ?, ?)",
+            [
+                ("t_root", "running", 200, None),
+                ("t_done_keyed", "done", 210, "idem-key-123"),
+                ("t_gc_live", "running", 220, None),
+                ("t_child", "running", 205, None),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_done_keyed", "t_root", 215),
+                ("t_child", "t_root", 216),
+                ("t_gc_live", "t_done_keyed", 225),
+            ],
+        )
+
+    with caplog.at_level(logging.WARNING):
+        descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants is not None
+    assert sorted(descendants) == ["t_child", "t_gc_live"]
     assert not any("skipped" in r.message for r in caplog.records)
 
 
@@ -801,7 +840,7 @@ def test_read_descendants_does_not_walk_subtrees_of_keyed_cards(
     with caplog.at_level(logging.WARNING):
         descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == []
-    assert any("skipped 2 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+    assert any("skipped 2 keyed live child card(s)" in r.message for r in caplog.records)
     assert any("and did not walk their subtrees" in r.message for r in caplog.records)
 
 

@@ -449,9 +449,8 @@ try:
             child_idem_key = row[1] if has_idempotency_key else None
 
             is_keyed = bool(child_idem_key)
-            if is_keyed:
-                if status not in TERMINAL_STATUSES:
-                    skipped += 1
+            if is_keyed and status not in TERMINAL_STATUSES:
+                skipped += 1
                 continue
 
             queue.append(child)
@@ -512,14 +511,16 @@ def read_descendants(
     Walks ``kanban_worker_children`` (fanned-out children created by workers)
     recursively, skipping cards that are already settled (statuses in
     :data:`TERMINAL_STATUSES`), no longer exist on the board (missing
-    ``tasks`` row), or carry an ``idempotency_key`` (idempotent cards that may
-    be shared across parallel repetition runs). When a card is keyed, its entire
-    subtree is omitted from traversal so parallel runs are protected from
-    having their children archived. Cards in ``exclude`` (e.g. already-attempted
-    cards from earlier rounds) are traversed to find deeper descendants but
-    omitted from the returned list so they do not consume scan slots.
-    Non-conforming card IDs (failing :data:`_TASK_ID_RE`) are dropped in-pod
-    without taking scan slots, and warned about.
+    ``tasks`` row), or carry an ``idempotency_key`` while non-terminal
+    (idempotent cards that may be shared across parallel repetition runs).
+    When a live card is keyed, its entire subtree is omitted from traversal so
+    parallel runs waiting on it are protected from having it or its children
+    archived. Settled keyed cards are traversed to discover and archive any
+    unsettled descendants their workers fanned out. Cards in ``exclude``
+    (e.g. already-attempted cards from earlier rounds) are traversed to find
+    deeper descendants but omitted from the returned list so they do not
+    consume scan slots. Non-conforming card IDs (failing :data:`_TASK_ID_RE`)
+    are dropped in-pod without taking scan slots, and warned about.
 
     ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
     module stays importable without the harness and testable with a canned
@@ -569,7 +570,7 @@ def read_descendants(
     skipped = payload.get("skipped")
     if isinstance(skipped, int) and skipped > 0:
         _log.warning(
-            "kanban board descendants skipped %d keyed or pre-dating live child card(s) and did not walk their subtrees; those workers, and any they fanned out, may still hold dispatcher slots",
+            "kanban board descendants skipped %d keyed live child card(s) and did not walk their subtrees; those workers, and any they fanned out, may still hold dispatcher slots",
             skipped,
         )
     if payload.get("truncated"):
