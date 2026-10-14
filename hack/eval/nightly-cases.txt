@@ -295,9 +295,9 @@
 # they failed (one run each, 2026-10-07 and 10-08). Entry 5's follow-up
 # takes 600s (one maintenance-policy read per cluster, 257-571s measured).
 # About 750 serial minutes at three repetitions, none of it on a lock.
-# Counted from the lists rather than the paragraphs above (which had fallen
-# three behind): eighty-six cases (258 units) here, of a one-hundred-case,
-# 300-unit matrix with the presubmit file's fourteen.
+# Counted from the lists rather than the paragraphs above (the latest is one
+# behind): eighty-seven cases (261 units) here, of a one-hundred-and-one-case,
+# 303-unit matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
