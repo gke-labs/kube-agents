@@ -35,10 +35,23 @@ Which clusters. The projects come from this pod, not from the sandbox:
 (``GCP_PROJECT_ID``) together with every project a Cluster Agent profile's
 ``cluster_identity`` names, the roster the cluster reconciler keeps; with
 neither, the sandbox's ``gcloud config get-value project``; and with nothing
-at all the tick fails closed rather than let the report script enumerate every
-project the credential can list. Every cluster in those projects is read,
+at all the tick fails closed rather than let the report script fall back to
+its own scope, which on an install that declares none is every project the
+credential can list. Every cluster in those projects is read,
 including ones ``spec.scope.exclude.clusters`` keeps a Cluster Agent from,
-because the report script enumerates by project. A project spelled by its
+because the report script enumerates by project. On an install that declares
+a scope (a ``spec.scope`` block), the report script, a fleet-audit collector,
+refuses a bare ``--project`` in the sandbox (``fleet_scope_args``, under the
+operator's ``KUBEAGENTS_SCOPE_DECLARED``), so the tick reads the declared
+scope on this pod, where the reconcile's snapshot is
+(``fleet_scope_targets.declared_scope_targets()``, which reads the operator's
+render until a reconcile tick writes a snapshot that answers), and hands the report the resolved
+scope beside each ``--project``, the ``collector_args`` the platform_control
+``fleet_scope`` tool hands the SOPs (``--scope-projects``, ``--scope-unread``):
+the report reads a project inside the scope and refuses one outside it with
+the reason, which the table carries as that project's failure; an install
+that declares none keeps the bare flag, and a render this pod cannot read
+fails the tick with the reason. A project spelled by its
 number is keyed by the id ``gcloud projects describe`` resolves, learned on
 its first table run; a number the credential cannot resolve is never a key,
 so its clusters earn no report until it resolves: when nothing was read under
@@ -110,6 +123,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 
@@ -155,6 +169,18 @@ IDENTITY_PROJECT_KEY = "project"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 PROJECT_FLAG = "--project"
+# On an install that declares a scope (a ``spec.scope`` block) the operator
+# marks the shell sandbox (``KUBEAGENTS_SCOPE_DECLARED``) and the report
+# script, a fleet-audit collector, refuses a bare ``--project`` there
+# (``fleet_scope_args.DeclaredScope``): without the scope a collector cannot
+# tell a project inside it from one outside. The scope is read on this pod
+# (``scope_flags``) and handed on as the fleet_scope tool spells it, so the
+# flags cannot drift from the collectors'. A render the operator wrote that
+# this pod cannot read is a fault, not an undeclared install.
+SCOPE_UNREADABLE_DETAIL = (
+    "the operator's scope render could not be read, so whether the install declares a scope is unknown; "
+    "nothing was read: {error}"
+)
 NO_PROJECT_DETAIL = (
     f"no GCP project: set {PROJECTS_ENV} or {MANAGEMENT_PROJECT_ENV}, onboard a cluster, or configure gcloud in the sandbox; "
     "refusing to let the report enumerate every project the credential can list"
@@ -203,6 +229,11 @@ BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could 
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
 TABLE_CUT_SHORT_DETAIL = "the version table's run for project {project} was cut short by its share of the budget"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
+TABLE_REFUSED_DETAIL = (
+    "version table for {project} refused by the report script: {error}; the remedy is on the install, not this job: "
+    "name the project in spec.scope, give the install read access to it, or take it out of the roster "
+    "(its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
+)
 # The remedy rides on the message: every read role the install binds carries
 # resourcemanager.projects.get (cluster_agent_reconcile.py relies on it), and
 # the CRD reference wants spec.harness.projectId to be the id, not the number.
@@ -218,6 +249,9 @@ STDERR_EXCERPT_CHARS = 300
 # The report's vocabulary this job reads (fleet_upgrade_report.py, upgrade_readiness.py).
 MEMBERS_KEY = "members"
 EXIT_OK = 0
+# The report script's EXIT_USAGE: it refused to read what it was asked and
+# wrote no report, with the reason on stderr; against a sandbox that failed.
+REPORT_USAGE_EXIT = 2
 STATUS_KEY = "status"
 TARGET_KEY = "target_version"
 READINESS_KEY = "readiness"
@@ -337,6 +371,7 @@ NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} cons
 # daily, or a timeout's figure, does not re-post the line.
 ERROR_KIND_UNRUN = "table not run to completion by the budget"
 ERROR_KIND_TABLE_FAILED = "table failed"
+ERROR_KIND_REFUSED = "refused by the report script"
 ERROR_KIND_UNRESOLVED = "project number not resolved"
 # The watch writes its own read errors with the kind on them; the report
 # script's carry no kind and are classified by their shape.
@@ -354,6 +389,13 @@ MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
 WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
+
+
+class ReportRefused(RuntimeError):
+    """The report script exited with its usage code and wrote no report: it
+    refused to read what it was asked, with the reason on stderr (a project
+    the declared scope does not list, one it lists but the install cannot
+    read, a number it cannot resolve), as against a sandbox that failed."""
 
 
 class SandboxTimedOut(RuntimeError):
@@ -529,14 +571,56 @@ def envelope_line(stdout: str) -> str | None:
     return None
 
 
-def report_argv(names: list[str], readiness: bool) -> list[str]:
-    argv = project_flags(names)
+def declared_scope() -> fleet_scope_targets.ScopeTargets | None:
+    """The install's declared scope as the reconcile resolved it, read on this
+    pod (the sandbox cannot read the snapshot), or None on an install that
+    declares none. A render the operator wrote that cannot be read is a fault,
+    not an undeclared install: the tick fails with the reason rather than hand
+    the report a bare ``--project`` a scoped sandbox refuses."""
+    try:
+        return fleet_scope_targets.declared_scope_targets()
+    except fleet_scope_targets.ScopeRenderUnreadable as exc:
+        raise RuntimeError(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
+
+
+def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
+    """What hands the report the declared scope beside ``--project``: nothing
+    on an install that declares none, where the report reads the project as
+    before; on one that does, the resolved scope as the platform_control
+    ``fleet_scope`` tool hands it to the SOPs (``ScopeTargets.collector_args``:
+    ``--scope-projects`` with the projects the reconcile read, ``--scope-unread``
+    with the declared ones it could not), the remedy the report's own refusal
+    names. Under ``--project`` the report then does what it does for an
+    agent's override (``DeclaredScope.override_error``): it reads the one
+    project when the id it resolves is inside the set, and refuses it with the
+    reason when it is not, the unread flag giving the reason for a declared
+    project the install could not read. The projects this pod decided on
+    (``projects``) are not all inside by construction: the reconcile keeps a
+    profile the scope never produced (one onboarded by hand before the scope
+    was declared) and, for one run, a project removed from the declaration,
+    and a hand run may name anything in ``UPGRADE_READINESS_PROJECTS``; such a
+    project's run is a table failure named in the partial line, not a read the
+    declaration did not allow; the table carries it under its own kind
+    (``ReportRefused``), so the partial line tells it from a sandbox that
+    fails. Until a reconcile tick writes a snapshot that answers (the first on
+    a new install, the next on one whose snapshot predates the ``boundary``
+    key) the render answers with the management project alone, so another
+    project is refused until that tick. The whole set goes because nothing
+    records this argv: it is one line of the loader on the sandbox command's
+    stdin, beside both scripts' sources."""
+    if scope is None:
+        return []
+    return list(scope.collector_argv())
+
+
+def report_argv(names: list[str], readiness: bool, scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
+    argv = project_flags(names) + scope_flags(scope)
     if readiness:
         argv += [READINESS_FLAG, KUBECONFIG_DIR_FLAG, SANDBOX_KUBECONFIG_DIR]
     return argv
 
 
-def run_report(names: list[str], readiness: bool, timeout: float | None = None) -> dict:
+def run_report(names: list[str], readiness: bool, *, scope: fleet_scope_targets.ScopeTargets | None, timeout: float | None = None) -> dict:
     """Run the skill's report in the sandbox and return the envelope:
     ``{"exit": int, "tables": str, "report": dict | None}``."""
     if timeout is None:
@@ -546,7 +630,7 @@ def run_report(names: list[str], readiness: bool, timeout: float | None = None) 
             [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG],
             timeout=timeout,
             check=False,
-            stdin=loader_source(report_argv(names, readiness)),
+            stdin=loader_source(report_argv(names, readiness, scope)),
         )
     except subprocess.TimeoutExpired:
         raise SandboxTimedOut(TIMED_OUT_DETAIL.format(seconds=int(timeout))) from None
@@ -558,7 +642,10 @@ def run_report(names: list[str], readiness: bool, timeout: float | None = None) 
         raise RuntimeError(f"sandbox exited {completed.returncode} without a report: {detail}")
     envelope = json.loads(envelope_text)
     if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
-        raise RuntimeError(f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}")
+        detail = f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}"
+        if envelope.get(ENVELOPE_EXIT_KEY) == REPORT_USAGE_EXIT:
+            raise ReportRefused(detail)
+        raise RuntimeError(detail)
     return envelope
 
 
@@ -931,7 +1018,7 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
     merge_exit(merged, envelope)
 
 
-def versions_by_project(names: list[str], deadline: float, ledger: dict, now: datetime) -> dict:
+def versions_by_project(names: list[str], deadline: float, ledger: dict, now: datetime, scope: fleet_scope_targets.ScopeTargets | None) -> dict:
     """The version table, one sandbox run per project under its own timeout and
     what is left of the table's share of the budget before ``deadline``, merged
     into one envelope. A project whose run failed, or that the budget did not reach, is a
@@ -974,7 +1061,7 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             continue
         timeout = min(VERSION_TABLE_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = run_report([project], readiness=False, timeout=timeout)
+            envelope = run_report([project], readiness=False, scope=scope, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not stamped, so it goes first next time.
@@ -984,6 +1071,17 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             failed[project] = exc
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
                 {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
+            )
+            continue
+        except ReportRefused as exc:
+            # The script would not read the project: on a declared install,
+            # one the scope does not list. Its own kind, so the partial line's
+            # signature tells a refusal that stands from a sandbox that fails,
+            # and the remedy named is the install's, not an agent's.
+            last_runs[project] = iso(now)
+            failed[project] = exc
+            merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_REFUSED, MESSAGE_KEY: TABLE_REFUSED_DETAIL.format(project=project, error=str(exc))}
             )
             continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -1036,7 +1134,13 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
 
 
 def readiness_by_project(
-    pending: dict[str, list[str]], due: dict[str, str], deadline: float, last_runs: dict[str, str], now: datetime, ids: dict[str, str]
+    pending: dict[str, list[str]],
+    due: dict[str, str],
+    deadline: float,
+    last_runs: dict[str, str],
+    now: datetime,
+    ids: dict[str, str],
+    scope: fleet_scope_targets.ScopeTargets | None,
 ) -> tuple[dict, dict[str, str], dict[str, str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
@@ -1062,7 +1166,7 @@ def readiness_by_project(
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = run_report([spelled.get(project, project)], readiness=True, timeout=timeout)
+            envelope = run_report([spelled.get(project, project)], readiness=True, scope=scope, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < READINESS_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not an attempt, not
@@ -1240,8 +1344,9 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
     names = projects()
+    scope = declared_scope()
     deadline = started + TICK_BUDGET_SECONDS
-    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now)
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
@@ -1271,7 +1376,7 @@ def tick(dry_run: bool = False) -> list[str]:
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     ledger[TABLE_ERRORS_KEY] = read_errors
     if due:
-        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
+        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY], scope)
         canonicalise_projects(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:

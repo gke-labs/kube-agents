@@ -1,4 +1,4 @@
-"""Tests for upgrade_readiness_watch.py: the gate, the files, the lines, the projects."""
+"""Tests for upgrade_readiness_watch.py: the gate, the files, the lines, the projects, the scope."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_scope_args  # noqa: E402
+import fleet_scope_targets  # noqa: E402
 import upgrade_readiness_watch as watch  # noqa: E402
 
 ROSTER = Path(__file__).resolve().parents[1] / "cron" / "jobs.json"
@@ -41,6 +43,20 @@ def loader_argv(stdin: str) -> list[str]:
     return json.loads(line[len(ARGV_LINE_PREFIX):])
 
 
+def scope_targets(*projects: str, unread: tuple[tuple[str, str], ...] = ()) -> fleet_scope_targets.ScopeTargets:
+    return fleet_scope_targets.ScopeTargets(projects=projects, unread=unread, resolved_at=None, path="fleet_scope.json")
+
+
+def declared_snapshot(projects: list[str], unread: list[str] | None = None) -> dict:
+    """The reconcile's snapshot for an install whose ``spec.scope`` resolved to
+    ``projects`` (the first the management project), with ``unread`` declared
+    projects the install could not read."""
+    rows = [{"id": p, "outcome": "ok", "state": "in-scope", "via": ["management"] if i == 0 else ["projects"]} for i, p in enumerate(projects)]
+    rows += [{"id": p, "outcome": "denied", "state": "in-scope", "via": ["projects"]} for p in unread or []]
+    declared = {"projects": projects[1:] + list(unread or []), "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {}}
+    return {"resolvedAt": "2026-10-09T12:00:00Z", "present": True, "boundary": True, "declared": declared, "projects": rows}
+
+
 class FakeSandbox:
     """Stands in for sandbox_exec.run: answers the version table and the
     readiness run from canned envelopes and records what was asked."""
@@ -57,6 +73,7 @@ class FakeSandbox:
         table_timeout_projects: set | None = None,
         aliases: dict | None = None,
         describe_down: set | None = None,
+        refused_projects: set | None = None,
     ):
         self.versions = versions
         self.readiness = readiness or versions
@@ -70,6 +87,8 @@ class FakeSandbox:
         self.aliases = aliases or {}
         # Spellings whose `projects describe` is down: the report keys the run by the spelling itself.
         self.describe_down = describe_down or set()
+        # Projects the report script refuses to read, as it does one the handed scope does not list.
+        self.refused_projects = refused_projects or set()
         self.calls: list[tuple[str, list[str], float]] = []
 
     def run(self, argv, *, timeout, check, stdin=None):
@@ -79,19 +98,26 @@ class FakeSandbox:
         report_argv = loader_argv(stdin)
         wanted = watch.READINESS_FLAG in report_argv
         self.calls.append(("readiness" if wanted else "versions", report_argv, timeout))
+        # The projects asked for are the --project values alone: the scope flags carry other ids.
+        asked = [report_argv[i + 1] for i, flag in enumerate(report_argv) if flag == watch.PROJECT_FLAG]
         if wanted and self.readiness_error is not None:
             raise self.readiness_error
-        if wanted and any(p in self.failing_projects for p in report_argv[1::2]):
+        if wanted and any(p in self.failing_projects for p in asked):
             return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
-        if wanted and any(p in self.garbled_projects for p in report_argv[1::2]):
+        if wanted and any(p in self.garbled_projects for p in asked):
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{{\"exit\": 0, \"tables\": \"| cut", stderr="")
-        if not wanted and any(p in self.table_failing_projects for p in report_argv[1::2]):
+        if not wanted and any(p in self.table_failing_projects for p in asked):
             return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
-        if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in report_argv[1::2]):
+        if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in asked):
             raise subprocess.TimeoutExpired(argv, timeout)
+        if any(p in self.refused_projects for p in asked):
+            # The script's usage exit, no report, the reason on stderr, as the real one answers an override outside the handed scope.
+            handed = next((report_argv[i + 1] for i, flag in enumerate(report_argv) if flag == fleet_scope_targets.SCOPE_PROJECTS_FLAG), "")
+            reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=handed.replace(",", ", "))
+            body = {"exit": 2, "tables": "", "report": None}
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
         body = self.readiness if wanted else self.versions
         # Both hops run once per project: answer with that project's slice.
-        asked = [report_argv[i + 1] for i, flag in enumerate(report_argv) if flag == watch.PROJECT_FLAG]
         down = {a for a in asked if a in self.describe_down}
         resolved = {a: (a if a in down else self.aliases.get(a, a)) for a in asked}
         projects = {self.aliases.get(a, a) for a in asked}
@@ -114,14 +140,27 @@ class Base(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "watch"
+        # The scope reader looks for the reconcile's snapshot under the agent
+        # home and the operator's render under its variable: an install that
+        # declares no scope until a test writes one.
         self.env = mock.patch.dict(
             os.environ,
-            {watch.WATCH_HOME_ENV: str(self.home), watch.PROJECTS_ENV: "p1", watch.REFRESH_DAYS_ENV: "", watch.SKILL_SCRIPTS_DIR_ENV: ""},
+            {
+                watch.WATCH_HOME_ENV: str(self.home),
+                watch.PROJECTS_ENV: "p1",
+                watch.REFRESH_DAYS_ENV: "",
+                watch.SKILL_SCRIPTS_DIR_ENV: "",
+                fleet_scope_targets.AGENT_HOME_ENV: self.tmp.name,
+                fleet_scope_targets.SCOPE_FILE_ENV: "",
+            },
             clear=False,
         )
         self.env.start()
         self.clock = mock.patch.object(watch, "now_utc", return_value=NOW)
         self.clock.start()
+
+    def declare_scope(self, projects: list[str], unread: list[str] | None = None) -> None:
+        (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(declared_snapshot(projects, unread)), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.clock.stop()
@@ -1319,6 +1358,103 @@ class Failures(Base):
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
 
+class DeclaredScope(Base):
+    """On an install with a ``spec.scope`` block the sandbox refuses the report
+    script a bare ``--project`` (``fleet_scope_args``), so the tick hands it
+    the resolved scope beside the project, as the fleet_scope tool spells it;
+    an install that declares none keeps the bare flag."""
+
+    def test_a_declared_scope_hands_the_report_the_resolved_scope_beside_the_project(self) -> None:
+        self.declare_scope(["p1", "p2"], unread=["p3"])
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="blocked")]))
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.kinds(), ["versions", "readiness"])
+        scope = ["--scope-projects", "p1,p2", "--scope-unread", "p3=denied"]
+        self.assertEqual(sandbox.calls[0][1], ["--project", "p1", *scope])
+        self.assertEqual(sandbox.calls[1][1], ["--project", "p1", *scope, "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR])
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 1 blocked (a), 0 ready", out)
+
+    def test_an_install_that_declares_no_scope_keeps_the_bare_project_flag(self) -> None:
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        code, _ = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.kinds(), ["versions", "readiness"])
+        for _, argv, _ in sandbox.calls:
+            self.assertNotIn(fleet_scope_targets.SCOPE_PROJECTS_FLAG, argv)
+            self.assertNotIn(fleet_scope_targets.SCOPE_UNREAD_FLAG, argv)
+        self.assertEqual(sandbox.calls[0][1], ["--project", "p1"])
+
+    def test_the_render_alone_declares_a_scope_before_the_first_reconcile_tick(self) -> None:
+        render = Path(self.tmp.name) / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": [], "exclude": {}}), encoding="utf-8")
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        with mock.patch.dict(os.environ, {fleet_scope_targets.SCOPE_FILE_ENV: str(render), watch.MANAGEMENT_PROJECT_ENV: "p1"}):
+            self.run_tick(sandbox)
+        self.assertEqual(sandbox.calls[0][1], ["--project", "p1", "--scope-projects", "p1", "--scope-unread", "declared-scope=unresolved"])
+
+    def test_the_whole_resolved_scope_goes_beside_every_project_so_the_report_can_refuse_one_outside_it(self) -> None:
+        """The roster is not bounded by the declaration (a profile onboarded by
+        hand before the scope, a hand run's list), so each run is handed the
+        set the reconcile resolved, not the project itself: p2 is read only if
+        the report finds it inside."""
+        self.declare_scope(["p1"])
+        sandbox = FakeSandbox(envelope([member("a", "lagging"), member("b", "lagging", project="p2")]))
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.run_tick(sandbox)
+        self.assertCountEqual(
+            [argv for kind, argv, _ in sandbox.calls if kind == "versions"],
+            [["--project", "p1", "--scope-projects", "p1"], ["--project", "p2", "--scope-projects", "p1"]],
+        )
+
+    def test_a_refused_project_is_its_own_kind_of_partial_so_a_later_outage_is_still_announced(self) -> None:
+        """A roster project the declared scope does not list is refused every
+        tick: the partial line names it once, with the remedy on the install,
+        and stays quiet while that is all; a sandbox outage on another project
+        is a new signature and a new line, not the same one swallowed."""
+        self.declare_scope(["p1", "p3"])
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2"), member("c", "current", project="p3")])
+        readiness = envelope([member("a", "lagging", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}):
+            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn("the version table was partial (1 read error(s)", out)
+            self.assertIn(
+                "p2: version table for p2 refused by the report script: report script exited 2 and wrote no report: "
+                "(declared scope: fleet_scope): the project override names p2, which the install's declared scope does not list (p1, p3)",
+                out,
+            )
+            self.assertIn("the remedy is on the install, not this job: name the project in spec.scope", out)
+            self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a)", out)
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script"])
+            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}, table_failing_projects={"p1"}))
+            self.assertEqual(code, 0)
+            self.assertIn("the version table was partial (2 read error(s)", out)
+            self.assertIn("p1: version table for p1 failed: sandbox exited 255 without a report: ssh: lost connection", out)
+            self.assertCountEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script", "table failed"])
+
+    def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
+        scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
+        handed = ["--scope-projects", "p1,p2", "--scope-unread", "p3=denied"]
+        self.assertEqual(watch.report_argv(["123456789012"], readiness=False, scope=scope), ["--project", "123456789012", *handed])
+        self.assertEqual(watch.report_argv(["p1"], readiness=False, scope=scope), ["--project", "p1", *handed])
+        self.assertEqual(watch.report_argv(["p1"], readiness=False, scope=None), ["--project", "p1"])
+        # Nothing readable this tick: the unread flag goes alone and the report refuses, fail closed.
+        self.assertEqual(watch.report_argv(["p1"], readiness=False, scope=scope_targets()), ["--project", "p1", "--scope-unread", "declared-scope=unresolved"])
+
+    def test_an_unreadable_scope_render_fails_the_tick_closed_with_the_reason(self) -> None:
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        with mock.patch.dict(os.environ, {fleet_scope_targets.SCOPE_FILE_ENV: str(Path(self.tmp.name) / "absent.json")}):
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.calls, [])
+        self.assertIn("the tick failed: RuntimeError: the operator's scope render could not be read", out)
+        self.assertIn("absent.json", out)
+        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+
+
 class Projects(unittest.TestCase):
     def test_the_explicit_list_wins(self) -> None:
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2, p1,p2", watch.MANAGEMENT_PROJECT_ENV: "mgmt"}):
@@ -1384,30 +1520,74 @@ class Loader(unittest.TestCase):
 
     def test_the_report_argv_carries_the_projects_and_the_sandbox_side_kubeconfig_dir(self) -> None:
         self.assertEqual(
-            watch.report_argv(["p1", "p2"], readiness=True),
+            watch.report_argv(["p1", "p2"], readiness=True, scope=None),
             ["--project", "p1", "--project", "p2", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR],
         )
-        self.assertEqual(watch.report_argv(["p1"], readiness=False), ["--project", "p1"])
+        self.assertEqual(watch.report_argv(["p1"], readiness=False, scope=None), ["--project", "p1"])
+        self.assertEqual(
+            watch.report_argv(["p1", "p2"], readiness=True, scope=scope_targets("p1", "p2", "p3")),
+            ["--project", "p1", "--project", "p2", "--scope-projects", "p1,p2,p3", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR],
+        )
+
+    @staticmethod
+    def run_loader(source: str, scratch: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        """``python3 -I -`` on the loader with a gcloud that answers no clusters."""
+        bin_dir = Path(scratch) / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        fake_gcloud = bin_dir / "gcloud"
+        fake_gcloud.write_text("#!/bin/sh\necho '[]'\n")
+        fake_gcloud.chmod(0o755)
+        env = {"PATH": str(bin_dir), "HOME": scratch, "TMPDIR": scratch, **(extra_env or {})}
+        return subprocess.run([sys.executable, "-I", "-"], input=source, capture_output=True, text=True, env=env, timeout=120)
+
+    @staticmethod
+    def envelope_of(completed: subprocess.CompletedProcess) -> dict:
+        return json.loads(completed.stdout.rsplit(watch.ENVELOPE_SENTINEL, 1)[1])
 
     def test_the_loader_runs_the_checkout_copy_of_the_report_script(self) -> None:
         """End to end against the real scripts, with gcloud answering no
         clusters: the envelope arrives and the private directory is gone."""
         source = watch.loader_source(["--project", "p1"])
         with tempfile.TemporaryDirectory() as scratch:
-            bin_dir = Path(scratch) / "bin"
-            bin_dir.mkdir()
-            fake_gcloud = bin_dir / "gcloud"
-            fake_gcloud.write_text("#!/bin/sh\necho '[]'\n")
-            fake_gcloud.chmod(0o755)
-            env = {"PATH": str(bin_dir), "HOME": scratch, "TMPDIR": scratch}
-            completed = subprocess.run([sys.executable, "-I", "-"], input=source, capture_output=True, text=True, env=env, timeout=120)
+            completed = self.run_loader(source, scratch)
             self.assertIn(watch.ENVELOPE_SENTINEL, completed.stdout, completed.stderr)
-            body = json.loads(completed.stdout.rsplit(watch.ENVELOPE_SENTINEL, 1)[1])
+            body = self.envelope_of(completed)
             self.assertEqual(body["exit"], 0)
             self.assertEqual(body["report"]["members"], [])
             self.assertIn("project", body["tables"])
             leftovers = [p.name for p in Path(scratch).iterdir() if p.name.startswith(watch.SANDBOX_TMP_PREFIX)]
             self.assertEqual(leftovers, [])
+
+    def test_the_real_report_script_on_a_scoped_sandbox_refuses_the_bare_flag_and_reads_under_the_scoped_argv(self) -> None:
+        """End to end with the operator's marker set, as in the sandbox of an
+        install with a ``spec.scope`` block: the bare ``--project`` is the exit
+        2 the watch posted before the scope was handed on, and the argv a
+        declared scope builds reads the project."""
+        scoped_sandbox = {fleet_scope_args.SCOPE_DECLARED_ENV: fleet_scope_args.SCOPE_DECLARED_TRUE}
+        with tempfile.TemporaryDirectory() as scratch:
+            bare = self.run_loader(watch.loader_source(watch.report_argv(["p1"], readiness=False, scope=None)), scratch, scoped_sandbox)
+            body = self.envelope_of(bare)
+            self.assertEqual(body["exit"], 2)
+            self.assertIsNone(body["report"])
+            self.assertIn(fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, bare.stderr)
+            scoped = self.run_loader(watch.loader_source(watch.report_argv(["p1"], readiness=False, scope=scope_targets("p1"))), scratch, scoped_sandbox)
+            body = self.envelope_of(scoped)
+            self.assertEqual(body["exit"], 0, scoped.stderr)
+            self.assertEqual(body["report"]["members"], [])
+            self.assertNotIn(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX, scoped.stderr)
+
+    def test_the_real_report_script_refuses_a_project_the_handed_scope_does_not_list_with_the_reason(self) -> None:
+        """A roster project outside the declared scope, or one the install could
+        not read, is the report's refusal, not a read: the unread flag is what
+        gives the second its reason."""
+        scoped_sandbox = {fleet_scope_args.SCOPE_DECLARED_ENV: fleet_scope_args.SCOPE_DECLARED_TRUE}
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = self.run_loader(watch.loader_source(watch.report_argv(["p2"], readiness=False, scope=scope_targets("p1"))), scratch, scoped_sandbox)
+            self.assertEqual(self.envelope_of(outside)["exit"], 2)
+            self.assertIn(fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project="p2", projects="p1"), outside.stderr)
+            unread = self.run_loader(watch.loader_source(watch.report_argv(["p2"], readiness=False, scope=scope_targets("p1", unread=(("p2", "denied"),)))), scratch, scoped_sandbox)
+            self.assertEqual(self.envelope_of(unread)["exit"], 2)
+            self.assertIn(fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project="p2", outcome="denied"), unread.stderr)
 
 
 class Roster(unittest.TestCase):

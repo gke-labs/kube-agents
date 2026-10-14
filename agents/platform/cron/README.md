@@ -179,10 +179,19 @@ Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS
 when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
-because the report script's own fallback is every project the credential can
-list. Within those projects the report script
+because on an install that declares no scope the report script's own fallback
+is every project the credential can list. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+Cluster Agent from is still read here. On an install that declares a scope (a
+`spec.scope` block), the report script, a fleet-audit collector, refuses a bare
+`--project` in the sandbox, so the job reads the declared scope on the agent
+pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
+resolved scope beside each `--project`, the `collector_args` the
+platform_control `fleet_scope` tool hands the SOPs (`--scope-projects`,
+`--scope-unread`): the script reads a project inside the scope and refuses one
+outside it with the reason, which the table carries as that project's failure;
+an install that declares none keeps the bare flag, and a scope render the pod
+cannot read fails the tick with the reason. That read is `gcloud` cluster metadata
 for the version table and, on a report day, one `get-credentials` and one
 `kubectl get pdb,deploy,statefulset -A` per cluster for the readiness grade;
 the budget names those objects in the saved report, which is tenant-written

@@ -22,7 +22,10 @@ reconcile writes the resolved set.
 
 Read in the agent pod, where the snapshot is, by the platform_control MCP
 server's `fleet_scope` tool (platform_mcp_server.py), which hands the agent
-the resolved set and the arguments to pass the collectors. The collectors
+the resolved set and the arguments to pass the collectors, and by the
+`upgrade-readiness-watch` job (upgrade_readiness_watch.py), a `no_agent`
+script on the same pod that hands the readiness report script
+`collector_args` beside each project it reads. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
@@ -134,8 +137,10 @@ SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
 RENDER_PRESENT_KEY = "present"
 # Where the management project's id is read when the render alone answers: the
 # sweep is then that project, until the next tick writes the resolved set. One
-# name: it is what the platform_control env block forwards to the only
-# production reader, the fleet_scope tool (agents/platform/config.yaml).
+# name: it is what the platform_control env block forwards to the fleet_scope
+# tool (agents/platform/config.yaml), and what the gateway pod's own
+# environment carries for the upgrade-readiness-watch job, the other
+# production reader.
 MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID",)
 
 # The keys under `declared` whose presence means the install drew a boundary,
@@ -160,22 +165,29 @@ class ScopeTargets:
     # Set when the render answered instead of a snapshot.
     note: str | None = None
 
-    def collector_args(self) -> str:
-        """The arguments that hand this scope to a collector: `--scope-projects`
-        with the sweep, and `--scope-unread` naming each declared project the
-        install could not read, as `project=outcome`. With nothing readable the
-        unread flag goes alone, so a collector handed it still knows a scope
-        was declared and reports that rather than listing. Never empty: a
-        declared scope with no row at all hands the collector the fixed
-        unresolved row, so it reports "nothing readable" rather than telling
-        the agent to call the tool it has just called."""
-        args = []
+    def collector_argv(self) -> tuple[str, ...]:
+        """The arguments that hand this scope to a collector, as an argument
+        list (each flag and its value one token each) for a caller that builds
+        the collector's argv itself, as the upgrade-readiness watch does:
+        `--scope-projects` with the sweep, and `--scope-unread` naming each
+        declared project the install could not read, as `project=outcome`.
+        With nothing readable the unread flag goes alone, so a collector handed
+        it still knows a scope was declared and reports that rather than
+        listing. Never empty: a declared scope with no row at all hands the
+        collector the fixed unresolved row, so it reports "nothing readable"
+        rather than telling the agent to call the tool it has just called."""
+        argv: list[str] = []
         if self.projects:
-            args.append(f"{SCOPE_PROJECTS_FLAG} {','.join(self.projects)}")
+            argv += [SCOPE_PROJECTS_FLAG, ",".join(self.projects)]
         unread = self.unread or ((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED),) if not self.projects else self.unread
         if unread:
-            args.append(f"{SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in unread))
-        return " ".join(args)
+            argv += [SCOPE_UNREAD_FLAG, ",".join(f"{project}={outcome}" for project, outcome in unread)]
+        return tuple(argv)
+
+    def collector_args(self) -> str:
+        """`collector_argv` as the one line the `fleet_scope` tool hands the
+        agent to paste after a collector command."""
+        return " ".join(self.collector_argv())
 
 
 def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:

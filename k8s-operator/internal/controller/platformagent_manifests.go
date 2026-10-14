@@ -950,9 +950,10 @@ const (
 	scopeFileName   = "scope.json"
 
 	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is, and
-	// the platform MCP server's fleet_scope tool (fleet_scope_targets.py), which reads
-	// it when no reconcile snapshot answers that a boundary is in force. Two readers,
-	// by design; a third code site naming this key is a review comment.
+	// fleet_scope_targets.py, which reads it when no reconcile snapshot answers that a
+	// boundary is in force, for the platform MCP server's fleet_scope tool and for the
+	// upgrade-readiness-watch job. Two code sites name the key, by design; a third
+	// naming it is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.

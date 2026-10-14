@@ -324,5 +324,15 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self.assertEqual(fst.snapshot_path("/elsewhere"), pathlib.Path("/elsewhere") / fst.SNAPSHOT_FILE)
 
 
+class CollectorArgvTest(unittest.TestCase):
+    def test_the_argv_form_is_the_pasted_line_tokenised(self):
+        targets = fst.ScopeTargets(projects=("ops-mgmt", "payments-prod"), unread=(("billing", "denied"),), resolved_at=None, path="x")
+        self.assertEqual(targets.collector_argv(), ("--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "billing=denied"))
+        self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt,payments-prod --scope-unread billing=denied")
+        nothing = fst.ScopeTargets(projects=(), unread=(), resolved_at=None, path="x")
+        self.assertEqual(nothing.collector_argv(), ("--scope-unread", "declared-scope=unresolved"))
+        self.assertEqual(nothing.collector_args(), "--scope-unread declared-scope=unresolved")
+
+
 if __name__ == "__main__":
     unittest.main()
