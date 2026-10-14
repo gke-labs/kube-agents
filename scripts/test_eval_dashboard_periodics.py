@@ -456,6 +456,10 @@ class AssessTest(unittest.TestCase):
         new_kind_missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": input_hash, "summary": {"applied": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: old_kind, DAILY.job: new_kind_missed}), {})
         new_failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": input_hash, "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "forbidden"}}})
+        # Only the input hash earns the exemption: a daily whose tree is
+        # neither shape says nothing.
+        odd = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "unknown", "summary": {"applied": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: old_kind, DAILY.job: odd}), {})
         # The other way round, an old-kind daily against a new-kind failure,
         # is a daily from before the merge the failure applied: no recovery.
         old_daily = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": git_id, "summary": {"applied": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}}})

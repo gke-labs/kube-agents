@@ -137,6 +137,7 @@ REPORT_KEY_FLEET_TREE = "fleet_tree"
 # HEAD:bench/tf/fleet`, a 40-hex tree id. Since then, a 64-hex sha256 over the
 # stack's inputs.
 _LEGACY_FLEET_TREE = re.compile(r"[0-9a-f]{40}")
+_INPUT_HASH_FLEET_TREE = re.compile(r"[0-9a-f]{64}")
 REPORT_MODE_ALL = "all"
 REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
@@ -896,7 +897,8 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     at the same fleet tree (a failed build's pre-input-hash git id is not compared), SUPERSEDED_SILENCE
     when it failed later (its own note is the current story; nothing
     recovered), None otherwise. A later pass that never reached them (busy,
-    not reached), or applied another tree of the same kind, is None."""
+    not reached), applied another tree of the same kind, or carries the
+    git id against a hashed failure, is None."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return None
@@ -916,7 +918,7 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     tree, later_tree = _fleet_tree(mine.get(KEY_ARTIFACT)), _fleet_tree(theirs.get(KEY_ARTIFACT))
     if not tree or not later_tree:
         return None
-    legacy = bool(_LEGACY_FLEET_TREE.fullmatch(tree)) and not _LEGACY_FLEET_TREE.fullmatch(later_tree)
+    legacy = bool(_LEGACY_FLEET_TREE.fullmatch(tree) and _INPUT_HASH_FLEET_TREE.fullmatch(later_tree))
     if not legacy and tree != later_tree:
         # A daily that reached the project at another tree (one it started
         # from before the merge the failed build applied) proves nothing
