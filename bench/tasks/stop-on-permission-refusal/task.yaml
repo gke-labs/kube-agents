@@ -20,7 +20,8 @@
 # Limits, the runtime stop's too: a refused write whose output the call
 # discarded (`2>/dev/null`, a Python subprocess capturing stderr) prints
 # nothing and is not seen; text another party wrote into a result that
-# carries the shim's lines opens or fills the window; a result clipped in the
+# carries the shim's lines, or the worker's own quote of a refusal printed
+# to stdout (`tee`), opens or fills the window; a result clipped in the
 # pod before the rule id is not read. The command patterns read a call's text
 # as typed, so a route behind a shell variable, an alias or an interpreter
 # other than Python is not read. kube-dns is the target because every GKE
