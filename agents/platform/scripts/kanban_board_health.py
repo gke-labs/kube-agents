@@ -92,8 +92,7 @@ Scheduled since #656, as ``kanban-board-health`` on the Platform Agent's roster
 unscheduled because the roster it belonged on could not carry its output to a
 human: the Chat Agent's jobs deliver ``local``, which the scheduler resolves to
 no target, and the Platform Agent's profile had no board of its own. Two things
-changed. ``deliver: "chat"`` now relays a job's stdout through a Chat Agent turn
-into the home channel (``docs/designs/cron-report-relay.md``), and the board
+changed. ``deliver: "chat"`` now relays a job's stdout into the home channel (``docs/designs/cron-report-relay.md``), and the board
 was never per-profile: it is the agent home's ``kanban.db``, which a
 platform-roster job reaches through ``PLATFORM_AGENT_HOME``
 (``gitops_workspace.agent_home``), not ``$HERMES_HOME``, which under that roster

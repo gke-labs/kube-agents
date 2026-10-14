@@ -9,7 +9,8 @@ gateway. Its callers include the gateway patches for reactions
 (``slack_ux_reactions``, which the kanban notifier also reaches), plan and
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
-``slack_moments``), incident triage (``slack_ux_incident``), button clicks
+``slack_moments``), incident triage (``slack_ux_incident``), a finished card's
+answer (``slack_ux_answer``, through :func:`split_lead`), button clicks
 (``slack_ux_clicks``), failure replies (``slack_ux_failure``, which bolds
 with ``_first_sentence`` and adds its offer with :func:`blocks_answer`) and
 the harness-message patch (``slack_boilerplate``, which reads only :func:`enabled`);
@@ -25,9 +26,10 @@ Everything a caller changes on screen is gated on :func:`enabled`, the
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
-answer; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
-buttons, whose value the caller sets, are built by ``_button`` and wrapped into
-rows by ``_actions``; :func:`fallback_text`
+answer, and :func:`split_lead` the same first sentence as written; link
+buttons, none for a url :func:`_safe_link_url` refuses, and choice buttons,
+whose value the caller sets, are built by ``_button`` and wrapped into rows by
+``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field, with any report rows led by their severity as inline code (a bullet when
 they have none).
@@ -288,6 +290,9 @@ SAFE_URL = re.compile(
 )
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
+#: Stands in for each character of a code span while :func:`sentence_starts` looks for sentence
+#: ends, keeping offsets: :func:`_hold_code`'s placeholder character, so it reads as that does.
+CODE_FILLER = "\x00"
 INLINE_CODE = re.compile(r"`[^`]*`")
 #: :func:`to_mrkdwn` holds a code span's place with this; :data:`CODE_PLACEHOLDER` finds it again.
 CODE_HOLD = "\x00{}\x00"
@@ -655,14 +660,42 @@ def _link_url(url: str) -> str:
     return url.replace("&", "&amp;").translate(MRKDWN_URL_ESCAPES)
 
 
+def _closes_own_run(stem: str, closer: str) -> bool:
+    """Whether ``closer``, the emphasis markers after ``stem``'s stop, closes a run ``stem`` opened."""
+    if closer in BOLD_EDGES:
+        return stem.count(closer) % 2 == 1
+    if closer in ITALIC_EDGES:
+        return stem.replace(closer * 2, "").count(closer) % 2 == 1
+    return False
+
+
+def _ends_sentence(line: str, match: re.Match) -> bool:
+    """Whether ``match``, a :data:`SENTENCE_END` in ``line``, ends a sentence rather than an abbreviation."""
+    sentence = line[: match.start()]
+    stem = sentence.rstrip("*_")
+    tail = max(0, len(stem) - ABBREVIATION_TAIL)
+    numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
+    # An emphasis run this sentence opened and closes right after the stop ends it, whatever
+    # word it ends on.
+    return _closes_own_run(stem, sentence[len(stem) :]) or not (numbered or ABBREVIATION_END.search(stem, tail))
+
+
+def sentence_starts(line: str) -> list[int]:
+    """The offsets in ``line`` where a sentence after the first starts, by :func:`_first_sentence`'s rules.
+
+    A stop inside a code span ends nothing, and neither does one after an abbreviation.
+    """
+    masked = line
+    for start, end, _opener in _code_spans(line):
+        masked = masked[:start] + CODE_FILLER * (end - start) + masked[end:]
+    return [match.end() for match in SENTENCE_END.finditer(masked) if _ends_sentence(masked, match)]
+
+
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
-        sentence = line[: match.start()]
-        stem = sentence.rstrip("*_")
-        tail = max(0, len(stem) - ABBREVIATION_TAIL)
-        numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
-        if not (numbered or ABBREVIATION_END.search(stem, tail)):
+        if _ends_sentence(line, match):
+            sentence = line[: match.start()]
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():
@@ -686,6 +719,12 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     gives ``("", [])``, and an answer that opens with a code fence has no
     headline: ``("", paragraphs)``.
     """
+    lead, body = split_lead(markdown)
+    return (_clip(_plain(lead), HEADLINE_MAX) if lead else ""), body
+
+
+def split_lead(markdown: str) -> tuple[str, list[str]]:
+    """:func:`split_answer` with the first sentence as it was written: markdown, unclipped."""
     paragraphs = _paragraphs((markdown or "").replace("\x00", ""))
     if not paragraphs:
         return "", []
@@ -706,10 +745,9 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     # A period inside a code span does not end the sentence.
     held, spans = _hold_code(LIST_MARKER.sub("", joined))
     sentence, remainder = (_restore_code(part, spans) for part in _first_sentence(held))
-    headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest
-    return headline, body
+    return sentence, body
 
 
 # --- blocks ----------------------------------------------------------------

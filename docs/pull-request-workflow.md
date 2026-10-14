@@ -719,9 +719,9 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
 re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
-[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) watches the completed
-attempts of the checks its `workflow_run` trigger lists, and when an attempt after the first passes
-on the same commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
+[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
+of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
+commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
 (or Go test, or pytest file) the failed attempts' logs name, falling back to one per failing job and
 step when they name none or name more than a handful, or adds a row to the issue that class already
 has. The tree did not change
@@ -729,8 +729,10 @@ between the attempts, so the code was not the cause; the issue is where the occu
 until someone
 reads them together. It never closes an issue, because every green run of a flaky check looks like a
 fix from the outside; close it when the cause is fixed, and a recurrence opens a new one that links
-back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header says why
-`Validate PR Title` and `Security Scanning` are left off.
+back. `scripts/notify_flaky_check.py` holds the reasoning and the watched list, and says why
+`Validate PR Title` and `Security Scanning` are left off. The sweep reads runs created in the last
+few days (`SWEEP_WINDOW_DAYS` in the script); a re-run later than that is recorded by dispatching
+the workflow with the run's id and `dry_run` off.
 
 A re-run that fails again records nothing, and neither does a push that happens to go green: only a
 same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke
