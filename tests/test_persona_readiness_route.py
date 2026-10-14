@@ -40,6 +40,9 @@ SCOPE_TOOL = "`fleet_scope`"
 # The slot as the skill's run block and the audit SOPs spell it, so one placeholder names the
 # step everywhere a collector is dictated.
 COLLECTOR_ARGS_SLOT = "<collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope>"
+OUTPUT_FLAG = "--output"
+# What makes the dictated output name this run's own: a command substitution in the name.
+PER_RUN_NAME_MARK = "$("
 
 
 def _dictated_runs(path: Path) -> list[str]:
@@ -69,6 +72,14 @@ class ReadinessRouteCarriesTheScopeTest(unittest.TestCase):
                 with self.subTest(file=path.name):
                     command = next(span for span in line.split("`")[1::2] if REPORT_SCRIPT in span and READINESS_FLAG in span)
                     self.assertIn(COLLECTOR_ARGS_SLOT, command, f"{path.name} dictates the run without the declared scope: {command}")
+
+    def test_the_output_path_is_this_runs_own(self):
+        # /opt/data/scratch is shared by every card, so a fixed --output name is two cards writing
+        # one file; the dictated command names the file for this run alone.
+        (bullet,) = [line for line in _dictated_runs(PLATFORM_AGENTS) if BULLET_LEAD in line]
+        command = next(span for span in bullet.split("`")[1::2] if REPORT_SCRIPT in span and READINESS_FLAG in span)
+        output = command.split(OUTPUT_FLAG, 1)[1].split()[0]
+        self.assertIn(PER_RUN_NAME_MARK, output, f"the --output name is fixed: {output}")
 
     def test_the_slot_is_the_one_the_skill_spells(self):
         self.assertIn(COLLECTOR_ARGS_SLOT, READINESS_SKILL.read_text(encoding="utf-8"))
