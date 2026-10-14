@@ -18,7 +18,6 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-import unittest.mock
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -136,7 +135,7 @@ class OverlayTemplateTest(unittest.TestCase):
             return real_copytree(src, dst, *args, **kwargs)
 
         stderr = io.StringIO()
-        with unittest.mock.patch.object(ps.shutil, "copytree", explode_only_on_plugins):
+        with patch.object(ps.shutil, "copytree", explode_only_on_plugins):
             with redirect_stderr(stderr):
                 ps.overlay_template(self.home, self.template, plugins, ITEMS)
 
@@ -580,7 +579,7 @@ class CapabilityCriteriaMergeTest(unittest.TestCase):
         # The copy must not put image defaults on the volume ahead of the merge:
         # a container killed in between would come back with the tuning gone.
         write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7}))
-        with unittest.mock.patch.object(ps, "_restore_volume_wins", side_effect=RuntimeError("killed")):
+        with patch.object(ps, "_restore_volume_wins", side_effect=RuntimeError("killed")):
             with self.assertRaises(RuntimeError):
                 self.overlay()
         self.assertEqual(self.read("criteria.json"), {"threshold": 7})
