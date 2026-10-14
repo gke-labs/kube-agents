@@ -6,34 +6,39 @@ audit or skill.
 ## High level summary
 
 A GKE minor upgrade replaces the control plane and rebuilds every node. Either event can stop an
-application that did not expect it. kube-agents answers two questions for every cluster: will the
-next upgrade succeed, and what did the last upgrade change. The agent only reads and reports. A
-person decides and upgrades.
+application that did not expect it. The upgrade work gives kube-agents two questions to answer for
+every cluster: will the next upgrade succeed, and what did the last upgrade change. Some pieces are
+on main today. The Scope table below and each linked document's status line say which. This document
+and the retrospective design specify the rest. The agent only reads and reports. A person decides
+and upgrades.
 
-**Before the upgrade: the readiness report.** A daily job grades each cluster for which GKE holds
-a new version, and the agent grades any cluster on request in chat. Each grade is blocked, unknown
-or ready. Each finding names the object and the setting that blocks. This document specifies the
-report; the Scope table below says which parts exist on main.
+**Before the upgrade: the readiness report.** A daily job grades each cluster for which GKE offers a
+new version, and the agent grades any cluster on request in chat. Today each cluster's grade is
+blocked, unknown or ready, and each finding names the object and the setting that blocks. This
+document specifies a verdict per cluster family: Go, No-Go or Action required. The Scope table below
+says which parts exist on main.
 
-**After the upgrade: the retrospective.** A job runs once at install, at the end of each weekend
-and soon after each upgrade. Its report says what each upgrade did, what failed, which catalogue
-entry the failure matches, and the fix to make before the next upgrade. It records each failure as
-a guard, and the next readiness report shows the guard. See
-[`upgrade-retrospective.md`](upgrade-retrospective.md).
+**After the upgrade: the retrospective.** The retrospective design specifies a job that runs once at
+install, at the end of each weekend and soon after each upgrade. Its report says what each upgrade
+did, what failed, which catalogue entry the failure matches, and the fix to make before the next
+upgrade. It records each failure as a guard, and the next readiness report shows the guard. Nothing
+of it is on main yet. See [`upgrade-retrospective.md`](upgrade-retrospective.md).
 
-**What both rest on: the catalogue and the test fleet.** The catalogue lists twenty ways an
-upgrade fails, each from a public incident, provider documentation or a reproduction. For each it
-names the signal before the upgrade and the signal after it. The test fleet holds the before-state
-of each entry that a standing fixture can hold. One evaluation case per entry grades whether the
-agent names it. See [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md) and
+**What both rest on: the catalogue and the test fleet.** The catalogue lists twenty ways an upgrade
+fails, each from a public incident, provider documentation or a test-fleet fixture. For each it
+names the signal before the upgrade and the signal after it. The test fleet carries the before-state
+of each entry that a standing fixture can carry. The catalogue plans one evaluation case per entry,
+each grading whether the agent names it, and its status table names the registered cases. See
+[`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md) and
 [`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md).
 
 ### The twenty scenarios, as the agent reports them
 
-Each case asks the agent one question about the test fleet and grades a fixed-form answer line.
-The line names the cluster, the object and the finding, so a check reads it without a judge. The
-catalogue's status table says which cases run nightly. One answer the agent gave on the test fleet
-for entry 5, a maintenance exclusion that holds a minor upgrade, quoted from the run's record:
+Each of the twenty cases is to ask the agent one question about the test fleet and grade a
+fixed-form answer line. The line names the cluster, the object and the finding, so a check reads it
+without a model as judge. The catalogue's status table names the registered cases; the rest are
+planned. Entry 5's fixture is a maintenance exclusion that holds the minor upgrade. One answer the
+agent gave for it on the test fleet, from a case not yet registered, quoted from the run's record:
 
 ```
 seeded-a: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
@@ -42,17 +47,18 @@ seeded-c: exclusion none; scope none; ends none; holds the automatic minor upgra
 seeded-d: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
 ```
 
-The check graded five objectives on those lines and passed all five. The five objectives: a line
-exists, it states the scope and end date, it says the exclusion holds the upgrade, and no CVE is
-invented.
+That case's check graded five objectives on that reply and passed all five. The five objectives: a
+line exists, it states the scope and end date, it says the exclusion holds the upgrade, and it
+invents no CVE.
 
 ### The retrospective, as it reports
 
-The collector reads GKE's upgrade operations for the window, the versions before and after, and
-the objects that failed after each one. It matches each failure to a catalogue entry. It writes one
-block per incident: what happened, what failed, how to detect and mitigate it next time, and the
-guard it recorded. One block from a report produced on the test fleet, quoted with its two tables
-left out and the project name replaced:
+The retrospective design specifies a collector. It reads GKE's upgrade operations for the window,
+the versions before and after, and the objects that failed after each one. It matches each failure
+to a catalogue entry, or marks it unclassified. It writes one block per incident: what happened,
+what failed, how to detect and mitigate it next time, and the guard it recorded. One block from a
+report the collector produced on a development project that contains the test fleet. The quote
+leaves out the version and operation tables and replaces the project name:
 
 ```
 ### 2 — <project>/us-central1-a/seeded-a — `seeded-capacity/Deployment/inference-server`
@@ -60,13 +66,20 @@ left out and the project name replaced:
 **What happened.** new (first seen); channel REGULAR; cluster status RUNNING.
 
 **What failed.**
+
+| Symptom | Since | Catalogue entry | Confidence | Evidence |
+| --- | --- | --- | --- | --- |
 | Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |
+
+**Detect and mitigate next time.**
+- **2. No spare capacity for the displaced pods** — For seeded-capacity/Deployment/inference-server: A pool whose upgrade settings let a node go before its replacement exists, with requests near allocatable, the autoscaler at its ceiling or quota exhausted. Read today: the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; `maxSurge` and headroom against allocatable are unread. Mitigate before: Keep the pool on maxSurge at least 1 and maxUnavailable 0, with one node of headroom and quota for the extra node. Mitigate after: Add a node or raise the ceiling and the Pending pods schedule.
 
 **Mitigation set up.**
 - guard `<project>/us-central1-a/seeded-a#failure#2#seeded-capacity/Deployment/inference-server` failure entry 2 (high), first seen 2026-10-14T19:49:58Z, 1 review(s)
 ```
 
-That run reviewed seven clusters in 20 seconds, filed 6 errors and 8 warnings, and held 61 guards.
+That run reviewed the project's seven clusters in 20 seconds, filed 6 errors and 8 warnings, and
+recorded 61 guards.
 
 ## The problem, in one paragraph
 
