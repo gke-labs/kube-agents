@@ -390,7 +390,7 @@ MAX_CARDS = int(MAX_ARG)
 exclude = set(a for a in EXCLUDE_ARG.split(",") if a)
 roots = [a for a in sys.argv[6:] if a]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"descendants": [], "truncated": False, "error": None}
+out = {"descendants": [], "truncated": False, "skipped": 0, "error": None}
 TERMINAL_STATUSES = ("done", "archived", "blocked", "failed", "cancelled")
 
 def has_table(conn, name):
@@ -432,6 +432,7 @@ try:
     queue = list(roots)
     seen = set(roots)
     descendants = []
+    skipped = 0
     truncated = False
     while queue and not truncated:
         curr = queue.pop(0)
@@ -457,22 +458,26 @@ try:
                 continue
             status = str(row[0]) if row[0] is not None else None
             col_idx = 1
+            child_created_at = None
             if has_created_at:
                 child_created_at = row[col_idx]
                 col_idx += 1
-                if (
-                    min_root_created_at is not None
-                    and child_created_at is not None
-                    and child_created_at < min_root_created_at
-                ):
-                    # Pre-dates root: idempotent re-create of an older card
-                    continue
+            child_idem_key = None
             if has_idempotency_key:
                 child_idem_key = row[col_idx]
                 col_idx += 1
-                if child_idem_key:
-                    # Idempotent card: shared across parallel repetitions
-                    continue
+
+            is_predating = (
+                min_root_created_at is not None
+                and child_created_at is not None
+                and child_created_at < min_root_created_at
+            )
+            is_keyed = bool(child_idem_key)
+            if is_predating or is_keyed:
+                if status not in TERMINAL_STATUSES:
+                    skipped += 1
+                continue
+
             if status not in TERMINAL_STATUSES:
                 if len(descendants) < MAX_CARDS:
                     descendants.append(child)
@@ -482,6 +487,7 @@ try:
     conn.close()
     out["descendants"] = descendants
     out["truncated"] = truncated
+    out["skipped"] = skipped
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc
 print(SENTINEL)
@@ -573,6 +579,12 @@ def read_descendants(
             dropped,
         )
     result = valid
+    skipped = payload.get("skipped")
+    if isinstance(skipped, int) and skipped > 0:
+        _log.warning(
+            "kanban board descendants skipped %d keyed or pre-dating live child card(s); their workers may still hold dispatcher slots",
+            skipped,
+        )
     if payload.get("truncated"):
         _log.warning(
             "kanban board descendants truncated at %d cards; some fan-out workers may still hold slots",

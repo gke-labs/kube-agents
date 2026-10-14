@@ -8,6 +8,7 @@ The harness-side parser is tested with canned replies.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -387,7 +388,10 @@ def test_a_session_past_the_scan_bound_reports_its_total(
 
 
 def _run_descendants_script(
-    root: Path, task_ids: list[str], max_cards: int = board.MAX_DESCENDANTS_SCANNED
+    root: Path,
+    task_ids: list[str],
+    max_cards: int = board.MAX_DESCENDANTS_SCANNED,
+    exclude: str = "",
 ) -> str:
     proc = subprocess.run(
         [
@@ -398,6 +402,7 @@ def _run_descendants_script(
             board.BOARD_FILE,
             board.DESCENDANTS_PRESENT,
             str(max_cards),
+            exclude,
             *task_ids,
         ],
         capture_output=True,
@@ -413,8 +418,9 @@ def _descendants_shell_for(root: Path):
         assert board.DESCENDANTS_PRESENT in script
         tokens = script.split(board.DESCENDANTS_PRESENT, 1)[1].split()
         max_cards = int(tokens[0].strip("'\""))
-        ids = [t.strip("'\"") for t in tokens[1:]]
-        return _run_descendants_script(root, ids, max_cards=max_cards)
+        exclude = tokens[1].strip("'\"")
+        ids = [t.strip("'\"") for t in tokens[2:]]
+        return _run_descendants_script(root, ids, max_cards=max_cards, exclude=exclude)
 
     return shell
 
@@ -598,7 +604,9 @@ def test_read_descendants_returns_none_on_error_or_missing_sentinel(tmp_path: Pa
     assert board.read_descendants(lambda script, timeout: "", [], 5.0) == []
 
 
-def test_read_descendants_skips_card_predating_root_creation(tmp_path: Path) -> None:
+def test_read_descendants_skips_card_predating_root_creation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     # Review finding: a card reached through an idempotent re-create whose creation
     # predates the root card's own creation must not be archived when the root stalls.
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
@@ -622,11 +630,15 @@ def test_read_descendants_skips_card_predating_root_creation(tmp_path: Path) -> 
             ],
         )
 
-    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    with caplog.at_level(logging.WARNING):
+        descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == ["t_valid_child"]
+    assert any("skipped 1 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
 
 
-def test_read_descendants_skips_card_with_idempotency_key(tmp_path: Path) -> None:
+def test_read_descendants_skips_card_with_idempotency_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     # Review finding: a card created or reached with an idempotency_key is an idempotent
     # card that can be shared across parallel repetitions, so it must not be archived.
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
@@ -652,8 +664,71 @@ def test_read_descendants_skips_card_with_idempotency_key(tmp_path: Path) -> Non
             ],
         )
 
-    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    with caplog.at_level(logging.WARNING):
+        descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == ["t_private_child"]
+    assert any("skipped 1 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+
+
+def test_read_descendants_skips_terminal_keyed_card_without_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Keyed or pre-dating cards that are already terminal (done/archived) do not
+    # hold dispatcher slots and do not increment skipped or log a warning.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER, idempotency_key TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status, created_at, idempotency_key) VALUES (?, ?, ?, ?)",
+            [
+                ("t_root", "running", 200, None),
+                ("t_done_keyed", "done", 210, "idem-key-123"),
+                ("t_child", "running", 220, None),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_done_keyed", "t_root", 215),
+                ("t_child", "t_root", 225),
+            ],
+        )
+
+    with caplog.at_level(logging.WARNING):
+        descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == ["t_child"]
+    assert not any("skipped" in r.message for r in caplog.records)
+
+
+def test_run_descendants_script_handles_task_ids_directly(tmp_path: Path) -> None:
+    # Review finding: test helper accepts task_ids directly without misinterpreting
+    # roots as the exclude argument.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status) VALUES (?, ?)",
+            [
+                ("t_root", "running"),
+                ("t_child", "running"),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            ("t_child", "t_root", 100),
+        )
+
+    out = _run_descendants_script(tmp_path, ["t_root"])
+    marker = out.find(board.DESCENDANTS_PRESENT)
+    assert marker >= 0
+    payload = json.loads(out[marker + len(board.DESCENDANTS_PRESENT) :].strip())
+    assert payload["descendants"] == ["t_child"]
 
 
 def test_read_descendants_excludes_attempted_cards_while_walking_grandchildren(tmp_path: Path) -> None:
