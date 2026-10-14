@@ -1472,7 +1472,7 @@ _SHELL_BACKTICK = "`"
 _SUBSTITUTION_MARK = "\x00S{index}\x00"
 _SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
 # After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
-# flag (its value, as in `-u hermes` or `-s KILL`; which flags take one is not tabled), a
+# flag (its value, as in `-u hermes` or `-s KILL`, unless that word is a flag itself; which flags take one is not tabled), a
 # duration or count (`timeout 600`, `timeout infinity`), an expansion the reader never resolves
 # (`timeout $T`, `"${TIMEOUT:-600}"`) and `--`, which ends its options. A redirect and its target
 # stand anywhere ahead of the command (`nohup > log python3 ...`). The first other word is the
@@ -1526,7 +1526,8 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
     single quotes is consumed whole, quotes and escapes inside it honoured, so
     ``r_$(date +%s).json`` stays one word and the ``)`` that closes it never opens a word for a
     ``#`` after it; inside double quotes only the forms bash runs there are folded. An operator
-    (``&&``, ``;``, ``|``, ``>``, ``2>&1``'s ``>&``, ``(``) is one only outside quotes, which is
+    (``&&``, ``;``, ``|``, ``>``, ``2>&1``'s ``>&``, ``(``, a bare newline, which starts a new
+    command as ``;`` does) is one only outside quotes, which is
     known here and not after the quotes come off: a quoted ``">"`` or ``';'`` stays a word of
     text. A span left open at the line's end is kept as it stands. Read before the quotes come
     off, because afterwards a quoted ``#1.json`` and a bare one look the same."""
@@ -1570,9 +1571,10 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 previous = _SUBSTITUTION_MARK[-1]
                 i = close
                 continue
-            if quote is None and (char in _SHELL_OPERATOR_RUN_CHARS or char in _SHELL_PARENS):
+            if quote is None and (char in _SHELL_OPERATOR_RUN_CHARS or char in _SHELL_PARENS or char == _SHELL_LINE_END):
+                # A bare newline starts a new command as `;` does, so it is an operator too.
                 end = i + 1
-                if char not in _SHELL_PARENS:
+                if char in _SHELL_OPERATOR_RUN_CHARS:
                     while end < len(command) and command[end] in _SHELL_OPERATOR_RUN_CHARS:
                         end += 1
                 operators.append(command[i:end])
@@ -1678,7 +1680,7 @@ def _is_redirect(word: str) -> bool:
 
 
 def _is_control_operator(word: str) -> bool:
-    return isinstance(word, _ShellOperator) and set(word) <= _SHELL_OPERATOR_CHARS
+    return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
 
 
 def _shell_argvs(command: str) -> list[list[str]]:
@@ -1721,7 +1723,7 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
     assignments and reserved words are skipped, and so is a redirect with its target, which bash
     takes anywhere on the line. After an exec wrapper (``timeout``, ``sudo``, ``env`` ...) only
     the wrapper's own words are transparent: a flag, the word after a flag (its value, ``-u user``
-    or ``-s KILL``; which flags take one is not tabled, so the word after a bare flag is read as
+    or ``-s KILL``, unless that word is a flag itself, ``sudo -E -u``; which flags take one is not tabled, so the word after a bare flag is read as
     its value even when it is a command, the one over-credit this leaves), a duration or count
     (``timeout 600``), an expansion the reader never resolves (``timeout $T``), ``--``, which
     ends its options, and the one positional ``flock`` and ``chroot`` take ahead of their command
@@ -1752,16 +1754,18 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
             continue
         if not after_wrapper:
             return None
-        if word == _SHELL_OPTIONS_END or _SHELL_COUNT_RE.match(word) or word.startswith(_SHELL_EXPANSION_PREFIX):
-            continue
-        if word.startswith(_SHELL_FLAG_PREFIX):
-            takes_value = True
+        if _SHELL_COUNT_RE.match(word) or word.startswith(_SHELL_EXPANSION_PREFIX):
             continue
         if positionals:
             positionals -= 1
             continue
         return None
     return None
+        if after_wrapper and word.startswith(_SHELL_FLAG_PREFIX):
+            # A flag in its own right, never the previous flag's value (`sudo -E -u hermes`); `--`
+            # ends the options and takes nothing.
+            takes_value = word != _SHELL_OPTIONS_END
+            continue
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:

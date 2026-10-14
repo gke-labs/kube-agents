@@ -7069,6 +7069,10 @@ def _run_objective(command: str) -> str:
         (f"sudo -u hermes 2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
         (f"2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
         (f"timeout $T ls {_SCRIPT_PATH} --readiness", False),
+        # a flag after a flag is a flag, not the first flag's value
+        (f"sudo -E -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        (f"env -i -u KUBECONFIG python3 {_SCRIPT_PATH} --readiness", True),
+        (f"sudo -n -u hermes python3 {_SCRIPT_PATH} --readiness", True),
         # the wrappers the sibling inline-code reader knows, a per-project loop among them; a runner that hands on to an interpreter
         (f"gcloud projects list --format='value(projectId)' | xargs -I{{}} python3 {_SCRIPT_PATH} --readiness --project {{}}", True),
         (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
@@ -7124,6 +7128,10 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs('bash -c "python3 /x/f.py --readiness # x"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs("(cd /x && python3 f.py --readiness)") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
     # a shell word behind a command that prints is text, not a shell to unwrap
+    # a bare newline starts a new command, as `;` does; inside quotes it is text
+    assert _shell_argvs("cd /x\npython3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("python3 -V\nls fleet_upgrade_report.py --readiness") == [["python3", "-V"], ["ls", "fleet_upgrade_report.py", "--readiness"]]
+    assert _shell_argvs('echo "a\nb" && python3 f.py --readiness') == [["echo", "a\nb"], ["python3", "f.py", "--readiness"]]
     assert _shell_argvs('echo bash -c "python3 /x/f.py --readiness"') == [["echo", "bash", "-c", "python3 /x/f.py --readiness"]]
     assert _shell_argvs('nice -n 10 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('timeout -s KILL 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
