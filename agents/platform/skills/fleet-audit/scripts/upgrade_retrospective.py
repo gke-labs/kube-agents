@@ -281,6 +281,11 @@ LOCK_PROBE_RESET_PENDING_FORMAT = "{line}; a reset is pending ({marker}): the ne
 LOCK_PROBE_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing started"
 PROBE_LOCK_WITH_OTHERS_TEXT = "--probe-lock takes no other mode flag: it tests the lock and nothing else"
 PROBE_LOCK_EXCLUSIVE = ("full", "after_upgrade", "cluster", "since", "dry_run", "reset_ledger", "report", "output", "manifest_file", "no_report")
+# The reset is the same kind of flag: it archives the store and runs nothing,
+# so a run-mode flag beside it would be ignored silently. --dry-run, --ledger
+# and --guards are its own.
+RESET_LEDGER_WITH_OTHERS_TEXT = "--reset-ledger takes no other mode flag (--dry-run, --ledger and --guards apart): it archives the store and runs nothing"
+RESET_LEDGER_EXCLUSIVE = ("full", "after_upgrade", "cluster", "since", "report", "output", "manifest_file", "no_report")
 # Three triggers write the same files: a run that finds the lock held waits
 # this long for it, polling, and only then prints the line above and exits.
 # Two minutes: the SOP runs the collector in the foreground under the
@@ -1943,16 +1948,21 @@ def _controller_of(obj: dict) -> tuple[str, str] | None:
 class Resolver:
     """Maps any pod, ReplicaSet or Job to its top owner, from the pod list
     and the `owners` read. An intermediate the read did not return is itself
-    the top: the hop is unknown rather than absent."""
+    the top: the hop is unknown rather than absent. A pod the list holds
+    without a controller is a bare pod and stays one; the name-prefix match
+    serves only a pod that is gone and known by the name an event carries."""
 
     def __init__(self, pods: list[dict], owners: list[dict], workloads: list[dict] | None = None):
         self.parent: dict[tuple[str, str, str], tuple[str, str]] = {}
         # Controllers by namespace, longest name first, for a pod that is
         # gone and known only by the name an event carries.
         self.controllers: dict[str, list[tuple[str, str]]] = {}
+        # Every pod the list holds: one of these is never resolved by prefix.
+        self.listed: set[tuple[str, str]] = set()
         for pod in pods:
             controller = _controller_of(pod)
             meta = pod.get("metadata") or {}
+            self.listed.add((meta.get("namespace", ""), meta.get("name", "")))
             if controller:
                 self.parent[(meta.get("namespace", ""), "Pod", meta.get("name", ""))] = controller
         for obj in list(owners) + list(workloads or []):
@@ -1982,7 +1992,7 @@ class Resolver:
         return None
 
     def resolve(self, namespace: str, kind: str, name: str) -> tuple[str, str]:
-        if kind == "Pod" and (namespace, kind, name) not in self.parent:
+        if kind == "Pod" and (namespace, kind, name) not in self.parent and (namespace, name) not in self.listed:
             by_prefix = self._controller_by_prefix(namespace, name)
             if by_prefix:
                 kind, name = by_prefix
@@ -4489,6 +4499,10 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     review["starting"] = starting
     review["gated"] = gated
     skew = version_skew(cluster, now or now_utc(), skews_first_seen)
+    # The pools still skewed, for the keep rule: under an open window or an
+    # active exclusion the review files no row, and the entry-5 guard is kept
+    # as the re-check keeps it, cleared only when the skew is gone.
+    review["skewed_pools"] = [_object_ref("", "NodePool", pool) for pool, _ in skew["skews"]]
     if skew["skews"] and not any(sym["category"] == CATEGORY_VERSION_SKEW for sym in symptoms):
         skews_text = "; ".join(text for _, text in skew["skews"])
         if skew.get("no_policy"):
@@ -5339,6 +5353,8 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
     forced = forced_clusters(args)
     if getattr(args, "probe_lock", False) and any(getattr(args, flag, None) for flag in PROBE_LOCK_EXCLUSIVE):
         raise argparse.ArgumentTypeError(PROBE_LOCK_WITH_OTHERS_TEXT)
+    if getattr(args, "reset_ledger", False) and any(getattr(args, flag, None) for flag in RESET_LEDGER_EXCLUSIVE):
+        raise argparse.ArgumentTypeError(RESET_LEDGER_WITH_OTHERS_TEXT)
     # The scope the run was handed, read before anything else: a `--project`
     # override outside a declared scope, a declared scope with nothing
     # readable, or the sandbox's scope guard with no flags is refused here.
@@ -5755,6 +5771,10 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # The same rule for entry 3: a workload still unavailable keeps its guard
     # while the operation its outage fell inside is out of the window.
     unavailable = {(r["cluster"], obj) for r in reviews for obj in r.get("unavailable_workloads") or []}
+    # And for entry 5: a pool still skewed keeps its guard through a review
+    # under an open window or an active exclusion, which files no row, as
+    # the re-check keeps it; the guard clears only when the skew is gone.
+    skewed = {(r["cluster"], obj) for r in reviews for obj in r.get("skewed_pools") or []}
     # And for a failure guard whose object the API still shows failing while
     # the review filed nothing for that object and every read the guard
     # needs answered (the re-check's rule): a review's window drops a pod
@@ -5779,7 +5799,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         where = (guard.get("cluster"), guard.get("object"))
         reads_answered = answered is None or set(guard.get("reads") or FAILURE_GUARD_READS) <= answered.get(guard.get("cluster"), set())
         still_failing = where in failing and where not in fresh_objects and guard.get("entry") not in (ENTRY_BUDGET, ENTRY_SPREAD, ENTRY_WINDOW, ENTRY_OPERATION) and reads_answered
-        if (guard.get("entry") == ENTRY_BUDGET and where in zero_budgets) or (guard.get("entry") == ENTRY_SPREAD and where in unavailable) or still_failing:
+        if (guard.get("entry") == ENTRY_BUDGET and where in zero_budgets) or (guard.get("entry") == ENTRY_SPREAD and where in unavailable) or (guard.get("entry") == ENTRY_WINDOW and where in skewed) or still_failing:
             kept = {**guard, "last_seen": seen_at}
             if fresh_check_by_object.get(where):
                 kept["check"] = fresh_check_by_object[where]
@@ -6026,7 +6046,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
     parser.add_argument("--manifest-file", help=f"also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against); the SOP passes the harness's path for the stream, {harness_manifest_path()}, where `finish`'s --no-collector-manifest waiver and `start`'s scrub look for this run's manifest")
-    parser.add_argument("--reset-ledger", action="store_true", help=f"the second remedy for a crash record, after the restore (the record moved back under the file's name, or the guards from the newest {REPORTS_SUBDIR}/<stamp>.json): archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) and the live ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/<stamp>/ and mark the store, so the next full run is a baseline the SOP files nothing from; does nothing on a store with no record and no file absent beside the other")
+    parser.add_argument("--reset-ledger", action="store_true", help=f"the second remedy for a crash record, after the restore (the record moved back under the file's name, or the guards from the newest {REPORTS_SUBDIR}/<stamp>.json): archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) and the live ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/<stamp>/ and mark the store, so the next full run is a baseline the SOP files nothing from; does nothing on a store with no record and no file absent beside the other. With no other mode flag (--dry-run, --ledger and --guards apart)")
     parser.add_argument("--probe-lock", action="store_true", help="test the lock without taking it: a non-blocking flock attempt on .lock, held for no time, reading and writing nothing; exit 0 when free, 1 with the holder line when another run holds it. With no other mode flag")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters (no project when handed the fleet_scope tool's {fleet_scope_args.UNRESOLVED_SCOPE_ROW} row, or when an undeclared install's projects listing failed or did not name the active project: the swept set is then not the fleet), writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--after-upgrade", action="store_true", help=f"the after-upgrade route: review the clusters with an UPGRADE_MASTER or UPGRADE_NODES that reached DONE at least {int(AFTER_UPGRADE_SETTLE.total_seconds() // SECONDS_PER_MINUTE)} min ago and that the ledger does not list as reviewed, as a scoped run (a cluster with a fresher unreviewed operation waits whole for the next wake); with nothing to review it prints nothing and writes nothing. Not with --full, --cluster or --since")

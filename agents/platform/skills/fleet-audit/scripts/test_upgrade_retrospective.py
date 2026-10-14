@@ -1544,6 +1544,14 @@ class OwnerResolutionTest(unittest.TestCase):
         resolver = ur.Resolver([sts_pod, pod("lonely")], [])
         self.assertEqual(resolver.resolve("apps", "Pod", "db-0"), ("StatefulSet", "db"))
         self.assertEqual(resolver.resolve("apps", "Pod", "lonely"), ("Pod", "lonely"))
+        # A live bare pod whose name looks like a sibling controller's (`db-1` beside StatefulSet `db`,
+        # `web-abcde` beside ReplicaSet `web`, a hand-run debug pod) stays a Pod: the prefix match is
+        # for a pod that is gone and known only by an event's name, which a pod the list holds is not.
+        bare = [pod("db-1"), pod("web-abcde")]
+        resolver = ur.Resolver([sts_pod] + bare, [{"kind": "ReplicaSet", "metadata": {"name": "web", "namespace": "apps"}}], [{"kind": "StatefulSet", "metadata": {"name": "db", "namespace": "apps"}}])
+        self.assertEqual((resolver.resolve("apps", "Pod", "db-1"), resolver.resolve("apps", "Pod", "web-abcde")), (("Pod", "db-1"), ("Pod", "web-abcde")))
+        self.assertEqual((resolver.resolve("apps", "Pod", "db-7"), resolver.resolve("apps", "Pod", "web-zzzzz")), (("StatefulSet", "db"), ("ReplicaSet", "web")))
+        self.assertEqual((resolver.pods_of.get("apps/Pod/db-1"), resolver.pods_of.get("apps/Pod/web-abcde"), resolver.pods_of.get("apps/StatefulSet/db")), (["db-1"], ["web-abcde"], ["db-0"]))
 
     def test_dead_pod_resolves_by_name_prefix(self):
         self.assertEqual(self.resolver.resolve("seeded-capacity", "Pod", "inference-server-778b78fdb8-zzzzz"), ("Deployment", "inference-server"))
@@ -2334,6 +2342,18 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                     self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
                 self.assertIn(ur.PROBE_LOCK_WITH_OTHERS_TEXT, err.getvalue())
+        # The reset is the same kind of flag: a run-mode flag beside it is refused rather than ignored,
+        # before any lock or archive; --dry-run, --ledger and --guards are its own.
+        for argv in (["--reset-ledger", "--full", "--scope-projects", PROJECT], ["--reset-ledger", "--after-upgrade"], ["--reset-ledger", "--cluster", SEEDED], ["--reset-ledger", "--since", "7"], ["--reset-ledger", "--manifest-file", str(self.home / "m.json")], ["--reset-ledger", "--no-report"], ["--reset-ledger", "--report", str(self.home / "r.md")]):
+            with self.subTest(argv=argv):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
+                self.assertIn(ur.RESET_LEDGER_WITH_OTHERS_TEXT, err.getvalue())
+        self.assertFalse((self.home / "m.json").exists())
+        for argv in (["--reset-ledger", "--dry-run"], ["--reset-ledger", "--ledger", str(self.home / "elsewhere.json")]):
+            with self.subTest(argv=argv), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(argv), 0)
+            self.assertIn(ur.RESET_LEDGER_NOTHING_TEXT, out.getvalue())
 
     def test_lock_makes_a_second_run_exit_quietly(self):
         lock_path = self.home / ur.LOCK_FILENAME
@@ -3484,6 +3504,14 @@ class LedgerAndGuardsTest(unittest.TestCase):
         guard = ur.guard_id(GEMMA, 5, "NodePool/default-pool")
         self.assertIn(guard, {g["id"] for g in second["guards"]})
         self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, ur.render_report(second))
+        # A review inside the open window, the cluster re-selected on its record: no row (the roll may
+        # still complete), the Info note, and the guard kept and counted as reviewed rather than
+        # dropped for want of a fresh guard, so the harness keeps the finding.
+        inside, _ = self.collect(FakeFleet(clusters=[cluster_doc("seeded-a"), gemma]), now=datetime(2026, 10, 17, 4, 0, tzinfo=timezone.utc))
+        [review] = [r for r in inside["reviews"] if r["cluster"] == GEMMA]
+        self.assertEqual((review["what_happened"]["reasons"], review["skew_notes"], [s for s in review["what_failed"] if s["category"] == ur.CATEGORY_VERSION_SKEW]), ([ur.SKEW_RESELECT_REASON], [ur.SKEW_OPEN_TEXT.format(skews=skew_text, state=ur.WINDOW_OPEN_STATE)], []))
+        kept = next(g for g in inside["guards"] if g["id"] == guard)
+        self.assertEqual((kept["last_seen"], kept["reviews"]), ("2026-10-17T04:00:00Z", 2))
         # A re-check inside the open window keeps the guard too: an older ledger without the stored
         # key leaves the cluster unchanged, and the re-check sees the skew still standing.
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
