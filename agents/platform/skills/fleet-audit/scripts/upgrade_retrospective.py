@@ -3792,17 +3792,30 @@ def _budget_allows_no_disruption(spec: dict, replicas: int | None) -> bool:
     return False
 
 
-def _budget_demands_the_only_pod(spec: dict) -> bool:
-    """The catalogue's third entry-1 before-signal: a budget whose spec
-    forbids evicting a single-replica workload's only pod, `maxUnavailable`
-    0, an integer `minAvailable` of one or more, or a percentage
-    `minAvailable` above zero, which rounds up to that one pod. A budget that
-    permits the eviction (`maxUnavailable` 1, `minAvailable` 0) is not entry
-    1's blocked drain, whatever the replica count."""
-    if _budget_allows_no_disruption(spec, SINGLE_REPLICA):
+def _percent(value: object) -> int | None:
+    """A budget field's percentage form (`"50%"`) as an integer, else None."""
+    text = str(value) if isinstance(value, str) else ""
+    return int(text.rstrip("%")) if text.endswith("%") and text.rstrip("%").isdigit() else None
+
+
+def _budget_demands_the_only_pod(spec: dict, covered: int | None) -> bool:
+    """The catalogue's third entry-1 before-signal: a single-replica workload
+    behind a budget whose spec forbids evicting its only pod. The budget's
+    controller counts every pod the selector covers together (`covered`), so
+    a selector spanning several workloads asks whether the spec allows no
+    disruption across the set: `maxUnavailable` 0, or a percentage the
+    controller rounds down to no pod; `minAvailable` at the covered count,
+    or a percentage it rounds up to every pod. A budget that still allows one
+    eviction across the set does not demand the singleton's pod; over one
+    covered pod any `minAvailable` percentage above zero does."""
+    total = covered or SINGLE_REPLICA
+    if _budget_allows_no_disruption(spec, total):
         return True
-    min_available = spec.get("minAvailable")
-    return isinstance(min_available, str) and min_available.endswith("%") and min_available.rstrip("%").isdigit() and int(min_available.rstrip("%")) > 0
+    max_unavailable = _percent(spec.get("maxUnavailable"))
+    if spec.get("maxUnavailable") is not None:
+        return max_unavailable is not None and (max_unavailable * total) // PERCENT_ALL == 0
+    min_available = _percent(spec.get("minAvailable"))
+    return min_available is not None and -(-(min_available * total) // PERCENT_ALL) >= total
 
 
 def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
@@ -3827,9 +3840,9 @@ def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
                 out.append(_shape(obj, ENTRY_BUDGET, MEDIUM, f"disruptionsAllowed=0 now, spec {json.dumps(spec, sort_keys=True)} allows disruption once its pods are ready", f"budget {name}"))
         for workload in covered:
             wmeta = workload.get("metadata") or {}
-            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA and _budget_demands_the_only_pod(spec):
+            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA and _budget_demands_the_only_pod(spec, replicas):
                 wobj = _object_of(namespace, workload["kind"], wmeta.get("name", ""))
-                out.append(_shape(wobj, ENTRY_BUDGET, HIGH, f"one replica behind budget {name} ({json.dumps(spec, sort_keys=True)})", f"budget {name}"))
+                out.append(_shape(wobj, ENTRY_BUDGET, HIGH, f"one replica behind budget {name} ({json.dumps(spec, sort_keys=True)}) covering {replicas} pod(s)", f"budget {name}"))
     return out
 
 
@@ -4892,7 +4905,10 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
         "object": obj,
         "severity": MANIFEST_SEVERITY_MAJOR if incident["severity"] == SEVERITY_ERROR else MANIFEST_SEVERITY_MINOR,
         "excerpt": _cell(excerpt)[:MESSAGE_EXCERPT_CHARS],
-        "impact": impact[:MANIFEST_IMPACT_CHARS],
+        # Tenant text reaches `impact` through a classification's detail (a
+        # webhook name, an image host), and `draft` copies it into the
+        # findings document: escaped as the excerpt is.
+        "impact": _cell(impact)[:MANIFEST_IMPACT_CHARS],
         "impact_authoritative": False,
         "needs_triage": None,
         "entries": incident.get("entries"),

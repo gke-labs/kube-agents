@@ -1713,6 +1713,28 @@ class ShapeTest(unittest.TestCase):
             self.assertEqual(ur.budget_shapes([{**pdb, "spec": {**permissive, "selector": selector}}], READS["seeded-a"]["workloads"]), [], permissive)
         percent = {**pdb, "spec": {"minAvailable": "50%", "selector": selector}}
         self.assertEqual([(s["object"], s["entry"], s["confidence"]) for s in ur.budget_shapes([percent], READS["seeded-a"]["workloads"])], [("seeded-debug/Deployment/payments-api", 1, ur.HIGH)])
+        # A budget whose selector spans several workloads counts their pods together, as its controller
+        # does: one that still allows an eviction across the set does not demand the singleton's only
+        # pod; one that allows none does, by count or by a percentage rounded as the controller rounds
+        # it (minAvailable up, maxUnavailable down).
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        payments = next(w for w in workloads if w["metadata"]["name"] == "payments-api")
+        payments["spec"]["template"]["metadata"].setdefault("labels", {})["tier"] = "payments"
+        sibling = copy.deepcopy(payments)
+        sibling["metadata"]["name"] = "payments-worker"
+        sibling["spec"]["replicas"] = 3
+        workloads.append(sibling)
+        shared = {"matchLabels": {"tier": "payments"}}
+
+        def singleton(spec):
+            return [(s["object"], s["confidence"]) for s in ur.budget_shapes([{**pdb, "spec": {**spec, "selector": shared}}], workloads) if s["object"].startswith("seeded-debug/Deployment/")]
+
+        for allows_one in ({"minAvailable": 1}, {"minAvailable": 3}, {"minAvailable": "50%"}, {"minAvailable": "75%"}, {"maxUnavailable": 1}, {"maxUnavailable": "25%"}):
+            self.assertEqual(singleton(allows_one), [], allows_one)
+        for allows_none in ({"minAvailable": 4}, {"minAvailable": "100%"}, {"minAvailable": "80%"}, {"maxUnavailable": 0}, {"maxUnavailable": "0%"}, {"maxUnavailable": "10%"}):
+            self.assertEqual(singleton(allows_none), [("seeded-debug/Deployment/payments-api", ur.HIGH)], allows_none)
+        [evidence] = [s["evidence"] for s in ur.budget_shapes([{**pdb, "spec": {"maxUnavailable": 0, "selector": shared}}], workloads) if s["object"] == "seeded-debug/Deployment/payments-api"]
+        self.assertIn("covering 4 pod(s)", evidence)
 
     def test_entry_19_in_tree_volume_and_class(self):
         pv = self.shape("PersistentVolume/intree-pd", 19)
@@ -4030,6 +4052,16 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn("### 7 — injected", report)  # still reported, inside a cell
         self.assertNotIn("gate|x", report)
         self.assertNotIn("evil`", report)
+        # The manifest's candidates carry the same tenant text in `impact` (a classification's detail:
+        # the webhook name) and in `excerpt`, and `draft` copies both into the findings document, so
+        # both are escaped as the report's cells are: no pipe, backtick or newline survives.
+        manifest_text = Path(result["manifest_path"]).read_text()
+        self.assertNotIn("gate|x", manifest_text)
+        candidates = [c for e in json.loads(manifest_text)["clusters"] for c in e.get("candidates") or []]
+        self.assertTrue(any("gate/x" in c["impact"] for c in candidates), [c["impact"][:120] for c in candidates])
+        for c in candidates:
+            for field in ("impact", "excerpt"):
+                self.assertFalse(any(ch in c[field] for ch in "|`\n"), (field, c[field]))
 
     def test_partial_kubectl_failure_keeps_the_rest(self):
         result, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "events")]))
