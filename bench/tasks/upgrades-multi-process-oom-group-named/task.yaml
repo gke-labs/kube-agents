@@ -20,6 +20,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the forking command. One process per container in its
@@ -76,7 +80,7 @@ verification_spec:
       fixture_roles:
         - multi-process-container
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
 
   - name: the-declared-line-says-the-container-runs-several-processes
     role: objective
@@ -87,9 +91,9 @@ verification_spec:
       fixture_roles:
         - multi-process-container
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?several(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?several(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?(?!several(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?!several(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
 
   # The shared limit is what the group kill applies to; the fold lowercases
   # the quantity, and a space or a MiB spelling is the same number.
@@ -102,9 +106,9 @@ verification_spec:
       fixture_roles:
         - multi-process-container
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?32 ?mib?(?: \([^)\n;]*\))?; oom kills the whole container: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?32 ?mib?(?: \([^)\n;]*\))?; oom kills the whole container: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?(?!32 ?mib?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?(?!32 ?mib?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
 
   - name: the-declared-line-says-the-whole-container-dies
     role: objective
@@ -115,9 +119,9 @@ verification_spec:
       fixture_roles:
         - multi-process-container
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

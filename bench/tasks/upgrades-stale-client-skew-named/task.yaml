@@ -20,6 +20,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the client image. Moving its tag within one minor of
@@ -78,7 +82,7 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   # The client is kubectl at 1.29: the image tag, with or without its `v`
   # and its patch.
@@ -91,9 +95,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?(?: \([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?(?: \([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   - name: the-declared-line-says-the-client-is-outside-the-skew
     role: objective
@@ -104,9 +108,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: no$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?!no$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?!no$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

@@ -20,6 +20,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the host-path mount. Dropping it is the heal that
@@ -76,7 +80,7 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   - name: the-declared-line-says-the-agent-uses-the-host-network
     role: objective
@@ -87,9 +91,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: yes(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: yes(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: (?!yes(?: \([^)\n;]*\))?;)[^;\n]+; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?!yes(?: \([^)\n;]*\))?;)[^;\n]+; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   # The CNI directory, wherever in the list of paths it sits and whether
   # named as the host path or as the mount point under /host.
@@ -102,9 +106,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?:/[^ ,;()\n]*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?: \([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?:/[^ ,;()\n]*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?: \([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?!(?:/[^ ,;()\n]*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?!(?:/[^ ,;()\n]*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   - name: the-declared-line-says-the-agent-is-coupled
     role: objective
@@ -115,9 +119,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

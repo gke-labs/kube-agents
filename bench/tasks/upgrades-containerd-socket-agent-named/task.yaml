@@ -18,6 +18,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the host-path mount. Dropping it is the heal that
@@ -70,7 +74,7 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-socket-is-mounted
     role: objective
@@ -81,9 +85,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: yes(?: \([^)\n;]*\))?; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: yes(?: \([^)\n;]*\))?; path:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?!yes(?: \([^)\n;]*\))?;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?!yes(?: \([^)\n;]*\))?;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-containerd-socket-path
     role: objective
@@ -94,9 +98,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?/run/containerd/containerd\.sock$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?/run/containerd/containerd\.sock$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: \([^)\n;]*\))?; path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective
