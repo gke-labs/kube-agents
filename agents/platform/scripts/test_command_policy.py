@@ -1949,11 +1949,6 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
                 self.assertFalse(decision.allowed)
                 self.assertNotIn(self.BOUNDARY_PHRASE, decision.message)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LocalRenderTests(unittest.TestCase):
     def test_client_renders_and_manifest_reads_are_local(self):
         for argv in (
@@ -1973,5 +1968,10 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=none"],
             ["kubectl", "scale", "deploy/x", "--replicas=3"],
             ["kubectl", "exec", "pod", "--", "kubectl", "apply", "--dry-run=client", "-f", "x"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
         ):
             self.assertFalse(command_policy.local_render(argv), argv)
+
+
+if __name__ == "__main__":
+    unittest.main()

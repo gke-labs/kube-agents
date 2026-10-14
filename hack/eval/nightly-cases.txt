@@ -253,7 +253,7 @@
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
-# lists: sixty-nine cases (207 units) here, of an eighty-three-case, 249-unit
+# lists: seventy cases (210 units) here, of an eighty-four-case, 252-unit
 # matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────

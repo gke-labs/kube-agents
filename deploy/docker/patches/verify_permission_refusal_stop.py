@@ -149,6 +149,8 @@ def main() -> int:
         return fail(f"a report quoting the refusal decided {report!r}")
     for command, result in (
         ("kubectl scale deploy x --replicas=3; kubectl get deploy x", refusal(*SCALE, exit_code=0)),
+        ("kubectl create deployment x --image=y --dry-run=client -o yaml | kubectl apply -f -",
+         _result(shim_lines(["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml"]) + "\n" + shim_lines(["kubectl", "apply", "-f", "-"]))),
         ("kubectl scale deploy x --replicas=3", refusal(*SCALE, exit_code=126)),
         ("kubectl scale deploy x --replicas=3 --dry-run=server", refusal("kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=server")),
     ):

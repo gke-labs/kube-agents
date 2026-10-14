@@ -282,7 +282,7 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     assert segments("python3 -Werror::DeprecationWarning -c 'import kubernetes'")[1] == "import kubernetes"
     # printf's format is the text when nothing follows it.
     assert segments("printf 'kubectl scale deploy x --replicas=3\\n' > /tmp/run.sh && bash /tmp/run.sh")[0] == (
-        "kubectl scale deploy x --replicas=3\\n"
+        "kubectl scale deploy x --replicas=3"
     )
     assert segments('printf "kubectl scale deploy x --replicas=3" > r.sh; bash r.sh')[0] == "kubectl scale deploy x --replicas=3"
     # A here-string is an operand, not a heredoc opener: the next line is still a command.
@@ -313,6 +313,19 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "watch -n 5 kubectl scale deploy x --replicas=3",
     ):
         assert segments(command) == ["kubectl scale deploy x --replicas=3" if "xargs" not in command else "kubectl scale --replicas=3"], command
+    # Launchers that run their argument, find -exec, and writer escapes.
+    assert segments("find manifests/ -name '*.yaml' -exec kubectl apply -f {} \\;")[0] == "kubectl apply -f {}"
+    assert segments("setsid kubectl scale deploy x --replicas=3") == ["kubectl scale deploy x --replicas=3"]
+    assert segments("busybox sh -c 'kubectl scale deploy x --replicas=3'")[-1] == "kubectl scale deploy x --replicas=3"
+    assert "kubectl scale deploy x --replicas=3" in segments("su -c 'kubectl scale deploy x --replicas=3'")
+    assert segments("printf 'kubectl get deploy x\\nkubectl scale deploy x --replicas=3\\n' > /tmp/s.sh && bash /tmp/s.sh")[:2] == [
+        "kubectl get deploy x",
+        "kubectl scale deploy x --replicas=3",
+    ]
+    assert segments('echo -e "kubectl get deploy x\\nkubectl scale deploy x --replicas=3" > s.sh; bash s.sh')[:2] == [
+        "kubectl get deploy x",
+        "kubectl scale deploy x --replicas=3",
+    ]
     # A chmod that does not add execute does not make the file a script.
     assert segments("echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes && chmod 600 /tmp/notes") == [
         "echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes",

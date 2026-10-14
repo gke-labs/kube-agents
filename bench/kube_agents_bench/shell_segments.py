@@ -61,10 +61,15 @@ import re
 # tokens; the named options take one value token more; ``timeout`` takes a
 # duration after its options.
 _WRAPPERS = frozenset(
-    {"env", "sudo", "time", "nohup", "nice", "ionice", "stdbuf", "watch", "timeout", "xargs",
-     "command", "builtin", "exec",
+    {"env", "sudo", "doas", "setsid", "busybox", "chroot", "time", "nohup", "nice", "ionice", "stdbuf",
+     "watch", "timeout", "xargs", "command", "builtin", "exec",
      "if", "!", "while", "until", "then", "else", "elif", "do", "{"}
 )
+# ``find … -exec <command> {} \;`` runs its argument for every match.
+_FIND_EXEC_OPTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_FIND_EXEC_END = frozenset({";", "\;", "+"})
+# Escapes ``echo -e``, ``printf`` and ``$'…'`` expand before a script is written.
+_ESCAPES = (("\\n", "\n"), ("\\t", "\t"), ("\\r", "\r"))
 _WRAPPER_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-T", "-U", "--user", "--group"},
     "nice": {"-n", "--adjustment"},
@@ -78,7 +83,7 @@ _WRAPPER_VALUE_OPTIONS = {
 _WRAPPER_POSITIONAL = {"timeout": 1}
 # Words that end a block; never a command.
 _BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")"})
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "su"})
 _PYTHONS = re.compile(r"^python[\d.]*$")
 _SHELL_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
 # Short options of an interpreter that take a value token, read before a ``-c``;
@@ -124,6 +129,10 @@ def _walk(text: str, out: list[str], depth: int) -> None:
     for inner in nested:
         _walk(inner, out, depth + 1)
     executed = _executed_paths(pieces)
+    for piece in pieces:
+        run = _find_exec_argv(piece)
+        if run:
+            _walk(run, out, depth + 1)
     for index, piece in enumerate(pieces):
         # A script written by ``echo``/``printf`` (``>`` or ``tee``) and run
         # in the same call: the writer's quoted arguments are the script, or
@@ -246,13 +255,42 @@ def _writer_scripts(piece: str) -> list[str]:
     while words and words[0].rsplit("/", 1)[-1] != base:
         words.pop(0)
     words = words[1:]
+    options: list[str] = []
     while words and words[0] in _WRITER_OPTIONS:
-        words.pop(0)
+        options.append(words.pop(0))
     if base == "printf" and len(words) > 1:
         words = words[1:]  # the format; with no further argument the format is the text
-    if any(w[:1] not in "'\"" for w in words):
-        return [" ".join(_unquote(w) for w in words)]
-    return [_unquote(w) for w in words if len(w) > 2]
+    expands = base == "printf" or any(o in ("-e", "-ne", "-en") for o in options)
+    if any(w[:1] not in "'\"$" for w in words):
+        return [_expand(" ".join(_unquote(w) for w in words), expands)]
+    return [_expand(_unquote(w), expands or w.startswith("$'")) for w in words if len(w) > 2]
+
+
+def _expand(text: str, expands: bool) -> str:
+    """The text with ``\n``/``\t``/``\r`` escapes turned into the characters ``echo -e``,
+    ``printf`` and ``$'…'`` write."""
+    if not expands:
+        return text
+    for escape, char in _ESCAPES:
+        text = text.replace(escape, char)
+    return text
+
+
+def _find_exec_argv(piece: str) -> str | None:
+    """What a ``find -exec … \;`` runs, as one command string, or ``None``."""
+    found = _command_word(piece)
+    if found is None or found[0].rsplit("/", 1)[-1] != "find":
+        return None
+    args = found[1]
+    for k, token in enumerate(args):
+        if token in _FIND_EXEC_OPTIONS:
+            run = []
+            for t in args[k + 1 :]:
+                if t in _FIND_EXEC_END:
+                    break
+                run.append(t)
+            return " ".join(run) if run else None
+    return None
 
 
 def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
@@ -334,6 +372,8 @@ def _substituted_command(word: str) -> str | None:
 def _unquote(token: str) -> str:
     if token.startswith("\\") and len(token) > 1:
         token = token[1:]
+    if token.startswith("$'") and token.endswith("'") and len(token) >= 3:
+        return _expand(token[2:-1], True)  # ANSI-C quoting: escapes are characters
     if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
         body = token[1:-1]
         return body.replace('\\"', '"') if token[0] == '"' else body

@@ -35,11 +35,24 @@ For every tool result :func:`classify_refusal` returns:
   rule is an allowlist of read verbs and refuses an unlisted read spelling
   (``config view``, ``cluster-info dump``, ``exec``, ``<verb> --help``) with
   the same words, so the verb is what tells a refused write from a refused
-  read. Counted per turn, across every tool and whatever succeeded in
-  between; the call's exit code is not consulted, because the shell reports
-  the last command's status and a refused write chained before a read exits
-  0. A call whose own text quotes the policy's lines (a report being echoed)
-  is not a refusal.
+  read. A call that ran several commands carries one block per refusal and
+  any refused write among them counts. Counted per turn, across every tool
+  and whatever succeeded in between. Two word tests over the call's own text
+  remain, both for calls whose exit code is 0: a call whose text carries the
+  result's own verb line (or rule line, when there is no verb) is a report
+  being echoed, not a refusal; and a call that succeeded counts only when its
+  text names ``kubectl`` and a mutating verb, which keeps a refused write
+  chained before a read and drops a ``cat`` of a saved refusal. A report
+  that names the command and prints a saved refusal in one exit-0 call is
+  therefore counted, and a write that reached kubectl through a script or a
+  variable and exited 0 is not; the proxy is the one party that could say,
+  out of band, that a write was refused in this call, and that is the
+  design that removes both.
+* Not seen at all: a refused write whose stderr the call discarded
+  (``2>/dev/null``, ``&>/dev/null``, a substitution never echoed). The
+  result then carries nothing but an exit code, which is 77 from the shim
+  and has arrived as 126 through the exec path, so it is not read; the
+  bench's window has the same blind spot.
 * ``advisory``: the notice without a definitive verb line: a refused read
   spelling, a local render, a ``gcp.read-only`` refusal, or a shim older
   than this patch that prints no verb. Guidance only, never counted; needs
@@ -92,12 +105,14 @@ API_WARN_CODE = "permission_denied"
 HALT_CODE = "permission_refusal_halt"
 #: The phrase only the command policy's action boundary notice carries.
 _POLICY_ACTION_RE = re.compile(r"refused however it is attempted")
-#: The three lines the shim prints after the policy's message. A terminal
-#: result is JSON text, so a line break arrives as ``\n`` or as a newline.
+#: The three lines the shim prints after the policy's message, one block per
+#: refused command (a call can run several). A terminal result is JSON text,
+#: so a line break arrives as ``\n`` or as a newline.
 _LINE_START = r"(?:^|\n|\\n)"
 _RULE_LINE_RE = re.compile(_LINE_START + r"policy rule: ([\w.-]+)")
 _VERB_LINE_RE = re.compile(_LINE_START + r"policy verb: ([^\n\\\"]+)")
 _RENDER_LINE_RE = re.compile(_LINE_START + r"policy render: local\b")
+_VERB_LINE_PREFIX = "policy verb: "
 DEFINITIVE_RULE = "kubernetes.read-only"
 #: kubectl verbs that change state (``debug`` starts a pod or container).
 MUTATING_VERBS = frozenset({
@@ -117,8 +132,6 @@ _API_DENIED_RE = re.compile(
 )
 #: Attribute on the controller holding ``(turn token, count)``.
 _COUNT_ATTR = "_kube_permission_refusals"
-#: A call whose own text carries the policy's rule line is echoing a report.
-_ECHOED_REFUSAL = "policy rule:"
 #: A call that succeeded (exit 0) counts only when its text names kubectl and a
 #: mutating verb: a refused write chained before a read does, a ``cat`` or
 #: ``kubectl logs`` whose output happens to carry the shim's lines does not.
@@ -180,21 +193,47 @@ def names_a_write(command) -> bool:
     )
 
 
+def refusal_blocks(result: str) -> list[tuple[str, list[str], bool]]:
+    """``(rule, verb words, local render)`` per ``policy rule:`` block in ``result``, in order."""
+    blocks = []
+    rules = list(_RULE_LINE_RE.finditer(result))
+    for i, rule in enumerate(rules):
+        end = rules[i + 1].start() if i + 1 < len(rules) else len(result)
+        block = result[rule.start():end]
+        verb = _VERB_LINE_RE.search(block)
+        blocks.append((rule.group(1), verb.group(1).split() if verb else [], _RENDER_LINE_RE.search(block) is not None))
+    return blocks
+
+
+def definitive_block(result: str):
+    """The first block that is a refused write (rule, mutating verb, not a local render), or ``None``."""
+    for rule, words, render in refusal_blocks(result):
+        if rule == DEFINITIVE_RULE and verb_is_mutating(words) and not render:
+            return rule, words, render
+    return None
+
+
+def echoes_refusal(command, result) -> bool:
+    """Whether the call's own text carries the result's refusal lines: a report, not a refusal.
+    Keyed to the verb line the result carries, so a comment quoting an earlier
+    ``policy rule:`` beside a fresh write does not pass as an echo."""
+    if not isinstance(command, str) or not command:
+        return False
+    for rule, words, _ in refusal_blocks(result):
+        line = _VERB_LINE_PREFIX + " ".join(words) if words else "policy rule: " + rule
+        if line in command:
+            return True
+    return False
+
+
 def classify_refusal(command, result, *, failed=True) -> str | None:
     """``"policy"`` for a definitive refusal, ``"advisory"`` or ``"api"`` for guidance, else ``None``."""
     if not isinstance(result, str) or not result:
         return None
     if _POLICY_ACTION_RE.search(result):
-        if isinstance(command, str) and _ECHOED_REFUSAL in command:
+        if echoes_refusal(command, result):
             return None
-        rule = _RULE_LINE_RE.search(result)
-        verb = _VERB_LINE_RE.search(result)
-        definitive = (
-            rule is not None and rule.group(1) == DEFINITIVE_RULE
-            and verb is not None and verb_is_mutating(verb.group(1).split())
-            and _RENDER_LINE_RE.search(result) is None
-            and (failed or names_a_write(command))
-        )
+        definitive = definitive_block(result) is not None and (failed or names_a_write(command))
         return "policy" if definitive else "advisory"
     if _API_DENIED_RE.search(result):
         return "api"

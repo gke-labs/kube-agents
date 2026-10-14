@@ -1210,7 +1210,7 @@ _NO_WORKER_COMMANDS_REASON = (
     "predates command capture -- so this check could not be evaluated"
 )
 _NO_WORKER_TERMINAL_CALLS_REASON = (
-    "no delegated worker's terminal calls are in the trajectory: no card was "
+    "no delegated worker's terminal or execute_code calls are in the trajectory: no card was "
     "delegated, the worker-trajectory capture did not run, or the pod withheld the "
     "calls' arguments, so after_result_pattern has no ordered commands and results to read"
 )
@@ -1378,7 +1378,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     defect is a write after the policy refused one, and a pattern over write
     verbs alone flags the honest attempt that met the refusal. The card log
     keeps no results, so with this option set the commands come from the
-    trajectory instead -- the workers' tagged ``terminal`` calls, which
+    trajectory instead -- the workers' tagged ``terminal`` and ``execute_code`` calls, which
     carry each command's result, in call-time order
     (:func:`_worker_terminal_calls`) -- and the card log is not read. The
     result text is the tool's output as the record stores it, a JSON string
@@ -1394,7 +1394,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     check ``status="error"``, since the read cannot be ordered.
     ``required_patterns`` still read every command. No result matching the
     pattern leaves nothing after it, which passes the forbidden set and says
-    so in the reason; no tagged terminal call at all is ``status="error"``,
+    so in the reason; no tagged terminal or ``execute_code`` call at all is ``status="error"``,
     and so is a capture with gaps (``worker_capture_gaps``) that found no
     forbidden command, a required one missing or not: the retry, or the
     required command, may be in the part it did not read.
@@ -1402,7 +1402,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     Limits, stated so a case is not written against them: only terminal
     commands and ``execute_code`` program text (one segment, the floating
     patterns' territory) are visible, not MCP tool calls; only delegated workers'
-    commands are read (their logs, or their tagged ``terminal`` calls),
+    commands are read (their logs, or their tagged ``terminal`` and ``execute_code`` calls),
     never the router's; a command the shell resolved through an alias
     appears as typed; and a result is clipped in the pod at
     ``worker_trajectory.MAX_RESULT_CHARS``, so a refusal chained behind a
@@ -1511,6 +1511,13 @@ class WorkerCommandsVerifier(BaseVerifier):
                     continue
                 opened_at = own[opener][1]
                 after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
+                if self.match == "segments" and self.after_command_pattern is not None:
+                    # The opener call's own segments behind the one that opened the
+                    # window are after it too: ``kubectl scale … || kubectl patch …``.
+                    texts = self._texts(own[opener][2])
+                    k = next((n for n, t in enumerate(texts) if re.search(self.after_command_pattern, t)), None)
+                    if k is not None:
+                        after = texts[k + 1 :] + after
                 graded.extend(after)
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
             if not opened:

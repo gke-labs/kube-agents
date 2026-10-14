@@ -1115,9 +1115,16 @@ def _gcloud_refuses_identity_change(argv: list[str]) -> str | None:
 
 
 def local_render(argv: list[str]) -> bool:
-    """Whether a kubectl ``argv`` only renders or reads a manifest locally."""
+    """Whether a kubectl ``argv`` only renders or reads a manifest locally.
+
+    kubectl resolves a repeated flag last-wins, so only the last ``--dry-run``
+    counts: ``--dry-run=client --dry-run=none`` is a write.
+    """
     own = argv[: argv.index("--")] if "--" in argv else argv
-    return any(t in _LOCAL_RENDER_FLAGS for t in own) or _LOCAL_RENDER_SUBCOMMAND in own
+    dry_runs = [t for t in own if t.startswith("--dry-run")]
+    if dry_runs and dry_runs[-1] in _LOCAL_RENDER_FLAGS:
+        return True
+    return any(t in _LOCAL_RENDER_FLAGS and not t.startswith("--dry-run") for t in own) or _LOCAL_RENDER_SUBCOMMAND in own
 
 
 def evaluate(argv: list[str]) -> Decision:

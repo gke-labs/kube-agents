@@ -230,9 +230,9 @@ purges it; with `match: segments` each pattern is tried against every simple com
 call as a shell runs it, behind joins, lines and `$(...)`, in `sh -c` strings and executed heredocs,
 wrapper words and assignments stripped, comments and content heredocs yielding nothing, and quoted text opening no segment of its own, so only a pattern anchored on the command word is shielded from a quoted argument; with `after_result_pattern` the forbidden set applies only to the commands
 a worker issued after its first call whose result matched and whose command matched
-`after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` calls in the
+`after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` and `execute_code` calls in the
 trajectory, which carry results as the record stores them, a JSON string with newlines
-escaped; a trajectory with no tagged `terminal` call, a call with no numeric time, or a capture with gaps and no hit, is then
+escaped; a trajectory with no tagged `terminal` or `execute_code` call, a call with no numeric time, or a capture with gaps and no hit, is then
 `status: "error"` where the log path would grade an empty list), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
