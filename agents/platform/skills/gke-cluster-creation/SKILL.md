@@ -114,24 +114,7 @@ practices:
 This is the default. All settings match
 `../gke-golden-path/assets/golden-path-autopilot.yaml`.
 
-**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
-
-```bash
-gcloud container clusters create-auto <CLUSTER_NAME> \
-  --region <REGION> \
-  --project <PROJECT_ID> \
-  --release-channel regular \
-  --enable-private-nodes \
-  --enable-master-authorized-networks \
-  --enable-dns-access \
-  --enable-secret-manager \
-  --secret-manager-rotation-interval=120s \
-  --scoped-rbs-bindings \
-  --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER,STORAGE,POD,DEPLOYMENT,STATEFULSET,DAEMONSET,HPA,CADVISOR,KUBELET,DCGM \
-  --quiet
-```
-
-**Settings as API fields (a reference for the manifest):**
+**Settings, as API fields (map them onto the repository's own format; never send this to a create call):**
 
 ```json
 {
@@ -161,17 +144,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
 Relaxes some golden path defaults for cost savings and easier access in
 non-production.
 
-**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
-
-```bash
-gcloud container clusters create-auto <CLUSTER_NAME> \
-  --region <REGION> \
-  --project <PROJECT_ID> \
-  --release-channel rapid \
-  --quiet
-```
-
-**Settings as API fields (a reference for the manifest):**
+**Settings, as API fields (map them onto the repository's own format; never send this to a create call):**
 
 ```json
 {
@@ -192,27 +165,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
 Best when Autopilot cannot be used (e.g., custom kernel tuning, specific node OS
 requirements). Creates 3 nodes across zones by default.
 
-**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
-
-```bash
-gcloud container clusters create <CLUSTER_NAME> \
-  --region <REGION> \
-  --project <PROJECT_ID> \
-  --num-nodes 3 \
-  --machine-type e2-standard-4 \
-  --disk-type pd-balanced \
-  --enable-autoscaling --min-nodes 1 --max-nodes 10 \
-  --enable-shielded-nodes --enable-secure-boot \
-  --workload-pool=<PROJECT_ID>.svc.id.goog \
-  --enable-private-nodes \
-  --enable-master-authorized-networks \
-  --enable-vertical-pod-autoscaling \
-  --enable-dataplane-v2 \
-  --release-channel regular \
-  --quiet
-```
-
-**Settings as API fields (a reference for the manifest):**
+**Settings, as API fields (map them onto the repository's own format; never send this to a create call):**
 
 ```json
 {
@@ -248,26 +201,19 @@ Best for: AI/ML Inference, small model serving. Can be provisioned via
 Autopilot + ComputeClass or via Standard node pool with `g2-standard-4`
 (`nvidia-l4`). *Note: Requires `g2-standard-4` quota.*
 
-**Autopilot ComputeClass / GIQ approach (settings as commands, a reference for the manifests, not commands to run):**
+**Autopilot ComputeClass / GIQ approach:** the cluster is template 1. The manifests below go into the repository through a pull request; the agent never runs `kubectl apply`.
 
 ```bash
-# 1. Create golden path cluster (same as template 1)
-gcloud container clusters create-auto <CLUSTER_NAME> \
-  --region <REGION> --project <PROJECT_ID> \
-  --enable-private-nodes --enable-master-authorized-networks \
-  --enable-dns-access --enable-secret-manager --scoped-rbs-bindings \
-  --quiet
-
-# 2. Apply GPU ComputeClass (see gke-compute-classes.md)
+# ComputeClass manifest (see gke-compute-classes.md)
 kubectl apply -f gpu-compute-class.yaml
 
-# 3. Or use GIQ for inference (see gke-inference.md)
+# Or render the GIQ inference manifest (see gke-inference.md)
 gcloud container ai profiles manifests create \
   --model=gemma-2-9b-it --model-server=vllm --accelerator-type=nvidia-l4 --quiet > inference.yaml
 kubectl apply -f inference.yaml
 ```
 
-**Standard node pool approach, as API fields (a reference for the manifest):**
+**Standard node pool approach, as API fields (map them onto the repository's own format; never send this to a create call):**
 
 ```json
 {
@@ -296,23 +242,7 @@ Best for: Large-scale LLM / AI model training and hypercompute inference. *Note:
 High hourly cost and strict quota requirements (`a3-highgpu-8g` /
 `nvidia-h100-80gb-hbm3`).*
 
-**Settings as `gcloud` flags (a reference for the manifest, not a command to run):**
-
-```bash
-gcloud container clusters create <CLUSTER_NAME> \
-  --region <REGION> \
-  --project <PROJECT_ID> \
-  --num-nodes 1 \
-  --machine-type a3-highgpu-8g \
-  --accelerator type=nvidia-h100-80gb-hbm3,count=8 \
-  --disk-size 200 \
-  --scopes https://www.googleapis.com/auth/cloud-platform \
-  --workload-pool=<PROJECT_ID>.svc.id.goog \
-  --release-channel regular \
-  --quiet
-```
-
-**Settings as API fields (a reference for the manifest):**
+**Settings, as API fields (map them onto the repository's own format; never send this to a create call):**
 
 ```json
 {
