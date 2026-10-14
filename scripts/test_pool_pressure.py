@@ -1008,6 +1008,14 @@ class IndexCopy(unittest.TestCase):
         self.assertEqual([], vanished)
         self.assertIsNone(pp._build_id_of("1².txt"))
         self.assertEqual(2110431553740869632, pp._build_id_of("2110431553740869632.txt"))
+        # A decimal stem of another length is not a snowflake: 22 digits would
+        # take snowflake_time past year 9999 at the window filter.
+        long_stem = self.VANISHED.replace("2110431553740869632", "1057500000000000000000")
+        entries, err, vanished = self._copy(1, long_stem)
+        self.assertEqual({}, entries)
+        self.assertEqual([], vanished)
+        self.assertIsNone(pp._build_id_of("1057500000000000000000.txt"))
+        self.assertIsNone(pp._build_id_of("211043155374086963.txt"))
 
     def test_an_exit_other_than_a_partial_failure_still_fails(self):
         # A copy killed by a signal after a pointer 404'd prints no further

@@ -206,6 +206,10 @@ TOO_FEW_RUNS = "(too few runs to judge)"
 # the end of the wait and NOT for its start. SNOWFLAKE_SLACK covers both that
 # jitter and a wait that straddles the window edge.
 SNOWFLAKE_EPOCH_MS = 1288834974657
+# Every Prow build ID is a 19-digit snowflake, as BUILD_ID_IN_OWNER reads
+# them; a longer decimal stem is not one and would take snowflake_time past
+# the datetime range, so the index grammar stops at this length.
+BUILD_ID_DIGITS = 19
 SNOWFLAKE_TIMESTAMP_SHIFT = 22
 SNOWFLAKE_SLACK = timedelta(hours=6)
 
@@ -935,7 +939,7 @@ def _build_id_of(name: str) -> Optional[int]:
         return None
     stem = name[: -len(BUILD_INDEX_SUFFIX)]
     # isdecimal, not isdigit: int() refuses the superscripts isdigit admits.
-    return int(stem) if stem.isdecimal() else None
+    return int(stem) if stem.isdecimal() and len(stem) == BUILD_ID_DIGITS else None
 
 
 def _index_entries_from_dir(dest: str) -> Dict[int, str]:
