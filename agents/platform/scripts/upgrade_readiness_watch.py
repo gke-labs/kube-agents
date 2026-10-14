@@ -265,9 +265,21 @@ REMEDY_OUTSIDE_UNRESOLVED = (
 )
 REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
+# The reconcile's listing of the project did not finish on its last run (a
+# timeout, a network or quota error, a gcloud failure it did not classify, or
+# a carried tick): not an access failure, so no grant is asked for.
+REMEDY_LISTING_UNFINISHED = (
+    "the reconcile could not list the project on its last run (a timeout, a network or quota error, or a run that carried "
+    "it without resolving it); the next reconcile tick that lists it reads it, and this line returns with a remedy if it does not"
+)
 # A declared project the install could not read, by the outcome the reconcile
-# recorded; any other outcome (denied, unreachable, unknown) is read access.
-UNREAD_REMEDIES = {fleet_scope_targets.OUTCOME_OVER_CAP: REMEDY_CAP, fleet_scope_targets.OUTCOME_UNRESOLVED: REMEDY_UNRESOLVED}
+# recorded; a denial, the one outcome that is an access failure, is read access.
+UNREAD_REMEDIES = {
+    fleet_scope_targets.OUTCOME_OVER_CAP: REMEDY_CAP,
+    fleet_scope_targets.OUTCOME_UNRESOLVED: REMEDY_UNRESOLVED,
+    fleet_scope_targets.OUTCOME_UNREACHABLE: REMEDY_LISTING_UNFINISHED,
+    fleet_scope_targets.OUTCOME_UNKNOWN: REMEDY_LISTING_UNFINISHED,
+}
 # The causes a refusal is filed under, each the kind its remedy is chosen by
 # and what the announcements key it on, so a cause that changes (a project
 # declared and then found unread, a scope that resolves) is news.
@@ -785,8 +797,9 @@ def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_target
     """The remedy for a refusal, by its cause: a project outside a scope the
     reconcile has resolved is declared or dropped from the roster; outside one
     it has not resolved, the line names both ways out and returns when the
-    scope resolves; a project the install could not read is read access, or
-    the cap, or the wait for the reconcile, by the outcome it recorded."""
+    scope resolves; a project the install could not read is read access for a
+    denial, the cap, the wait for the reconcile, or, for a listing that did
+    not finish, the next tick that lists it, by the outcome it recorded."""
     if cause == REFUSAL_OUTSIDE:
         return REMEDY_DECLARE
     if cause == REFUSAL_OUTSIDE_UNRESOLVED:
@@ -1301,7 +1314,11 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
         # the runs, not the roster's spellings, since two spellings of one
         # project are one run. A sandbox failure outranks an unresolved number.
         if failed:
-            raise next(iter(failed.values()))
+            # A refusal is the operator's standing condition on its project;
+            # a sandbox failure or a timeout on another is what stopped the
+            # read this tick, so it is the one named, and a refusal only when
+            # every run was refused.
+            raise next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
         if unresolved:
             raise ProjectUnresolved(
                 UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))

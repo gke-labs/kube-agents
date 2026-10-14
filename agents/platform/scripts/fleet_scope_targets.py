@@ -74,6 +74,11 @@ OUTCOME_API_DISABLED = "api-disabled"
 # cross `maxProjects`: the members all have rows at `over-cap`, so the lookup
 # resolved and the gap is already in `unread` by name.
 OUTCOME_OVER_CAP = "over-cap"
+# A listing the reconcile could not finish: a timeout, a network or quota
+# error, a gcloud failure it did not classify, or a project a carried tick did
+# not resolve. Not an access failure; the row says the reconcile did not read
+# the project this run, not that the install cannot.
+OUTCOME_UNREACHABLE = "unreachable"
 OUTCOME_UNKNOWN = "unknown"
 # A declared project the reconcile has not resolved yet (the render answered).
 OUTCOME_UNRESOLVED = "unresolved"

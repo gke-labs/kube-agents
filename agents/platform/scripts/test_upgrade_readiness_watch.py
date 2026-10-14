@@ -1482,6 +1482,16 @@ class DeclaredScope(Base):
             self.assertIn("none graded (readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection)", out)
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run failed"]])
 
+    def test_an_all_failed_tick_names_a_failure_before_a_refusal(self) -> None:
+        """A refused outside project that sorts first must not mask the real
+        failure on the one project the install can read."""
+        self.declare_scope(["mgmt-prod"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "alpha-legacy,mgmt-prod"}):
+            code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"alpha-legacy"}, table_failing_projects={"mgmt-prod"}))
+        self.assertEqual(code, 0)
+        self.assertIn("the tick failed: RuntimeError: sandbox exited 255 without a report: ssh: lost connection", out)
+        self.assertNotIn("refused", out)
+
     def test_a_tick_whose_every_project_is_refused_fails_in_the_install_s_terms(self) -> None:
         self.declare_scope(["p1"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
@@ -1542,8 +1552,12 @@ class DeclaredScope(Base):
         detail, cause = watch.refusal_detail(label + unread.format(project="p2", outcome="unresolved"), resolved)
         self.assertTrue(detail.endswith("; " + watch.REMEDY_UNRESOLVED), detail)
         self.assertEqual(cause, "listed but unread (unresolved)")
-        detail, _ = watch.refusal_detail(label + unread.format(project="p2", outcome="unreachable"), resolved)
-        self.assertTrue(detail.endswith(f"give the install read access to the project, {roster}"), detail)
+        # The reconcile's listing did not finish (a timeout, a carried tick): not an access failure, so no grant is asked for.
+        for outcome in ("unreachable", "unknown"):
+            detail, cause = watch.refusal_detail(label + unread.format(project="p2", outcome=outcome), resolved)
+            self.assertTrue(detail.endswith("; " + watch.REMEDY_LISTING_UNFINISHED), detail)
+            self.assertNotIn("read access", detail)
+            self.assertEqual(cause, f"listed but unread ({outcome})")
         # Outside a scope the reconcile has not resolved (the render window with a management project known by
         # number; a carried tick): the line names both ways out, and the cause changes when the scope resolves.
         numeric = fleet_scope_targets.ScopeTargets(projects=(), unread=(("declared-scope", "unresolved"),), resolved_at=None, path="render", note=fleet_scope_targets.RENDER_NUMERIC_HOST_NOTE)
