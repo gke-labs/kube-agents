@@ -421,7 +421,8 @@ by the `chat` profile's own deadline, and the executors it delegates to run to t
 two do not nest. When the session delegates, its turn completes with a reply that says so
 ("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
 thread as it does for any task, and the child's terminal wakes the session for one more turn
-with the child's result as its input, so the session can synthesize or follow up. A follow-up
+with the child's result as its input, so the session can synthesize it (the wake can't delegate
+again; below). A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
 today: the platform executor queues each one and answers it after the current turn (on its
 `api` executor; the `cli` executor refuses it `no-resume`), and
@@ -474,7 +475,16 @@ so the chain is minted or refused as the relay would have done it. The relay doe
 turn's terminal when the request's own event was lost before it ran (acked, then a gateway crash):
 a session turn's `completed` with neither a child nor a refusal on record runs the request read
 off the stream first. Both outcomes are written to the record when they are made - the child's
-link in the mint's own write, the refusal in its own - so neither path runs a request twice.
+link in the mint's own write, the refusal in its own - so neither path runs a request twice. The wake's text then closes with a guide chosen by where the chain's answer goes. In a chat the
+child's result is already posted, so it tells the session to reply with what it means rather than
+repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
+answer. Either way it says to state plainly when the child failed or reports more work still
+running. The wake's pod has no delegate tool (`A2A_DELEGATE_TOOL=off`, set by the
+spawner for a wake turn): a wake that could delegate read an interim answer such as "still
+checking, the results will post here" as a reason to ask again, and each ask woke another pod
+until the depth bound refused, with nothing answered. A message the person sends while the wake
+runs steers the wake like any other running turn, so it is answered without the tool as well. A
+question sent after the wake answers is a new human turn and has the tool.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain
@@ -1644,11 +1654,22 @@ section gives - and neither is the console adapter, which has no durable to spli
 `verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
 principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
 sender over the socket and asserted the `user_id`. Rendering
-into mrkdwn is a narrow deterministic translation of the two forms the relay emits
-(bold, links); the legacy Hermes converter stays where it is. The translation leaves
+into mrkdwn is a narrow deterministic translation; the legacy Hermes converter stays
+where it is. A line pass runs first, outside fenced blocks, for the forms mrkdwn has no
+syntax for: a heading, ATX or setext, becomes a bold line (shedding any bold pairs
+inside it, and left plain when a `**` that is not half of a pair remains), a
+thematic break is dropped, a list marker
+becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
+keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
+its label and URL, since a code block renders no link; only an escaped `\|` stays inside
+a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
+heading run onto the end of a sentence with no line break is moved to its own line
+first. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a
 link's destination, and refuses a link whose label carries a URL naming a host other
-than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - relayed
+than the one it opens. Posts ask Slack not to unfurl links or media: an answer cites
+console and documentation links, and each unfurled into a preview card under it.
+Everything posted is escaped first (`&`, `<`, `>`) - relayed
 text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
 would ping the room. The Google Chat adapter applies the same markdown rules behind its
 own defang, in two halves: the link defang reads prose, link text and an unclosed fence

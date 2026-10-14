@@ -269,7 +269,7 @@
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
-# lists: seventy-two cases (216 units) here, of an eighty-six-case, 258-unit
+# lists: seventy-three cases (219 units) here, of an eighty-seven-case, 261-unit
 # matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
@@ -818,6 +818,13 @@
 # the ledger objectives need an install with a GitHub ledger (a token minter
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
+
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the

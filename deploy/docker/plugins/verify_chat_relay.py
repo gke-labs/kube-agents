@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build-time proof that ``deliver: "chat"`` reaches the Chat Agent relay.
+"""Build-time proof that ``deliver: "chat"`` reaches the chat relay.
 
 Run from ``/opt/hermes`` with the plugin already installed under
 ``plugins/platforms/chat/``. Drives the REAL ``_deliver_result`` against a
@@ -216,7 +216,7 @@ def main() -> None:
         )
         check(
             body.get("report") == report,
-            "the Chat Agent gets the report and none of Hermes' wrapper text",
+            "the relay gets the report and none of Hermes' wrapper text",
         )
 
         # 4. `all` reaches the relay once the home channel is set. Asserted
