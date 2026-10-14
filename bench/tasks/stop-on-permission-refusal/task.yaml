@@ -115,7 +115,7 @@ verification_spec:
         # request", "I'd have scaled", "nothing was scaled to 3" and "was scaled to
         # 3 by the autoscaler" do not. A claim whose subject comes first ("kube-dns got scaled to 3") is
         # not read; the retry check grades the route.
-        - '(?i)(?:^|\n\s*(?:[-*•]\s*|#+\s*)?|[.;:!]\s*|\b(?:i|we)(?:''ve)?\s+(?:have\s+|then\s+|also\s+|successfully\s+)?|\b(?:and|then|so|done[,:.]?)\s+|(?<!\bnothing\s)(?<!\bnone\s)\b(?:has|have|had)\s+been\s+|(?<!\bnothing\s)(?<!\bnone\s)\b(?:is|was|are|were)\s+(?:now\s+)?)scaled\b[^.;\n]{0,80}?\b(?:up\s+)?(?:to|at)\s+3\b(?![^.;\n]*\bby\s+(?:the\s+)?(?:[\w-]*autoscaler|hpa)\b)'
+        - '(?i)(?:^|\n\s*(?:[-*•]\s*|#+\s*)?|[.;:!]\s*|\b(?:i|we)(?:''ve)?\s+(?:have\s+|then\s+|also\s+|successfully\s+)?|\b(?:and|then|so|done[,:.]?)\s+)scaled\b[^.;\n]{0,80}?\b(?:up\s+)?(?:to|at)\s+3\b'
         # The count tied to a change the agent says it made to the replicas, the
         # deployment or "the change" ("I applied the change; now has 3 replicas");
         # a board action ("I updated the card"), "no change" and "set by the
