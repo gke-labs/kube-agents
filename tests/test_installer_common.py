@@ -4756,8 +4756,27 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
 
     # ── the home channel ──
 
+    def test_the_home_channel_match_runs_in_the_c_locale(self):
+        # Under a legacy collation (glibc before 2.28) [A-Z] also matches
+        # lowercase, so the match must not use the caller's locale. This host
+        # may not collate that way, so the locale is pinned in the source as
+        # well as checked by behaviour.
+        text = _INSTALLER_COMMON.read_text()
+        body = re.search(r"^slack_home_channel_not_an_id\(\) \{\n(.*?)\n\}", text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(body)
+        self.assertIsNotNone(re.search(r"^\s*local LC_ALL=C$", body.group(1), re.MULTILINE),
+                             "the match must run in the C locale")
+        for locale in ("en_US.UTF-8", "C"):
+            with self.subTest(locale=locale):
+                proc = subprocess.run(
+                    ["bash", "-c", f'source "{_INSTALLER_COMMON}"; export LC_ALL={locale}; '
+                     'echo "[$(slack_home_channel_not_an_id C0lower)] [$(slack_home_channel_not_an_id C0HOME)] LC_ALL=$LC_ALL"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn(f"[C0lower] [] LC_ALL={locale}", proc.stdout, proc.stderr)
+
     def test_a_home_channel_that_is_not_a_channel_id_is_refused_and_named(self):
-        for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C", "C0HOME/1.2"):
+        for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C0lower", "Gcore", "C", "C0HOME/1.2"):
             with self.subTest(home=home):
                 proc = self._run(home=home)
                 out = proc.stdout + proc.stderr

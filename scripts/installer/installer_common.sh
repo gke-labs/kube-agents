@@ -642,6 +642,9 @@ slack_allowlist_emails() {
 # A Slack home channel ($1), trimmed, when it is set and is not a channel id
 # (SLACK_HOME_CHANNEL_ID_RE).
 slack_home_channel_not_an_id() {
+  # The C locale: under a legacy collation (glibc before 2.28) the range
+  # A-Z also matches lowercase, which the gateway's rune comparison refuses.
+  local LC_ALL=C
   local home="${1:-}"
   home="${home#"${home%%[![:space:]]*}"}"
   home="${home%"${home##*[![:space:]]}"}"

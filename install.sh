@@ -5338,9 +5338,10 @@ run_menu_system() {
         local install_env_before=""
         if [ -f "$INSTALL_ENV_FILE" ]; then
           install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
-          cat "$INSTALL_ENV_FILE" >"$install_env_before"
+          # Armed before the write, so a failed write leaves no copy either.
           # shellcheck disable=SC2064 # expand now: the local is gone at exit.
           trap "rm -f $(printf '%q' "$install_env_before")" EXIT
+          cat "$INSTALL_ENV_FILE" >"$install_env_before"
         fi
 
         # Into install.env, one key at a time, leaving the operator's comments

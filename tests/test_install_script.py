@@ -6203,6 +6203,18 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertEqual(len(r["made"]), 1, out)
         self.assertEqual(r["leftovers"], [], "the copy of install.env, with its credentials, was left behind")
 
+    def test_the_menu_leaves_no_copy_of_install_env_when_writing_it_fails(self):
+        # A full $TMPDIR: mktemp succeeds and the write fails. The trap is
+        # armed before the write, so the empty copy goes too.
+        failing_cat = ('cat() { if [ "$#" -eq 1 ] && [ "$1" = "$INSTALL_ENV_FILE" ]; then return 1; fi; '
+                       'command cat "$@"; }\n')
+        proc, r = self._menu_apply(failing_cat + "write_tfvars_from_state() { echo generated > \"$1\"; }\n",
+                                   call='_menu_apply; echo "rc=$?"\n')
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("APPLIED", out)
+        self.assertEqual(len(r["made"]), 1, out)
+        self.assertEqual(r["leftovers"], [], "the copy of install.env was left behind")
+
     def test_the_menu_leaves_no_copy_of_install_env_after_a_clean_apply(self):
         proc, r = self._menu_apply("write_tfvars_from_state() { echo generated > \"$1\"; }\n")
         out = proc.stdout + proc.stderr
