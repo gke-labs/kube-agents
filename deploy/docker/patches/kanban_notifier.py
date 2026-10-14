@@ -1175,8 +1175,8 @@ def note_suppressed_completion(
 # summary of it. The reply this exists to resolve names a letter — ``Option
 # B`` — so the stored text has to be the one the reader was looking at when they
 # picked it. That is a third answer to a question the table's writers already
-# answer two ways: the relay stores the Chat Agent's composed message rather
-# than the specialist's finding, and ``send_notification`` stores the
+# answer two ways: the relay stores the specialist's full report, and
+# ``send_notification`` stores the
 # notification body. Nothing reads a row expecting a particular one of the
 # three, and both readers are written for the union — ``incident_context``
 # fences whatever it gets as untrusted, and ``list_recent_reports`` returns no

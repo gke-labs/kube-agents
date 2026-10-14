@@ -42,7 +42,8 @@ Grading. A hard failure means the report reached no platform: the relay
 answered 502 (``composed but not delivered to <platforms>``), was unreachable,
 or had no key. A partial one means it landed somewhere but not everywhere
 (``chat relay partial: the report did not reach <platforms>``); a degraded
-one means it was posted but the Chat Agent's turn failed. All three count
+one means it was posted but the relay said it degraded, which only a route
+that still ran a Chat Agent turn over the report did. All three count
 toward the streak; the grade and the platforms are carried into the issue so
 a partial outage of one platform reads differently from a dead relay.
 
@@ -493,7 +494,7 @@ def render_issue(degraded: list[tuple[str, dict]], now: str, threshold_value: in
             "",
             "**Grades.** `hard`: the leg recorded no delivery at all (the relay answered 502, was unreachable, "
             "or had no key; for a job on `deliver: \"all\"`, one of its legs failed outright). `partial`: the relay "
-            "landed on some platforms and not the ones listed. `degraded`: it was posted but the Chat Agent's turn failed.",
+            "landed on some platforms and not the ones listed. `degraded`: it was posted but the relay said the delivery degraded.",
             "",
             "**What to check.**",
             "- The relay route: `logs/session_kv_server.log` in the agent home, around each last-failure time.",

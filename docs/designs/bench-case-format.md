@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -237,7 +237,7 @@ card-wake replay planted, read before the harness archives it), and `reply_is_si
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule).
 
-Ten read the install under test, nine of them from that file. `bootstrap_fanout` compares the
+Eleven read the install under test, nine of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -276,6 +276,10 @@ finding in its `document` whose id contains it. `oobe_audits_started`, in its ow
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
+`relay_posted_as_written`, in its own module (`bench/kube_agents_bench/relay.py`), reads the
+`relay-report` stack's state file and what the Session KV server stored for the report's threads,
+and passes when the route answered `delivered` and every stored post is the report exactly; a
+route that delivered but stored nothing fails, and one whose send registered no thread (outcome unknown) is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
