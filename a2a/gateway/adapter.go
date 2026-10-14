@@ -153,9 +153,10 @@ type Adapter interface {
 	RemoveReaction(conversation, messageID, token string) error
 }
 
-// MarkObserver is the optional extension an Adapter implements to learn the
-// whole mark state of a conversation's latest ask whenever the gateway
-// changes it, beside the React and RemoveReaction calls that draw it. The
+// MarkObserver is the optional extension an Adapter implements to learn a
+// conversation's session mark whenever it changes: the latest ask's whole
+// mark state, or the newest older ask's while that one still has open card
+// work (SessionRecord.sessionMark), beside the React and RemoveReaction calls that draw it. The
 // Slack adapter uses it to hold the thread's Agent Sessions status: an ask
 // whose chain has ended but still carries its kind is card work still open,
 // and a blocked settle is work waiting on the user. Called where the mark is

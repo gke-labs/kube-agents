@@ -108,7 +108,7 @@ func (c slackSessionsClient) call(ctx context.Context, method string, body map[s
 
 // slackSession is one thread's session state. running is whether a task of
 // the conversation is between its start and its chain's end (TaskObserver);
-// ask and settle are the conversation's latest mark (MarkObserver). sent and
+// ask and settle are the conversation's session mark (MarkObserver). sent and
 // sentAt are the last status that landed; seq orders the sends, so only the
 // newest wanted status is sent when several queue. ask text is the first
 // verified ask, kept until the title lands.
@@ -274,7 +274,7 @@ func (s *SlackAdapter) noteAsk(conversation, text string) {
 	}
 }
 
-// MarkChanged holds the thread's session on the conversation's latest mark
+// MarkChanged holds the thread's session on the conversation's session mark
 // (MarkObserver): card work still open past the chain's end keeps Working…,
 // and a blocked settle suspends it.
 func (s *SlackAdapter) MarkChanged(conversation, ask, settle string) {

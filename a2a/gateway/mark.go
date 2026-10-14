@@ -245,10 +245,18 @@ func (g *Gateway) applyNotifyMark(rec *SessionRecord, update string, next MarkSt
 // latest chain's, unless that holds no open work and an older ask still
 // does (its cards still running, or blocked on the person), in which case
 // the newest such ask's, so the session holds until every chain's cards
-// have settled. Each ask counts once, by the chain holding what is drawn
-// there now.
+// have settled. An older ask holds it only while a notify key is bound to
+// it: nothing else reaches an older ask, so one no key reaches (a keyless
+// card's, or one marked before keys were bound) would hold Working… for
+// good. Each ask counts once, by the chain holding what is drawn there now.
 func (rec *SessionRecord) sessionMark() MarkState {
 	open := func(m MarkState) bool { return m.Ask != "" || m.Settle == markSettleBlocked }
+	keyed := map[string]bool{}
+	for _, ref := range rec.Tasks {
+		if len(ref.NotifyKeys) > 0 {
+			keyed[ref.AskMessageID] = true
+		}
+	}
 	latest := MarkState{}
 	seen := map[string]bool{}
 	for i := len(rec.Tasks) - 1; i >= 0; i-- {
@@ -260,11 +268,12 @@ func (rec *SessionRecord) sessionMark() MarkState {
 		if ref.Mark != nil {
 			m = *ref.Mark
 		}
-		if len(seen) == 0 {
+		first := len(seen) == 0
+		if first {
 			latest = m
 		}
 		seen[ref.AskMessageID] = true
-		if open(m) {
+		if open(m) && (first || keyed[ref.AskMessageID]) {
 			return m
 		}
 	}

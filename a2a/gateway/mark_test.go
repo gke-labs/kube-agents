@@ -244,6 +244,21 @@ func TestMarkSessionHoldsUntilEveryChainsCardsSettle(t *testing.T) {
 	}
 }
 
+// An older ask holds the session only while a keyed notify can still settle
+// it: one whose open mark no notify key reaches (a keyless card, or a record
+// from before keys were bound) would hold Working… for good.
+func TestMarkSessionIgnoresAnOlderAskNoKeyReaches(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", Mark: &MarkState{Ask: "investigate"}},
+		{ID: "b", RootTaskID: "b", AskMessageID: "20.0", Mark: &MarkState{Ask: "upgrade"}},
+	}}
+	g.applyTerminalMark(rec, "b", lib.StateCompleted)
+	if want := []string{"slack:C1/10.0 /"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v (the session closes with the newest chain)", obs.changes, want)
+	}
+}
+
 // TestMarkAnOlderChainsLateTerminalDoesNotTellTheObserver: an older chain's
 // terminal redraws its own ask, but the observer holds the latest ask's
 // state, so a newer ask blocked on the person keeps its session suspended.
