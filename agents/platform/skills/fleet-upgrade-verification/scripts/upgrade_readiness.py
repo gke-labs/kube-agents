@@ -185,7 +185,8 @@ WILDCARD = "*"
 # by what the server serves it (`_rule_served_class`), on the resources it names and not on its
 # operations or scope, since the served version is the resource's: live when its `apiVersions`
 # carry `*` or `v1`, so every request the server sends it fails now; pinned when every resource it names is graded and
-# the version is one the server does not serve, so the server sends it nothing; unknown when the
+# the version is one the server does not serve, so the server sends it nothing (a pair it spells
+# that the server serves at no version, `policy/pods`, is said so, not served at `v1`); unknown when the
 # version is unserved on a resource, group or wildcard off the graded lists, whose served
 # versions this reader does not know. The outage cell says each of the three for the rules it
 # has (`WEBHOOK_PINNED_MATCHES` when every rule is pinned, `WEBHOOK_OFF_PATH_MATCHES` with one
@@ -319,9 +320,13 @@ GRADED_TARGETS = UPGRADE_PATH_TARGETS + CONTROL_PLANE_CLUSTER_WRITES + CONTROL_P
 KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in {namespaces}"
 BOOTSTRAP_WRITE_LABEL = "{operation} {resource}"
 # A pinned rule whose operations (or scope) reach no graded row is labelled at the resource: the
-# served version is the resource's, not the row's.
+# served version is the resource's, not the row's. A group-resource pair such a rule spells that
+# the server does not serve at all (`policy/pods`, a typo the API accepts) is labelled apart, with
+# its group always named, so the cell can say the server serves no such pair rather than that it
+# serves the pair at `v1` alone.
 PINNED_RESOURCE_LABEL = "{resource} in {group}"
 PINNED_CORE_RESOURCE_LABEL = "{resource}"
+UNSERVED_PAIR_LABEL = "{resource} in {group}"
 NAMESPACE_JOIN = ","
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
@@ -334,14 +339,20 @@ WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {rea
 WEBHOOK_OFF_PATH_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); {verdicts}; reported, not graded"
 RULES_LIVE_ALL = "it fails now every request the server sends it"
 RULES_LIVE_SOME = "it fails now every request the server sends it that matches {live}"
-RULES_PINNED_SOME = "the server serves {pinned} at {served} alone, so it sends the rule {pinned_rules} nothing"
+RULES_PINNED_SOME = "{reasons}, so it sends the rule {pinned_rules} nothing"
+# The reasons a pinned rule is sent nothing, one per kind of pair it names, joined when a rule or
+# a webhook carries both: a served pair pinned to an unserved version, and a pair the server does
+# not serve at any version.
+PINNED_SERVED_REASON = "the server serves {pinned} at {served} alone"
+PINNED_UNSERVED_REASON = "the server serves no {unserved}"
+REASON_JOIN = " and "
 RULES_UNKNOWN_ALL = "its requests fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
 RULES_UNKNOWN_SOME = "the requests matched by {unknown} fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
 VERDICT_JOIN = "; "
 # The off-path cell for a webhook whose every rule names graded resources only at a version the
 # server does not serve: the server sends the webhook none of those requests, so nothing fails
 # now, and the cell says so rather than reporting a live outage.
-WEBHOOK_PINNED_MATCHES = "no request the server sends at a served version (its rules: {rules}; the server serves {pinned} at {served} alone, so it sends this webhook none of them); it is reported, not graded"
+WEBHOOK_PINNED_MATCHES = "no request the server sends at a served version (its rules: {rules}; {reasons}, so it sends this webhook none of them); it is reported, not graded"
 # The classes `_rule_served_class` returns.
 RULE_LIVE = "live"
 RULE_PINNED = "pinned"
@@ -1015,13 +1026,17 @@ def _graded_resource_names(targets: tuple) -> set[str]:
     return {_resource_parent(resource) for _, _, resource, _, _ in targets}
 
 
-def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
+def _pinned_resource_labels(rules: list[dict], targets: tuple) -> tuple[list[str], list[str]]:
     """What a pinned rule names when no graded row carries its operations or scope, labelled at
-    the resource, since the served version is the resource's and not the row's; a subresource is
-    labelled by its parent, whose group-version it is served under, and a pair the server does not
-    serve at all (`policy/pods`) by the words the rule spells, so every pinned rule has a label and
-    the cell can say the server sends it nothing."""
-    labels: list[str] = []
+    the resource, since the served version is the resource's and not the row's: (the pairs the
+    server serves, pinned to a version it does not; the pairs it serves at no version). A
+    subresource is labelled by its parent, whose group-version it is served under. A pair the
+    rule spells that is not a graded pair (`policy/pods`, a group and a resource each graded but
+    not together) is one the server does not serve at all, labelled with its group always named,
+    so every pinned rule has a label and the cell says, truly, why the server sends it nothing."""
+    served: list[str] = []
+    unserved: list[str] = []
+    graded_pairs = _graded_resources(targets)
     for rule in rules:
         if any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets):
             continue
@@ -1029,21 +1044,27 @@ def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
             for spec in rule.get("resources") or []:
                 if not isinstance(spec, str):
                     continue
-                template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
-                label = template.format(resource=_resource_parent(spec), group=group)
+                parent = _resource_parent(spec)
+                if (group, parent) in graded_pairs:
+                    template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
+                    label, labels = template.format(resource=parent, group=group), served
+                else:
+                    label, labels = UNSERVED_PAIR_LABEL.format(resource=parent, group=group or RULE_CORE_GROUP_NAME), unserved
                 if label not in labels:
                     labels.append(label)
-    return labels
+    return served, unserved
 
 
-def _pinned_labels(rules: list[dict], hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
-    """The graded writes `rules` name only at a version the server does not serve, labelled; a
-    namespaced bootstrap write carries the namespaces the selector admits, or no namespace clause
-    when it admits neither, since what the server serves does not depend on the selector; a rule
-    whose operations reach no graded row is labelled at the resource."""
+def _pinned_labels(rules: list[dict], hook: dict, namespace_labels: dict[str, dict] | None = None) -> tuple[list[str], list[str]]:
+    """(the graded writes `rules` name only at a version the server does not serve, labelled; the
+    pairs they spell that the server serves at no version). A namespaced bootstrap write carries
+    the namespaces the selector admits, or no namespace clause when it admits neither, since what
+    the server serves does not depend on the selector; a rule whose operations reach no graded row
+    is labelled at the resource, or as an unserved pair."""
+    served, unserved = _pinned_resource_labels(rules, GRADED_TARGETS)
     return (_upgrade_path_labels(rules, read_version=False) + _cluster_write_labels(rules, read_version=False)
             + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook, namespace_labels), read_version=False)
-            + _pinned_resource_labels(rules, GRADED_TARGETS))
+            + served), unserved
 
 
 def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
@@ -1101,8 +1122,9 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     what it does match named so the operator can judge it, because the list is what this
     rule knows of the path, not a proof of safety. Each rule of an outage finding is classed
     by what the server serves it (`_rule_served_class`): `live_rules` fail their requests now,
-    `pinned_rules` (their writes in `version_pinned`) name graded resources only at a version
-    the server does not serve, so it sends them nothing, and `unknown_rules` are at an unserved
+    `pinned_rules` (their writes in `version_pinned`, and in `unserved_pairs` any pair they
+    spell that the server serves at no version) name graded resources only at a version the
+    server does not serve, so it sends them nothing, and `unknown_rules` are at an unserved
     version on a resource off the graded lists, which this reader cannot place; the cell says
     each for the rules it has and asserts a failure now for the live rules alone. `namespaces`
     are the Namespace objects read, whose labels the `namespaceSelector` is judged on for
@@ -1143,6 +1165,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             for rule in _rules(hook):
                 served = RULE_LIVE if matches else _rule_served_class(rule, GRADED_TARGETS)
                 (live if served == RULE_LIVE else pinned if served == RULE_PINNED else unknown).append(rule)
+            version_pinned, unserved_pairs = _pinned_labels(pinned, hook, namespace_labels)
             finding = {
                 "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
                 "config_kind": config_kind,
@@ -1151,7 +1174,8 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
                 "reason": reason,
                 "upgrade_path": matches,
-                "version_pinned": _pinned_labels(pinned, hook, namespace_labels),
+                "version_pinned": version_pinned,
+                "unserved_pairs": unserved_pairs,
                 "rules": describe_rules(hook),
                 "pinned_rules": [describe_rule(rule) for rule in pinned],
                 "unknown_rules": [describe_rule(rule) for rule in unknown],
@@ -1182,6 +1206,23 @@ def describe_rules(hook: dict) -> list[str]:
     return [describe_rule(rule) for rule in _rules(hook)]
 
 
+def _pinned_reasons(finding: dict) -> str:
+    """Why the server sends the finding's pinned rules nothing, one clause per kind of pair they
+    name: the served pairs pinned to an unserved version (`version_pinned`; the pinned rules
+    themselves when a record carries no labels) and the pairs served at no version
+    (`unserved_pairs`)."""
+    served = finding.get("version_pinned") or []
+    unserved = finding.get("unserved_pairs") or []
+    if not served and not unserved:
+        served = finding.get("pinned_rules") or []
+    reasons = []
+    if served:
+        reasons.append(PINNED_SERVED_REASON.format(pinned=LIST_SEPARATOR.join(served), served=VERSION_V1))
+    if unserved:
+        reasons.append(PINNED_UNSERVED_REASON.format(unserved=LIST_SEPARATOR.join(unserved)))
+    return REASON_JOIN.join(reasons)
+
+
 def describe_webhook_finding(finding: dict) -> str:
     """The cell for one finding: a blocking webhook names the path writes it matches; an outage
     webhook whose every rule is pinned is told the server sends it nothing; any other outage
@@ -1191,17 +1232,17 @@ def describe_webhook_finding(finding: dict) -> str:
     live = finding.get("live_rules") or []
     pinned = finding.get("pinned_rules") or []
     unknown = finding.get("unknown_rules") or []
-    pinned_labels = LIST_SEPARATOR.join(finding.get("version_pinned") or pinned)
+    reasons = _pinned_reasons(finding)
     if finding["upgrade_path"]:
         matches = LIST_SEPARATOR.join(finding["upgrade_path"])
     elif pinned and not live and not unknown:
-        matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, pinned=pinned_labels, served=VERSION_V1)
+        matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, reasons=reasons)
     else:
         verdicts = []
         if live or not (pinned or unknown):
             verdicts.append(RULES_LIVE_ALL if not (pinned or unknown) else RULES_LIVE_SOME.format(live=LIST_SEPARATOR.join(live)))
         if pinned:
-            verdicts.append(RULES_PINNED_SOME.format(pinned=pinned_labels, served=VERSION_V1, pinned_rules=LIST_SEPARATOR.join(pinned)))
+            verdicts.append(RULES_PINNED_SOME.format(reasons=reasons, pinned_rules=LIST_SEPARATOR.join(pinned)))
         if unknown:
             verdicts.append(RULES_UNKNOWN_ALL if not (live or pinned) else RULES_UNKNOWN_SOME.format(unknown=LIST_SEPARATOR.join(unknown)))
         matches = WEBHOOK_OFF_PATH_MATCHES.format(rules=rules, verdicts=VERDICT_JOIN.join(verdicts))

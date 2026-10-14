@@ -231,7 +231,8 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   rule of a dead off-path webhook is then classed by what the server serves it, on the resources it
   names and not on its operations: a rule at `*` or `v1` fails now every request the server sends it (whether the server serves an off-list resource at all is not the reader's to say, and the cell claims no more); a rule naming graded
   resources only, at an unserved version, is sent nothing (whatever the operation; the cell then names
-  the resource); a rule at an unserved version on a resource, group or wildcard off the lists is one
+  the resource, and a group-resource pair the rule spells that the server serves at no version, such as
+  `policy/pods`, is said so rather than served at `v1`); a rule at an unserved version on a resource, group or wildcard off the lists is one
   whose served versions the reader does not know. The cell says each for the rules the webhook has: a
   webhook whose every rule is pinned is told the server sends it no request at a served version rather
   than that its requests fail now; otherwise the live rules are named as failing now every request the server sends them,
