@@ -256,8 +256,9 @@ Rules for the agent:
   substitution for it. The installer stores it in the Secret `gitlab-forge-ca`. Only the
   credential broker trusts the CA, and only for that host. Use a release whose
   `install.sh --help` lists `--gitops-ca-file`.
-- `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
-  the token. They check the content of a regular CA file. `--generate-only` never creates the
+- `--dry-run` and `--generate-only` check that the token source is readable, and stop the run if a
+  regular token file is empty. They store no token, and they do not read `/dev/stdin` or a process
+  substitution. They check the content of a regular CA file. `--generate-only` never creates the
   Secrets. On a first install it writes the GitLab keys into `install.env`. Over an existing
   `install.env`, it does not change them, so set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
   `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` in that file before
