@@ -177,6 +177,8 @@ DEFAULT_EXCLUSION_SCOPE = "NO_UPGRADES"
 # §3.8's "ends more than 30 days from now": time left, not the freeze's length.
 LONG_FREEZE_DAYS = 30
 LONG_FREEZE = timedelta(days=LONG_FREEZE_DAYS)
+# The widest horizon the check's own arithmetic holds; past it `timedelta(days=...)` raises.
+MAX_FREEZE_HORIZON_DAYS = timedelta.max.days
 # How `--deprecated-image-types` separates its entries.
 IMAGE_TYPE_LIST_SEPARATOR = ","
 # §3.8's escalation: a freeze beside a critical or major version finding.
@@ -1379,12 +1381,15 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     """The run's `Criteria` from the parsed flags, or `parser.error` on a value
     the checks cannot take.
 
-    Only the floors are checked here. The ceilings are the criteria schema's
-    and the store refuses a write past them; a flag is read as what the tool
-    returned, and this script is not the place for a second copy of that
-    policy. The floors are different: a critical rung at or below GKE's
-    ceiling makes two of §3.2's rungs claim the same pool, and a spread width
-    or horizon under one has no reading at all.
+    Only the floors are checked here, plus the one ceiling that is this
+    file's arithmetic rather than policy. The schema's ceilings are the
+    store's to refuse; a flag is read as what the tool returned, and this
+    script is not the place for a second copy of that policy. The floors are
+    different: a critical rung at or below GKE's ceiling makes two of §3.2's
+    rungs claim the same pool, and a spread width or horizon under one has no
+    reading at all. A horizon past what `timedelta` holds would raise inside
+    every project's collection and read as the whole fleet failing
+    `clusters list`, so it is refused here by name.
     """
     if args.pool_skew_critical_minors < POOL_SKEW_CRITICAL_MINORS:
         parser.error(
@@ -1395,6 +1400,8 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error("--fleet-spread-min-minors must be at least 1")
     if args.blocking_exclusion_min_days < 1:
         parser.error("--blocking-exclusion-min-days must be at least 1")
+    if args.blocking_exclusion_min_days > MAX_FREEZE_HORIZON_DAYS:
+        parser.error(f"--blocking-exclusion-min-days must be at most {MAX_FREEZE_HORIZON_DAYS}: a longer horizon is not a span of days the check can hold")
     # Compared case-insensitively, as §3.9 reads image types; an empty flag is
     # an operator who emptied the list, not the default.
     deprecated = frozenset(

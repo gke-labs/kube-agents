@@ -1816,6 +1816,20 @@ class CriteriaTest(unittest.TestCase):
                 self.assertIn("overlap", err.getvalue())
                 collect.assert_not_called()
 
+    def test_a_horizon_past_what_timedelta_holds_is_refused_by_name(self):
+        # Otherwise `timedelta(days=...)` raises inside every project's collection and the
+        # manifest reads as the whole fleet failing `clusters list`.
+        err = io.StringIO()
+        with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exc:
+                pr.main(["--project", "acme", "--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS + 1)])
+        self.assertEqual(exc.exception.code, 2)
+        self.assertIn("--blocking-exclusion-min-days", err.getvalue())
+        collect.assert_not_called()
+        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect, redirect_stdout(io.StringIO()):
+            pr.main(["--project", "acme", "--blocking-exclusion-min-days", str(pr.MAX_FREEZE_HORIZON_DAYS)])
+        self.assertEqual(collect.call_args.kwargs["criteria"].blocking_exclusion_min_days, pr.MAX_FREEZE_HORIZON_DAYS)
+
     def test_a_width_or_horizon_under_one_is_refused(self):
         for flag in ("--fleet-spread-min-minors", "--blocking-exclusion-min-days"):
             with self.subTest(flag=flag):
