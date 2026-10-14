@@ -28,6 +28,10 @@ by the image's copy of each. Leaves alone:
   paused audit rather than starting it, and the oobe cases grade that chain.
 - a job already disabled, which has nothing to pause.
 
+Those four still fire on their clock (06:20, 06:50, Mondays 07:50, 09:20 UTC), and
+their `finish` can open remediation pull requests like any audit's, so a write from
+one of them mid-eval is still possible (#3020 tracks it).
+
 Prints one line naming what it paused and what it left. Exits 1 when a pause it
 asked for didn't take, so the caller can say so.
 """
@@ -46,7 +50,8 @@ STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.p
 STAGE_AUDITS = "FIRST_RUN_AUDITS"
 # The roster the image ships, which `profile_scaffold` merges onto the volume's.
 SHIPPED_ROSTER = os.environ.get("PLATFORM_ROSTER_SOURCE", "/opt/platform-template/cron/jobs.json")
-HERMES_BIN = os.environ.get("HERMES_BIN", "hermes")
+# Absolute, as profile_scaffold.py runs it, so PATH order can't change which binary answers.
+HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 PAUSE_TIMEOUT_SECONDS = 60
 PAUSED_STATE = "paused"
 

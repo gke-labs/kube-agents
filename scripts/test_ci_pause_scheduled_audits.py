@@ -167,6 +167,35 @@ class PauseTest(unittest.TestCase):
         self.assertIn("nothing paused", result.stdout)
 
 
+class RestartTest(unittest.TestCase):
+    """The pause outlives a gateway restart: the entrypoint's merge keeps the pause markers.
+
+    profile_scaffold.merge_cron_store puts back every key the image ships, `enabled` among
+    them, and keeps every key it doesn't. The image ships no `state` or `paused_at`, so a
+    paused job comes out `enabled: true` with its markers, which Hermes' due scan refuses
+    (`_has_pause_marker`) and disables again. A merge rule that dropped unshipped keys would
+    undo the pause silently; this fails first.
+    """
+
+    def test_merge_keeps_the_pause_markers(self):
+        sys.path.insert(0, str(REPO / "agents" / "platform" / "scripts"))
+        try:
+            import profile_scaffold
+        finally:
+            sys.path.pop(0)
+        shipped = json.loads(ROSTER_SOURCE.read_text())
+        job = next(j for j in shipped["jobs"] if j["id"] == "gcp-networking-fabric-audit")
+        live = {"jobs": [{**job, "enabled": False, "state": "paused",
+                          "paused_at": "2026-10-14T15:02:02+00:00"}]}
+        merged = profile_scaffold.merge_cron_store(shipped, live)
+        after = next(j for j in merged["jobs"] if j["id"] == job["id"])
+        self.assertTrue(after["enabled"])
+        self.assertEqual(after["state"], "paused")
+        self.assertEqual(after["paused_at"], "2026-10-14T15:02:02+00:00")
+        for key in ("state", "paused_at"):
+            self.assertNotIn(key, job, "the image now ships a pause key; the merge would reset it")
+
+
 class RunnerTest(unittest.TestCase):
     def test_called_once_per_lease_before_any_unit(self):
         text = RUNNER.read_text()
@@ -181,6 +210,7 @@ class RunnerTest(unittest.TestCase):
         body = RUNNER.read_text().split("pause_scheduled_audits() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('< "${SCRIPT_DIR}/ci_pause_scheduled_audits.py"', body)
         self.assertIn('"gke_${PROJECT_ID}_"*', body)
+        self.assertIn("EVAL_PAUSE_AUDITS_ATTEMPTS", body)
         self.assertIn("return 0", body)
 
 

@@ -169,6 +169,7 @@ readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
 # pause_scheduled_audits: how long the one exec that pauses the clock-started audits
 # may take. Each pause is a `hermes cron pause`, a few seconds apiece.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
+readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -1466,17 +1467,24 @@ pause_scheduled_audits() { # <label>
       echo "WARNING: Scheduled audits (${label}): not paused, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
       return 0 ;;
   esac
+  # An exec that fails (a pod rolling, an API blip) is tried again inside the bound, as
+  # wait_platform_runs does; the script is idempotent, so a retry pauses only what's left.
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
-    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
-    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" \
-    < "${SCRIPT_DIR}/ci_pause_scheduled_audits.py" 2>&1)" || rc=$?
-  if [ "${rc}" -eq 0 ]; then
-    echo "Scheduled audits (${label}): ${out}"
-  else
-    echo "WARNING: Scheduled audits (${label}): exited ${rc}: ${out}; any audit not named as paused runs on its clock" >&2
-  fi
+  local attempt
+  for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
+    rc=0
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+      -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+      "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" \
+      < "${SCRIPT_DIR}/ci_pause_scheduled_audits.py" 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      echo "Scheduled audits (${label}): ${out}"
+      return 0
+    fi
+    [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+  done
+  echo "WARNING: Scheduled audits (${label}): exited ${rc} after ${EVAL_PAUSE_AUDITS_ATTEMPTS} attempts: ${out}; any audit not named as paused runs on its clock" >&2
   return 0
 }
 
