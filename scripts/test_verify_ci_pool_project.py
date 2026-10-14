@@ -3830,7 +3830,8 @@ class IamGrantsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
         self.assertIn("soft-deleted", finding.observed)
-        self.assertTrue(finding.repair.startswith("gcloud iam roles undelete kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3"), finding.repair)
+        self.assertTrue(finding.repair.startswith("gcloud iam roles undelete kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3; "), finding.repair)
+        self.assertIn("--stage=GA --permissions=compute.advice.calendarMode", finding.repair)
 
     def test_a_disabled_calendar_mode_role_is_reported_as_missing_with_the_enable(self):
         # stage DISABLED keeps the permission list and drops the grant: the
@@ -3847,7 +3848,26 @@ class IamGrantsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
         self.assertIn("disabled", finding.observed)
-        self.assertTrue(finding.repair.startswith("gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --stage=GA"), finding.repair)
+        self.assertTrue(finding.repair.startswith("gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --stage=GA --permissions=compute.advice.calendarMode"), finding.repair)
+
+    def test_a_disabled_and_widened_calendar_mode_role_is_both_findings(self):
+        # State and contents are independent: the enable repair must not bring
+        # the extra permission back live, and the widened finding must be loud.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(stage="DISABLED", permissions={"compute.advice.calendarMode", "compute.reservations.create"})),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        ids = {f.id for f in result.findings}
+        self.assertIn(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE, ids)
+        self.assertIn(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS, ids)
+        enable = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertIn("--stage=GA --permissions=compute.advice.calendarMode", enable.repair)
+        self.assertIn("compute.reservations.create", next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS).observed)
 
     def test_a_refused_calendar_mode_role_read_is_unchecked_not_failed(self):
         # Like every other read: a 403 on the describe names what went

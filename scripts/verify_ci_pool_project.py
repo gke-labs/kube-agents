@@ -388,15 +388,18 @@ REPAIR_CALENDAR_MODE_ROLE_PERMISSIONS = (
     "gcloud iam roles update {role_id} --project={project_id} --permissions={permission} "
     "# docs/ci-pool-projects.md section 3"
 )
-REPAIR_CALENDAR_MODE_ROLE_UNDELETE = (
-    "gcloud iam roles undelete {role_id} --project={project_id} "
-    "# docs/ci-pool-projects.md section 3"
-)
-# A disabled role is bound and grants nothing, like a soft-deleted one.
+# A disabled role is bound and grants nothing, like a soft-deleted one. Both
+# repairs re-activate the role with the one permission in the same paste, so
+# a role that was also widened comes back narrow rather than live as it was.
 ROLE_STAGE_DISABLED = "DISABLED"
 ROLE_STAGE_LIVE = "GA"
+REPAIR_CALENDAR_MODE_ROLE_UNDELETE = (
+    "gcloud iam roles undelete {role_id} --project={project_id}; "
+    "gcloud iam roles update {role_id} --project={project_id} --stage=" + ROLE_STAGE_LIVE + " --permissions={permission} "
+    "# docs/ci-pool-projects.md section 3"
+)
 REPAIR_CALENDAR_MODE_ROLE_ENABLE = (
-    "gcloud iam roles update {role_id} --project={project_id} --stage=" + ROLE_STAGE_LIVE + " "
+    "gcloud iam roles update {role_id} --project={project_id} --stage=" + ROLE_STAGE_LIVE + " --permissions={permission} "
     "# docs/ci-pool-projects.md section 3"
 )
 # Findings a leased run passes with. Every finding outside this set reds the
@@ -1832,6 +1835,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                 calendar_mode_role_checked = True
                 granted = set(role_doc.get("includedPermissions") or [])
                 expected_permissions = {PLATFORM_GSA_CALENDAR_MODE_PERMISSION}
+                # The state (deleted, disabled) and the contents are read
+                # independently: a dead role that is also widened is both
+                # findings, so the paste that revives it does not revive the
+                # extra permissions with it.
                 if role_doc.get("deleted"):
                     passed = False
                     details.append(
@@ -1842,7 +1849,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         FINDING_PLATFORM_CALENDAR_MODE_ROLE,
                         f"{calendar_mode_role} on {project_id} is soft-deleted",
                         REPAIR_CALENDAR_MODE_ROLE_UNDELETE.format(
-                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID, project_id=project_id
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
                         ),
                     ))
                 elif role_doc.get("stage") == ROLE_STAGE_DISABLED:
@@ -1855,10 +1864,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         FINDING_PLATFORM_CALENDAR_MODE_ROLE,
                         f"{calendar_mode_role} on {project_id} is disabled",
                         REPAIR_CALENDAR_MODE_ROLE_ENABLE.format(
-                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID, project_id=project_id
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
                         ),
                     ))
-                elif granted != expected_permissions:
+                if granted != expected_permissions:
                     passed = False
                     details.append(
                         f"{calendar_mode_role} on {project_id} carries {', '.join(sorted(granted)) or 'no permissions'} "
