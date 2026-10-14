@@ -154,10 +154,15 @@ def _normalised(repo: str, repos: list[str]) -> str:
     """
     ref = repo_ref.try_parse(repo)
     if ref is not None:
-        if ref.is_github and len(ref.segments) > GITHUB_REPOSITORY_DEPTH:
-            # A browser URL (/tree/main, /pull/12): on GitHub the repository
-            # is exactly the first two segments.
-            ref = repo_ref.RepoRef(ref.host, "/".join(ref.segments[:GITHUB_REPOSITORY_DEPTH]))
+        if ref.is_github:
+            # repo_ref.GITHUB_HOSTS already names GitHub's aliases (www., ssh.);
+            # spell them as the canonical host. A browser URL (/tree/main,
+            # /pull/12) names its first two segments: on GitHub that is the
+            # repository.
+            ref = repo_ref.RepoRef(
+                repo_ref.GITHUB_CANONICAL_HOST,
+                "/".join(ref.segments[:GITHUB_REPOSITORY_DEPTH]),
+            )
         repo = str(ref)
     return gitops_workspace.qualify(repo, repos)
 

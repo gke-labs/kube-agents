@@ -73,6 +73,8 @@ class PreflightAnswersInOneLine(unittest.TestCase):
             "https://github.com/acme/fleet.git",
             "git@github.com:acme/fleet.git",
             "https://GitHub.com/Acme/Fleet",
+            "https://www.github.com/acme/fleet",
+            "ssh://git@ssh.github.com:443/acme/fleet.git",
         ):
             with self.subTest(spelling=spelling), _StateDir(entries=ENTRY), patch(
                 "subprocess.run", return_value=answered
