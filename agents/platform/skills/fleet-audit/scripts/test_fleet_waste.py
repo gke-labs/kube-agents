@@ -8057,25 +8057,39 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
 
 
 class CredentialsNoteTest(unittest.TestCase):
-    def test_a_refused_directory_names_its_owner_in_the_failed_credentials(self):
-        # `prepare_kubeconfig`'s note reaches the failed `get-credentials` result, so the entry built
-        # from it names the owner rather than gcloud's bare refusal; a result that succeeded keeps
-        # gcloud's own text.
+    def test_a_refused_directory_is_the_failed_credentials_and_gcloud_is_not_run(self):
+        # `prepare_kubeconfig`'s note is the `get-credentials` result: gcloud is not run through a
+        # directory this run may not write (a root run would otherwise write a kubeconfig wherever a
+        # planted symlink points), and the entry built from the result names the owner or the link.
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
             owner = kc.parent.stat().st_uid
             other = owner + 1
-            refused = lambda argv, env=None, **kwargs: run_of(1, "", "ERROR: (gcloud.container.clusters.get-credentials) Permission denied")  # noqa: E731
-            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
-                _, result = fw.fetch_credentials("p", "c", "l", run=refused)
-            self.assertEqual(result.rc, 1)
-            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
-            self.assertTrue(result.stderr.endswith("Permission denied"))
-            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
-                _, ok = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: run_of(0))
-            self.assertEqual((ok.rc, ok.stderr), (0, ""))
+            calls = []
 
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls), (fw.KUBECONFIG_REFUSED_RC, []))
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            # A symlink planted at the directory's name: refused the same way, nothing run through it,
+            # the target left empty.
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            linked = Path(tmp) / "linked" / "kubeconfig_p_c_l.yaml"
+            linked.parent.symlink_to(elsewhere)
+            with patch.object(fw, "KUBECONFIG_DIR", linked.parent):
+                _, result = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, sorted(p.name for p in elsewhere.iterdir())), (fw.KUBECONFIG_REFUSED_RC, [], []))
+            self.assertIn("is a symbolic link", result.stderr)
+            # With the directory usable, gcloud runs and its result is returned as is.
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent):
+                _, ok = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
 
 class PrepareKubeconfigTest(unittest.TestCase):
     def test_fetch_credentials_prepares_the_shared_directory(self):

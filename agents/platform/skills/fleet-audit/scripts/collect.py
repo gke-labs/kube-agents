@@ -118,9 +118,14 @@ KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 # stands there now and goes on.
 KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
 # A symlink at the shared directory's name, which the agent's own account can
-# plant, is never followed: a root run would otherwise chmod and write into
-# whatever it points at.
+# plant, is never followed: the rule refuses it with a note, its chmod goes
+# through a descriptor opened without following, and `fetch_credentials`
+# runs no gcloud through a directory the rule refused, so a root run neither
+# chmods nor writes into whatever the link points at.
 KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
+# The rc a refused directory stands for in the credentials result: gcloud
+# was not run, and the note is the result's error.
+KUBECONFIG_REFUSED_RC = 1
 ROOT_UID = 0
 DEFAULT_TIMEOUT_S = 60
 # How many clusters a sweep reads at once. Every check is a kubectl or gcloud
@@ -876,22 +881,19 @@ def fetch_credentials(
     two threads race each other's context).
     """
     kc = kubeconfig_path(project, cluster, location)
+    argv = [
+        "gcloud", "container", "clusters", "get-credentials", cluster,
+        "--location", location, "--project", project,
+    ]
     note = prepare_kubeconfig(kc)
     if note:
+        # The directory is not this run's to write through: gcloud is not
+        # run (a link the agent account planted would put a root-owned
+        # kubeconfig wherever it points), and the refusal is the result,
+        # as the retrospective's and the reporter's copies return it.
         log(f"{project}/{location}/{cluster}: {note}")
-    env = {**os.environ, "KUBECONFIG": str(kc)}
-    result = run(
-        [
-            "gcloud", "container", "clusters", "get-credentials", cluster,
-            "--location", location, "--project", project,
-        ],
-        env=env,
-    )
-    if note and result.rc != 0:
-        # gcloud's refusal follows the directory's: the entry built from
-        # this result names the owner, not the bare refusal alone.
-        result = result._replace(stderr=f"{note}; {result.stderr}")
-    return kc, result
+        return kc, Run(argv, KUBECONFIG_REFUSED_RC, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, "KUBECONFIG": str(kc)})
 
 
 DUMP_COMMAND_KINDS = (

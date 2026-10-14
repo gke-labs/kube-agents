@@ -2226,7 +2226,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
         target = self.home / "target"
         target.write_text("root's secret")
         target.chmod(0o600)
-        elsewhere = self.home / "elsewhere"
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        elsewhere = Path(outside.name) / "elsewhere"
         elsewhere.mkdir()
         elsewhere.chmod(0o700)
         store = self.home / "store"
@@ -2235,16 +2237,35 @@ class LedgerAndGuardsTest(unittest.TestCase):
         (store / ur.LOCK_FILENAME).symlink_to(target)
         (store / ur.ARCHIVE_SUBDIR).symlink_to(elsewhere)
         chowned = []
+        linked_dir = store / ur.ARCHIVE_SUBDIR
+        (elsewhere / "20260101T000000Z.md").write_text("theirs")
         with mock.patch.object(os, "geteuid", return_value=ur.ROOT_UID), mock.patch.object(os, "fchown", side_effect=lambda fd, uid, gid: chowned.append(os.fstat(fd).st_ino)):
             ur.write_report(store / ur.REPORTS_SUBDIR / "r.md", "# r\n", link=False)
             with self.assertRaises(ur.StateUnreadable) as caught:
                 ur.acquire_lock(store / ur.LOCK_FILENAME)
-            ur.make_store_dir(store / ur.ARCHIVE_SUBDIR)
+            # A store directory that is a symlink (here pointing outside the store, the case a resolved
+            # path would have let fall through to `mkdir`): every write under it is refused with one
+            # line, since mkstemp, os.replace and unlink all resolve a directory link; nothing lands in
+            # the target and nothing of the target's is pruned.
+            for write in (lambda: ur.make_store_dir(linked_dir), lambda: ur.write_json_atomically(linked_dir / "x.json", {}), lambda: ur.write_report(linked_dir / "r.md", "# r\n"), lambda: ur.prune_reports(linked_dir)):
+                with self.assertRaises(ur.StateUnreadable) as refused:
+                    write()
+                self.assertEqual(str(refused.exception), ur.STORE_IS_SYMLINK_TEXT.format(path=linked_dir))
         self.assertEqual((target.read_text(), stat.S_IMODE(target.stat().st_mode), (store / ur.REPORTS_SUBDIR / "r.md.tmp").is_symlink(), (store / ur.REPORTS_SUBDIR / "r.md").read_text()), ("root's secret", 0o600, True, "# r\n"))
         self.assertEqual((str(caught.exception), (store / ur.LOCK_FILENAME).is_symlink()), (ur.LOCK_IS_SYMLINK_TEXT.format(path=store / ur.LOCK_FILENAME), True))
-        self.assertEqual((stat.S_IMODE(elsewhere.stat().st_mode), (store / ur.ARCHIVE_SUBDIR).is_symlink()), (0o700, True))
+        self.assertEqual((stat.S_IMODE(elsewhere.stat().st_mode), linked_dir.is_symlink(), sorted(p.name for p in elsewhere.iterdir())), (0o700, True, ["20260101T000000Z.md"]))
         self.assertTrue({target.stat().st_ino, elsewhere.stat().st_ino}.isdisjoint(chowned))
         self.assertEqual(ur.probe_lock(store / ur.LOCK_FILENAME), (ur.EXIT_USAGE, ur.LOCK_IS_SYMLINK_TEXT.format(path=store / ur.LOCK_FILENAME)))
+        # The store root itself a symlink: the run stops before a state file is read, through `main`
+        # with the one line and the projects for the recovery `finish`, and the target stays empty.
+        root_target = self.home / "root-target"
+        root_target.mkdir()
+        linked_root = self.home / "linked-root"
+        linked_root.symlink_to(root_target)
+        with mock.patch.dict(os.environ, {ur.STORE_HOME_ENV: str(linked_root)}), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+        self.assertEqual((out.getvalue(), err.getvalue().splitlines()[-1], sorted(p.name for p in root_target.iterdir())), ("", ur.STORE_IS_SYMLINK_TEXT.format(path=linked_root) + ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note=""), []))
 
     def test_api_disabled_project_is_empty_for_operations_too(self):
         ops, error = ur.list_operations("no-gke-project", SINCE, run=lambda argv, **kw: run_of(1, "", API_OFF_STDERR.format(project="no-gke-project", api="operations")))

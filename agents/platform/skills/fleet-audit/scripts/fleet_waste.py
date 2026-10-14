@@ -94,6 +94,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
+# The rc a refused kubeconfig directory stands for in the credentials
+# result: gcloud was not run through it, and the note is the error.
+KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
 # The exit status a `Run` reports for a command `subprocess.run` killed on
 # its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
@@ -1006,20 +1009,15 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
     kc = kubeconfig_path(project, cluster, location)
     from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
 
+    argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
     note = prepare_kubeconfig(kc)
     if note:
+        # The directory is not this run's to write through: gcloud is not
+        # run through it, and the refusal is the result, as the shared rule's
+        # other callers return it.
         log(f"{project}/{location}/{cluster}: {note}")
-
-    env = {**os.environ, "KUBECONFIG": str(kc)}
-    result = run(
-        ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project],
-        env=env,
-    )
-    if note and result.rc != 0:
-        # gcloud's refusal follows the directory's: the entry built from
-        # this result names the owner, not the bare refusal alone.
-        result = result._replace(stderr=f"{note}; {result.stderr}")
-    return kc, result
+        return kc, Run(argv, KUBECONFIG_REFUSED_RC, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, "KUBECONFIG": str(kc)})
 
 
 def target_name(project: str, location: str, name: str) -> str:

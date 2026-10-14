@@ -577,6 +577,11 @@ AFTER_RESET_KEY = "after_reset"
 LEDGER_SKEW_FIRST_SEEN_KEY = "skews_first_seen"
 GUARDS_ABSENT_TEXT = "{guards} is absent beside a live {ledger}: a crash record, not a re-baseline, since a run that started from no guards would announce every held finding resolved. Restore it from the newest {reports}/<stamp>.json's guards list, or run --reset-ledger to archive the ledger and start a baseline; until then nothing starts from empty. Nothing written."
 LOCK_IS_SYMLINK_TEXT = "{path} is a symbolic link, which the lock may not be; it was not followed and is left as found. Remove it, then rerun. Nothing written."
+# A store directory that is a symlink, the store root included, is refused
+# before anything is read or written under it: `mkstemp`, `os.replace` and
+# `unlink` all resolve a directory link, and the store's directories are the
+# agent account's to replace.
+STORE_IS_SYMLINK_TEXT = "{path} is a symbolic link, which a store directory may not be; it was not followed and is left as found. Remove it, then rerun. Nothing written."
 CRASH_RECORD_GLOB = LEDGER_FILENAME + UNREADABLE_GLOB_SUFFIX
 GUARDS_RECORD_GLOB = GUARDS_FILENAME + UNREADABLE_GLOB_SUFFIX
 ARCHIVE_SUBDIR = "archive"
@@ -1553,7 +1558,9 @@ def make_store_dir(path: Path) -> None:
     owner alike: a root run that tightened a root-owned directory an operator
     had opened for the tick would lock the tick out of a store it could write
     before. A store this uid cannot write is met by the write, and is
-    `store_denied_line`'s one line."""
+    `store_denied_line`'s one line; a symlink at any component from the
+    store root down is `STORE_IS_SYMLINK_TEXT`'s, and nothing is written."""
+    _refuse_symlinked_store_path(path)
     missing: list[Path] = []
     existing = path
     while not existing.exists():
@@ -1600,11 +1607,31 @@ def store_denied_line(exc: PermissionError) -> str:
 
 
 def _under_store(path: Path) -> bool:
+    """Whether `path` is the store's, compared lexically: resolving it would
+    follow a link planted under the store out of it, and the store's own
+    rule (`make_store_dir`) is what refuses such a link."""
     try:
-        path.resolve().relative_to(data_dir().resolve())
+        Path(os.path.abspath(path)).relative_to(Path(os.path.abspath(data_dir())))
     except ValueError:
         return False
     return True
+
+
+def _refuse_symlinked_store_path(path: Path) -> None:
+    """Every component from the store root down to `path` must be a real
+    directory: a symlink at any of them is refused with one line, never
+    followed, since the writes that follow (`mkstemp`, `os.replace`,
+    `unlink`) resolve a directory link and the store's directories are the
+    agent account's to replace."""
+    root = data_dir()
+    try:
+        parts = path.relative_to(root).parts
+        components = [root] + [root.joinpath(*parts[: i + 1]) for i in range(len(parts))]
+    except ValueError:
+        components = [path]
+    for component in components:
+        if os.path.islink(component):
+            raise StateUnreadable(STORE_IS_SYMLINK_TEXT.format(path=component))
 
 
 def output_parent(path: Path) -> None:
@@ -5494,6 +5521,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
                 # A set-aside guards file blocks like a ledger's: restarting
                 # with no guards while the ledger says "unchanged" loses them.
                 raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1], name=state_path.name))
+    # Before a state file is read: a set-aside would otherwise rename through
+    # a planted link, and every write below goes under the same root.
+    _refuse_symlinked_store_path(data_dir())
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
     if ledger_path.exists() and not guards_path.exists():
         # The write order never leaves this (guards, then ledger, every run):
@@ -5901,6 +5931,7 @@ def prune_reports(reports_dir: Path) -> list[str]:
     `--report` leave JSON-only stamps that would otherwise age the linked
     report out from under its link."""
     pruned = []
+    _refuse_symlinked_store_path(reports_dir)
     if not reports_dir.is_dir():
         return pruned
     linked = None
