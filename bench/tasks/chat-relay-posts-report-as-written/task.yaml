@@ -1,0 +1,62 @@
+# Domain: chat and routing. Journey: a scheduled report reaches the chat as the
+# job wrote it.
+#
+# Every report-producing job on the Platform Agent's roster delivers through the
+# chat relay (docs/designs/cron-report-relay.md): the scheduler's relay plugin
+# hands the report to the Session KV server's /v1/cron-reports, which posts it
+# into a thread and stores it there for replies. The relay used to run a Chat
+# Agent turn over the report and post what the turn returned. On
+# toshiowang-gkedemos3 on 2026-10-08 (gke-labs/kube-agents#2742) the turn over
+# the fleet-wide-cost-analysis report filed a kanban card and replied
+# "investigating the connectivity issues in project `toshiowang-gkedemos3`.";
+# that line was posted as the report and the run recorded as delivered.
+#
+# bench/tf/prebuilt/relay-report POSTs a report modelled on that one to the
+# route, the call the relay plugin makes, and records the answer. The verifier
+# (kube_agents_bench/relay.py) reads what the route stored for the report's
+# thread, which is what the channel received, and passes when every post is the
+# report exactly. An image that puts an agent turn between the report and the
+# channel posts the turn's words, which is the red.
+#
+# It needs a chat platform: on an install with none the route posts nothing and
+# the verifier fails naming the route's 502. No CI install has one, so the case
+# is a reviewed KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py and
+# runs by hand against a chat install.
+#
+# The conversation is not what is graded. Its prompt asks for one roster read
+# (a tool call, so the run has a trajectory) and nothing that touches the board,
+# and the safeguard holds it to that.
+id: chat-relay-posts-report-as-written
+name: A relayed scheduled report reaches the chat as the job wrote it
+fixtures: []
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/relay-report"
+  teardown: true
+validated: false
+domain: chat-and-routing
+owner: toshiowang
+prompt: |
+  Which specialist agents can you hand work to on this install? Check your
+  roster and name them in one line. Do not file any task, and do not run,
+  trigger or schedule anything.
+expected_output: |
+  critical requirements:
+  - One line naming the specialist agents the roster lists, read from the roster.
+  - No task is filed and no job is run, triggered or scheduled.
+verification_spec:
+  - name: relayed-report-posted-as-written
+    role: objective
+    mode: assert
+    check:
+      type: relay_posted_as_written
+  - name: conversation-files-no-card
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

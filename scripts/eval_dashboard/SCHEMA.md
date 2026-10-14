@@ -568,6 +568,14 @@ what the renderer does with them.
   record) is the same note, and any other failure is the refusal line, as
   it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
   the refusal line either way, as for the nightly.
+- `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
+  periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
+  night), read as `--nightly-prefix` is (the prefix is its index, `pr`
+  null, `log_url` set, the nightly's rule on a listing that fails) but
+  tagged `tier: "gitlab"`, above the nights' own watermark: the lane's
+  pull-request builds and its nights are two sources of one tier, told
+  apart by `pr`. Given without a value it is
+  `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/`.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -889,17 +897,21 @@ and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
-`gitlab` is `{job, runs[], running[], counts{on_record, green, red}}` from
-`forge_lane.py`: the GitLab lane's runs (`runs[].tier == "gitlab"`) **newest
+`gitlab` is `{job, runs[], running[], counts{on_record, green, red},
+nightly_job, nights[], night_counts{...}}` from `forge_lane.py`: the GitLab
+lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
 first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
-project, started, finished, duration_s, result, eval_verdict, green,
-tasks{pass, fail, infra}}` (`green` is Prow's `SUCCESS`; `tasks` counts the
+project, log_url, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}`; `nights[]` the same shape for the lane's nightly
+runs (`pr` null, `log_url` the periodic's Spyglass page), `nightly_job` the
+newest night's job else the default, `night_counts` over every night on
+record (`green` is Prow's `SUCCESS`; `tasks` counts the
 run's task rows by result); `running[]` the lane's `pending_builds` as
 `{build, first_seen}`, only those first seen inside `RUNNING_MAX_AGE` (8 h,
 the presubmit's ceiling plus upload time) of the reference time, as the Grid's
 columns and the nightly's `running[]` are bounded; `counts` over every lane
-run on record. `job` is the
-name the newest lane run carries, else the default. The Brief's "GitLab
+pull-request run on record. `job` is the
+name the newest lane pull-request run carries, else the default. The Brief's "GitLab
 lane" section is this block and nothing else reads it: the lane's runs are
 in no gate number, no case history and no digest line.
 
@@ -1116,7 +1128,8 @@ finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
 when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
-over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them);
+over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
+from before #2645 carry the git tree id of `bench/tf/fleet` instead);
 `main_check_error` is set when the moved-check could
 not read main; outcomes are applied, converged, unchanged, planned, busy,
 refused, failed, interrupted, not_reached); the sweep's,
@@ -1133,9 +1146,10 @@ reading arrived for this tick, whether or not they are noted; the poster clears
 a told job on a reading that shows it clean, or when `periodics_superseded`
 marks it recovered. That map is `{job: {build, recovery[, by]}}` for the jobs
 whose latest failed build a later build of the job that supersedes them (the
-daily, for the on-merge reconcile) has dealt with: `recovery` true when the
+daily, for the postsubmit reconcile) has dealt with: `recovery` true when the
 daily passed having reached every project the failed build named, at the same
-`fleet_tree` (a project a whole pass no longer lists has left the pool and
+`fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
+is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
 failed itself, so its own note is the current story and nothing clears; `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,

@@ -3643,5 +3643,161 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertIn('kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts', common)
 
 
+class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
+    """#2812 on upgrade.sh. The full arm applies PLATFORM_AGENT_MODE from
+    install.env. With next, Slack on and Chat off, Slack moves to the A2A
+    gateway, so the arm refuses an email in SLACK_ALLOWED_USERS, a
+    SLACK_HOME_CHANNEL that is not a channel id, or a list of bot tokens.
+    The refusal sits beside refuse_full_apply_dropping_next and before the
+    arm's first write. The test runs the arm from the source with every
+    other guard and both writes stubbed, so it can observe that nothing was
+    applied."""
+
+    _CALL = "if ! refuse_next_slack_gateway_settings_from_env; then"
+
+    def _arm(self):
+        source = _UPGRADE_SH.read_text()
+        start = source.index("\n    full)\n", source.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
+        body_start = start + len("\n    full)\n")
+        end = source.index("\n      ;;\n", body_start)
+        return source[body_start:end]
+
+    def _run(self, keys, tfvars_file="/nonexistent"):
+        stubs = (
+            "print_step() { :; }\n"
+            "refuse_apply_over_undeclared_scope() { :; }\n"
+            "announce_platform_agent_mode_for_apply() { :; }\n"
+            "check_scope_container_access() { :; }\n"
+            "check_service_account_ownership() { :; }\n"
+            'apply_crd_upgrades() { echo "APPLIED crds"; }\n'
+            'run_lifecycle() { echo "APPLIED terraform"; }\n'
+        )
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            f"{stubs}{exports}"
+            f'repo_dir="{_REPO_ROOT}"; tfvars_file={shlex.quote(tfvars_file)}; target_namespace=kube-agents\n'
+            f"_full() {{\n{self._arm()}\n}}\n"
+            "_full\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+
+    def test_next_with_slack_on_the_gateway_refuses_each_setting_and_applies_nothing(self):
+        base = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true"}
+        for extra, says in (
+            ({"SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"},
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ({"SLACK_HOME_CHANNEL": "D0123ABCD"},
+             "SLACK_HOME_CHANNEL is 'D0123ABCD', which is not a Slack channel id (C... or G...)."),
+            ({"SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"}, "SLACK_BOT_TOKEN holds 2 tokens"),
+        ):
+            with self.subTest(keys=list(extra)):
+                proc = self._run({**base, **extra})
+                out = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 1, out)
+                self.assertNotIn("APPLIED", out)
+                self.assertIn(says, out)
+                self.assertIn("in install.env and run again", out)
+                self.assertNotIn("--slack-", out)
+                self.assertNotIn("secretpart", out)
+
+    def test_a_refusal_removes_the_tfvars_the_generator_wrote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars = pathlib.Path(tmp) / "terraform.tfvars"
+            tfvars.write_text('slack_bot_token = "xoxb-1-secretpart,xoxb-2-secretpart"\n')
+            proc = self._run({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+                              "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"}, str(tfvars))
+            left = tfvars.exists()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertNotIn("APPLIED", out)
+        self.assertFalse(left, "the tfvars rendering the refused token list were left for a hand-run apply")
+
+    def test_the_cases_the_refusal_leaves_alone_apply(self):
+        for keys in (
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD,W0456EFGH"},
+            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
+             "SLACK_HOME_CHANNEL": "C0123ABCD", "SLACK_BOT_TOKEN": "xoxb-1-secretpart"},
+            # Chat holds the gateway; Slack stays on the today path.
+            {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "true", "SLACK_ENABLED": "true",
+             "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
+             "SLACK_BOT_TOKEN": "xoxb-a,xoxb-b"},
+        ):
+            with self.subTest(keys=sorted(keys.items())):
+                proc = self._run(keys)
+                out = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, out)
+                self.assertIn("APPLIED crds\nAPPLIED terraform", proc.stdout, out)
+                self.assertNotIn("look like emails", out)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("SLACK_BOT_TOKEN holds", out)
+
+    _PLAN_START = 'if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning (read-only)"\n'
+
+    def _plan(self, keys):
+        """upgrade.sh --plan's block, from the source, with the plan itself
+        stubbed: it applies nothing, so it warns and refuses nothing."""
+        source = _UPGRADE_SH.read_text()
+        start = source.index(self._PLAN_START)
+        end = source.index('    exit "$plan_status"\n  fi\n', start) + len('    exit "$plan_status"\n  fi\n')
+        stubs = (
+            "print_step() { :; }\nrefuse_apply_over_undeclared_scope() { :; }\n"
+            "check_scope_container_access() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
+            'write_report() { echo "REPORT $1"; }\nrun_lifecycle() { echo "PLANNED"; return 0; }\n'
+        )
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            f"{stubs}{exports}"
+            f'repo_dir="{_REPO_ROOT}"; target_namespace=kube-agents; PARAM_PLAN=true PARAM_IMAGE_TAG=0.9.0\n'
+            f"_plan() {{\n  {source[start:end]}}}\n"
+            "_plan\n"
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+
+    def test_a_plan_warns_of_each_setting_the_full_run_would_refuse(self):
+        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+                           "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
+                           "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"})
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("PLANNED", proc.stdout)
+        self.assertIn("REPORT PLAN_IN_SYNC", proc.stdout)
+        for said in (
+            "An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.",
+            "An applying run would be refused: SLACK_HOME_CHANNEL is 'D0DM'",
+            "An applying run would be refused: SLACK_BOT_TOKEN holds 2 tokens",
+        ):
+            self.assertIn(said, out)
+        self.assertNotIn("secretpart", out)
+        self.assertLess(out.index("An applying run would be refused"), out.index("PLANNED"))
+
+    def test_a_plan_is_quiet_where_slack_stays_on_the_today_path(self):
+        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
+                           "SLACK_ALLOWED_USERS": "alice@example.com"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("would be refused", proc.stdout + proc.stderr)
+
+    def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
+        arm = self._arm()
+        self.assertEqual(arm.count(self._CALL), 1)
+        call = arm.index(self._CALL)
+        self.assertLess(arm.index('refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1'), call)
+        self.assertLess(call, arm.index("declare -F announce_platform_agent_mode_for_apply"))
+        # Guarded: an older target's installer_common.sh lacks it.
+        self.assertIn("if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then\n        " + self._CALL, arm)
+        self.assertLess(call, arm.index('UPGRADE_APPLY_STARTED="true"'))
+
+
 if __name__ == "__main__":
     unittest.main()

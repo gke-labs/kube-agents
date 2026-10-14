@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -386,5 +387,48 @@ func TestIsSessionCommand(t *testing.T) {
 		if isSessionOff(rest) {
 			t.Errorf("isSessionOff(%q) = true, want false", rest)
 		}
+	}
+}
+
+// TestChatChunksCarryATableHeadAcrossACut: a pipe table cut across chunks
+// gets its header and delimiter rows again at the head of the next chunk, so
+// each chunk renders (toMrkdwn) as a table rather than raw rows; nothing else
+// is added, and text without a table running across the cut splits as before.
+func TestChatChunksCarryATableHeadAcrossACut(t *testing.T) {
+	head := "| Pod | Status | Restarts |\n| --- | --- | --- |"
+	var rows strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&rows, "\n| pod-%03d | Running | %d |", i, i%7)
+	}
+	text := "## Pods\n\n" + head + rows.String() + "\n\nAll pods listed."
+	chunks := chatChunks(text, discordChunk)
+	if len(chunks) < 3 {
+		t.Fatalf("got %d chunks, want the table cut at least twice", len(chunks))
+	}
+	var joined strings.Builder
+	for i, c := range chunks {
+		if len(c) > discordChunk {
+			t.Errorf("chunk %d is %d bytes, over the cap", i, len(c))
+		}
+		if i > 0 && strings.Contains(c, "| pod-") {
+			if !strings.HasPrefix(c, head+"\n") {
+				t.Errorf("chunk %d holds table rows without the carried head: %q", i, c[:min(len(c), 60)])
+			}
+			if !strings.Contains(toMrkdwn(c), "Pod     | Status  | Restarts") {
+				t.Errorf("chunk %d does not render as a table: %q", i, toMrkdwn(c)[:min(len(toMrkdwn(c)), 80)])
+			}
+			joined.WriteString(strings.TrimPrefix(c, head))
+			continue
+		}
+		joined.WriteString(c)
+	}
+	if joined.String() != text {
+		t.Errorf("chunks, with the carried heads removed, are not the original text")
+	}
+
+	// A table that ends before the cut, with prose running across it, carries nothing.
+	prose := head + "\n| a | b | c |\n\n" + strings.Repeat("prose line | with a pipe in it\n", 200)
+	if got := strings.Join(chatChunks(prose, discordChunk), ""); got != prose {
+		t.Errorf("a table that ended before the cut changed the split")
 	}
 }

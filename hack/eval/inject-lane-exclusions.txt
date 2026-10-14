@@ -112,6 +112,12 @@ first-install-hello-running
 # #2039: the same for the greeting once the first-look scan has finished.
 first-install-hello-done
 
+# #2039: grades the specialist's answer as the chat front door's card round
+# trip delivers it into the thread (answer_first reads each delivered card
+# result). The inject door addresses `platform` directly, so no card is
+# filed and no result is delivered, and the check fails every repetition.
+# Returns to the lane when the door routes through the chat profile.
+chat-voice-answer-first
 # #2039: grades the chat front door's ack for a fleet question and the
 # platform worker's fan-out beneath the one card it files. The same gap as
 # chat-voice-ack-names-target: under the default api executor the front

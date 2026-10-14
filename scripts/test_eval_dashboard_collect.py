@@ -2468,6 +2468,33 @@ class TestGitLabLane(_MergeBase):
         merged, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15), index_prefix="")
         self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
 
+    def test_a_gitlab_night_is_a_periodic_of_the_gitlab_tier_with_its_own_watermark(self):
+        """The lane's nightly (kube-agents#2832) archives as a periodic: its
+        prefix is its index, its run has no pull request and a log_url, and
+        it is tier gitlab. Its watermark is apart from the lane's pull-request
+        builds, so a night above the newest lane build does not hide the
+        lane's next build, and the other way round."""
+        night_prefix = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab/"
+        gsutil, log = self.fake_gsutil([])
+        root = self.bucket_root()
+        prefix = root / night_prefix[len(FAKE_BUCKET):]
+        prefix.mkdir(parents=True)
+        shutil.copytree(TESTDATA / BUILD_998_FULL, prefix / BUILD_998_FULL)
+        (prefix / "latest-build.txt").write_text(BUILD_998_FULL + "\n")
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)  # inside 14 days of the fixtures (2026-08-26/27): the fresh sweep is bounded to that without a watermark
+        data, stderr = self.quiet_collect(gitlab_nightly_prefix=night_prefix, gsutil=gsutil, now=now)
+        (run,) = data["runs"]
+        self.assertEqual((run["tier"], run["pr"], run["job"]), ("gitlab", None, "ci-fake-eval-nightly-gitlab"))
+        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-fake-eval-nightly-gitlab/{BUILD_998_FULL}")
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
+        # A lane pull-request build with a LOWER id than the night is still read: the lane's watermark is its own.
+        prior = self.write_prior(data)
+        self.place_gitlab_build(BUILD_956_TRUNCATED)
+        merged, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gitlab_nightly_prefix=night_prefix, merge_with=prior, gsutil=gsutil, index_prefix="", now=now)
+        self.assertEqual({r["build_id"]: r["pr"] for r in merged["runs"]}, {BUILD_998_FULL: None, BUILD_956_TRUNCATED: 956}, "the night keeps no pull request; the lane build keeps the one its started.json names")
+        self.assertIn("gitlab scan resumed above build None", stderr)
+        self.assertIn(f"gitlab nights resumed above build {BUILD_998_FULL}, 0 new", stderr)
+
     def test_the_cli_takes_the_lane_glob_and_counts_it(self):
         gsutil, _ = self.fake_gsutil([])
         self.place_gitlab_build(BUILD_998_FULL)
