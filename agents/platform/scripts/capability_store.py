@@ -236,7 +236,10 @@ def load(root: Path, name: str) -> Capability:
     if criteria is None:
         raise CapabilityError(f"unknown capability {name!r}; {_known(root)}")
     if not isinstance(criteria, dict):
-        raise CapabilityError(f"{name}/{CRITERIA_FILENAME} must hold a JSON object")
+        raise CapabilityError(
+            f"{name}/{CRITERIA_FILENAME} must hold a JSON object; a pod restart does not replace it: remove the file "
+            f"from the volume and the next start re-seeds it empty ({CHANGELOG_FILENAME} keeps what was set)"
+        )
     schema = _read_json(directory / SCHEMA_FILENAME)
     if not isinstance(schema, dict):
         # Without its schema every key and value would validate, so a torn first scaffold or a
@@ -400,8 +403,9 @@ def apply_changes(
     A value of `None` removes the key from the volume, so the schema default
     applies again and follows later releases. Returns the changelog entry that was appended. Raises CapabilityError with
     a message the caller can relay verbatim when anything is refused; nothing is
-    written in that case. `changes` may arrive JSON-encoded; a model that
-    serialises the object as a string should not lose a turn over it.
+    written in that case. `changes` may arrive JSON-encoded from a direct caller
+    of this module; the MCP framework decodes a string parameter before the tool
+    body runs, so the tool never reaches that branch.
     """
     name = _validate_name(name)
     if isinstance(changes, str):

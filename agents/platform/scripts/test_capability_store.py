@@ -137,6 +137,11 @@ class StoreTest(unittest.TestCase):
                 call()
             self.assertIn("remove the file", str(ctx.exception))
             self.assertIn(cs.CRITERIA_FILENAME, str(ctx.exception))
+        # Valid JSON of the wrong shape is refused with the same recovery.
+        (self.root / "demo" / cs.CRITERIA_FILENAME).write_text("[]")
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.load(self.root, "demo")
+        self.assertIn("remove the file", str(ctx.exception))
         # The trail the message points at is readable in that state, and after the file is removed.
         self.assertEqual(cs.history(self.root, "demo"), [first])
         (self.root / "demo" / cs.CRITERIA_FILENAME).unlink()

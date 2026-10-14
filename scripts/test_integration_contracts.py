@@ -320,7 +320,9 @@ class SpecToolRegistryTest(unittest.TestCase):
 
     @staticmethod
     def _names_builtin(name, corpus):
-        """Whether the corpus names the tool as a call or a quoted name.
+        """Whether the corpus names the tool as a call, a quoted name, or a
+        double-backticked name in a docstring (the file-tool guard names the
+        native tools it gates that way).
 
         A bare substring is not enough: `skill_manage` is part of the patch
         module's own file name, which every file of that family imports. A
@@ -328,7 +330,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         the kanban patches dispatch on.
         """
         root = name.removeprefix("kanban_")
-        forms = [f"{name}(", f"'{name}'", f'"{name}"']
+        forms = [f"{name}(", f"'{name}'", f'"{name}"', f"``{name}``"]
         if root != name:
             forms += [f"'{root}'", f'"{root}"']
         return any(form in corpus for form in forms)
