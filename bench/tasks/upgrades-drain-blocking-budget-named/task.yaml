@@ -18,6 +18,9 @@
 # delete command only to advise against it, which a substring check cannot
 # tell from a proposal, so no objective forbids the command.
 #
+# The minAvailable slot is read, not graded: the planted budget has none, and
+# the spellings of an absent field (none, N/A, not set) are the judge's to read.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the budget's maxUnavailable. Widening it to 1 is the
