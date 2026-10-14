@@ -212,7 +212,8 @@ verification_spec:
   # the dictated command without the `fleet_scope` call exits 2 and a worker that then surveys
   # budgets and webhooks by `kubectl` could reach the right verdicts; the forbidden run is
   # `kubectl` as a segment's command word with `get` or `describe` and a budget or webhook
-  # configuration resource among its words, read from the argv as the run is, so any global
+  # configuration resource among its words, spelled as a resource name or as the API path a
+  # `kubectl get --raw` reads, read from the argv as the run is, so any global
   # flags between `kubectl` and the verb (`--context`, `--kubeconfig`, `-n`) stand as the
   # governance SOPs spell a per-cluster read, and a quoted mention of the survey (a grep of a
   # skill file, an echoed sentence) is one word that is no command (the script's own kubectl
@@ -232,7 +233,7 @@ verification_spec:
         - script: kubectl
           word_patterns:
             - "^(?:get|describe)$"
-            - "(?i)^(?:[a-z0-9.-]+,)*(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)(?:[./,].*)?$"
+            - '(?i)^(?:(?:[a-z0-9.-]+,)*(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)(?:[./,].*)?|(?:--raw=)?/apis/(?:policy|admissionregistration\.k8s\.io)/v\d+(?:(?:alpha|beta)\d+)?(?:/namespaces/[^/]+)?/(?:poddisruptionbudgets|validatingwebhookconfigurations|mutatingwebhookconfigurations)(?:[/?].*)?)$'
 
   - name: no-invented-cves
     role: objective

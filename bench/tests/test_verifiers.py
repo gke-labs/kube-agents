@@ -7453,6 +7453,11 @@ def _run_objective(command: str) -> str:
         (f"python3 {_SCRIPT_PATH} --readiness; sudo kubectl --context c get pdb -A", False),
         (f'python3 {_SCRIPT_PATH} --readiness; bash -c "kubectl get deploy,pdb -A"', False),
         (f"python3 {_SCRIPT_PATH} --readiness; kubectl describe pdb/pinned-batch-runner -n seeded-upgrade", False),
+        # the survey spelled as the API path a `kubectl get --raw` reads is the survey; another path is not
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl get --raw /apis/policy/v1/poddisruptionbudgets", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl get --raw=/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl --context c get --raw /apis/policy/v1/namespaces/seeded-upgrade/poddisruptionbudgets?limit=500", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl get --raw /api/v1/nodes", True),
         (f"grep -n readiness {_SCRIPT_PATH}", False),
         ("cat fleet_upgrade_report.py | grep -- --readiness", False),
         (f"python3 {_SCRIPT_PATH} --target-version 1.33", False),
