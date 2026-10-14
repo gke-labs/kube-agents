@@ -75,7 +75,18 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      required_patterns: ['audit_report\.py\s+start\b']
+      required_patterns: ['audit_report\.py\s+start\s+--audit\b']
+  # No worker command named a skill script or an SOP by a path relative to the
+  # profile home, and none joined `governance/` to a script directory. From a
+  # card's workspace both name nothing, and the worker spends its turns
+  # recovering.
+  - name: the-worker-used-full-paths
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        ['(?<![\w/.-])(?:\./)?skills/[\w-]+/scripts/', "scripts/governance/"]
   # The answer is the only report an operator on such an install receives, so
   # it names the planted binding and says why no ledger was written.
   - name: the-answer-names-the-binding
