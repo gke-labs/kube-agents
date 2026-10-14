@@ -416,7 +416,7 @@ What to report in each case:
 - `status: "CLEAN"` with `resolved: > 0` → the fleet is fully patched and no longer behind its channel. Report the issue URL and how many findings closed with it. On a patch audit this is the sentence someone has been waiting for, and silence would bury it.
 - `status: "CLEAN"` with `partial: true` → nothing reproduced, but the ledger and its PRs stay open on incomplete coverage. One line reporting the clean result and the `coverage_gaps`, then the issue URL.
 - `status: "HELD"` → zero findings, but the ledger stayed open because the run did not account for findings it was carrying (`start` listed them under `carried`; `unaccounted` names the ones held): one line reporting the clean result, the held ids and the issue URL, then stop. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
-- Any other outcome → one line, then the issue URL. For example: `Upgrade & patch readiness: 3 new findings (1 critical), 2 resolved, across 11 clusters, criteria revision 4 — <issue_url>` (with `invalid_keys: <key>` after the revision when §1's `get` listed any). Name any remediation PRs opened or closed in the same line.
+- Any other outcome → one line, then the issue URL. For example: `Upgrade & patch readiness: 3 new findings (1 critical), 2 resolved, across 11 clusters, criteria revision 4 — <issue_url>` (with `invalid_keys: <key>` or `stale_keys: <key>` after the revision when §1's `get` listed any). Name any remediation PRs opened or closed in the same line.
 
 ## Red Lines
 
