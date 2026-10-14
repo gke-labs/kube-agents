@@ -454,27 +454,37 @@ def report_message(
 # --- the moments -----------------------------------------------------------
 
 
+def _pr_layout(url: str) -> tuple[str, str, str, str, str]:
+    """:data:`slack_moments.MR_LAYOUT` for a GitLab merge request url, else ``PR_LAYOUT``, as :func:`slack_moments.pr_opened` picks."""
+    return _moments.MR_LAYOUT if _moments.MR_URL.match(url) else _moments.PR_LAYOUT
+
+
 def _evidence(url: str, number: str, line: str) -> str:
-    """The worker's line with the url shortened to "PR #n", as :func:`slack_moments.pr_opened` shows it."""
+    """The worker's line with the url shortened to "PR #n" ("MR !n"), as :func:`slack_moments.pr_opened` shows it."""
+    _, ref_format, lead, _, _ = _pr_layout(url)
     ref = _moments.PR_REF_URL.format(url=re.escape(url), tail=_moments.PR_URL_TAIL)
-    span = re.compile(_moments.PR_REF_SPAN.format(number=number, ref=ref), re.IGNORECASE)
-    shortened = span.sub(lambda m: _moments.PR_REF.format(number=number) + _moments._ref_markup(m), line)
+    span = re.compile(_moments.PR_REF_SPAN.format(lead=lead.format(number=number), ref=ref), re.IGNORECASE)
+    shortened = span.sub(lambda m: ref_format.format(number=number) + _moments._ref_markup(m), line)
+    if _moments.MR_URL.match(url):
+        shortened = _moments.A_BEFORE_MR.sub(r"\1n", shortened)
     return _presenter._clip(_line(shortened), _moments.EVIDENCE_MAX)
 
 
 def pr_message(url: str, repo: str, number: str, line: str) -> dict:
-    """:func:`slack_moments.pr_opened`'s card: the headline, the worker's line, Open PR primary."""
+    """:func:`slack_moments.pr_opened`'s card: the headline, the worker's line, Open PR (Open MR) primary."""
+    headline_format, _, _, open_label, files_path = _pr_layout(url)
     return message(
-        headline=_moments.PR_HEADLINE.format(number=number, repo=repo),
+        headline=headline_format.format(number=number, repo=repo),
         note=_evidence(url, number, line),
         tone=TONE_SUCCESS,
-        links=_links([(_moments.OPEN_PR, url), (_moments.FILES_CHANGED, url + _moments.FILES_PATH)], primary_first=True),
+        links=_links([(open_label, url), (_moments.FILES_CHANGED, url + files_path)], primary_first=True),
     )
 
 
 def pr_text(url: str, repo: str, number: str, line: str) -> str:
     """The PR card's fallback: the headline, the worker's line, the url."""
-    return "\n".join(part for part in (_moments.PR_HEADLINE.format(number=number, repo=repo), line.strip(), url) if part)
+    headline = _pr_layout(url)[0].format(number=number, repo=repo)
+    return "\n".join(part for part in (headline, line.strip(), url) if part)
 
 
 def needs_you_message(reason: str, card: str = "", buttons: bool = True) -> dict | None:

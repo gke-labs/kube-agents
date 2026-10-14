@@ -168,6 +168,27 @@ class ChoicesTest(unittest.TestCase):
         self.assertIsNone(cm.failure_message("It failed. X" + "x" * cm.DETAIL_MAX, True))
 
 
+class PrOpenedTest(unittest.TestCase):
+    def test_a_merge_request_reads_as_one(self):
+        mr = "https://gitlab.com/platform/infra/-/merge_requests/12"
+        chat = cm.pr_message(mr, "infra", "12", f"I opened a merge request: {mr}")
+        self.assertEqual(chat["headline"], "I opened merge request !12 in infra. It's yours to review.")
+        self.assertEqual(chat["note"], "I opened an MR !12")
+        self.assertEqual(chat["links"], [
+            {"text": "Open MR ↗", "url": mr, "primary": True},
+            {"text": "Files changed ↗", "url": mr + "/diffs"},
+        ])
+        self.assertTrue(cm.pr_text(mr, "infra", "12", "x").startswith("I opened merge request !12 in infra."))
+
+    def test_a_pull_request_keeps_its_layout(self):
+        pr = "https://github.com/acme/fleet-config/pull/412"
+        chat = cm.pr_message(pr, "fleet-config", "412", f"Opened {pr} for review.")
+        self.assertEqual(chat["headline"], "I opened PR #412 in fleet-config. It's yours to review.")
+        self.assertEqual(chat["note"], "Opened PR #412 for review.")
+        self.assertEqual([link["text"] for link in chat["links"]], ["Open PR ↗", "Files changed ↗"])
+        self.assertEqual(chat["links"][1]["url"], pr + "/files")
+
+
 class MarkTest(unittest.TestCase):
     def test_tokens_only(self):
         self.assertEqual(cm.mark("fleet", "done"), {"ask": "fleet", "settle": "done"})
