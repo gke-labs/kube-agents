@@ -39,7 +39,10 @@ type fakeBroker struct {
 	requests  []string // "METHOD path"
 	auths     []string
 	autopilot map[string]bool // cluster name -> Autopilot.Enabled
-	status    int             // non-zero answers every request with it
+	// unreachable names clusters whose describe carries no usable endpoint:
+	// no external DNS endpoint, and an IP endpoint with no CA.
+	unreachable map[string]bool
+	status      int // non-zero answers every request with it
 }
 
 func (f *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,11 +59,22 @@ func (f *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	const gkePrefix = "/v1/watcher/gcp/container.googleapis.com/v1/projects/"
 	if strings.HasPrefix(r.URL.Path, gkePrefix) {
 		name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-		_ = json.NewEncoder(w).Encode(&container.Cluster{
+		cluster := &container.Cluster{
 			Name:      name,
 			Endpoint:  "10.0.0.1", // must be ignored in broker mode
 			Autopilot: &container.Autopilot{Enabled: f.autopilot[name]},
-		})
+		}
+		if !f.unreachable[name] {
+			// Usable addressing, which discovery checks and the broker's
+			// config then ignores: the broker resolves the control plane.
+			cluster.ControlPlaneEndpointsConfig = &container.ControlPlaneEndpointsConfig{
+				DnsEndpointConfig: &container.DNSEndpointConfig{
+					AllowExternalTraffic: true,
+					Endpoint:             name + ".example.internal",
+				},
+			}
+		}
+		_ = json.NewEncoder(w).Encode(cluster)
 		return
 	}
 	_, _ = w.Write([]byte(`{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`))
@@ -81,7 +95,7 @@ func (f *fakeBroker) seen() (requests, auths []string) {
 func newFakeBroker(t *testing.T) (*fakeBroker, *Broker) {
 	t.Helper()
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
-	fb := &fakeBroker{autopilot: map[string]bool{}}
+	fb := &fakeBroker{autopilot: map[string]bool{}, unreachable: map[string]bool{}}
 	srv := httptest.NewServer(fb)
 	t.Cleanup(srv.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -199,6 +213,31 @@ func TestDiscoverThroughBroker(t *testing.T) {
 		if c.Autopilot != want.autopilot {
 			t.Errorf("%s Autopilot = %v, want %v", profile, c.Autopilot, want.autopilot)
 		}
+	}
+}
+
+// TestDiscoverThroughBrokerSkipsAClusterWithNoUsableEndpoint keeps the skip the
+// direct path has: the broker refuses every request for a cluster whose describe
+// gives no usable endpoint, so discovery reports it to OnSkip (the discovery
+// error counter) rather than returning a cluster whose informer never syncs.
+func TestDiscoverThroughBrokerSkipsAClusterWithNoUsableEndpoint(t *testing.T) {
+	fb, broker := newFakeBroker(t)
+	fb.unreachable["dark"] = true
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-dark", "proj", "dark", "us-central1")
+	writeClusterProfile(t, dir, "cluster-ok", "proj", "ok", "us-central1")
+
+	skips := map[string]error{}
+	d := Discoverer{Broker: broker, OnSkip: func(p string, err error) { skips[p] = err }}
+	clusters, err := d.Discover(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].Profile != "cluster-ok" {
+		t.Fatalf("clusters = %v, want only cluster-ok", clusters)
+	}
+	if skips["cluster-dark"] == nil || len(skips) != 1 {
+		t.Fatalf("skips = %v, want cluster-dark alone", skips)
 	}
 }
 

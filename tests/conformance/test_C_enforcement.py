@@ -197,28 +197,36 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth(self) -> None:
         """The watcher role reaches fleet API servers and Pub/Sub through the broker.
 
-        Its token is projected for the watcher audience and mounted into the
-        gateway pod's agent-api-auth container and nowhere else, so the Hermes
-        container beside it, which runs model-chosen tools, holds only the chat
-        token and cannot present this one. Checked on every golden.
+        The broker confers the role by audience alone, so the question is where a
+        token for the watcher audience is mounted, under any volume name, in any
+        workload: exactly the gateway's agent-api-auth container. Not the Hermes
+        container beside it, which runs model-chosen tools and holds only the
+        chat token; not the sandbox, where model-authored shell runs; not the
+        broker. Checked on every golden.
         """
         for fixture, documents in h.golden_documents().items():
-            gateways = [
-                d for d in documents
-                if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-gateway")
-            ]
+            mounts = set()
+            gateways = []
+            for workload in h.objects_of_kind(documents, "Deployment") + h.objects_of_kind(documents, "StatefulSet"):
+                name = workload["metadata"]["name"]
+                if workload["kind"] == "Deployment" and name.endswith("-gateway"):
+                    gateways.append(name)
+                spec = workload["spec"]["template"]["spec"]
+                watcher_volumes = {
+                    v["name"]
+                    for v in spec.get("volumes", [])
+                    for source in (v.get("projected") or {}).get("sources", [])
+                    if (source.get("serviceAccountToken") or {}).get("audience") == self._WATCHER_AUDIENCE
+                }
+                for container in h.containers_of(workload):
+                    if any(m["name"] in watcher_volumes for m in container.get("volumeMounts", [])):
+                        mounts.add((name, container["name"]))
             self.assertEqual(len(gateways), 1, f"{fixture}: expected one gateway Deployment")
-            spec = gateways[0]["spec"]["template"]["spec"]
-            volumes = {v["name"]: v for v in spec.get("volumes", [])}
-            self.assertIn(self._WATCHER_TOKEN_VOLUME, volumes, f"{fixture}: no watcher token volume")
-            source = volumes[self._WATCHER_TOKEN_VOLUME]["projected"]["sources"][0]["serviceAccountToken"]
-            self.assertEqual(source["audience"], self._WATCHER_AUDIENCE, fixture)
-            mounted_in = sorted(
-                c["name"]
-                for c in spec.get("containers", []) + spec.get("initContainers", [])
-                if any(m["name"] == self._WATCHER_TOKEN_VOLUME for m in c.get("volumeMounts", []))
+            self.assertEqual(
+                mounts,
+                {(gateways[0], "agent-api-auth")},
+                f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
             )
-            self.assertEqual(mounted_in, ["agent-api-auth"], f"{fixture}: watcher token mounted in {mounted_in}")
 
     def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
         policy = h.watcher_policy

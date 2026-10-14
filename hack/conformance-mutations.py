@@ -583,6 +583,16 @@ Mutation(
         "reads every fleet cluster's events and objects through the broker",
     ),
     Mutation(
+        "C1-watcher-audience-on-the-chat-token",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("                  audience: kubeagents-credential-proxy-chat\n",
+         "                  audience: kubeagents-credential-proxy-watcher\n"),
+        "test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth",
+        "project the watcher audience on the Hermes container's own token to "
+        "save a volume -- under its old name, the model's container then holds "
+        "the watcher role and a check keyed on the volume name never sees it",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
