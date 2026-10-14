@@ -7296,3 +7296,150 @@ def test_group3_case_accepts_the_declared_lines_as_rendered(case, line):
 def test_group3_case_refuses_a_wrong_or_hedged_seeded_a_line(case, line):
     verdicts = _group3_verdicts(case, _group3_report(case, line))
     assert any(s != "pass" for s in verdicts.values()), verdicts
+
+
+# ------------------------------------------------ the group-5 catalogue cases
+#
+# Six declared-line cases on the seeded-a shape fixtures, read the way the
+# group-3 cases are read: the objectives out of the task file, the fleet
+# directory standing in for the runner's, the renderings a report gives a
+# line (bare, bulleted, backticked, bold, numbered, a parenthetical after the
+# cluster). The wrong rows are each graded value's exact wrong word, an
+# off-vocabulary value, and a hedge after the last value; the missing rows
+# are a report that names no line at all, which fails every declared-line
+# objective rather than erroring.
+
+_GROUP5 = {
+    "upgrades-pod-security-latest-pinned-named": (
+        [
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
+            "- `seeded-a/seeded-defaults`: enforce baseline; enforce-version `latest`; rule set changes at the next minor: yes.",
+            "**seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes**",
+            "1. seeded-a (us-central1-a)/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
+        ],
+        [
+            "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version v1.33; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: no",
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes?",
+        ],
+        "No namespace on the seeded clusters pins its Pod Security Admission version to the running minor; every enforce-version label names a minor.",
+    ),
+    "upgrades-stale-client-skew-named": (
+        [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "- `seeded-a/seeded-shapes/stale-kubectl-client`: client kubectl 1.29; server 1.34; within supported skew: no.",
+            "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
+        ],
+        [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.34.1; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client helm v3.14.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no (but still succeeds)",
+        ],
+        "Every client in the seeded clusters is within one minor of its control plane; the kubectl CronJob succeeds on every run.",
+    ),
+    "upgrades-cgroup-blind-runtime-named": (
+        [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "- `seeded-a/seeded-shapes/cgroup-blind-jvm`: runtime `eclipse-temurin:8u302-b08-jre`; reads cgroup v2 limits: no; memory limit 192Mi.",
+            "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
+        ],
+        [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit none",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi (reads host memory)",
+        ],
+        "No workload on the seeded clusters runs a Java or .NET runtime older than the cgroup v2 releases.",
+    ),
+    "upgrades-multi-process-oom-group-named": (
+        [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: yes",
+            "- `seeded-a/seeded-shapes/multi-process-worker`: processes per container several; memory limit `32Mi`; oom kills the whole container: yes.",
+            "**seeded-a/seeded-shapes/multi-process-worker**: processes per container several; memory limit 32 MiB; OOM kills the whole container: yes",
+        ],
+        [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container one; memory limit 32Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container 3; memory limit 32Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 64Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: no",
+        ],
+        "Every container on the seeded clusters runs a single process; nothing changes for them at 1.28.",
+    ),
+    "upgrades-node-image-coupled-agent-named": (
+        [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "- `seeded-a/seeded-shapes/cni-shaped-agent`: host network: yes; host paths `/etc/cni/net.d` (read-only, mounted at /host/etc/cni/net.d); coupled to the node image: yes.",
+            "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
+        ],
+        [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /var/run/docker.sock; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
+        ],
+        "No DaemonSet outside kube-system on the seeded clusters uses host networking or mounts a host path.",
+    ),
+    "upgrades-cuda-pinned-gpu-job-named": (
+        [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes",
+            "- `seeded-a/seeded-shapes/cuda-pinned-trainer`: accelerator `nvidia-l4`; CUDA 12.2.0; suspended: yes.",
+            "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
+        ],
+        [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-tesla-t4; cuda 12.2; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes (not running)",
+        ],
+        "No running workload on the seeded clusters requests a GPU; there is nothing to check against the target image's driver.",
+    ),
+}
+
+
+def _group5_report(line: str) -> str:
+    return "\n".join(
+        [
+            "I read the seeded clusters' manifests and found one match.",
+            "",
+            line,
+            "",
+            "Nothing else on the seeded clusters matched.",
+        ]
+    )
+
+
+def _group5_verdicts(case: str, text: str) -> dict[str, str]:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    out = {}
+    with tempfile.TemporaryDirectory(prefix="group5-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            for entry in spec["verification_spec"]:
+                check = entry["check"]
+                if check.get("type") != "report_contains" or not check.get("any_of_patterns"):
+                    continue
+                v = parse_node(dict(check))
+                _stash(text)
+                out[entry["name"]] = v.verify(5.0).status
+    return out
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _GROUP5.items() for l in ok])
+def test_group5_case_accepts_the_declared_line_as_rendered(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _GROUP5.items() for l in bad])
+def test_group5_case_refuses_a_wrong_or_hedged_value(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert any(s != "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case", list(_GROUP5))
+def test_group5_case_fails_every_objective_without_the_declared_line(case):
+    _, _, missing = _GROUP5[case]
+    verdicts = _group5_verdicts(case, missing)
+    assert verdicts and all(s == "fail" for s in verdicts.values()), verdicts

@@ -180,6 +180,17 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-exclusion-end-date-named",
     "upgrades-removed-api-callers-distinguished",  # catalogue entries 6 and 16, the third group's two cases on fixtures the fleet carries
     "upgrades-network-policy-enforcement-stated",
+    "upgrades-node-local-state-named",  # catalogue entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20, the fourth and fifth groups on the seeded-a shapes
+    "upgrades-pod-security-latest-pinned-named",
+    "upgrades-stale-client-skew-named",
+    "upgrades-deprecated-node-label-selector-named",
+    "upgrades-containerd-socket-agent-named",
+    "upgrades-cgroup-blind-runtime-named",
+    "upgrades-multi-process-oom-group-named",
+    "upgrades-node-image-coupled-agent-named",
+    "upgrades-cuda-pinned-gpu-job-named",
+    "upgrades-intree-volume-named",
+    "upgrades-retired-registry-image-named",
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

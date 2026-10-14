@@ -2642,6 +2642,19 @@ unit_cost_hint() {
     # Entry 5's follow-up: one maintenance-policy read per seeded cluster, no
     # card fan-out. 571s wall clock on 2026-10-08, 257-354s on 2026-10-13.
     upgrades-exclusion-end-date-named) echo 600 ;;
+    # The fourth and fifth groups (entries 4, 8, 10, 12, 13, 14, 15, 17, 18,
+    # 19 and 20), on the seeded-a shapes: each asks across the seeded
+    # clusters for one planted object the prompt does not place, so the
+    # agent reads every cluster to find it, entry 3's shape. Measured one
+    # run each on the same dev install, 2026-10-07 and 10-08: 390-2180s a
+    # repetition where they passed, 1350-2522s where they failed. The same
+    # 900 band.
+    upgrades-node-local-state-named | upgrades-pod-security-latest-pinned-named) echo 900 ;;
+    upgrades-stale-client-skew-named | upgrades-deprecated-node-label-selector-named) echo 900 ;;
+    upgrades-containerd-socket-agent-named | upgrades-cgroup-blind-runtime-named) echo 900 ;;
+    upgrades-multi-process-oom-group-named | upgrades-node-image-coupled-agent-named) echo 900 ;;
+    upgrades-cuda-pinned-gpu-job-named | upgrades-intree-volume-named) echo 900 ;;
+    upgrades-retired-registry-image-named) echo 900 ;;
     *) echo 200 ;;
   esac
 }

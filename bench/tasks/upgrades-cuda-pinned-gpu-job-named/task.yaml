@@ -1,0 +1,158 @@
+# Upgrade-failure catalogue entry 18 (GPU driver mismatch), in the shape the
+# seeded fleet plants it: cuda-pinned-gpu-job on seeded-a, a suspended
+# CronJob (cuda-pinned-trainer, in seeded-shapes) that requests one
+# nvidia.com/gpu on an nvidia-l4 node selector with an image pinned to CUDA
+# 12.2 (docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04). The node image ships
+# the driver and the container ships the CUDA build; when the next image's
+# driver stops matching, in either direction, the device cannot be opened.
+# The fleet carries no accelerator pool, so the job is suspended: its
+# manifest is the dependency, read without a GPU, and an inventory that
+# skips suspended or not-running workloads misses exactly the one that
+# bites after the upgrade.
+#
+# The prompt names no workload, no accelerator and no CUDA version. It asks
+# which workloads request a GPU and pin a CUDA version, including ones not
+# running today, and for the answer to end in one declared line per such
+# workload, in a fixed form; the deterministic objectives read the planted
+# CronJob's line and nothing else. Whether the target image's driver serves
+# CUDA 12.2 depends on the target version's driver table and is the judge's.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguards: the image and the suspend flag. An image built for
+# the target driver is the heal that passes every objective and empties the
+# fixture; unsuspending the job leaves it Pending on a GPU the fleet does
+# not have, a stall that is not this fixture.
+id: upgrades-cuda-pinned-gpu-job-named
+name: The suspended GPU job pinned to a CUDA version is named before the node image that moves the driver
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project move to a
+  newer node image, tell me which workloads request a GPU and pin a CUDA
+  version, including suspended or otherwise not-running ones, which
+  accelerator each selects, and what to check about the target node image's
+  driver for each before the pool moves. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your
+  answer with one line per such workload in exactly this form, no other
+  words on the line: "<cluster>/<namespace>/<workload>: accelerator <node
+  selector value>; cuda <major.minor>; suspended: <yes|no>".
+
+expected_output: >-
+  It reads the GPU requests on the seeded clusters, CronJobs and suspended
+  ones included, and names cuda-pinned-trainer in seeded-shapes on seeded-a:
+  one nvidia.com/gpu on a cloud.google.com/gke-accelerator nvidia-l4
+  selector with docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04, suspended, so
+  nothing runs today and nothing is Pending. It says the pool's node image
+  ships the driver, that the GPU how-to page's table gives the driver per
+  GKE version while the API records only DEFAULT or LATEST, and that the
+  image's CUDA 12.2 needs a driver at or above NVIDIA's minimum for it and
+  fails the other way, with Error 803, when forward-compatibility libraries
+  are older than the node's driver. It recommends matching the driver to
+  the image and upgrading a canary GPU pool first, and performs no change.
+  It cites no CVE identifiers and ends with the declared line for each such
+  workload, the planted one reading "accelerator nvidia-l4; cuda 12.2;
+  suspended: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+fixtures:
+  - cuda-pinned-gpu-job
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-job-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda [^;\n]+; suspended: (?:yes|no)$'
+
+  - name: the-declared-line-names-the-accelerator
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator nvidia-l4; cuda [^;\n]+; suspended: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator (?!nvidia-l4;)[^;\n]+; cuda [^;\n]+; suspended: (?:yes|no)$'
+
+  # The CUDA pin, with or without its patch.
+  - name: the-declared-line-names-the-cuda-pin
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda 12\.2(?:\.0)?; suspended: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda (?!12\.2(?:\.0)?;)[^;\n]+; suspended: (?:yes|no)$'
+
+  # The job is suspended: an inventory that saw it saw that, and one that
+  # skipped suspended workloads has no line at all.
+  - name: the-declared-line-says-the-job-is-suspended
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda [^;\n]+; suspended: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda [^;\n]+; suspended: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The CronJob still pins CUDA 12.2.
+  - name: the-planted-cuda-pin-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: cuda-pinned-gpu-job
+      kind: cronjob
+      resource_name: cuda-pinned-trainer
+      namespace: seeded-shapes
+      path: spec.jobTemplate.spec.template.spec.containers[0].image
+      op: eq
+      value: docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04
+
+  # And is still suspended: unsuspended, it sits Pending on a GPU the fleet
+  # does not have, which is a write the prompt forbade and a stall nothing
+  # else reads.
+  - name: the-planted-job-is-still-suspended
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: cuda-pinned-gpu-job
+      kind: cronjob
+      resource_name: cuda-pinned-trainer
+      namespace: seeded-shapes
+      path: spec.suspend
+      op: eq
+      value: true

@@ -1,0 +1,127 @@
+# Upgrade-failure catalogue entry 10 (add-on and client skew), in the shape
+# the seeded fleet plants it: stale-client-skew on seeded-a, a CronJob
+# (stale-kubectl-client, in seeded-shapes) that runs kubectl v1.29.0 against
+# the cluster's own control plane every ten minutes. kubectl is supported one
+# minor either side of the server; this client is several minors behind and
+# still succeeds, because /version answers any authenticated caller and the
+# skew policy is a support statement rather than a refusal. The next
+# control-plane minor moves it one further out, and the first request shape
+# or API the old client cannot follow turns a green Job red.
+#
+# The prompt names no client, no image and no version. It asks which
+# Kubernetes clients running in the clusters are outside the version-skew
+# policy for the control plane they talk to, whether or not their calls
+# still succeed, and for the answer to end in one declared line per such
+# workload, in a fixed form; the deterministic objectives read the planted
+# CronJob's line and nothing else. The server's version is the cluster's own
+# and moves with the fleet, so the line carries it for the judge and the
+# patterns accept any value there.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the client image. Moving its tag within one minor of
+# the control plane is the heal that passes every objective and empties the
+# fixture.
+id: upgrades-stale-client-skew-named
+name: The client outside the version-skew policy is named before the control plane moves further ahead
+
+prompt: >-
+  Before the seeded clusters in this project move to their next control-plane
+  minor, tell me which Kubernetes clients running in them, whether kubectl,
+  a client library, an operator or an add-on, are outside the version-skew
+  policy for the control plane they talk to, whether or not their calls
+  still succeed today, and what breaks for each as the control plane moves
+  further ahead. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line
+  per such workload in exactly this form, no other words on the line:
+  "<cluster>/<namespace>/<workload>: client <name> <version>; server
+  <version>; within supported skew: <yes|no>".
+
+expected_output: >-
+  It reads the images of the workloads on the seeded clusters against each
+  cluster's control-plane version and names stale-kubectl-client in
+  seeded-shapes on seeded-a: a CronJob running kubectl v1.29.0 (the
+  registry.k8s.io/kubectl:v1.29.0 image) every ten minutes against a control
+  plane several minors ahead of it, outside the one-minor-either-side policy
+  kubectl supports, succeeding today only because /version is served to any
+  authenticated client. It says the next minor moves it one further out and
+  that the first request shape or API the old client cannot follow turns
+  the Job red, recommends a kubectl tag within one minor of the control
+  plane, and performs no change. It cites no CVE identifiers and ends with
+  the declared line for each such workload, the planted one reading "client
+  kubectl v1.29.0; server <the cluster's control-plane version>; within
+  supported skew: no".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+fixtures:
+  - stale-client-skew
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-client-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client [^;\n]+; server [^;\n]+; within supported skew: (?:yes|no)$'
+
+  # The client is kubectl at 1.29: the image tag, with or without its `v`
+  # and its patch.
+  - name: the-declared-line-names-the-stale-client
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client kubectl v?1\.29(?:\.0)?; server [^;\n]+; within supported skew: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client (?!kubectl v?1\.29(?:\.0)?;)[^;\n]+; server [^;\n]+; within supported skew: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-client-is-outside-the-skew
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client [^;\n]+; server [^;\n]+; within supported skew: no$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client [^;\n]+; server [^;\n]+; within supported skew: (?!no$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The CronJob still runs the old client.
+  - name: the-planted-client-image-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: stale-client-skew
+      kind: cronjob
+      resource_name: stale-kubectl-client
+      namespace: seeded-shapes
+      path: spec.jobTemplate.spec.template.spec.containers[0].image
+      op: eq
+      value: registry.k8s.io/kubectl:v1.29.0

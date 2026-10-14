@@ -265,32 +265,39 @@
 # (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
 # file's fourteen.
 
-# 2026-10-14 adds the upgrade-failure catalogue's scenario cases whose
-# fixtures the fleet already carries: six cases, eighteen units, the last six
-# entries below. The second group (entries 1, 2, 3 and 5:
-# upgrades-drain-blocking-budget-named, -no-surge-pool-recreate-warned,
-# -zonal-skew-replicas-warned, -exclusion-end-date-named) and two of the
-# third (entries 6 and 16: upgrades-removed-api-callers-distinguished,
-# -network-policy-enforcement-stated). Each is a read-only chat prompt over a
-# fixture the seeded fleet plants, deployer: noop with no stack and no audit
-# stream, so none takes the infra lock or a stream lock. Five fan out:
-# entries 1 and 2 to one Cluster Agent card per seeded cluster, entry 3 to
-# every cluster to find the multi-zone one, and entries 6 and 16 to one
-# declared line per seeded cluster, so each carries a 900s unit_cost_hint
-# rather than the 200s default. Measured on a dev install with one user
-# worker slot, so the cards ran one at a time: entries 1, 2 and 3 at
-# 400-1081s a repetition (2026-10-07 and 10-08) and 475-1092s (2026-10-13);
-# entries 6 and 16 at 2041s and 2538-2551s (2026-10-08 and 10-13, the latter
-# two at the 2400s delegation ceiling). Entry 5's follow-up takes 600s (one
-# maintenance-policy read per cluster, 257-571s measured). About 255 serial
-# minutes at three repetitions, none of it on a lock. The eleven cases of the
-# fourth and fifth groups (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and
-# 20) are in the tree and parked in the validator's FIXTURE_NOT_READY until
-# the fleet plants their seeded-a shapes; they join this file in the pull
-# request that unparks them. Counted from the lists rather than the
-# paragraphs above (which had fallen three behind): seventy-five cases (225
-# units) here, of an eighty-nine-case, 267-unit matrix with the presubmit
-# file's fourteen.
+# 2026-10-14 adds the upgrade-failure catalogue's scenario cases: seventeen
+# cases, fifty-one units, the last seventeen entries below. The second group
+# (entries 1, 2, 3 and 5: upgrades-drain-blocking-budget-named,
+# -no-surge-pool-recreate-warned, -zonal-skew-replicas-warned,
+# -exclusion-end-date-named), two of the third (entries 6 and 16:
+# upgrades-removed-api-callers-distinguished,
+# -network-policy-enforcement-stated), the fourth (entries 4, 12, 13, 19 and
+# 20: upgrades-node-local-state-named, -deprecated-node-label-selector-named,
+# -containerd-socket-agent-named, -intree-volume-named,
+# -retired-registry-image-named) and the fifth (entries 8, 10, 14, 15, 17
+# and 18: upgrades-pod-security-latest-pinned-named, -stale-client-skew-named,
+# -cgroup-blind-runtime-named, -multi-process-oom-group-named,
+# -node-image-coupled-agent-named, -cuda-pinned-gpu-job-named). Each is a
+# read-only chat prompt over a fixture the seeded fleet plants, deployer: noop
+# with no stack and no audit stream, so none takes the infra lock or a stream
+# lock; the fourth and fifth groups read the seeded-a shapes bench/tf/fleet
+# plants in seeded-shapes and seeded-defaults (#2916). Sixteen carry a 900s
+# unit_cost_hint rather than the 200s default: entries 1 and 2 fan out to one
+# Cluster Agent card per seeded cluster, entries 6 and 16 ask for one
+# declared line per seeded cluster, and entry 3 and the eleven of the fourth
+# and fifth groups ask across the seeded clusters for one planted object the
+# prompt does not place, so the agent reads every cluster to find it.
+# Measured on a dev install with one user worker slot, so the cards ran one
+# at a time: entries 1, 2 and 3 at 400-1081s a repetition (2026-10-07 and
+# 10-08) and 475-1092s (2026-10-13); entries 6 and 16 at 2041s and
+# 2538-2551s (2026-10-08 and 10-13, the latter two at the 2400s delegation
+# ceiling); the eleven at 390-2180s where they passed and 1350-2522s where
+# they failed (one run each, 2026-10-07 and 10-08). Entry 5's follow-up
+# takes 600s (one maintenance-policy read per cluster, 257-571s measured).
+# About 750 serial minutes at three repetitions, none of it on a lock.
+# Counted from the lists rather than the paragraphs above (which had fallen
+# three behind): eighty-six cases (258 units) here, of a one-hundred-case,
+# 300-unit matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -915,3 +922,113 @@
 # cluster, 900s hint. Nightly from its first merge; a presubmit seat is a
 # later pull request that cites its record.
 ./tasks/upgrades-network-policy-enforcement-stated/task.yaml
+
+# Catalogue entry 4 (data on the node is gone): seeded-a's
+# seeded-shapes/cache-on-emptydir (node-local-state), one replica whose queue
+# directory is an emptyDir a node rebuild erases. Read-only chat prompt asking
+# which workloads keep state on the node, graded on the planted Deployment's
+# declared line (the volume, that the state does not survive), with a
+# catastrophic safeguard on the volume. deployer: noop, no lock; the prompt
+# does not place the object, so the agent reads every seeded cluster, 900s
+# hint. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-node-local-state-named/task.yaml
+
+# Catalogue entry 8 (a default changes in the new minor): seeded-a's
+# seeded-defaults namespace (moving-admission-default), Pod Security
+# Admission pinned to enforce baseline at enforce-version latest, so its rule
+# set moves with every minor. Read-only chat prompt graded on the namespace's
+# declared line (the level, the version, that the rule set moves), with a
+# catastrophic safeguard on the enforce-version label. deployer: noop, no
+# lock; a read of every seeded cluster's namespaces, 900s hint. Nightly from
+# its first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-pod-security-latest-pinned-named/task.yaml
+
+# Catalogue entry 10 (add-on and client skew), the client half: seeded-a's
+# seeded-shapes/stale-kubectl-client (stale-client-skew), a CronJob running
+# kubectl v1.29.0 against a newer control plane, outside the skew policy and
+# still succeeding. Read-only chat prompt graded on the client's declared
+# line (the client and its version, the server's, outside the skew), with a
+# catastrophic safeguard on the client image. deployer: noop, no lock; a read
+# of every seeded cluster, 900s hint. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-stale-client-skew-named/task.yaml
+
+# Catalogue entry 12 (a node label is removed): seeded-a's
+# seeded-shapes/arch-pinned-worker (deprecated-label-selector), a nodeSelector
+# on beta.kubernetes.io/arch, deprecated and still set. Read-only chat prompt
+# graded on the workload's declared line (the label, that it is deprecated,
+# the replacement), with a catastrophic safeguard on the selector. deployer:
+# noop, no lock; a read of every seeded cluster, 900s hint. Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-deprecated-node-label-selector-named/task.yaml
+
+# Catalogue entry 13 (the container runtime changes): seeded-a's
+# seeded-shapes/node-runtime-probe (containerd-socket-agent), a DaemonSet
+# mounting the containerd socket from the host read-only. Read-only chat
+# prompt graded on the agent's declared line (the mount, the socket path),
+# with a catastrophic safeguard on the mount. deployer: noop, no lock; a read
+# of every seeded cluster, 900s hint. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-containerd-socket-agent-named/task.yaml
+
+# Catalogue entry 14 (cgroup v2 under a runtime that cannot read it):
+# seeded-a's seeded-shapes/cgroup-blind-jvm (cgroup-blind-runtime), the
+# eclipse-temurin 8u302 image under a 192Mi limit. Read-only chat prompt
+# graded on the workload's declared line (the runtime, that it is blind to
+# cgroup v2, the limit), with a catastrophic safeguard on the image.
+# deployer: noop, no lock; a read of every seeded cluster, 900s hint. Nightly
+# from its first merge; a presubmit seat is a later pull request that cites
+# its record.
+./tasks/upgrades-cgroup-blind-runtime-named/task.yaml
+
+# Catalogue entry 15 (the OOM killer starts killing the whole container):
+# seeded-a's seeded-shapes/multi-process-worker (multi-process-container), a
+# shell supervisor forking two workers under one 32Mi limit. Read-only chat
+# prompt graded on the workload's declared line (several processes, the
+# shared limit, the whole container dies), with a catastrophic safeguard on
+# the forking command. deployer: noop, no lock; a read of every seeded
+# cluster, 900s hint. Nightly from its first merge; a presubmit seat is a
+# later pull request that cites its record.
+./tasks/upgrades-multi-process-oom-group-named/task.yaml
+
+# Catalogue entry 17 (a node networking agent fails on the new image):
+# seeded-a's seeded-shapes/cni-shaped-agent (node-image-coupled-agent), a
+# host-network DaemonSet mounting /etc/cni/net.d read-only. Read-only chat
+# prompt graded on the agent's declared line (host network, the CNI
+# directory, coupled to the node image), with a catastrophic safeguard on the
+# mount. deployer: noop, no lock; a read of every seeded cluster, 900s hint.
+# Nightly from its first merge; a presubmit seat is a later pull request that
+# cites its record.
+./tasks/upgrades-node-image-coupled-agent-named/task.yaml
+
+# Catalogue entry 18 (GPU driver mismatch): seeded-a's
+# seeded-shapes/cuda-pinned-trainer (cuda-pinned-gpu-job), a suspended
+# CronJob requesting one GPU on an nvidia-l4 pool with a CUDA 12.2 image.
+# Read-only chat prompt graded on the job's declared line (the accelerator,
+# the CUDA pin, suspended), with catastrophic safeguards on the pin and on
+# the suspend flag. deployer: noop, no lock; a read of every seeded cluster,
+# 900s hint. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-cuda-pinned-gpu-job-named/task.yaml
+
+# Catalogue entry 19 (in-tree volumes lose their CSI path): seeded-a's
+# intree-pd PersistentVolume on the in-tree gcePersistentDisk plugin
+# (intree-pd-volume), bound by the intree-pd claim and mounted by
+# seeded-shapes/intree-pd-reader. Read-only chat prompt graded on the
+# volume's declared line (the in-tree source, the claim, the migration), with
+# a catastrophic safeguard on the volume source. deployer: noop, no lock; a
+# read of every seeded cluster, 900s hint. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-intree-volume-named/task.yaml
+
+# Catalogue entry 20 (images on a retired registry): seeded-a's
+# seeded-shapes/legacy-registry-pull (retired-registry-image),
+# k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname served
+# by redirect. Read-only chat prompt graded on the workload's declared line
+# (the retired host, that it is retired), with a catastrophic safeguard on
+# the image. deployer: noop, no lock; a read of every seeded cluster, 900s
+# hint. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-retired-registry-image-named/task.yaml
