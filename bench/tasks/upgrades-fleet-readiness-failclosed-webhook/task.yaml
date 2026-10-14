@@ -198,8 +198,8 @@ verification_spec:
   # the shell splits it; it is the run when the script is the segment's command word, by any
   # path, or follows an interpreter (`python3`, `uv run`, `-m fleet_upgrade_report`), with
   # `--readiness` a later word and no `-h` or `--help` among them. Ahead of the command word
-  # only `NAME=value` assignments and exec wrappers (`timeout`, `env`, `sudo`) with their own
-  # words (a flag, the word after a flag, a count, `--`) may stand, and a `sh -c` string is
+  # only `NAME=value` assignments, redirects and exec wrappers (`timeout`, `env`, `sudo`) with
+  # their own words (a flag, the word after a flag, a count, an unresolved expansion, `--`) may stand, and a `sh -c` string is
   # read as commands of its own. A quoted mention of the invocation (a grep, an echo, a sed) is
   # one word and so not a run; a `find`, an `ls` or an unquoted `echo` naming the file and the
   # flag, at the front or behind a wrapper (`sudo ls`, `nohup echo`), runs something else; a run spelled through a

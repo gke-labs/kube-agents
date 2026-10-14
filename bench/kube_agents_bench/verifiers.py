@@ -1443,8 +1443,9 @@ _SHELL_LINE_END = "\n"
 _SHELL_WORD_OPENERS = frozenset(" \t\n\r\f\v<>") | _SHELL_OPERATOR_CHARS
 # Bash's reserved words: a command word stands behind them (`if python3 ...`, `do python3 ...`).
 _SHELL_RESERVED_WORDS = frozenset(("if", "then", "else", "elif", "while", "until", "do", "{", "!"))
-# A redirect with nothing after it (`>#log`, once the comment is off) is a line bash refuses.
-_SHELL_REDIRECT_RE = re.compile(r"^\d*[<>]{1,2}&?$")
+# A redirect word, as the tokeniser cuts it (`>`, `>>`, `>&`, `&>`; a leading fd number is a word of
+# its own); one with nothing after it (`>#log`, once the comment is off) is a line bash refuses.
+_SHELL_REDIRECT_RE = re.compile(r"^(?:\d*[<>]{1,2}&?|&>>?)$")
 # A substitution opens a span inside a word that the shell runs for its text, not a subshell:
 # `$(`...`)`, `$((`...`))`, `<(`...`)` and `>(`...`)`. Outside single quotes each is folded into
 # its enclosing word before the line is tokenised, so `r_$(date +%s).json` stays one word while
@@ -1456,11 +1457,14 @@ _SUBSTITUTION_MARK = "\x00S{index}\x00"
 _SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
 # After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
 # flag (its value, as in `-u hermes` or `-s KILL`; which flags take one is not tabled), a
-# duration or count (`timeout 600`) and `--`, which ends its options. The first other word is
-# the command the wrapper runs.
+# duration or count (`timeout 600`, `timeout infinity`), an expansion the reader never resolves
+# (`timeout $T`, `"${TIMEOUT:-600}"`) and `--`, which ends its options. A redirect and its target
+# stand anywhere ahead of the command (`nohup > log python3 ...`). The first other word is the
+# command the wrapper runs.
 _SHELL_FLAG_PREFIX = "-"
 _SHELL_OPTIONS_END = "--"
-_SHELL_COUNT_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+_SHELL_EXPANSION_PREFIX = "$"
+_SHELL_COUNT_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|infinity)$")
 _USAGE_FLAGS = ("-h", "--help")
 
 
@@ -1502,7 +1506,7 @@ def _read_shell_line(command: str) -> tuple[str, list[str]]:
     comments out the rest of its line, operators included, so nothing after it runs; a ``#``
     inside a word (``readiness-#2.json``, ``$#``), inside quotes (``'#1.json'``) or escaped is
     part of the word. A substitution (``$(``...``)``, ``$((``...``))``, ``<(``...``)``,
-    ``>(``...``)``) outside single quotes is consumed whole, quotes inside it honoured, so
+    ``>(``...``)``) outside single quotes is consumed whole, quotes and escapes inside it honoured, so
     ``r_$(date +%s).json`` stays one word and the ``)`` that closes it never opens a word for a
     ``#`` after it; inside double quotes only the two forms bash runs there are folded. A span
     left open at the line's end is kept as it stands. Read before the quotes come off, because
@@ -1550,11 +1554,14 @@ def _read_shell_line(command: str) -> tuple[str, list[str]]:
 
 def _substitution_end(command: str, start: int, depth: int) -> int | None:
     """The index just past the ``)`` that closes a span opened with ``depth`` parentheses before
-    ``start``, quotes inside the span honoured; None when the line ends first."""
+    ``start``, quotes and escapes inside the span honoured; None when the line ends first."""
     inner_quote: str | None = None
     j = start
     while j < len(command) and depth > 0:
         c = command[j]
+        if c == _SHELL_ESCAPE_CHAR and inner_quote != _SHELL_SINGLE_QUOTE:
+            j += 2
+            continue
         if inner_quote is not None:
             if c == inner_quote:
                 inner_quote = None
@@ -1626,37 +1633,43 @@ def _shell_argvs(command: str) -> list[list[str]]:
 def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
     """The index of the word the shell runs as this argv's command, when it is one the reader
     knows: a shell program, an interpreter, or ``script`` itself. Leading ``NAME=value``
-    assignments and reserved words are skipped. After an exec wrapper (``timeout``, ``sudo``,
-    ``env`` ...) only the wrapper's own words are transparent: a flag, the word after a flag (its
-    value, ``-u user`` or ``-s KILL``; which flags take one is not tabled, so the word after a
-    bare flag is read as its value even when it is a command, the one over-credit this leaves),
-    a duration or count (``timeout 600``) and ``--``, which ends its options. The first word that
-    is none of those is the command the wrapper runs: a shell, an interpreter or the script is
-    returned, and any other word (``ls``, ``echo``, ``find``, ``grep``) is a command of its own,
-    behind a wrapper as at the front of the argv, and None is returned: nothing it names as an
-    argument runs."""
+    assignments and reserved words are skipped, and so is a redirect with its target, which bash
+    takes anywhere on the line. After an exec wrapper (``timeout``, ``sudo``, ``env`` ...) only
+    the wrapper's own words are transparent: a flag, the word after a flag (its value, ``-u user``
+    or ``-s KILL``; which flags take one is not tabled, so the word after a bare flag is read as
+    its value even when it is a command, the one over-credit this leaves), a duration or count
+    (``timeout 600``), an expansion the reader never resolves (``timeout $T``) and ``--``, which
+    ends its options. The first word that is none of those is the command the wrapper runs: a
+    shell, an interpreter or the script is returned, and any other word (``ls``, ``echo``,
+    ``find``, ``grep``) is a command of its own, behind a wrapper as at the front of the argv,
+    and None is returned: nothing it names as an argument runs."""
     after_wrapper = False
-    after_flag = False
+    takes_value = False
     for index, word in enumerate(argv):
         base = os.path.basename(word)
         if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
             return index
         if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
-            after_flag = False
+            takes_value = False
             continue
         if base in _SHELL_EXEC_WRAPPERS:
-            after_wrapper, after_flag = True, False
+            after_wrapper, takes_value = True, False
+            continue
+        if _SHELL_REDIRECT_RE.match(word) or (word.isdigit() and index + 1 < len(argv) and _SHELL_REDIRECT_RE.match(argv[index + 1])):
+            # A redirect takes the next word as its target; a bare fd number ahead of one is its own.
+            takes_value = not word.isdigit()
+            continue
+        if takes_value:
+            takes_value = False
             continue
         if not after_wrapper:
             return None
-        if word == _SHELL_OPTIONS_END:
-            after_flag = False
-        elif word.startswith(_SHELL_FLAG_PREFIX):
-            after_flag = True
-        elif after_flag or _SHELL_COUNT_RE.match(word):
-            after_flag = False
-        else:
-            return None
+        if word == _SHELL_OPTIONS_END or _SHELL_COUNT_RE.match(word) or word.startswith(_SHELL_EXPANSION_PREFIX):
+            continue
+        if word.startswith(_SHELL_FLAG_PREFIX):
+            takes_value = True
+            continue
+        return None
     return None
 
 
@@ -1724,7 +1737,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     inside its word, as the shell keeps it, and a reserved word (``if``, ``do``,
     ``!``) stands ahead of the command word; so may an exec wrapper (``timeout``,
     ``sudo``, ``env``) with its own words -- a flag, the word after a flag, a
-    count, ``--`` -- and a program behind one that is not the script, a shell or
+    count, an unresolved expansion, ``--``, and a redirect with its target -- and
+    a program behind one that is not the script, a shell or
     an interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a
     run; which flags take a value is not tabled, so the word after a bare flag
     is read as its value (``sudo -n ls <script> --readiness`` is still credited).

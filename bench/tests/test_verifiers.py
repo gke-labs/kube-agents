@@ -7039,6 +7039,14 @@ def _run_objective(command: str) -> str:
         (f"env -u KUBECONFIG sh -c 'python3 {_SCRIPT_PATH} --readiness'", True),
         (f"sudo -u hermes python3 {_SCRIPT_PATH} --readiness", True),
         (f"sudo -- python3 {_SCRIPT_PATH} --readiness", True),
+        # an expansion the reader never resolves, a GNU duration word, or a redirect with its target may stand there too
+        (f"timeout $T python3 {_SCRIPT_PATH} --readiness", True),
+        (f'timeout "${{TIMEOUT:-600}}" python3 {_SCRIPT_PATH} --readiness', True),
+        (f"timeout infinity python3 {_SCRIPT_PATH} --readiness", True),
+        (f"nohup > /tmp/readiness.log python3 {_SCRIPT_PATH} --readiness &", True),
+        (f"sudo -u hermes 2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
+        (f"2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
+        (f"timeout $T ls {_SCRIPT_PATH} --readiness", False),
         # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
         ("sudo -n ls fleet_upgrade_report.py --readiness", True),
         # a program behind a wrapper that is not the script, a shell or an interpreter is the command the wrapper runs
@@ -7109,6 +7117,8 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs("python3 f.py --output r_$(date +%s)#1.json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)#1.json", "--readiness"]]
     assert _shell_argvs("python3 f.py --output r_$(date +%s) #done --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)"]]
     assert _shell_argvs('echo "a $(echo "b c") d"') == [["echo", 'a $(echo "b c") d']]
+    # an escaped quote inside a span does not open a quote there
+    assert _shell_argvs("python3 f.py --output r_$(echo don\\'t).json --readiness") == [["python3", "f.py", "--output", "r_$(echo don\\'t).json", "--readiness"]]
     assert _shell_argvs("python3 f.py --readiness >#log") == []
     # a wrapped shell is unwrapped behind the wrappers that hand their argv on
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
