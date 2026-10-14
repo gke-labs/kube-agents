@@ -855,11 +855,11 @@
 
 # Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
 # eviction), the first of the catalogue's scenario cases on fixtures the
-# fleet already carries (entries 1, 2, 3, 5, 6 and 16, the six entries that
-# end this file). A read-only chat case whose prompt names no fixture; it
-# grades, on a declared line per budget, the reading of the one the seeded
-# fleet plants: pinned-batch-runner's maxUnavailable 0 budget in
-# seeded-upgrade on seeded-b (readiness-drain-blocked,
+# fleet already carries (entries 1, 2, 3, 5, 6 and 16, the first six of the
+# seventeen entries that end this file). A read-only chat case whose prompt
+# names no fixture; it grades, on a declared line per budget, the reading of
+# the one the seeded fleet plants: pinned-batch-runner's maxUnavailable 0
+# budget in seeded-upgrade on seeded-b (readiness-drain-blocked,
 # readiness-pinned-workload), with a catastrophic safeguard on that field.
 # deployer: noop, no lock; one Cluster Agent card per seeded cluster, 900s
 # hint. Nightly from its first merge; a presubmit seat is a later pull
