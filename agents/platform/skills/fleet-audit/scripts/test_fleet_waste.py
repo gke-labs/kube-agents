@@ -8108,9 +8108,9 @@ def owned_by(path, uid):
 class PrepareKubeconfigTest(unittest.TestCase):
     def test_fetch_credentials_prepares_the_shared_directory(self):
         # The shared `.kubeconfigs` is prepared by `collect.prepare_kubeconfig`, the one rule for the
-        # fleet-audit collectors, before gcloud runs: sticky and world-writable whatever the umask, a
-        # directory this uid made at another mode widened, a stale kubeconfig this uid cannot write
-        # removed (root can write any file and keeps it).
+        # fleet-audit collectors, before gcloud runs: this uid's and closed to other uids (0755) whatever
+        # the umask, a directory this uid made at another mode brought to it, a stale kubeconfig this uid
+        # cannot write removed.
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
@@ -8124,19 +8124,19 @@ class PrepareKubeconfigTest(unittest.TestCase):
                     path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
             finally:
                 os.umask(mask)
-            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o1777, kept))
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o755, kept))
 
     def test_a_root_run_keeps_another_uids_directory(self):
         # The tick's directory, then a root hand run: from root's side it is another uid's, and root
-        # keeps it rather than moving the tick's files aside. Mocked root shows this branch; the
-        # `os.access` keep of a stale file root can write needs a real root.
+        # keeps it rather than moving it aside, and replaces the tick's stale file rather than writing
+        # through it. Mocked root shows both branches.
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
             kc.write_text("the tick's")
             with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1):
                 path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
-            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o1777, True, [".kubeconfigs"]))
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 if __name__ == "__main__":
     unittest.main()

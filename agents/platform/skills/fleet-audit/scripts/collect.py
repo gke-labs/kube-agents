@@ -76,6 +76,7 @@ import os
 import posixpath
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -100,26 +101,39 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
-# The shared kubeconfig directory is made like /tmp, world-writable with the
-# sticky bit: any uid writes its own kubeconfigs there, and only a file's
-# owner or the directory's owner replaces one. A hand run over `kubectl exec`
-# lands as root while the tick runs as uid 1000; a directory another uid made
-# (a root hand run's 0755, or a 01777 root created first) cannot hold this
-# uid's files under the sticky bit, so it is moved aside in the parent, which
-# is this uid's, and remade (`prepare_kubeconfig`).
-KUBECONFIG_DIR_MODE = 0o1777
+# The shared kubeconfig directory is this uid's and closed to every other
+# uid: 0755, so only its owner (and root, which no mode binds) creates
+# entries in it. The file names are public and fixed, so a directory other
+# uids could write would let any login on the pod plant an entry at a
+# cluster's name before the tick writes it. A hand run over `kubectl exec`
+# lands as root while the tick runs as uid 1000: root writes into the tick's
+# directory as it is, and a directory another uid made first (a root hand
+# run's) is moved aside in the parent, which is this uid's, and remade
+# (`prepare_kubeconfig`); a wider mode an earlier run or an operator left is
+# brought back to this one.
+KUBECONFIG_DIR_MODE = 0o755
 KUBECONFIG_DIR_MODE_MASK = 0o7777
 # A chmod the filesystem refuses (mode bits it does not carry, a read-only
 # mount) on a directory this uid owns alone -- the owner able to write and
-# search it, no other uid able to write in it, the directory the old `mkdir`
-# used -- keeps the directory at its mode, said on stderr: the sticky bit
-# would guard against no other uid there. Any other mode the chmod cannot
-# reach is the note.
+# search it, no other uid able to write in it (0700, say) -- keeps the
+# directory at its mode, said on stderr: it is closed to other uids as the
+# rule asks. Any other mode the chmod cannot reach is the note.
 KUBECONFIG_DIR_OWNER_WRITE_SEARCH = 0o300
 KUBECONFIG_DIR_OTHERS_WRITE = 0o022
 KUBECONFIG_MODE_KEPT_FORMAT = "{directory} stays at mode {mode}, which could not be changed to {wanted} ({error}): this uid's own and closed to other uids, so usable"
 KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
 KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# What may stand at a kubeconfig's name before gcloud writes it: this uid's
+# own regular file, writable, which gcloud overwrites. A link is removed
+# (never written through); anything else that is not a regular file -- a
+# directory planted at the name -- is moved aside under the directory's own
+# aside name and said on stderr; another uid's file (root's after a hand run,
+# the tick's from root's side) or one this uid cannot write is removed, and
+# gcloud writes a fresh file. Each refusal is the note.
+KUBECONFIG_FILE_NOT_READ_FORMAT = "{path} could not be read ({error})"
+KUBECONFIG_NOT_A_FILE_MOVED_FORMAT = "{path}: not a regular file, moved aside to {aside}; gcloud writes a fresh file"
+KUBECONFIG_NOT_A_FILE_FORMAT = "{path} is not a regular file, which a kubeconfig must be, and could not be moved aside ({error})"
+KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is not this uid's writable file and could not be replaced ({error})"
 # A rename that finds the directory already moved: another thread of this
 # run, or another collector's tick in the same second, won the move-aside
 # between this thread's stat and its rename (the source gone, or the aside
@@ -804,37 +818,56 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
 
 def prepare_kubeconfig(kc: Path) -> str | None:
     """The shared kubeconfig directory usable by this run before
-    `get-credentials` writes `kc` into it, and a kubeconfig this uid cannot
-    replace out of the way; None when it is, else why not (the caller logs
-    it, and gcloud's own refusal follows). The one rule for the fleet-audit
-    collectors (`fleet_stockout.py`, `fleet_waste.py` and
-    `upgrade_retrospective.py` import it); `fleet_upgrade_report.py` carries
-    the same rule for its default directory."""
+    `get-credentials` writes `kc` into it, and whatever stands at `kc` that
+    is not this uid's own writable file out of the way (a link removed, a
+    directory moved aside, another uid's file removed); None when it is, else
+    why not (the caller logs it, and gcloud's own refusal follows). The one
+    rule for the fleet-audit collectors (`fleet_stockout.py`,
+    `fleet_waste.py` and `upgrade_retrospective.py` import it);
+    `fleet_upgrade_report.py` carries the same rule for its default
+    directory."""
     note = usable_kubeconfig_dir(kc.parent)
     if note:
         return note
-    if os.path.islink(kc):
+    try:
+        current = kc.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return KUBECONFIG_FILE_NOT_READ_FORMAT.format(path=kc, error=exc)
+    if stat.S_ISLNK(current.st_mode):
         # Never written through: removed, and gcloud writes a fresh file.
         try:
             kc.unlink()
         except OSError as exc:
             return KUBECONFIG_LINK_NOT_REMOVED_FORMAT.format(path=kc, error=exc)
-    elif kc.exists() and not os.access(kc, os.W_OK):
+    elif not stat.S_ISREG(current.st_mode):
+        # A directory, or any other object, planted at the name: gcloud's
+        # rename over it would fail on every tick. Moved aside, never entered.
+        aside = kc.with_name(KUBECONFIG_UNUSABLE_FORMAT.format(name=kc.name, stamp=time.strftime(KUBECONFIG_STAMP_FORMAT, time.gmtime())))
+        try:
+            kc.rename(aside)
+        except OSError as exc:
+            return KUBECONFIG_NOT_A_FILE_FORMAT.format(path=kc, error=exc)
+        log(KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=kc, aside=aside.name))
+    elif current.st_uid != os.geteuid() or not os.access(kc, os.W_OK):
+        # Another uid's file, or one this uid cannot write: replaced by a
+        # fresh file rather than written through.
         try:
             kc.unlink()
         except OSError as exc:
-            return f"{kc} is another uid's and could not be replaced ({exc})"
+            return KUBECONFIG_NOT_REPLACED_FORMAT.format(path=kc, error=exc)
     return None
 
 
 def usable_kubeconfig_dir(directory: Path) -> str | None:
     """`directory` at `KUBECONFIG_DIR_MODE`, owned by this uid or root: made
     fresh and chmodded (its missing ancestors keep the caller's umask);
-    widened when this uid owns it at another mode, or kept at that mode,
-    said on stderr, when the chmod fails and the directory is this uid's
-    alone; moved aside and remade when it is another uid's, since under the
-    sticky bit this uid could not replace that uid's files in it. A note
-    when none of that is possible, naming the owner."""
+    brought to the mode when this uid owns it at another, or kept at that
+    mode, said on stderr, when the chmod fails and the directory is this
+    uid's alone; moved aside and remade when it is another uid's, since this
+    uid could not write into it. A note when none of that is possible,
+    naming the owner."""
     euid = os.geteuid()
     if os.path.islink(directory):
         return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory)
@@ -890,9 +923,9 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
             private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
             if not private:
                 return f"{directory} is at mode {oct(mode)}, not {oct(KUBECONFIG_DIR_MODE)}, and could not be changed ({exc})"
-            # This uid's alone: no other uid can unlink or plant a file here,
-            # so the mode the sticky bit was for is not needed, and refusing
-            # would read no cluster on every tick over such a filesystem.
+            # This uid's alone: closed to other uids as the rule asks, so
+            # kept; refusing would read no cluster on every tick over such a
+            # filesystem.
             log(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=directory, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc))
         finally:
             os.close(opened)

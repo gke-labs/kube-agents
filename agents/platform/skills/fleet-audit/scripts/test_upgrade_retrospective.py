@@ -1598,6 +1598,25 @@ class OwnerResolutionTest(unittest.TestCase):
         self.assertEqual((resolver.resolve("apps", "Pod", "db-7"), resolver.resolve("apps", "Pod", "web-zzzzz")), (("StatefulSet", "db"), ("ReplicaSet", "web")))
         self.assertEqual((resolver.pods_of.get("apps/Pod/db-1"), resolver.pods_of.get("apps/Pod/web-abcde"), resolver.pods_of.get("apps/StatefulSet/db")), (["db-1"], ["web-abcde"], ["db-0"]))
 
+    def test_a_node_owned_mirror_pod_stays_a_pod(self):
+        # A static pod's mirror (`kube-proxy-<node>`) is owned by its Node, which controls nothing: it
+        # stays a Pod, so its symptom and guard key on the pod rather than on a node name the next pool
+        # operation recreates, and it is counted under the pod, not under the node.
+        node = "gke-seeded-a-default-pool-62ac8ee0-d595"
+        name = f"kube-proxy-{node}"
+        mirror = pod(name, namespace="kube-system", owner="Node")
+        mirror["metadata"]["ownerReferences"][0]["name"] = node
+        mirror["metadata"]["creationTimestamp"] = "2026-10-01T00:00:00Z"
+        mirror["status"]["startTime"] = "2026-10-01T00:00:00Z"
+        mirror["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-08T12:00:00Z"}]
+        resolver = ur.Resolver([mirror], [])
+        key = f"kube-system/Pod/{name}"
+        self.assertEqual(resolver.resolve("kube-system", "Pod", name), ("Pod", name))
+        self.assertEqual((resolver.pods_of.get(key), resolver.pod_total(key), resolver.pods_of.get(f"kube-system/Node/{node}")), ([name], 1, None))
+        rows = ur.collect_symptoms(cluster_doc("seeded-a"), {"pods": [mirror], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}, ops_for("seeded-a"), SINCE, now=NOW)
+        self.assertEqual([(r["object"], r["owner_kind"]) for r in rows], [(key, "Pod")])
+        self.assertEqual([g["id"].rsplit("#", 1)[1] for g in ur.guards_for(SEEDED, rows, "2026-10-08T18:00:00Z")], [key])
+
     def test_dead_pod_resolves_by_name_prefix(self):
         self.assertEqual(self.resolver.resolve("seeded-capacity", "Pod", "inference-server-778b78fdb8-zzzzz"), ("Deployment", "inference-server"))
         self.assertEqual(self.resolver.resolve("kubeagents-system", "Pod", "legacy-flowcontrol-tuner-29857980-k9k9k"), ("CronJob", "legacy-flowcontrol-tuner"))
@@ -3086,10 +3105,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
 
     def test_kubeconfig_directory_and_a_stale_kubeconfig_survive_a_root_hand_run(self):
         # The shared `.kubeconfigs` is made usable by `collect.prepare_kubeconfig` before gcloud runs,
-        # in either order of uids: fresh under any umask it is sticky and world-writable; one this uid
-        # made at another mode is widened; another uid's (a root hand run's) is moved aside and remade;
-        # a stale kubeconfig this uid cannot write is removed (root can write any file and keeps it);
-        # a directory that cannot be made usable is the read's error.
+        # in either order of uids: fresh under any umask it is 0755, this uid's and closed to other
+        # uids; one this uid made at another mode is brought to it; another uid's (a root hand run's)
+        # is moved aside and remade; a stale kubeconfig this uid cannot write is removed; a directory
+        # that cannot be made usable is the read's error.
         import collect as fleet_collect  # noqa: PLC0415 -- the shared rule under test
 
         seeded = {"project": PROJECT, "name": "seeded-a", "location": LOCATION}
@@ -3121,15 +3140,15 @@ class LedgerAndGuardsTest(unittest.TestCase):
             with mock.patch.object(fleet_collect, "prepare_kubeconfig", return_value="refused"):
                 self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, "get-credentials: refused"))
             # A root hand run after the tick: from root's side the directory is another uid's, and root
-            # keeps it rather than moving the tick's files aside (the `os.access` keep of a stale file
-            # root can write is the one branch that needs a real root).
+            # keeps it rather than moving it aside; the tick's stale file is another uid's from root's
+            # side too, replaced by a fresh one rather than written through.
             kc.write_text("the tick's")
             # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
             # exercised whoever runs the suite, root included; the log shows no move-aside.
             with mock.patch.object(os, "geteuid", return_value=fleet_collect.ROOT_UID), owned_by(kc.parent, fleet_collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
             self.assertNotIn("moved aside", err.getvalue())
-            self.assertEqual((kc.exists(), stat.S_IMODE(kc.parent.stat().st_mode), len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")])), (True, fleet_collect.KUBECONFIG_DIR_MODE, 1))
+            self.assertEqual((kc.exists(), stat.S_IMODE(kc.parent.stat().st_mode), len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")])), (False, fleet_collect.KUBECONFIG_DIR_MODE, 1))
             # The rename race in the worker pool: the thread whose rename finds the directory already
             # moved (the winner remade it between this thread's stat and rename) reads what stands there
             # and reports no refusal, so its cluster is read this run.

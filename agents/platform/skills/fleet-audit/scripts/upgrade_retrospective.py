@@ -341,8 +341,10 @@ LATEST_REPORT_LINK = "upgrade-retro-report.md"
 LINK_TEMP_SUFFIX = ".tmp-link"
 # The same kubeconfig directory `collect.py` and the SOPs use, one file per
 # cluster, passed per command rather than exported; `collect.prepare_kubeconfig`
-# makes it usable for whichever uid runs (sticky and world-writable, another
-# uid's directory moved aside) before `get-credentials` writes into it.
+# makes it usable for whichever uid runs (this uid's and closed to other
+# uids, another uid's directory moved aside, anything at the file's name that
+# is not this uid's own file out of the way) before `get-credentials` writes
+# into it.
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILENAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
@@ -994,6 +996,11 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 # kinds here are the ones with an owner of their own worth one more hop.
 OWNER_INTERMEDIATE_KINDS = ("ReplicaSet", "Job")
 OWNER_MAX_HOPS = 3
+# Owner kinds that control nothing: a static pod's mirror (`kube-proxy-<node>`)
+# carries an ownerReference to its Node. Such an owner is not followed, so the
+# pod stays a Pod rather than keying its incident and guard on a node name
+# the next pool operation recreates.
+NON_CONTROLLER_OWNER_KINDS = ("Node",)
 # How a pod-backed symptom's evidence names the pods behind it.
 POD_EVIDENCE_FORMAT = "{count} of {total} pods: {evidence}; e.g. {example}"
 PRE_EXISTING_PODS_FORMAT = "; {count} pre-existing since {earliest} (e.g. {example})"
@@ -1969,7 +1976,7 @@ def _pod_text(pod: dict) -> str:
 
 def _controller_of(obj: dict) -> tuple[str, str] | None:
     for owner in (obj.get("metadata") or {}).get("ownerReferences") or []:
-        if owner.get("kind") and owner.get("name"):
+        if owner.get("kind") and owner.get("name") and owner["kind"] not in NON_CONTROLLER_OWNER_KINDS:
             return owner["kind"], owner["name"]
     return None
 
@@ -1978,8 +1985,10 @@ class Resolver:
     """Maps any pod, ReplicaSet or Job to its top owner, from the pod list
     and the `owners` read. An intermediate the read did not return is itself
     the top: the hop is unknown rather than absent. A pod the list holds
-    without a controller is a bare pod and stays one; the name-prefix match
-    serves only a pod that is gone and known by the name an event carries."""
+    without a controller is a bare pod and stays one, a static pod's mirror
+    (owned by its Node, which controls nothing) among them; the name-prefix
+    match serves only a pod that is gone and known by the name an event
+    carries."""
 
     def __init__(self, pods: list[dict], owners: list[dict], workloads: list[dict] | None = None):
         self.parent: dict[tuple[str, str, str], tuple[str, str]] = {}

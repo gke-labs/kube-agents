@@ -12492,13 +12492,16 @@ class PrepareKubeconfigTest(unittest.TestCase):
             # caller's umask.
             self.assertEqual((self.mode(kc.parent), self.mode(kc.parent.parent)), (collect.KUBECONFIG_DIR_MODE, 0o700))
 
-    def test_this_uids_directory_at_another_mode_is_widened(self):
-        # uid 1000 first, under the earlier code: a 0755 directory this uid made.
-        with TemporaryDirectory() as tmp:
-            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
-            kc.parent.mkdir(0o755)
-            self.assertIsNone(collect.prepare_kubeconfig(kc))
-            self.assertEqual(self.mode(kc.parent), collect.KUBECONFIG_DIR_MODE)
+    def test_this_uids_directory_at_another_mode_is_brought_to_the_mode(self):
+        # uid 1000 first: a 0700 a narrow umask left, or a 0777 or 01777 an operator or an earlier rule
+        # left open to other uids, is brought to 0755, this uid's alone; one already there is left as is.
+        for mode in (0o700, 0o777, 0o1777, 0o755):
+            with self.subTest(mode=oct(mode)), TemporaryDirectory() as tmp:
+                kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+                kc.parent.mkdir()
+                kc.parent.chmod(mode)
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+                self.assertEqual(self.mode(kc.parent), collect.KUBECONFIG_DIR_MODE)
 
     def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
         # A filesystem that refuses the chmod (mode bits it does not carry, a read-only mount): a
@@ -12511,23 +12514,23 @@ class PrepareKubeconfigTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir()
-            kc.parent.chmod(0o755)
+            kc.parent.chmod(0o700)
             # The directory's owner is the test's own fact, this run's euid on the path and on the
             # opened descriptor alike, so the keep is the branch taken whoever runs the suite.
             with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(collect.prepare_kubeconfig(kc))
-            self.assertEqual(self.mode(kc.parent), 0o755)
-            self.assertIn(collect.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kc.parent, mode="0o755", wanted=oct(collect.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            self.assertEqual(self.mode(kc.parent), 0o700)
+            self.assertIn(collect.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kc.parent, mode="0o700", wanted=oct(collect.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
             for mode in (0o777, 0o555):
                 with self.subTest(mode=oct(mode)):
                     kc.parent.chmod(mode)
                     with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
                         note = collect.prepare_kubeconfig(kc)
                     self.assertEqual(note, f"{kc.parent} is at mode {oct(mode)}, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
-            kc.parent.chmod(0o755)
+            kc.parent.chmod(0o700)
             with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
                 note = collect.prepare_kubeconfig(kc)
-            self.assertEqual(note, f"{kc.parent} is at mode 0o755, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+            self.assertEqual(note, f"{kc.parent} is at mode 0o700, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
 
     def test_another_uids_directory_is_moved_aside_and_remade(self):
         # root first: a 0755 directory a root hand run made, with root's 0600 kubeconfig in it, cannot
@@ -12550,9 +12553,9 @@ class PrepareKubeconfigTest(unittest.TestCase):
 
     def test_a_root_run_keeps_another_uids_directory(self):
         # uid 1000 first, then a root hand run over `kubectl exec`: from root's side the directory is
-        # another uid's, and root keeps it rather than moving the tick's files aside, since root can
-        # write into it. Mocked root shows this branch; the one branch it cannot show is the
-        # `os.access` keep of a stale file root can write, which needs a real root.
+        # another uid's, and root keeps it rather than moving it aside, since root can write into it;
+        # the tick's stale file in it is another uid's from root's side too, replaced by a fresh one
+        # rather than written through. Mocked root shows both branches.
         with TemporaryDirectory() as tmp:
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
@@ -12562,7 +12565,51 @@ class PrepareKubeconfigTest(unittest.TestCase):
             with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(collect.prepare_kubeconfig(kc))
             self.assertNotIn("moved aside", err.getvalue())
-            self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, True, [".kubeconfigs"]))
+            self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))
+
+    def test_an_entry_planted_at_the_kubeconfig_name_is_never_used(self):
+        # The names are public and fixed; only this uid's own writable regular file may stand at one.
+        # A directory planted there (the shim's rename over it would fail on every tick) is moved aside
+        # under the directory's aside name and said, never entered; when it cannot be moved the note is
+        # the credentials result and gcloud is not run. Another uid's regular file is removed, not
+        # written through; this uid's own is kept for gcloud to overwrite; a link to a directory is
+        # removed with its target untouched.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.mkdir(0o777)
+            (kc / "inside").write_text("planted")
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            [aside] = [p for p in kc.parent.iterdir() if p.name.startswith(kc.name + ".unusable-")]
+            self.assertEqual((os.path.lexists(kc), (aside / "inside").read_text()), (False, "planted"))
+            self.assertIn(collect.KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=kc, aside=aside.name), err.getvalue())
+            kc.mkdir(0o777)
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, result.stderr), (collect.KUBECONFIG_REFUSED_RC, [], collect.KUBECONFIG_NOT_A_FILE_FORMAT.format(path=kc, error="[Errno 13] Permission denied")))
+            kc.rmdir()
+            kc.write_text("another's")
+            kc.chmod(0o666)
+            with owned_by(kc, os.geteuid() + 1):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertFalse(kc.exists())
+            kc.write_text("mine")
+            with owned_by(kc, os.geteuid()):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(kc.read_text(), "mine")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            kc.unlink()
+            kc.symlink_to(elsewhere)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), elsewhere.is_dir(), self.mode(elsewhere)), (False, True, 0o700))
 
     def test_a_symlink_at_the_kubeconfig_file_name_is_removed_not_written_through(self):
         # The directory is the tick's and 01777, so its account can plant a link at the file's name;

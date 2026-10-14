@@ -1134,9 +1134,9 @@ class PrepareKubeconfigTest(unittest.TestCase):
 
     def test_a_root_run_keeps_the_ticks_directory_and_a_lost_rename_race_is_no_refusal(self):
         # From root's side the tick's directory is another uid's, and root keeps it rather than moving
-        # the tick's files aside (mocked root shows this branch; the `os.access` keep of a stale file
-        # root can write needs a real root). A rename that finds the directory already moved, another
-        # run's tick in the same second having won, reads what stands there now and is no refusal.
+        # it aside; the tick's stale file in it is replaced rather than written through (mocked root
+        # shows both branches). A rename that finds the directory already moved, another run's tick in
+        # the same second having won, reads what stands there now and is no refusal.
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root, True)
         with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
@@ -1148,13 +1148,12 @@ class PrepareKubeconfigTest(unittest.TestCase):
             with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
             self.assertNotIn("moved aside", err.getvalue())
-            self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, True, [".kubeconfigs"]))
+            self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))
             # A link planted at the file's name is removed, never written through, the target untouched.
             target = os.path.join(root, "target")
             with open(target, "w", encoding="utf-8") as f:
                 f.write("root's secret")
             os.chmod(target, 0o600)
-            os.unlink(path)
             os.symlink(target, path)
             with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1):
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
@@ -1206,23 +1205,69 @@ class PrepareKubeconfigTest(unittest.TestCase):
         with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
             shared = report.default_kubeconfig_dir()
             os.mkdir(shared)
-            os.chmod(shared, 0o755)
+            os.chmod(shared, 0o700)
             path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
             # The owner is the test's own fact, this run's euid on the path and on the descriptor.
             with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
-            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o755)
-            self.assertIn(report.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=shared, mode="0o755", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
+            self.assertIn(report.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=shared, mode="0o700", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
             for mode in (0o777, 0o555):
                 with self.subTest(mode=oct(mode)):
                     os.chmod(shared, mode)
                     with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
                         note = report.prepare_kubeconfig(shared, path)
                     self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode=oct(mode), wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
-            os.chmod(shared, 0o755)
+            os.chmod(shared, 0o700)
             with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
                 note = report.prepare_kubeconfig(shared, path)
-            self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode="0o755", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+            self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode="0o700", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+
+    def test_an_entry_planted_at_the_kubeconfig_name_is_never_used(self):
+        # As the shared rule: a directory planted at the public name is moved aside and said, the note
+        # when it cannot be; another uid's file is removed; this uid's own writable file is kept; a link
+        # to a directory is removed with its target untouched.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            os.mkdir(path, 0o777)
+            with open(os.path.join(path, "inside"), "w", encoding="utf-8") as f:
+                f.write("planted")
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            [aside] = [n for n in os.listdir(shared) if n.startswith(os.path.basename(path) + ".unusable-")]
+            with open(os.path.join(shared, aside, "inside"), encoding="utf-8") as f:
+                self.assertEqual((os.path.lexists(path), f.read()), (False, "planted"))
+            self.assertIn(report.KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=path, aside=aside), err.getvalue())
+            os.mkdir(path, 0o777)
+            with patch.object(os, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_NOT_A_FILE_FORMAT.format(path=path, error="[Errno 13] Permission denied"))
+            with patch.object(report, "prepare_kubeconfig", return_value=note):
+                items, error, _ = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
+            self.assertEqual((items, error), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note)))
+            os.rmdir(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("another's")
+            os.chmod(path, 0o666)
+            with owned_by(path, os.geteuid() + 1):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertFalse(os.path.exists(path))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("mine")
+            with owned_by(path, os.geteuid()):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "mine")
+            elsewhere = os.path.join(root, "elsewhere")
+            os.mkdir(elsewhere, 0o700)
+            os.unlink(path)
+            os.symlink(elsewhere, path)
+            self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual((os.path.lexists(path), os.path.isdir(elsewhere), os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK), (False, True, 0o700))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
