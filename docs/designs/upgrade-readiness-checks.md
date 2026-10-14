@@ -6,34 +6,36 @@ audit or skill.
 ## High level summary
 
 A GKE minor upgrade replaces the control plane and rebuilds every node. Either event can stop an
-application that assumed it would never happen. kube-agents answers two questions for every cluster:
-will the next upgrade succeed, and what did the last upgrade change. It does this with four pieces,
-each specified in its own document.
+application that did not expect it. kube-agents answers two questions for every cluster: will the
+next upgrade succeed, and what did the last upgrade change. Four pieces answer them, each with its
+own document. Some pieces are on main today; this document and the retrospective design specify the
+rest, and each section below credits what exists.
 
-The first piece is a catalogue of twenty ways an upgrade fails, each taken from a published
-incident. For every entry it names the signal that predicts the failure before the upgrade and the
-signal that confirms it afterwards. See
-[`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
+The first piece is a catalogue of twenty ways an upgrade fails. Each entry rests on a public
+incident, on provider documentation or on a reproduction on a test cluster. For every entry it names
+the signal that predicts the failure before the upgrade and the signal that confirms it afterwards.
+See [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
 
-The second piece is the readiness report, the subject of this document. Every day, and on request in
-chat, the agent reads every cluster and grades it against the next version: blocked, risk or ready.
-For each finding it names the object that breaks and the change that clears it. Once a week the
-audit files a tracked issue for every cluster whose upgrade would not complete.
+The second piece is the readiness report, the subject of this document. A daily job grades every
+cluster for which a new GKE version is pending, then once a week while the version stays pending. In
+chat, the agent grades any cluster against a target version on request. Each grade is blocked,
+unknown or ready, and each finding names the object that breaks and the change that clears it. Once
+a week the upgrade audit grades every cluster that is behind its channel. It adds each cluster whose
+upgrade is held or refused to its ledger issue. This document specifies one verdict per cluster
+family, a set of clusters built from the same template: Go, No-Go or Action required.
 
-The third piece is the retrospective, which runs on the first day of an install and every weekend.
-It reports what each upgrade did, what failed, which catalogue entry the failure matches, and the
-mitigation it set up. Each confirmed failure becomes a guard that the next readiness report reads,
-so the fleet learns from every upgrade. See
+The third piece is the retrospective. It runs once at install, at the end of each weekend, and soon
+after each upgrade. It reports what each upgrade did, what failed, which catalogue entry the failure
+matches, and the fix to make before the next upgrade. It records each failure it files as a guard,
+and the next readiness report shows the guard, so the fleet learns from every upgrade. See
 [`upgrade-retrospective.md`](upgrade-retrospective.md).
 
-The fourth piece is proof. Every catalogue entry is planted as a live defect on a seeded test fleet,
-and a nightly evaluation shows that the agent detects each one. See
+The fourth piece is the test fleet. It carries the before-state of each catalogue entry that a
+standing fixture can hold. A nightly evaluation case per entry grades whether the agent names it. See
 [`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md) for the scripts, the
 fixtures and the evidence.
 
-All of it is read-only. The agent reports and recommends; a person decides and upgrades. The
-outcome for a team is one answer per cluster family: Go, No-Go or Action required. The answer comes
-with its evidence and a record of every upgrade.
+All of it is read-only. The agent reports and recommends; a person decides and upgrades.
 
 ## The problem, in one paragraph
 
