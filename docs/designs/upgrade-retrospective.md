@@ -435,8 +435,8 @@ Each has one read that decides it and a set of reads that feed it:
 - `upgrade-broke-workload`, `upgrade-symptom-tentative`, `upgrade-symptom-unclassified` and
   `symptom-predates-upgrade`: decided by the pods list; fed by events (rows 7 and 19, the
   unclassified rows, corroboration), budgets (entry 1), owners (proof of age, an event's owner),
-  workloads (entry 3), nodes (the pod's pool; kubelet versions for entry 5), the cluster describe
-  (versions; the maintenance policy for entry 5) and the operations listing (the window and the
+  workloads (entry 3), nodes (the pod's pool), the cluster describe
+  (versions and the maintenance policy for entry 5) and the operations listing (the window and the
   gate).
 - Info alone, no limitation: the server config (the next upgrade) and the storage, webhook and
   endpoint-slice lists (the risks table); a failure there is a "Reads that failed" line.
@@ -557,8 +557,8 @@ signatures:
 | a budget with no allowance left on a drained node; a node operation past an hour per node              | 1     |
 | `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API                  | 6     |
 | every replica of a multi-replica workload unavailable inside one `UPGRADE_NODES` span, all on its pool | 3     |
-| a pool two minors from its control plane, or one pool on two kubelet versions, standing                | 5     |
-| more than a day after the last window close or exclusion end; never on a cluster with no policy        |       |
+| a pool more than one minor behind its control plane, standing seven days or longer since first         | 5     |
+| recorded; never on a cluster with no maintenance policy                                                |       |
 
 Rows overlap, and a symptom carries exactly one entry, so the rows are tried in a fixed order and
 the first that holds wins; the order is the most specific discriminator first, so a finding id (the
@@ -569,8 +569,7 @@ driver error text in a container whose image or command names a GPU driver compo
 pool's cgroup mode and the runtime floor are facts of the pool and the image) before 15 (several
 processes), then 20, 17, 3 (an `Available=False` transition inside one `UPGRADE_NODES` span, every
 pod on the drained pool or in its zone, on a workload with more than one replica), 2 (`Insufficient
-cpu` or `memory` in the clause for the pool the pod targets, after a node-pool operation), 1, 5 (a
-version skew standing more than a day past the last window close or exclusion end; it is
+cpu` or `memory` in the clause for the pool the pod targets, after a node-pool operation), 1, 5 (a pool more than one minor behind its control plane for seven days or longer; it is
 cluster-scoped and collides with nothing), and 12 last. The order is tried per symptom, and a
 symptom's source already narrows the rows it can reach: a workload's `Available` condition reaches
 row 3 alone, a budget reaches row 1 alone, a Pending pod's scheduling message reaches 18, 2 and 12.
@@ -654,9 +653,14 @@ section keeps what a cell cannot carry, their discriminators: entry 3 holds on a
 `Available=False` transition, or a StatefulSet with no ready replica, on a workload with more than
 one replica, inside one `UPGRADE_NODES` span with every pod on that pool (high; medium when the
 pods were in the zone it drained), keyed by the operation like a budget hold; entry 5 is read
-from the cluster describe and the maintenance policy, medium, and only once the skew has stood
-more than a day after the latest window close or exclusion end (while a window is open or an
-exclusion active it is an Info line). On a cluster with no maintenance policy the row does not
+from the cluster describe at review time: a pool more than one minor behind its control plane,
+standing seven days or longer (`SKEW_STANDING_DAYS`) since the run that first recorded it in the
+ledger's stored set, medium, with no window arithmetic (the describe carries no date for the gap,
+and the control plane's last upgrade is no measure of it, since a weekly auto-upgrade would reset
+it); inside the seven days, and while a maintenance window is open or an exclusion active, it is
+an Info line that states the age. The catalogue's mixed-versions shape, one pool on two kubelet
+versions under a paused surge upgrade, is not a row: an open operation holds the cluster, not
+reviewed (§3.2), and a finished one leaves the pool on one version. On a cluster with no maintenance policy the row does not
 hold: there is no window to be too short, and the skew is the pool-skew reading the readiness
 watch's shipped rule makes under entry 10; the report lists it as an Info line naming that rule,
 the stored set carries it, and nothing is filed or re-filed for it.
@@ -849,8 +853,12 @@ dry run reads without the lock. Reports are named by their finish time in UTC, f
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
-temporary name and renamed, at 0644 whatever the writer's umask (`STORE_FILE_MODE`, set by chmod,
-since `mkstemp` makes 0600 under any umask) in 0755 directories (`STORE_DIR_MODE`), and a run as
+temporary name and renamed, at 0644 whatever the writer's umask (`STORE_FILE_MODE`, set through the open
+descriptor, since `mkstemp` makes 0600 under any umask; the temporary name is random and made with
+`O_EXCL`, the owner is set through the same descriptor, the lock is opened with `O_NOFOLLOW`, and
+a store directory is set through a descriptor opened without following, so a symlink planted in
+the store by the agent's own account is never followed by a root run) in 0755 directories
+(`STORE_DIR_MODE`), and a run as
 root hands each directory and file it creates to the owner of the nearest directory that already
 existed: the fleet-audit report store's rule (`audit_report.py`'s `REPORT_DIR_MODE`,
 `REPORT_FILE_MODE` and `_adopt_owner`), which the collector carries as the sibling collectors carry
@@ -869,14 +877,25 @@ in the order report, guards, ledger, so a run that dies leaves at most a report 
 advance, and a run that dies between the guards and the ledger leaves the guards' review counts
 one ahead, which the next run's review of the same clusters raises again (the ids and first-seen
 dates are unchanged); a ledger or a `guards.json` that cannot be parsed is set aside under a dated
-name (`<file>.unreadable-<stamp>`) and the run stops with that as its line, naming the file. One
-rule serves both files, because the guards file is the stream's memory across the gap (§3.3): a
-run that started from an empty one would emit no held candidate, so a complete `finish` would
-announce every held finding resolved and a failed upgrade with no retry fixed. While a dated crash
-record of either file sits beside no live copy of it, every run refuses to start from empty and
-repeats that line, so the record is read rather than overwritten, a route that called `start`
-releasing its note with the recovery `finish` above; `--reset-ledger`, run by an operator on
-purpose, archives both files' records and lets the next run start as a first run. A run starts
+name (`<file>.unreadable-<stamp>`) and the run stops with that as its line, naming the file; a
+`guards.json` absent beside a live ledger, which the collector's write order never produces (every
+run writes the guards and then the ledger, a first run included), is the same crash record,
+refused with a line naming the file. One rule serves both files, because the guards file is the
+stream's memory across the gap (§3.3): a run that started from an empty one would emit no held
+candidate, so a complete `finish` would announce every held finding resolved and a failed upgrade
+with no retry fixed. While a dated crash record of either file sits beside no live copy of it, or
+the guards file is absent beside the ledger, every run refuses to start from empty and repeats
+that line, so the record is read rather than overwritten, a route that called `start` releasing
+its note with the recovery `finish` above. The remedies, in order: the first is the restore,
+repairing the JSON or moving `<file>.unreadable-<stamp>` back under the file's name (a removed
+`guards.json` is restored from the newest `reports/<stamp>.json`, whose `guards` list is the file
+as that run wrote it). The second is `--reset-ledger`, run by an operator on purpose: it archives
+the records and the live ledger and guards files under `archive/<stamp>/` and marks the store, so
+the next full run is a baseline that reviews every cluster as new under the first-run rules of
+§3.2, writes its manifest with `after_reset: true`, and the SOP calls no `finish` for it; the
+ledger issue keeps its findings until the following full run files them again from its own reads
+or resolves them, and every guard's first-seen date and review count restart. Every run between
+the reset and that baseline carries the same marker. A run starts
 from an empty ledger on its own only when neither a ledger nor a crash record exists, and only on a
 route that may: the after-upgrade route with no full run recorded prints its no-baseline line
 instead (§3.2). The readiness watch runs on the gateway pod and reads the file as §3.5 states,
@@ -1030,7 +1049,11 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   listing that failed, did not name the active project, or had no active project to check it
   against (an empty one the failed case) holding every ledger project outside it;
   `--after-upgrade` refusing `--since`; a two-minor skew on a cluster with no maintenance policy
-  an Info line and never row 5, on a first run and on the next; the read deadline: a run whose clock passes
+  an Info line and never row 5, on a first run and on the next; row 5 on a pool more than one minor
+  behind its control plane once the skew has stood seven days since the run that first recorded it,
+  under a daily window as under a weekly one, an Info line with its age before that, under an open
+  window or an active exclusion, and on a cluster with no policy, and one pool on two kubelet
+  versions no row; the read deadline: a run whose clock passes
   `RUN_DEADLINE_S` after the first review reviews no further cluster, writes the clusters it read,
   holds the rest as `gate-failed` with the budget reason and no stale Warning, defers the
   re-checks the same way with their guards held and their checks unevaluated, and orders reviews
@@ -1075,8 +1098,12 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   line when it is held, holding it for no time and writing nothing; the lock-held and
   crash-record lines ending with the projects the run resolved, the handed scope or the
   undeclared listing with its note; an unparseable `guards.json` set aside under a dated name and
-  refused on the next run as the ledger's record is, the line naming the file, and `--reset-ledger`
-  archiving both files' records; the recovery `finish` of a run that lost the lock on a first
+  refused on the next run as the ledger's record is, the line naming the file; a `guards.json`
+  absent beside a live ledger refused the same way; `--reset-ledger` archiving the records and the
+  live files and marking the store, the next full run a baseline whose manifest carries
+  `after_reset: true`, the runs before it too, and the run after it not; a root run writing the
+  report, the JSON, the lock and a store directory with a symlink planted at each name, the
+  targets untouched; the recovery `finish` of a run that lost the lock on a first
   run, with no saved report: `scope.clusters` from the listing of the projects the exit line
   names, admitted by the validator, and the note released; a document whose every cluster the
   collector could not read, carried as `scope.clusters` rows with `checks_run: []` and the
