@@ -880,5 +880,3 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 		t.Fatalf("conv.posts = %v, want 0 posts after Stop", conv.posts)
 	}
 }
-
-
