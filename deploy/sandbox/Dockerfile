@@ -28,16 +28,15 @@ ARG PYTHON_IMAGE=python
 ARG PYTHON_VERSION=3.14-slim
 FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 
-# No bytecode caches, for any process the container's own environment reaches:
-# the entrypoint, and every `kubectl exec`, which runs as root (#3047). The image
-# trees under /opt/defaults are root-owned so the model can't change them, and
-# root can still write there, so a root-run script that imports from
+# No bytecode caches from any process the container's own environment reaches,
+# which is every `kubectl exec`, and those run as root (#3047). The image trees
+# under /opt/defaults are root-owned so the model can't change them, but root
+# can still write there, so a root-run script that imports from
 # /opt/defaults/scripts would leave a __pycache__ in the reference tree. That
 # tree is what `sandbox_tree_matches_image` compares the read-only copies
 # against, so the stray cache reads as an edit. The model's own sessions come in
-# through sshd and don't inherit this. They can't write to those trees anyway,
-# and the scripts they run are small enough that compiling on each start is
-# noise.
+# through sshd and don't inherit this; they could never write a cache into those
+# trees anyway, so nothing they run loses one.
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # openssh-server is baked rather than installed by the startup command. The
