@@ -221,8 +221,8 @@ fixtures:
       Control plane held one minor behind the REGULAR channel default, and
       enrolled in REGULAR, which is what makes the lag visible to the upgrade
       SOP's master-behind check at all. Held between reconciles by a
-      NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from the
-      location-wide valid_master_versions rather than the channel's own list,
+      NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from REGULAR's
+      own list and held when the running patch is one REGULAR does not carry,
       so the held version can be absent from REGULAR; it is still offered at
       the location, so upgrade check 3.1 branch (a) does not fire and the
       cluster carries branch (b) at major. See

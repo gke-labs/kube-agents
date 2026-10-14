@@ -241,8 +241,8 @@ data "external" "seeded_b_pin" {
 
 locals {
   # "" from the script: REGULAR offers nothing one minor behind its default
-  # and no seeded-b is running to hold. null here, so seeded_b's precondition
-  # names that instead of a create with an empty version.
+  # and seeded-b is not held. null here, so seeded_b's precondition names
+  # that instead of a create with an empty version.
   lagging_version = data.external.seeded_b_pin.result.pin != "" ? data.external.seeded_b_pin.result.pin : null
 }
 
@@ -541,7 +541,7 @@ resource "google_container_cluster" "seeded_b" {
   lifecycle {
     precondition {
       condition     = local.lagging_version != null
-      error_message = "REGULAR offers no version one minor behind its default and no seeded-b is running to hold; pick the lag manually this cycle."
+      error_message = "REGULAR offers no version one minor behind its default and seeded-b is not on a patch to hold; pick the lag manually this cycle."
     }
   }
 }

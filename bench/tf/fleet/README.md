@@ -80,14 +80,17 @@ provider answers a raised value with an operator-initiated `clusters.update` car
 down). That is what keeps the pin from rotting: a new patch inside the held minor moves
 the master onto it, and the day the REGULAR default rolls a minor, the derived pin
 recomputes and the next apply walks the master to the new default-minus-one, so the lag
-stays exactly one minor without anyone touching the file. The pin is drawn from
+stays one minor without anyone touching the file, a hold excepted. The pin is drawn from
 REGULAR's own version list by `seeded_b_pin.py` (the stack's `external` data source),
 never from the provider's all-channel list: GKE lets a cluster running a patch its
 channel does not carry upgrade only within that minor, so a pin from a newer channel
-turns the next minor roll into a refused apply on every project (#3025). When
-`seeded-b` is found on such a patch, the script holds the pin instead, at the newest
-REGULAR patch of that minor above the running one if there is one, else at the running
-version, and the apply after that step does the minor bump. `seeded-b`'s node pool is
+turns the next minor roll into a refused apply on every project. When `seeded-b` is
+found on such a patch, the script holds the pin instead, at the newest REGULAR patch of
+that minor above the running one if there is one, else at the running version, and the
+apply after that step does the minor bump. While a hold lasts the lag is two minors, not
+one: `hack/fleet-fixture-state.py` reads `version-laggard` as drifted until REGULAR ships
+a patch above the running one, and if REGULAR drops the minor first no pin can recover,
+so the cluster is upgraded by hand off the channel or replaced. `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
 moves with the master; freezing it would leave the pool a minor (or, between minor
 rolls, a patch) behind the control plane, which is upgrade SOP 3.2 `pool-skew` and a

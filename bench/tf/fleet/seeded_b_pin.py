@@ -33,6 +33,11 @@ import sys
 
 CHANNEL = "REGULAR"
 GCLOUD = "gcloud"
+SERVER_CONFIG_ARGS = ("container", "get-server-config")
+DESCRIBE_ARGS = ("container", "clusters", "describe")
+PROJECT_FLAG = "--project=%s"
+ZONE_FLAG = "--zone=%s"
+JSON_FORMAT_FLAG = "--format=json"
 # Two reads of one zone, once per plan.
 GCLOUD_TIMEOUT_SECONDS = 120
 # The query main.tf sends; every value a string, as the data source requires.
@@ -122,7 +127,7 @@ def _document(command, stdout):
 
 def read_server_config(project, zone):
     """REGULAR's (default version, valid versions) at the zone."""
-    command, result = _gcloud(["container", "get-server-config", "--project=%s" % project, "--zone=%s" % zone, "--format=json"])
+    command, result = _gcloud([*SERVER_CONFIG_ARGS, PROJECT_FLAG % project, ZONE_FLAG % zone, JSON_FORMAT_FLAG])
     if result.returncode != 0:
         raise PinError("%s exited %d: %s" % (command, result.returncode, result.stderr.strip()))
     doc = _document(command, result.stdout)
@@ -134,7 +139,7 @@ def read_server_config(project, zone):
 
 def read_running_version(project, zone, cluster):
     """seeded-b's current master version, or None when the cluster does not exist."""
-    command, result = _gcloud(["container", "clusters", "describe", cluster, "--project=%s" % project, "--zone=%s" % zone, "--format=json"])
+    command, result = _gcloud([*DESCRIBE_ARGS, cluster, PROJECT_FLAG % project, ZONE_FLAG % zone, JSON_FORMAT_FLAG])
     if result.returncode != 0:
         if NOT_FOUND_MARKER in result.stderr:
             return None

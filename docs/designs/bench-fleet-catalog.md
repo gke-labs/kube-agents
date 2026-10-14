@@ -320,9 +320,12 @@ documented background ones, and nothing else — that is what lets a case assert
 finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
 rule now keeps it intact.
 
-The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
-rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
-`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+The pin in `bench/tf/fleet/main.tf` is drawn from REGULAR's own `validVersions` by
+`seeded_b_pin.py`, so in steady state `seeded-b` sits on a version its channel carries. It
+can still sit on one absent from REGULAR's roster: a patch REGULAR dropped between reconciles,
+or the hold the pin keeps while the running patch is one REGULAR does not carry (on 2026-10-14,
+`1.34.12-gke.1011000` from RAPID's roster; the pin used to be drawn from the location-wide
+`valid_master_versions`, which is how it got there). The check once read
 that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
 (a) now fires only when a version is offered by no route at the location: not by the
 cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
