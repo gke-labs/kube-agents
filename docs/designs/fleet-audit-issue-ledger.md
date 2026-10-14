@@ -873,9 +873,9 @@ harness had turned itself into an answer key for the one claim it could not veri
 
 Four changes close it, and none of them pretend to verify anything:
 
-- **No rejection names a slug.** Every `checks_run` message now points at the SOP filename that
-  defines the roster (`AuditSpec.sop`, the same string a test pins against an independent map)
-  instead of listing it. A test asserts that no rejection on any path contains any roster slug.
+- **No rejection names a slug.** Every `checks_run` message now points at the SOP that defines the
+  roster, by its full path built from `AuditSpec.sop` (the same string a test pins against an
+  independent map), instead of listing it. A test asserts that no rejection on any path contains any roster slug.
 - **`start` hands the roster over.** The roster is in the SOP and the SOP is required reading, but
   "it will read far enough" is not a mechanism: Hermes's `read_file` defaults to 500 lines and every
   audit SOP fits inside that, and the run still asked for 100 lines of each, on files whose checks

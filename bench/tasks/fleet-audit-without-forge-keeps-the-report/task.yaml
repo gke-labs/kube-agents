@@ -76,8 +76,8 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns: ['audit_report\.py\s+start\s+--audit\b']
-  # No worker command named a skill script or an SOP by a path relative to the
-  # profile home, and none joined `governance/` to a script directory. From a
+  # No worker command ran a skill script by a path relative to the profile
+  # home, and none joined `governance/` to a script directory. From a
   # card's workspace both name nothing, and the worker spends its turns
   # recovering.
   - name: the-worker-used-full-paths

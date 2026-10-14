@@ -50,9 +50,9 @@ nothing:
   to maintain;
 * ``/opt/data/**`` is runtime state that exists only in a live pod, and is
   skipped, except the platform profile home ``/opt/data/profiles/platform/``,
-  which the image fills from ``agents/platform`` and which skills and SOPs name
-  in full for a kanban worker; it resolves like ``/opt/platform-template/``. So
-  is any reference holding a shell variable or an obvious placeholder;
+  which skills and SOPs name in full for a kanban worker and which is resolved
+  against ``agents/platform`` as ``/opt/platform-template/`` is. Any reference
+  holding a shell variable or an obvious placeholder is skipped too;
 * nothing resolves against the repository root. A checkout is not mounted into
   any agent, so ``agents/platform/skills/x/y.md`` -- which names a real file
   here, and survives every review a human gives it -- is a finding: that tree
@@ -169,11 +169,12 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     ),
 }
 
-# The profile templates the entrypoint scaffolds from. Unlike /opt/defaults
-# these are plain directory copies, so the mapping is one line each.
 # The platform profile's home in a running pod.
 PLATFORM_PROFILE_HOME = "/opt/data/profiles/platform/"
 
+# The profile templates the entrypoint scaffolds from, plus the platform
+# profile home they fill. Unlike /opt/defaults these are plain directory
+# copies, so the mapping is one line each.
 OPT_TEMPLATES: tuple[tuple[str, str], ...] = (
     ("/opt/platform-template/", "agents/platform"),
     # The platform profile home, filled from the template at startup and
