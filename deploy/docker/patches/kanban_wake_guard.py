@@ -145,6 +145,12 @@ async def _is_front_door(adapter, session_id: str) -> bool:
                 return True
             seen.add(parent)
             current = parent
+        else:
+            # Same consequence as an unreadable store, so the same line.
+            logger.warning(
+                "kanban_wake_guard: lineage of %s is deeper than %d sessions, so "
+                "its wake turn runs unguarded", session_id, LINEAGE_WALK_MAX,
+            )
     except Exception as exc:  # noqa: BLE001 — fail open, but say so
         # Not debug: for a compressed front-door session this walk alone
         # decides the mark, so a store that can't be read lets the wake turn

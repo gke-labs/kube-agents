@@ -75,6 +75,13 @@ class TestTheHandlerWrapper(unittest.TestCase):
         rows = {"s1": {"parent_session_id": "s2"}, "s2": {"parent_session_id": "s1"}}
         self.assertIs(run_wrapped({**MARK, guard.SESSION_HEADER: "s1"}, _Adapter(rows)), False)
 
+    def test_a_lineage_past_the_walk_cap_warns_and_fails_open(self):
+        rows = {f"s{i}": {"parent_session_id": f"s{i + 1}"} for i in range(guard.LINEAGE_WALK_MAX + 1)}
+        rows[f"s{guard.LINEAGE_WALK_MAX + 1}"] = {"parent_session_id": FRONT_DOOR}
+        with self.assertLogs(guard.logger, level="WARNING") as logs:
+            self.assertIs(run_wrapped({**MARK, guard.SESSION_HEADER: "s0"}, _Adapter(rows)), False)
+        self.assertTrue(any("deeper than" in line for line in logs.output))
+
     def test_an_unreadable_store_answers_from_the_id_alone(self):
         self.assertIs(run_wrapped({**MARK, guard.SESSION_HEADER: COMPRESSED_TIP}, _Adapter(broken=True)), False)
         self.assertTrue(run_wrapped({**MARK, guard.SESSION_HEADER: FRONT_DOOR}, _Adapter(broken=True)))
