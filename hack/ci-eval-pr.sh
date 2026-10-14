@@ -80,6 +80,9 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # STATE_DIR, holds one such record per skipped repetition.
 readonly EVAL_INFRA_FAILURE_MARKER="KUBE_AGENTS_INFRA_FAILURE"
 readonly EVAL_NOT_RUN_DIR="not-run"
+# The opening chat turn's seconds beside results.json, where
+# bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
+readonly EVAL_TIMING_FILE="timing.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
 
@@ -166,6 +169,12 @@ readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
 readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=7200
 readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
+# scheduled_audits: how long one exec that pauses or resumes the clock-started audits
+# may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
+# script, so five stalled calls still finish and name themselves inside this.
+readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
+readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
+readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -655,6 +664,8 @@ profile_and_dump_on_exit() {
   collect_gateway_log
   collect_agent_pod_diagnostics
   collect_litellm_log
+  # Defined further down; a run that died before then paused nothing.
+  declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -1472,6 +1483,53 @@ wait_platform_runs() { # <label> <space-separated audit ids>
   return 0
 }
 
+# The Platform Agent's clock-started audits, paused once per lease before any unit
+# runs (#3020) and resumed from the EXIT trap. hack/ci_pause_scheduled_audits.py does
+# both in the gateway with Hermes' own `cron pause`/`cron resume`, and its header owns
+# which jobs, why the pause outlives a gateway restart, and its exit codes. A Prow
+# lease's teardown sweeps the volume anyway; the resume is for a run against an
+# install that outlives it. A pause that fails is a warning: the run goes on as it
+# did before this existed, with the audits on their clock. Pinned to
+# AGENT_CLUSTER_CONTEXT and refused for a context that does not name PROJECT_ID, as
+# wait_platform_runs is. Returns 0 whatever happens.
+scheduled_audits() { # <pause|resume> <label>
+  local mode="$1" label="$2" ns ctx out rc=0 args=()
+  ns="${TARGET_NAMESPACE:-}"
+  ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  [ "${mode}" = "resume" ] && args=(--resume)
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || ! command -v kubectl >/dev/null 2>&1; then
+    echo "WARNING: Scheduled audits (${label}): no ${mode}, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing" >&2
+    return 0
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) ;;
+    *)
+      echo "WARNING: Scheduled audits (${label}): no ${mode}, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
+      return 0 ;;
+  esac
+  # An exec that fails (a pod rolling, an API blip) is tried again, as wait_platform_runs
+  # does; the script skips what is already done. Its exit 3 is a verdict a retry would
+  # only repeat (unreadable inputs, a pause Hermes refused), so that one is final.
+  local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  local attempt
+  for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
+    rc=0
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+      -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+      "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" ${args[@]+"${args[@]}"} \
+      < "${SCRIPT_DIR}/ci_pause_scheduled_audits.py" 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      echo "Scheduled audits (${label}): ${out}"
+      return 0
+    fi
+    [ "${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break
+    [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+  done
+  echo "WARNING: Scheduled audits (${label}): ${mode} exited ${rc} on attempt ${attempt}: ${out}; any audit not named as ${mode}d keeps its state" >&2
+  return 0
+}
+
 if [ "${EVAL_FORGE}" = "gitlab" ]; then
   EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 else
@@ -1480,6 +1538,7 @@ fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
 probe_gitlab_ledger_path "lease" || exit 1
+scheduled_audits pause "lease"
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -1783,8 +1842,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
-# tracker seats it in the presubmit file held out (#2013, #2016; the
-# presubmit file's last section).
+# tracker seats it in the presubmit file held out (#2013; #2016's seat took
+# its roster line 2026-10-14; the presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2255,8 +2314,8 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # of the thirteen-case matrix measure it, and until they have, this is the
 # projection. No Prow deadline change.
 #
-# pdb-remediation-pr, seat opened 2026-09-28, is seated held out beside it
-# (#2016 step 2): FOURTEEN tasks, 42 units, against the same 360m deadline.
+# pdb-remediation-pr, seat opened 2026-09-28, was seated held out beside it
+# (#2016 step 2; roster line 2026-10-14): FOURTEEN tasks, 42 units, against the same 360m deadline.
 # What arrived is three units of ~15-25min each (420-1153s on the four
 # graded nights of 09-16 to 09-20, 980-1929s in its 2026-09-14 presubmit
 # run; hinted at 1250, the presubmit's largest), serialized on their own
@@ -2450,7 +2509,7 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (its first two seats are
+# The GitLab lane's list may hold no roster case (two of its three seats are
 # held out), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
@@ -2616,7 +2675,7 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Presubmit held out, seat opened 2026-09-28 (#2016 step 2); nightly 2026-09-15
+    # On the roster since 2026-10-14 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
     # to then. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
@@ -2945,7 +3004,7 @@ record_case() { # <task-name>
 # gradings apart; it is not what keeps one case's block contiguous in the job
 # log, since the launcher's `>>>` and the other lanes' `<<<` lines never take
 # it. That is the single `cat` below: a block under PIPE_BUF (4096 bytes; the
-# fixtures measure 448-1524) reaches the stdout pipe in one write. It matters
+# fixtures measure 550-2054) reaches the stdout pipe in one write. It matters
 # because scripts/eval_dashboard/collect.py attaches `rep N:` lines to the
 # `Task <name> Result:` line above them and closes the block at the next
 # `>>>`/`===`/`---` header, so a launch marker landing inside a block would
@@ -3216,13 +3275,24 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   else
     unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM EVAL_STREAM_REPO
   fi
+  # The harness writes the opening chat turn's seconds here (harness.py,
+  # KUBE_AGENTS_TIMING_FILE); removed first so a stale file from an earlier
+  # lease is never copied in for this repetition.
+  local timing="${STATE_DIR}/${name}.rep${rep}.${EVAL_TIMING_FILE}"
+  rm -f "${timing}"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
   # run someone will need the log for.
   dir="$(grep -oE 'results: [^ ]*/results\.json' "${log}" | tail -1 | sed -e 's/^results: //' -e 's|/results\.json$||' || true)"
+  # Beside results.json, where load_run reads it, and before the .dir state
+  # file below lets the grading pass see this repetition. Best effort: a
+  # missing timing never fails the repetition.
+  if [ -n "${dir}" ] && [ -f "${timing}" ]; then
+    cp "${timing}" "${dir}/${EVAL_TIMING_FILE}" 2>/dev/null || true
+  fi
   # Written while this unit still holds the task lock, and counted under it:
   # repetitions of one task write their state files serially, so exactly one
   # of them -- the last to finish -- sees the count reach EVAL_REPETITIONS,

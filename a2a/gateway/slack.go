@@ -290,18 +290,28 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 // toMrkdwn rewrites the line-level markdown Slack cannot show (headings,
 // rules, list markers, tables: rewriteSlackBlocks), escapes Slack's control
 // characters, then translates the two inline markdown forms the relay emits
-// (bold pairs, links) into mrkdwn. Escaping
-// first, over the whole text, so the only < and > on the wire are the ones
-// our own deterministic link translation writes, and so a prompt-injected
-// <!channel> inside a code span is as inert as one in prose; the two
-// translations then leave code spans as written, since the task's result is
-// executor output of arbitrary shape and a `**kwargs` or a `**/*.yaml` in
-// it is the answer, not bold. The rules are the ones markdown.go holds for
-// both chat surfaces. Narrow on purpose: full markdown fidelity is
-// presentation polish, and the legacy Hermes path's converter is not this
-// code path's to reuse.
+// (bold pairs, links) into mrkdwn. Escaping first, over the whole text, so
+// the only < and > on the wire are the ones our own deterministic link
+// translation writes or keeps (below), and so a prompt-injected <!channel>
+// inside a code span is as inert as one in prose; the two translations then
+// leave code spans as written, since the task's result is executor output of
+// arbitrary shape and a `**kwargs` or a `**/*.yaml` in it is the answer, not
+// bold. The rules are the ones markdown.go holds for both chat surfaces.
+// Narrow on purpose: full markdown fidelity is presentation polish, and the
+// legacy Hermes path's converter is not this code path's to reuse.
+//
+// One <url|text> the executor wrote is not escaped: a closed one, in prose,
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
+// text does not name another host (keepChatLinks), which is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground. Its URL and text are escaped as the rest of the text is,
+// and only its own angle brackets stay live. Its URL must start with
+// http(s)://, so a <!channel>, <@U…> or <#C…> is never one, and its text
+// admits no angle bracket, so none rides out inside it.
 func toMrkdwn(text string) string {
-	return rewriteMarkdown(slackEscaper.Replace(rewriteSlackBlocks(text)), slackLinkRE)
+	return rewriteMarkdown(keepChatLinks(rewriteSlackBlocks(text), slackEscaper.Replace, func(dest, label string) string {
+		return chatLinkOpen + slackEscaper.Replace(dest) + chatLinkSep + slackEscaper.Replace(label) + chatLinkClose
+	}), slackLinkRE)
 }
 
 var (

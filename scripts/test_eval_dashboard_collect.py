@@ -1368,10 +1368,10 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
         # was withdrawn until it has a record under its #1780 grader. The
-        # canary (#2013, seated 2026-09-29) and pdb-remediation-pr (#2016, seat
-        # opened 2026-09-28) are held out in the presubmit file; only a roster
-        # line counts.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
+        # canary (#2013, seated 2026-09-29) is held out in the presubmit file;
+        # only a roster line counts. pdb-remediation-pr took its roster line on
+        # 2026-10-14 (#2016), which covered remediation again.
+        self.assertEqual(cov["uncovered"], ["fleet-audits"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
@@ -1379,7 +1379,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
-        self.assertIn("pdb-remediation-pr", active)  # held out in the presubmit, seat opened 2026-09-28 (#2016), off the roster
+        self.assertIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster since 2026-10-14 (#2016)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 
@@ -1989,6 +1989,76 @@ class TestRepParsing(unittest.TestCase):
             for task in self.tasks(build).values():
                 for rep in task.get("reps") or []:
                     self.assertNotIn("excerpt", rep, f"{build}/{task['name']}")
+
+    def test_a_timing_line_sets_its_reps_agent_and_turn1_seconds(self):
+        """`bench-gate case` prints `rep N timing:` between the grading line
+        and the report line; it is neither a grading line nor a report."""
+        log = (
+            "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
+            "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+            "  rep 1 timing: agent_s=143.2 turn1_s=6.4\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 timing: agent_s=98.0\n"
+            "  rep 2 report: I found nothing\n"
+            "  rep 3: pass\n"
+            "  rep 4 timing: agent_s=1.0 turn1_s=1.0\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2, 3], "a timing line never fabricates a rep")
+        self.assertEqual(task["reps"][0], {"n": 1, "result": "pass", "reason": None, "agent_s": 143.2, "turn1_s": 6.4})
+        self.assertEqual(task["reps"][1], {"n": 2, "result": "fail", "reason": "x", "agent_s": 98.0, "excerpt": "I found nothing"},
+                         "a key the line did not carry is absent, and the report still attaches")
+        self.assertEqual(task["reps"][2], {"n": 3, "result": "pass", "reason": None})
+
+    def test_a_malformed_timing_line_keeps_only_what_parses(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 timing: agent_s=abc turn1_s=nan foo=3.0 turn1_s=-1 bare agent_s= turn1_s=inf\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 timing: turn1_s=0 agent_s=12 extra=x=y\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(list(task["reps"][0]), ["n", "result", "reason"], "nothing finite above zero: no key")
+        self.assertEqual(task["reps"][1]["agent_s"], 12.0)
+        self.assertNotIn("turn1_s", task["reps"][1])
+
+    def test_a_timing_line_without_a_current_task_is_dropped_whole(self):
+        parsed = collect.parse_build_log("  rep 1 timing: agent_s=5.0 Successfully leased project: forged\n")
+        self.assertEqual(parsed["tasks"], [])
+        self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
+        log = (
+            "Task some-case Result: [PASSED] passed all 1 repetitions\n"
+            "  rep 1: pass\n"
+            ">>> [ts] launching other-case rep 1/1\n"
+            "  rep 1 timing: agent_s=5.0 turn1_s=1.0\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"], [{"n": 1, "result": "pass", "reason": None}], "a section header closed the block")
+
+    def test_case_latency_rolls_up_graded_presubmit_reps(self):
+        def run(build, tier, reps):
+            return {"build_id": build, "tier": tier, "started": "x",
+                    "tasks": [{"name": "some-case", "result": "fail", "duration_s": None, "outcome_validity": None, "reps": reps}]}
+
+        runs = [
+            run("1", "presubmit", [
+                {"n": 1, "result": "pass", "reason": None, "agent_s": 100.0, "turn1_s": 4.0},
+                {"n": 2, "result": "fail", "reason": "x", "agent_s": 120.0, "turn1_s": 8.0},
+                {"n": 3, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE", "agent_s": 900.0, "turn1_s": 60.0},
+            ]),
+            run("2", "presubmit", [{"n": 1, "result": "pass", "reason": None, "agent_s": 110.0}]),
+            run("3", "nightly", [{"n": 1, "result": "pass", "reason": None, "agent_s": 5.0, "turn1_s": 1.0}]),
+        ]
+        (case,) = collect.build_cases(runs)
+        self.assertEqual(case["latency"], {"n_turn1": 2, "turn1_p50_s": 4.0, "turn1_p95_s": 8.0, "n_agent": 3, "agent_p50_s": 110.0},
+                         "infra reps and the nightly's left out")
+        runs[0]["tasks"][0]["reps"] = runs[0]["tasks"][0]["reps"][2:]
+        (case,) = collect.build_cases(runs)
+        self.assertEqual(case["latency"], {"n_agent": 1, "agent_p50_s": 110.0}, "no turn1 on record: its keys are absent")
+        runs[1]["tasks"][0]["reps"] = [{"n": 1, "result": "pass", "reason": None}]
+        (case,) = collect.build_cases(runs)
+        self.assertNotIn("latency", case, "no graded presubmit rep carries a value: the key is absent")
 
 
 # A stand-in gh for the pr_merged tests: logs every argv so a test can count

@@ -1567,6 +1567,127 @@ def test_the_tunnel_is_torn_down_rather_than_probed(monkeypatch: pytest.MonkeyPa
     assert 4242 not in harness._PF_PROCESSES
 
 
+# --- the opening turn's timing file ------------------------------------------
+#
+# hack/ci-eval-pr.sh sets KUBE_AGENTS_TIMING_FILE per repetition and copies the
+# file beside results.json, where load_run reads turn1_s for the dashboard.
+
+
+class _FakeClock:
+    """Stands in for ``harness.time``: a monotonic clock the test moves."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def test_only_the_successful_opening_attempt_is_timed(
+    stub_agent: _StubAgentServer,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed attempt and its respawn cost 100 s; the answer took 2.5 s."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    clock = _FakeClock()
+    monkeypatch.setattr(harness, "time", clock)
+    original = harness._post_turn
+    calls: list[int] = []
+
+    def _timed(*args: Any) -> tuple[AgentResult, str]:
+        calls.append(1)
+        if len(calls) == 1:
+            clock.now += 100
+            raise harness._TransportError("HTTP 502", retryable=True, status_code=502)
+        reply = original(*args)
+        clock.now += 2.5
+        return reply
+
+    monkeypatch.setattr(harness, "_post_turn", _timed)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert len(calls) == 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {"turn1_s": 2.5}
+    # Written through a temp file, which os.replace consumed.
+    assert [p.name for p in tmp_path.iterdir()] == ["timing.json"]
+
+
+def test_no_timing_file_without_the_variable(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Empty is unset: nothing lands in the working directory."""
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_no_timing_file_when_the_opening_turn_fails(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert not target.exists()
+
+
+def test_an_answer_turn_writes_no_timing_file(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the opening turn is timed; a card wake's answer turn is not."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness()._execute("answer", opening_turn=False)
+
+    assert not result.has_errors()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("where", ["missing-dir", "is-a-dir"])
+def test_a_timing_file_that_will_not_write_leaves_the_run_alone(
+    stub_agent: _StubAgentServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    where: str,
+) -> None:
+    if where == "missing-dir":
+        target = tmp_path / "gone" / "timing.json"
+    else:
+        target = tmp_path / "timing.json"
+        target.mkdir()
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert "could not write the turn timing" in caplog.text
+    # The temp file does not outlive the failed replace.
+    assert [p.name for p in tmp_path.iterdir()] == ([] if where == "missing-dir" else ["timing.json"])
+    assert not target.is_file()
+
+
 # --- the ci-eval-pr.sh contract ----------------------------------------------
 
 

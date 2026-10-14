@@ -184,6 +184,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import re
 import statistics
@@ -193,9 +194,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 try:
-    from . import tiers
+    from . import nightly, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import nightly
     import tiers
 try:
     import eval_rosters
@@ -445,6 +447,15 @@ _REP_LINE = re.compile(
 # was cut. Its own shape, `rep N report:`, so `_REP_LINE` never matches it.
 #   rep 2 report: I looked for a pool named pinned-inference-pool and found ...
 _REP_REPORT_LINE = re.compile(r"^\s+rep (?P<n>\d+) report: (?P<text>.*)$")
+# How long a repetition took: one optional line right under a repetition's
+# grading line, printed by `bench-gate case` with each of two values it knows,
+# one decimal each -- `agent_s` the agent run's wall clock (results.json's
+# `latency`: no provisioning, verification or judge in it),
+# `turn1_s` the opening chat turn on the api transport. Its own shape, `rep N
+# timing:`, so `_REP_LINE` never matches it.
+#   rep 2 timing: agent_s=143.2 turn1_s=6.4
+_REP_TIMING_LINE = re.compile(r"^\s+rep (?P<n>\d+) timing: (?P<fields>.*)$")
+_REP_TIMING_KEYS = ("agent_s", "turn1_s")
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -554,6 +565,32 @@ def _attach_excerpt(task: dict, n: int, text: str) -> None:
             return
 
 
+def _attach_timing(task: dict, n: int, fields: str) -> None:
+    """Record a `rep N timing:` line's known values on the rep it follows.
+
+    Only `_REP_TIMING_KEYS` with a finite value above zero are kept, as
+    floats; an unknown key or a value that does not parse is skipped, never
+    raised on. A key is absent when the line did not carry it -- absence
+    means unknown -- and a line for a repetition the log never graded is
+    dropped.
+    """
+    values = {}
+    for pair in fields.split():
+        key, _, raw = pair.partition("=")
+        if key not in _REP_TIMING_KEYS:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if math.isfinite(value) and value > 0:
+            values[key] = value
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep.update(values)
+            return
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
@@ -562,7 +599,8 @@ def parse_build_log(text: str) -> dict:
     <name> Result:` line they follow; a task whose log has none (single-rep
     era, or a log truncated before grading) simply gets no `reps` key --
     absence means unknown, never fabricated. A `rep N report:` line under a
-    grading line becomes that rep's `excerpt`, the agent's own words.
+    grading line becomes that rep's `excerpt`, the agent's own words, and a
+    `rep N timing:` line its `agent_s` and `turn1_s`.
     """
     project = None
     tasks = []
@@ -574,11 +612,17 @@ def parse_build_log(text: str) -> dict:
         # The agent's own words first, and consumed whole: every other
         # pattern below that is an unanchored `search` (the lease, the final
         # verdict) would otherwise read the report as if the log had said
-        # it. A report line that follows no grading block is dropped.
+        # it. A report line that follows no grading block is dropped, and so
+        # is a timing line.
         m = _REP_REPORT_LINE.match(line)
         if m:
             if current is not None:
                 _attach_excerpt(current, int(m.group("n")), m.group("text"))
+            continue
+        m = _REP_TIMING_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_timing(current, int(m.group("n")), m.group("fields"))
             continue
         m = _LEASE.search(line)
         if m:
@@ -1156,7 +1200,9 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
 
     INFRA results never count against a case: they are excluded from the
     pass_rate denominator and from the duration stats, though they do appear
-    in runs_on_record and last3 (they are still history).
+    in runs_on_record and last3 (they are still history). Nor do they count
+    in `latency`, the reps' timing (nightly.latency_rollup), which is absent
+    when no graded presubmit rep carries one.
 
     The per-case fields are the PRESUBMIT's record, as they were before the
     nightly existed; the nightly's record sits beside them under `nightly`,
@@ -1179,6 +1225,7 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
             if task["result"] != "infra" and task["duration_s"] is not None
         ]
         nightly_results = [task["result"] for _, task in nightly_history.get(name, [])]
+        latency = nightly.latency_rollup([rep for _, task in entries for rep in task.get("reps") or []])
         cases.append(
             {
                 "name": name,
@@ -1207,6 +1254,8 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
                 },
             }
         )
+        if latency:
+            cases[-1]["latency"] = latency
     return cases
 
 

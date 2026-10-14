@@ -55,6 +55,7 @@
             "OutcomeScore": 0.5
           },
           "latency": 133.12637670803815,
+          "turn1_s": null,
           "total_tokens": 275153,
           "not_applicable_checks": []
         },
@@ -73,6 +74,7 @@
             "OutcomeScore": 0.5
           },
           "latency": 49.3587532970123,
+          "turn1_s": null,
           "total_tokens": 135530,
           "not_applicable_checks": []
         },
@@ -91,6 +93,7 @@
             "OutcomeScore": 0.5
           },
           "latency": 46.11065511684865,
+          "turn1_s": null,
           "total_tokens": 135064,
           "not_applicable_checks": []
         }
@@ -154,6 +157,7 @@
             "OutcomeScore": 1.0
           },
           "latency": 46.67580479523167,
+          "turn1_s": null,
           "total_tokens": 135281,
           "not_applicable_checks": []
         },
@@ -172,6 +176,7 @@
             "OutcomeScore": 1.0
           },
           "latency": 47.00481715425849,
+          "turn1_s": null,
           "total_tokens": 135195,
           "not_applicable_checks": []
         },
@@ -190,6 +195,7 @@
             "OutcomeScore": 1.0
           },
           "latency": 46.67580479523167,
+          "turn1_s": null,
           "total_tokens": 135281,
           "not_applicable_checks": []
         }

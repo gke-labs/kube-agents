@@ -280,22 +280,25 @@ def test_the_per_repetition_detail_is_printed(kanban_task, tmp_path, capsys):
 
 
 REPORT_PREFIX = "  rep 1 report: "
+TIMING_PREFIX = "  rep 1 timing: "
 
 
 def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
     kanban_task, tmp_path, capsys
 ):
     """The dashboard quotes the agent's own words beside the grader's reason,
-    and reads them from the build log: one `rep N report:` line right under
-    the repetition's grading line, which itself does not change."""
+    and reads them from the build log: one `rep N report:` line under the
+    repetition's grading line (and its timing line), which itself does not
+    change."""
     out = tmp_path / "case.json"
     run_case(kanban_task, [FIXTURE_RUNS / RED_RUNS[0]], out)
     lines = capsys.readouterr().out.splitlines()
     graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: fail -- "))
-    assert lines[graded + 1].startswith(
+    assert lines[graded + 1].startswith(TIMING_PREFIX), lines[graded + 1]
+    assert lines[graded + 2].startswith(
         REPORT_PREFIX + "Delegated to the platform agent — the task was created with id "
         "t_bbbebbd5. [Redacted:"
-    ), lines[graded + 1]
+    ), lines[graded + 2]
     # The report never rides in the hand-off; the log is its one channel.
     assert "report" not in payload(out)["reps"][0]
 
@@ -332,6 +335,46 @@ def test_the_report_line_is_one_flat_line_with_no_angle_brackets_and_a_cap(
     assert text.startswith("Line one. b>Line two/b> xxx")
     assert "<" not in text
     assert len(text) == REPORT_EXCERPT_MAX_CHARS and text.endswith("…")
+
+
+def _timed_run(make_run, latency, turn1_s=None):
+    def timed(rec):
+        rec["latency"] = latency
+
+    run = make_run("kanban_red_1", timed)
+    if turn1_s is not None:
+        (run / "timing.json").write_text(json.dumps({"turn1_s": turn1_s}), encoding="utf-8")
+    return run
+
+
+@pytest.mark.parametrize(
+    ("latency", "turn1_s", "expected"),
+    [
+        (123.46, 4.26, TIMING_PREFIX + "agent_s=123.5 turn1_s=4.3"),
+        (123.46, None, TIMING_PREFIX + "agent_s=123.5"),
+        (None, 4.26, TIMING_PREFIX + "turn1_s=4.3"),
+        (0.0, 4.26, TIMING_PREFIX + "turn1_s=4.3"),
+        (123.46, 0.04, TIMING_PREFIX + "agent_s=123.5"),
+    ],
+    ids=["both", "no-turn1", "no-latency", "zero-latency", "turn1-rounds-to-zero"],
+)
+def test_the_timing_line_follows_the_grading_line_and_omits_missing_fields(
+    kanban_task, make_run, tmp_path, capsys, latency, turn1_s, expected
+):
+    """The dashboard reads each repetition's agent and opening-turn seconds
+    from `rep N timing:`, a shape the collector's `rep N:` match skips."""
+    run_case(kanban_task, [_timed_run(make_run, latency, turn1_s)], tmp_path / "case.json")
+    lines = capsys.readouterr().out.splitlines()
+    # A record with no latency blocks rather than fails; the line is the same.
+    graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: "))
+    assert lines[graded + 1] == expected
+    assert lines[graded + 2].startswith(REPORT_PREFIX)
+
+
+def test_no_timing_line_when_both_values_are_missing(kanban_task, make_run, tmp_path, capsys):
+    run_case(kanban_task, [_timed_run(make_run, None)], tmp_path / "case.json")
+    printed = capsys.readouterr().out
+    assert "  rep 1: " in printed and TIMING_PREFIX not in printed
 
 
 @pytest.mark.parametrize(

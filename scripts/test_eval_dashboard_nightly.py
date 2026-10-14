@@ -143,6 +143,36 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual(nightly.night_reports(data, limit=1)[0]["previous_build"], NIGHT_1, "the night outside the window still serves as the comparison")
         self.assertEqual(nightly.nightly_document({"runs": [], "cases": []}), {"job": JOB, "nights": [], "running": []})
 
+    def test_turn1_and_agent_medians_per_case_and_the_nights_turn1_percentiles(self):
+        data = two_nights()
+        a, b, c = data["runs"][-1]["tasks"]
+        for r, (agent, turn1) in zip(a["reps"], [(100.0, 4.0), (120.0, 9.0), (110.0, 6.0)]):
+            r.update(agent_s=agent, turn1_s=turn1)
+        b["reps"][0].update(agent_s=300.0, turn1_s=12.0)
+        b["reps"][1].update(result="infra", agent_s=900.0, turn1_s=80.0)
+        c["reps"][0].update(turn1_s=float("nan"), agent_s=True)
+        last, first = nightly.night_reports(data)
+        by_name = {row["case"]: row for row in last["cases"]}
+        self.assertEqual((by_name["case-a"]["turn1_p50_s"], by_name["case-a"]["agent_p50_s"]), (6.0, 110.0))
+        self.assertEqual((by_name["case-b"]["turn1_p50_s"], by_name["case-b"]["agent_p50_s"]), (12.0, 300.0), "the infra rep left out")
+        self.assertEqual((by_name["case-c"]["turn1_p50_s"], by_name["case-c"]["agent_p50_s"]), (None, None), "a value that is not a finite number is unknown")
+        # 100.0, 110.0, 120.0: nearest rank, index round(1.8) == 2 for p90.
+        self.assertEqual([by_name[name]["agent_p90_s"] for name in ("case-a", "case-b", "case-c")], [120.0, 300.0, None])
+        # 4.0, 6.0, 9.0, 12.0: nearest rank, index round(1.5) == 2 for p50.
+        self.assertEqual((last["turn1_p50_s"], last["turn1_p95_s"]), (9.0, 12.0))
+        self.assertEqual((first["turn1_p50_s"], first["turn1_p95_s"]), (None, None), "no rep carried a time")
+        self.assertIsNone(first["cases"][0]["turn1_p50_s"])
+
+    def test_a_split_nights_turn1_percentiles_count_each_case_once(self):
+        main = night(NIGHT_2, "2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00", [task("case-a", "pass")])
+        main["tasks"][0]["reps"][0]["turn1_s"] = 4.0
+        part = writers(WRITERS_2, "2026-09-08T00:00:00+00:00", "2026-09-08T02:10:00+00:00", [task("case-a", "pass"), task("pr-a", "pass")])
+        part["tasks"][0]["reps"][0]["turn1_s"] = 50.0
+        part["tasks"][1]["reps"][0]["turn1_s"] = 8.0
+        data = {"generated_at": NOW, "cases": copy.deepcopy(CASES), "runs": [main, part]}
+        (only,) = nightly.night_reports(data)
+        self.assertEqual((only["turn1_p50_s"], only["turn1_p95_s"]), (4.0, 8.0), "case-a as the main part recorded it")
+
     def test_a_nightly_build_in_flight_is_a_running_night_not_a_grid_column(self):
         data = two_nights()
         data["pending_builds"] = [
@@ -236,6 +266,15 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(self.line({"runs": [], "cases": []}), "🌙 Nightly: no run on record yet")
         self.assertEqual(self.line({}), "🌙 Nightly: no data.json to read a night from")
         self.assertEqual(self.line(None), "🌙 Nightly: no data.json to read a night from")
+
+    def test_the_nights_turn1_percentiles_are_advice_beside_the_target(self):
+        data = two_nights()
+        for r, turn1 in zip(data["runs"][-1]["tasks"][0]["reps"], (4.0, 9.0, 6.04)):
+            r["turn1_s"] = turn1
+        self.assertEqual(self.line(data), "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-b · "
+                                          "chat turn 1 p50 6.0 s, p95 9.0 s (advisory: target p95 < 10 s) · 6h 40m")
+        data["runs"][-1].update(result="ABORTED", duration_s=None)
+        self.assertNotIn("chat turn", self.line(data), "a truncated night gives no numbers")
 
     def test_many_newly_failing_cases_are_counted_past_three(self):
         data = two_nights()
@@ -696,7 +735,11 @@ class NightlyPageTest(unittest.TestCase):
         data = load_fixture()
         data["generated_at"] = NOW
         data["cases"] = copy.deepcopy(CASES)
+        data["cases"][0]["latency"] = {"n_turn1": 6, "turn1_p50_s": 5.25, "turn1_p95_s": 9.0, "n_agent": 6, "agent_p50_s": 120.0}
         data["runs"] += copy.deepcopy([FIRST, SECOND])
+        # Last night's case-a carries the reps' timing; nothing else does.
+        for r, (agent, turn1) in zip(data["runs"][-1]["tasks"][0]["reps"], [(100.0, 4.0), (120.0, 11.5), (110.0, 6.0)]):
+            r.update(agent_s=agent, turn1_s=turn1)
         # A third night in flight at render time (NOW is Tue 10:30 AM ET).
         data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"}]
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
@@ -717,10 +760,17 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn("The job ran to the end in 6h 40m: 3 cases recorded of 3 expected.", app)
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}"', app)
         # Grouped by domain, each case with its state pill, reps and reason.
-        self.assertLess(app.index('<tr class="grp"><td colspan="5">cost</td></tr>'), app.index('<tr class="grp"><td colspan="5">reliability</td></tr>'))
+        self.assertLess(app.index('<tr class="grp"><td colspan="6">cost</td></tr>'), app.index('<tr class="grp"><td colspan="6">reliability</td></tr>'))
         self.assertIn('<tr class="newly"><td class="nm">case-b</td><td><span class="pill p-fail"', app)
         self.assertIn('<span class="pill p-partial" title="failed some reps">partial</span></td><td class="num" title="repetitions passed / graded">2/3</td>', app)
         self.assertIn("check y: required phrases absent", app)
+        # The timing: case-a's medians, a dash where none was recorded, and
+        # the night's opening turn beside the target, as advice.
+        self.assertIn('2/3</td><td class="num tm" title="median opening chat turn / median agent wall clock, then the agent\'s p90, over the repetitions not lost to infra">6.0 s / 110.0 s<br><small class="mut">p90 120.0 s</small></td>', app)
+        self.assertIn(">— / —</td>", app)
+        self.assertIn('<div class="k">Chat turn 1</div><div class="v">6.0<small>s p50</small></div><div class="d2">p95 11.5 s · advisory target p95 &lt; 10 s</div>', app)
+        self.assertNotIn("Chat turn 1", dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no timing")
+        self.assertIn("chat turn 1 p50 5.3 s, p95 9.0 s (6 reps) · agent p50 120.0 s (6 reps)", dom_text(self.out / "cases.html"))
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}/artifacts/eval_case-b_rep1.log"', app)
         self.assertIn('href="cases.html#case-b"', app)
         # Against the night before, and the other nights list.

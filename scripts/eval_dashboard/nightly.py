@@ -58,6 +58,7 @@ free of third-party dependencies.
 from __future__ import annotations
 
 import datetime
+import math
 import re
 
 try:
@@ -140,6 +141,19 @@ DIGEST_GLYPH = "🌙"
 SEP = " · "
 # How many newly failing cases the digest names before counting the rest.
 DIGEST_NAMED_CASES = 3
+# The per-rep timing the collector records from `rep N timing:` (SCHEMA.md:
+# runs[].tasks[].reps): the agent run's wall clock (results.json's latency),
+# and the opening chat turn on the api transport.
+REP_AGENT_S = "agent_s"
+REP_TURN1_S = "turn1_s"
+# The slow-run percentile the Nightly page shows beside a case's agent median:
+# the agent run's variation is in its tail, which a median hides.
+AGENT_SLOW_PCT = 90
+# The end-state target for a chat turn, "p95 < 10 s for read/plan"
+# (docs/architecture/05-system-architecture.md, "Chat turn latency"). The
+# digest and the page show the night's turn-1 p95 beside it as advice only:
+# nothing gates on it.
+TURN1_P95_TARGET_S = 10
 
 UTC = datetime.timezone.utc
 
@@ -199,6 +213,42 @@ def first_reason(task: dict) -> str | None:
             if isinstance(rep, dict) and rep.get("result") == wanted and isinstance(rep.get("reason"), str) and rep["reason"]:
                 return rep["reason"][:REASON_MAX_CHARS]
     return None
+
+
+def percentile(values: list[float], pct: int) -> float | None:
+    """Nearest rank, the rule of ``health.percentile``, which this module
+    cannot import: health imports collect (through periodics), which
+    imports this module."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[round((pct / 100) * (len(ordered) - 1))]
+
+
+def rep_seconds(reps, key: str) -> list[float]:
+    """``key`` (REP_AGENT_S or REP_TURN1_S) of every rep that is not
+    ``infra`` and carries a finite value above zero; a rep without it is
+    unknown, not zero."""
+    out = []
+    for rep in reps if isinstance(reps, list) else []:
+        value = rep.get(key) if isinstance(rep, dict) and rep.get("result") != "infra" else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+            out.append(float(value))
+    return out
+
+
+def latency_rollup(reps) -> dict:
+    """The reps' timing as ``cases[].latency`` carries it (SCHEMA.md):
+    ``{n_turn1, turn1_p50_s, turn1_p95_s, n_agent, agent_p50_s}`` over the
+    reps that are not ``infra``, a value's keys left out when no rep carries
+    it; empty when none carries either."""
+    turn1, agent = rep_seconds(reps, REP_TURN1_S), rep_seconds(reps, REP_AGENT_S)
+    out = {}
+    if turn1:
+        out.update(n_turn1=len(turn1), turn1_p50_s=percentile(turn1, 50), turn1_p95_s=percentile(turn1, 95))
+    if agent:
+        out.update(n_agent=len(agent), agent_p50_s=percentile(agent, 50))
+    return out
 
 
 def domains(data: dict) -> dict[str, str]:
@@ -265,6 +315,9 @@ def night_cases(run: dict, domain_of: dict[str, str]) -> list[dict]:
             "reps": counts,
             "reason": first_reason(task) if state != STATE_PASS else None,
             "transcript_url": transcript_url(run, name),
+            "turn1_p50_s": percentile(rep_seconds(task.get("reps"), REP_TURN1_S), 50),
+            "agent_p50_s": percentile(rep_seconds(task.get("reps"), REP_AGENT_S), 50),
+            "agent_p90_s": percentile(rep_seconds(task.get("reps"), REP_AGENT_S), AGENT_SLOW_PCT),
         })
     out.sort(key=lambda c: (c["domain"], c["case"]))
     return out
@@ -536,6 +589,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     runs = night_parts(night)
     cases: list[dict] = []
     parts = []
+    turn1: list[float] = []
     for part in PARTS:
         if part not in night:
             continue
@@ -544,6 +598,10 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         seen = {c["case"] for c in cases}
         mine = [c for c in night_cases(night[part], domain_of) if c["case"] not in seen]
         cases.extend(mine)
+        names = {c["case"] for c in mine}
+        for task in night[part].get("tasks") or []:
+            if isinstance(task, dict) and task.get("name") in names:
+                turn1 += rep_seconds(task.get("reps"), REP_TURN1_S)
         parts.append(part_document(part, night[part], mine, borrowed.get(part)))
     cases.sort(key=lambda c: (c["domain"], c["case"]))
     recorded = {c["case"] for c in cases}
@@ -601,6 +659,10 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         "parts": parts,
         "missing_parts": missing_parts,
         "running_parts": running_parts,
+        # The opening chat turn over every rep of the night that is not
+        # infra; advisory beside TURN1_P95_TARGET_S, never a verdict.
+        "turn1_p50_s": percentile(turn1, 50),
+        "turn1_p95_s": percentile(turn1, 95),
         "cases": cases,
     }
 
@@ -745,6 +807,15 @@ def part_notes(night: dict, cut: bool = True) -> list[str]:
     return notes
 
 
+def turn1_note(night: dict) -> str | None:
+    """The night's opening chat turn as the digest says it, beside the
+    target it is advice against; ``None`` when no rep carried one."""
+    p50, p95 = night.get("turn1_p50_s"), night.get("turn1_p95_s")
+    if p50 is None or p95 is None:
+        return None
+    return f"chat turn 1 p50 {p50:.1f} s, p95 {p95:.1f} s (advisory: target p95 < {TURN1_P95_TARGET_S} s)"
+
+
 def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     """One line for the 9 AM digest. ``clock`` renders a datetime the way
     the rest of the digest does (post_health.clock); without one the ISO
@@ -752,7 +823,9 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     and so does a split night whose main part is still running; a split
     night with one part cut short, missing or still running otherwise has
     its numbers and says which part, without a newly-failing verdict when
-    the main part is missing."""
+    the main part is missing. A night with numbers whose reps carried the
+    opening chat turn's time gives its p50 and p95, as advice
+    (``turn1_note``)."""
     when = clock or (lambda value: value.isoformat(timespec="minutes"))
     if not data:
         return f"{DIGEST_GLYPH} Nightly: no data.json to read a night from"
@@ -805,5 +878,8 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     if not night["complete"]:
         # Every case recorded: the part notes above say what is short.
         parts.append(f"incomplete: {recorded}" if counts["missing"] else "incomplete")
+    note = turn1_note(night)
+    if note:
+        parts.append(note)
     parts.append(took)
     return f"{DIGEST_GLYPH} Nightly: {SEP.join(parts)}"
