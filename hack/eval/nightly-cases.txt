@@ -288,8 +288,9 @@
 # and fifth groups ask across the seeded clusters for one planted object the
 # prompt does not place, so the agent reads every cluster to find it.
 # Measured on a dev install with one user worker slot, so the cards ran one
-# at a time: entries 1, 2 and 3 at 400-1081s a repetition (2026-10-07 and
-# 10-08) and 475-1092s (2026-10-13); entries 6 and 16 at 2041s and
+# at a time: entries 1 and 3 at 541-1081s and entry 2 at 3163s a repetition
+# (2026-10-07 and 10-08), all three at 475-1092s (2026-10-13); entries 6 and
+# 16 at 2041s and
 # 2538-2551s (2026-10-08 and 10-13, the latter two at the 2400s delegation
 # ceiling); the eleven at 390-2180s where they passed and 1350-2522s where
 # they failed (one run each, 2026-10-07 and 10-08). Entry 5's follow-up

@@ -338,11 +338,15 @@ def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | Non
     (root / "clusters").mkdir(exist_ok=True)
     roles = _catalog_roles()
     lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
-    for slot in sorted({roles[role]["cluster_slot"] for role in reached}):
+    # A role the catalogue lacks (a retired role, bench/tf/fleet/README.md) gets
+    # no slot credential, as the runner writes none for a role it cannot place.
+    for slot in sorted({roles[role]["cluster_slot"] for role in reached if role in roles}):
         name = (names or {}).get(slot, f"seeded-{slot}")
         lines += [f"cluster.{slot}={name}", f"location.{slot}={location}"]
     (root / ".fleet-context").write_text("\n".join(lines) + "\n", encoding="utf-8")
     for role in reached:
+        if role not in roles:
+            continue
         (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
 
 
@@ -7258,6 +7262,8 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: there are none, though kube-system still writes endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints,none of the others",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, and not actually called by anything",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, which is not actually called by anything",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, never called",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: neither, endpoints is only kube-system's",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
         ],
@@ -7284,6 +7290,7 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: no policies in seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation carry none)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 without (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/0, seeded-debug/0, seeded-capacity/0, seeded-deprecation/0",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation?",
         ],
         "seeded-{s}: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none",
@@ -7411,6 +7418,8 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none (/etc/cni/net.d is read-only and does not count); coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d, which is not mounted; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d, never mounted; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /var/run/docker.sock; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
         ],
@@ -7579,6 +7588,8 @@ _GROUP4 = {
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes none (the queue directory is scratch); survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache (the queue directory); survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, though not strictly node-local; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, never persisted; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue-data; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: yes",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no (one replica)",
@@ -7746,3 +7757,16 @@ def test_group3_removed_api_refuses_a_long_oxford_joined_list_at_once():
     verdicts = _group3_verdicts(case, _group3_report(case, line))
     assert time.monotonic() - started < 2.0
     assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
+
+
+@pytest.mark.parametrize("case", list(_GROUP2) + list(_GROUP3) + list(_GROUP4) + list(_GROUP5))
+def test_every_check_of_a_catalogue_case_constructs(case):
+    """Every entry of the seventeen files, the fleet safeguards included, builds
+    through the registry, so a typo in a check is a red test here and not a
+    spec-load error after the nightly's lease."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory(prefix="construct-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            built = [parse_node(dict(entry["check"])) for entry in spec["verification_spec"]]
+    assert len(built) == len(spec["verification_spec"]) >= 3

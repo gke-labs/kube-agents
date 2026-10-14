@@ -109,7 +109,7 @@ repeats neither. Two
 parts of this section change as work merges: the column's in-review items, and the fourth table,
 "Gap to scheduled coverage", whose cells say what the daily readiness watch (on `main`) and the
 upgrade retrospective (#2729, in review) would cover before and after an upgrade and what is left to
-build. The column was last reconciled on 2026-10-14, the fourth table on 2026-10-09, before the watch merged.
+build. The column was last reconciled on 2026-10-14, the fourth table on 2026-10-14.
 
 ### A scheduled audit files it, without anyone asking
 
@@ -169,7 +169,7 @@ exist.
 | 4     | No rule.                                                              | No signature; shape: stateful `emptyDir` and local SSD volumes.                                                                                                                                                  | Rule on the collector's shape, with the target known; the watch prints the collector's guard too.                                                            |
 | 5     | Maintenance rule shipped; the watch runs it.                          | Signature: a pool more than one minor behind its control plane for seven days or longer, from the cluster describe ([§3.4](upgrade-retrospective.md#34-classification-by-signature-with-the-evidence-attached)). | Nothing once the collector merges.                                                                                                                           |
 | 6     | GitOps scan on request only; audit-log stamps read in conversation.   | Signature: `no matches for kind`, a removed API named.                                                                                                                                                           | Rule (the exception below: no fixture of its own can be standing).                                                                                           |
-| 7     | Webhook rule in review (#2194).                                       | Signature: `failed calling webhook`.                                                                                                                                                                             | Nothing once #2194, the watch and the collector merge.                                                                                                       |
+| 7     | Webhook rule in review (#2194).                                       | Signature: `failed calling webhook`.                                                                                                                                                                             | Nothing once #2194 and the collector merge.                                                                                                                  |
 | 8     | No rule: nothing reads a namespace's admission pin.                   | No signature.                                                                                                                                                                                                    | Rule (changed defaults at the target minor).                                                                                                                 |
 | 9     | No rule: `k8s.io/deprecated` stamps read in conversation.             | No signature; nothing breaks yet.                                                                                                                                                                                | Rule (deprecated-API callers).                                                                                                                               |
 | 10    | Pool skew rule shipped; client and add-on skew not read.              | No signature.                                                                                                                                                                                                    | Rule (client and add-on skew).                                                                                                                               |
@@ -785,8 +785,8 @@ leaves row 1's rule to the second model. The form the rest of the series uses, w
 elsewhere in the harness asked for before them, narrows the automatic check: the question ends by asking
 for one short line per cluster, or per object examined, in a fixed vocabulary, for example "cluster B:
 protected application: yes; which: batch-runner", and the automatic check is a pattern anchored on the
-cluster's name that accepts a right line and refuses any other word in a graded value slot, a hedge such as
-"probably" included (a slot graded for its form alone, the exclusion's end date, refuses only a hedge mark, and an item's parenthetical in a list slot is ungraded, the judge's to read); prose stays with the second model. Two guards
+cluster's name that accepts a right line and refuses any other word in a slot graded for its value, a hedge such as
+"probably" included (a slot graded for its form alone, the exclusion's end date, refuses only a hedge mark; an ungraded slot, the `next minor` and `dataplane` tails among them, and an item's parenthetical in a list slot are the judge's to read); prose stays with the second model. Two guards
 go with that form. A
 test about a planted object carries a check on that object, so a run that
 quietly repairs it fails rather than passes; the check reaches only objects in the cluster that the

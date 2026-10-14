@@ -193,7 +193,8 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-retired-registry-image-named",
 ]
 # Taken back out of the nightly file after registering there, each with a
-# KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
+# KNOWN_UNREGISTERED or FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# that says why.
 PARKED_AFTER_THE_MOVE = [
     "oobe-first-run-audits",  # 2026-10-09: truncated the main nightly, graded blocked
 ]
