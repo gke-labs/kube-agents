@@ -67,7 +67,7 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?:yes|no); path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no); path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-socket-is-mounted
     role: objective
@@ -78,9 +78,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: yes; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: yes; path:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?!yes;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?!yes;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-containerd-socket-path
     role: objective
@@ -91,9 +91,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?:yes|no); path:? ?/run/containerd/containerd\.sock$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no); path:? ?/run/containerd/containerd\.sock$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?:yes|no); path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no); path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

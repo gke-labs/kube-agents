@@ -71,7 +71,7 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?[^ :;\n][^\n]*$'
 
   # The image reference as the manifest spells it, with or without the
   # docker.io/library/ prefix kubectl shows.
@@ -84,9 +84,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: (?:yes|no); memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: (?:yes|no); memory limit:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?(?!(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre;)[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?(?!(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre;)[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-runtime-is-blind-to-cgroup-v2
     role: objective
@@ -97,9 +97,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: no; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: no; memory limit:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?!no;)[^;\n]+; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?!no;)[^;\n]+; memory limit:? ?[^ :;\n][^\n]*$'
 
   # The limit is what the misread heap is killed at; the fold lowercases the
   # quantity, and a space or a MiB spelling is the same number.
@@ -112,9 +112,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?192 ?mib?$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?192 ?mib?$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?(?!192 ?mib?$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no); memory limit:? ?(?!192 ?mib?$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

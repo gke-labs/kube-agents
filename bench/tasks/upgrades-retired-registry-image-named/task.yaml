@@ -63,7 +63,7 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-names-the-retired-host
     role: objective
@@ -74,9 +74,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io; retired: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-says-the-host-is-retired
     role: objective
@@ -87,9 +87,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
