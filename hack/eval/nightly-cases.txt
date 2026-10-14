@@ -377,11 +377,14 @@
 # seventy-three: ninety cases (270 units) here, of a one-hundred-and-four-case,
 # 312-unit matrix with the presubmit file's fourteen. The eleven on the
 # seeded-a shapes (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20) read
-# fixtures #2916 plants: they enter the nightly only after the postsubmit
-# reconcile that follows #2916's merge has applied the shapes to every pool
-# project, and the reconcile report and the scan that reads each role
-# healthy are cited here before the registering pull request's hold is
-# lifted (docs/designs/bench-case-format.md, Registration).
+# fixtures #2916 plants and enter on the author's decision of 2026-10-14,
+# with their fixture scan on record: 2026-10-14 18:12 UTC, each role healthy
+# on 38 of 40 pool projects and absent on kube-agents-evals-12 and -24. The
+# postsubmit reconcile that followed #2916 failed on seeded-b's pin (#3025,
+# fixed by #3042); the reconcile report and a scan reading every role healthy
+# on every project are cited here when a clean one exists
+# (docs/designs/bench-case-format.md, Registration). Until then a case that
+# reads an absent role on a project fails there, as the record shows.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
