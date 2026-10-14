@@ -401,12 +401,16 @@ def merge_volume_wins(image: object, live: object) -> object:
 
 
 def _snapshot_volume_wins(home: Path) -> dict[str, object]:
+    """Every VOLUME_WINS_GLOBS file the volume holds, keyed by its path, with its parsed
+    contents, or None when it could not be read or parsed. Every existing file is held out
+    of the copy either way: the image's copy of a volume-wins file is empty, so letting it
+    stand over a file a transient read error or a hand edit made unreadable would erase the
+    operator's tuning; such a file is left as it is and named in a WARN."""
     prior: dict[str, object] = {}
     for pattern in VOLUME_WINS_GLOBS:
         for path in home.glob(pattern):
-            contents = read_json(path)
-            if contents is not None:
-                prior[path.relative_to(home).as_posix()] = contents
+            if path.is_file():
+                prior[path.relative_to(home).as_posix()] = read_json(path)
     return prior
 
 
@@ -432,6 +436,9 @@ def _restore_volume_wins(
     for relative, previous in prior.items():
         parts = relative.split("/")
         if parts[0] not in names:
+            continue
+        if previous is None:
+            log(f"WARN: could not read {relative}; the volume's copy stands untouched and is not merged")
             continue
         source = template_dir.joinpath(*parts)
         if not source.is_file():

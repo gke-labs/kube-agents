@@ -556,10 +556,25 @@ class CapabilityCriteriaMergeTest(unittest.TestCase):
         self.overlay(items=("cron",))
         self.assertEqual(self.read("criteria.json"), {"threshold": 7})
 
-    def test_an_unreadable_volume_copy_lets_the_image_defaults_stand(self):
+    def test_an_unreadable_volume_copy_is_left_untouched_not_replaced(self):
+        # The image's copy is empty, so letting it stand would erase the tuning; a file that
+        # does not parse, or could not be read this start, stays as it is and is not merged.
         write(self.home / self.CAP / "criteria.json", "{not json")
         self.overlay()
-        self.assertEqual(self.read("criteria.json"), {"threshold": 3, "new_key": "shipped"})
+        self.assertEqual((self.home / self.CAP / "criteria.json").read_text(), "{not json")
+        self.assertEqual(self.read("criteria.schema.json"), {"v": 2})
+        write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7}))
+        real_read_json = ps.read_json
+
+        def transient_read_error(path):
+            # A read that fails this start, as a volume still attaching produces: None, as read_json answers an OSError.
+            if path.name == "criteria.json" and path.is_relative_to(self.home):
+                return None
+            return real_read_json(path)
+
+        with patch.object(ps, "read_json", side_effect=transient_read_error):
+            self.overlay()
+        self.assertEqual(self.read("criteria.json"), {"threshold": 7})
 
     def test_a_crash_before_the_merge_leaves_the_tuned_file_untouched(self):
         # The copy must not put image defaults on the volume ahead of the merge:
