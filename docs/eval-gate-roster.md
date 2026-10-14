@@ -437,8 +437,9 @@ Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.t
 from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
-ledger case passes three repetitions anywhere, so nothing grades the GitLab ledger issue until
-#2920, a per-run harness probe of the issue path, lands or a ledger case earns a line. The GitLab
+ledger case passes three repetitions anywhere, so the ledger path is the harness's to prove: the
+lease-time probe in [`docs/ci-pool-projects.md`](ci-pool-projects.md) 5.6, which says the forge
+takes a ledger, not that the agent publishes one; that stays a case's job once one earns a line. The GitLab
 nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against

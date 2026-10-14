@@ -136,8 +136,8 @@ from github_api import (
     REQUEST_RETRY_CEILING,
     REQUEST_RETRY_SECONDS,
     GitHubAPI as BaseGitHubAPI,
-    _rate_limited,
     _retry_delay,
+    is_refusal,
     log,
 )
 
@@ -180,11 +180,6 @@ WATCHED_WORKFLOWS = (
 LABEL = "ci:main-broken"
 LABEL_COLOR = "d73a4a"
 LABEL_DESCRIPTION = "A required check is failing on main"
-
-# Status codes that separate GitHub refusing a request from GitHub failing:
-# the first is ours to fix and reds the sweep, the second is retried later.
-HTTP_SERVER_ERROR_FLOOR = 500
-HTTP_TOO_MANY_REQUESTS = 429
 
 # Where the checked-out repository is, relative to this file: the sweep runs
 # from a checkout of the default branch, so a workflow file that exists here is
@@ -609,24 +604,6 @@ class GitHubAPI(BaseGitHubAPI):
     def run(self, run_id):
         """One run as GitHub has it now, or None if it has been deleted."""
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}", tolerate=(404,))
-
-    def workflows(self):
-        """Every workflow the repository has, paged to the endpoint's own total.
-
-        The list endpoint returns `{"total_count": n, "workflows": [...]}`, so
-        the shared client's `get_all`, which pages a bare list, cannot read it.
-        An empty page ends the loop as well as reaching the total, so a total
-        that overstates the list cannot spin this.
-        """
-        found = []
-        page = 1
-        while True:
-            query = urllib.parse.urlencode({"per_page": PER_PAGE, "page": page})
-            batch = self.get(f"/repos/{self.repo}/actions/workflows?{query}")
-            found.extend(batch["workflows"])
-            if not batch["workflows"] or len(found) >= batch["total_count"]:
-                return found
-            page += 1
 
     def run_exists(self, run_id):
         """Whether a run is still there. An administrator can delete one."""
@@ -1081,7 +1058,7 @@ def sweep(api, repo, branch, dry_run):
         # the client's retries, or a response of the wrong shape, must not red
         # the schedule every fifteen minutes; the next sweep retries. A request
         # GitHub refused outright is ours to fix, and does.
-        if _is_our_fault(error):
+        if is_refusal(error):
             log(f"GitHub refused the workflow list ({error}); that is a fault in this repository")
             return 1
         warn(f"The workflow list could not be read ({type(error).__name__}: {error}); leaving this sweep to the next one")
@@ -1123,7 +1100,7 @@ def sweep(api, repo, branch, dry_run):
             report(api, workflow["id"], runs, repo, dry_run)
         except Exception as error:  # noqa: BLE001 - one workflow's failure, read or write, must not stop the rest
             log(f"{name}: {type(error).__name__}: {error}")
-            (broken if _is_our_fault(error) else failed).append(name)
+            (broken if is_refusal(error) else failed).append(name)
 
     if missing:
         log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing reports on it")
@@ -1137,17 +1114,6 @@ def sweep(api, repo, branch, dry_run):
     if broken:
         log(f"GitHub refused a request while reconciling {', '.join(broken)}; that is a fault in this repository")
     return 1 if missing or broken else 0
-
-
-def _is_our_fault(error):
-    """A 4xx other than a rate limit: a permission or a request GitHub rejects,
-    which retrying will not change and a person here has to fix."""
-    return (
-        isinstance(error, urllib.error.HTTPError)
-        and error.code < HTTP_SERVER_ERROR_FLOOR
-        and error.code != HTTP_TOO_MANY_REQUESTS
-        and not _rate_limited(error)
-    )
 
 
 def main(argv=None):
