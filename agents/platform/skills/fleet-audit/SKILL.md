@@ -458,6 +458,8 @@ real run plans. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
+With no forge configured, the dry run still validates the document the same way, but its preview
+shows the ledger and pull-request bodies a forge would get; the real run publishes neither.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
 the message names and re-run; never delete the finding that tripped it. The one exception is a

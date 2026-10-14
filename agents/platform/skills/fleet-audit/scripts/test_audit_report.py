@@ -25187,6 +25187,16 @@ class TestNoForge(BaseTestCase):
         self.assertFalse(out["silent_ok"])
         self.assertEqual(out["summary"].splitlines()[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
 
+    def test_the_summary_order_does_not_follow_the_document(self):
+        first = self.finish(make_doc(findings=THREE_SEVERITIES))["summary"].splitlines()[1:5]
+        second = self.finish(make_doc(findings=list(reversed(THREE_SEVERITIES))))["summary"].splitlines()[1:5]
+        self.assertEqual(first, second)
+
+    def test_the_summary_says_when_collector_candidates_were_left_out(self):
+        self.patch_attr("unpublished_candidates", lambda accounted, manifest: [{"id": "a"}, {"id": "b"}])
+        out = self.finish(make_doc())
+        self.assertIn("The collector flagged 2 candidate(s)", out["summary"])
+
     def test_the_summary_names_the_object(self):
         out = self.finish(make_doc(findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="")]))
         self.assertIn("(prod-us-east/ClusterRoleBinding/debug-binding)", out["summary"])

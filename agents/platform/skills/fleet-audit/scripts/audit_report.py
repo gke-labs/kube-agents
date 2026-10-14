@@ -15977,13 +15977,15 @@ def render_no_forge_summary(
     delta_known: bool,
     held: list[str],
     note: str,
+    dropped: int = 0,
 ) -> str:
     """The chat summary of a run with no forge, which is the only report its operator gets.
 
     The headline counts, the most severe findings up to
     `NO_FORGE_SUMMARY_FINDINGS` with the object each one names, the ids the
-    collector still flags that the document left out, the coverage gaps, and
-    `note`. Redacted like the ledger body, because it is delivered to a
+    collector still flags that the document left out, how many of this run's
+    collector candidates the document does not carry (`dropped`), the
+    coverage gaps, and `note`. Redacted like the ledger body, because it is delivered to a
     channel the same way.
     """
     findings = list(data.get("findings") or [])
@@ -15998,8 +16000,7 @@ def render_no_forge_summary(
         f"{audit_name(audit_id)}: {findings_phrase(len(findings))} "
         f"({counts['critical']} critical) across {clusters} cluster(s){delta}."
     ]
-    rank = {severity: index for index, severity in enumerate(SEVERITIES)}
-    ordered = sorted(findings, key=lambda f: rank.get(str(f.get("severity")), len(SEVERITIES)))
+    ordered = sort_findings(findings)
     for finding in ordered[:NO_FORGE_SUMMARY_FINDINGS]:
         where = "/".join(
             part
@@ -16023,6 +16024,11 @@ def render_no_forge_summary(
             "Still flagged by the collector but not in this run's document: "
             + shown
             + (f", and {more} more in the report store" if more > 0 else "")
+        )
+    if dropped:
+        lines.append(
+            f"The collector flagged {dropped} candidate(s) this run's document does not carry; "
+            f"the report store lists them under `{UNPUBLISHED_CANDIDATES_KEY}`."
         )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
@@ -16129,7 +16135,7 @@ def _finish_without_forge(
     # For the same reason, a run the store does not hold is never quiet.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored
     payload["summary"] = render_no_forge_summary(
-        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note
+        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
     )
     print(json.dumps(payload))
 
