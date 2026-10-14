@@ -919,9 +919,11 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
 
 
 def webhook_read_row(error: dict) -> bool:
-    """Whether an ``errors`` row is one the second, webhook read wrote (``read: webhooks``): the
-    member's PDB, maintenance and skew rules were graded and ``unknown`` is its verdict, not an
-    absence, so the member is graded and the row is listed apart, not as an unread member."""
+    """Whether an ``errors`` row is one the second, webhook read wrote (``read: webhooks``). When
+    it is the member's only row, the member's PDB, maintenance and skew rules were graded and
+    ``unknown`` is its verdict, not an absence, so the member is graded and the row is listed
+    apart; a member whose first read also failed (two rows: the deadline, then the second read)
+    is unread, and both its rows are listed with the unread ones."""
     return bool(error.get(MEMBER_ID_KEYS[-1])) and error.get(ERROR_READ_KEY) == WEBHOOK_READ_ERROR
 
 
@@ -1192,9 +1194,13 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         "",
     ]
     errors = version_slice(report, clusters)[ERRORS_KEY]
+    # A webhook row is listed as a graded member's only when no row of the same member says its
+    # first read failed; with both rows the member is unread, and both rows say so.
+    unread_members = {member_key(e) for e in errors if unread_row(e)}
+    graded_webhook_rows = [e for e in errors if webhook_read_row(e) and member_key(e) not in unread_members]
     for heading, rows in (
-        (FAILED_READS_HEADING, [e for e in errors if not webhook_read_row(e)]),
-        (WEBHOOK_READ_ROWS_HEADING, [e for e in errors if webhook_read_row(e)]),
+        (FAILED_READS_HEADING, [e for e in errors if not any(e is row for row in graded_webhook_rows)]),
+        (WEBHOOK_READ_ROWS_HEADING, graded_webhook_rows),
     ):
         if rows:
             lines.append(heading)

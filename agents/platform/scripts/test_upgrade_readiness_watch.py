@@ -1039,6 +1039,24 @@ class WebhookReadFailure(unittest.TestCase):
         self.assertTrue(watch.unread_row(rows[1]) and not watch.webhook_read_row(rows[1]))
         self.assertFalse(watch.unread_row({"project": "p", "location": "us-central1", "message": "server config failed"}))
 
+    def test_a_member_with_a_first_read_row_and_a_webhook_row_is_listed_as_unread_with_both_rows(self) -> None:
+        # The first read timed out at the deadline (no skip marker), the second read then failed
+        # too: two rows for one member, which the summary counts as not read, so neither row
+        # sits under the heading that says the member was graded.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl get pdb,deploy,statefulset -A -o json timed out after 60 seconds"},
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+        ]
+        key = watch.member_key(big)
+        self.assertEqual(watch.readiness_verdicts({watch.MEMBERS_KEY: [big], watch.ERRORS_KEY: rows}, [key])[3], [key])
+        text = watch.render_markdown(TARGET, "a new version", [key], envelope([big], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 not read (p/us-central1/big;", text)
+        self.assertNotIn(watch.WEBHOOK_READ_ROWS_HEADING, text)
+        tail = text[text.index(watch.FAILED_READS_HEADING):]
+        self.assertIn("- p/us-central1/big: kubectl get pdb,deploy,statefulset -A -o json timed out after 60 seconds", tail)
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", tail)
+
 
 class ProfileHome(unittest.TestCase):
     def test_a_hand_run_from_the_gateway_home_finds_the_profile_s_ledger(self) -> None:
