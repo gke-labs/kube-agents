@@ -1180,6 +1180,34 @@ class PrepareKubeconfigTest(unittest.TestCase):
                 self.assertEqual((os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.islink(shared)), (0o700, True))
 
 
+    def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
+        # As the shared rule: a chmod the filesystem refuses keeps a directory this uid owns alone
+        # (owner write and search, no other uid's write) at its mode, said on stderr; any other mode,
+        # and another uid's directory from root's side, stay the note.
+        refused = OSError(errno.EPERM, "Operation not permitted")
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            os.mkdir(shared)
+            os.chmod(shared, 0o755)
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            with patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o755)
+            self.assertIn(report.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=shared, mode="0o755", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            for mode in (0o777, 0o555):
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(shared, mode)
+                    with patch.object(os, "fchmod", side_effect=refused):
+                        note = report.prepare_kubeconfig(shared, path)
+                    self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode=oct(mode), wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+            os.chmod(shared, 0o755)
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode="0o755", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+
+
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
     """The declared scope the agent carries from the platform_control fleet_scope
     tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,

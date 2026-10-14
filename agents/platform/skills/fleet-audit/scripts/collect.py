@@ -109,6 +109,15 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 # is this uid's, and remade (`prepare_kubeconfig`).
 KUBECONFIG_DIR_MODE = 0o1777
 KUBECONFIG_DIR_MODE_MASK = 0o7777
+# A chmod the filesystem refuses (mode bits it does not carry, a read-only
+# mount) on a directory this uid owns alone -- the owner able to write and
+# search it, no other uid able to write in it, the directory the old `mkdir`
+# used -- keeps the directory at its mode, said on stderr: the sticky bit
+# would guard against no other uid there. Any other mode the chmod cannot
+# reach is the note.
+KUBECONFIG_DIR_OWNER_WRITE_SEARCH = 0o300
+KUBECONFIG_DIR_OTHERS_WRITE = 0o022
+KUBECONFIG_MODE_KEPT_FORMAT = "{directory} stays at mode {mode}, which could not be changed to {wanted} ({error}): this uid's own and closed to other uids, so usable"
 KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
 KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 # A rename that finds the directory already moved: another thread of this
@@ -821,10 +830,11 @@ def prepare_kubeconfig(kc: Path) -> str | None:
 def usable_kubeconfig_dir(directory: Path) -> str | None:
     """`directory` at `KUBECONFIG_DIR_MODE`, owned by this uid or root: made
     fresh and chmodded (its missing ancestors keep the caller's umask);
-    widened when this uid owns it at another mode; moved aside and
-    remade when it is another uid's, since under the sticky bit this uid
-    could not replace that uid's files in it. A note when none of that is
-    possible, naming the owner."""
+    widened when this uid owns it at another mode, or kept at that mode,
+    said on stderr, when the chmod fails and the directory is this uid's
+    alone; moved aside and remade when it is another uid's, since under the
+    sticky bit this uid could not replace that uid's files in it. A note
+    when none of that is possible, naming the owner."""
     euid = os.geteuid()
     if os.path.islink(directory):
         return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory)
@@ -874,7 +884,16 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
         try:
             os.fchmod(opened, KUBECONFIG_DIR_MODE)
         except OSError as exc:
-            return f"{directory} is at mode {oct(current.st_mode & KUBECONFIG_DIR_MODE_MASK)}, not {oct(KUBECONFIG_DIR_MODE)}, and could not be changed ({exc})"
+            # Judged on the directory the descriptor holds, not the earlier stat.
+            actual = os.fstat(opened)
+            mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
+            private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
+            if not private:
+                return f"{directory} is at mode {oct(mode)}, not {oct(KUBECONFIG_DIR_MODE)}, and could not be changed ({exc})"
+            # This uid's alone: no other uid can unlink or plant a file here,
+            # so the mode the sticky bit was for is not needed, and refusing
+            # would read no cluster on every tick over such a filesystem.
+            log(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=directory, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc))
         finally:
             os.close(opened)
     return None

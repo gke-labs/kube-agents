@@ -259,6 +259,11 @@ KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
 # the caller named is made under the caller's umask.
 KUBECONFIG_DIR_MODE = 0o1777
 KUBECONFIG_DIR_MODE_MASK = 0o7777
+# A chmod the filesystem refuses keeps a directory this uid owns alone (owner
+# write and search, no other uid's write) at its mode, said on stderr, as the
+# shared rule keeps it; any other mode the chmod cannot reach is the note.
+KUBECONFIG_DIR_OWNER_WRITE_SEARCH = 0o300
+KUBECONFIG_DIR_OTHERS_WRITE = 0o022
 KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
 # The shared rule's notes, as `collect.usable_kubeconfig_dir` words them: the
 # reason a directory or file could not be made usable, with the owner named,
@@ -268,6 +273,7 @@ KUBECONFIG_NOT_MOVED_FORMAT = "{directory} is owned by uid {uid} and this run is
 KUBECONFIG_NOT_MADE_FORMAT = "{directory} could not be made ({error})"
 KUBECONFIG_NOT_READ_FORMAT = "{directory} could not be read ({error})"
 KUBECONFIG_MODE_NOT_CHANGED_FORMAT = "{directory} is at mode {mode}, not {wanted}, and could not be changed ({error})"
+KUBECONFIG_MODE_KEPT_FORMAT = "{directory} stays at mode {mode}, which could not be changed to {wanted} ({error}): this uid's own and closed to other uids, so usable"
 KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is another uid's and could not be replaced ({error})"
 KUBECONFIG_NOT_PREPARED_FORMAT = "cannot prepare kubeconfig: {note}"
 KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -704,8 +710,9 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
     into it, and a kubeconfig this uid cannot write removed. The default
     shared directory follows `collect.prepare_kubeconfig`'s rule and its
     contract: made at `KUBECONFIG_DIR_MODE` whatever the umask, widened when
-    this uid owns it, moved aside (said on stderr) and remade when another
-    uid's; None when it is usable, else why not, with the owner named, which
+    this uid owns it (or kept at its mode, said on stderr, when the chmod
+    fails and it is this uid's alone), moved aside (said on stderr) and
+    remade when another uid's; None when it is usable, else why not, with the owner named, which
     the caller reports as the member's read error. A directory the caller
     named is made under the caller's umask."""
     shared = os.path.realpath(kubeconfig_dir) == os.path.realpath(default_kubeconfig_dir())
@@ -763,7 +770,13 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
             try:
                 os.fchmod(opened, KUBECONFIG_DIR_MODE)
             except OSError as exc:
-                return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(current.st_mode & KUBECONFIG_DIR_MODE_MASK), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
+                # Judged on the directory the descriptor holds, as the shared rule.
+                actual = os.fstat(opened)
+                mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
+                private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
+                if not private:
+                    return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
+                print(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc), file=sys.stderr)
             finally:
                 os.close(opened)
     if os.path.islink(path):

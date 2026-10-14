@@ -12487,6 +12487,33 @@ class PrepareKubeconfigTest(unittest.TestCase):
             self.assertIsNone(collect.prepare_kubeconfig(kc))
             self.assertEqual(self.mode(kc.parent), collect.KUBECONFIG_DIR_MODE)
 
+    def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
+        # A filesystem that refuses the chmod (mode bits it does not carry, a read-only mount): a
+        # directory this uid owns, writable and searchable by it and by no other uid, is the one the
+        # old `mkdir` used, and the sticky bit would guard against no other uid there; it is kept at
+        # its mode and the keep is said, so the tick reads its clusters rather than refusing every
+        # one. A mode another uid can write under, one this uid cannot write under, and another
+        # uid's directory from root's side stay the note.
+        refused = OSError(errno.EPERM, "Operation not permitted")
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir()
+            kc.parent.chmod(0o755)
+            with patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(self.mode(kc.parent), 0o755)
+            self.assertIn(collect.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kc.parent, mode="0o755", wanted=oct(collect.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            for mode in (0o777, 0o555):
+                with self.subTest(mode=oct(mode)):
+                    kc.parent.chmod(mode)
+                    with patch.object(os, "fchmod", side_effect=refused):
+                        note = collect.prepare_kubeconfig(kc)
+                    self.assertEqual(note, f"{kc.parent} is at mode {oct(mode)}, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+            kc.parent.chmod(0o755)
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} is at mode 0o755, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+
     def test_another_uids_directory_is_moved_aside_and_remade(self):
         # root first: a 0755 directory a root hand run made, with root's 0600 kubeconfig in it, cannot
         # hold this uid's files; it is renamed in the parent, which is this uid's, and a fresh one made.
