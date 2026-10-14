@@ -281,6 +281,10 @@ stderr, where the scheduler logs it: a job announcing its own housekeeping every
 night is a job the room learns to skip, and the message that must not be skipped
 is the failure.
 
+It also logs, to stderr and for the same reason, each sandbox profile home's
+top-level entries that the product doesn't create (#2989). That's an inventory
+only: nothing is moved or deleted.
+
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
 68 KB in the sandbox; the first sweep removed 21 and 9 of them, leaving 164 KB
