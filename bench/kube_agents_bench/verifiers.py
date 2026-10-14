@@ -1681,11 +1681,6 @@ def _is_control_operator(word: str) -> bool:
     return isinstance(word, _ShellOperator) and set(word) <= _SHELL_OPERATOR_CHARS
 
 
-def _shell_words(command: str) -> list[str]:
-    """The words of :func:`_shell_words_and_spans`."""
-    return _shell_words_and_spans(command)[0]
-
-
 def _shell_argvs(command: str) -> list[list[str]]:
     """Each segment of a command line as an argv: comments come off and the line is tokenised
     first, so a quoted path is one word and a quoted sentence one word whatever it contains,
