@@ -7026,14 +7026,29 @@ def _run_objective(command: str) -> str:
         # the dictated per-run name is one word, whatever order the flags come in; a reserved word stands ahead
         (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness_$(date +%s).json", True),
         (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p", True),
+        # one quote model for the whole line: an apostrophe inside double quotes ahead of the name is text, and a `#`
+        # glued to the substitution's closing paren is part of the word
+        (f'echo "don\'t fan out" && python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p', True),
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s)#1.json --readiness", True),
         (f"for p in a b; do python3 {_SCRIPT_PATH} --readiness --project $p; done", True),
         (f"if python3 {_SCRIPT_PATH} --readiness; then echo ok; fi", True),
         # a redirect whose target is a comment is a line bash refuses
         (f"python3 {_SCRIPT_PATH} --readiness >#log", False),
-        # a wrapper's flag may take a word: everything after a wrapper is its own until the shell or interpreter
+        # a wrapper's own words are transparent: a flag, the word after a flag, a count, `--`
         (f'timeout -s KILL 600 bash -c "python3 {_SCRIPT_PATH} --readiness"', True),
         (f"env -u KUBECONFIG sh -c 'python3 {_SCRIPT_PATH} --readiness'", True),
         (f"sudo -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        (f"sudo -- python3 {_SCRIPT_PATH} --readiness", True),
+        # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
+        ("sudo -n ls fleet_upgrade_report.py --readiness", True),
+        # a program behind a wrapper that is not the script, a shell or an interpreter is the command the wrapper runs
+        (f"sudo ls {_SCRIPT_PATH} --readiness", False),
+        (f"sudo -- ls {_SCRIPT_PATH} --readiness", False),
+        (f"nohup echo python3 {_SCRIPT_PATH} --readiness &", False),
+        (f"sudo -u hermes echo python3 {_SCRIPT_PATH} --readiness", False),
+        (f'timeout 600 echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
+        (f'env echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
+        (f"nohup find /opt/data/profiles/platform/skills -name fleet_upgrade_report.py -exec grep -n -- --readiness {{}} \\;", False),
         # the file and the flag as another command's arguments are not a run of the file
         (f"find /opt/data/profiles/platform/skills -name fleet_upgrade_report.py -exec grep -n -- --readiness {{}} \\;", False),
         ("ls fleet_upgrade_report.py --readiness", False),
@@ -7049,7 +7064,7 @@ def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
 
 
 def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
-    from kube_agents_bench.verifiers import WorkerRun, _shell_argvs
+    from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _shell_argvs
 
     assert _shell_argvs('cd /x && python3 "/a b/f.py" --readiness; echo done') == [
         ["cd", "/x"], ["python3", "/a b/f.py", "--readiness"], ["echo", "done"]]
@@ -7076,11 +7091,24 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs('echo bash -c "python3 /x/f.py --readiness"') == [["echo", "bash", "-c", "python3 /x/f.py --readiness"]]
     assert _shell_argvs('nice -n 10 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('timeout -s KILL 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    # behind a wrapper, `echo` is the command the wrapper runs: its shell word is text and is not unwrapped
+    assert _shell_argvs('timeout 600 echo bash -c "python3 /x/f.py --readiness"') == [["timeout", "600", "echo", "bash", "-c", "python3 /x/f.py --readiness"]]
+    assert _shell_argvs('env echo bash -c "python3 /x/f.py --readiness"') == [["env", "echo", "bash", "-c", "python3 /x/f.py --readiness"]]
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
+    assert _argv_runs(["sudo", "ls", "fleet_upgrade_report.py", "--readiness"], run) is False
+    assert _argv_runs(["sudo", "-u", "hermes", "python3", "fleet_upgrade_report.py", "--readiness"], run) is True
     # a substitution stays inside its word; a bare `(` still opens a subshell; a quoted one is text
     assert _shell_argvs("python3 f.py --output r_$(date +%s).json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"]]
     assert _shell_argvs("echo $((1+2)) && python3 f.py --readiness") == [["echo", "$((1+2))"], ["python3", "f.py", "--readiness"]]
     assert _shell_argvs("diff <(echo a) <(echo b)") == [["diff", "<(echo a)", "<(echo b)"]]
     assert _shell_argvs("echo '$(not run)'") == [["echo", "$(not run)"]]
+    # one quote model: a `'` inside double quotes is text, so a later substitution still folds; a `)` that closes a
+    # span never opens a word, so a `#` glued to it is part of the word and one after a space is a comment
+    assert _shell_argvs("echo \"don't\" && python3 f.py --output r_$(date +%s).json --readiness") == [
+        ["echo", "don't"], ["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s)#1.json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)#1.json", "--readiness"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s) #done --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)"]]
+    assert _shell_argvs('echo "a $(echo "b c") d"') == [["echo", 'a $(echo "b c") d']]
     assert _shell_argvs("python3 f.py --readiness >#log") == []
     # a wrapped shell is unwrapped behind the wrappers that hand their argv on
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]

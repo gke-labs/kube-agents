@@ -1221,7 +1221,8 @@ _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
-# `printf` is text the command prints, and the string after its `-c` is not run.
+# `printf` is text the command prints, wherever the `echo` stands (`nohup echo bash -c ...` is
+# the wrapper running `echo`), and the string after its `-c` is not run.
 _SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command"))
 _SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # The interpreters a case's script is run through; `-m <stem>` is read after one of these.
@@ -1230,6 +1231,7 @@ _INTERPRETER_CODE_FLAG = "-c"
 _SHELL_COMMENT_CHAR = "#"
 _SHELL_QUOTE_CHARS = frozenset("'\"")
 _SHELL_SINGLE_QUOTE = "'"
+_SHELL_DOUBLE_QUOTE = '"'
 _SHELL_ESCAPE_CHAR = "\\"
 _SHELL_LINE_END = "\n"
 # A `#` opens a comment only where a word opens: at the start of the line, after whitespace or
@@ -1244,8 +1246,17 @@ _SHELL_REDIRECT_RE = re.compile(r"^\d*[<>]{1,2}&?$")
 # its enclosing word before the line is tokenised, so `r_$(date +%s).json` stays one word while
 # a bare `(` keeps opening a subshell.
 _SHELL_SUBSTITUTION_OPENERS = ("$((", "$(", "<(", ">(")
+# Inside double quotes bash still runs `$(`...`)` and `$((`...`))`; `<(` and `>(` are text there.
+_SHELL_QUOTED_SUBSTITUTION_OPENERS = ("$((", "$(")
 _SUBSTITUTION_MARK = "\x00S{index}\x00"
 _SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
+# After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
+# flag (its value, as in `-u hermes` or `-s KILL`; which flags take one is not tabled), a
+# duration or count (`timeout 600`) and `--`, which ends its options. The first other word is
+# the command the wrapper runs.
+_SHELL_FLAG_PREFIX = "-"
+_SHELL_OPTIONS_END = "--"
+_SHELL_COUNT_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _USAGE_FLAGS = ("-h", "--help")
 
 
@@ -1277,97 +1288,80 @@ class WorkerRun(BaseModel):
         return flags
 
 
-def _strip_shell_comments(command: str) -> str:
-    """The command line with its comments removed, as bash reads them: a ``#`` outside quotes
-    that opens a word (at the start of the line, after whitespace or after an operator
-    character) comments out the rest of its line, operators included, so nothing after it runs.
-    A ``#`` inside a word (``readiness-#2.json``, ``$#``), inside quotes (``'#1.json'``) or
-    escaped is part of the word. Read on the raw line, before the quotes come off, because
+def _read_shell_line(command: str) -> tuple[str, list[str]]:
+    """The command line with its comments removed and every substitution span the shell would
+    run replaced by a marker, and the spans in order, so the tokeniser reads each as part of its
+    word. One pass over the raw line, with one quote model: a ``'`` or ``"`` outside quotes opens
+    a quoted string that the other character does not close (``"don't"`` is one quoted word), and
+    an escaped character is kept with its escape and never opens a word. A ``#`` outside quotes
+    that opens a word (at the start of the line, after whitespace or after an operator character)
+    comments out the rest of its line, operators included, so nothing after it runs; a ``#``
+    inside a word (``readiness-#2.json``, ``$#``), inside quotes (``'#1.json'``) or escaped is
+    part of the word. A substitution (``$(``...``)``, ``$((``...``))``, ``<(``...``)``,
+    ``>(``...``)``) outside single quotes is consumed whole, quotes inside it honoured, so
+    ``r_$(date +%s).json`` stays one word and the ``)`` that closes it never opens a word for a
+    ``#`` after it; inside double quotes only the two forms bash runs there are folded. A span
+    left open at the line's end is kept as it stands. Read before the quotes come off, because
     afterwards a quoted ``#1.json`` and a bare one look the same."""
-    kept: list[str] = []
-    quote: str | None = None
-    escaped = False
-    commented = False
-    previous = _SHELL_LINE_END
-    for char in command:
-        if commented:
-            if char != _SHELL_LINE_END:
-                continue
-            commented = False
-        elif escaped:
-            # An escaped character never opens a word, so a `#` after it is part of the word
-            # (`readiness\ #1.json`), as bash reads it; it records as the escape, not as itself.
-            escaped = False
-            kept.append(char)
-            previous = _SHELL_ESCAPE_CHAR
-            continue
-        elif char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
-            escaped = True
-        elif quote is not None:
-            if char == quote:
-                quote = None
-        elif char in _SHELL_QUOTE_CHARS:
-            quote = char
-        elif char == _SHELL_COMMENT_CHAR and previous in _SHELL_WORD_OPENERS:
-            commented = True
-            continue
-        kept.append(char)
-        previous = char
-    return "".join(kept)
-
-
-def _fold_substitutions(command: str) -> tuple[str, list[str]]:
-    """The command line with every unquoted substitution span replaced by a marker, and the
-    spans in order, so the tokeniser reads each as part of its word; a span left open at the
-    line's end is kept as it stands."""
     spans: list[str] = []
     out: list[str] = []
     i = 0
     quote: str | None = None
+    previous = _SHELL_LINE_END
     while i < len(command):
         char = command[i]
-        if quote is not None:
-            if char == quote:
-                quote = None
-            out.append(char)
-            i += 1
+        if quote is None and char == _SHELL_COMMENT_CHAR and previous in _SHELL_WORD_OPENERS:
+            end = command.find(_SHELL_LINE_END, i)
+            if end < 0:
+                break
+            i = end
             continue
-        if char == _SHELL_ESCAPE_CHAR and i + 1 < len(command):
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 < len(command):
             out.append(command[i:i + 2])
+            previous = _SHELL_ESCAPE_CHAR
             i += 2
             continue
-        if char == _SHELL_SINGLE_QUOTE:
+        if char == quote:
+            quote = None
+        elif quote is None and char in _SHELL_QUOTE_CHARS:
             quote = char
-            out.append(char)
-            i += 1
-            continue
-        opener = next((o for o in _SHELL_SUBSTITUTION_OPENERS if command.startswith(o, i)), None)
-        if opener is None:
-            out.append(char)
-            i += 1
-            continue
-        depth = opener.count("(")
-        j = i + len(opener)
-        inner_quote: str | None = None
-        while j < len(command) and depth > 0:
-            c = command[j]
-            if inner_quote is not None:
-                if c == inner_quote:
-                    inner_quote = None
-            elif c in _SHELL_QUOTE_CHARS:
-                inner_quote = c
-            elif c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-            j += 1
-        if depth > 0:
-            out.append(command[i:])
-            break
-        spans.append(command[i:j])
-        out.append(_SUBSTITUTION_MARK.format(index=len(spans) - 1))
-        i = j
+        else:
+            openers = () if quote == _SHELL_SINGLE_QUOTE else _SHELL_QUOTED_SUBSTITUTION_OPENERS if quote == _SHELL_DOUBLE_QUOTE else _SHELL_SUBSTITUTION_OPENERS
+            opener = next((o for o in openers if command.startswith(o, i)), None)
+            if opener is not None:
+                close = _substitution_end(command, i + len(opener), opener.count("("))
+                if close is None:
+                    out.append(command[i:])
+                    break
+                spans.append(command[i:close])
+                out.append(_SUBSTITUTION_MARK.format(index=len(spans) - 1))
+                previous = _SUBSTITUTION_MARK[-1]
+                i = close
+                continue
+        out.append(char)
+        previous = char
+        i += 1
     return "".join(out), spans
+
+
+def _substitution_end(command: str, start: int, depth: int) -> int | None:
+    """The index just past the ``)`` that closes a span opened with ``depth`` parentheses before
+    ``start``, quotes inside the span honoured; None when the line ends first."""
+    inner_quote: str | None = None
+    j = start
+    while j < len(command) and depth > 0:
+        c = command[j]
+        if inner_quote is not None:
+            if c == inner_quote:
+                inner_quote = None
+        elif c in _SHELL_QUOTE_CHARS:
+            inner_quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        j += 1
+    return None if depth > 0 else j
 
 
 def _unfold_substitutions(word: str, spans: list[str]) -> str:
@@ -1378,11 +1372,11 @@ def _shell_words(command: str) -> list[str]:
     """The command line as the shell's words, quotes honoured and removed, operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
     quotes do not balance is one bash refuses and runs nothing of, so it yields no words, and
-    neither a run nor a mention is credited from it. Comments come off first
-    (:func:`_strip_shell_comments`), so the lexer's own ``#`` commenter is off, as in
-    ``shlex.split``: it would cut a word at a ``#`` inside it (``readiness-#2.json``), which
-    bash does not."""
-    command, spans = _fold_substitutions(_strip_shell_comments(command))
+    neither a run nor a mention is credited from it. Comments come off and substitutions
+    fold into their words first, in one pass (:func:`_read_shell_line`), so the lexer's own
+    ``#`` commenter is off, as in ``shlex.split``: it would cut a word at a ``#`` inside it
+    (``readiness-#2.json``), which bash does not."""
+    command, spans = _read_shell_line(command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -1428,24 +1422,37 @@ def _shell_argvs(command: str) -> list[list[str]]:
 def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
     """The index of the word the shell runs as this argv's command, when it is one the reader
     knows: a shell program, an interpreter, or ``script`` itself. Leading ``NAME=value``
-    assignments are skipped; after an exec wrapper (``timeout``, ``sudo``, ``env`` ...) every
-    word is the wrapper's until one of those three appears, so a wrapper's flag and its value
-    (``-s KILL 600``, ``-u user``) need no grammar of their own. A first word that is none of
-    them (``echo``, ``find``, ``ls``, ``grep``) is a command of its own, and None is returned:
-    nothing it names as an argument runs."""
+    assignments and reserved words are skipped. After an exec wrapper (``timeout``, ``sudo``,
+    ``env`` ...) only the wrapper's own words are transparent: a flag, the word after a flag (its
+    value, ``-u user`` or ``-s KILL``; which flags take one is not tabled, so the word after a
+    bare flag is read as its value even when it is a command, the one over-credit this leaves),
+    a duration or count (``timeout 600``) and ``--``, which ends its options. The first word that
+    is none of those is the command the wrapper runs: a shell, an interpreter or the script is
+    returned, and any other word (``ls``, ``echo``, ``find``, ``grep``) is a command of its own,
+    behind a wrapper as at the front of the argv, and None is returned: nothing it names as an
+    argument runs."""
     after_wrapper = False
+    after_flag = False
     for index, word in enumerate(argv):
         base = os.path.basename(word)
         if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
             return index
         if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
+            after_flag = False
             continue
         if base in _SHELL_EXEC_WRAPPERS:
-            after_wrapper = True
+            after_wrapper, after_flag = True, False
             continue
-        if after_wrapper:
-            continue
-        return None
+        if not after_wrapper:
+            return None
+        if word == _SHELL_OPTIONS_END:
+            after_flag = False
+        elif word.startswith(_SHELL_FLAG_PREFIX):
+            after_flag = True
+        elif after_flag or _SHELL_COUNT_RE.match(word):
+            after_flag = False
+        else:
+            return None
     return None
 
 
@@ -1454,8 +1461,9 @@ def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
     basename, or follows an interpreter that is (``python3 -m <stem>`` counts, ``python3 -c``
     does not, since the code string runs and the file is its argument); every one of
     ``run.flags`` is a later word, and no word is a usage flag, which prints the help and runs
-    nothing. A segment whose command is something else (``find``, ``ls``, an unquoted ``echo``)
-    is not a run however it names the file and the flag."""
+    nothing. A segment whose command is something else (``find``, ``ls``, an unquoted ``echo``),
+    at the front or behind an exec wrapper, is not a run however it names the file and the
+    flag."""
     if any(word in _USAGE_FLAGS for word in argv):
         return False
     command = _command_word_index(argv, run.script)
@@ -1509,7 +1517,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``$(...)`` is not read as one -- the dictated command spells the path in
     full; an unquoted ``$(...)``, ``$((...))``, ``<(...)`` or ``>(...)`` is kept
     inside its word, as the shell keeps it, and a reserved word (``if``, ``do``,
-    ``!``) stands ahead of the command word. Fails closed
+    ``!``) stands ahead of the command word; so may an exec wrapper (``timeout``,
+    ``sudo``, ``env``) with its own words -- a flag, the word after a flag, a
+    count, ``--`` -- and a program behind one that is not the script, a shell or
+    an interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a
+    run; which flags take a value is not tabled, so the word after a bare flag
+    is read as its value (``sudo -n ls <script> --readiness`` is still credited).
+    Fails closed
     like its siblings -- a run with no captured worker commands is
     ``status="error"``, not a pass.
     """
