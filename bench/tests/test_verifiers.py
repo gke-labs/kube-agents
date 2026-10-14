@@ -7257,6 +7257,7 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas, not endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: there are none, though kube-system still writes endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints,none of the others",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, and not actually called by anything",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: neither, endpoints is only kube-system's",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
         ],
@@ -7282,6 +7283,7 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: no policies in seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation carry none)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 without (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation?",
         ],
         "seeded-{s}: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none",
@@ -7732,3 +7734,15 @@ def test_group2_no_surge_refuses_nested_unclosed_parentheticals_at_once():
     verdicts = _group5_verdicts(case, _group5_report(line))
     assert time.monotonic() - started < 2.0
     assert verdicts["the-declared-line-names-the-pinned-workload"] != "pass", verdicts
+
+
+def test_group3_removed_api_refuses_a_long_oxford_joined_list_at_once():
+    import time
+
+    case = "upgrades-removed-api-callers-distinguished"
+    items = ", and ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
+    line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
+    started = time.monotonic()
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts

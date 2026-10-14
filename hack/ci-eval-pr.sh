@@ -2632,8 +2632,9 @@ unit_cost_hint() {
     # names the multi-zone cluster without saying which, so the agent reads
     # each to find it; entries 6 and 16 ask for one declared line per
     # cluster). Measured on a dev install with one user worker slot, so the
-    # cards ran one at a time: entries 1, 2 and 3 at 400-1081s a repetition
-    # (2026-10-07 and 10-08) and 475-1092s (2026-10-13); entries 6 and 16 at
+    # cards ran one at a time: entries 1 and 3 at 541-1081s and entry 2 at
+    # 3163s a repetition (2026-10-07 and 10-08), all three at 475-1092s
+    # (2026-10-13); entries 6 and 16 at
     # 2041s and 2538-2551s (2026-10-08 and 10-13, the latter two at the 2400s
     # delegation ceiling). All priced at the 900 band they share.
     upgrades-drain-blocking-budget-named | upgrades-no-surge-pool-recreate-warned) echo 900 ;;
