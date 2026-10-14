@@ -1790,6 +1790,15 @@ class CriteriaTest(unittest.TestCase):
             pr.Criteria(pool_skew_critical_minors=4, fleet_spread_min_minors=3, blocking_exclusion_min_days=45, deprecated_image_types=frozenset({"COS", "UBUNTU"})),
         )
 
+    def test_the_deprecated_list_takes_the_scope_flags_grammar(self):
+        # Commas or whitespace, each entry once: the grammar --scope-projects uses on the same line.
+        for value, expected in (("COS UBUNTU", {"COS", "UBUNTU"}), ("cos, ubuntu cos", {"COS", "UBUNTU"})):
+            with self.subTest(value=value):
+                with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        pr.main(["--project", "acme", "--deprecated-image-types", value])
+                self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset(expected))
+
     def test_no_flags_is_the_shipped_criteria(self):
         with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):

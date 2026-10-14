@@ -1403,12 +1403,10 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     if args.blocking_exclusion_min_days > MAX_FREEZE_HORIZON_DAYS:
         parser.error(f"--blocking-exclusion-min-days must be at most {MAX_FREEZE_HORIZON_DAYS}: a longer horizon is not a span of days the check can hold")
     # Compared case-insensitively, as §3.9 reads image types; an empty flag is
-    # an operator who emptied the list, not the default.
-    deprecated = frozenset(
-        item.strip().upper()
-        for item in args.deprecated_image_types.split(IMAGE_TYPE_LIST_SEPARATOR)
-        if item.strip()
-    )
+    # an operator who emptied the list, not the default. The list grammar is
+    # the one the scope flags on this same command line use, commas or
+    # whitespace with each entry once, so one command line has one grammar.
+    deprecated = frozenset(item.upper() for item in fleet_scope_args.parse_scope_projects(args.deprecated_image_types))
     return Criteria(
         pool_skew_critical_minors=args.pool_skew_critical_minors,
         fleet_spread_min_minors=args.fleet_spread_min_minors,
@@ -1426,7 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pool-skew-critical-minors", type=int, default=POOL_SKEW_CRITICAL_MINORS, help="§3.2: a pool this many minors or more behind its control plane is critical (criteria.pool_skew_critical_minors)")
     parser.add_argument("--fleet-spread-min-minors", type=int, default=FLEET_SPREAD_MIN_MINORS, help="§3.3: flag the fleet once its control-plane minors span this many (criteria.fleet_spread_min_minors)")
     parser.add_argument("--blocking-exclusion-min-days", type=int, default=LONG_FREEZE_DAYS, help="§3.8: an upgrade-blocking exclusion ending further out than this many days is flagged on its own (criteria.blocking_exclusion_min_days)")
-    parser.add_argument("--deprecated-image-types", default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: comma-separated node image types flagged whether or not the location still offers them (criteria.deprecated_image_types)")
+    parser.add_argument("--deprecated-image-types", default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated as --scope-projects is (criteria.deprecated_image_types)")
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)
     manifest = collect_fleet(args.project, criteria=criteria_from_args(parser, args))
