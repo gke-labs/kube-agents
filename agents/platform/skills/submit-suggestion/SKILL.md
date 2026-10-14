@@ -81,7 +81,7 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py pre
 
 _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` or `--repo "acme/fleet" --branch "platform-agent/upgrade-policy-baseline"`)_
 
-In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.5).
+In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3, item 6).
 
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because

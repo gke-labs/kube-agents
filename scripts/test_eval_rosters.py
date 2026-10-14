@@ -529,9 +529,6 @@ INJECT_LANE_REQUESTING = [
     # objective's pull_request_opened leaf allows one.
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
-    # A cluster request may end in the pull request that proposes the cluster
-    # (#2937); its objective's pull_request_opened leaf allows one.
-    "provisioning-cluster-request-never-creates",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
