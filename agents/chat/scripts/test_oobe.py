@@ -1102,6 +1102,18 @@ class RosterTest(unittest.TestCase):
         self.assertTrue(job["no_agent"])
         self.assertEqual(job["deliver"], "local")
 
+    def test_the_retired_first_run_jobs_ship_disabled(self):
+        # oobe is the only job that may start the first-run audits; the image's
+        # `enabled` is what turns off a copy already on the volume.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
+        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery", "first-run-quick-value-audit"):
+            if job_id in jobs:
+                self.assertIs(jobs[job_id].get("enabled"), False, job_id)
+                self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
+
 
 if __name__ == "__main__":
     unittest.main()
