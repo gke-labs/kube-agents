@@ -11,7 +11,7 @@ import tempfile
 import unittest
 import subprocess
 from unittest import mock
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -1041,18 +1041,31 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+@contextmanager
 def owned_by(path, uid):
-    """`os.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
-    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
-    real = os.stat
+    """`os.stat` and `os.fstat` reporting `uid` as `path`'s owner -- on the path, and on a descriptor
+    opened on it (matched by device and inode) -- the test's own fact rather than the runner's uid, real
+    for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real_stat, real_fstat = os.stat, os.fstat
+    try:
+        identity = os.lstat(path)
+        same = (identity.st_dev, identity.st_ino)
+    except FileNotFoundError:
+        same = None
+
+    def rewrite(result):
+        return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
 
     def fake(target, *args, **kwargs):
-        result = real(target, *args, **kwargs)
-        if isinstance(target, (str, bytes, os.PathLike)) and os.fspath(target) == os.fspath(path):
-            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
-        return result
+        result = real_stat(target, *args, **kwargs)
+        return rewrite(result) if isinstance(target, (str, bytes, os.PathLike)) and os.fspath(target) == os.fspath(path) else result
 
-    return patch.object(os, "stat", fake)
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        return rewrite(result) if same is not None and (result.st_dev, result.st_ino) == same else result
+
+    with patch.object(os, "stat", fake), patch.object(os, "fstat", fake_fstat):
+        yield
 
 
 class PrepareKubeconfigTest(unittest.TestCase):

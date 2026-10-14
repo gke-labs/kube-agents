@@ -1822,6 +1822,12 @@ class ShapeTest(unittest.TestCase):
         scaled_down = copy.deepcopy(payments)
         scaled_down["spec"]["replicas"] = 0
         self.assertEqual(ur.budget_shapes([{**pdb, "spec": {"minAvailable": "50%", "selector": shared}, "status": {"disruptionsAllowed": 0}}], [scaled_down]), [])
+        # The singleton leg honours the controller's zero as the budget's legs do: a one-replica
+        # Deployment whose budget reads expectedPods 0 (no pod object at read time: a quota refusal, an
+        # admission denial) is graded on no leg; only an unknown count falls back to the one replica.
+        no_pod_yet = {**pdb, "spec": {"minAvailable": 1, "selector": shared}, "status": {"disruptionsAllowed": 0, "expectedPods": 0, "currentHealthy": 0}}
+        self.assertEqual(ur.budget_shapes([no_pod_yet], [payments]), [])
+        self.assertEqual((ur._budget_demands_the_only_pod({"minAvailable": 1}, 0), ur._budget_demands_the_only_pod({"minAvailable": 1}, None), ur._budget_demands_the_only_pod({"minAvailable": "50%"}, 0)), (False, True, False))
 
     def test_entry_19_in_tree_volume_and_class(self):
         pv = self.shape("PersistentVolume/intree-pd", 19)
@@ -3941,6 +3947,22 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual([w for w in result["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["cluster"] == GEMMA], [])
         third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         self.assertEqual(([r["cluster"] for r in third["reviews"]], sorted(u["cluster"] for u in third["unchanged"])), ([], [GEMMA, SEEDED]))
+
+    def test_a_forced_cluster_the_listing_returned_not_running_gets_its_status_line_alone(self):
+        # `--cluster` naming a cluster the listing returned in PROVISIONING (STOPPING, ERROR): held with
+        # its status as the one line under Reads that failed. "named by --cluster but not listed in its
+        # project" is for a cluster the listing did not return, and is not also said of this one.
+        self.collect()
+        provisioning = cluster_doc("gemma-gpu-upgraded")
+        provisioning["status"] = "PROVISIONING"
+        fleet = FakeFleet(clusters=[cluster_doc("seeded-a"), provisioning])
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        result, _ = self.collect(fleet, now=later, cluster=[GEMMA])
+        self.assertEqual((result["reviews"], [line for line in result["failed_reads"] if GEMMA in line]), ([], [ur.NOT_RUNNING_TEXT.format(cluster=GEMMA, status="PROVISIONING")]))
+        self.assertEqual(result["not_running"][GEMMA], ur.NOT_RUNNING_REASON_FORMAT.format(status="PROVISIONING"))
+        nope = f"{PROJECT}/{LOCATION}/nope"
+        missing, _ = self.collect(fleet, now=later, cluster=[nope])
+        self.assertEqual([line for line in missing["failed_reads"] if nope in line], [f"{nope}: named by --cluster but not listed in its project"])
 
     def test_newly_displaced_replicas_make_an_already_recorded_row_new(self):
         # A StatefulSet carries no dated failure condition, so its pods are dated by their own evidence.

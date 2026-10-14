@@ -3901,8 +3901,12 @@ def _budget_demands_the_only_pod(spec: dict, covered: int | None) -> bool:
     (`_budget_allows_no_disruption`, with the controller's rounding): a
     positive `maxUnavailable`, by count or by percentage, allows at least one
     eviction and never demands the singleton's pod; over one covered pod any
-    `minAvailable` percentage above zero does."""
-    return _budget_allows_no_disruption(spec, covered or SINGLE_REPLICA)
+    `minAvailable` percentage above zero does. A controller that counts no
+    pod (`covered` 0) demands nothing, as the budget's own legs grade it;
+    only an unknown count falls back to the one replica."""
+    if covered == 0:
+        return False
+    return _budget_allows_no_disruption(spec, SINGLE_REPLICA if covered is None else covered)
 
 
 def budget_shapes(pdbs: list[dict], workloads: list[dict], pods: list[dict] | None = None) -> list[dict]:
@@ -5707,7 +5711,10 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     enumerated_keys = {cluster_key(c["project"], c["location"], c["name"]) for c in clusters}
     if forced:
         clusters = [c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) in forced]
-        missing = forced - {cluster_key(c["project"], c["location"], c["name"]) for c in clusters}
+        # Against the listing before the status filter: a forced cluster the
+        # listing returned outside AUDITABLE_STATUSES has its status line
+        # already, and is not also said to be unlisted.
+        missing = forced - enumerated_keys - set(not_running)
         for key in sorted(missing):
             failed_reads.append(f"{key}: named by --cluster but not listed in its project")
 

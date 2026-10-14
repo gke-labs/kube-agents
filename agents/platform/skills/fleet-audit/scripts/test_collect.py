@@ -22,7 +22,7 @@ import sys
 import textwrap
 import unittest
 import os
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -12445,18 +12445,31 @@ class CredentialsNoteTest(unittest.TestCase):
                 _, ok = collect.fetch_credentials("p", "c", "l", run=recording)
             self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
 
+@contextmanager
 def owned_by(path, uid):
-    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
-    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
-    real = Path.stat
+    """`Path.stat` and `os.fstat` reporting `uid` as `path`'s owner -- on the path, and on a descriptor
+    opened on it (matched by device and inode) -- the test's own fact rather than the runner's uid, real
+    for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real_stat, real_fstat = Path.stat, os.fstat
+    try:
+        identity = os.lstat(path)
+        same = (identity.st_dev, identity.st_ino)
+    except FileNotFoundError:
+        same = None
+
+    def rewrite(result):
+        return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
 
     def fake(self, *args, **kwargs):
-        result = real(self, *args, **kwargs)
-        if self == path:
-            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
-        return result
+        result = real_stat(self, *args, **kwargs)
+        return rewrite(result) if self == path else result
 
-    return patch.object(Path, "stat", fake)
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        return rewrite(result) if same is not None and (result.st_dev, result.st_ino) == same else result
+
+    with patch.object(Path, "stat", fake), patch.object(os, "fstat", fake_fstat):
+        yield
 
 
 class PrepareKubeconfigTest(unittest.TestCase):
