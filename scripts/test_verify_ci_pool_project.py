@@ -442,12 +442,19 @@ class GkeAndCmekTest(unittest.TestCase):
         # construction, and both are read so the record shows it.
         seated = set(eval_rosters.presubmit_cases()) | set(eval_rosters.blocking_roster())
         self.assertTrue(seated, "no presubmit cases found")
-        # Not one case id: any seated case whose prompt or checks reach the
-        # calendar-mode probe makes the pool's gap a presubmit red.
+        # A tripwire for the spellings a case can name the probe by, on the
+        # prompt side (the API's name, the phrase the skill section uses) and
+        # the check side (the gcloud verb, its flags). It pins the condition
+        # as far as text can: a prompt that reaches the probe through the
+        # skill's own trigger without any of these words is an eval-crew
+        # judgment at seating time, not something a grep can see.
+        spellings = ("calendar-mode", "calendarmode", "calendar mode", "future window", "--duration-range", "--start-time-range")
         for case_id in sorted(seated):
             case = checker._ROOT / "bench" / "tasks" / case_id / "task.yaml"
             self.assertTrue(case.is_file(), case_id)
-            self.assertNotIn("calendar-mode", case.read_text(), f"{case_id} reaches the calendar-mode probe; the finding can no longer be lease-silent")
+            text = case.read_text().lower()
+            hits = [s for s in spellings if s in text]
+            self.assertEqual(hits, [], f"{case_id} names the calendar-mode probe ({hits}); the finding can no longer be lease-silent")
         self.assertNotIn("obtainability-window-planning-probe", seated)
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):

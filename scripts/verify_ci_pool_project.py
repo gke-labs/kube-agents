@@ -411,7 +411,11 @@ REPAIR_CALENDAR_MODE_ROLE_ENABLE = (
 # presubmit in full: no case on the blocking roster runs `gcloud beta compute
 # advice calendar-mode`, and the one case that does
 # (obtainability-window-planning-probe) is nightly-only, so the finding is the
-# nightly's to read and not a pull request's. The bot reads this set
+# nightly's to read and not a pull request's. test_verify_ci_pool_project.py
+# trips on a seated case that names the probe by any of its spellings; a case
+# that reaches it through the skill's own trigger without naming it is for
+# whoever seats it to weigh, and moves this finding out of the set. The bot
+# reads this set
 # (scripts/eval_dashboard/pool_state.py `passes_leases`, for health.py's rule
 # 3e) before wording the advice, so a 403 on a project whose findings are all
 # here is reported as the change's to read, not the pool's.
