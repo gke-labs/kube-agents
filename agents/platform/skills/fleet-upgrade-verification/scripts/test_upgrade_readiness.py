@@ -490,6 +490,30 @@ class WebhookBackendTest(unittest.TestCase):
         slices = [endpoint_slice("scen", "other-svc", [True]), endpoint_slice("prod", "gate-svc", [True])]
         self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
 
+    def test_an_off_list_rule_at_an_unserved_version_is_not_said_to_fail_now(self):
+        # A leftover PodSecurityPolicy gate pinned to policy/v1beta1: no GKE version in support
+        # sends that request, and the reader cannot tell for a resource off its lists, so the
+        # cell says the requests fail if the server still serves the version, not that they do.
+        rule = {"apiGroups": ["policy"], "apiVersions": ["v1beta1"], "resources": ["podsecuritypolicies"], "operations": ["CREATE", "UPDATE"]}
+        graded = grade([hook("psp.example.com", [rule], policy="Fail")])
+        self.assertEqual(graded["blocking"], [])
+        cell = r.describe_webhook_finding(graded["outage"][0])
+        self.assertNotIn("fails its own requests now", cell)
+        self.assertIn("if the server still serves those versions", cell)
+        # The same resource at a served version, or unversioned, keeps the live-failure sentence.
+        for versions in (["v1"], ["*"]):
+            with self.subTest(versions=versions):
+                live = grade([hook("x.example.com", [dict(rule, apiVersions=versions)], policy="Fail")])
+                self.assertIn("fails its own requests now", r.describe_webhook_finding(live["outage"][0]))
+
+    def test_a_selector_exempting_kube_system_by_a_label_the_reader_never_sees_still_names_the_gate(self):
+        # `DoesNotExist` and `NotIn` on an operator-added exemption label read as admitting, the
+        # direction this reader errs toward: the gate is named, as the docstring says.
+        selector = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]}
+        self.assertTrue(r.namespace_selector_reaches({"namespaceSelector": selector}, {r.NAMESPACE_NAME_LABEL: "kube-system"}))
+        selector = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "NotIn", "values": ["no-self-managing"]}]}
+        self.assertTrue(r.namespace_selector_reaches({"namespaceSelector": selector}, {r.NAMESPACE_NAME_LABEL: "kube-system"}))
+
     def test_a_webhook_with_no_rules_is_counted_not_graded(self):
         # `rules` is optional and a webhook with none matches no request, so the server never
         # calls it: a dead backend behind it fails nothing now and is not an outage to report.

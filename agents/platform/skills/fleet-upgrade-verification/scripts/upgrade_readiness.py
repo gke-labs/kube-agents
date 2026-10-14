@@ -323,6 +323,10 @@ WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
 WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); it fails its own requests now and is reported, not graded"
+# The off-path cell for a rule pinned to a version of a resource off every graded list: the
+# reader does not know whether the server still serves that version, so it does not assert
+# that anything fails now.
+WEBHOOK_OUTAGE_VERSIONED_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); its requests fail now if the server still serves those versions, which this reader does not know for a resource off its lists; reported, not graded"
 # The off-path cell for a rule that names an upgrade-path write only at a version the server
 # does not serve: the server sends the webhook none of those requests, so nothing fails now,
 # and the cell says so rather than reporting a live outage.
@@ -915,7 +919,10 @@ def namespace_selector_reaches(hook: dict, labels: dict) -> bool:
     cannot evaluate counts as admitting, which errs toward naming the webhook. The caller
     passes the namespace's labels; `kube-system` and `kube-public` are judged on their default
     `kubernetes.io/metadata.name` label alone, so a selector keyed on a label an operator added
-    to them reads as not admitting, the one direction this reader errs away from naming."""
+    to them reads as not admitting under `matchLabels`, `In` and `Exists` (the one direction
+    this reader errs away from naming) and as admitting under `NotIn` and `DoesNotExist` (a label
+    added to exempt the namespace is one the reader never sees, so it errs toward naming there,
+    as it does everywhere else)."""
     selector = hook.get("namespaceSelector")
     if not isinstance(selector, dict) or not selector:
         return True
@@ -1086,6 +1093,13 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 continue
             matches = upgrade_path_matches(hook) + kube_system_write_matches(hook)
             pinned = [] if matches else version_pinned_rules(hook)
+            # Every rule names a version other than `*` and the served `v1`, and none is on a
+            # graded list: whether the server still serves them is not this reader's to say.
+            versioned_off_lists = not matches and not pinned and all(
+                (rule.get("apiVersions") or []) and WILDCARD not in rule["apiVersions"] and VERSION_V1 not in rule["apiVersions"]
+                and WILDCARD not in (rule.get("apiGroups") or []) and WILDCARD not in (rule.get("resources") or [])
+                for rule in _rules(hook)
+            )
             finding = {
                 "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
                 "config_kind": config_kind,
@@ -1097,6 +1111,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "version_pinned": _pinned_labels(pinned, hook),
                 "rules": describe_rules(hook),
                 "pinned_rules": [describe_rule(rule) for rule in pinned],
+                "versioned_off_lists": versioned_off_lists,
                 "live_rules": [describe_rule(rule) for rule in _rules(hook) if not any(rule is p for p in pinned)],
             }
             result["blocking" if matches else "outage"].append(finding)
@@ -1140,6 +1155,8 @@ def describe_webhook_finding(finding: dict) -> str:
     elif finding.get("pinned_rules"):
         matches = WEBHOOK_PINNED_MATCHES.format(
             rules=rules, pinned=LIST_SEPARATOR.join(finding.get("version_pinned") or finding["pinned_rules"]), served=VERSION_V1)
+    elif finding.get("versioned_off_lists"):
+        matches = WEBHOOK_OUTAGE_VERSIONED_MATCHES.format(rules=rules)
     else:
         matches = WEBHOOK_OUTAGE_MATCHES.format(rules=rules)
     return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)
