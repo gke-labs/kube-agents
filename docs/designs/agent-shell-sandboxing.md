@@ -2137,11 +2137,14 @@ start in the profile home, so a worker's loose files land beside the skills and 
 on a volume nothing sweeps, and a later session that lists the home cannot tell them
 from what the product put there. Every top-level entry not on the job's expected list
 (the mirror's skeleton, the image-staged trees, the cluster-profile identity and
-kubeconfig, the database placeholders) is logged with its mtime and size. Inventory
-only, no moves: whether to move anything waits for data from the test fleet after cron
-runs get a working directory of their own. The listing runs as `hermes`, the default
-principal, because its output is believed, and with NUL-terminated records so a name
-cannot forge a row.
+kubeconfig, the database placeholders) goes to `logs/kanban_workspace_gc.log` on the
+agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
+profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
+kubeconfig there. Inventory only, no moves: whether to move anything waits for data from
+the test fleet after cron runs get a working directory of their own. The listing runs as
+`hermes`, the default principal, because its output is believed, under the sandbox's own
+`workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
+name cannot forge a row.
 
 #### The agent pod gives up cluster tooling entirely
 
