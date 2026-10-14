@@ -201,6 +201,9 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop.classify_refusal("echo '$ kubectl scale deploy kube-dns --replicas=3'; cat /tmp/refusal.txt | tee /tmp/pr-body.md", _result(lines, 0), failed=False), "policy")
         # Not counted, by design: a write that reached kubectl through a script or a variable and exited 0.
         self.assertEqual(stop.classify_refusal("bash /tmp/retry.sh; echo done", _result(lines, 0), failed=False), "advisory")
+        # ``auth can-i <verb>`` names the verb in a read's arguments.
+        self.assertEqual(stop.classify_refusal("kubectl auth can-i scale deployments -n kube-system; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
+        self.assertEqual(stop.classify_refusal("kubectl auth can-i scale deployments -n kube-system; kubectl scale deploy/kube-dns -n kube-system --replicas=3 || true", _result(lines, 0), failed=False), "policy")
         # A shell prologue's ``set`` is before the kubectl word, so it is not the verb.
         self.assertEqual(stop.classify_refusal("set -euo pipefail; kubectl get deploy kube-dns -n kube-system -o yaml > /tmp/c.yaml; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
 

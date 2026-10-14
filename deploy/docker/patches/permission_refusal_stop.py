@@ -142,6 +142,9 @@ _COUNT_ATTR = "_kube_permission_refusals"
 #: mutating verb: a refused write chained before a read does, a ``cat`` or
 #: ``kubectl logs`` whose output happens to carry the shim's lines does not.
 _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
+# ``kubectl auth can-i <verb> …`` names a verb in a read's arguments; the phrase is
+# dropped before the word test.
+_CAN_I_RE = re.compile(r"(?<![\w-])kubectl(\s+-\S+)*\s+auth\s+can-i\b[^;|&\n]*")
 
 WARN_MESSAGE = (
     "Permission refused. This is a boundary, not an error to work around: the change is "
@@ -194,10 +197,11 @@ def names_a_write(command) -> bool:
     read from a read that echoed a refusal; a ``set -e`` prologue is before the word)."""
     if not isinstance(command, str):
         return False
-    first = _KUBECTL_WORD_RE.search(command)
+    text = _CAN_I_RE.sub("", command)
+    first = _KUBECTL_WORD_RE.search(text)
     if first is None:
         return False
-    words = set(re.split(r"[\s\"'`;|&()\[\],]+", command[first.end():]))
+    words = set(re.split(r"[\s\"'`;|&()\[\],]+", text[first.end():]))
     return bool(words & MUTATING_VERBS) or any(
         head in words and words & subs for head, subs in MUTATING_SUBVERBS.items()
     )

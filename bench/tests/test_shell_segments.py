@@ -328,6 +328,11 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "doas -u root kubectl scale deploy x --replicas=3",
         "chroot /mnt/root kubectl scale deploy x --replicas=3",
         "taskset -c 0 kubectl scale deploy x --replicas=3",
+        "taskset 0x1 kubectl scale deploy x --replicas=3",
+        "/usr/bin/sudo kubectl scale deploy x --replicas=3",
+        "/usr/bin/timeout 30 kubectl scale deploy x --replicas=3",
+        "env -S 'kubectl scale deploy x --replicas=3'",
+        "echo 'kubectl scale deploy x --replicas=3' | tee /tmp/fix.sh >/dev/null && bash /tmp/fix.sh",
         '"$(which kubectl)" scale deploy x --replicas=3',
     ):
         assert "kubectl scale deploy x --replicas=3" in segments(command), command
@@ -373,6 +378,7 @@ def test_typed_segments_type_python_text_wherever_it_ran():
     assert "kubectl scale deploy/x --replicas=3" in segments("bash -m -c 'kubectl scale deploy/x --replicas=3'")
     assert typed_segments("python3 -c 'print(1)'") == [("shell", "python3 -c 'print(1)'"), ("python", "print(1)")]
     assert ("python", "print(1)") in typed_segments("echo 'print(1)' > s.py && python3 s.py")
+    assert ("python", "print(1)") in typed_segments("/usr/bin/env python3 -c 'print(1)'")
     assert all(kind == "shell" for kind, _ in typed_segments("bash -c 'kubectl get x; kubectl scale deploy/x --replicas=3'"))
 
 

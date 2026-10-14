@@ -80,10 +80,12 @@ _WRAPPER_VALUE_OPTIONS = {
     "stdbuf": {"-i", "-o", "-e"},
     "watch": {"-n", "-d", "--interval"},
     "xargs": {"-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--replace"},
-    "env": {"-u", "-C", "-S"},
+    "env": {"-u", "-C"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
 }
 _WRAPPER_POSITIONAL = {"timeout": 1, "chroot": 1}
+# taskset's first form is a mask before the command (``taskset 0x1 cmd``).
+_TASKSET_MASK_RE = re.compile(r"^(0x)?[0-9a-fA-F]+$")
 # Words that end a block; never a command.
 _BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "su"})
@@ -213,6 +215,15 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
     out.append((unquoted + piece[end:]).strip())
     base = unquoted.rsplit("/", 1)[-1]
     rest = tokens[index + 1 :]
+    if base == "env":
+        # GNU ``env -S '<string>'`` splits and runs its string.
+        for n, (_, _, token) in enumerate(rest):
+            if token in ("-S", "--split-string") and n + 1 < len(rest):
+                _walk(_unquote(rest[n + 1][2]), out, depth + 1)
+                break
+            if token.startswith("-S") and len(token) > 2:
+                _walk(_unquote(token[2:]), out, depth + 1)
+                break
     if base in _SHELLS or base == "eval" or _PYTHONS.match(base):
         script = _dash_c_script(base, rest)
         if script is not None:
@@ -378,9 +389,11 @@ def _command_index(tokens: list[tuple[int, int, str]]) -> int | None:
         if _ASSIGNMENT_RE.match(raw) and not raw.startswith(("'", '"')):
             i += 1
             continue
-        if word in _WRAPPERS:
-            name = word
+        if word.rsplit("/", 1)[-1] in _WRAPPERS:
+            name = word.rsplit("/", 1)[-1]
             i += 1
+            if name == "taskset" and i < len(tokens) and _TASKSET_MASK_RE.match(tokens[i][2]):
+                i += 1
             values = _WRAPPER_VALUE_OPTIONS.get(name, set())
             while i < len(tokens) and tokens[i][2].startswith("-") and tokens[i][2] != "--":
                 option = tokens[i][2]
@@ -704,6 +717,11 @@ def _writer_target(piece: str) -> str:
     """The file a writer piece's own redirect, ``tee`` or ``dd of=`` names, read token by token
     so a ``>`` inside the quoted text is not taken for it."""
     tokens = [t for _, _, t in _tokens(piece)]
+    found = _command_word(piece)
+    if found and found[0].rsplit("/", 1)[-1] == "tee":
+        positional = [a for a in found[1] if not a.startswith(("-", ">"))]
+        if positional:
+            return positional[0]
     for i, token in enumerate(tokens):
         attached = _ATTACHED_REDIRECT_RE.match(token)
         if attached:

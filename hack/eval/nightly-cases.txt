@@ -254,7 +254,7 @@
 # 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
 # units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
 # plants a previous run in the report store and removes it on destroy). It is
-# the next-to-last entry below: sixty-six cases (198 units) here, of an eighty-case,
+# the entry after fleet-audit-unchanged-finding-keeps-wording below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
 #

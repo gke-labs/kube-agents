@@ -42,16 +42,15 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
-
-# The verb words go onto a line protocol the agent runtime reads; see
-# credential_proxy_client.py, which applies the same rule.
-_VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
-_VERB_WORD_MAX = 64
 import providers
 import repo_ref
 import scoped_sa_pool
 import vcs_broker
 
+# The verb words go onto a line protocol the agent runtime reads; see
+# credential_proxy_client.py, which applies the same rule.
+_VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
+_VERB_WORD_MAX = 64
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
 # file is in its pod and not in this one; these are the vocabulary both sides
 # share, and importing them keeps the context-name grammar -- and where the

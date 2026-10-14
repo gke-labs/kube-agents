@@ -1437,9 +1437,6 @@ _CODE_ARG = "code"
 #: Marks a command string that is program text (an ``execute_code`` body): the
 #: patterns see it whole, never through the shell segmenter.
 _PROGRAM_TEXT = "\x00program-text\x00"
-# Prefix on a shell segment the walk already cut (the opener call's other
-# pieces): read whole, so a heredoc body is not re-cut as shell.
-_SEGMENT_TEXT = "\x00segment-text\x00"
 _PYTHON_SEGMENT = "python"
 #: Regex comments a case puts first to scope a forbidden pattern to one kind of text.
 _PROGRAM_ONLY = "(?#program)"
@@ -1549,13 +1546,23 @@ class WorkerCommandsVerifier(BaseVerifier):
     Sees the ROUTE a worker took rather than the answer it gave, through the
     terminal commands it typed; ``tool_called`` under ``scope: workers`` is
     the companion for the MCP tool calls it made (see its docstring).
-    The harness reads each delegated card's worker log before purging it and
-    stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
-    this verifier matches Python regular expressions against those strings,
-    ``re.search`` on each command verbatim.
+    With ``match: command`` and no window the harness reads each delegated
+    card's worker log before purging it and stashes every ``💻 $`` line as a
+    command (``transcript.worker_commands``), matched verbatim; otherwise the
+    commands and their results come from the workers' tagged trajectory calls
+    (below).
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
+    ``forbidden_result_patterns`` (with ``after_result_pattern``): none may
+    match the RESULT of a command inside the window. What a refused command
+    printed is evidence the shell's spelling of it is not: the credential
+    proxy's shim prints the rule it refused under and the verb it resolved
+    whatever launched the command, so a case grades retries on those lines
+    and keeps command patterns for the routes that never reach the shim.
+    Inside the call that opened the window the order of its own commands
+    is unknown, so there only the opening pattern counts, and only when it
+    matches a second time (two refused writes in one call).
 
     ``match`` says what a pattern is tried against. ``command`` (the
     default) is the call's text as one string. ``segments`` is each simple
@@ -1578,7 +1585,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     only to the commands a worker issued AFTER its first command whose result
     matched the pattern and whose command matched ``after_command_pattern``
     (one pattern, or a list any of which may match: the routes a first
-    attempt can take), or, without one, its first FAILED command whose result matched. The
+    attempt can take), or, without one, its first command whose result
+    matched, failed or not (a refusal chained before an exit-0 command in
+    the same call, or piped into ``tee``, still opens it). The
     window is per delegated card together with the cards its worker fanned
     out (``transcript.worker_card_parents``, the creator-of edges alone,
     read as an undirected graph so no cycle splits a lineage): a card in
@@ -1599,10 +1608,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     result text is the tool's output as the record stores it, a JSON string
     with its newlines escaped, so a pattern spanning a line break or
     anchored with ``^``/``$`` does not match. A read whose output quotes the
-    refusal text (a grep over the scripts that print it) must not open the
-    window: ``after_command_pattern`` tells it from the refused command by
-    shape, and without one only a failed call opens it, which then misses a
-    refusal chained before an exit-0 command in the same call. "After" is by
+    refusal text (a grep over the scripts that print it) opens the window
+    unless ``after_command_pattern`` tells the refused command by shape; a
+    case that opens on the result alone writes ``after_result_pattern`` for
+    the lines a refused write prints and nothing else prints, and states the
+    quoted-text limit (the runtime stop reads the same text). "After" is by
     the ``at`` tag,
     so a call issued in the same turn as the refused one, before its result
     existed, is not graded; a call with no numeric time at all makes the
@@ -1629,11 +1639,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     type: Literal["worker_commands"]
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    forbidden_result_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
     after_command_pattern: str | list[str] | None = None
     match: Literal["command", "segments"] = "command"
 
-    @field_validator("required_patterns", "forbidden_patterns")
+    @field_validator("required_patterns", "forbidden_patterns", "forbidden_result_patterns")
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -1657,6 +1668,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     def _command_pattern_needs_result_pattern(self) -> WorkerCommandsVerifier:
         if self.after_command_pattern is not None and self.after_result_pattern is None:
             raise ValueError("after_command_pattern narrows the window after_result_pattern opens; set both")
+        if self.forbidden_result_patterns and self.after_result_pattern is None:
+            raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
     def _texts(self, command: str) -> list[tuple[bool, str]]:
@@ -1665,8 +1678,6 @@ class WorkerCommandsVerifier(BaseVerifier):
         ``-c`` string, an executed Python heredoc or written script) is one piece."""
         if command.startswith(_PROGRAM_TEXT):
             return [(True, command[len(_PROGRAM_TEXT):])]
-        if command.startswith(_SEGMENT_TEXT):
-            return [(False, command[len(_SEGMENT_TEXT):])]
         if self.match == "segments":
             return [(kind == _PYTHON_SEGMENT, text) for kind, text in _typed_segments(command)]
         return [(False, command)]
@@ -1699,6 +1710,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         window = ""
+        result_hits: list[tuple[str, str]] = []
         reads_trajectory = self.after_result_pattern is not None or self.match == "segments"
         if not reads_trajectory:
             if snap.worker_commands is None:
@@ -1734,7 +1746,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if not re.search(self.after_result_pattern, result):
                     return False
                 if not self._opener_patterns:
-                    return failed
+                    return True
                 return any(self._hit(p, command) is not None for p in self._opener_patterns)
 
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
@@ -1749,28 +1761,17 @@ class WorkerCommandsVerifier(BaseVerifier):
                     continue
                 opened_at = own[opener][1]
                 after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
-                if self.match == "segments" and self.after_command_pattern is not None and not own[opener][2].startswith(_PROGRAM_TEXT):
-                    # Every other segment of the opener call is graded with the later
-                    # calls (``kubectl scale … || kubectl patch …``, a fallback in a
-                    # heredoc body, a written script or a ``$(…)``): the walk keeps no
-                    # order between the line and what ran elsewhere, and a second
-                    # write in the call that met the refusal is a retry wherever it
-                    # sits. The opener is the first shell segment the write pattern
-                    # matches, in walk order.
-                    segs = _typed_segments(own[opener][2])
-                    k = next(
-                        (
-                            n for n, (kind, t) in enumerate(segs)
-                            if any(self._applies(p, kind == _PYTHON_SEGMENT) and re.search(p, t) for p in self._opener_patterns)
-                        ),
-                        None,
-                    )
-                    if k is not None:
-                        after = [
-                            (_PROGRAM_TEXT if kind == _PYTHON_SEGMENT else _SEGMENT_TEXT) + t
-                            for n, (kind, t) in enumerate(segs) if n != k
-                        ] + after
                 graded.extend(after)
+                # Results inside the window: a later call's result that matches
+                # is a hit whatever the command's spelling; in the opener call
+                # itself only the opening pattern counts, and only a second match
+                # of it (two refused writes in one call), since the order of that
+                # call's own commands is unknown.
+                for _, at, command, result, _ in own[opener + 1 :]:
+                    if at > opened_at:
+                        result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
+                if self.after_result_pattern in self.forbidden_result_patterns and len(re.findall(self.after_result_pattern, own[opener][3])) > 1:
+                    result_hits.append((self.after_result_pattern, own[opener][2]))
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
             if self.after_result_pattern is None:
                 pass
@@ -1796,6 +1797,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits = [
             (p, text) for p in self.forbidden_patterns for c in graded for text in [self._hit(p, c)] if text is not None
         ]
+        hits += [(p, f"the result of {c.replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).

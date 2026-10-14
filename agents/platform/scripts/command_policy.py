@@ -103,7 +103,10 @@ _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # attempted against the cluster, so the agent's runtime does not count it as a
 # refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
 # a help flag is (the verb's usage text, nothing attempted).
-_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list", "--dry-run", "--dry-run=client", "--dry-run=true", "-h", "--help"})
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list", "--dry-run", "-h", "--help"})
+# kubectl parses ``--dry-run``'s value with ParseBool before the strategy switch,
+# so every true spelling is a client render; ``server``/``none`` are writes.
+_LOCAL_DRY_RUN_VALUES = frozenset({"client", "true", "t", "1"})
 _LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
@@ -1118,12 +1121,17 @@ def local_render(argv: list[str]) -> bool:
     """Whether a kubectl ``argv`` only renders or reads a manifest locally.
 
     kubectl resolves a repeated flag last-wins, so only the last ``--dry-run``
-    counts: ``--dry-run=client --dry-run=none`` is a write.
+    counts: ``--dry-run=client --dry-run=none`` is a write. A render flag
+    given as another flag's value (``--field-manager -h``) reads as a render
+    here; the policy refuses the write either way, the runtime appends
+    guidance instead of halting.
     """
     own = argv[: argv.index("--")] if "--" in argv else argv
     dry_runs = [t for t in own if t.startswith("--dry-run")]
-    if dry_runs and dry_runs[-1] in _LOCAL_RENDER_FLAGS:
-        return True
+    if dry_runs:
+        last = dry_runs[-1]
+        if last == "--dry-run" or (last.startswith("--dry-run=") and last.split("=", 1)[1].lower() in _LOCAL_DRY_RUN_VALUES):
+            return True
     if any(t in _LOCAL_RENDER_FLAGS and not t.startswith("--dry-run") for t in own):
         return True
     verb, _ = _kubectl_verb_and_flag(argv)
