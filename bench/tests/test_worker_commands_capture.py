@@ -240,6 +240,50 @@ def test_archive_stalled_cards_warns_when_descendants_read_fails(monkeypatch, ca
     assert "'t_parent'" in archive_calls[0]
 
 
+def test_archive_stalled_cards_archives_roots_before_descendants_and_reaches_fixpoint(monkeypatch, caplog):
+    # Review finding: root workers are archived first to terminate them before
+    # reading descendants, and descendant reading loops to a fixpoint so any child
+    # filed while children are being archived is also discovered and archived.
+    calls = []
+    round_count = 0
+
+    def fake_shell(script, timeout):
+        nonlocal round_count
+        calls.append(script)
+        if getattr(board, "DESCENDANTS_PRESENT", "__KANBAN_DESCENDANTS__") in script:
+            round_count += 1
+            if round_count == 1:
+                # Pass 1: child_1 exists
+                payload = {"descendants": ["t_child_1"], "error": None}
+            elif round_count == 2:
+                # Pass 2: grandchild_1 filed by child_1 before child_1 was archived
+                payload = {"descendants": ["t_child_1", "t_grandchild_1"], "error": None}
+            else:
+                # Pass 3: fixpoint reached, no new descendants
+                payload = {"descendants": ["t_child_1", "t_grandchild_1"], "error": None}
+            return f"__KANBAN_DESCENDANTS__\n{json.dumps(payload)}\n"
+        if "kanban archive" in script:
+            tid = script.split("kanban archive")[1].strip().split()[0].strip("'\"")
+            return f"Archived {tid}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_parent"], 5.0)
+
+    # First call must be the root card archive
+    assert "kanban archive 't_parent'" in calls[0]
+    # Second call is the first descendants read
+    assert getattr(board, "DESCENDANTS_PRESENT", "__KANBAN_DESCENDANTS__") in calls[1]
+
+    archive_calls = [s for s in calls if "kanban archive" in s]
+    assert len(archive_calls) == 3
+    assert "'t_parent'" in archive_calls[0]
+    assert "'t_child_1'" in archive_calls[1]
+    assert "'t_grandchild_1'" in archive_calls[2]
+    assert round_count == 3
+
+
 def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):
     # _agent_shell returns "" for a failed exec exactly as for silence; the
     # log must not read as if the worker was stopped.

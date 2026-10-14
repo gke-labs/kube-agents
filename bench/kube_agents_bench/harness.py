@@ -1033,35 +1033,47 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     Best effort, like the rest of :meth:`KubeAgentsHarness._settle`, but a
     card that did not archive is warned about by name, with hermes's reason:
     its worker may still hold a slot, and the run log should not say
-    otherwise.
+    otherwise. Stalled root cards are archived first to terminate their
+    workers before walking descendants to a fixpoint, preventing concurrent
+    fan-out from escaping the pass.
     """
     if not stalled:
         return
-    descendants = board.read_descendants(_agent_shell, list(stalled), timeout)
-    to_archive = list(stalled)
-    if descendants is None:
-        _log.warning(
-            "could not read the fan-out children of %s; their workers may still hold dispatcher slots",
-            ", ".join(stalled),
-        )
-    else:
-        for cid in descendants:
-            if cid not in to_archive:
-                to_archive.append(cid)
-    for tid in to_archive:
+
+    def _archive(cid: str) -> bool:
         script = (
             f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
-            f'"$H" kanban archive {_shell_quote(tid)} 2>&1 || true'
+            f'"$H" kanban archive {_shell_quote(cid)} 2>&1 || true'
         )
         out = _agent_shell(script, timeout).strip()
         if out.startswith(_ARCHIVED_PREFIX):
-            _log.info("archived stalled card %s", tid)
-        else:
+            _log.info("archived stalled card %s", cid)
+            return True
+        _log.warning(
+            "could not archive stalled card %s; its worker may still hold a dispatcher slot (%s)",
+            cid,
+            out[:_LOG_EXCERPT_CHARS] or "no output",
+        )
+        return False
+
+    for tid in stalled:
+        _archive(tid)
+
+    archived = set(stalled)
+    while True:
+        descendants = board.read_descendants(_agent_shell, list(stalled), timeout)
+        if descendants is None:
             _log.warning(
-                "could not archive stalled card %s; its worker may still hold a dispatcher slot (%s)",
-                tid,
-                out[:_LOG_EXCERPT_CHARS] or "no output",
+                "could not read the fan-out children of %s; their workers may still hold dispatcher slots",
+                ", ".join(stalled),
             )
+            break
+        unarchived = [cid for cid in descendants if cid not in archived]
+        if not unarchived:
+            break
+        for cid in unarchived:
+            archived.add(cid)
+            _archive(cid)
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
