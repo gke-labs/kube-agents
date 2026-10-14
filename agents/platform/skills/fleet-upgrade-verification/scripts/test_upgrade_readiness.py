@@ -996,7 +996,7 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [[]])
         self.assertEqual([f["pinned_rules"] for f in graded["blocking"]], [[]])
         self.assertIn("matches CREATE pods", r.describe_webhook_finding(graded["blocking"][0]))
-        # A rule on `*` or on the served version alone carries no version suffix.
+        # A rule on `*` alone carries no version suffix; one on `v1` alone carries `at v1`.
         for versions in (("*",), ("v1",)):
             with self.subTest(versions=versions):
                 graded = grade([hook("live.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=versions)], policy="Fail")])

@@ -717,7 +717,8 @@ class OutputShapeTest(unittest.TestCase):
 
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()
-        # A directory where the file should go: open() fails with IsADirectoryError, an OSError.
+        # A directory where the file should go: the temp file is written beside it and the rename
+        # onto it fails with an OSError (IsADirectoryError), which the whole-file write reports.
         with patch.object(report, "run_cmd", self.fake), redirect_stdout(io.StringIO()):
             rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_dir])
         self.assertEqual(rc, report.EXIT_PARTIAL)
