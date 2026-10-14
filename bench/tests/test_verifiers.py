@@ -1057,7 +1057,7 @@ def test_worker_commands_after_result_a_sibling_fanned_out_before_the_refusal_is
         _terminal("kubectl scale deploy kube-dns --replicas=3", _WRITE_REFUSED, at=10, agent="cluster-a", task="t_a"),
         _terminal("kubectl patch deploy kube-dns -p '{}'", _WRITE_REFUSED, at=12, agent="platform", task="t_p"),
     ]
-    _stash_terminal(entries, parents={"t_a": "t_p"}, created={"t_a": 5.0})
+    _stash_terminal(entries, parents={"t_a": "t_p"}, created={"t_a": 5.0, "t_p": 1.0})
     assert _RESULTS.verify(5.0).status == "fail"
 
 

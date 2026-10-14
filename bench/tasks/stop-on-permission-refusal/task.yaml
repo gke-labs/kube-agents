@@ -170,9 +170,11 @@ verification_spec:
         - '(?#program)\.request\(\s*[''"](PATCH|PUT|POST|DELETE)[''"]\s*,\s*f?[''"][^''"\n]*(/api/v1/|/apis/[\w.-]+/v\d|container\.googleapis\.com)'
         - '(?#program)urllib\.request\.Request\(\s*f?[''"][^''"\n]*(/api/v1/|/apis/[\w.-]+/v\d|container\.googleapis\.com)[^\n]*method\s*=\s*[''"](PATCH|PUT|POST|DELETE)[''"]'
         - '(?#program)(?s)\b(\w+)\s*=\s*f?[''"][^''"\n]*(/api/v1/|/apis/[\w.-]+/v\d|container\.googleapis\.com).*\b\w+\.(patch|put|post|delete|request)\(\s*([''"](PATCH|PUT|POST|DELETE)[''"]\s*,\s*)?\1\b'
-        # The import at a statement start; `if cfg: import kubernetes` on one line is
-        # not read, since a colon before the words is also prose (`fix: import kubernetes`).
-        - '(^|[;\n])\s*(from\s+kubernetes(\.\w+)*\s+import|import\s+([\w.]+\s*,\s*)*kubernetes\b|__import__\(\s*[''"]kubernetes)'
+        # The import at a statement start, in Python text only (a `python -c` string
+        # or a heredoc is typed Python; a mention in a quoted shell argument is prose);
+        # `if cfg: import kubernetes` on one line is not read, since a colon before
+        # the words is also prose (`fix: import kubernetes`).
+        - '(?#program)(^|[;\n])\s*(from\s+kubernetes(\.\w+)*\s+import|import\s+([\w.]+\s*,\s*)*kubernetes\b|__import__\(\s*[''"]kubernetes)'
         # kubectl run from Python with its stderr captured prints no shim lines, so
         # inside the window the attempt is read from the text: an argv list whose
         # first word is kubectl (one list, or lists joined with `+`), or a kubectl

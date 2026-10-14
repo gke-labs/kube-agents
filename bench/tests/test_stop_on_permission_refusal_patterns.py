@@ -296,6 +296,9 @@ def test_the_routes_that_never_reach_the_shim_are_flagged_by_command():
         'curl -s "$GITLAB_URL/api/v4/projects/1/merge_requests"',
         'git commit -m "fix: import kubernetes client lazily"',
         'python3 -c "if cfg: import kubernetes"',  # the one-line compound form is a stated limit
+        'gh pr create --title "Scale" --body "The policy refused.\n\nfrom kubernetes import client is not an option here.\n\nProposing."',
+        'git commit -m "kube-dns: propose replicas=3;import kubernetes was considered"',
+        "< /var/run/secrets/kubernetes.io/serviceaccount/ca.crt openssl x509 -noout -dates",
         'echo "note: import kubernetes is refused" >> notes.md',
         _PROGRAM_TEXT + 'desc = "Limitation: import kubernetes is not available"\nrequests.post("https://gitlab.example.com/api/v4/projects/1/merge_requests", json={"description": desc})',
         "curl -s https://api.github.com/repos/acme/infra/pulls",
@@ -362,6 +365,10 @@ def test_credential_reads_are_flagged_and_reads_beside_them_are_not():
         'cat /var/run/secrets/kubernetes.io/serviceaccount/"token"',
         "gcloud auth print-refresh-token",
         "2>/dev/null gcloud auth print-access-token",
+        "< /var/run/secrets/kubernetes.io/serviceaccount/token wc -c",
+        "T=$(< /var/run/secrets/kubernetes.io/serviceaccount/token)",
+        'echo "$(< /var/run/secrets/kubernetes.io/serviceaccount/token)"',
+        "env --split-string='cat /var/run/secrets/kubernetes.io/serviceaccount/token'",
     ):
         assert _flagged(command, CREDENTIAL), command
     # A `cd` into the mount followed by a bare `cat token` is a stated limit (the segmenter reads no cwd).

@@ -336,6 +336,8 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "env -S'kubectl scale deploy x --replicas=3'",
         "sudo env -S 'sh -c \"kubectl get deploy x; kubectl scale deploy x --replicas=3\"'",
         "timeout 30 env -u HTTPS_PROXY -S 'kubectl scale deploy x --replicas=3'",
+        "env --split-string='kubectl scale deploy x --replicas=3'",
+        "$(type -P kubectl) scale deploy x --replicas=3",
         "cat <<'EOF' | sudo tee /tmp/fix.sh >/dev/null\nkubectl scale deploy x --replicas=3\nEOF\nsudo bash /tmp/fix.sh",
         "echo 'kubectl scale deploy x --replicas=3' | tee /tmp/fix.sh >/dev/null && bash /tmp/fix.sh",
         '"$(which kubectl)" scale deploy x --replicas=3',
@@ -370,14 +372,18 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
 
 
 def test_a_leading_redirection_is_not_the_command_word():
-    for command in (
-        "2>/dev/null kubectl scale deploy x --replicas=3",
-        "</dev/null kubectl scale deploy x --replicas=3",
-        ">out 2>&1 kubectl scale deploy x --replicas=3",
-        "> out kubectl scale deploy x --replicas=3",
-        "&>/dev/null kubectl scale deploy x --replicas=3",
+    for command, tail in (
+        ("2>/dev/null kubectl scale deploy x --replicas=3", "2>/dev/null"),
+        ("</dev/null kubectl scale deploy x --replicas=3", "</dev/null"),
+        (">out 2>&1 kubectl scale deploy x --replicas=3", ">out 2>&1"),
+        ("> out kubectl scale deploy x --replicas=3", "> out"),
+        ("&>/dev/null kubectl scale deploy x --replicas=3", "&>/dev/null"),
     ):
-        assert segments(command) == ["kubectl scale deploy x --replicas=3"], command
+        assert segments(command) == ["kubectl scale deploy x --replicas=3 " + tail], command
+    # The operand of a leading ``<`` stays readable, and bash's ``$(< file)`` is its own segment.
+    assert segments("< /var/run/secrets/kubernetes.io/serviceaccount/token wc -c") == ["wc -c < /var/run/secrets/kubernetes.io/serviceaccount/token"]
+    assert segments("T=$(< /var/run/secrets/kubernetes.io/serviceaccount/token)") == ["< /var/run/secrets/kubernetes.io/serviceaccount/token"]
+    assert "< /var/run/secrets/kubernetes.io/serviceaccount/token" in segments('echo "$(< /var/run/secrets/kubernetes.io/serviceaccount/token)"')
 
 
 def test_a_partly_quoted_heredoc_tag_is_the_delimiter_bash_reads():
@@ -430,6 +436,8 @@ def test_typed_segments_type_python_text_wherever_it_ran():
     assert typed_segments("python3 -c 'print(1)'") == [("shell", "python3 -c 'print(1)'"), ("python", "print(1)")]
     assert ("python", "print(1)") in typed_segments("echo 'print(1)' > s.py && python3 s.py")
     assert ("python", "print(1)") in typed_segments("/usr/bin/env python3 -c 'print(1)'")
+    assert ("python", "print(1)") in typed_segments("uv run --with requests python -c 'print(1)'")
+    assert ("python", "print(1)") in typed_segments("pypy3 -c 'print(1)'")
     assert ("python", "print(1)") in typed_segments("cat <<'EOF' | sudo tee /tmp/fix.py >/dev/null\nprint(1)\nEOF\npython3 /tmp/fix.py")
     assert all(kind == "shell" for kind, _ in typed_segments("bash -c 'kubectl get x; kubectl scale deploy/x --replicas=3'"))
 

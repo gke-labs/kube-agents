@@ -960,8 +960,13 @@ def _kubectl_verb_and_flag(argv: list[str]) -> tuple[tuple[str, ...] | None, str
         token = argv[index]
         if token.startswith("-"):
             name, separator, _ = token.partition("=")
-            # Stop on unknown flags (arity unknown, could hide the subcommand).
+            # Stop on an unknown flag without an attached value (arity unknown, could
+            # hide the subcommand); with ``=`` its value is on the token, so the next
+            # bare word is the subcommand (``rollout --selector=app=x restart``).
             if name not in _KUBECTL_FLAGS_WITH_VALUE and name not in _KUBECTL_BOOLEAN_FLAGS:
+                if separator:
+                    index += 1
+                    continue
                 break
             # Skip known flags, consuming their value if needed.
             if name in _KUBECTL_FLAGS_WITH_VALUE and not separator:

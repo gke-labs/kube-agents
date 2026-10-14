@@ -63,7 +63,7 @@ import re
 # duration after its options.
 _WRAPPERS = frozenset(
     {"env", "sudo", "doas", "setsid", "busybox", "chroot", "time", "nohup", "nice", "ionice", "stdbuf",
-     "taskset", "watch", "timeout", "xargs", "command", "builtin", "exec",
+     "taskset", "watch", "timeout", "xargs", "command", "builtin", "exec", "uv",
      "if", "!", "while", "until", "then", "else", "elif", "do", "{"}
 )
 # kubectl's boolean global flags, which take no value token: a copy of the command
@@ -87,15 +87,16 @@ _WRAPPER_VALUE_OPTIONS = {
     "watch": {"-n", "-d", "--interval"},
     "xargs": {"-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--replace"},
     "env": {"-u", "-C"},
+    "uv": {"--python", "-p", "--with", "--project", "--directory", "--package"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
 }
-_WRAPPER_POSITIONAL = {"timeout": 1, "chroot": 1}
+_WRAPPER_POSITIONAL = {"timeout": 1, "chroot": 1, "uv": 1}  # ``uv run <command>``
 # taskset's first form is a mask before the command (``taskset 0x1 cmd``).
 _TASKSET_MASK_RE = re.compile(r"^(0x)?[0-9a-fA-F]+$")
 # Words that end a block; never a command.
 _BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "su"})
-_PYTHONS = re.compile(r"^python[\d.]*$")
+_PYTHONS = re.compile(r"^(?:python|pypy)[\d.]*$")
 _SHELL_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
 # Short options of an interpreter that take a value token, read before a ``-c``;
 # the value may also be attached (``-Werror``, ``-Xdev``).
@@ -115,7 +116,7 @@ _WRITERS = frozenset({"echo", "printf", "tee"})
 _PYTHON_SUFFIX = ".py"
 _SHELL_SUFFIXES = (".sh", ".bash")
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
-_WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-p)\s+(\S+)(?:\s+\d*[<>].*|\s*\|\|.*)?$")
+_WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-[pP])\s+(\S+)(?:\s+\d*[<>].*|\s*\|\|.*)?$")
 # Quotes and backslashes inside a command word (``cu''rl``, ``"cu"rl``, ``cur\l``) are
 # the shell's, not the word's.
 _WORD_QUOTING_RE = re.compile(r'\\(.)|[\'"]')
@@ -214,7 +215,22 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
     tokens = _tokens(piece)
     index = _command_index(tokens)
     if index is None:
+        # A piece that is only a redirection (``$(< file)``, bash's file read) is its own segment.
+        if tokens and _LEADING_REDIRECT_RE.match(tokens[0][2]):
+            out.append(piece.strip())
         return
+    # A redirection before the command word moves behind it, so its operand stays in the segment.
+    leading_parts: list[str] = []
+    k = 0
+    while k < index:
+        t = tokens[k][2]
+        if _LEADING_REDIRECT_RE.match(t):
+            leading_parts.append(t)
+            if _BARE_REDIRECT_RE.match(t) and k + 1 < index:
+                leading_parts.append(tokens[k + 1][2])
+                k += 1
+        k += 1
+    leading = " ".join(leading_parts)
     _, end, word = tokens[index]
     unquoted = _bare_word(_unquote(word))
     inner = _substituted_command(unquoted)
@@ -226,7 +242,7 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
             unquoted = which.group(1)
     if unquoted in _BLOCK_CLOSERS:
         return
-    out.append((unquoted + piece[end:]).strip())
+    out.append((unquoted + piece[end:] + (" " + leading if leading else "")).strip())
     base = unquoted.rsplit("/", 1)[-1]
     rest = tokens[index + 1 :]
     if base in _SHELLS or base == "eval" or _PYTHONS.match(base):
@@ -358,6 +374,8 @@ def _env_split_string(piece: str) -> str | None:
         token = words[k]
         if token in ("-S", "--split-string") and k + 1 < len(words):
             return _unquote(words[k + 1])
+        if token.startswith("--split-string="):
+            return _unquote(token[len("--split-string="):])
         if token.startswith("-S") and len(token) > 2:
             return _unquote(token[2:])
         if token in _WRAPPER_VALUE_OPTIONS["env"]:
@@ -435,16 +453,22 @@ def _command_index(tokens: list[tuple[int, int, str]], keep: frozenset[str] = fr
             if name == "taskset" and i < len(tokens) and _TASKSET_MASK_RE.match(tokens[i][2]):
                 i += 1
             values = _WRAPPER_VALUE_OPTIONS.get(name, set())
-            while i < len(tokens) and tokens[i][2].startswith("-") and tokens[i][2] != "--":
-                option = tokens[i][2]
-                i += 1
-                if option in values and i < len(tokens):
+
+            def skip_options(i: int) -> int:
+                while i < len(tokens) and tokens[i][2].startswith("-") and tokens[i][2] != "--":
+                    option = tokens[i][2]
                     i += 1
+                    if option in values and i < len(tokens):
+                        i += 1
+                return i
+
+            i = skip_options(i)
             if i < len(tokens) and tokens[i][2] == "--":
                 i += 1
             for _ in range(_WRAPPER_POSITIONAL.get(name, 0)):
                 if i < len(tokens):
                     i += 1
+                i = skip_options(i)  # options may follow a positional (``uv run --with x python``)
             continue
         return i
     return None
