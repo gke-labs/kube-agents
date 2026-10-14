@@ -191,7 +191,7 @@ class PrOpenedTest(unittest.TestCase):
                 sent.append((update, "choices" in chat))
                 return SimpleNamespace(success=True)
 
-        for store in (runtime._questions, runtime._unsettled, runtime._question_keys):
+        for store in (runtime._questions, runtime._unsettled):
             store.clear()
         adapter = StandIn()
         self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 1)))
@@ -208,10 +208,10 @@ class PrOpenedTest(unittest.TestCase):
                 sent.append(update)
                 return SimpleNamespace(success=True)
 
-        for store in (runtime._questions, runtime._unsettled, runtime._question_keys):
+        for store in (runtime._questions, runtime._unsettled):
             store.clear()
         self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 7)))
-        for store in (runtime._questions, runtime._unsettled, runtime._question_keys):
+        for store in (runtime._questions, runtime._unsettled):
             store.clear()
         self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 9)))
         self.assertEqual(sent, ["question-t_e0c1-7", "question-t_e0c1-9"])

@@ -59,7 +59,8 @@ var errNotifyRouteUnavailable = errors.New("route unavailable")
 
 // notifyUpdateMax bounds an --update key. The gateway keeps at most 16 per
 // conversation (spec-a2a-payloads, "Card work after the task ends"); the
-// senders pick short ones (plan, plan-<n>, question-<card>, alert).
+// senders pick short ones (plan-<card>-<serial>, question-<card>-<serial>,
+// alert-<event session>).
 const notifyUpdateMax = 128
 
 const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path> | --chat-file <path>] [--update <key>] [--timeout <d>] [--] [text]

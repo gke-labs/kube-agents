@@ -555,7 +555,11 @@ func (t *Task) ValidateArtifacts() error {
 		case ArtifactThinking, ArtifactProgress:
 			for _, p := range a.Parts {
 				if p.Kind != "text" && !(a.Name == ArtifactProgress && chatMessagePart(p)) {
-					return &ProtocolError{Msg: fmt.Sprintf("artifact %q carries a %q part; reserved name is text-only", a.Name, p.Kind)}
+					allowed := "text only"
+					if a.Name == ArtifactProgress {
+						allowed = "text and chat messages only"
+					}
+					return &ProtocolError{Msg: fmt.Sprintf("artifact %q carries a %q part; reserved name carries %s", a.Name, p.Kind, allowed)}
 				}
 			}
 		case ArtifactActivity:

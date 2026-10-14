@@ -118,8 +118,8 @@ thread through the kanban notifier's chat.notify stand-in
 (``kanban_chat_notify``), which has no Slack client. The plan is the same
 state machine: :func:`_render` sends it as a ``kube-agents.chat/v1`` plan
 (``agents/platform/scripts/chat_message.py``) with an ``update`` key, so it is
-edited in place as here, under ``plan-<the plan's first card>``, which a later
-plan in the thread, or one opened after a restart, does not share. The message carries the
+edited in place as here, under ``plan-<the plan's first card>-<serial>``, which no
+other plan shares, before or after a restart. The message carries the
 ask's reaction state as ``mark`` when it changes: the ask's kind (recorded on
 the conversation's route by the hermes-bridge) while a card runs, ⏸️ beside
 it while one waits on the user, and ``done`` or ``failed`` once all have
@@ -129,9 +129,11 @@ settled. The session status is the gateway's there, so nothing is set.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
@@ -202,6 +204,9 @@ MOVE_KINDS = {"review": "review_requested"}
 #: it refuses, as opposed to a thread with no session yet or a network fault.
 RENAME_REFUSED_ERROR = "invalid_name"
 
+#: Hex characters of the per-process nonce in a plan's ``update`` key: enough
+#: that two notifier processes do not draw the same one.
+KEY_NONCE_CHARS = 8
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
 ASKS_MAX = 512
@@ -308,6 +313,10 @@ _lapsing: set = set()
 #: ``(channel, thread) -> the mark the thread's plans last carried over chat.notify``. The
 #: mark is the thread's ask's state, so it is the thread's, not one plan's (:func:`_render_chat`).
 _marks_sent: OrderedDict[tuple, dict] = OrderedDict()
+#: The serial in a plan's ``update`` key: this process's nonce, then a count no
+#: plan in the process repeats (:func:`_plan_key`).
+_KEY_NONCE = uuid.uuid4().hex[:KEY_NONCE_CHARS]
+_plan_serials = itertools.count(1)
 #: ``(channel, thread) -> suspended`` for a card waiting after a restart, with
 #: no plan to hold it: :func:`_settle_orphan` sends the legacy setter a clear,
 #: and :func:`set_thread_status` reads this once to send the wait instead.
@@ -512,16 +521,17 @@ def _drawable(adapter: Any) -> bool:
 
 
 def _plan_key(key: tuple, plan: _Plan) -> str:
-    """The ``update`` key of a new plan: ``plan-<its first card>``.
+    """The ``update`` key of a new plan: ``plan-<its first card>-<serial>``.
 
-    Named by a card rather than counted in this process, so a plan opened after a
-    restart, or after the thread's count was evicted, cannot take an earlier plan's
-    key and edit that message, which the gateway still holds, down to its own rows.
+    The serial is this process's nonce and a count no plan in it repeats, so no
+    plan takes another's key and edits that message, which the gateway still
+    holds, down to its own rows: not a plan the same card reopens after a lapse,
+    and not one opened after a restart.
     """
     # A new plan is a new ask's: its first mark goes out even when it equals the last ask's.
     _marks_sent.pop(key, None)
     first = next(iter(plan.rows), "") or next(iter(plan.pending), "")
-    return _chat.PLAN_UPDATE.format(card=first)
+    return _chat.PLAN_UPDATE.format(card=first, serial=f"{_KEY_NONCE}{next(_plan_serials)}")
 
 
 def _thread_rows(key: tuple, plan: _Plan) -> list:

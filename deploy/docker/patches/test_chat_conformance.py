@@ -18,7 +18,9 @@ the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 """
 
 import asyncio
+import itertools
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,13 +99,18 @@ def _row(spec: dict) -> slack_ux_status._Row:
     return row
 
 
+def _stem(update: str) -> str:
+    """An ``update`` key without its serial: ``plan-t_a-<serial>`` is ``plan-t_a``."""
+    return update.rsplit("-", 1)[0]
+
+
 def _as_case(outs: list, expected: list) -> list:
     """``outs`` with each ``update`` key spelled as the case spells it.
 
-    The emitter names a key by something that outlives the process (``plan-<first card>``,
-    ``question-<card>-<event>``) so a restart never reuses one; the cases name only the
-    stem (``plan``, ``question-<card>``). A key that is the stem plus a ``-`` suffix
-    matches it; any other key is left as it is, and fails the comparison.
+    The emitter ends a key with a serial no other message repeats, before or after a
+    restart (``plan-<first card>-<serial>``, ``question-<card>-<serial>``); the cases
+    name only the stem (``plan``, ``question-<card>``). A key that is the stem plus a
+    ``-`` suffix matches it; any other key is left as it is, and fails the comparison.
     """
     spelled = []
     for out, want in zip(outs, expected):
@@ -127,8 +134,7 @@ class SharedCasesTest(unittest.TestCase):
     @staticmethod
     def reset() -> None:
         """Empty in-process state, so each case runs as on a thread of its own."""
-        for store in (slack_ux_moments._questions, slack_ux_moments._unsettled, slack_ux_moments._announced,
-                      slack_ux_moments._question_keys):
+        for store in (slack_ux_moments._questions, slack_ux_moments._unsettled, slack_ux_moments._announced):
             store.clear()
         _reset_status()
 
@@ -164,7 +170,7 @@ class SharedCasesTest(unittest.TestCase):
             return self.run_card_events(given)
         if "rows" in given:
             rows = [_row(r) for r in given["rows"]]
-            update = chat_message.PLAN_UPDATE.format(card=rows[0].task_id)
+            update = chat_message.PLAN_UPDATE.format(card=rows[0].task_id, serial=1)
             return [_out(chat_message.plan_message(given.get("title"), rows), NOTIFY, update)]
         return self.run_marks(given, case["expected"])
 
@@ -282,7 +288,8 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "1.33.4 = default", "seeded-a")
 
         asyncio.run(run())
-        self.assertEqual([s["update"] for s in adapter.sent], ["plan-t_a", "plan-t_a", "plan-t_a"])
+        self.assertEqual([_stem(s["update"]) for s in adapter.sent], ["plan-t_a"] * 3)
+        self.assertEqual(len({s["update"] for s in adapter.sent}), 1, "one plan, one key")
         self.assertEqual({s["thread"] for s in adapter.sent}, {"slack:C1/1.2"})
         first, second, last = (s["chat"] for s in adapter.sent)
         self.assertEqual(first["mark"], {"ask": "fleet"})
@@ -302,20 +309,40 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "done", "two")
 
         asyncio.run(run())
-        self.assertEqual([s["update"] for s in adapter.sent], ["plan-t_a", "plan-t_b"])
+        self.assertEqual([_stem(s["update"]) for s in adapter.sent], ["plan-t_a", "plan-t_b"])
 
     def test_a_plan_after_a_restart_does_not_take_an_earlier_plans_key(self):
-        # The notifier restarted between two asks in one thread: its memory is gone,
-        # and the second plan must still not edit the first plan's message.
+        # The notifier restarted between two plans its first card opened in one thread:
+        # its memory is gone, and the second plan must still not edit the first's message.
+        adapter = _ChatAdapter()
+        sub = dict(self.SUB)
+
+        asyncio.run(slack_ux_status.settle_row(adapter, sub, "completed", "done", "one"))
+        _reset_status()
+        with mock.patch.object(slack_ux_status, "_KEY_NONCE", "restarted"), \
+                mock.patch.object(slack_ux_status, "_plan_serials", itertools.count(1)):
+            asyncio.run(slack_ux_status.settle_row(adapter, dict(sub), "completed", "done", "one"))
+        first, second = (s["update"] for s in adapter.sent)
+        self.assertEqual((_stem(first), _stem(second)), ("plan-t_a", "plan-t_a"))
+        self.assertNotEqual(first, second)
+
+    def test_a_card_reopening_the_thread_after_a_lapse_posts_a_new_plan(self):
+        # The plan lapsed with its first card still running; that card's next note
+        # opens a new plan, which must not edit the set-aside one.
         adapter = _ChatAdapter()
 
-        async def run(sub):
-            await slack_ux_status.settle_row(adapter, sub, "completed", "done", "one")
+        async def run():
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB), 1, "a", "reading")
+            key = (CHAT_ID, THREAD)
+            plan = slack_ux_status._plans[key]
+            plan.touched = time.monotonic() - slack_ux_status.PLAN_HOLD_SECONDS - 1
+            await slack_ux_status._lapse(adapter, key, plan)
+            await slack_ux_status.deliver_row(adapter, dict(self.SUB), 2, "a", "still reading")
 
-        asyncio.run(run(dict(self.SUB)))
-        _reset_status()
-        asyncio.run(run(dict(self.SUB, task_id="t_b")))
-        self.assertEqual([s["update"] for s in adapter.sent], ["plan-t_a", "plan-t_b"])
+        asyncio.run(run())
+        first, second = (s["update"] for s in adapter.sent)
+        self.assertEqual(_stem(second), "plan-t_a")
+        self.assertNotEqual(first, second)
 
     def test_the_mark_reads_every_plan_in_the_thread(self):
         # A card that gave up sets its plan aside; the next card runs on plan-2.
@@ -332,7 +359,7 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "fine", "b")
 
         asyncio.run(run())
-        marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent if "mark" in s["chat"]]
+        marks = [(_stem(s["update"]), s["chat"].get("mark")) for s in adapter.sent if "mark" in s["chat"]]
         self.assertEqual(marks, [("plan-t_a", {"ask": "fleet"}), ("plan-t_a", {"settle": "failed"}),
                                  ("plan-t_b", {"ask": "fleet"}), ("plan-t_b", {"settle": "done"})])
 
@@ -361,7 +388,7 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "fine", "b")
 
         asyncio.run(run())
-        marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent]
+        marks = [(_stem(s["update"]), s["chat"].get("mark")) for s in adapter.sent]
         self.assertEqual(marks, [("plan-t_a", {"settle": "done"}), ("plan-t_b", {"settle": "done"})])
 
     def test_with_no_recorded_ask_a_lifted_pause_still_goes(self):

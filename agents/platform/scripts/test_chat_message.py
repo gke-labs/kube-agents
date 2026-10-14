@@ -156,6 +156,12 @@ class ChoicesTest(unittest.TestCase):
             "https://console.cloud.google.com/b", "https://console.cloud.google.com:443/c", "https://grafana.example/e",
         ])
 
+    def test_the_host_check_reads_the_label_as_clipped(self):
+        # Clipped, the label's host ends mid-name, which the validator reads as another host.
+        url = "https://monitoring-dashboards.observability.internal.example.com/d/abc"
+        chat = cm.report_message("x", links=[(f"Grafana restarts dashboard (prod): {url}", url)])
+        self.assertNotIn("links", chat)
+
     def test_failure_offers_try_again_only_when_asked(self):
         self.assertEqual(cm.failure_message("It failed. Retry?", True)["choices"], [{"text": "Try again"}])
         self.assertNotIn("choices", cm.failure_message("It failed. Retry?", False))

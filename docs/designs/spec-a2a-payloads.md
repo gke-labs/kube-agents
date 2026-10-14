@@ -705,7 +705,7 @@ carry the same chat message:
   limit of addressing by conversation rather than by task.)
 
 So the Planning Agent's terminal carries a mark-only chat message with `ask` still set, and the terminal no-mark default doesn't fire at the ack. Its cards' notifies
-then carry the plan (`update: "plan"`), ⏸️ (`settle: blocked`), the one answer per fan-out
+then carry the plan (under one `update` key per plan), ⏸️ (`settle: blocked`), the one answer per fan-out
 and the folded answer, and the final settle. The task is not held open for its cards:
 that would turn every follow-up into a steer queued behind hours of idle.
 
@@ -717,14 +717,15 @@ the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the
 terminal keeps its default. The kanban notifier, in the Hermes gateway process where the
 board is, sends a card's work through `a2a notify --chat-file <object> --update <key>`
-with these keys: `plan-<first card>` for a thread's plan, `question-<card>-<blocked event>`
+with these keys: `plan-<first card>-<serial>` for a plan, `question-<card>-<blocked event>`
 for a card's question and its answered form, and `alert-<event session>` for an incident's
 triage, which edits the
-event watcher's alert because the watcher posts it under that key. Each key is named by
-something that outlives the notifier process, so a plan or question opened after a restart
-never takes an earlier one's key and edits its message, which the gateway still holds. The
-shared cases spell only the stem (`plan`, `question-<card>`); their runner matches a key
-that adds a `-` suffix to it. The alert is a
+event watcher's alert because the watcher posts it under that key. A plan's serial is the
+notifier process's random nonce and a count no plan in it repeats (a question with no event
+id takes one too), so no plan takes another's key and edits its message, which the gateway
+still holds: not one its first card reopens after the plan lapsed, and not one opened after
+a restart. The shared cases spell only the stem (`plan`, `question-<card>`); their runner
+matches a key that adds a `-` suffix to it. The alert is a
 home-channel post and its triage a reply in its thread, so the edit asks the gateway to
 keep `update` keys for a home-channel thread as it does for a conversation. The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`

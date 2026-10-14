@@ -81,9 +81,11 @@ to what it did before.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import re
+import uuid
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
@@ -103,6 +105,8 @@ except ImportError:  # the scripts directory is not on PYTHONPATH, or predates i
 
 #: The flag, read here only to word the warning when the renderer is missing.
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Hex characters of the per-process nonce in a question's fallback ``update`` key.
+KEY_NONCE_CHARS = 8
 
 #: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
 #: exactly when that module cannot be imported. Unset is on there too.
@@ -178,9 +182,10 @@ _questions: OrderedDict[tuple, tuple] = OrderedDict()
 _unsettled: OrderedDict[tuple, tuple] = OrderedDict()
 #: ``(channel, ts)`` of a question whose card resumed but whose settle failed: its retry still reads the answer.
 _resumed: OrderedDict[tuple, None] = OrderedDict()
-#: ``(card,) -> questions it has posted over chat.notify``, which names a question's update key when
-#: its ``blocked`` event id is unknown (0); a known id names it otherwise, and survives a restart.
-_question_keys: OrderedDict[tuple, int] = OrderedDict()
+#: What names a question's update key when its ``blocked`` event id is unknown (0): this process's
+#: nonce, then a count no question in it repeats. A known id names it otherwise.
+_KEY_NONCE = uuid.uuid4().hex[:KEY_NONCE_CHARS]
+_question_serials = itertools.count(1)
 #: ``(channel, thread, reply ts)`` of a typed reply already shown as a question's answer, never credited twice.
 _credited: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
@@ -334,12 +339,12 @@ async def _needs_you_chat(adapter: Any, sub: dict, reason: str, event_id: int) -
     if asked(sub, event_id):
         return True
     earlier = _questions.get(key)
-    count = _question_keys.get((key[0],), 0) + 1
-    update = _chat.QUESTION_UPDATE.format(card=key[0], event=int(event_id or 0) or f"n{count}")
+    serial = int(event_id or 0) or f"{_KEY_NONCE}{next(_question_serials)}"
+    update = _chat.QUESTION_UPDATE.format(card=key[0], serial=serial)
     text = f"{reason.strip()}\n{QUESTION_CARD_NOTE.format(card=key[0])}" if key[0] else reason.strip()
     if not await _send_chat(adapter, sub, text, chat, update):
         return False
-    _remember(_question_keys, (key[0],), count)
+
     if earlier is not None:
         _remember(_unsettled, (key, earlier[2]), earlier)
     _remember(_questions, key, (int(event_id or 0), str(sub.get("chat_id") or ""), update, chat, text))
