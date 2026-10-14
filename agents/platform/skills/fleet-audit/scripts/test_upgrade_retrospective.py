@@ -3984,6 +3984,42 @@ class LedgerAndGuardsTest(unittest.TestCase):
             third, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
         self.assertNotIn(gid, {g["id"] for g in third["guards"]})
 
+    def test_a_still_failing_pod_older_than_the_window_keeps_its_guard_across_a_review(self):
+        # A master-only upgrade a week on selects the cluster with a window that starts at the
+        # operation. payments-api's OOM-killed pod last did anything before it (the fixture's stamps are
+        # a week old), so the review's symptom pass does not grade it again, but the API still shows the
+        # Deployment failing: the guard is held as a re-check would hold it, counted as reviewed, and the
+        # manifest carries its held candidate with the persistence, instead of the guard being cleared
+        # and the finding announced resolved.
+        first, _ = self.collect()
+        obj = "seeded-debug/Deployment/payments-api"
+        gid = ur.guard_id(SEEDED, 14, obj)
+        self.assertIn(gid, {g["id"] for g in first["guards"]})
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_MASTER" and "/clusters/seeded-a" in o["targetLink"]))
+        master.update(name="operation-master-only", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:10:00Z")
+        second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), manifest_file=str(self.home / "manifest.json"))
+        [review] = [r for r in second["reviews"] if r["cluster"] == SEEDED]
+        self.assertEqual(review["what_happened"]["status"], ur.STATUS_UPGRADED)
+        self.assertNotIn(obj, {s["object"] for s in review["what_failed"]})
+        self.assertIn(obj, review["failing_objects"])
+        kept = next(g for g in second["guards"] if g["id"] == gid)
+        self.assertEqual((kept["first_seen"], kept["last_seen"], kept["reviews"]), ("2026-10-08T18:00:00Z", "2026-10-15T18:00:00Z", 2))
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        [held] = [c for e in manifest["clusters"] if e["name"] == SEEDED for c in e.get("candidates") or [] if (c["namespace"], c["object"]) == ("seeded-debug", "Deployment/payments-api")]
+        self.assertEqual((held["severity"], held["persistence"], held["check"]), (ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-08T18:00:00Z, 2 review(s)"], kept["check"]))
+        # The same review with the pod healthy again: nothing holds the guard, and it is cleared.
+        pods = copy.deepcopy(READS["seeded-a"]["pods"])
+        for pod in pods:
+            if pod["metadata"]["name"].startswith("payments-api-"):
+                pod["status"]["phase"] = ur.PHASE_RUNNING
+                pod["status"]["containerStatuses"] = [{"name": "api", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": "2026-10-15T10:00:00Z"}}}]
+                pod["status"]["conditions"] = [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-10-15T10:00:00Z"}]
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": pods, "events": []}}):
+            third, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        self.assertNotIn(gid, {g["id"] for g in third["guards"]})
+
     def test_unchanged_cluster_versions_are_refreshed(self):
         self.collect()
         grown = cluster_doc("seeded-a")

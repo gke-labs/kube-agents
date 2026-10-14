@@ -139,7 +139,10 @@ and a node not back are keyed by their operation in the stored set, so this
 upgrade's hold is never "already recorded" from the last one; one whose onset predates the window's first operation, or
 that the previous full run recorded, is a Warning that says so, never an
 Error; with no readable onset the stored set decides, and a first run grades
-by onset alone and says so. Confidence is high only when the signature names
+by onset alone and says so. A pod whose last activity predates the window
+is not graded again, and a failure guard whose object the API still shows
+failing is held by the merge as a re-check holds it, with its candidate
+carrying the persistence. Confidence is high only when the signature names
 the entry's own mechanism and an operation in the window reached the object
 (its pool; the control plane for 6 and 7); entry 14 also needs a runtime
 image below the floor, entry 20 the same image still running on an
@@ -2142,7 +2145,10 @@ def _pod_is_starting(pod: dict, now: datetime | None) -> bool:
 def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None, gated: list[str] | None = None) -> list[dict]:
     """One row per (top owner, category, reason), carrying the pods behind
     it; the row's detail (node, containers, images) is the example pod's.
-    A pod whose last activity predates `window_start` is not the upgrade's."""
+    A pod whose last activity predates `window_start` is not the upgrade's
+    and is not graded again; a guard its object already carries is held by
+    the merge while the API shows the object failing (`failing_objects` on
+    the review), as a re-check holds it."""
     rows: dict[tuple, dict] = {}
     for pod in pods:
         meta, status = pod.get("metadata") or {}, pod.get("status") or {}
@@ -4500,6 +4506,12 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     # Workloads still unavailable, for the entry-3 keep rule: the operation
     # the outage fell inside is outside a later window, the outage is not.
     review["unavailable_workloads"] = sorted(_unavailable_workloads(reads.get("workloads") or [])) if "workloads" not in failed else []
+    # The objects the API itself shows failing, from the whole pods read and
+    # not the window: a failure guard on one of them is held by the merge as
+    # a re-check holds it, since a pod that lost readiness, or a Job pod in
+    # phase Failed, before the window's first operation is not graded again
+    # by the symptom pass yet still fails.
+    review["failing_objects"] = sorted(_api_set_failures(reads.get("pods") or [], reads.get("owners") or [], Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or []))[1]) if "pods" not in failed else []
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
     shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
@@ -5743,6 +5755,18 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # The same rule for entry 3: a workload still unavailable keeps its guard
     # while the operation its outage fell inside is out of the window.
     unavailable = {(r["cluster"], obj) for r in reviews for obj in r.get("unavailable_workloads") or []}
+    # And for a failure guard whose object the API still shows failing while
+    # the review filed nothing for that object and every read the guard
+    # needs answered (the re-check's rule): a review's window drops a pod
+    # that lost readiness, or a Job pod in phase Failed, before the window's
+    # first operation, so the symptom pass does not re-file it, but the
+    # failure stands and the guard is held with its candidate. An object the
+    # review did file keeps the ordinary rules (its fresh guards replace the
+    # old), and a guard a needed read failed for keeps the held path, named
+    # with the read that failed; the entries with a rule of their own above
+    # (1, 3, 5) and the operation guards are not this rule's.
+    failing = {(r["cluster"], obj) for r in reviews for obj in r.get("failing_objects") or []}
+    fresh_objects = {(g["cluster"], g["object"]) for g in fresh_guards if g.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE}
     # A kept guard follows the object's fresh guard this run: one object, one
     # check (`merge_guards` holds the same rule for every guard it merges).
     fresh_check_by_object = {}
@@ -5753,7 +5777,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         if guard.get("kind", GUARD_KIND_FAILURE) != GUARD_KIND_FAILURE or guard["id"] in fresh_ids:
             continue
         where = (guard.get("cluster"), guard.get("object"))
-        if (guard.get("entry") == ENTRY_BUDGET and where in zero_budgets) or (guard.get("entry") == ENTRY_SPREAD and where in unavailable):
+        reads_answered = answered is None or set(guard.get("reads") or FAILURE_GUARD_READS) <= answered.get(guard.get("cluster"), set())
+        still_failing = where in failing and where not in fresh_objects and guard.get("entry") not in (ENTRY_BUDGET, ENTRY_SPREAD, ENTRY_WINDOW, ENTRY_OPERATION) and reads_answered
+        if (guard.get("entry") == ENTRY_BUDGET and where in zero_budgets) or (guard.get("entry") == ENTRY_SPREAD and where in unavailable) or still_failing:
             kept = {**guard, "last_seen": seen_at}
             if fresh_check_by_object.get(where):
                 kept["check"] = fresh_check_by_object[where]
