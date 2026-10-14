@@ -3,12 +3,14 @@
 Run: python3 -m unittest agents.platform.scripts.test_capability_store
 """
 
+import io
 import json
 import os
 import re
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -362,6 +364,28 @@ class StoreTest(unittest.TestCase):
         (machine_home / cs.CAPABILITIES_DIRNAME).mkdir()
         with patch.dict(os.environ, {cs.HERMES_HOME_ENV: str(machine_home)}, clear=True):
             self.assertEqual(cs.cli_root(), machine_home / cs.CAPABILITIES_DIRNAME, "an existing home store wins")
+
+    def test_the_cli_asks_for_a_name_rather_than_failing_on_argv(self):
+        # `get` without a name is the first thing an operator types before `list`; the answer
+        # is the usage line, which names `list`, not an index error.
+        seed(self.root)
+        with patch.dict(os.environ, {cs.CAPABILITIES_DIR_ENV: str(self.root)}):
+            for argv in (["capability_store.py", "get"], ["capability_store.py", "history"], ["capability_store.py"], ["capability_store.py", "nope"]):
+                with self.subTest(argv=argv):
+                    err = io.StringIO()
+                    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                        self.assertEqual(cs.main(argv), cs.USAGE_EXIT_CODE)
+                    self.assertIn("usage:", err.getvalue())
+                    self.assertIn("list", err.getvalue())
+                    self.assertNotIn("index", err.getvalue())
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(cs.main(["capability_store.py", "get", "demo"]), 0)
+            self.assertEqual(json.loads(out.getvalue())["capability"], "demo")
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                self.assertEqual(cs.main(["capability_store.py", "get", "nope"]), 1)
+            self.assertIn("unknown capability", err.getvalue())
 
     def test_confirmed_by_is_a_name_not_a_transcript(self):
         seed(self.root)

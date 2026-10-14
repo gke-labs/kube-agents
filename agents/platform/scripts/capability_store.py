@@ -107,6 +107,7 @@ MAX_HISTORY_ENTRIES = 50
 # purpose: writes go through the MCP tool so every one carries a policy check
 # and a changelog line.
 CLI_ACTIONS = ("list", "get", "history")
+CLI_USAGE = "usage: capability_store.py list | get <name> | history <name>  (list prints the names)"
 # argparse's convention for a usage error, which the CLI follows without argparse.
 USAGE_EXIT_CODE = 2
 JSON_INDENT = 2
@@ -608,17 +609,20 @@ def cli_root() -> Path:
 def main(argv: list[str]) -> int:
     """Tiny read-only CLI for an operator on the gateway."""
     root = cli_root()
-    if len(argv) < 2 or argv[1] not in CLI_ACTIONS:
-        print(f"usage: capability_store.py {' | '.join(CLI_ACTIONS)} [<name>]", file=sys.stderr)
+    action = argv[1] if len(argv) > 1 else ""
+    # `get` and `history` take a name; without one the usage line says so and names `list`
+    # as the way to find it, rather than an index error from reading argv.
+    if action not in CLI_ACTIONS or (action != "list" and len(argv) < 3):
+        print(CLI_USAGE, file=sys.stderr)
         return USAGE_EXIT_CODE
     try:
-        if argv[1] == "list":
+        if action == "list":
             print(json.dumps(list_capabilities(root), indent=JSON_INDENT))
-        elif argv[1] == "get":
+        elif action == "get":
             print(json.dumps(describe(load(root, argv[2])), indent=JSON_INDENT, sort_keys=True))
         else:
             print(json.dumps(history(root, argv[2]), indent=JSON_INDENT, sort_keys=True))
-    except (CapabilityError, IndexError) as exc:
+    except CapabilityError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     return 0
