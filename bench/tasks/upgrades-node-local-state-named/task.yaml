@@ -14,6 +14,9 @@
 # else. Other fleet workloads may mount an emptyDir for scratch; the case does
 # not grade whether the agent lists them.
 #
+# An item's parenthetical is graded on its first word only (a negation word
+# there is refused); the rest of a gloss is the judge's to read.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the volume. Moving the queue to a claim is the heal
@@ -79,9 +82,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?(?:(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*queue(?![/\w-])(?: \((?!\s*(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?(?:(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*queue(?![/\w-])(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*; survives a node rebuild: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?(?!(?:(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*queue(?![/\w-])(?: \((?!\s*(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?(?!(?:(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*, ?)*queue(?![/\w-])(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\))?(?:, ?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^ :;,\n][^;,\n]*)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
 
   - name: the-declared-line-says-the-state-does-not-survive
     role: objective
