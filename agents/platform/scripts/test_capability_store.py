@@ -96,6 +96,41 @@ class StoreTest(unittest.TestCase):
             cs.apply_changes(self.root, "demo", {"names": ["a"], "threshold": 9}, reason="x", confirmed_by="ops")
         self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3})
 
+    def test_a_capability_without_its_schema_is_refused_not_validated(self):
+        # A torn first scaffold or a hand-made directory: criteria.json present, no schema. Every
+        # key and value would validate against an empty schema, so the store refuses the
+        # capability for reads and writes alike, naming the missing file.
+        d = self.root / "torn"
+        d.mkdir(parents=True)
+        (d / cs.CRITERIA_FILENAME).write_text(json.dumps({"threshold": 3}))
+        self.assertEqual(cs.list_capabilities(self.root), ["torn"])
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "torn", {"anything": {"nested": True}}, reason="x", confirmed_by="ops@example")
+        self.assertIn(cs.SCHEMA_FILENAME, str(ctx.exception))
+        self.assertEqual(json.loads((d / cs.CRITERIA_FILENAME).read_text()), {"threshold": 3})
+        self.assertFalse((d / cs.CHANGELOG_FILENAME).exists())
+        with self.assertRaises(cs.CapabilityError):
+            cs.load(self.root, "torn")
+        (d / cs.SCHEMA_FILENAME).write_text("[]")
+        with self.assertRaises(cs.CapabilityError):
+            cs.load(self.root, "torn")
+
+    def test_the_changelog_line_lands_before_the_value_moves(self):
+        # A changelog the store cannot append to leaves the value where it was; a value the
+        # store cannot write leaves the line that says what was about to change.
+        seed(self.root)
+        (self.root / "demo" / cs.CHANGELOG_FILENAME).mkdir()
+        with self.assertRaises(OSError):
+            cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3})
+        (self.root / "demo" / cs.CHANGELOG_FILENAME).rmdir()
+        with patch.object(cs, "write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3})
+        (line,) = cs.history(self.root, "demo")
+        self.assertEqual((line["revision"], line["changes"]), (1, {"threshold": {"before": 3, "after": 4}}))
+
     def test_schema_violations_are_named_and_nothing_is_written(self):
         seed(self.root)
         cases = {

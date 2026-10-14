@@ -203,12 +203,20 @@ def load(root: Path, name: str) -> Capability:
     if not isinstance(criteria, dict):
         raise CapabilityError(f"{name}/{CRITERIA_FILENAME} must hold a JSON object")
     schema = _read_json(directory / SCHEMA_FILENAME)
+    if not isinstance(schema, dict):
+        # Without its schema every key and value would validate, so a torn first scaffold or a
+        # hand-made directory would take any write. The store refuses the capability instead;
+        # the next pod start copies the image's schema back.
+        raise CapabilityError(
+            f"{name}/{SCHEMA_FILENAME} is missing or not a JSON object: the store refuses to read or "
+            f"write a capability without its schema; a pod restart restores the image's copy"
+        )
     learning = _read_json(directory / LEARNING_FILENAME)
     return Capability(
         name=name,
         root=root,
         criteria=criteria,
-        schema=schema if isinstance(schema, dict) else {},
+        schema=schema,
         learning=learning if isinstance(learning, dict) else {},
     )
 
@@ -443,9 +451,12 @@ def _apply_locked(
         "pruned": {k: cap.criteria[k] for k in pruned},
         "reset": {k: {"value": cap.criteria[k], "error": e} for k, e in reset.items()},
     }
-    write_json_atomic(cap.directory / CRITERIA_FILENAME, stored, sort_keys=True)
+    # The changelog line lands before the value moves. A failure between the two writes then
+    # leaves a changelog line for a value that never took effect, which `history` shows, rather
+    # than a value in effect that no line explains.
     with (cap.directory / CHANGELOG_FILENAME).open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    write_json_atomic(cap.directory / CRITERIA_FILENAME, stored, sort_keys=True)
     return entry
 
 
