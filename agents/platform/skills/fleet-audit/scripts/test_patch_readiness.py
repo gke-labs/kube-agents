@@ -3417,29 +3417,56 @@ class CriteriaTest(unittest.TestCase):
         self.assertEqual(len(pr.check_stale_image_type(unoffered, BASELINE, deprecated=frozenset())), 1)
 
     def test_criteria_reach_the_candidates_and_the_manifest_through_collect_fleet(self):
+        # All four threads, through the collector's own entry point: drop any one of
+        # `critical_minors=`, `long_freeze=`, `deprecated=` or `min_minors=` inside the collector
+        # and the matching assertion below fails, since every keyword defaults to the shipped
+        # value and the manifest's `criteria` block is carried, not read back from the candidates.
         behind = cluster(name="lagging", master="1.33.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
+        # Two minors behind the newest control plane: a spread the shipped width flags and a
+        # width of three does not.
+        older = cluster(name="older", master="1.31.0-gke.1", node_pools=[pool(version="1.31.0-gke.1")])
+        # At the channel default with no version finding of its own, under a blocking exclusion
+        # with 59 days left (NOW is 2026-01-15): past the shipped 30, short of 90. Its pool runs an
+        # offered image type the shipped list does not name.
+        frozen = cluster(
+            name="frozen",
+            master="1.33.0-gke.1",
+            node_pools=[pool(version="1.33.0-gke.1", image_type="COS_CONTAINERD")],
+            maintenancePolicy={
+                "window": {
+                    "recurringWindow": {},
+                    "maintenanceExclusions": {"freeze": {"startTime": "2026-01-01T00:00:00Z", "endTime": "2026-03-15T00:00:00Z", "maintenanceExclusionOptions": {"scope": "NO_UPGRADES"}}},
+                }
+            },
+        )
 
         def run(argv, **kwargs):
             if "clusters" in argv and "list" in argv:
-                return run_of(0, json.dumps([behind]))
+                return run_of(0, json.dumps([behind, older, frozen]))
             if "get-server-config" in argv:
-                return run_of(0, json.dumps(server_config(default="1.33.0-gke.1")))
+                return run_of(0, json.dumps(server_config(default="1.33.0-gke.1", valid_versions=["1.33.0-gke.1", "1.31.0-gke.1"])))
             raise AssertionError(f"unexpected discovery call: {argv}")
 
-        def pool_skew_severity(manifest):
-            entry = next(c for c in manifest["clusters"] if short(c) == "lagging")
-            return [c["severity"] for c in entry["candidates"] if c["check"] == "pool-skew"]
+        def severities(manifest, name, check):
+            entry = next(c for c in manifest["clusters"] if short(c) == name)
+            return [c["severity"] for c in entry.get("candidates", []) if c["check"] == check]
 
         shipped = pr.collect_fleet("acme", run=run, now=NOW)
-        self.assertEqual(pool_skew_severity(shipped), ["critical"])
+        self.assertEqual(severities(shipped, "lagging", "pool-skew"), ["critical"])
+        self.assertEqual(len(severities(shipped, "older", "fleet-spread")), 1)
+        self.assertEqual(len(severities(shipped, "frozen", "blocking-exclusion")), 1)
+        self.assertEqual(severities(shipped, "frozen", "stale-image-type"), [])
         self.assertEqual(shipped["criteria"], pr.DEFAULT_CRITERIA.record())
 
-        tuned = pr.Criteria(pool_skew_critical_minors=4, fleet_spread_min_minors=3, blocking_exclusion_min_days=90, deprecated_image_types=frozenset({"UBUNTU"}))
+        tuned = pr.Criteria(pool_skew_critical_minors=4, fleet_spread_min_minors=3, blocking_exclusion_min_days=90, deprecated_image_types=frozenset({"COS_CONTAINERD"}))
         manifest = pr.collect_fleet("acme", run=run, now=NOW, criteria=tuned)
-        self.assertEqual(pool_skew_severity(manifest), ["major"])
+        self.assertEqual(severities(manifest, "lagging", "pool-skew"), ["major"])
+        self.assertEqual(severities(manifest, "older", "fleet-spread"), [])
+        self.assertEqual(severities(manifest, "frozen", "blocking-exclusion"), [])
+        self.assertEqual(len(severities(manifest, "frozen", "stale-image-type")), 1)
         self.assertEqual(
             manifest["criteria"],
-            {"pool_skew_critical_minors": 4, "fleet_spread_min_minors": 3, "blocking_exclusion_min_days": 90, "deprecated_image_types": ["UBUNTU"]},
+            {"pool_skew_critical_minors": 4, "fleet_spread_min_minors": 3, "blocking_exclusion_min_days": 90, "deprecated_image_types": ["COS_CONTAINERD"]},
         )
 
     def test_the_flags_build_the_criteria_the_run_uses(self):
