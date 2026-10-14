@@ -48,7 +48,15 @@ from typing import Any
 from kube_agents_bench.parsing import _TASK_ID_RE, DELEGATION_TOOL, delegated_task_ids
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
-__all__ = ["SessionCards", "api_session_id", "read_session_cards", "read_statuses"]
+__all__ = [
+    "DESCENDANTS_PRESENT",
+    "SessionCards",
+    "api_session_id",
+    "command_descendants",
+    "read_descendants",
+    "read_session_cards",
+    "read_statuses",
+]
 
 _log = logging.getLogger("kube_agents_bench.board")
 
@@ -355,6 +363,129 @@ def read_statuses(
     if not isinstance(statuses, dict):
         return None
     return {str(k): str(v) for k, v in statuses.items() if k in task_ids}
+
+
+# Line the in-pod descendants script prints before its JSON.
+DESCENDANTS_PRESENT = "__KANBAN_DESCENDANTS__"
+
+_DESCENDANTS_SCRIPT = r"""
+import json, sqlite3, sys
+
+ROOT, BOARD, SENTINEL = sys.argv[1:4]
+roots = [a for a in sys.argv[4:] if a]
+SQLITE_BUSY_TIMEOUT = 10
+out = {"descendants": [], "error": None}
+
+def has_table(conn, name):
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+try:
+    conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
+    has_children = has_table(conn, "kanban_worker_children")
+    has_links = has_table(conn, "task_links")
+    has_tasks = has_table(conn, "tasks")
+    queue = list(roots)
+    seen = set(roots)
+    descendants = []
+    MAX_CARDS = 64
+    while queue and len(descendants) < MAX_CARDS:
+        curr = queue.pop(0)
+        children = []
+        if has_children:
+            rows = conn.execute(
+                "SELECT child_id FROM kanban_worker_children WHERE creator_id = ? ORDER BY created_at, child_id",
+                (curr,),
+            ).fetchall()
+            for r in rows:
+                cid = str(r[0]) if r[0] is not None else ""
+                if cid:
+                    children.append(cid)
+        if has_links:
+            rows = conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (curr,),
+            ).fetchall()
+            for r in rows:
+                cid = str(r[0]) if r[0] is not None else ""
+                if cid:
+                    children.append(cid)
+        for child in children:
+            if child not in seen:
+                seen.add(child)
+                queue.append(child)
+                status = None
+                if has_tasks:
+                    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
+                    if row is not None and row[0] is not None:
+                        status = str(row[0])
+                if status not in ("done", "archived"):
+                    descendants.append(child)
+                if len(descendants) >= MAX_CARDS:
+                    break
+    conn.close()
+    out["descendants"] = descendants
+except sqlite3.Error as exc:
+    out["error"] = "kanban board: %s" % exc
+print(SENTINEL)
+print(json.dumps(out))
+"""
+
+
+def command_descendants(task_ids: list[str]) -> str:
+    """The ``sh -c`` line that reads ``task_ids``' descendants in the pod."""
+    args = " ".join(
+        shlex.quote(a) for a in [DATA_ROOT, BOARD_FILE, DESCENDANTS_PRESENT, *task_ids]
+    )
+    return (
+        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(_DESCENDANTS_SCRIPT)} {args}'
+    )
+
+
+def read_descendants(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> list[str] | None:
+    """The unsettled descendant card ids filed under ``task_ids``, or ``None``.
+
+    Walks ``kanban_worker_children`` (fanned-out children created by workers)
+    and ``task_links`` (predecessor links) recursively, skipping cards that
+    are already settled (``done`` or ``archived``).
+
+    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
+    module stays importable without the harness and testable with a canned
+    reply.
+
+    ``None`` means the read cannot be trusted: the script did not run to
+    completion, its reply was not JSON, or the board could not be opened.
+    An empty list means the read succeeded and no unsettled descendants exist.
+    """
+    if not task_ids:
+        return []
+    reply = shell(command_descendants(task_ids), timeout)
+    marker = reply.find(DESCENDANTS_PRESENT)
+    if marker < 0:
+        _log.debug("kanban board descendants could not be read for %s", ", ".join(task_ids))
+        return None
+    body = reply[marker + len(DESCENDANTS_PRESENT) :].strip()
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        _log.warning("kanban board descendants reply is not JSON: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("error"):
+        _log.warning("kanban board descendants: %s", payload["error"])
+        return None
+    descendants = payload.get("descendants")
+    if not isinstance(descendants, list):
+        return None
+    return [str(d) for d in descendants if isinstance(d, str)]
 
 
 def api_session_id(context_id: str) -> str:

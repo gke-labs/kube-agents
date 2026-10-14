@@ -381,3 +381,114 @@ def test_a_session_past_the_scan_bound_reports_its_total(
     read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
     assert read is not None
     assert (read.card_ids, read.total) == (cards[:3], 5)
+
+
+# --- fan-out child and descendant discovery (#3019) --------------------------
+
+
+def _run_descendants_script(root: Path, task_ids: list[str]) -> str:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            board._DESCENDANTS_SCRIPT,
+            str(root),
+            board.BOARD_FILE,
+            board.DESCENDANTS_PRESENT,
+            *task_ids,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _descendants_shell_for(root: Path):
+    def shell(script: str, timeout: float) -> str:
+        assert board.DESCENDANTS_PRESENT in script
+        ids = script.split(board.DESCENDANTS_PRESENT, 1)[1].split()
+        return _run_descendants_script(root, [i.strip("'") for i in ids])
+
+    return shell
+
+
+def test_command_descendants_prefers_hermes_interpreter_and_names_the_cards() -> None:
+    cmd = board.command_descendants([FRONT, CHILD])
+    assert cmd.startswith(f"PY={board.HERMES_PYTHON}")
+    assert board.FALLBACK_PYTHON in cmd
+    assert board.DATA_ROOT in cmd
+    assert board.DESCENDANTS_PRESENT in cmd
+    assert cmd.index(FRONT) < cmd.index(CHILD)
+
+
+def test_read_descendants_walks_worker_children_and_links(tmp_path: Path) -> None:
+    # #3019: walk kanban_worker_children and task_links recursively, skipping settled cards
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, assignee TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
+        conn.executemany(
+            "INSERT INTO tasks (id, status, assignee) VALUES (?, ?, ?)",
+            [
+                ("t_root", "running", "platform"),
+                ("t_c1", "running", "cluster-a"),
+                ("t_gc1", "running", "cluster-b"),
+                ("t_c2", "todo", "cluster-c"),
+                ("t_done", "done", "cluster-d"),
+                ("t_arch", "archived", "cluster-e"),
+                ("t_other", "running", "cluster-f"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_c1", "t_root", 100),
+                ("t_gc1", "t_c1", 200),
+                ("t_done", "t_root", 300),
+                ("t_arch", "t_root", 400),
+            ],
+        )
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_root", "t_c2"))
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == ["t_c1", "t_c2", "t_gc1"]
+
+
+def test_read_descendants_handles_missing_tables(tmp_path: Path) -> None:
+    # Fail-soft when kanban_worker_children does not exist yet (pre-patch board)
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, assignee TEXT)")
+        conn.execute("INSERT INTO tasks (id, status, assignee) VALUES ('t_root', 'running', 'platform')")
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == []
+
+
+def test_read_descendants_handles_cycles_without_infinite_loop(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status) VALUES (?, ?)",
+            [("t_a", "running"), ("t_b", "running")],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [("t_b", "t_a", 100), ("t_a", "t_b", 200)],
+        )
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_a"], 5.0)
+    assert descendants == ["t_b"]
+
+
+def test_read_descendants_returns_none_on_error_or_missing_sentinel(tmp_path: Path) -> None:
+    assert board.read_descendants(lambda script, timeout: "", ["t_root"], 5.0) is None
+    assert board.read_descendants(lambda script, timeout: f"{board.DESCENDANTS_PRESENT}\nnot json", ["t_root"], 5.0) is None
+    assert board.read_descendants(lambda script, timeout: "", [], 5.0) == []
+

@@ -9,13 +9,14 @@ suffixes stripped, that ``_settle`` records them on the result, and that
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
 import pytest
 from devops_bench.agents import AgentResult
 
-from kube_agents_bench import harness, transcript
+from kube_agents_bench import board, harness, transcript
 
 _LOG = """__WORKER_LOG__
   ┊ 💻 preparing terminal…
@@ -181,8 +182,38 @@ def test_each_stalled_card_is_archived_in_its_own_exec(monkeypatch):
     calls = []
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: calls.append(script) or "")
     harness._archive_stalled_cards(["t_a", "t_b"], 5.0)
-    assert ["'t_a'" in s for s in calls] == [True, False]
-    assert ["'t_b'" in s for s in calls] == [False, True]
+    archive_calls = [s for s in calls if "kanban archive" in s]
+    assert ["'t_a'" in s for s in archive_calls] == [True, False]
+    assert ["'t_b'" in s for s in archive_calls] == [False, True]
+
+
+def test_stalled_cards_archive_fanned_out_children(monkeypatch, caplog):
+    # #3019: archiving a stalled card collects and archives its fanned-out children too,
+    # so child workers do not keep holding dispatcher slots into later units.
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if getattr(board, "DESCENDANTS_PRESENT", "__KANBAN_DESCENDANTS__") in script:
+            payload = {"descendants": ["t_child_1", "t_child_2"], "error": None}
+            return f"__KANBAN_DESCENDANTS__\n{json.dumps(payload)}\n"
+        if "kanban archive" in script:
+            tid = script.split("kanban archive")[1].strip().split()[0].strip("'\"")
+            return f"Archived {tid}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_parent"], 5.0)
+
+    archive_calls = [s for s in calls if "kanban archive" in s]
+    assert len(archive_calls) == 3
+    assert "'t_parent'" in archive_calls[0]
+    assert "'t_child_1'" in archive_calls[1]
+    assert "'t_child_2'" in archive_calls[2]
+    assert "archived stalled card t_parent" in caplog.text
+    assert "archived stalled card t_child_1" in caplog.text
+    assert "archived stalled card t_child_2" in caplog.text
 
 
 def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):
@@ -207,7 +238,8 @@ def test_a_refused_archive_warns_with_hermes_reason(monkeypatch, caplog):
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
         harness._archive_stalled_cards(["t_gone"], 5.0)
-    assert scripts[0].endswith("2>&1 || true")
+    archive_script = next(s for s in scripts if "kanban archive" in s)
+    assert archive_script.endswith("2>&1 || true")
     assert "could not archive stalled card t_gone" in caplog.text
     assert "task t_gone not found" in caplog.text
 

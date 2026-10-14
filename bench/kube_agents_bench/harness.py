@@ -1023,7 +1023,9 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     reclaims only a silent one), and every later unit's card queues behind
     it. ``hermes kanban archive`` moves a running card to the terminal
     ``archived`` state and terminates its worker. Children the worker filed
-    are not known here and keep running.
+    (recorded in ``kanban_worker_children``) are collected as descendants and
+    archived in the same pass so their workers do not keep holding dispatcher
+    slots.
 
     One exec per card, so a card the dispatcher already archived does not
     fail the batch for the rest, and each kill has the whole exec timeout.
@@ -1032,7 +1034,15 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     its worker may still hold a slot, and the run log should not say
     otherwise.
     """
-    for tid in stalled:
+    if not stalled:
+        return
+    descendants = board.read_descendants(_agent_shell, list(stalled), timeout)
+    to_archive = list(stalled)
+    if descendants:
+        for cid in descendants:
+            if cid not in to_archive:
+                to_archive.append(cid)
+    for tid in to_archive:
         script = (
             f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
             f'"$H" kanban archive {_shell_quote(tid)} 2>&1 || true'
