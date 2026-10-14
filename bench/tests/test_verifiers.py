@@ -7384,6 +7384,8 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
         ],
         [
+            "seeded-a: dataplane legacy no longer, now dataplane v2 (migrated at 1.33); networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy-free; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: yes; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability are unenforced)",

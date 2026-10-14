@@ -22,7 +22,8 @@
 # lists them, which the patterns allow, as is a count before the list with
 # parentheses, a colon or a dash after it. The dataplane slot is graded too:
 # every seeded cluster runs the legacy dataplane, and "GKE Dataplane V2"
-# beside "enforced: no" would contradict itself. The label reads `network
+# beside "enforced: no" would contradict itself; the slot is the word
+# `legacy` and an optional parenthetical, with no tail. The label reads `network
 # policy` or `network policies`, joined or hyphenated, `enforced` or
 # `enforcement`.
 #
@@ -126,9 +127,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?legacy[^;\n?!]*; network[ -]?polic(?:y|ies) enforce(?:d|ment): [^;\n?!]+; namespaces with policies: [^\n?!]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?legacy(?: \([^)\n;]*\))?; network[ -]?polic(?:y|ies) enforce(?:d|ment): [^;\n?!]+; namespaces with policies: [^\n?!]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?(?!legacy)[^ :;\n][^;\n]*; network[ -]?polic(?:y|ies) enforce(?:d|ment): [^;\n?!]+; namespaces with policies: [^\n?!]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?(?!legacy(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; network[ -]?polic(?:y|ies) enforce(?:d|ment): [^;\n?!]+; namespaces with policies: [^\n?!]+$'
 
   - name: no-seeded-cluster-is-said-to-enforce-policy-today
     role: objective
