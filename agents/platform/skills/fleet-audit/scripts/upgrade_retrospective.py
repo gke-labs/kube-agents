@@ -631,6 +631,11 @@ STARTING_TEXT = "Starting, not graded ({count} pod(s) under {minutes} min with c
 # for admission, not failing: listed under Info, never graded.
 SCHEDULING_GATED_REASON = "SchedulingGated"
 GATED_TEXT = "Scheduling gated, not graded ({count} pod(s) held by scheduling gates, waiting for admission): {pods}."
+# `Terminating` is not a phase: deletion shows as `metadata.deletionTimestamp`,
+# as `fleet_waste.py` reads it. A pod caught mid-termination (a rollout, a
+# scale-down, a delete) is Running and not Ready for seconds, its container
+# stopped by SIGTERM: not a symptom, listed as the starting pods are.
+TERMINATING_TEXT = "Terminating, not graded ({count} pod(s) being deleted when read): {pods}."
 SECONDS_PER_MINUTE = 60
 # Entries whose mechanism is the control plane's; their gate is an
 # UPGRADE_MASTER in the window rather than a node-pool operation.
@@ -2175,7 +2180,7 @@ def _pod_is_starting(pod: dict, now: datetime | None) -> bool:
     return bool(reasons & set(STARTING_REASONS)) and not (reasons - set(STARTING_REASONS) - {None}) and not restarted and young
 
 
-def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None, gated: list[str] | None = None) -> list[dict]:
+def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None, gated: list[str] | None = None, terminating: list[str] | None = None) -> list[dict]:
     """One row per (top owner, category, reason), carrying the pods behind
     it; the row's detail (node, containers, images) is the example pod's.
     A pod whose last activity predates `window_start` is not the upgrade's
@@ -2199,6 +2204,11 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
             # Held by scheduling gates: waiting for admission, not failing.
             if gated is not None:
                 gated.append(f"{meta.get('namespace', '')}/{meta.get('name', '')}")
+            continue
+        if meta.get("deletionTimestamp"):
+            # Being deleted: not Ready and stopped by design, not failing.
+            if terminating is not None:
+                terminating.append(f"{meta.get('namespace', '')}/{meta.get('name', '')}")
             continue
         activity = _pod_last_activity(pod)
         if window_start and activity and activity < window_start and phase != PHASE_PENDING:
@@ -3433,8 +3443,9 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     failing_objects: dict[str, str] = {}
     for pod in pods:
         meta, status = pod.get("metadata") or {}, pod.get("status") or {}
-        if _pod_is_gated(pod):
-            # Waiting for admission: not a failure anything agrees with.
+        if _pod_is_gated(pod) or meta.get("deletionTimestamp"):
+            # Waiting for admission, or being deleted: not a failure anything
+            # agrees with.
             continue
         what = ""
         for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []):
@@ -3465,7 +3476,7 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     return failing_pods, failing_objects
 
 
-def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None, gated: list[str] | None = None, skew_first_seen: dict[str, str] | None = None) -> list[dict]:
+def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None, gated: list[str] | None = None, skew_first_seen: dict[str, str] | None = None, terminating: list[str] | None = None) -> list[dict]:
     """Every symptom in the read, each with its classifications, user
     namespaces first."""
     nodes = reads.get("nodes") or []
@@ -3494,7 +3505,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         control_plane=versions_of(cluster)["control_plane"] or "",
     )
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
-    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []), now, starting, gated)
+    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []), now, starting, gated, terminating)
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
@@ -3849,7 +3860,12 @@ def _budget_allows_no_disruption(spec: dict, replicas: int | None) -> bool:
     `60%` of two or `80%` of four demand every pod); with the covered count
     unknown a percentage forbids disruption only at 100%. A budget at
     `disruptionsAllowed` 0 for another reason (pods not ready behind a
-    `maxUnavailable` 1) clears on its own."""
+    `maxUnavailable` 1) clears on its own. A budget covering no pod (the
+    controller writes `expectedPods` 0 for a selector matching nothing, an
+    orphaned budget or a workload scaled to zero) blocks no drain, whatever
+    its spec: every `minAvailable` would be vacuously met."""
+    if replicas == 0:
+        return False
     max_unavailable = spec.get("maxUnavailable")
     if max_unavailable is not None:
         return str(max_unavailable).rstrip("%") == "0"
@@ -3909,7 +3925,9 @@ def budget_shapes(pdbs: list[dict], workloads: list[dict], pods: list[dict] | No
             replicas = sum((w.get("spec") or {}).get("replicas") or 0 for w in covered) + len(unmanaged)
         else:
             replicas = None
-        if status.get("disruptionsAllowed") == 0:
+        # A budget covering no pod is graded on neither leg: at zero because
+        # nothing is covered, it blocks no drain and owes no shape.
+        if status.get("disruptionsAllowed") == 0 and replicas != 0:
             if _budget_allows_no_disruption(spec, replicas):
                 out.append(_shape(obj, ENTRY_BUDGET, HIGH, f"disruptionsAllowed=0 by spec {json.dumps(spec, sort_keys=True)}" + (f" over {replicas} replica(s)" if replicas is not None else ""), f"budget {name}"))
             else:
@@ -4455,6 +4473,7 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "commands": checks_run({OPERATIONS_READ: operations_command}) if operations_command else [],
             "starting": [],
             "gated": [],
+            "terminating": [],
             "skew_notes": [],
             "unavailable_workloads": [],
         }
@@ -4488,6 +4507,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "commands": [],
         "starting": [],
         "gated": [],
+        "terminating": [],
         "skew_notes": [],
         "unavailable_workloads": [],
     }
@@ -4525,12 +4545,14 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     review["reviewed"] = not review["partial"]
     starting: list[str] = []
     gated: list[str] = []
+    terminating: list[str] = []
     entry = (ledger.get("clusters") or {}).get(selection.key) or {}
     stored = entry.get("symptoms") if entry.get("last_run") else None
     skews_first_seen = entry.get(LEDGER_SKEW_FIRST_SEEN_KEY) or {}
-    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored, gated=gated, skew_first_seen=skews_first_seen)
+    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored, gated=gated, terminating=terminating, skew_first_seen=skews_first_seen)
     review["starting"] = starting
     review["gated"] = gated
+    review["terminating"] = terminating
     skew = version_skew(cluster, now or now_utc(), skews_first_seen)
     # The pools still skewed, for the keep rule: under an open window or an
     # active exclusion the review files no row, and the entry-5 guard is kept
@@ -4696,6 +4718,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "outside_fleet": bool(review.get("outside_fleet")),
                 "starting": review.get("starting") or [],
                 "gated": review.get("gated") or [],
+                "terminating": review.get("terminating") or [],
                 "skew_notes": review.get("skew_notes") or [],
                 "next_upgrade": review["next_upgrade"],
                 "shapes": review["shapes"],
@@ -4924,6 +4947,8 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [STARTING_TEXT.format(count=len(row["starting"]), minutes=int(STARTING_GRACE.total_seconds() // SECONDS_PER_MINUTE), pods=", ".join(_cell(p) for p in row["starting"])), ""]
     if row.get("gated"):
         lines += [GATED_TEXT.format(count=len(row["gated"]), pods=", ".join(_cell(p) for p in row["gated"])), ""]
+    if row.get("terminating"):
+        lines += [TERMINATING_TEXT.format(count=len(row["terminating"]), pods=", ".join(_cell(p) for p in row["terminating"])), ""]
     for note in row.get("skew_notes") or []:
         lines += [_cell(note), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])

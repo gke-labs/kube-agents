@@ -1787,6 +1787,16 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual([s["object"] for s in ur.budget_shapes([{**alone, "status": {"disruptionsAllowed": 3, "expectedPods": 4}}], [payments]) if s["object"].startswith("seeded-debug/Deployment/")], [])
         [with_agents] = [s for s in ur.budget_shapes([{**pdb, "spec": {"maxUnavailable": 0, "selector": shared}}], [payments], agents) if s["object"].startswith("seeded-debug/Deployment/")]
         self.assertIn("covering 4 pod(s)", with_agents["evidence"])
+        # A budget covering no pod blocks no drain: the controller writes expectedPods 0 (and clamps
+        # disruptionsAllowed to 0) for a selector matching nothing, and every minAvailable would be
+        # vacuously met, so neither leg grades it; a covered Deployment scaled to zero is the same.
+        for spec in ({"minAvailable": "50%"}, {"minAvailable": 1}, {"minAvailable": 0}, {"maxUnavailable": 0}):
+            self.assertFalse(ur._budget_allows_no_disruption(spec, 0), spec)
+        orphan = {**pdb, "spec": {"minAvailable": "50%", "selector": shared}, "status": {"disruptionsAllowed": 0, "expectedPods": 0, "currentHealthy": 0}}
+        self.assertEqual(ur.budget_shapes([orphan], []), [])
+        scaled_down = copy.deepcopy(payments)
+        scaled_down["spec"]["replicas"] = 0
+        self.assertEqual(ur.budget_shapes([{**pdb, "spec": {"minAvailable": "50%", "selector": shared}, "status": {"disruptionsAllowed": 0}}], [scaled_down]), [])
 
     def test_entry_19_in_tree_volume_and_class(self):
         pv = self.shape("PersistentVolume/intree-pd", 19)
@@ -2653,6 +2663,24 @@ class LedgerAndGuardsTest(unittest.TestCase):
         [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
         self.assertFalse(any("fresh" in key for key in recheck["symptom_baseline"]), recheck["symptom_baseline"])
         self.assertFalse(any("fresh" in key for key in ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["symptoms"]))
+
+    def test_terminating_pods_are_listed_under_info_not_graded(self):
+        # A pod caught mid-termination (deletionTimestamp set; Running, not Ready for seconds, its
+        # container stopped by SIGTERM) is not a symptom: it is listed under Info as the starting and
+        # gated pods are, files no unclassified Warning and no guard, and the API-set evidence skips it.
+        leaving = pod("leaving", namespace="seeded-debug", statuses=[{"name": "c0", "ready": False, "restartCount": 0, "state": {"terminated": {"reason": "Error", "exitCode": 143, "finishedAt": "2026-10-08T17:59:50Z"}}}])
+        leaving["metadata"]["deletionTimestamp"] = "2026-10-08T17:59:45Z"
+        leaving["status"]["startTime"] = "2026-10-01T00:00:00Z"
+        leaving["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-08T17:59:50Z"}]
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [leaving]}}):
+            result, _ = self.collect()
+        review = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual(review["terminating"], ["seeded-debug/leaving"])
+        self.assertNotIn("seeded-debug/leaving", json.dumps([s.get("pods") for s in review["what_failed"]]))
+        self.assertFalse(any(g["object"].endswith("/leaving") for g in result["guards"]))
+        self.assertNotIn("seeded-debug/Pod/leaving", review["failing_objects"])
+        block = ur.render_report(result).split(ur.SECTION_INFO)[1].split(f"### {SEEDED}")[1].split("### ")[0]
+        self.assertIn(ur.TERMINATING_TEXT.format(count=1, pods="seeded-debug/leaving"), block)
 
     def test_gated_pods_are_listed_under_info_not_graded(self):
         queued = pod("queued", namespace="seeded-debug", phase="Pending", statuses=[])
