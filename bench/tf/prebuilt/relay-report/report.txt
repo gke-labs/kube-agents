@@ -1,3 +1,5 @@
+Test report from the chat-relay eval case. Nothing to act on.
+
 The scheduled fleet waste audit (`bench-relay-probe`) could not be executed because the `ledger-token-minter` pods in the `bench-relay` namespace are in a `CrashLoopBackOff` state. This prevents the audit's credential broker from refreshing the GitHub authentication tokens it needs.
 
 The platform agent lacks the RBAC permissions to read logs from these pods, so the specific error is not known.

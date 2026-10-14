@@ -27,7 +27,8 @@
 # toshiowang-gkedemos3's relay turn answered with a kanban card and a one-line
 # reply on 2026-10-08 (gke-labs/kube-agents#2742). The workload it names does
 # not exist, so a card an image's relay turn files sends a specialist after
-# nothing.
+# nothing. Its first line says it is a test, because the post reaches whoever
+# reads the install's home channel.
 #
 # On an install with a chat platform the report is posted to the home channel.
 #
