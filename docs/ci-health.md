@@ -283,7 +283,8 @@ below 280 minutes (timeout − 80 min). A run qualifies if it finished in the
 window, has non-null wall clock, had no repetitions lost to infrastructure
 (`storm_reps == 0`), and either completed at least `SLOW_MIN_TASKS` tasks
 (SUCCESS or FAILURE) or was killed at the deadline with at least one task
-recorded (`run.deadline_kill and run.full`). If the window has no qualifying runs
+recorded (`run.deadline_kill and run.full`); a kill finished at or before the
+current GREEN episode began does not count. If the window has no qualifying runs
 (such as over a quiet weekend), the note holds its previous value across ticks.
 
 The poster sends one line when the note appears:

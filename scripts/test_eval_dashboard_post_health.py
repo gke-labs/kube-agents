@@ -88,7 +88,7 @@ def slow(**note):
     return doc
 
 
-def near_deadline_note(since="2026-09-17T16:00:00+00:00", max_s=356 * 60, runs=14, max_build="183592847291", deadline_s=360 * 60, headroom_s=None, kills=0):
+def near_deadline_note(since="2026-09-17T16:00:00+00:00", max_s=356 * 60, runs=14, max_build="183592847291", deadline_s=360 * 60, headroom_s=None, kills=0, max_killed=False):
     if headroom_s is None:
         headroom_s = max(0, deadline_s - max_s)
     return {
@@ -99,6 +99,7 @@ def near_deadline_note(since="2026-09-17T16:00:00+00:00", max_s=356 * 60, runs=1
         "deadline_s": deadline_s,
         "headroom_s": headroom_s,
         "kills": kills,
+        "max_killed": max_killed,
     }
 
 
@@ -882,11 +883,29 @@ class NearDeadlineNote(RunHarness):
         self.assertEqual(lines[1], f"{URL}#view=agent")
 
     def test_render_message_when_killed_past_deadline(self):
-        self.tick(near_deadline(max_s=365 * 60, kills=1), self.at(10))
+        self.tick(near_deadline(max_s=365 * 60, kills=1, max_killed=True), self.at(10))
         lines = self.opener.texts[0].split("\n")
         self.assertEqual(
             lines[0],
             "⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
+        )
+        self.assertEqual(lines[1], f"{URL}#view=agent")
+
+    def test_render_message_when_killed_at_deadline(self):
+        self.tick(near_deadline(max_s=360 * 60, kills=1, max_killed=True), self.at(10))
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(
+            lines[0],
+            "⏱ *Smoke gate: close to the deadline* — slowest run 360 min in the last 24h, killed at the deadline. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
+        )
+        self.assertEqual(lines[1], f"{URL}#view=agent")
+
+    def test_render_message_when_graded_at_deadline_with_separate_kill(self):
+        self.tick(near_deadline(max_s=360 * 60, kills=1, max_killed=False), self.at(10))
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(
+            lines[0],
+            "⏱ *Smoke gate: close to the deadline* — slowest run 360 min in the last 24h, at the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
         )
         self.assertEqual(lines[1], f"{URL}#view=agent")
 

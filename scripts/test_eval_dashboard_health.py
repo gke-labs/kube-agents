@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import health
+from eval_dashboard import health, post_health
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
@@ -1272,6 +1272,7 @@ class NearDeadline(unittest.TestCase):
                 "deadline_s": 360 * 60,
                 "headroom_s": 55 * 60,
                 "kills": 0,
+                "max_killed": False,
             },
         )
         self.assertIn(
@@ -1325,6 +1326,7 @@ class NearDeadline(unittest.TestCase):
                 "deadline_s": 360 * 60,
                 "headroom_s": 2 * 60,
                 "kills": 1,
+                "max_killed": True,
             },
         )
         self.assertIn(
@@ -1348,6 +1350,7 @@ class NearDeadline(unittest.TestCase):
                 "deadline_s": 360 * 60,
                 "headroom_s": 0,
                 "kills": 1,
+                "max_killed": True,
             },
         )
         self.assertIn(
@@ -1424,13 +1427,11 @@ class NearDeadline(unittest.TestCase):
         )
 
     def test_deadline_kill_outage_recovery_does_not_fire_near_deadline(self):
-        # Three deadline kills cause an OUTAGE
+        # Three deadline kills that graded all matrix cases cause an OUTAGE
         outage_runs = [
-            run(3101 + i, 701 + i, T0 - timedelta(hours=3 - i * 0.5), minutes=363, result="FAILURE", tasks=[task("case-0", "ppp")])
+            kill(3101 + i, 701 + i, T0 - timedelta(hours=3 - i * 0.5), minutes=363, tasks=full_tasks())
             for i in range(3)
         ]
-        for r in outage_runs:
-            r["eval_verdict"] = None
         # Then three distinct-PR green runs finish to recover the gate
         recovery_runs = [
             run(3201 + i, 801 + i, T0 - timedelta(minutes=40 - i * 10), minutes=120, result="SUCCESS", tasks=full_tasks())
@@ -1445,10 +1446,58 @@ class NearDeadline(unittest.TestCase):
             "cause": "deadline_kill",
             "failing_cases": [],
         }
+        # First tick recovers from OUTAGE to GREEN; near_deadline must NOT fire using the outage's own kills
         result = adjudicate(doc, T0, prev_outage)
         self.assertEqual(result["state"], "GREEN")
-        # Near deadline must NOT fire using the outage's own kills
         self.assertIsNone(result["near_deadline"])
+
+        # Second tick (30 min later): state is GREEN, prev is result (since = T0).
+        # Outage kills remain in the 24h window but finished <= non_green_end (prev.since),
+        # so near_deadline remains None over the subsequent 24 hours.
+        t1 = T0 + timedelta(minutes=30)
+        result1 = adjudicate(doc, t1, result)
+        self.assertEqual(result1["state"], "GREEN")
+        self.assertIsNone(result1["near_deadline"])
+
+        # Third tick (1h later): a new deadline kill finishes AFTER recovery (finished > non_green_end).
+        # This fresh kill while GREEN qualifies and fires near_deadline with kills: 1.
+        t2 = T0 + timedelta(hours=1)
+        fresh_kill = kill(3301, 901, t2 - timedelta(minutes=5), minutes=363, tasks=full_tasks())
+        doc_with_fresh = data(*(outage_runs + recovery_runs + [fresh_kill]))
+        result2 = adjudicate(doc_with_fresh, t2, result1)
+        self.assertEqual(result2["state"], "GREEN")
+        self.assertIsNotNone(result2["near_deadline"])
+        self.assertEqual(result2["near_deadline"]["kills"], 1)
+        self.assertTrue(result2["near_deadline"]["max_killed"])
+
+    def test_slowest_graded_run_with_separate_deadline_kill_does_not_claim_killed(self):
+        # A 360m graded SUCCESS run alongside a 345m deadline kill in the same 24h window.
+        # The graded run is slowest (max_s = 21600), so the margin must NOT say "killed at the deadline".
+        graded_run = run(3401, 801, T0 - timedelta(hours=2), minutes=360, result="SUCCESS", tasks=full_tasks())
+        killed_run = kill(3402, 802, T0 - timedelta(hours=1), minutes=345, tasks=[task("case-0", "ppp")])
+        doc = data(graded_run, killed_run)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIsNotNone(result["near_deadline"])
+        self.assertEqual(result["near_deadline"]["kills"], 1)
+        self.assertFalse(result["near_deadline"]["max_killed"])
+        self.assertEqual(result["near_deadline"]["max_s"], 360 * 60)
+        self.assertEqual(
+            health.near_deadline_margin(result["near_deadline"]),
+            "at the 360-minute Prow timeout",
+        )
+        self.assertEqual(
+            health.near_deadline_headroom_text(result["near_deadline"]),
+            "at the timeout",
+        )
+        self.assertIn(
+            "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 2 runs)",
+            result["evidence"],
+        )
+        post = post_health.render_near_deadline(result)
+        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout.", post)
+        self.assertNotIn("killed at the deadline", post)
+        self.assertNotIn("Not a break", post)
 
 
 # --------------------------------------------------------------------------- #
@@ -2516,6 +2565,7 @@ class NearDeadlineReplay(unittest.TestCase):
                 "deadline_s": 21600,
                 "headroom_s": 240,
                 "kills": 0,
+                "max_killed": False,
             },
         )
         self.assertIn("close to deadline: slowest run 356 min in the last 24h (4 min under the 360-minute Prow timeout; 4 runs)", tick["evidence"])
@@ -2533,6 +2583,7 @@ class NearDeadlineReplay(unittest.TestCase):
                 "deadline_s": 21600,
                 "headroom_s": 240,
                 "kills": 0,
+                "max_killed": False,
             },
         )
         self.assertIn(

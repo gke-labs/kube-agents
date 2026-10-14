@@ -470,7 +470,8 @@ SLOW_CLEAR_FACTOR = 1.1
 # - Clear when the slowest qualifying run in the last 24h < timeout - 80m (280m).
 # A run qualifies if it meets slow_gate()'s filter (SUCCESS or FAILURE, at least
 # SLOW_MIN_TASKS tasks, non-null wall_clock) with storm_reps == 0, or is a
-# deadline_kill with tasks recorded (run.full) and storm_reps == 0.
+# deadline_kill with tasks recorded (run.full) and storm_reps == 0; a kill
+# finished at or before the current GREEN episode began does not count.
 NEAR_DEADLINE_WINDOW = timedelta(hours=24)
 NEAR_DEADLINE_HEADROOM = timedelta(minutes=60)
 NEAR_DEADLINE_CLEAR_HEADROOM = timedelta(minutes=80)
@@ -1430,8 +1431,9 @@ def near_deadline(
     A run qualifies if it finished in (now - 24h, now], has non-null wall_clock,
     has 0 storm repetitions, and either completed at least SLOW_MIN_TASKS tasks
     with SUCCESS/FAILURE or was killed at the deadline with at least one task
-    recorded and finished after the previous non-GREEN episode ended. If the
-    window has no qualifying runs (weekends), keeps the previous note unchanged.
+    recorded; a kill finished at or before the current GREEN episode began does
+    not count. If the window has no qualifying runs (weekends), keeps the
+    previous note unchanged.
     """
     window_start = now - NEAR_DEADLINE_WINDOW
     qualifying = [
@@ -1441,9 +1443,10 @@ def near_deadline(
         and run.storm_reps == 0
         and run.finished is not None
         and window_start < run.finished <= now
+        and (non_green_end is None or not run.deadline_kill or run.finished > non_green_end)
         and (
             (run.result in (RUN_SUCCESS, RUN_FAILURE) and len(run.tasks) >= SLOW_MIN_TASKS)
-            or (run.deadline_kill and run.full and (non_green_end is None or run.finished > non_green_end))
+            or (run.deadline_kill and run.full)
         )
     ]
     if not qualifying:
@@ -1473,6 +1476,7 @@ def near_deadline(
         "deadline_s": deadline_s,
         "headroom_s": headroom_s,
         "kills": kills,
+        "max_killed": slowest.deadline_kill,
     }
 
 
@@ -1483,14 +1487,14 @@ def near_deadline_margin(nd: dict) -> str:
     headroom_s = nd.get("headroom_s")
     if headroom_s is None:
         headroom_s = max(0, deadline_s - max_s)
-    kills = nd.get("kills", 0)
+    max_killed = bool(nd.get("max_killed", False))
     timeout_min = minutes_text(deadline_s)
     headroom_min = int(headroom_s // SECONDS_PER_MINUTE)
     overrun_min = int((max_s - deadline_s) // SECONDS_PER_MINUTE) if max_s > deadline_s else 0
 
     if headroom_min > 0:
         return f"{headroom_min} min under the {timeout_min}-minute Prow timeout"
-    if kills > 0:
+    if max_killed:
         if overrun_min > 0:
             return f"{overrun_min} min past the {timeout_min}-minute Prow timeout"
         return "killed at the deadline"
@@ -1506,13 +1510,13 @@ def near_deadline_headroom_text(nd: dict) -> str:
     headroom_s = nd.get("headroom_s")
     if headroom_s is None:
         headroom_s = max(0, deadline_s - max_s)
-    kills = nd.get("kills", 0)
+    max_killed = bool(nd.get("max_killed", False))
     headroom_min = int(headroom_s // SECONDS_PER_MINUTE)
     overrun_min = int((max_s - deadline_s) // SECONDS_PER_MINUTE) if max_s > deadline_s else 0
 
     if headroom_min > 0:
         return f"{headroom_min} min of headroom"
-    if kills > 0:
+    if max_killed:
         if overrun_min > 0:
             return f"{overrun_min} min past the timeout"
         return "killed at the deadline"
@@ -2680,6 +2684,7 @@ def timeline(ticks, every: bool = False) -> list[dict]:
                         "deadline_s": nd["deadline_s"],
                         "headroom_s": nd.get("headroom_s", max(0, nd["deadline_s"] - nd["max_s"])),
                         "kills": nd.get("kills", 0),
+                        "max_killed": nd.get("max_killed", False),
                     } if nd else None,
                 }
             )

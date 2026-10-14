@@ -1037,7 +1037,7 @@ baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
 it is set. `near_deadline` is `null` or, on a `GREEN` tick, the near-deadline note
-(`{since, runs, max_s, max_build, deadline_s, headroom_s, kills}`, `docs/ci-health.md`, "Close to the
+(`{since, runs, max_s, max_build, deadline_s, headroom_s, kills, max_killed}`, `docs/ci-health.md`, "Close to the
 deadline").
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
