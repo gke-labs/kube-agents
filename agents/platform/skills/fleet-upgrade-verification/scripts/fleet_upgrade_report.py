@@ -288,12 +288,13 @@ NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
 NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out or cut
 # at the proxy's cap, a custom role without webhook-configuration reads) costs the webhook rule
-# only, never the PDBs. The webhook read lists every Service and EndpointSlice in the cluster
-# though only the referenced Services are consulted; a read proportional to the webhooks (the
-# configurations first, then each referenced Service and its slices) is the change that removes
-# the cluster-size bound, and is not made here.
+# only, never the PDBs. The webhook read lists every Service, EndpointSlice and Namespace in the
+# cluster though only the referenced Services and the two bootstrap namespaces (whose labels the
+# `namespaceSelector` is judged on) are consulted; a read proportional to the webhooks (the
+# configurations first, then each referenced Service and its slices, and the two namespaces by
+# name) is the change that removes the cluster-size bound, and is not made here.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
-KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices"
+KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces"
 KUBECONFIG_ENV = "KUBECONFIG"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
@@ -746,7 +747,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
 
     `get-credentials` writes the member's kubeconfig; then one `kubectl get` reads every
     PodDisruptionBudget, Deployment and StatefulSet, and a second reads the webhook
-    configurations, Services and EndpointSlices. Returns `items`/`error` for the first,
+    configurations, Services, EndpointSlices and Namespaces. Returns `items`/`error` for the first,
     `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
     `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
     (`directory_error`); a first read that failed before the server answered it (a connection,

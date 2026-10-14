@@ -186,7 +186,7 @@ Cluster Agent from is still read here. That read is `gcloud` cluster metadata
 for the version table and, on a report day, one `get-credentials` and two
 `kubectl get` per cluster for the readiness grade, one of
 `pdb,deploy,statefulset -A` and one of
-`validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices -A`;
+`validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A`;
 the budget names those objects, and a fail-closed webhook with no reachable
 backend names its configuration and its Service, in the saved report, which is
 tenant-written text, so the entry declares `risk: high` as `stall-watch` does. A project

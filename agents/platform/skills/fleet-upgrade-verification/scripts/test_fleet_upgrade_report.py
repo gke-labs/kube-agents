@@ -1229,6 +1229,7 @@ class FakeReadinessCommands(FakeGcloud):
         "mutatingwebhookconfigurations": "MutatingWebhookConfiguration",
         "services": "Service",
         "endpointslices": "EndpointSlice",
+        "namespaces": "Namespace",
     }
 
     def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=(), failing_webhook_read=()):
@@ -1280,6 +1281,10 @@ def k8s_service(namespace, name, port=443, port_name="https"):
 
 def k8s_endpointslice(namespace, service, ready, port_name="https"):
     return {"kind": "EndpointSlice", "metadata": {"namespace": namespace, "name": f"{service}-x", "labels": {"kubernetes.io/service-name": service}}, "ports": [{"name": port_name, "port": 8443}], "endpoints": [{"conditions": {"ready": ready}}]}
+
+
+def k8s_namespace(name, labels=None):
+    return {"kind": "Namespace", "metadata": {"name": name, "labels": {"kubernetes.io/metadata.name": name, **(labels or {})}}}
 
 
 class ReadinessTest(unittest.TestCase):
@@ -1411,7 +1416,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
-        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails its own requests now and is reported, not graded", b_row)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails its own requests now; reported, not graded", b_row)
         self.assertIn("pod-gate/pods.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service gate/pod-hook has no ready endpoints on port 443; matches CREATE pods", host_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
@@ -1440,7 +1445,7 @@ class ReadinessTest(unittest.TestCase):
             kubectl,
             [
                 ["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"],
-                ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices", "-A", "-o", "json"],
+                ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces", "-A", "-o", "json"],
             ]
             * 3,
         )
@@ -1571,7 +1576,23 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("webhook read failed; webhooks not graded", host["note"])
         row = next(l for l in text.splitlines() if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
         self.assertIn("(2 replicas)) | read failed |", row)
-        self.assertIn("kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices -A -o json failed (1)", text)
+        self.assertIn("kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json failed (1)", text)
+
+    def test_the_namespace_read_feeds_the_selector(self):
+        # A dead Role gate that exempts kube-system and kube-public by a label the installer
+        # put on them is an outage on the cluster whose Namespace read shows the label, and a
+        # blocker on the cluster whose namespaces do not carry it.
+        gate = k8s_webhook("ValidatingWebhookConfiguration", "policy-gate", "roles.example.com", "Fail", ("policy", "absent"), ["roles"])
+        gate["webhooks"][0]["rules"][0]["apiGroups"] = ["rbac.authorization.k8s.io"]
+        gate["webhooks"][0]["namespaceSelector"] = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]}
+        exempt = [k8s_namespace("kube-system", {"admission.policy.example/ignore": "true"}), k8s_namespace("kube-public", {"admission.policy.example/ignore": "true"})]
+        plain = [k8s_namespace("kube-system"), k8s_namespace("kube-public")]
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [gate] + exempt, "robot-host": self.objects["robot-host"] + [gate] + plain}
+        _, _, data = self._run(FakeReadinessCommands(self.clusters, {}, objects))
+        webhooks = {m["cluster"]: m["readiness"]["webhooks"] for m in data["members"]}
+        self.assertEqual(([f["webhook"] for f in webhooks["seeded-a"]["outage"]], webhooks["seeded-a"]["blocking"]), (["policy-gate/roles.example.com"], []))
+        blocking = {f["webhook"]: f["upgrade_path"] for f in webhooks["robot-host"]["blocking"]}
+        self.assertEqual(blocking["policy-gate/roles.example.com"], ["CREATE roles in kube-system,kube-public"])
 
     def test_url_backend_is_counted_in_the_json_and_not_noted(self):
         url_hook = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "warden"}, "webhooks": [{"name": "warden.example.com", "failurePolicy": "Fail", "rules": [{"apiGroups": [""], "operations": ["CREATE"], "resources": ["pods"]}], "clientConfig": {"url": "https://localhost:5443/validate"}}]}

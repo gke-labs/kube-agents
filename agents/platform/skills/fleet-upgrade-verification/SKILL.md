@@ -208,7 +208,7 @@ webhook without a visible backend, GKE's own URL-backed ones included, as a bloc
   silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
   them.
 - **Fail-closed webhooks**, from a second read with the same kubeconfig: `kubectl get
-validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices -A -o json`.
+validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json`.
   It is a read of its own so that a failure there grades only this rule `unknown` and never costs
   the PDB result. In the agent sandbox the credential proxy cuts a list past its output cap on the
   largest clusters; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
@@ -227,14 +227,17 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   API group, API version, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics)
   and scope, as the API server matches them: a rule's `apiVersions` must carry `*` or the version
   the server serves the write at (`v1` for every write on the list), so a rule pinned to a version
-  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing. The
-  pin is judged per rule, on the resources it names and not on its operations (a graded resource at
-  an unserved version is pinned whatever the operation, and the cell then names the resource): a
-  webhook whose every rule is so pinned is an outage, not a blocker, whose
-  cell says the server sends it no request at a served version rather than that its requests fail
-  now, and one that pairs such a rule with a rule the server does serve off the path is an outage
-  whose cell names the live rules as failing their requests now and the pinned rule alone as sent
-  nothing; `objectSelector` and `matchConditions` are not evaluated, and `namespaceSelector`
+  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing. Each
+  rule of a dead off-path webhook is then classed by what the server serves it, on the resources it
+  names and not on its operations: a rule at `*` or `v1` fails its requests now; a rule naming graded
+  resources only, at an unserved version, is sent nothing (whatever the operation; the cell then names
+  the resource); a rule at an unserved version on a resource, group or wildcard off the lists is one
+  whose served versions the reader does not know. The cell says each for the rules the webhook has: a
+  webhook whose every rule is pinned is told the server sends it no request at a served version rather
+  than that its requests fail now; otherwise the live rules are named as failing their requests now,
+  the pinned rules as sent nothing, and the unknown rules as failing only if the server still serves
+  their version, so a failure now is asserted for the live rules alone; `objectSelector` and
+  `matchConditions` are not evaluated, and `namespaceSelector`
   is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
   able to match. A dead webhook off the node path is graded `blocked` all the same when its rules match a
   bootstrap RBAC write a new master's start-up reconciles and fatals without, so the
@@ -243,8 +246,8 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   selector (`CONTROL_PLANE_CLUSTER_WRITES` in the script); or a Role or RoleBinding write when the
   `namespaceSelector` admits `kube-system` or `kube-public` (absent or empty admits every
   namespace; a requirement the reader cannot evaluate counts as admitting; the two namespaces
-  are judged on their default `kubernetes.io/metadata.name` label alone;
-  `CONTROL_PLANE_KUBE_SYSTEM_WRITES`). Its cell names the write and, for the namespaced rows, the
+  are judged on the labels the read returns for them, so an exemption label an operator put on
+  them reads as admission reads it; `CONTROL_PLANE_KUBE_SYSTEM_WRITES`). Its cell names the write and, for the namespaced rows, the
   namespaces admitted. A ConfigMap gate is
   not on that list: the start-up ConfigMap write the Jetstack outage deadlocked on left the
   start-up path in Kubernetes 1.17, and its successor retries. The cell names the

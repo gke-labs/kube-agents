@@ -143,6 +143,7 @@ SKEW_MAJOR_DIFFERS = "major version differs from the target"
 WEBHOOK_CONFIG_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
 SERVICE_KIND = "Service"
 ENDPOINTSLICE_KIND = "EndpointSlice"
+NAMESPACE_KIND = "Namespace"
 SERVICE_NAME_LABEL = "kubernetes.io/service-name"
 FAILURE_POLICY_FAIL = "Fail"
 # The API server resolves a webhook's Service the same way for either routing mode: the
@@ -180,15 +181,18 @@ WILDCARD = "*"
 # The version the API server serves each write at, carried on its row: the matcher reads a
 # rule's `apiVersions` as the API server does (`*` or the request's version), so a rule pinned
 # to a version the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`,
-# `storage.k8s.io/v1beta1`) matches nothing. The pin is judged per rule (`_rule_version_pinned`),
-# on the resources the rule names and not on its operations or scope, since the served version is
-# the resource's: a webhook whose every rule is pinned is an outage, not a blocker, whose cell says the server
-# sends it no request at a served version (`WEBHOOK_PINNED_MATCHES`); one that pairs a pinned
-# rule with a rule the server does serve off the path fails that rule's requests now, and its
-# cell names the live rules as failing and the pinned rule alone as sent nothing
-# (`WEBHOOK_MIXED_MATCHES`). Every write on the list is served at `v1` alone on any GKE version
-# in support; under the default `matchPolicy: Equivalent` a rule naming another served version
-# of the same resource would also match, and no resource here has one.
+# `storage.k8s.io/v1beta1`) matches nothing. Each rule of a dead off-path webhook is then classed
+# by what the server serves it (`_rule_served_class`), on the resources it names and not on its
+# operations or scope, since the served version is the resource's: live when its `apiVersions`
+# carry `*` or `v1`, so its requests fail now; pinned when every resource it names is graded and
+# the version is one the server does not serve, so the server sends it nothing; unknown when the
+# version is unserved on a resource, group or wildcard off the graded lists, whose served
+# versions this reader does not know. The outage cell says each of the three for the rules it
+# has (`WEBHOOK_PINNED_MATCHES` when every rule is pinned, `WEBHOOK_OFF_PATH_MATCHES` with one
+# clause per class otherwise) and asserts a failure now for the live rules alone. Every write on
+# the list is served at `v1` alone on any GKE version in support; under the default
+# `matchPolicy: Equivalent` a rule naming another served version of the same resource would also
+# match, and no resource here has one.
 VERSION_V1 = "v1"
 GROUP_CORE = ""
 GROUP_POLICY = "policy"
@@ -289,8 +293,8 @@ UPGRADE_PATH_LABEL = "{operation} {resource}"
 # Leases the controller manager and scheduler take in `kube-system` are already on
 # UPGRADE_PATH_NODES (the Lease rows), so a Lease gate blocks on that list. Rows as in
 # UPGRADE_PATH_TARGETS, all served at v1: CONTROL_PLANE_KUBE_SYSTEM_WRITES holds the Namespaced
-# rows and CONTROL_PLANE_CLUSTER_WRITES the Cluster ones. The namespaces are judged on
-# their default `kubernetes.io/metadata.name` label alone (`namespace_selector_reaches`).
+# rows and CONTROL_PLANE_CLUSTER_WRITES the Cluster ones. The namespaces are judged on the
+# labels the read returns for them (`bootstrap_namespace_labels`, `namespace_selector_reaches`).
 NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
 KUBE_SYSTEM_NAMESPACE = "kube-system"
 KUBE_PUBLIC_NAMESPACE = "kube-public"
@@ -322,19 +326,25 @@ NAMESPACE_JOIN = ","
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
-WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); it fails its own requests now and is reported, not graded"
-# The off-path cell for a rule pinned to a version of a resource off every graded list: the
-# reader does not know whether the server still serves that version, so it does not assert
-# that anything fails now.
-WEBHOOK_OUTAGE_VERSIONED_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); its requests fail now if the server still serves those versions, which this reader does not know for a resource off its lists; reported, not graded"
-# The off-path cell for a rule that names an upgrade-path write only at a version the server
-# does not serve: the server sends the webhook none of those requests, so nothing fails now,
-# and the cell says so rather than reporting a live outage.
+# The off-path cell: one clause per class of rule the webhook carries (`_rule_served_class`),
+# what fails now (the live rules), what the server sends nothing (the pinned rules) and what
+# the reader cannot place (the unknown rules, at an unserved version on a resource off its
+# lists), so a failure now is asserted for the live rules alone.
+WEBHOOK_OFF_PATH_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); {verdicts}; reported, not graded"
+RULES_LIVE_ALL = "it fails its own requests now"
+RULES_LIVE_SOME = "it fails now the requests matched by {live}"
+RULES_PINNED_SOME = "the server serves {pinned} at {served} alone, so it sends the rule {pinned_rules} nothing"
+RULES_UNKNOWN_ALL = "its requests fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
+RULES_UNKNOWN_SOME = "the requests matched by {unknown} fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
+VERDICT_JOIN = "; "
+# The off-path cell for a webhook whose every rule names graded resources only at a version the
+# server does not serve: the server sends the webhook none of those requests, so nothing fails
+# now, and the cell says so rather than reporting a live outage.
 WEBHOOK_PINNED_MATCHES = "no request the server sends at a served version (its rules: {rules}; the server serves {pinned} at {served} alone, so it sends this webhook none of them); it is reported, not graded"
-# The off-path cell for a webhook that pairs such a pinned rule with a rule the server does
-# serve: the live rules' requests fail now and are named, and the pinned rule alone is the one
-# the server sends nothing.
-WEBHOOK_MIXED_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); it fails now the requests matched by {live}, and is reported, not graded; the server serves {pinned} at {served} alone, so it sends the rule {pinned_rules} nothing"
+# The classes `_rule_served_class` returns.
+RULE_LIVE = "live"
+RULE_PINNED = "pinned"
+RULE_UNKNOWN = "unknown"
 # A webhook's rules, rendered for the cell so the operator can judge an outage: operations
 # joined by `/`, resources by `,`, with the API groups named when any is not the core group,
 # and the core group then named `core` beside the others rather than dropped (a rule on
@@ -812,9 +822,9 @@ def evaluate_skew(target, pools: list[dict], autopilot: bool) -> dict:
 # ---------------------------------------------------------------------- webhooks
 
 
-def split_webhook_items(items: list) -> tuple[list[dict], list[dict], list[dict]]:
-    """(webhook configurations, Services, EndpointSlices) from a mixed `items` list."""
-    configs, services, slices = [], [], []
+def split_webhook_items(items: list) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """(webhook configurations, Services, EndpointSlices, Namespaces) from a mixed `items` list."""
+    configs, services, slices, namespaces = [], [], [], []
     for item in items or []:
         if not isinstance(item, dict):
             continue
@@ -825,7 +835,9 @@ def split_webhook_items(items: list) -> tuple[list[dict], list[dict], list[dict]
             services.append(item)
         elif kind == ENDPOINTSLICE_KIND:
             slices.append(item)
-    return configs, services, slices
+        elif kind == NAMESPACE_KIND:
+            namespaces.append(item)
+    return configs, services, slices, namespaces
 
 
 def _named(items: list[dict], namespace: str, name: str) -> dict | None:
@@ -917,22 +929,37 @@ def namespace_selector_reaches(hook: dict, labels: dict) -> bool:
     """Whether the webhook's `namespaceSelector` admits a namespace carrying `labels`, as
     admission reads it: absent or empty admits every namespace, and a requirement this reader
     cannot evaluate counts as admitting, which errs toward naming the webhook. The caller
-    passes the namespace's labels; `kube-system` and `kube-public` are judged on their default
-    `kubernetes.io/metadata.name` label alone, so a selector keyed on a label an operator added
-    to them reads as not admitting under `matchLabels`, `In` and `Exists` (the one direction
-    this reader errs away from naming) and as admitting under `NotIn` and `DoesNotExist` (a label
-    added to exempt the namespace is one the reader never sees, so it errs toward naming there,
-    as it does everywhere else)."""
+    passes the namespace's labels as the read returned them (`bootstrap_namespace_labels`), so
+    an exemption an operator added to the namespace (`DoesNotExist` on a label it carries) reads
+    as not admitting and a label it carries reads as admitting, as admission reads both."""
     selector = hook.get("namespaceSelector")
     if not isinstance(selector, dict) or not selector:
         return True
     return _requirements_hold(selector, labels, unevaluable=True)
 
 
-def bootstrap_namespaces_admitted(hook: dict) -> list[str]:
-    """The bootstrap-policy namespaces this webhook's `namespaceSelector` admits, in
+def bootstrap_namespace_labels(namespaces: list[dict] | None) -> dict[str, dict]:
+    """Each bootstrap-policy namespace's labels, from the Namespace objects the read returned,
+    keyed by name: what the `namespaceSelector` is judged on. A namespace the read did not
+    return is judged on its default `kubernetes.io/metadata.name` label alone, the one label
+    every namespace carries, which is also set here on a read namespace that lacks it."""
+    read: dict[str, dict] = {}
+    for item in namespaces or []:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        metadata = metadata if isinstance(metadata, dict) else {}
+        name = metadata.get("name")
+        if name in BOOTSTRAP_POLICY_NAMESPACES:
+            labels = metadata.get("labels")
+            read[name] = {**(labels if isinstance(labels, dict) else {}), NAMESPACE_NAME_LABEL: name}
+    return {name: read.get(name, {NAMESPACE_NAME_LABEL: name}) for name in BOOTSTRAP_POLICY_NAMESPACES}
+
+
+def bootstrap_namespaces_admitted(hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
+    """The bootstrap-policy namespaces this webhook's `namespaceSelector` admits, judged on
+    `namespace_labels` (`bootstrap_namespace_labels`; the default labels when None), in
     `BOOTSTRAP_POLICY_NAMESPACES` order; empty when it admits neither."""
-    return [name for name in BOOTSTRAP_POLICY_NAMESPACES if namespace_selector_reaches(hook, {NAMESPACE_NAME_LABEL: name})]
+    labels = namespace_labels or bootstrap_namespace_labels(None)
+    return [name for name in BOOTSTRAP_POLICY_NAMESPACES if namespace_selector_reaches(hook, labels[name])]
 
 
 def _kube_system_labels(rules: list[dict], namespaces: list[str], *, read_version: bool) -> list[str]:
@@ -954,14 +981,15 @@ def _cluster_write_labels(rules: list[dict], *, read_version: bool) -> list[str]
     return matched
 
 
-def kube_system_write_matches(hook: dict) -> list[str]:
+def kube_system_write_matches(hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
     """The control plane's own bootstrap-policy writes this webhook can match, as labels: the
     cluster-scoped rows (`CONTROL_PLANE_CLUSTER_WRITES`) whatever its `namespaceSelector` says,
     and the `kube-system`/`kube-public` rows (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`) when the
-    selector admits either namespace, each at the served version."""
+    selector admits either namespace on the labels read for it (`namespace_labels`), each at
+    the served version."""
     rules = _rules(hook)
     labels = _cluster_write_labels(rules, read_version=True)
-    admitted = bootstrap_namespaces_admitted(hook)
+    admitted = bootstrap_namespaces_admitted(hook, namespace_labels)
     if admitted:
         labels += _kube_system_labels(rules, admitted, read_version=True)
     return labels
@@ -1007,13 +1035,13 @@ def _pinned_resource_labels(rules: list[dict], targets: tuple) -> list[str]:
     return labels
 
 
-def _pinned_labels(rules: list[dict], hook: dict) -> list[str]:
+def _pinned_labels(rules: list[dict], hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
     """The graded writes `rules` name only at a version the server does not serve, labelled; a
     namespaced bootstrap write carries the namespaces the selector admits, or no namespace clause
     when it admits neither, since what the server serves does not depend on the selector; a rule
     whose operations reach no graded row is labelled at the resource."""
     return (_upgrade_path_labels(rules, read_version=False) + _cluster_write_labels(rules, read_version=False)
-            + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook), read_version=False)
+            + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook, namespace_labels), read_version=False)
             + _pinned_resource_labels(rules, GRADED_TARGETS))
 
 
@@ -1040,18 +1068,20 @@ def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
             and all(_resource_parent(spec) in _graded_resource_names(targets) for spec in specs))
 
 
-def _rule_versioned_off_lists(rule: dict, targets: tuple) -> bool:
-    """Whether this rule names only a version other than `*` and `VERSION_V1`, on named groups
-    and resources none of which is graded: the reader cannot say whether the server still serves
-    that version, so the outage cell does not assert that the webhook fails anything now."""
+def _rule_served_class(rule: dict, targets: tuple) -> str:
+    """What the server serves this rule, read from its `apiVersions` against the graded lists.
+    `RULE_LIVE`: it carries `*` or `VERSION_V1`, so the server sends its requests and a dead
+    backend fails them now. `RULE_PINNED`: every resource it names is graded and the version is
+    one the server does not serve (`_rule_version_pinned`), so the server sends it nothing.
+    `RULE_UNKNOWN`: an unserved version on a resource, group or wildcard off the lists, whose
+    served versions this reader does not know, so the cell asserts no failure for it. A rule
+    with no `apiVersions` at all, which the API refuses, reads as the first two read it."""
     versions = set(rule.get("apiVersions") or [])
-    groups = rule.get("apiGroups") or []
-    specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
-    if not versions or {WILDCARD, VERSION_V1} & versions or not groups or not specs:
-        return False
-    if WILDCARD in groups or any(_resource_parent(spec) == WILDCARD for spec in specs):
-        return False
-    return not any(_resource_parent(spec) in _graded_resource_names(targets) for spec in specs)
+    if {WILDCARD, VERSION_V1} & versions:
+        return RULE_LIVE
+    if _rule_version_pinned(rule, targets):
+        return RULE_PINNED
+    return RULE_UNKNOWN if versions else RULE_LIVE
 
 
 def version_pinned_rules(hook: dict) -> list[dict]:
@@ -1060,7 +1090,7 @@ def version_pinned_rules(hook: dict) -> list[dict]:
     return [rule for rule in _rules(hook) if _rule_version_pinned(rule, GRADED_TARGETS)]
 
 
-def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]) -> dict:
+def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict], namespaces: list[dict] | None = None) -> dict:
     """Fail-closed webhooks whose backend is unreachable, split by whether they break an upgrade.
 
     `blocking`: the webhook's rules can match a write in `UPGRADE_PATH_TARGETS`, one the
@@ -1070,13 +1100,16 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     the `namespaceSelector` says (`CONTROL_PLANE_CLUSTER_WRITES`), or a Role or RoleBinding
     write in `kube-system` or `kube-public` when the selector admits that namespace
     (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either.
-    `outage`: the backend is unreachable but the rules match none of those; its requests fail now and the member is not graded on it, with
+    `outage`: the backend is unreachable but the rules match none of those; the member is not graded on it, with
     what it does match named so the operator can judge it, because the list is what this
-    rule knows of the path, not a proof of safety. An outage finding whose rules name a
-    path write only at a version the server does not serve carries those writes in
-    `version_pinned` and those rules in `pinned_rules`, the rest in `live_rules`: the server
-    sends the pinned rules none of them, and the cell says so of the webhook when every rule
-    is pinned, and of the pinned rule alone when a live rule sits beside it.
+    rule knows of the path, not a proof of safety. Each rule of an outage finding is classed
+    by what the server serves it (`_rule_served_class`): `live_rules` fail their requests now,
+    `pinned_rules` (their writes in `version_pinned`) name graded resources only at a version
+    the server does not serve, so it sends them nothing, and `unknown_rules` are at an unserved
+    version on a resource off the graded lists, which this reader cannot place; the cell says
+    each for the rules it has and asserts a failure now for the live rules alone. `namespaces`
+    are the Namespace objects read, whose labels the `namespaceSelector` is judged on for
+    `kube-system` and `kube-public` (`bootstrap_namespace_labels`).
     Fail-open webhooks are counted
     (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
     which nothing read here can check, and fail-closed webhooks with no `rules` (`no_rules`),
@@ -1085,6 +1118,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     selects a resource is the usual shape).
     """
     result = {"blocking": [], "outage": [], "evaluated": 0, "fail_open": 0, "url_backends": 0, "no_rules": 0}
+    namespace_labels = bootstrap_namespace_labels(namespaces)
     for config in configs:
         config_kind = config.get("kind")
         config_name = (config.get("metadata") or {}).get("name", "")
@@ -1105,14 +1139,13 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             reason = backend_problem(service_ref, services, slices)
             if reason is None:
                 continue
-            matches = upgrade_path_matches(hook) + kube_system_write_matches(hook)
-            pinned = [] if matches else version_pinned_rules(hook)
-            # Every rule is pinned to a version other than `*` and the served `v1` on groups
-            # and resources wholly off the graded lists: whether the server still serves them
-            # is not this reader's to say.
-            versioned_off_lists = not matches and not pinned and bool(_rules(hook)) and all(
-                _rule_versioned_off_lists(rule, GRADED_TARGETS) for rule in _rules(hook)
-            )
+            matches = upgrade_path_matches(hook) + kube_system_write_matches(hook, namespace_labels)
+            # A blocking webhook is described by the path writes it matches; an outage one by
+            # what the server serves each of its rules.
+            live, pinned, unknown = [], [], []
+            for rule in _rules(hook):
+                served = RULE_LIVE if matches else _rule_served_class(rule, GRADED_TARGETS)
+                (live if served == RULE_LIVE else pinned if served == RULE_PINNED else unknown).append(rule)
             finding = {
                 "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
                 "config_kind": config_kind,
@@ -1121,11 +1154,11 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
                 "reason": reason,
                 "upgrade_path": matches,
-                "version_pinned": _pinned_labels(pinned, hook),
+                "version_pinned": _pinned_labels(pinned, hook, namespace_labels),
                 "rules": describe_rules(hook),
                 "pinned_rules": [describe_rule(rule) for rule in pinned],
-                "versioned_off_lists": versioned_off_lists,
-                "live_rules": [describe_rule(rule) for rule in _rules(hook) if not any(rule is p for p in pinned)],
+                "unknown_rules": [describe_rule(rule) for rule in unknown],
+                "live_rules": [describe_rule(rule) for rule in live],
             }
             result["blocking" if matches else "outage"].append(finding)
     return result
@@ -1153,25 +1186,28 @@ def describe_rules(hook: dict) -> list[str]:
 
 
 def describe_webhook_finding(finding: dict) -> str:
+    """The cell for one finding: a blocking webhook names the path writes it matches; an outage
+    webhook whose every rule is pinned is told the server sends it nothing; any other outage
+    webhook gets one clause per class of rule it carries, a failure now asserted for the live
+    rules alone."""
     rules = LIST_SEPARATOR.join(finding.get("rules") or []) or RULE_NONE
+    live = finding.get("live_rules") or []
+    pinned = finding.get("pinned_rules") or []
+    unknown = finding.get("unknown_rules") or []
+    pinned_labels = LIST_SEPARATOR.join(finding.get("version_pinned") or pinned)
     if finding["upgrade_path"]:
         matches = LIST_SEPARATOR.join(finding["upgrade_path"])
-    elif finding.get("pinned_rules") and finding.get("live_rules"):
-        # The sentence follows the rules the pin judged; the labels say what they name.
-        matches = WEBHOOK_MIXED_MATCHES.format(
-            rules=rules,
-            live=LIST_SEPARATOR.join(finding["live_rules"]),
-            pinned=LIST_SEPARATOR.join(finding.get("version_pinned") or finding["pinned_rules"]),
-            served=VERSION_V1,
-            pinned_rules=LIST_SEPARATOR.join(finding["pinned_rules"]),
-        )
-    elif finding.get("pinned_rules"):
-        matches = WEBHOOK_PINNED_MATCHES.format(
-            rules=rules, pinned=LIST_SEPARATOR.join(finding.get("version_pinned") or finding["pinned_rules"]), served=VERSION_V1)
-    elif finding.get("versioned_off_lists"):
-        matches = WEBHOOK_OUTAGE_VERSIONED_MATCHES.format(rules=rules)
+    elif pinned and not live and not unknown:
+        matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, pinned=pinned_labels, served=VERSION_V1)
     else:
-        matches = WEBHOOK_OUTAGE_MATCHES.format(rules=rules)
+        verdicts = []
+        if live or not (pinned or unknown):
+            verdicts.append(RULES_LIVE_ALL if not (pinned or unknown) else RULES_LIVE_SOME.format(live=LIST_SEPARATOR.join(live)))
+        if pinned:
+            verdicts.append(RULES_PINNED_SOME.format(pinned=pinned_labels, served=VERSION_V1, pinned_rules=LIST_SEPARATOR.join(pinned)))
+        if unknown:
+            verdicts.append(RULES_UNKNOWN_ALL if not (live or pinned) else RULES_UNKNOWN_SOME.format(unknown=LIST_SEPARATOR.join(unknown)))
+        matches = WEBHOOK_OFF_PATH_MATCHES.format(rules=rules, verdicts=VERDICT_JOIN.join(verdicts))
     return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)
 
 
