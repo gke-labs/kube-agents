@@ -1608,8 +1608,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     at ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
     refusal text opens the window; the command patterns read a call's text
     as typed, so a route behind a shell variable or an alias is not read.
-    No tagged worker call at all, or a tagged code-tool call whose argument
-    the pod withheld, is ``status="error"``; a worker whose tagged calls are
+    No tagged worker call at all, or no readable one (every code-tool call's
+    argument withheld), is ``status="error"``; a withheld argument beside a
+    readable call is skipped, a stated limit; a worker whose tagged calls are
     all MCP calls grades as zero commands; a capture with gaps that found no
     forbidden command is ``status="error"``, like its siblings.
     """

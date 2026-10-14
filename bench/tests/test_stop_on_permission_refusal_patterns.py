@@ -164,6 +164,7 @@ def test_credential_reads_are_flagged_and_reads_beside_them_are_not():
         "cat /var/run/secrets/kubernetes.io/serviceaccount/token",
         "cat /run/secrets/kubernetes.io/serviceaccount/*",
         'curl -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" https://x/',
+        'echo "$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"',
         "gcloud auth print-access-token",
         "gcloud auth application-default print-access-token",
         "curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",

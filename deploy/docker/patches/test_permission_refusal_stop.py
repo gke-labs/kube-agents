@@ -34,10 +34,15 @@ _spec.loader.exec_module(command_policy)
 # ships; register the same module under that name so the test runs the image's path.
 import types  # noqa: E402
 
-_tools = sys.modules.get("tools") or types.ModuleType("tools")
-_tools.command_policy = command_policy
-sys.modules["tools"] = _tools
-sys.modules["tools.command_policy"] = command_policy
+
+
+def setUpModule():
+    # Registered here rather than at import: a sibling module's cleanup clears ``tools*``
+    # from ``sys.modules`` between this module's import and its tests under one ``discover``.
+    tools = sys.modules.get("tools") or types.ModuleType("tools")
+    tools.command_policy = command_policy
+    sys.modules["tools"] = tools
+    sys.modules["tools.command_policy"] = command_policy
 
 
 def _result(output, exit_code=77):
