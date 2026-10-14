@@ -10,7 +10,7 @@ trying to use.
 
 The board itself is a SQLite file on the agent's data volume, the same one
 :mod:`kube_agents_bench.worker_trajectory` reads the workers' cards from once
-they settle. This module has two reads, each one ``kubectl exec`` of the kind
+they settle. This module has three reads, each one ``kubectl exec`` of the kind
 the harness already relies on for artifacts and session stores:
 
 - :func:`read_statuses`, the ``status`` column of the awaited cards. The api
@@ -23,6 +23,10 @@ the harness already relies on for artifacts and session stores:
   the session store or the board's subscriptions addressed to it, and reads
   each card's status and deliverable (``tasks.result``, the newest
   ``task_runs.summary``). The wait polls it alone and sends no turn.
+- :func:`read_descendants`, for the eval harness settling phase when a card
+  reaches its delegation ceiling. It finds unsettled fan-out child cards
+  (from ``kanban_worker_children``) filed by workers of stalled cards so they
+  can be archived in the same pass.
 
 Best effort in the same sense as the artifact read-back: a pod that cannot
 be reached or a store that cannot be opened returns ``None`` for that read,
@@ -50,7 +54,9 @@ from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERM
 
 __all__ = [
     "DESCENDANTS_PRESENT",
+    "MAX_DESCENDANTS_SCANNED",
     "SessionCards",
+    "TERMINAL_STATUSES",
     "api_session_id",
     "command_descendants",
     "read_descendants",
@@ -142,6 +148,13 @@ MAX_SESSION_IDS_SCANNED = 1024
 # bound the pinned hermes' own get_compression_chain uses
 # (hermes_state_compression.py); a chain this deep is pathological.
 MAX_CHAIN_STEPS = 100
+# How many unsettled descendant card ids the descendant read collects before
+# truncating. Settle runs one archive exec per card, bounded by the harness's
+# timeout, so this prevents a runaway loop from stalling the settle phase.
+MAX_DESCENDANTS_SCANNED = 64
+
+# Terminal task statuses considered settled by the eval harness.
+TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
 
 
 # Runs inside the agent container, read-only like the status read. Positional
@@ -371,43 +384,32 @@ DESCENDANTS_PRESENT = "__KANBAN_DESCENDANTS__"
 _DESCENDANTS_SCRIPT = r"""
 import json, sqlite3, sys
 
-ROOT, BOARD, SENTINEL = sys.argv[1:4]
-roots = [a for a in sys.argv[4:] if a]
+ROOT, BOARD, SENTINEL, MAX_ARG = sys.argv[1:5]
+MAX_CARDS = int(MAX_ARG)
+roots = [a for a in sys.argv[5:] if a]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"descendants": [], "error": None}
+out = {"descendants": [], "truncated": False, "error": None}
+TERMINAL_STATUSES = ("done", "archived", "blocked", "failed", "cancelled")
 
 def has_table(conn, name):
-    try:
-        return conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
-        ).fetchone() is not None
-    except sqlite3.Error:
-        return False
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
 
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     has_children = has_table(conn, "kanban_worker_children")
-    has_links = has_table(conn, "task_links")
     has_tasks = has_table(conn, "tasks")
     queue = list(roots)
     seen = set(roots)
     descendants = []
-    MAX_CARDS = 64
-    while queue and len(descendants) < MAX_CARDS:
+    truncated = False
+    while queue and not truncated:
         curr = queue.pop(0)
         children = []
         if has_children:
             rows = conn.execute(
                 "SELECT child_id FROM kanban_worker_children WHERE creator_id = ? ORDER BY created_at, child_id",
-                (curr,),
-            ).fetchall()
-            for r in rows:
-                cid = str(r[0]) if r[0] is not None else ""
-                if cid:
-                    children.append(cid)
-        if has_links:
-            rows = conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
                 (curr,),
             ).fetchall()
             for r in rows:
@@ -423,12 +425,15 @@ try:
                     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
                     if row is not None and row[0] is not None:
                         status = str(row[0])
-                if status not in ("done", "archived"):
-                    descendants.append(child)
-                if len(descendants) >= MAX_CARDS:
-                    break
+                if status not in TERMINAL_STATUSES:
+                    if len(descendants) < MAX_CARDS:
+                        descendants.append(child)
+                    else:
+                        truncated = True
+                        break
     conn.close()
     out["descendants"] = descendants
+    out["truncated"] = truncated
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc
 print(SENTINEL)
@@ -436,10 +441,19 @@ print(json.dumps(out))
 """
 
 
-def command_descendants(task_ids: list[str]) -> str:
+def command_descendants(
+    task_ids: list[str], max_cards: int = MAX_DESCENDANTS_SCANNED
+) -> str:
     """The ``sh -c`` line that reads ``task_ids``' descendants in the pod."""
     args = " ".join(
-        shlex.quote(a) for a in [DATA_ROOT, BOARD_FILE, DESCENDANTS_PRESENT, *task_ids]
+        shlex.quote(a)
+        for a in [
+            DATA_ROOT,
+            BOARD_FILE,
+            DESCENDANTS_PRESENT,
+            str(max_cards),
+            *task_ids,
+        ]
     )
     return (
         f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
@@ -448,13 +462,16 @@ def command_descendants(task_ids: list[str]) -> str:
 
 
 def read_descendants(
-    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+    shell: Callable[[str, float], str],
+    task_ids: list[str],
+    timeout: float,
+    max_cards: int = MAX_DESCENDANTS_SCANNED,
 ) -> list[str] | None:
     """The unsettled descendant card ids filed under ``task_ids``, or ``None``.
 
     Walks ``kanban_worker_children`` (fanned-out children created by workers)
-    and ``task_links`` (predecessor links) recursively, skipping cards that
-    are already settled (``done`` or ``archived``).
+    recursively, skipping cards that are already settled (statuses in
+    :data:`TERMINAL_STATUSES`).
 
     ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
     module stays importable without the harness and testable with a canned
@@ -466,7 +483,7 @@ def read_descendants(
     """
     if not task_ids:
         return []
-    reply = shell(command_descendants(task_ids), timeout)
+    reply = shell(command_descendants(task_ids, max_cards=max_cards), timeout)
     marker = reply.find(DESCENDANTS_PRESENT)
     if marker < 0:
         _log.debug("kanban board descendants could not be read for %s", ", ".join(task_ids))
@@ -485,7 +502,13 @@ def read_descendants(
     descendants = payload.get("descendants")
     if not isinstance(descendants, list):
         return None
-    return [str(d) for d in descendants if isinstance(d, str)]
+    result = [str(d) for d in descendants if isinstance(d, str)]
+    if payload.get("truncated"):
+        _log.warning(
+            "kanban board descendants truncated at %d cards; some fan-out workers may still hold slots",
+            len(result),
+        )
+    return result
 
 
 def api_session_id(context_id: str) -> str:

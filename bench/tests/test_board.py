@@ -386,7 +386,9 @@ def test_a_session_past_the_scan_bound_reports_its_total(
 # --- fan-out child and descendant discovery (#3019) --------------------------
 
 
-def _run_descendants_script(root: Path, task_ids: list[str]) -> str:
+def _run_descendants_script(
+    root: Path, task_ids: list[str], max_cards: int = board.MAX_DESCENDANTS_SCANNED
+) -> str:
     proc = subprocess.run(
         [
             sys.executable,
@@ -395,6 +397,7 @@ def _run_descendants_script(root: Path, task_ids: list[str]) -> str:
             str(root),
             board.BOARD_FILE,
             board.DESCENDANTS_PRESENT,
+            str(max_cards),
             *task_ids,
         ],
         capture_output=True,
@@ -408,8 +411,10 @@ def _run_descendants_script(root: Path, task_ids: list[str]) -> str:
 def _descendants_shell_for(root: Path):
     def shell(script: str, timeout: float) -> str:
         assert board.DESCENDANTS_PRESENT in script
-        ids = script.split(board.DESCENDANTS_PRESENT, 1)[1].split()
-        return _run_descendants_script(root, [i.strip("'") for i in ids])
+        tokens = script.split(board.DESCENDANTS_PRESENT, 1)[1].split()
+        max_cards = int(tokens[0].strip("'\""))
+        ids = [t.strip("'\"") for t in tokens[1:]]
+        return _run_descendants_script(root, ids, max_cards=max_cards)
 
     return shell
 
@@ -420,11 +425,13 @@ def test_command_descendants_prefers_hermes_interpreter_and_names_the_cards() ->
     assert board.FALLBACK_PYTHON in cmd
     assert board.DATA_ROOT in cmd
     assert board.DESCENDANTS_PRESENT in cmd
+    assert str(board.MAX_DESCENDANTS_SCANNED) in cmd
     assert cmd.index(FRONT) < cmd.index(CHILD)
 
 
-def test_read_descendants_walks_worker_children_and_links(tmp_path: Path) -> None:
-    # #3019: walk kanban_worker_children and task_links recursively, skipping settled cards
+def test_read_descendants_walks_worker_children_and_skips_terminal_statuses(tmp_path: Path) -> None:
+    # #3019: walk kanban_worker_children recursively, skipping settled cards
+    # (done, archived, blocked, failed, cancelled) and ignoring task_links (dependency edges).
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, assignee TEXT)")
         conn.execute(
@@ -437,10 +444,13 @@ def test_read_descendants_walks_worker_children_and_links(tmp_path: Path) -> Non
                 ("t_root", "running", "platform"),
                 ("t_c1", "running", "cluster-a"),
                 ("t_gc1", "running", "cluster-b"),
-                ("t_c2", "todo", "cluster-c"),
+                ("t_todo", "todo", "cluster-c"),
                 ("t_done", "done", "cluster-d"),
                 ("t_arch", "archived", "cluster-e"),
-                ("t_other", "running", "cluster-f"),
+                ("t_blocked", "blocked", "cluster-f"),
+                ("t_failed", "failed", "cluster-g"),
+                ("t_cancelled", "cancelled", "cluster-h"),
+                ("t_dep", "running", "cluster-i"),
             ],
         )
         conn.executemany(
@@ -448,14 +458,19 @@ def test_read_descendants_walks_worker_children_and_links(tmp_path: Path) -> Non
             [
                 ("t_c1", "t_root", 100),
                 ("t_gc1", "t_c1", 200),
+                ("t_todo", "t_root", 250),
                 ("t_done", "t_root", 300),
                 ("t_arch", "t_root", 400),
+                ("t_blocked", "t_root", 500),
+                ("t_failed", "t_root", 600),
+                ("t_cancelled", "t_root", 700),
             ],
         )
-        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_root", "t_c2"))
+        # task_links is a dependency edge, not hierarchy; must not be archived.
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_root", "t_dep"))
 
     descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
-    assert descendants == ["t_c1", "t_c2", "t_gc1"]
+    assert descendants == ["t_c1", "t_todo", "t_gc1"]
 
 
 def test_read_descendants_handles_missing_tables(tmp_path: Path) -> None:
@@ -466,6 +481,38 @@ def test_read_descendants_handles_missing_tables(tmp_path: Path) -> None:
 
     descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == []
+
+
+def test_read_descendants_truncates_and_warns(tmp_path: Path, caplog) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.execute("INSERT INTO tasks (id, status) VALUES ('t_root', 'running')")
+        for i in range(5):
+            conn.execute("INSERT INTO tasks (id, status) VALUES (?, 'running')", (f"t_child_{i}",))
+            conn.execute(
+                "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, 't_root', ?)",
+                (f"t_child_{i}", 100 + i),
+            )
+
+    with caplog.at_level("WARNING", logger="kube_agents_bench.board"):
+        descendants = board.read_descendants(
+            _descendants_shell_for(tmp_path), ["t_root"], 5.0, max_cards=2
+        )
+    assert descendants == ["t_child_0", "t_child_1"]
+    assert "kanban board descendants truncated at 2 cards; some fan-out workers may still hold slots" in caplog.text
+
+
+def test_read_descendants_database_error_propagates_to_none(tmp_path: Path) -> None:
+    # When sqlite encounters an error on table access, has_table does not mask it
+    # as a successful empty read; it raises and read_descendants returns None.
+    board_path = tmp_path / board.BOARD_FILE
+    board_path.write_text("corrupted sqlite header garbage")
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants is None
 
 
 def test_read_descendants_handles_cycles_without_infinite_loop(tmp_path: Path) -> None:

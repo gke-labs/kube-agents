@@ -216,6 +216,30 @@ def test_stalled_cards_archive_fanned_out_children(monkeypatch, caplog):
     assert "archived stalled card t_child_2" in caplog.text
 
 
+def test_archive_stalled_cards_warns_when_descendants_read_fails(monkeypatch, caplog):
+    # Review finding: when read_descendants returns None (e.g. failed exec or busy board),
+    # _archive_stalled_cards must warn that child workers may still hold slots.
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if getattr(board, "DESCENDANTS_PRESENT", "__KANBAN_DESCENDANTS__") in script:
+            return ""  # failed read -> None
+        if "kanban archive" in script:
+            tid = script.split("kanban archive")[1].strip().split()[0].strip("'\"")
+            return f"Archived {tid}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_parent"], 5.0)
+
+    assert "could not read the fan-out children of t_parent; their workers may still hold dispatcher slots" in caplog.text
+    archive_calls = [s for s in calls if "kanban archive" in s]
+    assert len(archive_calls) == 1
+    assert "'t_parent'" in archive_calls[0]
+
+
 def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):
     # _agent_shell returns "" for a failed exec exactly as for silence; the
     # log must not read as if the worker was stopped.

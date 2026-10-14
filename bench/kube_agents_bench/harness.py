@@ -1025,7 +1025,8 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     ``archived`` state and terminates its worker. Children the worker filed
     (recorded in ``kanban_worker_children``) are collected as descendants and
     archived in the same pass so their workers do not keep holding dispatcher
-    slots.
+    slots. If the descendants read fails, a warning is logged naming the stalled
+    cards whose children may still hold slots.
 
     One exec per card, so a card the dispatcher already archived does not
     fail the batch for the rest, and each kill has the whole exec timeout.
@@ -1038,7 +1039,12 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
         return
     descendants = board.read_descendants(_agent_shell, list(stalled), timeout)
     to_archive = list(stalled)
-    if descendants:
+    if descendants is None:
+        _log.warning(
+            "could not read the fan-out children of %s; their workers may still hold dispatcher slots",
+            ", ".join(stalled),
+        )
+    else:
         for cid in descendants:
             if cid not in to_archive:
                 to_archive.append(cid)
