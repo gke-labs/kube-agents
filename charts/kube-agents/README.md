@@ -400,7 +400,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation and request metrics from its metrics-only port 8766, and the A2A
+tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
 terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
 that one selects no pod). The operator's policies on all three pods admit the
@@ -489,7 +489,12 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   ignored for `github` and required for `gitlab`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
-  never a GitHub name, and one `gitlab` forge per host. With a `gitlab` forge
+  never a GitHub name, and one `gitlab` forge per host. A self-managed
+  instance whose certificate a private CA signed also sets `caBundleRef`
+  (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
+  holds the CA, which the broker trusts for that host only. A Secret, so
+  changing the CA needs the same rights as changing the token. It is for a
+  `gitlab` forge at a self-managed host, never gitlab.com. With a `gitlab` forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
   repository that the install registered by URL. Name a GitLab repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading

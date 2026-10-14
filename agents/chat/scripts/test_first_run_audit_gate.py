@@ -17,6 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
+# oobe imports bootstrap_delivery, which imports sandbox_exec from agents/platform/scripts.
+sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
 
 import first_run_audit_gate  # noqa: E402
 

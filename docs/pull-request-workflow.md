@@ -125,7 +125,9 @@ package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two release
 release two behind reports a different set of findings than CI.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
-place, and the comment above the target says why.
+place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
+place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
+fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
@@ -604,17 +606,20 @@ not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
 `/override`, and the command is silently ignored.
 
-**Branch protection is not the gate and reads as though there is none.** `main` requires ten
+**Branch protection is not the gate and reads as though there is none.** `main` requires these
 contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
-`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`, and
-`Agent instructions cite assets that exist` — and conversation resolution, but **zero** approving
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`,
+`Agent instructions cite assets that exist`, and `Run A2A Module Tests` — and conversation
+resolution, but **zero** approving
 reviews, because approval is Tide's business rather than GitHub's. A reader who checks the
 repository settings for the review requirement therefore finds nothing and concludes wrongly.
 
-The last four joined the set on 2026-09-02; before that, a pull request they had not run on could
-merge without them.
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
+`Agent instructions cite assets that exist` joined the set on 2026-09-02, and
+`Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
+could merge without it.
 
-Those ten are not the whole required set either. Tide also requires every Prow presubmit not marked
+Those contexts are not the whole required set either. Tide also requires every Prow presubmit not marked
 `optional`, and those are configured in `oss-test-infra` rather than in branch protection —
 `pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that

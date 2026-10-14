@@ -326,7 +326,7 @@ Every PR that changes what the agent reads from a mirrored skill — a sync or a
 | Register | A new case goes in `hack/eval/nightly-cases.txt` with an owner and a domain.                         |
 | Record   | The PR body names the case, the red run and the three green runs.                                    |
 
-- Exempt: PRs that leave every generated skill byte-identical, such as the four migration PRs below; the PR states it in one line.
+- Exempt: PRs that leave every generated skill byte-identical, such as the four migration PRs below, and a patch that only fixes a lint finding in a script without changing what it does; the PR states it in one line.
 - Most mirrored skills have no case of their own today, so the first sync or patch for a skill usually adds one; later changes to the skill can reuse it when it is red for their reason.
 - `refresh` notes when upstream has changed the skill since its pin and suggests running `make skills-sync SKILL=<skill>` in its own commit or PR. It never syncs on its own: an edit and an upstream update stay separate changes, each reviewed and validated on its own.
 

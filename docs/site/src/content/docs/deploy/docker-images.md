@@ -29,7 +29,8 @@ same commit, so the operator takes its registry and tag from the agent image ins
 `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
 table as `nats` and `nats-box`, so `make mirror-images` copies them; the chart does not set their
 env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at
-the copies by hand.
+the copies itself, through the operator's environment
+([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
@@ -72,7 +73,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `litellm` | `ghcr.io/berriai/litellm` | `v1.100.1` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
+| `litellm` | `ghcr.io/berriai/litellm` | `v1.104.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.2` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing on a default install. |
 | `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing on a default install. |

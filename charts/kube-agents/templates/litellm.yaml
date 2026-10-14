@@ -244,6 +244,12 @@ spec:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
               value: /tmp
+            # LiteLLM v1.104.0+ refuses to boot without a master key unless permitted.
+            # In kube-agents, LiteLLM is an in-cluster gateway on a private Service
+            # protected by NetworkPolicy, and internal callers authenticate at the
+            # transport boundary rather than via LiteLLM's user-auth layer.
+            - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
+              value: "true"
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
               value: {{ $vertexProject | quote }}

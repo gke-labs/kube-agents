@@ -859,9 +859,11 @@ Consequences:
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
   requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
-  sets limits equal to requests, so the proxy's limit there is its 512Mi request, and a
+  sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents.
+  it prevents. The operator declares that request at 1Gi, above the floor, so that the
+  budget engages there too, admitting four; the floor remains for a CR override that
+  sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.

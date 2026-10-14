@@ -56,8 +56,9 @@ and is never reinstalled.
 The ledger cannot help on its *first* run, though, because it starts empty: a
 deployment that finished onboarding before this script existed has no record that
 the two onboarding jobs were retired, so they would look new and come back. They
-would come back inert — both scripts check ``.bootstrap_completed`` and return
-silently — until the delivery script's first run retires them again.
+would come back inert — disabled, or enabled by ``keep_onboarding_without_oobe``
+on an install with no ``oobe`` job, where both scripts check
+``.bootstrap_completed`` and return silently.
 ``--assume-retired`` closes that: the caller, which is the only thing that knows
 *why* a job is gone, seeds those ids into the ledger. The entrypoint passes the onboarding ids when
 ``.bootstrap_completed`` exists.
@@ -129,6 +130,15 @@ from pathlib import Path
 # below already leaves it alone. Neither does any scheduler field — that is the
 # point of the rule. See `merge_job`.
 RUNTIME_WINS = ("deliver",)
+
+# oobe took over the delivery job's chat link (docs/designs/oobe.md section 5). The plugin
+# links once, on the first human turn, so an install that spoke before oobe ran has the link
+# on the old job only; without carrying it, the report would go out with `deliver: local`.
+LINK_FROM_JOB = "bootstrap-inventory-delivery"
+OLD_ONBOARDING_JOBS = ("bootstrap-inventory-scan", LINK_FROM_JOB)
+LINK_TO_JOB = "oobe"
+LINK_KEYS = ("deliver", "origin")
+ORIGIN_KEY = "origin"
 
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
 DEFAULT_LEGACY_CRON_RISK = "low"
@@ -250,7 +260,43 @@ def reconcile(
             else:
                 result.append(job)
 
+    summary["linked"] = carry_chat_link(result)
+    summary["kept_onboarding"] = keep_onboarding_without_oobe(result)
     return result, ledger | {j.get("id") for j in image_jobs if j.get("id")}, summary
+
+
+def keep_onboarding_without_oobe(jobs: list[dict]) -> list[str]:
+    """Leave the old onboarding jobs enabled on an install that has no ``oobe`` job.
+
+    An image from before the fold removed ``oobe`` as soon as its audits stage was done, with no
+    human involved, so an install can reach this image mid-onboarding with ``oobe`` gone and the
+    two old jobs still in place. Disabled, nothing would deliver the report or finish the scan;
+    enabled, they carry on as they did. Returns the ids kept enabled, for the summary.
+    """
+    if any(j.get("id") == LINK_TO_JOB for j in jobs if isinstance(j, dict)):
+        return []
+    kept = []
+    for job in jobs:
+        if isinstance(job, dict) and job.get("id") in OLD_ONBOARDING_JOBS and job.get("enabled") is False:
+            job["enabled"] = True
+            kept.append(job["id"])
+    return kept
+
+
+def carry_chat_link(jobs: list[dict]) -> list[str]:
+    """Copy the old delivery job's chat link onto ``oobe`` when only the old job has one.
+
+    Returns the ids linked, for the summary. A link already on ``oobe`` stands: the plugin
+    wrote it to the chat the operator spoke in under this image.
+    """
+    by_id = {j.get("id"): j for j in jobs if isinstance(j, dict)}
+    source, target = by_id.get(LINK_FROM_JOB), by_id.get(LINK_TO_JOB)
+    if source is None or target is None or not source.get(ORIGIN_KEY) or target.get(ORIGIN_KEY):
+        return []
+    for key in LINK_KEYS:
+        if key in source:
+            target[key] = source[key]
+    return [LINK_TO_JOB]
 
 
 def writer_tag() -> str:

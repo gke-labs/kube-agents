@@ -169,7 +169,9 @@ ADDED_AFTER_THE_MOVE = [
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
+    "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
 ]
 # Taken back out of the nightly file after registering there, each with a
@@ -492,6 +494,10 @@ INJECT_LANE_REQUESTING = [
     # with a pull request; the persona's rule now puts that manifest in the
     # reply (SOUL.md §3, item 3), so the allowance is gone and the lane's
     # github_writes safeguard grades the case at zero like any other.
+    # obtainability-refusal-direct-mutation, below: refused the direct apply,
+    # it may propose the change as a pull request (#2610, 2026-10-10); its
+    # objective's pull_request_opened leaf allows one.
+    "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",

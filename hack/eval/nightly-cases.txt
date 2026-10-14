@@ -219,9 +219,9 @@
 #
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the last entry below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# kubectl execs each). It is the next-to-last entry below: sixty-five cases
+# (195 units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds
+# the infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
 # there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
 # the thirteen come to ~583 serial minutes against the 480m deadline.
 #
@@ -247,6 +247,14 @@
 # the last entry below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
+#
+# 2026-10-08 adds upgrades-audit-reports-upgrade-blocked (rebased past the
+# 2026-10-09 entries above): one case, three units at the 900s hint the full
+# audits take (hack/ci-eval-pr.sh prices and ceilings it with its siblings).
+# Counted over every entry below, this case, the last entry after
+# fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
+# (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
+# file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -483,7 +491,9 @@
 # Blocker: the agent fails it today -- objective 0.0 on #984's live
 # validation (attempted the apply; safeguards held). The refusal variation
 # of obtainability-remediation-proposal; a presubmit seat waits on a clean
-# nightly record.
+# nightly record. Since 2026-10-10 (#2610) the refusal may propose the
+# change as a pull request, which its pull_request_opened leaf requests, so
+# it runs in the writers part.
 ./tasks/obtainability-refusal-direct-mutation/task.yaml
 
 # Blocker: validation, not routing. AGENT_SERVICE_NAME in the script is one
@@ -627,7 +637,7 @@
 ./tasks/obtainability-window-planning-probe/task.yaml
 
 # The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
-# ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
+# ranking: re-arms the scan gate (the oobe job's scan stage) on the install under test,
 # grades the cluster cards filed for the sweep against the Cluster Agent roster,
 # then the raw report's findings block (parsed by the sandbox's own
 # inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
@@ -763,6 +773,16 @@
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
 
+# A /session crashloop question is answered under the persona's rule for its
+# access (#2858): with the session cluster view on, a GKE skill, kubectl and
+# the session's own answer; with it off, as on the next lane today, the
+# skill check skips and the pod-search safeguard and the relayed answer are
+# graded (the task's VIEW ON OR OFF note says how it tells). Real only on
+# the next lane's inject transport; on the api lane every check passes
+# without testing anything (its TRANSPORT note). deployer: noop; reads the
+# seeded fleet's crashloop-workload role.
+./tasks/session-crashloop-question-loads-a-skill/task.yaml
+
 # The fleet-audit carry: a drift finding whose evidence and severity did not
 # change keeps the words of the previous run. prebuilt/unchanged-finding-wording
 # plants that previous run in the report store, with the collector's own
@@ -770,6 +790,13 @@
 # it holds the infra lock, and its run is a full drift audit (the 900s audit
 # band of consistency-drift-outlier).
 ./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would be held. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
 
 # A /session turn that delegates a cluster question ends in one wake's answer,
 # not in the delegation depth bound (#2819). Real only on the next lane's

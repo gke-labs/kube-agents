@@ -458,7 +458,9 @@ line; a patch is validated by the RC pipeline and released by hand.
    `kube-agents-release-lines-checks` ruleset requires `main`'s status contexts, copied in by
    hand (the list is in `docs/pull-request-workflow.md`, "Branch protection is not the gate", and a
    context added to `main`'s set has to be added to the ruleset too), with the release bot as its only
-   bypass actor. The contexts live in a ruleset rather than on the branch
+   bypass actor. `Run A2A Module Tests` joined both on 2026-10-13; the lines `release/0.1.0` to
+   `release/0.4.0` predate `a2a-test.yml`, so a backport to one of them can never post that context
+   and merges only through the release bot's bypass. The contexts live in a ruleset rather than on the branch
    protection rule because a branch protection rule cannot exempt an app from required checks,
    and the tagger's push of a freshly stamped commit, which has had no checks run, was rejected
    by exactly that when it created the first line. Tide is deliberately not a bypass actor of the

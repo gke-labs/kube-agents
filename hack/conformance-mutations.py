@@ -57,7 +57,8 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Two today, B1-denylist-rule and A3-fastpath-redundant.
+    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
+    #: and B1-gke-mcp-overlay-copy-redundant.
     must_survive: bool = False
 
 
@@ -475,6 +476,67 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-gke-mcp-allowlist-inverted",
+        "agents/cluster/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "turn the Cluster Agent's allowlist into a denylist, the way a denylist "
+        "author would spell it -- the reads are now hidden and the eight write "
+        "tools, create_cluster among them, are offered to every cluster profile",
+    ),
+    Mutation(
+        "B1-gke-mcp-write-tool-in-shared-defaults",
+        "deploy/shared/defaults/config.yaml",
+        ("        - check_k8s_auth\n", "        - check_k8s_auth\n        - create_cluster\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "re-offer create_cluster in the shared defaults alone. The platform "
+        "overlay is untouched, so only an assertion against the merged config "
+        "the image builds sees the union carry it to the Platform Agent",
+    ),
+    Mutation(
+        "B1-gke-mcp-unmodelled-profile",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "give the Chat Agent the gke server by copying the entry without its "
+        "filter -- a profile the test does not build is a profile it would "
+        "otherwise never read",
+    ),
+    Mutation(
+        "B1-gke-mcp-native-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    url: "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "reach the same server through Hermes' native HTTP transport instead "
+        "of mcp-remote, under a new name -- no argv for a URL match to find",
+    ),
+    Mutation(
+        "B1-gke-mcp-respelt-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp/"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "copy the entry with a trailing slash on the URL -- the same endpoint, "
+        "and not byte-equal to the canonical spelling",
+    ),
+    Mutation(
+        # The platform overlay's copy of the allowlist is redundant with the
+        # shared defaults' one once the two are merged, and Hermes lets
+        # `include` win over `exclude`. Pinned as deliberate: a suite that went
+        # red here would be asserting the source file, not the profile.
+        "B1-gke-mcp-overlay-copy-redundant",
+        "agents/platform/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "invert the platform overlay's copy alone; the merged config still "
+        "carries the shared defaults' allowlist, and include wins",
+        must_survive=True,
+    ),
+    Mutation(
         "B1-slack-remove-allowlist-widened",
         "agents/platform/scripts/credential_proxy.py",
         ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',
@@ -758,6 +820,24 @@ Mutation(
         ("run: make skills-check", "run: make skills-check || true"),
         "test_C4_upstream_skills_are_pinned_and_verified",
         "keep the step but discard its exit code, so a lock mismatch reports green",
+    ),
+    Mutation(
+        "C4-skills-check-blank-line-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a blank line inside the step, valid YAML that GitHub honours, "
+        "which a reader that stops at the first blank line would miss",
+    ),
+    Mutation(
+        "C4-skills-check-comment-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n      # note\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a comment at the step's own indent; YAML still reads it as a "
+        "key of the step",
     ),
     Mutation(
         "C4-skills-check-skips-lock",
@@ -1776,10 +1856,20 @@ Mutation(
         "then posts as the install's bot for a second principal",
     ),
     Mutation(
+        "A3-bridge-sends-a-slack-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.slack",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the Slack notify subject, "
+        "so a task the bridge runs can make the Slack bot post to the home "
+        "channel without the agent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "

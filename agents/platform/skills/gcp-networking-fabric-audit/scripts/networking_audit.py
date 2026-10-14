@@ -64,6 +64,37 @@ UNKNOWN_PROJECT = "unknown"
 # unknown and the run must read as partial rather than as a full sweep. Same
 # name fleet_drift.py uses, so every stream reports it alike.
 UNENUMERATED_PROJECTS = "UNENUMERATED_PROJECTS"
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(pathlib.Path(__file__).resolve().parents[3] / "scripts")] if len(pathlib.Path(__file__).resolve().parents) > 3 else []),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 # A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
 # skips discovery, so it reads the named projects and no other. Without a row
 # saying so the document reads as the whole fleet, and `finish` resolves every
@@ -432,21 +463,54 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
     into a `project/UNENUMERATED_PROJECTS` skipped target so the run reads as
     partial rather than as the whole fleet:
 
-    - `--project-id` or a non-empty `MONITORED_PROJECT_IDS` narrows the scope
-      on purpose and skips discovery;
+    - `--project-id` narrows the scope on purpose and skips discovery;
+    - `--scope-projects`, passed by the SOP from the fleet_scope tool, is the
+      install's declared scope: swept as given, nothing listed, and a declared
+      project the install could not read (`--scope-unread`) is the one note;
+    - without either, a non-empty `MONITORED_PROJECT_IDS` narrows the scope on
+      purpose and skips discovery;
     - a failed `gcloud projects list` leaves only the env/config project;
     - a listing that succeeds without naming the configured project is
       filtered rather than complete, as fleet_drift.py treats it.
 
-    The host project from `gcloud config get-value project` is always part of
-    the discovered scope, alongside any `GCP_PROJECT_ID`-style variable.
+    When discovery runs, the host project from `gcloud config get-value project`
+    is always part of the scope, alongside any `GCP_PROJECT_ID`-style variable.
     """
     if cli_project and cli_project.strip():
         raw = cli_project.strip()
-        project = _normalise_project_id(raw) or raw
+        # Refused before anything is read: a scoped sandbox without the flags
+        # must not describe a project the worker named.
+        if declared_scope.args_missing:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        resolved = _normalise_project_id(raw, listing_errors)
+        project = resolved or raw
+        # On the resolved id: a project number given here names the same
+        # project the tool lists by id. A number the describe could not resolve
+        # reaches the holder as digits, which it refuses under a declared scope
+        # with the remedy, and lets through without one, as it always did, with
+        # the describe failure already recorded.
+        override_error = declared_scope.override_error(project)
+        if override_error:
+            if listing_errors is not None:
+                listing_errors.append(override_error)
+            return []
         if listing_errors is not None:
             listing_errors.append(SCOPED_RUN_NOTE.format(projects=project, source="`--project-id`"))
         return [project]
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable sweeps nothing and says so,
+        # rather than widening to the listing.
+        if not declared_scope.projects:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        if listing_errors is not None and declared_scope.note():
+            listing_errors.append(declared_scope.note())
+        return sorted(declared_scope.projects)
 
     env_projects = {os.environ.get(var, "").strip() for var in PROJECT_ENV_VARS} - {""}
     # Parsed before it is tested, so a blank or separator-only value reads as
@@ -1981,17 +2045,20 @@ def subnet_targets(projects: list[str], usage: dict | None = None) -> list[dict]
     return entries
 
 
-def unenumerated_entry(notes: list[str]) -> dict:
+def unenumerated_entry(notes: list[str], declared_sweep: bool = False) -> dict:
     """One `project/UNENUMERATED_PROJECTS` row for everything that narrowed or
     lost part of the fleet; its notes are clipped, not its tail."""
-    budget = ERROR_EXCERPT_CHARS - len(UNENUMERATED_TAIL) - len(SENTENCE_END)
+    # Under a declared scope the fleet's size is known exactly, so the tail says
+    # so rather than calling it unknown.
+    tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_sweep else UNENUMERATED_TAIL
+    budget = ERROR_EXCERPT_CHARS - len(tail) - len(SENTENCE_END)
     name = f"{PROJECT_TARGET_PREFIX}{UNENUMERATED_PROJECTS}"
     return {
         "name": name,
         "project": UNENUMERATED_PROJECTS,
         "location": GLOBAL_LOCATION,
         "outcome": OUTCOME_GATE_FAILED,
-        "error": f"{NOTE_SEPARATOR.join(notes)[:budget]}{SENTENCE_END}{UNENUMERATED_TAIL}",
+        "error": f"{NOTE_SEPARATOR.join(notes)[:budget]}{SENTENCE_END}{tail}",
     }
 
 
@@ -2022,8 +2089,11 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
     if check in (CHECK_ALL, SUBNET_CHECK_SLUG):
         entries.extend(subnet_targets(projects, usage))
     if notes:
-        entries.append(unenumerated_entry(notes))
-    if not projects:
+        entries.append(unenumerated_entry(notes, declared_scope.sweep_is_declared((project_id or "").strip())))
+    # Under a declared scope the reason is in `notes` (nothing readable, the
+    # flags missing, an override outside the scope); the generic row would
+    # name remedies the scope forbids and the top-level error would take it.
+    if not projects and not declared_scope.declared:
         sys.stderr.write("No target projects resolved from CLI, environment, or gcloud.\n")
         entries.append({
             "name": f"{PROJECT_TARGET_PREFIX}{UNKNOWN_PROJECT}",
@@ -2065,11 +2135,13 @@ def write_atomically(path: str, text: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Collect the GCP networking fabric audit's run manifest")
-    parser.add_argument("--project-id", help="audit one project; omit to resolve the scope (SOP §1)")
+    parser.add_argument("--project-id", help="audit one project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else resolve the scope (SOP §1)")
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--output", help="write the manifest here and print a summary instead of it")
     parser.add_argument("--check", choices=CHECK_CHOICES, default=CHECK_ALL,
                         help=f"run the subnet sweep, the project-level checks ({PROJECT_CHECKS_CHOICE}), or both")
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
     # A run killed before it writes must not leave the last run's manifest to
     # be read as this one's.
     if args.output:

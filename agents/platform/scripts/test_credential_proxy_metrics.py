@@ -684,6 +684,176 @@ class BusyRouteCountingTest(_BrokerFixture):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
 
 
+class VcsRequestCountingTest(_BrokerFixture):
+    """The version-control route counts by verb and outcome, the way the exec route counts tools."""
+
+    def post_vcs(self, verb, payload=None):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/vcs/" + verb,
+            data=json.dumps(payload or {}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def assert_vcs_count(self, verb, status, expected=1, msg=None):
+        """Assert the series reaches `expected`, polling first: the outcome is
+        recorded after the response is written, so a scrape right behind the
+        answer can precede the increment, and a series that already exists from
+        an earlier request reads one short. At the deadline the assertion fails
+        with the last value seen, so a miscount still names the real number."""
+        deadline = time.monotonic() + 2.0
+        while True:
+            count = _series(self.families(), "kubeagents_vcs_requests_total", verb=verb, status=status)
+            if count == expected or time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
+        self.assertEqual(expected, count, msg)
+
+    @contextlib.contextmanager
+    def vcs_route(self, verb, fn):
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={verb: fn}),
+            mock.patch.object(credential_proxy.vcs_broker, "UNGATED_VERBS", frozenset({verb})),
+        ):
+            yield
+
+    def test_a_proposal_the_forge_accepted_counts_as_success_under_its_verb(self):
+        with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
+            status, _ = self.post_vcs("proposal-create", {"repository": "github:example.com/o/r"})
+        self.assertEqual(200, status)
+        self.assert_vcs_count("proposal-create", "success")
+
+    def test_an_underscored_verb_counts_under_the_hyphenated_name(self):
+        with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
+            self.post_vcs("proposal_create")
+        self.assert_vcs_count("proposal-create", "success")
+
+    def test_an_unknown_verb_counts_as_other_and_blocked_and_is_never_named(self):
+        with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
+            status, _ = self.post_vcs("secret-verb-from-caller")
+        self.assertEqual(404, status)
+        self.assert_vcs_count("other", "blocked")
+        self.assertNotIn("secret-verb", CredentialProxyHandler.metrics.render())
+
+    def test_a_forge_fault_counts_as_error(self):
+        def failing(payload):
+            raise RuntimeError("forge said no")
+
+        with self.vcs_route("proposal-create", failing):
+            status, _ = self.post_vcs("proposal-create")
+        self.assertEqual(500, status)
+        self.assert_vcs_count("proposal-create", "error")
+
+    def test_an_unmanaged_repository_counts_as_blocked(self):
+        def refused(payload):
+            raise PermissionError("not managed")
+
+        with self.vcs_route("proposal-create", refused):
+            status, _ = self.post_vcs("proposal-create")
+        self.assertEqual(403, status)
+        self.assert_vcs_count("proposal-create", "blocked")
+
+    def test_a_broker_at_its_cap_counts_as_busy(self):
+        @contextlib.contextmanager
+        def no_slot_free(caller=None):
+            raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands")
+            yield  # pragma: no cover
+
+        with (
+            self.vcs_route("proposal-list", lambda payload: {"items": []}),
+            mock.patch.object(CredentialProxyHandler.executor, "request_slot", no_slot_free),
+        ):
+            status, _ = self.post_vcs("proposal-list")
+        self.assertEqual(503, status)
+        self.assert_vcs_count("proposal-list", "busy")
+
+    def test_a_repository_field_that_cannot_be_read_counts_as_error_and_an_unserved_host_as_blocked(self):
+        # The exceptions `registry.resolve` raises: an unreadable field, an
+        # allowlist refusal (GitLab's 403), and a host no forge serves, which is
+        # `ForgeUnsupported` and fixes its own 501.
+        cases = (
+            (credential_proxy.providers.WorkspaceError("bad repository", status=400), 400, "error"),
+            (credential_proxy.providers.WorkspaceError("not allowed", status=403), 403, "blocked"),
+            (credential_proxy.providers.ForgeUnsupported("bitbucket.example is not a forge this install serves"), 501, "blocked"),
+        )
+        counted = {}
+        for exc, status, want in cases:
+            broker = mock.Mock()
+            broker.registry.resolve.side_effect = exc
+            with (
+                mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+                mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
+            ):
+                got, _ = self.post_vcs("proposal-list", {"repository": "nonsense"})
+            self.assertEqual(status, got)
+            counted[want] = counted.get(want, 0) + 1
+            self.assert_vcs_count("proposal-list", want, counted[want], (status, want))
+
+    def test_a_caller_that_leaves_the_queue_counts_as_abandoned(self):
+        @contextlib.contextmanager
+        def caller_gone(caller=None):
+            raise credential_proxy.CallerHungUp()
+            yield  # pragma: no cover
+
+        with (
+            self.vcs_route("proposal-list", lambda payload: {"items": []}),
+            mock.patch.object(CredentialProxyHandler.executor, "request_slot", caller_gone),
+        ):
+            # Nothing is written back, so the client sees the connection close.
+            with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+                self.post_vcs("proposal-list")
+        self.assert_vcs_count("proposal-list", "abandoned")
+
+    def test_an_unreadable_managed_list_counts_as_error_not_blocked(self):
+        broker = mock.Mock()
+        broker.registry.resolve.return_value = ("github", "example.com/o/r")
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
+            mock.patch.object(credential_proxy, "repository_is_managed", side_effect=OSError("mount gone")),
+        ):
+            status, body = self.post_vcs("proposal-list", {"repository": "o/r"})
+        self.assertEqual(503, status)
+        self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", body["code"])
+        self.assert_vcs_count("proposal-list", "error")
+        self.assertIsNone(_series(self.families(), "kubeagents_vcs_requests_total", verb="proposal-list", status="blocked"))
+
+    def test_every_label_value_is_from_the_closed_vocabularies(self):
+        with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
+            self.post_vcs("proposal-create")
+        with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
+            self.post_vcs("nope")
+        self.assert_vcs_count("other", "blocked")
+        for labels in self.families()["kubeagents_vcs_requests_total"]:
+            pairs = dict(labels)
+            self.assertIn(pairs["verb"], credential_proxy.vcs_broker.VCS_VERBS | {credential_proxy.LABEL_OTHER})
+            self.assertIn(pairs["status"], credential_proxy.VCS_STATUSES)
+
+    def test_the_verb_vocabulary_is_the_route_table(self):
+        self.assertEqual(set(credential_proxy.vcs_broker.route_table(mock.Mock())), set(credential_proxy.vcs_broker.VCS_VERBS))
+
+
+class MergedProposalMetricTest(_BrokerFixture):
+    def test_merged_proposals_render_as_one_unlabelled_counter(self):
+        CredentialProxyHandler.metrics.record_merged(2)
+        CredentialProxyHandler.metrics.record_merged(1)
+        families = self.families()
+        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_merged_total"))
+        self.assertIn("# TYPE kubeagents_vcs_proposals_merged_total counter", CredentialProxyHandler.metrics.render())
+
+    def test_the_broker_built_for_the_handler_reports_merges_into_its_metrics(self):
+        broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
+        broker.merge_observer(2)
+        self.assertEqual(2, _series(self.families(), "kubeagents_vcs_proposals_merged_total"))
+        self.assertEqual(credential_proxy.PROCESS_START_TIME_SECONDS, broker.started_at)
+
+
 class MetricsListenerTest(unittest.TestCase):
     def setUp(self):
         previous = CredentialProxyHandler.__dict__.get("metrics")

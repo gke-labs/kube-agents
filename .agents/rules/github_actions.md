@@ -3,13 +3,14 @@
 paths:
   - ".github/workflows/**"
 trigger: model_decision
-description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs and guarding credentialed workflows against forks."
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, and collapsing superseded pull-request runs with a concurrency group."
 ---
 
 # GitHub Actions rules
 
-[`AGENTS.md`](../../AGENTS.md) states both rules below under Pull Request Hygiene. This file holds
-the format each one takes and the cases exempt from it.
+[`AGENTS.md`](../../AGENTS.md) states the first two rules below under Pull Request Hygiene. This
+file holds the format each one takes and the cases exempt from it, and the rules after them,
+which `AGENTS.md` does not state.
 
 ## Pin GitHub Actions to a full commit SHA
 
@@ -32,3 +33,34 @@ Two classes need no guard: a workflow reachable only through `workflow_call` is 
 starts it (`rc-create-tag.yml`, `deploy-environment.yml`, `rc-tag-validated.yml`,
 `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
 can publish its own Pages site.
+
+## Collapse superseded pull-request runs with a concurrency group
+
+Every workflow that starts on `pull_request` carries this block at the top level:
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+```
+
+A second push to a pull request then cancels the first push's queued and running runs instead of
+queueing behind them. The group falls back to the run id, so `push`, `merge_group` and
+`workflow_dispatch` runs each sit in a group of their own and are never cancelled or displaced:
+GitHub holds one pending run per group and cancels the older one, which on a burst of merges to
+`main` would lose the runs in the middle before they started. The cancel flag is an expression
+rather than `true` so that the intent reads from the block; the fallback is what makes it safe.
+`tests/test_pull_request_concurrency.py` holds the group key, the fallback, the head key below
+and the pull-request cancel; it accepts a bare `true` for the cancel flag, since the fallback keeps
+that safe too.
+
+A workflow whose `pull_request` trigger also lists `edited` adds the head SHA to the group,
+`-${{ github.event.pull_request.head.sha }}`, as `validate-pr-title.yml` and the
+`pull_request_target` workflow `risk_classify.yml` do. `edited` does not advance the head and
+nothing orders run creation by event, so an `edited` run still carrying the old head can arrive
+after the `synchronize` run for the new one; in a group keyed on the number alone it cancels or
+displaces that run, and the new head carries no check run under the workflow's name until the
+next push or edit. Keyed by head, a run can only supersede runs for its own head.
+
+`smoke-test-sticky.yml` has no group on purpose and says why in its header: it starts on `status`
+and `push`, never on `pull_request`, and a dropped pending run there would drop a re-pin.

@@ -35,7 +35,7 @@
 # checks, so a report that lists every critical lists more than two.
 #
 # The stack refuses an install where a person has connected or been greeted,
-# onboarding has already delivered, either onboarding cron job is gone, or the
+# onboarding has already delivered, the oobe job is gone, or the
 # delivery job is paused or bound to a chat: the ranked report this produces is
 # the one onboarding sends to the user. It also refuses one whose gate has not filed its sweep,
 # and one without exactly one shell sandbox pod. The checks are one read at
