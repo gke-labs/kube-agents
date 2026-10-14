@@ -147,6 +147,22 @@ class K8sTest(unittest.TestCase):
         self.assertFalse(w.is_watch({"watch": ["0", "1"]}))
         self.assertFalse(w.is_watch({}))
 
+    def test_the_watches_client_go_actually_sends_are_allowed(self):
+        # Copied from the broker's access log on a live run of the k8s-event-watcher
+        # (ka-next-4, 2026-10-14): the watch-list request, the paginated list
+        # fallback, and its continuation.
+        import urllib.parse
+        for query in (
+            "allowWatchBookmarks=true&resourceVersionMatch=NotOlderThan&sendInitialEvents=true"
+            "&timeout=5m49s&timeoutSeconds=349&watch=true",
+            "limit=500&resourceVersion=0",
+            "continue=eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ&limit=500",
+            "allowWatchBookmarks=true&resourceVersion=12345&timeout=7m2s&timeoutSeconds=422&watch=true",
+        ):
+            with self.subTest(query=query):
+                parsed = urllib.parse.parse_qs(query, keep_blank_values=True)
+                self.assertTrue(self.evaluate("api/v1/events", query=parsed).allowed)
+
     def test_query_keys_are_held_to_what_the_clients_send(self):
         self.assertEqual(
             self.evaluate("api/v1/events", query={"watch": ["1"], "dryRun": ["All"]}).rule_id, w.RULE_K8S_QUERY

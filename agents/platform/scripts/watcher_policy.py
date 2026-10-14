@@ -99,6 +99,10 @@ REFUSED_RESOURCES = frozenset({"secrets"})
 # events rule never saw.
 REFUSED_PATH_SEGMENTS = frozenset({"watch", "proxy"})
 # Query keys an events list or watch may carry: what client-go's reflector sends.
+# `timeout` is the client-side request timeout client-go adds to a watch beside
+# the server-side `timeoutSeconds` (seen on a live watch-list request:
+# `...&timeout=5m49s&timeoutSeconds=349&watch=true`); without it every watch the
+# real watcher opens is refused and it lists once and never watches.
 EVENTS_QUERY_KEYS = frozenset(
     {
         "allowWatchBookmarks",
@@ -109,6 +113,7 @@ EVENTS_QUERY_KEYS = frozenset(
         "resourceVersion",
         "resourceVersionMatch",
         "sendInitialEvents",
+        "timeout",
         "timeoutSeconds",
         "watch",
     }
