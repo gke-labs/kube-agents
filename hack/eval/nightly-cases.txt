@@ -265,12 +265,90 @@
 # fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
 # (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
 # file's fourteen.
+# 2026-10-13 adds gitops-drift-noise-filtered-triage (fixture #2739): one case,
+# three units, priced at the 900s band but measured 566s, 584s and 677s on a
+# dev install, so ~30 serial minutes. Counted from the lists rather than the
+# paragraphs above, which have drifted: seventy-three cases (219 units) here,
+# of an eighty-seven-case, 261-unit matrix with the presubmit file's fourteen.
+# Its stack holds the infra lock, making it the fourteenth tofu case; the
+# cases added alongside it are not stack-bearing and do not join that chain.
+#
+# What the nights measure. The four after oobe-first-run-audits was parked
+# (builds 2108709248731975680, 2109071632629764096, 2109434024542867456,
+# 2109796417722650624) ran an infra-lock chain of 340, 312, 303 and 337
+# minutes -- every repetition of the then-twelve tofu cases, summed from the
+# build logs -- inside builds of 412, 400, 422 and 396 minutes against the
+# 480m deadline. The chain is 72 to 85% of the build, 79% summed, so an
+# addition to it lands roughly one for one. On the dev-install measurement
+# this case puts those nights at 442, 430, 452 and 426 minutes, inside the
+# deadline with 28 to 54 minutes to spare.
+#
+# That is the optimistic reading and it should not be the one this is
+# registered on. Two corrections push the other way, and the worst night
+# (422m) is where they bite:
+#   -- this case at its own 900s hint is 45 minutes, not the 30 its quiet-board
+#      dev runs measured, and the nightly's board is shared;
+#   -- fleet-audit-unchanged-finding-keeps-wording, added in the paragraph
+#      above and first run on 2026-10-14, is on none of those four nights,
+#      and it is an audit-band case rather than a card-wait one: the same
+#      full drift audit as consistency-drift-outlier, with the band's 3000s
+#      unit_delegation_timeout. Price it off that band's measured peers --
+#      381s/385s/880s above (~27 min at three), 327s-1191s, and 600-1300s a
+#      repetition in unit_cost_hint -- which puts it at ~27 minutes at the
+#      floor and well past 45 at the top.
+# Run against the worst night (422m), nothing in that range is comfortably
+# inside 480m. Both cases at the bottom of their bands is 422 + 30 + 27 =
+# 479, one minute in; this case at its hint with the sibling still at its
+# floor is 494; the sibling at the 600s floor of its own band puts the pair
+# at 482 even with this case measured. The better nights absorb it -- 396 +
+# 30 + 27 = 453 -- and at both hints even 396 reaches 486.
+#
+# So the honest statement is narrower than the dev measurement alone
+# suggests: this case fits the nights that have room and the pair may not
+# fit the worst one, on a sibling nobody has measured. The night of
+# 2026-10-14 prices it and settles this.
+#
+# The ceiling-priced worst case, which the KNOWN_UNREGISTERED entry this
+# change deletes carried and which is the figure that decides a bad night:
+# card_timeout_seconds plus settle_seconds plus the plant and the publishes is
+# about 33 minutes a repetition, ~100 for three, and it is longest on exactly
+# the nights the filter or the ingress is broken. A repetition that does reach
+# the ceiling writes card-turn-failed and exits non-zero, so _provision_death
+# excludes it: the chain pays the minutes and the night gets no verdict from
+# them.
+#
+# card_timeout_seconds is therefore not the lever it might look like. The wait
+# ends when the card reaches a terminal status, so a ceiling nothing
+# approaches costs nothing and lowering it saves nothing; lowering it far
+# enough to bite only converts repetitions into excluded ones, which is the
+# truncation it would be meant to avoid. If the deadline bites, the levers are
+# the ones the header above names -- the periodic's timeout, then this list's
+# tail, in that order.
+#
+# Context for the margin, and the attribution matters. 6, 7 and 9 October ran
+# 482, 483 and 485 minutes against the 480m deadline -- deadline kills. Only
+# the last of those is the one parking oobe-first-run-audits answered: the
+# 2026-10-09 paragraph above gives its first night as build
+# 2108346853085941760, one nightly step before the four measured here, so it
+# ran once. The 6 and 7 October kills predate it and parking it cannot have
+# cured them. What sits between them and the clear nights is 8 October at 332
+# minutes -- a night that could not have held oobe's 140-minute chain -- and
+# the one matrix change in that window is the writers split of 2026-10-07.
+# That is an inference from the dates rather than a measurement, and it is
+# the one worth testing before anyone treats removing a case as the lever
+# that bought this headroom.
+#
+# The two drift cases now spend six injects a night between them, above the
+# default ALERT_DAILY_LIMIT_DRIFT of 5 that the sibling's paragraph below
+# reasons from. The eval install runs uncapped (EVAL_ALERT_DAILY_LIMIT_DRIFT=0
+# in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
+#
 # 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
-# lists: seventy-three cases (219 units) here, of an eighty-seven-case, 261-unit
-# matrix.
+# lists: seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit
+# matrix, the gitops-drift-noise-filtered-triage paragraph above included.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -825,6 +903,24 @@
 # the api lane it reaches the platform agent as a plain prompt and its
 # forbidden-phrase check passes without testing anything. deployer: noop.
 ./tasks/session-cluster-question-wake-answers-once/task.yaml
+# gitops-drift-noise-filtered-triage: the drift detector's principal
+# classifier, which nothing else exercises. The sibling
+# gitops-drift-out-of-band-triage posts to the daemon's inject and so starts
+# at the last step of the chain, where the record has already been
+# classified; this one publishes twelve synthetic audit records to the
+# drift-audit topic -- eleven automation principals, one human -- so Classify
+# itself decides. Whether the filter held is graded by the fixture's own
+# observation of the ledger and the detector's log; everything else is graded
+# on the agent -- four objectives on its report and the board read, and a
+# safeguard on what it did to the cluster, since putting the memory limit
+# back is a forbidden action rather than a weak report. One check of the six
+# reads the fixture's observation.
+#
+# Priced at 900s in unit_cost_hint rather than the ~600s measured: those runs
+# met a quiet board, and the nightly shares one leased install across its
+# cases, so a busy board pushes this case's card wait toward its 1800s
+# ceiling. The dated paragraph above carries the budget arithmetic.
+./tasks/gitops-drift-noise-filtered-triage/task.yaml
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the

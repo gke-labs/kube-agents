@@ -1,0 +1,68 @@
+{
+  "name": "report-after-capped-at-five",
+  "source": "agents/platform/scripts/test_slack_presenter.py::BlocksReportTest.test_after_rows_is_a_plain_line_below_the_rows",
+  "notes": "G1: today's after_rows has no cap. The emitter keeps the first 5 lines; the text fallback keeps all 7.",
+  "input": {
+    "headline": "Security & RBAC audit: 7 findings, 2 critical.",
+    "note": "2 are new since the last run.",
+    "rows": [
+      {
+        "severity": "critical",
+        "text": "seeded-b and -c admit privileged pods"
+      },
+      {
+        "severity": "critical",
+        "text": "default SA is `cluster-admin` on seeded-c"
+      }
+    ],
+    "choices": [
+      "look at: seeded-b and -c admit privileged pods"
+    ],
+    "links": [
+      {
+        "text": "Ledger issue #231 ↗",
+        "url": "https://l/231"
+      }
+    ],
+    "after_rows": "Also found: finding 1.\nAlso found: finding 2.\nAlso found: finding 3.\nAlso found: finding 4.\nAlso found: finding 5.\nAlso found: finding 6.\nAlso found: finding 7."
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Security & RBAC audit: 7 findings, 2 critical.",
+        "note": "2 are new since the last run.",
+        "rows": [
+          {
+            "severity": "critical",
+            "text": "seeded-b and -c admit privileged pods"
+          },
+          {
+            "severity": "critical",
+            "text": "default SA is `cluster-admin` on seeded-c"
+          }
+        ],
+        "after": [
+          "Also found: finding 1.",
+          "Also found: finding 2.",
+          "Also found: finding 3.",
+          "Also found: finding 4.",
+          "Also found: finding 5."
+        ],
+        "choices": [
+          {
+            "text": "look at: seeded-b and -c admit privileged pods",
+            "primary": true
+          }
+        ],
+        "links": [
+          {
+            "text": "Ledger issue #231 ↗",
+            "url": "https://l/231"
+          }
+        ]
+      }
+    }
+  ]
+}

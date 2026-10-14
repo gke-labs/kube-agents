@@ -1028,15 +1028,15 @@ class PoolNote(RunHarness):
         # The periodic's third trigger: runs asked Boskos for a project and
         # got none. Every run that would have waited died at the acquire, so
         # Deck shows no backlog -- and the gate must not read that as nothing
-        # to say. The message names the refusals and the hand holds.
+        # to say. The message names the refusals and the leases with no build ID.
         note = pool_note(waiting_longest_s=0, waiting_now=False, over_threshold=0,
                          window_hours=None, p50_s=None, p95_s=None,
-                         lease_failures=2, lease_failures_hours=3, held_by_hand=2)
+                         lease_failures=2, lease_failures_hours=3, no_build_id=2)
         self.assertTrue(post_health.pool_advisable(note))
         self.assertTrue(post_health.pool_advisable(note, drained=True))
         self.assertEqual(
             post_health.pool_cause_text(note),
-            "*Smoke gate: pool full* — all 30 projects are leased, 2 held by hand."
+            "*Smoke gate: pool full* — all 30 projects are leased, 2 with no build ID in the owner."
             " Consider onboarding a project.",
         )
         # The refusal line rides under every header, the UNKNOWN one included:
@@ -1052,15 +1052,14 @@ class PoolNote(RunHarness):
             post_health.pool_digest_line(note),
             "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
         )
-        # The page has no stretch and no queue to show for this note, and its
-        # Brief reads healthy, so the alert links the job's history instead.
-        self.assertEqual(
-            post_health.render_pool({"pool": note}).split("\n")[-1], post_health.POOL_JOB_HISTORY_URL
-        )
-        self.assertEqual(
-            post_health.render_pool({"pool": note | {"over_threshold": 3}}).split("\n")[-1],
-            post_health.dashboard_link(post_health.DASHBOARD_VIEW_AGENT),
-        )
+        # The Brief now carries the refusals, so this alert links it like
+        # every other breach; and its closing line says what a refusal is,
+        # because "runs still pass" is false for a run that died at the acquire.
+        lines = post_health.render_pool({"pool": note}).split("\n")
+        self.assertEqual(lines[-1], post_health.dashboard_link(post_health.DASHBOARD_VIEW_AGENT))
+        self.assertEqual(lines[-2], "A refused run did not start; retest once the pool has room.")
+        self.assertIn("Runs still pass; /retest makes the queue longer.",
+                      post_health.render_pool({"pool": note | {"lease_failures": None}}))
         # A live queue beside the refusals is the fact a reader can act on
         # this morning, so the refusal joins it rather than displacing it.
         self.assertEqual(
