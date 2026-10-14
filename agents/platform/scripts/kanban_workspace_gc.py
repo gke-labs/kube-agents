@@ -44,7 +44,7 @@ inventory (#2989).  Hermes cron runs start in the profile home, so a worker's
 loose files land beside the skills and config, on a volume that outlives
 restarts, upgrades and ``helm uninstall``.  A later session lists the home and
 can't tell an invented ``dummy-gitops-state`` from something the product put
-there.  Every top-level entry not on ``EXPECTED_HOME_ENTRIES`` is logged with
+there.  Every top-level entry not expected for that kind of home is logged with
 its mtime and size, as is any sandbox profile home the agent pod no longer has
 a profile for.  Nothing is moved or deleted, and nothing goes to chat:
 an allowlist mover would eventually displace a file someone put there on
@@ -103,26 +103,47 @@ STDERR_EXCERPT_CHARS = 400
 
 
 # What a sandbox profile home holds when nothing but the product has written
-# to it.  The skeleton is `sandbox_mirror.SKELETON_DIRS` (pinned by a test);
-# `skills`, `governance` and `scripts` are staged by the sandbox image;
-# `.kubeconfigs` is the credential proxy client's directory; `USER.md` and
-# `kubeconfig.yaml` are a cluster profile's identity and kubeconfig.
-# `kanban.db` and `state.db` are directories the sandbox entrypoint plants so a
-# shell can't create a second copy of the agent pod's databases.  Anything else
-# at the top level was put there by someone, which is what the inventory is
-# for.
-EXPECTED_HOME_ENTRIES = frozenset({
-    "artifacts", "gitops", "plans", "scratch", "tmp", "workspace",
-    "skills", "governance", "scripts",
-    ".kubeconfigs", "USER.md", "kubeconfig.yaml",
-    "kanban.db", "state.db",
-})
+# to it, by kind of home, as name -> find's `%y` type.  Every home gets the
+# mirror's skeleton (`sandbox_mirror.SKELETON_DIRS`, pinned by a test).  The
+# platform home also gets the image-staged trees (`sandbox_mirror.IMAGE_OWNED`,
+# staged for `shellSandboxImageTreeHomes`), the entrypoint's `kanban.db` and
+# `state.db` placeholder directories (`AGENT_POD_DATABASES`, planted for
+# `SANDBOX_HOME_ROOTS`), and the credential proxy client's `.kubeconfigs`.  A
+# cluster profile's home gets its `USER.md` from the mirror and the
+# `kubeconfig.yaml` `cluster_agent_profile` writes.  Anything else, or one of
+# these in the wrong kind of home or of the wrong type, was put there by
+# someone, which is what the inventory is for.
+SKELETON_ENTRIES = {
+    name: "d" for name in ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
+}
+PLATFORM_HOME_ENTRIES = {
+    **SKELETON_ENTRIES,
+    "skills": "d", "governance": "d", "scripts": "d",
+    "kanban.db": "d", "state.db": "d",
+    ".kubeconfigs": "d",
+}
+CLUSTER_HOME_ENTRIES = {
+    **SKELETON_ENTRIES,
+    "USER.md": "f", "kubeconfig.yaml": "f",
+}
+PLATFORM_PROFILE = "platform"
+CLUSTER_PROFILE_PREFIX = "cluster-"
+
+
+def expected_entries(profile: str) -> dict[str, str]:
+    """The expected top-level entries for one profile's home."""
+    if profile == PLATFORM_PROFILE:
+        return PLATFORM_HOME_ENTRIES
+    if profile.startswith(CLUSTER_PROFILE_PREFIX):
+        return CLUSTER_HOME_ENTRIES
+    return SKELETON_ENTRIES
+
 
 # What `sandbox_mirror.push_skeleton` and the sandbox entrypoint rename an
 # expected entry to when they find a file where a directory belongs: the name,
 # this mark, and a `%Y%m%dT%H%M%S` stamp.  Both log those themselves.
 DISPLACED_MARK = ".displaced-"
-DISPLACED_STAMP = re.compile(r"^\d{8}T\d{6}$")
+DISPLACED_STAMP = re.compile(r"\d{8}T\d{6}")
 
 # Lists a directory's entries as name, mtime, size and type, NUL terminated so
 # a name with a newline or a tab in it can't forge a second row.  By absolute
@@ -336,11 +357,12 @@ def _parse_listing(output: str) -> list[Row]:
     return sorted(rows)
 
 
-def _is_expected(name: str) -> bool:
-    if name in EXPECTED_HOME_ENTRIES:
+def _is_expected(row: Row, expected: dict[str, str]) -> bool:
+    name, _, _, kind = row
+    if expected.get(name) == kind:
         return True
     base, mark, stamp = name.partition(DISPLACED_MARK)
-    return bool(mark) and base in EXPECTED_HOME_ENTRIES and bool(DISPLACED_STAMP.match(stamp))
+    return bool(mark) and base in expected and bool(DISPLACED_STAMP.fullmatch(stamp))
 
 
 def _list(path: Path, inv: Inventory) -> list[Row] | None:
@@ -354,11 +376,12 @@ def _list(path: Path, inv: Inventory) -> list[Row] | None:
             [REMOTE_FIND, str(path), "-mindepth", "1", "-maxdepth", "1",
              "-printf", FIND_FORMAT],
             timeout=LS_TIMEOUT_SECONDS,
+            errors="surrogateescape",
         )
     except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
         inv.problems.append(f"inventory stopped, the shell sandbox did not answer: {exc}")
         raise _SandboxGone from exc
-    except Exception as exc:  # noqa: BLE001 - eg a name that isn't UTF-8
+    except Exception as exc:  # noqa: BLE001
         inv.problems.append(f"could not list {path} in the sandbox: {exc}")
         return None
     if result.returncode != 0:
@@ -396,7 +419,8 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
             ]
         for name in names:
             rows = _list(remote_profiles / name, inv)
-            unexpected = [row for row in rows or [] if not _is_expected(row[0])]
+            expected = expected_entries(name)
+            unexpected = [row for row in rows or [] if not _is_expected(row, expected)]
             if unexpected:
                 inv.unexpected[str(remote_profiles / name)] = unexpected
     except _SandboxGone:
@@ -438,10 +462,14 @@ def append_log(lines: list[str], home: Path) -> None:
         return
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     path = home / LOGS_DIR / LOG_FILE_NAME
+    # One physical line per entry: fluent-bit's tail has no multiline parser,
+    # so a continuation line would ship with no timestamp or prefix.  An
+    # exception's text (ssh's stderr, say) can carry newlines.
+    records = (" ".join(line.splitlines()) for line in lines)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write("".join(f"{now} {line}\n" for line in lines))
+        with path.open("a", encoding="utf-8", errors="backslashreplace") as handle:
+            handle.write("".join(f"{now} {record}\n" for record in records))
     except OSError:
         pass
 

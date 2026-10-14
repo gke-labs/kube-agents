@@ -390,15 +390,16 @@ class HomeInventoryTest(unittest.TestCase):
         (self.profiles / ".hidden").mkdir()
         self.remote = Path("/sandbox-root")
         rp = self.remote / "profiles"
-        self.expected_rows = [(n, "1.0", "4096", "d") for n in sorted(gc.EXPECTED_HOME_ENTRIES)]
+        def rows(entries):
+            return [(n, "1.0", "4096", k) for n, k in sorted(entries.items())]
         self.tree = {
             str(rp): [("platform", "1.0", "1", "d"), ("cluster-a", "1.0", "1", "d"),
                       ("cluster-gone", "1760000000.0", "1", "d"), (".hidden", "1.0", "1", "d"),
                       ("stray-file", "1.0", "1", "f")],
-            str(rp / "platform"): self.expected_rows + [
+            str(rp / "platform"): rows(gc.PLATFORM_HOME_ENTRIES) + [
                 ("dummy-gitops-state", "1760088420.5", "88", "f"),
                 ("dummy-git-repo", "1760080140.0", "4096", "d")],
-            str(rp / "cluster-a"): self.expected_rows,
+            str(rp / "cluster-a"): rows(gc.CLUSTER_HOME_ENTRIES),
         }
 
     def tearDown(self):
@@ -433,6 +434,39 @@ class HomeInventoryTest(unittest.TestCase):
             self.assertFalse(any("\0" in a or "\t" in a for a in argv), argv)
             self.assertIn(r"\0", argv[-1])
 
+    def test_entries_are_expected_per_kind_of_home_and_type(self):
+        rp = self.remote / "profiles"
+        self.tree[str(rp / "platform")] += [("USER.md", "1.0", "1", "f")]
+        self.tree[str(rp / "cluster-a")] += [("kanban.db", "1.0", "0", "f"), ("skills", "1.0", "1", "d")]
+        self.tree[str(rp / "platform")] = [
+            (n, m, s, "f" if n == "state.db" else k) for n, m, s, k in self.tree[str(rp / "platform")]]
+        inv = self.run_inventory(FakeSandbox(self.tree))
+        got = {h.rsplit("/", 1)[1]: sorted(r[0] for r in rows) for h, rows in inv.unexpected.items()}
+        self.assertEqual(got["platform"], ["USER.md", "dummy-git-repo", "dummy-gitops-state", "state.db"])
+        self.assertEqual(got["cluster-a"], ["kanban.db", "skills"])
+        self.assertEqual(gc.expected_entries("chat"), gc.SKELETON_ENTRIES)
+
+    def test_a_non_utf8_name_is_reported_and_the_rest_survives(self):
+        # The listing decodes with surrogateescape, so one bad byte costs one
+        # name, not the home's whole inventory.
+        fake = FakeSandbox(self.tree)
+        self.run_inventory(fake)
+        for _, kwargs in fake.calls:
+            self.assertEqual(kwargs.get("errors"), "surrogateescape")
+        raw = b"x\xff\t1.0\t1\tf\0dummy-gitops-state\t1.0\t88\tf\0".decode("utf-8", "surrogateescape")
+        names = [r[0] for r in gc._parse_listing(raw)]
+        self.assertEqual(names, ["dummy-gitops-state", "x\udcff"])
+        inv = gc.Inventory()
+        inv.unexpected["/h"] = [(names[1], 1.0, 1, "f")]
+        gc.append_log(gc._format_inventory(inv), self.home)
+        self.assertIn("x\\udcff", (self.home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8"))
+
+    def test_every_log_entry_is_one_line(self):
+        gc.append_log(["kanban_workspace_gc: inventory skipped: Warning: added host\nclient_loop: send disconnect"], self.home)
+        text = (self.home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertIn("added host client_loop", text)
+
     def test_a_name_cannot_forge_a_row(self):
         # A newline or a tab inside a name stays inside its NUL-terminated
         # record and is reported whole; neither becomes an expected entry.
@@ -444,10 +478,13 @@ class HomeInventoryTest(unittest.TestCase):
         self.assertEqual([r[0] for r in gc._parse_listing(out)], ["kept"])
 
     def test_only_the_mirrors_displaced_names_are_expected(self):
-        self.assertTrue(gc._is_expected("scratch.displaced-20261010T000000"))
-        self.assertFalse(gc._is_expected("notes.displaced-20261010T000000"))
-        self.assertFalse(gc._is_expected(".displaced"))
-        self.assertFalse(gc._is_expected("scratch.displaced-notes.sh"))
+        def expected(name):
+            return gc._is_expected((name, 1.0, 1, "f"), gc.PLATFORM_HOME_ENTRIES)
+        self.assertTrue(expected("scratch.displaced-20261010T000000"))
+        self.assertFalse(expected("notes.displaced-20261010T000000"))
+        self.assertFalse(expected(".displaced"))
+        self.assertFalse(expected("scratch.displaced-notes.sh"))
+        self.assertFalse(expected("scratch.displaced-20261010T000000\n"))
 
     def test_skeleton_matches_the_mirror(self):
         # The mirror creates these in every home; if it grows one, the
@@ -458,9 +495,21 @@ class HomeInventoryTest(unittest.TestCase):
             import sandbox_mirror
         finally:
             sys.path.remove(str(shared))
-        self.assertLessEqual(set(sandbox_mirror.SKELETON_DIRS), gc.EXPECTED_HOME_ENTRIES)
-        self.assertIn(sandbox_mirror.CLUSTER_IDENTITY_FILE, gc.EXPECTED_HOME_ENTRIES)
+        self.assertEqual(set(sandbox_mirror.SKELETON_DIRS), set(gc.SKELETON_ENTRIES))
+        self.assertLessEqual(sandbox_mirror.IMAGE_OWNED, set(gc.PLATFORM_HOME_ENTRIES))
+        self.assertIn(sandbox_mirror.CLUSTER_IDENTITY_FILE, gc.CLUSTER_HOME_ENTRIES)
+        self.assertTrue(sandbox_mirror.CLUSTER_PROFILE_PREFIX.endswith(gc.CLUSTER_PROFILE_PREFIX))
         self.assertEqual(sandbox_mirror.DISPLACED_SUFFIX + "-", gc.DISPLACED_MARK)
+
+    def test_databases_match_the_entrypoint(self):
+        import re
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "sandbox" / "entrypoint.sh").read_text()
+        default = re.search(r'AGENT_POD_DATABASES="\$\{AGENT_POD_DATABASES:-([^}]*)\}"', entrypoint)
+        self.assertIsNotNone(default)
+        self.assertEqual({n for n in default.group(1).split()},
+                         {n for n, k in gc.PLATFORM_HOME_ENTRIES.items() if n.endswith(".db")})
+        roots = re.search(r'SANDBOX_HOME_ROOTS="\$\{SANDBOX_HOME_ROOTS:-([^}]*)\}"', entrypoint)
+        self.assertIn(f"profiles/{gc.PLATFORM_PROFILE}", roots.group(1).split())
 
     def test_an_unreadable_home_is_a_problem_not_a_stop(self):
         rp = self.remote / "profiles"
