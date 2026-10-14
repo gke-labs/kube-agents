@@ -21,6 +21,7 @@ root it reads and the two pod shells are swapped for local ones.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -129,3 +130,20 @@ def test_the_case_declares_the_check():
     node = parse_node(check["check"])
     assert isinstance(node, AuditReportStoredVerifier)
     assert node.status == "NO_FORGE"
+
+
+def test_a_misspelt_status_fails_at_load():
+    with pytest.raises(ValueError):
+        AuditReportStoredVerifier(type="audit_report_stored", audit=AUDIT, status="NO-FORGE")
+
+
+def test_the_status_set_matches_what_the_status_view_knows():
+    """`AuditStatus` copies the outcomes `finish` stores. The status view in
+    scripts/ lists the same set as its known statuses; read it from source so
+    the two cannot drift apart unnoticed."""
+    view = (REPO / "scripts" / "fleet_audit_status_view.py").read_text()
+    block = view[view.index("STATUS_STYLE = {"):]
+    block = block[: block.index("}")]
+    known = set(re.findall(r'^\s+"([A-Z_]+)": "', block, re.M))
+    assert len(known) == 5, known
+    assert known == set(verifiers.AuditStatus.__args__)

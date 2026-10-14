@@ -968,6 +968,10 @@ AuditId = Literal[
     "stockout-prevention",
 ]
 
+# Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
+# a typo fails at spec-load time, as `AuditId` does for the stream.
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
+
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
@@ -4644,7 +4648,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
 
     type: Literal["audit_report_stored"]
     audit: AuditId
-    status: str | None = None
+    status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
