@@ -423,8 +423,12 @@ try:
                 status = None
                 if has_tasks:
                     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
-                    if row is not None and row[0] is not None:
+                    if row is None:
+                        continue
+                    if row[0] is not None:
                         status = str(row[0])
+                else:
+                    continue
                 if status not in TERMINAL_STATUSES:
                     if len(descendants) < MAX_CARDS:
                         descendants.append(child)
@@ -471,7 +475,8 @@ def read_descendants(
 
     Walks ``kanban_worker_children`` (fanned-out children created by workers)
     recursively, skipping cards that are already settled (statuses in
-    :data:`TERMINAL_STATUSES`).
+    :data:`TERMINAL_STATUSES`) or no longer exist on the board (missing
+    ``tasks`` row).
 
     ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
     module stays importable without the harness and testable with a canned

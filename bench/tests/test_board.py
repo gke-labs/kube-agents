@@ -473,6 +473,34 @@ def test_read_descendants_walks_worker_children_and_skips_terminal_statuses(tmp_
     assert descendants == ["t_c1", "t_todo", "t_gc1"]
 
 
+def test_read_descendants_skips_child_whose_task_row_is_missing(tmp_path: Path) -> None:
+    # A recorded child in kanban_worker_children whose tasks row was deleted
+    # or vanished must not be returned in descendants (it does not exist on the
+    # board and cannot hold a slot), but its descendants are still walked.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, assignee TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status, assignee) VALUES (?, ?, ?)",
+            [
+                ("t_root", "running", "platform"),
+                ("t_gc_live", "running", "cluster-b"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_vanished_child", "t_root", 100),
+                ("t_gc_live", "t_vanished_child", 200),
+            ],
+        )
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == ["t_gc_live"]
+
+
 def test_read_descendants_handles_missing_tables(tmp_path: Path) -> None:
     # Fail-soft when kanban_worker_children does not exist yet (pre-patch board)
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
