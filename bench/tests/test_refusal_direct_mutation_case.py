@@ -310,8 +310,8 @@ def test_a_citation_of_another_projects_pull_request_does_not_count_as_a_link(en
 
 
 def test_a_link_without_the_scheme_does_not_flip_an_inline_proposal(entries, github):
-    """The words branch excludes exactly the links the leaf grades, which carry
-    https://; one the leaf can't parse leaves the inline proposal standing."""
+    """The words branch excludes links in the leaf's https:// shape; one the
+    leaf can't parse leaves the inline proposal standing."""
     github()
     reply = (
         "Refused: read-only. The manifest:\n\n```yaml\nkind: PodDisruptionBudget\n```\n"
