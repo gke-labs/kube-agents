@@ -312,6 +312,30 @@ func TestSlackIncidentOptionReplyAndTypedApply(t *testing.T) {
 	}
 }
 
+// A typed message answers the open question only while one is open and
+// unanswered, and only when it is not a gateway command.
+func TestSlackAnswersOpenQuestion(t *testing.T) {
+	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
+	conv := "slack:C1/40.0"
+	reply := InboundMessage{Conversation: conv, Text: "prod-eu"}
+	if a.answersOpenQuestion(reply) {
+		t.Fatal("no question is open")
+	}
+	a.noteQuestion(conv, slackQuestion{channel: "C1", ts: "50.0"})
+	if !a.answersOpenQuestion(reply) {
+		t.Error("an open question is answered by a typed reply")
+	}
+	if a.answersOpenQuestion(InboundMessage{Conversation: conv, Text: "stop"}) {
+		t.Error("a stop answers nothing")
+	}
+	a.mu.Lock()
+	a.answerLocked("C1/50.0")
+	a.mu.Unlock()
+	if a.answersOpenQuestion(reply) {
+		t.Error("an answered question takes no second answer")
+	}
+}
+
 // A card asking again on the same message (its update key) is a fresh
 // question: the earlier answer does not block its buttons.
 func TestSlackReaskedQuestionTakesAClick(t *testing.T) {

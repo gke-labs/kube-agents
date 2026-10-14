@@ -1641,9 +1641,11 @@ task's mark, the terminal default, a conversation notify's mark) and records wha
 the chain's root history entry, so a mark draws only its difference, across a restart too; the
 adapter owns which emoji a token shows, and removes only its own reactions. A delegated child's
 terminal takes no default, since it is relayed before the wake that digests it exists: the
-wake's terminal settles the chain, or the child's end does when no wake starts. A click is no
-message of its own, so a chain a click starts marks the ask of the conversation's previous
-chain, from what is already drawn there. Interactive
+wake's terminal settles the chain, or the child's end does when no wake starts. A chain that a
+click starts, or a typed answer to the conversation's open question (`InboundMessage.Answer`),
+continues that ask's work, so it marks the ask of the conversation's previous chain, from what
+is already drawn there: a click is no message of its own, and a card that settles after its
+question was answered then lifts ⏸️ on the ask rather than marking the answer. Interactive
 envelopes are acked like events. A click on a choice button the renderer drew is a message from
 the clicker whose text is the choice's reply, handed to the gateway like a typed one, so the
 allowlist and the map judge it the same way and it carries no intent. The gateway tells the

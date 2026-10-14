@@ -398,9 +398,22 @@ func TestAChildsEndLeavesTheMarkToTheWake(t *testing.T) {
 	}
 }
 
-// A click that starts a chain marks the ask whose question it answered, not
-// the click (which is no message).
+// A click, or a typed answer to an open question, that starts a chain marks
+// the ask whose question it answered: a click is no message, and an answer
+// continues that ask's work, so the card's settle must land on the ask.
 func TestAClickChainMarksThePreviousAsk(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  InboundMessage
+	}{
+		{"click", InboundMessage{MessageID: "click-ts", Text: "prod-eu", Click: true}},
+		{"typed answer", InboundMessage{MessageID: "typed-ts", Text: "prod-eu please", Answer: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testAnswerChainMarksThePreviousAsk(t, tc.msg) })
+	}
+}
+
+func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
 	r := startRig(t)
 	conv := "discord:g1/click-chain"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "which cluster first?"}
@@ -416,7 +429,8 @@ func TestAClickChainMarksThePreviousAsk(t *testing.T) {
 		rec, err := r.g.reg.Get(context.Background(), conv)
 		return err == nil && rec != nil && rec.ActiveTask == nil
 	})
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "click-ts", Text: "prod-eu", Click: true}
+	answer.Conversation, answer.Kind, answer.AuthorID = conv, "group", "1001"
+	r.adapter.inbox <- answer
 	second := awaitSubmission(t, r, "platform", 1)
 	completeTask(t, r.execFor(t, second, "platform"), "prod-eu is done")
 	want := []string{conv + " +question@d-5", conv + " +blocked@d-5", conv + " -question@d-5", conv + " -blocked@d-5"}

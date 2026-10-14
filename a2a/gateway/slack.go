@@ -634,6 +634,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
+					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}
 			case *slackevents.AssistantThreadStartedEvent, *slackevents.AppHomeOpenedEvent:

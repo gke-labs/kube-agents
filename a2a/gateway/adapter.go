@@ -70,6 +70,13 @@ type InboundMessage struct {
 	// carries its mark on the conversation's previous ask instead (mark.go).
 	// False for a typed message, and for every backend but Slack.
 	Click bool
+	// Answer marks a typed message that answers a question the conversation
+	// has open (one the adapter laid out with choices). Like a click, it
+	// continues that ask's work rather than starting an ask of its own, so
+	// its chain marks the previous ask: otherwise the card that asked
+	// settles on the answer, and the ask keeps ⏸️. False on every backend
+	// but Slack.
+	Answer bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running

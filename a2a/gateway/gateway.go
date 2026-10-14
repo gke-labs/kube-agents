@@ -2018,9 +2018,11 @@ type taskStart struct {
 	// gateway starts on its own (a child, a wake) has no backend message.
 	MessageID string
 	Principal string
-	// Click is InboundMessage.Click: MessageID names a click, not a message
-	// a mark can be drawn on.
-	Click bool
+	// Click and Answer are InboundMessage's: the turn continues the
+	// conversation's previous ask, whose message its chain marks. A click
+	// names no message of its own; an answer with no earlier chain marks
+	// itself.
+	Click, Answer bool
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -2066,6 +2068,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		Text:      msg.Text,
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
+		Answer:    msg.Answer,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -2180,8 +2183,12 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
 		// The message the chain's mark is drawn on (mark.go).
 		ref.AskMessageID = ts.MessageID
-		if ts.Click {
-			ref.AskMessageID, ref.Mark = rec.clickAskMessage()
+		if ts.Click || ts.Answer {
+			if ask, mark := rec.continuedAskMessage(); ask != "" {
+				ref.AskMessageID, ref.Mark = ask, mark
+			} else if ts.Click {
+				ref.AskMessageID = ""
+			}
 		}
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})

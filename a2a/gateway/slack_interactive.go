@@ -246,6 +246,20 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 	return slackChatOptions(layout, text)
 }
 
+// answersOpenQuestion reports a typed message that answers its
+// conversation's open question: one is open, unanswered, and the message is
+// not a gateway command (InboundMessage.Answer).
+func (s *SlackAdapter) answersOpenQuestion(msg InboundMessage) bool {
+	if chattext.IsCommand(msg.Text) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	open, ok := ux.questions[msg.Conversation]
+	return ok && !ux.answered[open.channel+"/"+open.ts]
+}
+
 // notePending records a typed turn the gateway has not verified yet.
 func (s *SlackAdapter) notePending(msg InboundMessage) {
 	s.mu.Lock()
