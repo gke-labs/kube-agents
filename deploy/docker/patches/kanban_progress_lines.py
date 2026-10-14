@@ -161,6 +161,8 @@ QUEUED_LINES_KEY = "queued_lines"
 NEEDS_YOU_KIND = "blocked"
 UNBLOCKED_KIND = "unblocked"
 PR_REPORT_KIND = "completed"
+#: The completed event's payload key holding the worker's one-line status.
+SUMMARY_KEY = "summary"
 
 #: With ``KAGE_SLACK_UX`` on, a card beneath a fan-out folds its report into
 #: its row in the thread's plan rather than posting it, when its nearest
@@ -661,6 +663,17 @@ async def _settle_question(moments: Any, adapter: Any, sub: dict, kind: str, eve
         logger.debug("kanban progress: settling the question for %s failed: %s", sub.get("task_id"), exc)
 
 
+def _with_summary(ev: Any, message: str) -> str:
+    """The completion's message plus the worker's summary when the message dropped it.
+
+    The message can be the result alone, so a PR the summary names is still one this card
+    opened; both completion paths (posted, and folded into a plan row) scan this.
+    """
+    payload = getattr(ev, "payload", None)
+    summary = str(payload.get(SUMMARY_KEY) or "").strip() if isinstance(payload, dict) else ""
+    return message if not summary or summary in message else f"{message}\n{summary}"
+
+
 async def _pr_opened(moments: Any, adapter: Any, sub: dict, text: str, result: Any) -> None:
     if moments is None or getattr(result, "success", True) is False:
         return
@@ -931,7 +944,7 @@ async def deliver(
         if kind == FOLDED_KIND and shown and await _folds(sub, board):
             # The row says it; the creator's completion carries the answer.
             await _settle_reaction(adapter, sub, kind, board)
-            await _pr_opened(moments, adapter, sub, message, None)
+            await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
             return None
         if _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
@@ -946,7 +959,7 @@ async def deliver(
         if getattr(result, "success", True) is not False:
             await _settle_reaction(adapter, sub, kind, board)
         if kind == PR_REPORT_KIND:
-            await _pr_opened(moments, adapter, sub, message, result)
+            await _pr_opened(moments, adapter, sub, _with_summary(ev, message), result)
         return result
 
     payload = getattr(ev, "payload", None)

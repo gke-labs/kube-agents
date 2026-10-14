@@ -81,6 +81,15 @@ on:
       - Python Unit Tests
       - Validate Repo Structure
     types: [completed]
+    # The head branch of the triggering run. The job below acts only on a push
+    # to main, but `workflow_run` fires on every completion of a watched
+    # workflow, pull-request and merge-queue runs included, and each one
+    # started a notify run here that the `if:` skipped: about 320 a day in
+    # October 2026, most of what this workflow created (#2943). The filter
+    # keeps those off the queue. It is not the guard: a fork pull request
+    # whose head branch is called `main` passes it, and the `if:` and the
+    # concurrency key below still decide on the event and the repository.
+    branches: [main]
   # The backstop for an event that is never delivered -- a dropped
   # `workflow_run`, a runner outage -- and for anything the group below drops:
   # every watched workflow is reconciled against its newest completed push run
@@ -113,16 +122,17 @@ on:
 # runs after every push run of the burst has finished, and it files whatever the
 # newest of them says.
 #
-# That holds only if nothing else enters the group. `workflow_run` fires for
-# every completion of a watched workflow, pull-request runs included -- several
-# of those per push run -- and the group is evaluated before the job's `if:`
-# skips them. Keyed on the workflow alone, a pull-request run's notify arriving
-# mid-burst would cancel the pending push run's notify and then skip itself,
-# leaving the red to the sweep. So the key repeats the push-to-main half of
-# the `if:`'s test: a push run on main joins its workflow's group, and anything
-# else gets a group of its own that cancels nothing. The `if:` below filters nothing by
-# conclusion for the same reason: a cancelled run's notify can be the last
-# arrival, and it reconciles as well as any other.
+# That holds only if nothing else enters the group. The `branches: [main]`
+# filter on the trigger keeps same-repository pull-request and merge-queue
+# runs out, but a fork pull request whose head branch is called `main` still
+# arrives, and the group is evaluated before the job's `if:` skips it. Keyed
+# on the workflow alone, that run's notify arriving mid-burst would cancel the
+# pending push run's notify and then skip itself, leaving the red to the
+# sweep. So the key repeats the push-to-main half of the `if:`'s test: a push
+# run on main joins its workflow's group, and anything else gets a group of
+# its own that cancels nothing. The `if:` below filters nothing by conclusion
+# for the same reason: a cancelled run's notify can be the last arrival, and
+# it reconciles as well as any other.
 #
 # Sweeps (the schedule and a dispatch) share a group of their own: one sweep at
 # a time is all the serialisation they need, and holding an event run behind a

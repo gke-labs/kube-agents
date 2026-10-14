@@ -401,6 +401,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    # No field: a bold one-sentence lead, no heading and the length caps are
+    # the assertion, and every field narrows it.
+    "answer_first": (),
     # No field: "this run's report is in the store" is the assertion, and
     # `status` and `required_finding_phrases` only narrow it.
     "audit_report_stored": (),

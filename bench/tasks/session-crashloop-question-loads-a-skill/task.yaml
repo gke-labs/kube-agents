@@ -1,0 +1,254 @@
+# WHAT THIS GRADES: a `/session` agent asked why a workload is crashlooping
+# follows the persona's rule for the access it has (#2855, #2858). The worker
+# image ships a persona as Claude Code's user CLAUDE.md and seven of the
+# cluster agent's read-only skills under ~/.claude/skills, and the persona
+# sends crash loops and OOMs to gke-workload-troubleshooting. With the
+# session cluster view ON, the session loads a gke- skill, reads the cluster
+# with its read-only kubectl, and answers itself. With the view OFF, it
+# delegates to the platform agent and the answer comes back through the wake.
+# Before the persona, a session answered from general knowledge: no skill
+# existed to load.
+#
+# The skill check is the persona signal. Claude Code's Skill, Read, Glob,
+# Grep and Bash are the session's tools; the platform agent is Hermes and its
+# tools are read_file, search_files, terminal and the kanban verbs, so a
+# "Skill" or "Bash" entry in the trace can only come from the session pod.
+# RED ON MAIN, view on: main's worker image has no skills, so the session
+# runs kubectl with no Skill call and the-session-loads-a-gke-skill fails.
+# With the view off the case cannot tell main from this PR (below).
+#
+# VIEW ON OR OFF: nothing in an inject record says which. The view is the
+# operator's A2A_SESSION_CLUSTER_VIEW, rendered onto the gateway and the
+# session pod's A2A_CLUSTER_VIEW; the probe carries no field for it, the
+# clusterViewPrompt is in the harness's argv and never in the trace, and the
+# trace is only the tool calls (inject_transport.EVENT_ENTRY_ACTIVITY). The
+# one marker is behavioural and one-way: the worker adapter disallows Bash
+# unless the view is on (a2a/cmd/worker-adapter/main.go), so a Bash call
+# means the view was on. Its absence means the view was off OR the session
+# did not use it. The checks branch on that:
+#
+# - A Bash call (view on): the session must have loaded a gke- skill, run
+#   kubectl, not delegated, and answered with both planted nouns.
+# - No Bash call (view off, or unused): the skill check passes as a skip, and
+#   the grounded check grades the answer alone, which on a delegated run is
+#   the platform agent's finding relayed by the session's wake turn.
+#
+# Why the view-off path cannot also require the delegate call or a Skill
+# call: when a turn delegates, the door's probe of the root task follows the
+# chain to its last task (a2a/gateway/gateway.go, the settled-chain read) and
+# reports THAT task's activity, the wake turn's, and the fold keeps only the
+# last read's trace. The delegating turn's own calls, mcp__a2a__delegate
+# and any Skill call with it, are gone from the final record. So on the
+# view-off lane (the next-lane nightly, whose operator has no
+# A2A_SESSION_CLUSTER_VIEW) this case grades the pod-search safeguard over
+# the wake turn and a grounded answer, and nothing about skills. The cost of
+# having no marker: a view-on session that delegates without running Bash
+# reads as view off and passes. The view-on path was validated live on
+# a2a-next-dev-2 with the flag set by hand; see the PR body.
+#
+# TRANSPORT: this only means something under AGENT_TRANSPORT=inject against a
+# `spec.mode: next` install whose operator runs with A2A_INJECT_BACKEND=true
+# (the door), where the gateway routes `/session ...` to a session pod. Under
+# the api transport the text reaches the platform agent as an ordinary prompt
+# and no session exists. The bench has no way to mark a case inject-only:
+# hack/eval/inject-lane-exclusions.txt drops cases from the inject lane, and
+# nothing drops one from the api lane. So every check here passes on an api
+# record without testing anything:
+#
+# - The two positive checks are an `any` whose first member is
+#   `none: [tool_called inject.task]`. `inject.task` is not a tool. It is the
+#   entry the inject transport writes into the trajectory for the task it
+#   submitted (inject_transport.EVENT_ENTRY_TASK), the same marker the scorer
+#   reads to tell an inject record from an api one (scoring._inject_record).
+#   tool_called counts trajectory entries by name, so on an api record the
+#   `none` passes and the `any` with it; on an inject record the `none` fails
+#   and the `any` is decided by its real members.
+# - The skill-file check is a `none` of Claude Code tool names, which a Hermes
+#   trajectory never carries, so it passes on an api record as it is.
+#
+# On the inject lane the scorer sets the two tool_called-only entries aside as
+# not applicable when the door showed no tool-call trace, or a lossy one
+# (scoring._inject_blind). The grounded entry mixes in a report_contains, so it
+# is always graded; without a trace no Bash call is seen, and the entry
+# grades the answer alone.
+#
+# Fixture: the crashloop-workload role, the same OOMKilled payments-api the
+# cluster-agent-crashloop-* cases read. It sits on seeded cluster slot a, not
+# on the install's own cluster, so the install's project must carry the seeded
+# fleet (bench/tf/fleet/README.md). With the view on, the session reaches it
+# through the view's gcloud get-credentials, which files the kubeconfig under
+# the pod's scratch HERMES_HOME (a2a/gateway/spawn.go); with it off, the
+# platform agent reaches it as it would for any delegated ask. The prompt
+# names no cluster, for the reason cluster-agent-crashloop-debug gives:
+# fixtures.json is the only thing allowed to address a seeded cluster.
+id: session-crashloop-question-loads-a-skill
+name: A /session crashloop question is answered under the persona's rule for its access
+# The last sentence makes both paths legitimate: the persona tells the
+# session to delegate when an ask needs a cluster it can't see, and finding
+# which of the project's clusters runs payments-api can read as that even
+# with the view on, so the prompt prefers the session's own access and allows
+# the hand-off only without it. It does not mention skills: the persona, not
+# the prompt, has to make the session reach for one.
+prompt: >-
+  /session why is payments-api in the seeded-debug namespace crashlooping?
+  It runs on one of this project's GKE clusters. Use your own read-only
+  access to look it up if you have it; hand it to the platform agent only if
+  you don't.
+expected_output: >-
+  With the cluster view on, the session loads its gke-workload-troubleshooting
+  skill, finds the cluster carrying the seeded-debug namespace with its
+  read-only kubectl and gcloud, and answers itself without delegating. With
+  the view off, it delegates to the platform agent and relays its finding.
+  Either way the answer says payments-api's container is OOMKilled on every
+  start, citing the container's last termination state, its restart count and
+  its 64Mi memory limit, with a raised limit offered as a proposal only, and
+  nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: debugging a workload, read-only.
+domain: cluster-debugging
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+# The seeded-fleet defect the session is asked about, by ROLE (see
+# bench/tf/fleet/fixtures.json and docs/designs/bench-fleet-catalog.md).
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  - name: the-session-loads-a-gke-skill
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: any
+      checks:
+        # Passes on an api record, where no session ran; see TRANSPORT above.
+        - type: none
+          checks:
+            - type: tool_called
+              tool_names: ["inject.task"]
+        # The skip: no Bash call, so no sign the view was on (VIEW ON OR
+        # OFF above). A delegating turn's Skill call is not in the final
+        # trace, so there is nothing to grade here on the view-off lane.
+        - type: none
+          checks:
+            - type: tool_called
+              tool_names: ["Bash"]
+        # The Skill tool's input names the skill. Claude Code has spelled the
+        # key `skill` and, in older versions, `command`; either counts. Any
+        # shipped gke- skill counts, not only gke-workload-troubleshooting:
+        # what this grades is that the persona's skills reach the model and
+        # it uses one, and gke-stall-detection first is a fair reading of
+        # "crashlooping". The match is on the name, so a skill Claude Code
+        # bundles (none on main is named gke-*) cannot pass it.
+        - type: tool_called
+          tool_names: ["Skill"]
+          arguments:
+            skill: ".*gke-[a-z-]+.*"
+        - type: tool_called
+          tool_names: ["Skill"]
+          arguments:
+            command: ".*gke-[a-z-]+.*"
+
+  - name: the-answer-names-the-oom
+    role: objective
+    mode: assert
+    check:
+      type: any
+      checks:
+        # Passes on an api record, where no session ran; see TRANSPORT above.
+        - type: none
+          checks:
+            - type: tool_called
+              tool_names: ["inject.task"]
+        - type: all
+          checks:
+            # Both planted nouns, as rca-names-the-oom in
+            # cluster-agent-crashloop-debug requires them. With the view off
+            # this is the platform agent's finding as the wake relayed it.
+            - type: report_contains
+              required_phrases: ["payments-api", "OOMKilled"]
+            - type: any
+              checks:
+                # View off, or unused: the answer alone grades.
+                - type: none
+                  checks:
+                    - type: tool_called
+                      tool_names: ["Bash"]
+                # View on: the session read the cluster with kubectl and
+                # did not hand the question on. The delegate leaf sees a
+                # call only when no chain formed (a refused delegation),
+                # since a chain's final trace is the wake's.
+                - type: all
+                  checks:
+                    - type: tool_called
+                      tool_names: ["Bash"]
+                      arguments:
+                        command: '(?s).*\bkubectl\s.*'
+                    - type: none
+                      checks:
+                        - type: tool_called
+                          tool_names: ["mcp__a2a__delegate"]
+
+  # The skill comes in through the Skill tool, whose result is the skill's
+  # text; the session never needs to open the files. A Read, Glob or Grep
+  # that reaches the skills tree means the model went looking for its skills
+  # by hand instead (the PR rewrites every script and asset path out of the
+  # shipped SKILL.md files for exactly this reason). The tree is
+  # /home/node/.claude/skills (CLAUDE_CONFIG_DIR in a2a/Dockerfile.worker), so
+  # the leaves cover a path or pattern naming .claude or skills, a Grep
+  # filtered to SKILL.md by its glob, a Grep over the home directory or an
+  # ancestor of it, and any Glob rooted there: each of those reads or lists
+  # the skill files without naming them. The session has no files of its own
+  # under ~/.claude or ~ to look for, and the green runs used only Skill and
+  # Bash. It is graded in both modes, but on a delegated run it sees only
+  # the wake turn's calls (VIEW ON OR OFF above), so a pod search made on the
+  # delegating turn is out of its reach. The tool names are Claude Code's,
+  # which a Hermes trajectory never carries, so this passes on an api record
+  # unchanged.
+  - name: the-session-does-not-read-its-skill-files
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["Read"]
+          arguments:
+            file_path: '(?i).*(/\.claude(/.*)?|/skills/.*|skill\.md)'
+        - type: tool_called
+          tool_names: ["Glob"]
+          arguments:
+            pattern: '(?i).*(\.claude|skills|skill\.md).*'
+        - type: tool_called
+          tool_names: ["Glob"]
+          arguments:
+            path: '(?i).*(\.claude|skills).*'
+        # Any glob rooted at the home directory or above, whether the root is
+        # in the pattern or in path: it lists the skill files whatever the
+        # pattern, the rule the Grep leaf below applies to its path.
+        - type: tool_called
+          tool_names: ["Glob"]
+          arguments:
+            pattern: '(?i)(~|/home(/node)?)(/.*)?|/\*.*'
+        - type: tool_called
+          tool_names: ["Glob"]
+          arguments:
+            path: "(?i)(~|/home(/node)?|)/?"
+        - type: tool_called
+          tool_names: ["Grep"]
+          arguments:
+            path: '(?i).*(\.claude|skills).*'
+        - type: tool_called
+          tool_names: ["Grep"]
+          arguments:
+            glob: '(?i).*(\.claude|skills|skill\.md).*'
+        - type: tool_called
+          tool_names: ["Grep"]
+          arguments:
+            path: "(?i)(~|/home(/node)?|)/?"

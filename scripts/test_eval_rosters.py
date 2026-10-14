@@ -163,13 +163,16 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
+    "chat-voice-answer-first",  # a delegated answer opens on its verdict
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "platform-security-secrets-encryption-currentstate-probe",  # the gke-basics/security skills sync
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
+    "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -371,12 +374,17 @@ INJECT_LANE_EXCLUDED = [
     "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
+    "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
 # a run on any transport but api.
 FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
+# Check types that read what only the chat front door's card round trip
+# delivers; on the inject lane there is no card, so the check fails rather
+# than being set aside (bench/README.md, the transport table).
+FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first"})
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
@@ -393,8 +401,77 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-routing-fleet-question": "nightly",
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
+    "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
 }
+
+
+def positive_check_types(node, negations: int = 0) -> set:
+    """The check types a task REQUIRES to pass: every `type:` under an even
+    number of negating `type: none` compounds (parity, as the bench's
+    `_negates_every_leaf` reads them) and under no `any` compound, where a
+    leaf is one alternative and not required. The other compounds
+    (`sequence`, `parallel`, `all`) are conjunctive and transparent."""
+    if isinstance(node, dict):
+        if node.get("type") == "any":
+            return set()
+        if node.get("type") == "none":
+            found = set()
+            for value in node.values():
+                found |= positive_check_types(value, negations + 1)
+            return found
+        found = {node["type"]} if isinstance(node.get("type"), str) and negations % 2 == 0 else set()
+        for value in node.values():
+            found |= positive_check_types(value, negations)
+        return found
+    if isinstance(node, list):
+        found = set()
+        for item in node:
+            found |= positive_check_types(item, negations)
+        return found
+    return set()
+
+
+class GitLabLaneTest(unittest.TestCase):
+    """hack/eval/gitlab-cases.txt: what the GitLab lane's presubmit
+    runs (kube-agents#2394). Registered cases only, every entry a case that
+    grades the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.gitlab_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered(self):
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.gitlab_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+
+    def test_every_lane_case_grades_the_forge(self):
+        import yaml
+
+        for case in eval_rosters.gitlab_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+
+    def test_a_negated_forge_check_does_not_count(self):
+        # "The agent did not open a merge request" proves nothing on GitLab.
+        negated = {"verification_spec": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}
+        self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "pull_request_opened"}]}) & self.FORGE_CHECKS)
+        # A none under a none undoes it, as the bench reads it (bench/tests/test_cases.py, doubly-negated).
+        double = {"verification_spec": [{"type": "none", "checks": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}]}
+        self.assertTrue(positive_check_types(double) & self.FORGE_CHECKS)
+        # Under `any` the forge check is one alternative, not a requirement: a chat answer could pass the case instead.
+        either = {"verification_spec": [{"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}]}
+        self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_CASES_FILE.read_text(encoding="utf-8")), [])
 
 
 class InjectLaneExclusionsTest(unittest.TestCase):
@@ -457,6 +534,28 @@ class InjectLaneExclusionsTest(unittest.TestCase):
             if lines and lines[0].strip() in FRONT_DOOR_WAKE_DIRECTIVES:
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
+
+    def test_every_registered_front_door_delivery_case_is_excluded(self):
+        # answer_first fails on the inject lane rather than being set aside,
+        # so an unlisted case carrying one reds there every repetition.
+        import yaml
+
+        def check_types(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("type"), str):
+                    yield node["type"]
+                for value in node.values():
+                    yield from check_types(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from check_types(value)
+
+        excluded = eval_rosters.inject_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if FRONT_DOOR_DELIVERY_CHECK_TYPES & set(check_types(doc.get("verification_spec"))):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_an_exclusion_is_not_a_demotion(self):
         # The api lane's roster is untouched by an entry here: an excluded

@@ -183,8 +183,9 @@ env:
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
-  # The GitLab lane (kube-agents#2394): the same matrix against a pool
-  # project's GitLab repository, collected as tier gitlab with a watermark
+  # The GitLab lane (kube-agents#2394): the forge-grading cases of the
+  # catalogue against a pool project's GitLab repository, collected
+  # as tier gitlab with a watermark
   # of its own and shown in the Brief's "GitLab lane" section only.
   GITLAB_PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
@@ -193,6 +194,9 @@ env:
   # and until a writers build is on record any other listing failure but a
   # hang is a note too: it has a watermark of its own.
   NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
+  # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
+  # tier gitlab with no pull request, listed under the Brief's GitLab section.
+  GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -329,6 +333,7 @@ jobs:
             --gitlab-pr-glob "$GITLAB_PR_GLOB" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
+            --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
