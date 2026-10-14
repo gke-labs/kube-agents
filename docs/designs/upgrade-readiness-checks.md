@@ -21,8 +21,9 @@ says which parts exist on main.
 **After the upgrade: the retrospective.** The retrospective design specifies a job that runs once at
 install, at the end of each weekend and soon after each upgrade. Its report says what each upgrade
 did, what failed, which catalogue entry the failure matches, and the fix to make before the next
-upgrade. It records each failure as a guard, and the next readiness report shows the guard. Nothing
-of it is on main yet. See [`upgrade-retrospective.md`](upgrade-retrospective.md).
+upgrade. It records each failure, and each risk it finds on a cluster, as a guard. The next
+readiness report shows the guard. Nothing of it is on main yet. See
+[`upgrade-retrospective.md`](upgrade-retrospective.md).
 
 **What both rest on: the catalogue and the test fleet.** The catalogue lists twenty ways an upgrade
 fails, each from a public incident, provider documentation or a test-fleet fixture. For each it
@@ -78,8 +79,8 @@ leaves out the version and operation tables and replaces the project name:
 - guard `<project>/us-central1-a/seeded-a#failure#2#seeded-capacity/Deployment/inference-server` failure entry 2 (high), first seen 2026-10-14T19:49:58Z, 1 review(s)
 ```
 
-That run reviewed the project's seven clusters in 20 seconds, filed 6 errors and 8 warnings, and
-recorded 61 guards.
+That run reviewed the project's seven clusters in 20 seconds and filed 6 errors and 8 warnings. It
+recorded 61 guards: 15 for failures and 46 for risks.
 
 ## The problem, in one paragraph
 
