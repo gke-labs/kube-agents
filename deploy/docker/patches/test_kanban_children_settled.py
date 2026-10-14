@@ -17,6 +17,7 @@ from kanban_children_settled import (
     WORKER_TASK_ENV,
     maybe_record_worker_child,
     record_worker_child,
+    refuse_idle_dependency_block,
     require_children_settled,
 )
 
@@ -36,11 +37,16 @@ RECEIPT = (
 # own table is deliberately absent: the module creates it on first write, and
 # a board that predates the patch must read as "no children" (fail-open).
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER);
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+CREATE TABLE IF NOT EXISTS task_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    kind    TEXT NOT NULL
 );
 """
 
@@ -50,14 +56,14 @@ def board(path):
     conn.row_factory = sqlite3.Row
     conn.executescript(BOARD_SCHEMA)
     conn.execute(
-        "INSERT INTO tasks VALUES (?, 'running', NULL)", (DELEGATION_CARD,)
+        "INSERT INTO tasks (id, status, result) VALUES (?, 'running', NULL)", (DELEGATION_CARD,)
     )
     conn.commit()
     return conn
 
 
 def add_card(conn, task_id, status="running"):
-    conn.execute("INSERT INTO tasks VALUES (?, ?, NULL)", (task_id, status))
+    conn.execute("INSERT INTO tasks (id, status, result) VALUES (?, ?, NULL)", (task_id, status))
     conn.commit()
 
 
@@ -374,6 +380,124 @@ class TestFailOpen(Fixture):
         self.assertTrue(closed)
 
 
+class TestTheDependencyBlock(Fixture):
+    """The #2704 duplicate (card t_b999714f, #250/#251): refused at
+    completion, the worker waited with kanban_block(kind="dependency"). With
+    no parent to wait on, upstream re-queued the card to a fresh worker that
+    had no record of the first one's pull request."""
+
+    def block(self, kind="dependency", task_id=DELEGATION_CARD):
+        return refuse_idle_dependency_block(task_id, kind, self.conn)
+
+    def test_a_dependency_block_with_only_fanned_out_children_is_refused(self):
+        spawn(self.conn, "t_seed_b", status="blocked")
+        refusal = self.block()
+        self.assertIsNotNone(refusal)
+        self.assertIn("t_seed_b", refusal)
+        self.assertIn("needs_input", refusal)
+        self.assertIn("kanban_show", refusal)
+
+    def test_a_card_with_no_children_at_all_is_refused_too(self):
+        refusal = self.block()
+        self.assertIsNotNone(refusal)
+        self.assertNotIn("(`", refusal)
+
+    def test_the_refusal_is_not_rationed(self):
+        spawn(self.conn, "t_seed_b")
+        self.assertIsNotNone(self.block())
+        self.assertIsNotNone(self.block())
+
+    def test_other_kinds_are_untouched(self):
+        spawn(self.conn, "t_seed_b")
+        for kind in (None, "needs_input", "capability", "transient"):
+            self.assertIsNone(self.block(kind=kind), kind)
+
+    def test_an_unsettled_parent_is_something_to_wait_on(self):
+        add_card(self.conn, "t_upstream", status="running")
+        self.conn.execute(
+            "INSERT INTO task_links VALUES (?, ?)", ("t_upstream", DELEGATION_CARD)
+        )
+        self.assertIsNone(self.block())
+
+    def test_a_settled_parent_is_not(self):
+        add_card(self.conn, "t_upstream", status="done")
+        self.conn.execute(
+            "INSERT INTO task_links VALUES (?, ?)", ("t_upstream", DELEGATION_CARD)
+        )
+        self.assertIsNotNone(self.block())
+
+    def event(self, task_id, kind):
+        self.conn.execute(
+            "INSERT INTO task_events (task_id, kind) VALUES (?, ?)", (task_id, kind)
+        )
+
+    def link(self, parent, child):
+        self.conn.execute("INSERT INTO task_links VALUES (?, ?)", (parent, child))
+
+    def test_a_child_the_scheduling_repair_will_flip_is_something_to_wait_on(self):
+        """A child created with parents=[<this card>] after the card was
+        claimed, and gated by nothing else: kanban_scheduling flips that edge
+        inside block_task, after this gate, so the card really waits."""
+        self.event(DELEGATION_CARD, "claimed")
+        add_card(self.conn, "t_fanned", status="todo")
+        self.event("t_fanned", "created")
+        self.link(DELEGATION_CARD, "t_fanned")
+        self.assertIsNone(self.block())
+
+    def test_a_successor_planned_before_the_card_started_is_not(self):
+        """A pipeline successor (A -> B -> C, C filed before B was claimed) is
+        never flipped, so B's dependency block would re-queue it at once."""
+        add_card(self.conn, "t_next_stage", status="todo")
+        self.event("t_next_stage", "created")
+        self.event(DELEGATION_CARD, "claimed")
+        self.link(DELEGATION_CARD, "t_next_stage")
+        self.assertIsNotNone(self.block())
+
+    def test_a_child_that_still_waits_on_another_card_is_not(self):
+        """The aggregation-card shape: Agg has parents=[X, Y]. X blocking on it
+        frees nothing while Y is unsettled, so the repair leaves the edge and X
+        would re-queue."""
+        add_card(self.conn, "t_sibling", status="running")
+        self.event(DELEGATION_CARD, "claimed")
+        add_card(self.conn, "t_agg", status="todo")
+        self.event("t_agg", "created")
+        self.link(DELEGATION_CARD, "t_agg")
+        self.link("t_sibling", "t_agg")
+        self.assertIsNotNone(self.block())
+
+    def test_a_card_this_worker_no_longer_runs_is_left_to_upstream(self):
+        """A released or reassigned claim: block_task reports the block
+        didn't land, rather than the worker being told it holds the card."""
+        self.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (DELEGATION_CARD,))
+        self.assertIsNone(self.block())
+
+    def test_another_runs_card_is_left_to_upstream(self):
+        self.conn.execute("UPDATE tasks SET current_run_id = 8 WHERE id = ?", (DELEGATION_CARD,))
+        self.assertIsNone(refuse_idle_dependency_block(DELEGATION_CARD, "dependency", self.conn, 7))
+        self.assertIsNotNone(refuse_idle_dependency_block(DELEGATION_CARD, "dependency", self.conn, 8))
+
+    def test_the_refusal_says_a_linked_successor_runs_after_completion(self):
+        add_card(self.conn, "t_next_stage", status="todo")
+        self.event("t_next_stage", "created")
+        self.event(DELEGATION_CARD, "claimed")
+        self.link(DELEGATION_CARD, "t_next_stage")
+        self.assertIn("complete this card and it starts", self.block())
+
+    def test_a_read_error_lets_the_block_through(self):
+        broken = mock.Mock()
+        broken.execute.side_effect = sqlite3.OperationalError("database is locked")
+        self.assertIsNone(refuse_idle_dependency_block(DELEGATION_CARD, "dependency", broken))
+
+    def test_a_board_without_the_attribution_table_still_refuses(self):
+        self.assertIsNotNone(self.block())
+
+    def test_the_gate_neither_writes_nor_closes_the_handlers_connection(self):
+        spawn(self.conn, "t_seed_b")
+        self.block()
+        self.conn.execute("SELECT 1").fetchone()
+        self.assertFalse(self.conn.in_transaction)
+
+
 class TestTheApplier(unittest.TestCase):
     """Drive apply_kanban_children_settled against a fixture tree."""
 
@@ -398,7 +522,12 @@ class TestTheApplier(unittest.TestCase):
             "    with _board(args.get('board')) as (kb, conn):\n"
             "        new_tid = kb.create_task(conn, title=title)\n"
             "        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)\n"
-            "        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))\n",
+            "        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))\n"
+            "\n"
+            "def _handle_block(args):\n"
+            "    with _board(args.get('board')) as (kb, conn):\n"
+            + applier.BLOCK_ANCHOR
+            + "        return _ok_landed(kb, conn, tid, 'blocked', block_kind=kind)\n",
             encoding="utf-8",
         )
 
@@ -425,6 +554,21 @@ class TestTheApplier(unittest.TestCase):
         self.assertLess(
             out.index("_require_children_settled"), out.index("_require_result")
         )
+
+    def test_the_dependency_gate_runs_just_before_block_task(self):
+        self.applier.apply(self.tmp)
+        out = self.patched()
+        self.assertIn("tid, kind, conn, _worker_run_id(tid)", out)
+        self.assertLess(
+            out.index("_refuse_idle_dependency_block("),
+            out.index("ok = kb.block_task("),
+        )
+
+    def test_a_missing_block_anchor_fails_the_build(self):
+        source = self.patched().replace("ok = kb.block_task(", "ok = kb.block_task_v2(")
+        self.target.write_text(source, encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            self.applier.apply(self.tmp)
 
     def test_a_second_run_refuses(self):
         self.applier.apply(self.tmp)

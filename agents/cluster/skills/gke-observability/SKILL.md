@@ -7,6 +7,8 @@ description: Workflows for setting up and auditing observability (logging, monit
 
 This skill provides workflows for ensuring your GKE cluster and workloads have adequate observability for production use.
 
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
+
 ## Workflows
 
 ### 1. Audit Cluster Observability
@@ -25,13 +27,8 @@ Look for `loggingService` and `monitoringService` to be set to something other t
 
 Google Cloud Managed Service for Prometheus is the recommended way to collect metrics from your applications.
 
-**Command to enable:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --enable-managed-prometheus \
-    --region <region>
-```
+**To enable:** propose turning on Managed Service for Prometheus (Config
+Connector `ContainerCluster` field `spec.monitoringConfig.managedPrometheus.enabled: true`).
 
 **Verify installation:**
 
@@ -98,25 +95,18 @@ Use Logging Query Language (LQL) in Cloud Logging to find specific logs.
 
 For Standard clusters, you can enable collection of metrics from the Kubernetes API server, scheduler, and controller manager.
 
-**Command:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER \
-    --region <region>
-```
+Propose the monitoring components `SYSTEM_COMPONENTS`, `APISERVER`,
+`SCHEDULER` and `CONTROLLER_MANAGER` (Config Connector `ContainerCluster` field
+`spec.monitoringConfig.enableComponents`).
 
 ### 9. Enable Dataplane V2 Observability
 
 If using GKE Dataplane V2, you can enable advanced L4 observability.
 
-**Command:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --enable-dataplane-v2-observability \
-    --region <region>
-```
+Propose enabling Dataplane V2 observability (Config Connector
+`ContainerCluster` field `spec.monitoringConfig.advancedDatapathObservabilityConfig`,
+a list whose entry sets `enableMetrics: true`, plus `relayMode` for flow
+observability).
 
 This allows you to observe traffic flows and network metrics.
 
