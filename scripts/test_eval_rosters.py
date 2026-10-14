@@ -173,6 +173,7 @@ ADDED_AFTER_THE_MOVE = [
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
+    "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -376,6 +377,7 @@ INJECT_LANE_EXCLUDED = [
     "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
+    "fanout-absent-cluster-cards-complete",  # worker-scope objectives, #2978
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -403,6 +405,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
+    "fanout-absent-cluster-cards-complete": "nightly",
 }
 
 

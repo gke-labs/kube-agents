@@ -32,7 +32,7 @@ Delegation runs on the shared kanban board — agents never pass context to each
 3. The worker completes the card with the grounded root-cause analysis in `result` — the field the gateway posts into the requesting chat thread verbatim — and the machine-readable form of it, including the proposed manifest patch, in `metadata`.
 4. The Platform Agent reads the result and, if you asked for the fix, submits it through the [declarative workflow](/kube-agents/concepts/declarative-workflow/) (`submit-suggestion`); if you asked for a diagnosis, the root cause and the proposed patch come back in the reply. The write path never moves to the cluster side.
 
-For multi-cluster work the Platform Agent fans out one card per cluster, keeps its own card open while they run, and completes it with the synthesized answer once every per-cluster card has finished — the image refuses a completion that would hand back a dispatch receipt while they are still running (`deploy/docker/patches/kanban_children_settled.py`). See the `workload-rebalancing` skill for the pattern.
+For multi-cluster work the Platform Agent fans out one card per cluster, keeps its own card open while they run, and completes it with the synthesized answer once every per-cluster card has finished — the image refuses a completion that would hand back a dispatch receipt while they are still running (`deploy/docker/patches/kanban_children_settled.py`). A per-cluster card whose cluster doesn't have what it was asked about reports that and completes, and one still running after 30 minutes is stopped and settled as not finished on that cluster (`deploy/docker/patches/kanban_fanout_reaper.py`). See the `workload-rebalancing` skill for the pattern.
 
 ## Event triage
 

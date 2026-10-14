@@ -1511,6 +1511,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
+# kanban_fanout_reaper: a per-cluster card a worker fanned out (to a Cluster
+# Agent, with no parents, beside at least one sibling) that has run 30 minutes
+# is stopped and settled with a result saying it didn't finish on its cluster, so
+# a child waiting on a workload its cluster doesn't have can't hold a worker
+# slot for hours (#2978). Heartbeats don't matter; cards a person filed are
+# never touched. It hooks the dispatcher's reclaim phase right after
+# enforce_max_runtime, which is anchored on upstream's line, after the
+# kanban-scheduling stage's edits to the same file.
+# See the module docstring in deploy/docker/patches/kanban_fanout_reaper.py.
+#
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
 # record, the `queued` events) is in the kanban-scheduling stage above, which
@@ -1573,6 +1583,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_wake_guard.py \
      deploy/docker/patches/apply_kanban_wake_guard.py \
      deploy/docker/patches/verify_kanban_wake_guard.py \
+     deploy/docker/patches/kanban_fanout_reaper.py \
+     deploy/docker/patches/apply_kanban_fanout_reaper.py \
+     deploy/docker/patches/verify_kanban_fanout_reaper.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
@@ -1641,6 +1654,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
     grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
     grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
+    cp /tmp/latency-patches/kanban_fanout_reaper.py /opt/hermes/tools/kanban_fanout_reaper.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_fanout_reaper.py /opt/hermes && \
+    grep -qF '_kanban_reap_overdue_fanout(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -1671,6 +1687,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
