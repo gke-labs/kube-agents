@@ -245,7 +245,7 @@ COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      /tmp/kanban-progress/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
     grep -qF 'TERMINAL_KINDS = ' /opt/hermes/gateway/kanban_watchers_notifier.py && \
-    grep -qF '+ ("heartbeat",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat", "pr_opened")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^def _fmt_heartbeat(ev, n) -> tuple:' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
@@ -1647,7 +1647,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/tools/kanban_tools.py)" = "1" && \
     test "$(grep -c '_kanban_saturation_tick(' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
     grep -q 'kanban dispatcher stuck: ready queue non-empty' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF '+ ("heartbeat",) + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat", "pr_opened") + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \

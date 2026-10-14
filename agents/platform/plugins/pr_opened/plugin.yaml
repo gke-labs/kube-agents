@@ -1,0 +1,5 @@
+name: pr_opened
+version: 0.1.0
+kind: standalone
+description: Record a pull request the worker's card opened as a pr_opened kanban event.
+provides_hooks: [transform_terminal_output]

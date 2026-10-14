@@ -72,12 +72,19 @@ KINDS_COMMENT = (
     "# here so mid-run progress notes reach the subscriber's thread;\n"
     "# _fmt_heartbeat below drops the noteless auto-heartbeats, and the\n"
     "# kind is deliberately absent from _WAKE_KINDS so a progress line\n"
-    "# costs no LLM turn. See gateway/kanban_progress_lines.py.\n"
+    "# costs no LLM turn. \"pr_opened\" is claimed for the same reason and\n"
+    "# has no formatter: the pr_opened plugin records it when the broker\n"
+    "# opens a proposal for the card, and silent_event posts the PR from\n"
+    "# it. See gateway/kanban_progress_lines.py.\n"
 )
 
 #: Kinds the filter must still carry for it to be the one this patch means.
 #: Not the whole tuple: upstream may add to it, and this patch does not care.
 KINDS_EXPECTED = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+
+#: What this patch adds to the filter, as the source text appended to it: mid-run
+#: progress, and the PR a card's worker opened (``kanban_progress_lines.PR_OPENED_KIND``).
+CLAIMED_KINDS = '("heartbeat", "pr_opened")'
 
 # --- the header a progress line carries ------------------------------------
 #
@@ -265,7 +272,7 @@ def apply(root: Path) -> None:
     notifier.refuse_if_patched(KINDS_COMMENT.splitlines()[0])
     kinds = notifier.find_assign("TERMINAL_KINDS", label="terminal-kind filter")
     kinds.expect_contains(*KINDS_EXPECTED)
-    widened = f'{kinds.value_text} + ("heartbeat",)'
+    widened = f"{kinds.value_text} + {CLAIMED_KINDS}"
     notifier.splice(kinds.value_start, kinds.value_end, widened)
     notifier.insert(
         kinds.line_start, textwrap.indent(KINDS_COMMENT, kinds.indent)

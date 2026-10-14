@@ -187,7 +187,7 @@ def _widen_kinds(notifier: patchlib.Patch) -> None:
 
     ``Assignment.expect_contains`` wants a bare tuple literal, and by the time
     this runs ``apply_kanban_progress_lines.py`` has already made the value
-    ``(...) + ("heartbeat",)``. So the same assertion is made over the chain of
+    ``(...) + ("heartbeat", "pr_opened")``. So the same assertion is made over the chain of
     tuple literals instead: the filter must still be built of literals only,
     and still hold the kinds this patch reasons about.
     """

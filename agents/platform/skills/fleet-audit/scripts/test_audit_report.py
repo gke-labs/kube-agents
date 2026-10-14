@@ -24998,5 +24998,27 @@ class TestManifestRemediationLinks(HarnessTestCase):
             self.assertNotIn("refreshed", out["b"])
 
 
+class ProposalOpenedRecordTest(unittest.TestCase):
+    """The remediation pull request reaches the broker through `vcs_client.call`, which records it."""
+
+    def test_a_remediation_pull_request_is_recorded_on_stderr(self):
+        url = "https://github.com/acme/fleet/pull/31"
+
+        def broker(verb, payload):
+            return {"proposal": {"number": 31, "title": payload["title"], "url": url}}
+
+        stderr = io.StringIO()
+        with patch.object(vcs_client, "_call", broker), patch("sys.stderr", stderr):
+            audit_report.forge(
+                "proposal-create", "acme/fleet",
+                {"source": "platform-agent/audit-1", "target": "main", "title": "audit 1", "body": "b"},
+            )
+        records = [json.loads(line) for line in stderr.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(
+            records,
+            [{"kube-agents.event": "proposal-opened", "proposal": {"url": url, "number": 31, "title": "audit 1"}}],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

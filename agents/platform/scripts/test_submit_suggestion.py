@@ -40,6 +40,9 @@ sys.path.insert(0, str(HERE))
 
 import gitops_workspace  # noqa: E402
 import vcs_client  # noqa: E402
+
+#: The real `call`, which the setUp replaces with the stub broker; the record tests put it back.
+REAL_CALL = vcs_client.call
 from providers import validate_branch  # noqa: E402
 
 SUBJECT = (
@@ -1039,6 +1042,45 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertNotIn("platform-agent/scale-web", self.remote_branches())
 
     # -- submit -----------------------------------------------------------
+
+    def test_submit_records_the_proposal_it_opened_on_stderr(self):
+        # The chokepoint: `vcs_client.call` itself, with only the broker under it
+        # stubbed, writes the record the agent pod's pr_opened plugin reads.
+        prepared = self.prepare()
+        self.edit(prepared)
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                mock.patch("sys.stderr", stderr):
+            code, out = self.run_subject(
+                "submit",
+                "--branch", "platform-agent/scale-web",
+                "--title", "fix(capacity): raise the replica floor",
+                "--body-file", self.body_file(),
+            )
+        self.assertEqual(code, 0)
+        records = [json.loads(line) for line in stderr.getvalue().splitlines() if "kube-agents.event" in line]
+        self.assertEqual(records, [{
+            "kube-agents.event": "proposal-opened",
+            "proposal": {"url": out, "number": 101, "title": "fix(capacity): raise the replica floor"},
+        }])
+
+    def test_updating_an_open_proposal_records_nothing(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.existing_proposal("platform-agent/scale-web")
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                mock.patch("sys.stderr", stderr):
+            code, _ = self.run_subject(
+                "submit",
+                "--branch", "platform-agent/scale-web",
+                "--title", "fix(capacity): raise the replica floor",
+                "--body-file", self.body_file(),
+            )
+        self.assertEqual(code, 0)
+        self.assertNotIn("kube-agents.event", stderr.getvalue())
 
     def test_submit_publishes_the_branch_and_opens_the_proposal(self):
         prepared = self.prepare()

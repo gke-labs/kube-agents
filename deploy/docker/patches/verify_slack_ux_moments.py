@@ -14,7 +14,9 @@ Three things are checked:
    ``wake_text`` (``apply_slack_ux_moments.py``).
 3. The module, loaded by path and driven with a stub adapter: flag off it is
    inert; flag on, an opened PR posts once with its two url buttons, a PR
-   that is only cited posts nothing, and a ``needs_input`` block posts its
+   that is only cited posts nothing, a ``pr_opened`` event posts its PR once
+   whatever the worker's note says and the note saying it opened that PR
+   posts nothing more, and a ``needs_input`` block posts its
    question with a choice per option it ends with while any other block posts
    nothing. The wake for that question's ``blocked`` event carries the note
    and a wake for another event does not; the question loses its buttons when
@@ -46,6 +48,11 @@ THREAD = "1700000000.000100"
 PR = "https://github.com/acme/fleet-config/pull/412"
 OPENED = f"Opened PR {PR} raising the limit to 512Mi"
 CITED = f"{PR} already covers this"
+#: A pr_opened event, and the worker's note after it, which says nothing about opening it.
+EVENT_PR = "https://github.com/acme/fleet-config/pull/99"
+EVENT_NUMBER = 99
+EVENT_TITLE = "Raise the checkout memory limit"
+EVENT_NOTE = "Both fixes are up for review in PR #99"
 QUESTION = "Which checkout-gateway did you mean?\nTwo clusters run one. Which should I look at?\n- seeded-reliability\n- seeded-debug"
 CHOICES = ["seeded-reliability", "seeded-debug"]
 BLOCKED = "blocked"
@@ -133,6 +140,15 @@ async def _drive(module) -> None:
     urls = [b.get("url") for b in _buttons(_shown(adapter.posts[0]))]
     if urls != [PR, PR + "/files"] or adapter.posts[0]["thread_ts"] != THREAD:
         raise _fail(f"the PR moment was {adapter.posts[0]!r}")
+
+    adapter = _StubAdapter()
+    await module.pr_event(adapter, sub, {"url": EVENT_PR, "number": EVENT_NUMBER, "title": EVENT_TITLE}, EVENT_NOTE)
+    await module.pr_opened(adapter, sub, f"Opened {EVENT_PR}")
+    if len(adapter.posts) != 1:
+        raise _fail(f"a pr_opened event and the note after it posted {len(adapter.posts)} times, expected once")
+    urls = [b.get("url") for b in _buttons(_shown(adapter.posts[0]))]
+    if urls != [EVENT_PR, EVENT_PR + "/files"] or "PR #99" not in adapter.posts[0]["text"]:
+        raise _fail(f"the PR moment from a pr_opened event was {adapter.posts[0]!r}")
 
     adapter = _StubAdapter()
     await module.needs_you(adapter, sub, {"kind": "capability", "reason": QUESTION})

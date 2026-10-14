@@ -317,9 +317,12 @@ memory:
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls.
+# to audit this privileged specialist's tool calls. pr_opened records each pull
+# request this profile's kanban workers open on their card, which is what posts
+# the thread's PR message (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
+    - pr_opened

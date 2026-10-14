@@ -235,7 +235,7 @@ class ApplierTest(unittest.TestCase):
         patched = self._notifier(root)
         self.assertIn('"heartbeat": _fmt_heartbeat,', patched)
         self.assertIn("def _fmt_heartbeat(ev, n) -> tuple:", patched)
-        self.assertIn('+ ("heartbeat",)', patched)
+        self.assertIn('+ ("heartbeat", "pr_opened")', patched)
         self.assertIn("self.progress_header = ", patched)
         self.assertIn("from gateway.kanban_progress_lines import progress_note", patched)
         self.assertIn("from gateway.kanban_progress_lines import deliver", patched)
@@ -338,7 +338,7 @@ class TerminalKindsLocatorTest(ApplierTest):
         patched = self._notifier(root)
         # Upstream's addition survives, and heartbeat is appended to it.
         self.assertIn('"abandoned"', patched)
-        self.assertIn('+ ("heartbeat",)', patched)
+        self.assertIn('+ ("heartbeat", "pr_opened")', patched)
 
     def test_a_reformatted_tuple_still_patches(self):
         multiline = (
@@ -352,7 +352,7 @@ class TerminalKindsLocatorTest(ApplierTest):
         )
         root = self._tree(kinds=multiline)
         applier.apply(root)
-        self.assertIn('+ ("heartbeat",)', self._notifier(root))
+        self.assertIn('+ ("heartbeat", "pr_opened")', self._notifier(root))
 
     def test_a_filter_that_lost_a_kind_fails_the_build(self):
         # Membership this patch reasons about is asserted, not searched on, so
@@ -1450,6 +1450,15 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             test.announced.append((sub["task_id"], text, len(adapter.sent)))
             return True
 
+        self.recorded = []
+        self.pr_event_raises = None
+
+        async def pr_event(adapter, sub, payload, text=""):
+            if test.pr_event_raises:
+                raise test.pr_event_raises
+            test.recorded.append((sub["task_id"], payload, text))
+            return True
+
         async def settle_delegated(adapter, sub, kind, board=None):
             test.settled.append((sub["task_id"], kind))
 
@@ -1464,6 +1473,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             asked=lambda sub, event_id: event_id == test.asked_event,
             needs_you=needs_you,
             pr_opened=pr_opened,
+            pr_event=pr_event,
             settle_question=settle_question,
         )
         self.modules = {
@@ -1598,6 +1608,51 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.posts_question = False
         await self._blocked(_Adapter(), {"kind": "capability", "reason": "no GPU"})
         self.assertEqual(self.questions_settled, ["t_e0c1"])
+
+    PR_EVENT = {"url": "https://github.com/acme/fleet/pull/99", "number": 99, "title": "Raise the limit"}
+
+    def _pr_batch(self, sub=SLACK_SUB):
+        events = [
+            SimpleNamespace(id=5, kind="pr_opened", payload=self.PR_EVENT),
+            _beat(6, "Both fixes are up for review in PR #99"),
+            SimpleNamespace(id=7, kind="completed", payload={"summary": "Raised the limit on seeded-a."}),
+        ]
+        return SimpleNamespace(sub=sub, adapter=_Adapter(), title="t", d={"events": events}), events
+
+    async def test_a_pr_opened_event_posts_its_pr_with_the_words_after_it(self):
+        # No "opened" anywhere: the event, not the wording, decides.
+        notification, events = self._pr_batch()
+        await silent_event(notification, events[0])
+        self.assertEqual(
+            self.recorded,
+            [("t_e0c1", self.PR_EVENT, "Both fixes are up for review in PR #99\nRaised the limit on seeded-a.")],
+        )
+        self.assertEqual(self.questions_settled, [], "a PR is not a reason to settle the card's question")
+
+    async def test_a_pr_opened_event_alone_posts_with_no_words(self):
+        notification, events = self._pr_batch()
+        notification.d["events"] = events[:1]
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [("t_e0c1", self.PR_EVENT, "")])
+
+    async def test_a_replayed_pr_opened_event_posts_nothing(self):
+        notification, events = self._pr_batch({**SLACK_SUB, "last_ping_event_id": 5})
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [])
+
+    async def test_a_pr_opened_event_posts_nothing_with_the_flag_off_or_off_slack(self):
+        notification, events = self._pr_batch(SUB)
+        await silent_event(notification, events[0])
+        self.flag = False
+        notification, events = self._pr_batch()
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [])
+
+    async def test_a_pr_opened_event_that_fails_to_post_never_raises(self):
+        self.pr_event_raises = RuntimeError("channel_not_found")
+        notification, events = self._pr_batch()
+        await silent_event(notification, events[0])
+        await silent_event(SimpleNamespace(), events[0])
 
     async def test_an_unblocked_or_archived_card_settles_its_question(self):
         # Both format to None upstream, so only silent_event sees them.

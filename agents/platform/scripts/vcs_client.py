@@ -129,6 +129,23 @@ BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 #: broker that refused.
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 
+#: The verb that opens a change proposal, and the record `call()` writes to stderr
+#: when the broker answers it with one: a single compact JSON object on its own
+#: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
+#: title}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
+#: submit-suggestion, the fleet audit -- reaches the broker through `call()`, so
+#: this is the one place that knows a proposal was opened, with the forge's own
+#: url. The agent pod's `pr_opened` plugin (agents/platform/plugins/pr_opened)
+#: takes the line out of the terminal output and records it on the worker's
+#: card, which is how the thread's PR message is posted without reading the
+#: worker's words. A JSON value rather than a prefixed line, so a pipeline that
+#: merges stderr into `jq` reads one more document instead of failing. The
+#: plugin holds the same three names; its test reads these to keep them equal.
+PROPOSAL_CREATE_VERB = "proposal-create"
+PROPOSAL_OPENED_KEY = "kube-agents.event"
+PROPOSAL_OPENED_EVENT = "proposal-opened"
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title")
+
 
 @functools.lru_cache(maxsize=1)
 def _registered_urls() -> dict[str, str]:
@@ -168,6 +185,33 @@ def _on_the_wire(repository: object) -> object:
 
 
 def call(verb: str, payload: dict) -> dict:
+    """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`)."""
+    answer = _call(verb, payload)
+    if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
+        _say_opened(answer)
+    return answer
+
+
+def _say_opened(answer: object) -> None:
+    """Write the `PROPOSAL_OPENED_KEY` record for the proposal in `answer`, if it names one.
+
+    Never raises: the proposal is open whatever happens to this line, and a
+    caller told otherwise would try to open it again.
+    """
+    proposal = answer.get("proposal") if isinstance(answer, dict) else None
+    if not isinstance(proposal, dict) or not proposal.get("url"):
+        return
+    record = {
+        PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT,
+        "proposal": {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS},
+    }
+    try:
+        print(json.dumps(record, separators=(",", ":")), file=sys.stderr, flush=True)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _call(verb: str, payload: dict) -> dict:
     if "repository" in payload:
         payload = {**payload, "repository": _on_the_wire(payload["repository"])}
     endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()

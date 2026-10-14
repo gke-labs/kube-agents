@@ -6,7 +6,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 * A pull request the work opened (:func:`pr_opened`), or a GitLab merge
   request: a bold headline naming it, the worker's own line below it as evidence, and "Open PR"
   ("Open MR" for a merge request; the primary button) and "Files changed" url buttons, beside a green side bar
-  (:data:`PR_SIDE_BAR`). :func:`opened_pr` finds it in a progress note or a report, and
+  (:data:`PR_SIDE_BAR`). :func:`proposal_ref` reads one from the url the forge
+  answered with when the work opened it, which no wording decides, and
+  :func:`evidence_line` finds the worker's line naming it. As the fallback for a
+  PR opened any other way, :func:`opened_pr` finds it in a progress note or a report, and
   only where the line says it opened that PR, the verb in front of the url
   with the worker as its subject by the one rule in :func:`_ours`, so a note
   citing someone else's PR ("… pull/300, opened by bob", "Dependabot opened
@@ -197,6 +200,10 @@ A_BEFORE_MR = re.compile(r"\b([Aa])(?=\s+[*_`]*MR !)")
 PR_LAYOUT = (PR_HEADLINE, PR_REF, PR_LEAD, OPEN_PR, FILES_PATH)
 MR_LAYOUT = (MR_HEADLINE, MR_REF, MR_LEAD, OPEN_MR, DIFFS_PATH)
 PR_ACTION_PREFIX = "kage_pr"
+#: A line naming a PR or merge request by its number alone ("PR #99", "MR !12"), as
+#: :func:`evidence_line` finds the worker's line about one it opened.
+PR_NUMBER_REF = r"(?<![\w#!])#{number}\b"
+MR_NUMBER_REF = r"(?<![\w#!])!{number}\b"
 
 #: An option line in a block reason: a bullet, a numbered item or a lettered one ("a)", "B.").
 OPTION_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+(.+?)\s*$")
@@ -259,6 +266,33 @@ def opened_prs(text: str, gitlab_hosts: Collection[str] = frozenset()) -> Iterat
             if NEGATED_VERB.search(before) or not _ours(before, labels):
                 continue
             yield match.group(0), match.group(2), match.group(3), line.strip()
+
+
+def proposal_ref(url: str, gitlab_hosts: Collection[str] = frozenset()) -> tuple[str, str, str] | None:
+    """``(url, repo, number)`` for the PR or merge request at ``url``, else None.
+
+    For a url a forge answered with when the work opened it, so no wording is
+    read: a GitHub PR, or a merge request on :data:`GITLAB_HOST` or one of
+    ``gitlab_hosts``, the hosts :func:`opened_prs` would announce, with any
+    tail left out as it leaves it out.
+    """
+    text = str(url or "").strip()
+    match = PR_URL.match(text)
+    if match is None:
+        match = MR_URL.match(text)
+        hosts = {GITLAB_HOST, *(host.lower() for host in gitlab_hosts)}
+        if match is None or match.group(1).lower() not in hosts:
+            return None
+    return match.group(0), match.group(2), match.group(3)
+
+
+def evidence_line(text: str, url: str, number: str) -> str:
+    """The first line of ``text`` naming the PR at ``url``, by its url or its number, else ""."""
+    ref = re.compile((MR_NUMBER_REF if MR_URL.match(url) else PR_NUMBER_REF).format(number=re.escape(number)))
+    for line in str(text or "").splitlines():
+        if url in line or ref.search(line):
+            return line.strip()
+    return ""
 
 
 def _proposals(line: str, gitlab_hosts: Collection[str]) -> list[tuple[re.Match, tuple]]:

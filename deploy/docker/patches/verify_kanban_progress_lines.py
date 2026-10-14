@@ -152,6 +152,13 @@ check(
     "a progress note that costs a full LLM turn is the most expensive thing on the board",
 )
 check(
+    "pr_opened is claimed, wakes no one and has no formatter",
+    "pr_opened" in notifier.TERMINAL_KINDS
+    and "pr_opened" not in notifier._WAKE_KINDS
+    and "pr_opened" not in notifier._EVENT_FORMATTERS,
+    "the PR a worker opened reaches the thread only through silent_event, with no line and no turn",
+)
+check(
     "heartbeat has a formatter",
     callable(notifier._EVENT_FORMATTERS.get("heartbeat")),
     "a claimed kind with no formatter is silently skipped by format_event()",

@@ -799,6 +799,7 @@ var DefaultBuiltInPlugins = []string{
 	"tool_call_audit",
 	"incident_context",
 	"bootstrap_onboarding",
+	"pr_opened",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -1233,7 +1234,7 @@ var frontDoorToolsets = []string{
 // own README states the rule ("Do not relocate any part of this flow"), and the CRD page
 // carries the cost as a known limit.
 //
-// hermes_otel, tool_call_audit and incident_context are the three the image's own copy
+// hermes_otel, tool_call_audit, incident_context and pr_opened are the four the image's own copy
 // already enables; the overlay unions lists, so naming them again would be inert rather
 // than wrong, and leaving them out keeps the list to what the flag actually adds.
 var frontDoorPlugins = []string{
