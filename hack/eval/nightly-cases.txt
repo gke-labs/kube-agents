@@ -297,7 +297,13 @@
 # About 750 serial minutes at three repetitions, none of it on a lock.
 # Counted from the lists rather than the paragraphs above (the latest is one
 # behind): eighty-seven cases (261 units) here, of a one-hundred-and-one-case,
-# 303-unit matrix with the presubmit file's fourteen.
+# 303-unit matrix with the presubmit file's fourteen. The eleven on the
+# seeded-a shapes (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20) read
+# fixtures #2916 plants: they enter the nightly only after the postsubmit
+# reconcile that follows #2916's merge has applied the shapes to every pool
+# project, and the reconcile report and the scan that reads each role
+# healthy are cited here before the registering pull request's hold is
+# lifted (docs/designs/bench-case-format.md, Registration).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

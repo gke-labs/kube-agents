@@ -17,8 +17,8 @@
 # GKE API, not in a cluster, so fleet_resource_property has nothing to read;
 # the fleet's scheduled reconcile re-stamps it on every apply and owns its
 # integrity, and the prompt forbids the change.
-# The end objective grades the form of the date (a day, with an optional
-# time, offset and parenthetical), not its value: the fleet re-stamps the exclusion's window at every
+# The end objective grades the form of the date (a day first, then anything
+# but a hedge mark), not its value: the fleet re-stamps the exclusion's window at every
 # apply, so no fixed pattern can hold the day, and whether the day the agent
 # names is the real end is the judge's to check against the policy.
 id: upgrades-exclusion-end-date-named
@@ -102,9 +102,9 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d(?:[t ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?: ?(?:z|utc|[a-z]{3,5}|[+-]\d\d:?\d\d))?)?(?: \([^)\n;]*\))?; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d[^;\n?!]*; holds the automatic minor upgrade: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d(?:[t ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?: ?(?:z|utc|[a-z]{3,5}|[+-]\d\d:?\d\d))?)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d[^;\n?!]*;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-says-it-holds-the-automatic-upgrade
     role: objective
