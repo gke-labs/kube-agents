@@ -223,8 +223,9 @@ fixtures:
       SOP's master-behind check at all. Held between reconciles by a
       NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from REGULAR's
       own list and held when the running patch is one REGULAR does not carry,
-      so the held version can be absent from REGULAR; it is still offered at
-      the location, so upgrade check 3.1 branch (a) does not fire and the
+      so the held version can be absent from REGULAR; while another roster or
+      validMasterVersions still offers it (so on 2026-10-14; nothing in the
+      stack keeps it) upgrade check 3.1 branch (a) does not fire and the
       cluster carries branch (b) at major. See
       docs/designs/bench-fleet-catalog.md.
 

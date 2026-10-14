@@ -99,16 +99,16 @@ def _run(gcloud, query=None):
 
 
 class ChooseTest(unittest.TestCase):
-    def test_the_lagging_version_is_regulars_newest_previous_minor_patch(self):
+    def test_the_lag_target_is_regulars_newest_previous_minor_patch(self):
         chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, None)
-        self.assertEqual(chosen["lagging_version"], "1.35.8-gke.1626001", "REGULAR's own 1.35, not RAPID's 1.35.8-gke.1919000 that leads the all-channel list")
+        self.assertEqual(chosen["lag_target"], "1.35.8-gke.1626001", "REGULAR's own 1.35, not RAPID's 1.35.8-gke.1919000 that leads the all-channel list")
         self.assertEqual(chosen["pin"], "1.35.8-gke.1626001")
         self.assertFalse(chosen["held"])
 
-    def test_a_create_takes_the_lagging_version(self):
+    def test_a_create_takes_the_lag_target(self):
         chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, None)
         self.assertEqual(chosen["running_master_version"], "")
-        self.assertEqual(chosen["pin"], chosen["lagging_version"])
+        self.assertEqual(chosen["pin"], chosen["lag_target"])
 
     def test_a_running_patch_regular_does_not_carry_is_held(self):
         # The defect of #3025: seeded-b on RAPID's 1.34.12, REGULAR's 1.34 ends
@@ -116,7 +116,7 @@ class ChooseTest(unittest.TestCase):
         chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, RUNNING_RAPID)
         self.assertTrue(chosen["held"])
         self.assertEqual(chosen["pin"], RUNNING_RAPID)
-        self.assertEqual(chosen["lagging_version"], "1.35.8-gke.1626001", "the lag target is still computed and reported")
+        self.assertEqual(chosen["lag_target"], "1.35.8-gke.1626001", "the lag target is still computed and reported")
 
     def test_a_held_cluster_steps_to_a_newer_regular_patch_of_its_own_minor(self):
         # The one upgrade GKE allows an off-channel cluster: same minor. The
@@ -143,12 +143,30 @@ class ChooseTest(unittest.TestCase):
         self.assertEqual(chosen["pin"], "1.34.11-gke.1209000")
         self.assertGreater(pin.parse_version("1.34.11-gke.1209000"), pin.parse_version("1.34.9-gke.9999999"))
 
-    def test_no_previous_minor_in_regular_is_an_empty_pin_unless_held(self):
+    def test_no_previous_minor_in_regular_is_an_empty_pin_only_on_a_create(self):
         chosen = pin.choose(REGULAR_DEFAULT, ["1.36.4-gke.1391002"], None)
-        self.assertEqual(chosen["lagging_version"], "")
+        self.assertEqual(chosen["lag_target"], "")
         self.assertEqual(chosen["pin"], "", "the stack's precondition names the gap; the script does not guess")
         chosen = pin.choose(REGULAR_DEFAULT, ["1.36.4-gke.1391002"], RUNNING_RAPID)
-        self.assertEqual(chosen["pin"], RUNNING_RAPID, "a running cluster is held whatever REGULAR offers")
+        self.assertEqual(chosen["pin"], RUNNING_RAPID, "a held cluster keeps its version whatever REGULAR offers")
+        chosen = pin.choose(REGULAR_DEFAULT, ["1.36.4-gke.1391002", RUNNING_REGULAR], RUNNING_REGULAR)
+        self.assertFalse(chosen["held"])
+        self.assertEqual(chosen["pin"], RUNNING_REGULAR, "an on-channel cluster with nothing legal to move to keeps its version; the project still applies")
+
+    def test_a_cluster_two_minors_behind_the_target_moves_one_minor_per_apply(self):
+        # A hold that outlived a REGULAR roll exits onto an on-channel 1.34
+        # with the lag target at 1.36; GKE moves a control plane one minor per
+        # upgrade, so the pin is REGULAR's newest 1.35, not the 1.36 target.
+        default = "1.37.1-gke.1000000"
+        valid = [default, "1.36.4-gke.1495002", "1.35.8-gke.1626001", "1.35.8-gke.1439001", "1.34.13-gke.1000000"]
+        chosen = pin.choose(default, valid, "1.34.13-gke.1000000")
+        self.assertFalse(chosen["held"])
+        self.assertEqual(chosen["lag_target"], "1.36.4-gke.1495002")
+        self.assertEqual(chosen["pin"], "1.35.8-gke.1626001")
+        chosen = pin.choose(default, [default, "1.36.4-gke.1495002", "1.34.13-gke.1000000"], "1.34.13-gke.1000000")
+        self.assertEqual(chosen["pin"], "1.34.13-gke.1000000", "no REGULAR 1.35 to step to: stay, rather than ask for a two-minor jump")
+        chosen = pin.choose(default, valid, "1.35.8-gke.1439001")
+        self.assertEqual(chosen["pin"], "1.36.4-gke.1495002", "one minor behind the target is the ordinary bump")
 
     def test_a_version_that_does_not_parse_fails_rather_than_misorders(self):
         with self.assertRaises(pin.PinError):
@@ -173,7 +191,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(result["held"], "true")
         self.assertEqual(result["running_master_version"], RUNNING_RAPID)
         self.assertEqual(result["regular_default"], REGULAR_DEFAULT)
-        self.assertEqual(result["lagging_version"], "1.35.8-gke.1626001")
+        self.assertEqual(result["lag_target"], "1.35.8-gke.1626001")
         for key, value in result.items():
             self.assertIsInstance(value, str, "the external data source takes strings only: %s" % key)
 
@@ -240,7 +258,9 @@ class StackWiringTest(unittest.TestCase):
         self.assertIn('"${path.module}/%s"' % _MODULE_PATH.name, main_tf)
         self.assertNotIn(".valid_master_versions", main_tf, "the all-channel list is what put seeded-b on a RAPID patch")
         self.assertNotIn('data "google_container_engine_versions"', main_tf, "the provider has no per-channel valid list; the script reads REGULAR's")
-        block = re.search(r'data\s+"external"\s+"seeded_b_pin"\s*\{.*?query\s*=\s*\{(.*?)\}', main_tf, re.DOTALL)
+        # The map closes on a line of its own; a `}` inside a "${...}" string
+        # does not end it.
+        block = re.search(r'data\s+"external"\s+"seeded_b_pin"\s*\{.*?query\s*=\s*\{\n(.*?)\n\s*\}', main_tf, re.DOTALL)
         self.assertIsNotNone(block, "the data source carries a query map")
         query_keys = set(re.findall(r"^\s*(\w+)\s*=", block.group(1), re.MULTILINE))
         self.assertEqual(query_keys, set(pin.QUERY_KEYS), "the query carries exactly what the script reads")

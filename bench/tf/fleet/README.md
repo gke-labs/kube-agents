@@ -87,10 +87,12 @@ channel does not carry upgrade only within that minor, so a pin from a newer cha
 turns the next minor roll into a refused apply on every project. When `seeded-b` is
 found on such a patch, the script holds the pin instead, at the newest REGULAR patch of
 that minor above the running one if there is one, else at the running version, and the
-apply after that step does the minor bump. While a hold lasts the lag is two minors, not
-one: `hack/fleet-fixture-state.py` reads `version-laggard` as drifted until REGULAR ships
-a patch above the running one, and if REGULAR drops the minor first no pin can recover,
-so the cluster is upgraded by hand off the channel or replaced. `seeded-b`'s node pool is
+apply after that step does the minor bump, one minor per apply (GKE's control-plane
+rule), so a master the hold left two minors behind reaches the target over two applies.
+While a hold lasts the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
+`version-laggard` as drifted until REGULAR ships a patch above the running one, and if
+REGULAR drops the minor first no pin can recover, so the cluster is upgraded by hand off
+the channel or replaced. `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
 moves with the master; freezing it would leave the pool a minor (or, between minor
 rolls, a patch) behind the control plane, which is upgrade SOP 3.2 `pool-skew` and a
@@ -481,7 +483,9 @@ remaining absolute checks are clean by construction: every cluster now has a
 channel and a window, the fleet's minor spread is one (below the two-minor
 threshold — which is also why `seeded-b`'s master is re-pinned forward rather
 than frozen: a frozen master would fall two minors behind at the next REGULAR
-roll and trip 3.3 `fleet-spread`), 3.2 `pool-skew` is clean because
+roll and trip 3.3 `fleet-spread`; a hold is that frozen master, so while one
+lasts and the other clusters follow the default, 3.3 fires on `seeded-b`, a
+finding the background table does not carry and the hold's end clears), 3.2 `pool-skew` is clean because
 `seeded-b`'s pool is driven from the same derived pin as its control plane
 (any skew between them is the transient mid-reconcile lag 3.2 explicitly does
 not flag), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly

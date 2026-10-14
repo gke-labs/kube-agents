@@ -7,23 +7,27 @@ cluster that does not exist is a create) and prints the flat string map the
 data source takes:
 
   regular_default         REGULAR's default version at the zone
-  lagging_version         the newest patch REGULAR offers one minor behind it,
+  lag_target              the newest patch REGULAR offers one minor behind it,
                           "" when it offers none
   running_master_version  seeded-b's master, "" before the cluster exists
   held                    "true" when the running patch is one REGULAR does
                           not carry
   pin                     what min_master_version is set to this cycle
 
-The pin is lagging_version, except for a held cluster. GKE refuses a minor
-upgrade from a patch the enrolled channel does not carry ("control plane patch
-version and the desired control plane patch version have matching minor
-versions", release-channels#newer-patch-versions) and allows a same-minor one,
-so a held cluster is pinned to the newest REGULAR patch of its own minor above
-the running version when there is one, else to the running version, and the
-apply after that step does the minor bump from an on-channel patch. The
-provider only ever raises a master, so neither choice asks for a downgrade. A
-read that fails exits non-zero with the reason: it is the data source failing,
-never a create.
+The pin is lag_target on a create and for a cluster within one minor of it.
+Two GKE rules bend it. A control plane moves one minor per upgrade, so a
+cluster further behind (a hold that outlived a REGULAR roll) is pinned to the
+newest REGULAR patch of the next minor up and reaches the target over the
+applies that follow. And GKE refuses a minor upgrade from a patch the enrolled
+channel does not carry ("control plane patch version and the desired control
+plane patch version have matching minor versions",
+release-channels#newer-patch-versions) and allows a same-minor one, so a held
+cluster is pinned to the newest REGULAR patch of its own minor above the
+running version when there is one, else to the running version. When REGULAR
+offers nothing legal to ask for, a running cluster keeps its version, which the
+provider leaves alone. The provider only ever raises a master, so no choice asks
+for a downgrade. A read that fails exits non-zero with the reason: it is the
+data source failing, never a create.
 """
 
 import json
@@ -56,7 +60,7 @@ CLUSTER_MASTER_VERSION = "currentMasterVersion"
 NOT_FOUND_MARKER = "code=404"
 # The result keys, as main.tf reads them.
 OUT_REGULAR_DEFAULT = "regular_default"
-OUT_LAGGING_VERSION = "lagging_version"
+OUT_LAG_TARGET = "lag_target"
 OUT_RUNNING = "running_master_version"
 OUT_HELD = "held"
 OUT_PIN = "pin"
@@ -88,6 +92,10 @@ def _newest(versions):
     return max(versions, key=parse_version) if versions else ""
 
 
+def _newest_of_minor(versions, minor):
+    return _newest([version for version in versions if parse_version(version)[MINOR_INDEX] == minor])
+
+
 def choose(regular_default, regular_valid, running):
     """The pin, from REGULAR's default and valid list and seeded-b's running
     master version (None before the cluster exists)."""
@@ -95,15 +103,20 @@ def choose(regular_default, regular_valid, running):
     for version in valid:
         parse_version(version)
     lag_minor = parse_version(regular_default)[MINOR_INDEX] - 1
-    lagging = _newest([version for version in valid if parse_version(version)[MINOR_INDEX] == lag_minor])
+    lag_target = _newest_of_minor(valid, lag_minor)
     held = running is not None and running not in valid
-    if held:
+    if running is None:
+        chosen = lag_target
+    elif held:
         running_key = parse_version(running)
         step = _newest([version for version in valid if parse_version(version)[MINOR_INDEX] == running_key[MINOR_INDEX] and parse_version(version) > running_key])
         chosen = step or running
     else:
-        chosen = lagging
-    return {OUT_REGULAR_DEFAULT: regular_default, OUT_LAGGING_VERSION: lagging, OUT_RUNNING: running or "", OUT_HELD: held, OUT_PIN: chosen}
+        # One minor per apply: a cluster further behind the target takes the
+        # next minor REGULAR offers; nothing legal to ask for keeps it put.
+        target_minor = min(lag_minor, parse_version(running)[MINOR_INDEX] + 1)
+        chosen = _newest_of_minor(valid, target_minor) or running
+    return {OUT_REGULAR_DEFAULT: regular_default, OUT_LAG_TARGET: lag_target, OUT_RUNNING: running or "", OUT_HELD: held, OUT_PIN: chosen}
 
 
 def _gcloud(args):

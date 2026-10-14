@@ -78,7 +78,7 @@ provider "kubernetes" {
 # its lifecycle block says why.
 resource "terraform_data" "no_surge_pool_minor" {
   # `try` for the same reason `local.lagging_version` can be null: on a cycle
-  # where REGULAR offers no previous minor and seeded-b is not held, the
+  # where seeded-b is a create and REGULAR offers no previous minor, the
   # message the operator must see is seeded_b's precondition, not a `split`
   # error here.
   input = try(join(".", slice(split(".", local.lagging_version), 0, 2)), null)

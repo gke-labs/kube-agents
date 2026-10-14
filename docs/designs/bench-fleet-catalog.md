@@ -330,9 +330,10 @@ that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster criti
 (a) now fires only when a version is offered by no route at the location: not by the
 cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
 offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
-(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
-pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
-correctly.
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. A held pin is not
+re-drawn: each reconcile returns the running version until REGULAR ships a patch above it, so
+if every roster drops that version meanwhile, branch (a) fires on every project, and correctly,
+until REGULAR catches up or the cluster is replaced.
 
 A case touching `version-laggard` may assert that branch (a) is absent, and
 `upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it

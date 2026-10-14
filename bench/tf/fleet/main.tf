@@ -206,7 +206,9 @@ resource "google_project_iam_member" "pool_state_readers" {
 # CARRIES THE MASTER FORWARD: a new REGULAR patch inside the held minor moves
 # the master to it, and the day REGULAR's default rolls a minor the pin
 # recomputes and the next apply walks the master to the new
-# default-minus-one. Both are manual upgrades in GKE's sense, which the
+# default-minus-one, one minor per apply (GKE's control-plane rule), so a
+# master further behind reaches the target over the applies that follow.
+# Both are manual upgrades in GKE's sense, which the
 # exclusion does not gate; the channel rule above does. So when the running
 # patch is one REGULAR does not carry, the script HOLDS the pin instead of
 # asking for the refused bump: the newest REGULAR patch of the running minor
@@ -240,9 +242,10 @@ data "external" "seeded_b_pin" {
 }
 
 locals {
-  # "" from the script: REGULAR offers nothing one minor behind its default
-  # and seeded-b is not held. null here, so seeded_b's precondition names
-  # that instead of a create with an empty version.
+  # "" from the script: a create, and REGULAR offers nothing one minor behind
+  # its default (a running cluster always gets a pin, its own version at
+  # worst). null here, so seeded_b's precondition names that instead of a
+  # create with an empty version.
   lagging_version = data.external.seeded_b_pin.result.pin != "" ? data.external.seeded_b_pin.result.pin : null
 }
 
@@ -462,7 +465,10 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 # entry, so (b)/(c) cannot evaluate; the earlier UNSPECIFIED design hid the
 # defect from the audit it was planted for. Branch (a) -- version offered by
 # no channel and absent from validMasterVersions -- stays false while the
-# pin, drawn from REGULAR's own list, remains offered.
+# pin is offered somewhere at the location. A pin drawn from REGULAR's list
+# is; a held pin is the running version, which REGULAR's list does not
+# carry, so for it that is another roster or validMasterVersions: true on
+# 2026-10-14, kept by nothing in the stack.
 #
 # What holds the lag under a channel: the maintenance exclusion below, at
 # scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now
@@ -499,8 +505,8 @@ resource "google_container_cluster" "seeded_b" {
   maintenance_policy {
     # A window is required alongside an exclusion; 03:00 UTC keeps patch
     # work clear of eval hours. Minors are excluded below; patches within
-    # the lagged minor may roll, which keeps the defect exactly "one minor
-    # behind", never "unpatched".
+    # the lagged minor may roll, which keeps the defect "one minor behind"
+    # (two while a hold lasts), never "unpatched".
     daily_maintenance_window {
       start_time = "03:00"
     }
@@ -541,7 +547,7 @@ resource "google_container_cluster" "seeded_b" {
   lifecycle {
     precondition {
       condition     = local.lagging_version != null
-      error_message = "REGULAR offers no version one minor behind its default and seeded-b is not on a patch to hold; pick the lag manually this cycle."
+      error_message = "REGULAR offers no version one minor behind its default; pick seeded-b's create pin manually this cycle."
     }
   }
 }
