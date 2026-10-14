@@ -512,18 +512,33 @@ def test_read_descendants_handles_missing_tables(tmp_path: Path) -> None:
 
 
 def test_read_descendants_fails_to_none_when_tasks_table_is_missing(tmp_path: Path) -> None:
-    # When tasks table is missing from a SQLite database with children,
-    # read_descendants fails honestly to None rather than returning an empty list.
+    # When tasks table is missing from a SQLite database (even with no child rows,
+    # or an unrelated SQLite schema), read_descendants fails honestly to None.
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
-        conn.execute(
-            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
-        )
-        conn.execute(
-            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES ('t_child', 't_root', 100)"
-        )
+        conn.execute("CREATE TABLE other_table (id TEXT PRIMARY KEY)")
 
     descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants is None
+
+
+def test_read_descendants_filters_invalid_task_ids(tmp_path: Path, caplog) -> None:
+    # IDs containing newlines, whitespace or non-conforming characters are dropped
+    # and warned about to avoid log/argument pollution.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.execute("INSERT INTO tasks (id, status) VALUES ('t_root', 'running')")
+        conn.execute("INSERT INTO tasks (id, status) VALUES ('t_valid', 'in_progress')")
+        conn.execute("INSERT INTO tasks (id, status) VALUES ('bad id\nwith newline', 'in_progress')")
+        conn.execute("INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES ('t_valid', 't_root', 100)")
+        conn.execute("INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES ('bad id\nwith newline', 't_root', 101)")
+
+    with caplog.at_level("WARNING"):
+        descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == ["t_valid"]
+    assert "kanban board descendants ignored 1 non-conforming card id(s)" in caplog.text
 
 
 def test_read_descendants_truncates_and_warns(tmp_path: Path, caplog) -> None:

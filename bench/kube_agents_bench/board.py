@@ -398,6 +398,9 @@ def has_table(conn, name):
 
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
+    # tasks is hermes's core table: a store without it is not a board, so the
+    # read fails to None here rather than walking nothing and reporting [].
+    conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
     has_children = has_table(conn, "kanban_worker_children")
     queue = list(roots)
     seen = set(roots)
@@ -501,7 +504,19 @@ def read_descendants(
     descendants = payload.get("descendants")
     if not isinstance(descendants, list):
         return None
-    result = [str(d) for d in descendants if isinstance(d, str)]
+    valid = []
+    dropped = 0
+    for d in descendants:
+        if isinstance(d, str) and _TASK_ID_RE.match(d):
+            valid.append(d)
+        else:
+            dropped += 1
+    if dropped:
+        _log.warning(
+            "kanban board descendants ignored %d non-conforming card id(s)",
+            dropped,
+        )
+    result = valid
     if payload.get("truncated"):
         _log.warning(
             "kanban board descendants truncated at %d cards; some fan-out workers may still hold slots",
