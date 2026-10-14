@@ -166,8 +166,8 @@ func (g *Gateway) applyNotifyMark(rec *SessionRecord, next MarkState) bool {
 }
 
 // drawMark draws next on the ask message of rec.Tasks[i] over what was drawn
-// there before, records it on the entry, and tells a MarkObserver; it
-// reports whether anything changed. Best effort: a reaction that fails is
+// there before, records it on the entry, and tells a MarkObserver when the
+// entry is the conversation's latest ask; it reports whether anything changed. Best effort: a reaction that fails is
 // logged and the state still advances, so a reaction refused once (a missing
 // scope) is not retried on every event.
 func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
@@ -199,7 +199,10 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 		stored := next
 		ref.Mark = &stored
 	}
-	if observer, ok := g.adapter.(MarkObserver); ok {
+	// The observer holds the latest ask's state, so an older chain's late
+	// mark (a stopped task ending after a newer ask) redraws its own message
+	// without telling it.
+	if observer, ok := g.adapter.(MarkObserver); ok && i == rec.latestChainIndex() {
 		observer.MarkChanged(rec.Key, next.Ask, next.Settle)
 	}
 	return true

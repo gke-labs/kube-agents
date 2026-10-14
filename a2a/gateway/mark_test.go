@@ -129,3 +129,25 @@ func TestMarkNotifyIsDroppedWhileAChainRuns(t *testing.T) {
 		t.Errorf("reactions = %v, want %v (the latest chain's message)", got, want)
 	}
 }
+
+// TestMarkAnOlderChainsLateTerminalDoesNotTellTheObserver: an older chain's
+// terminal redraws its own ask, but the observer holds the latest ask's
+// state, so a newer ask blocked on the person keeps its session suspended.
+func TestMarkAnOlderChainsLateTerminalDoesNotTellTheObserver(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", Mark: &MarkState{Ask: "fleet"}},
+		{ID: "b", RootTaskID: "b", AskMessageID: "20.0", Mark: &MarkState{Ask: "upgrade", Settle: "blocked"}},
+	}}
+	g.applyTerminalMark(rec, "a", lib.StateCompleted)
+	if got, want := obs.reactionCalls(), []string{"slack:C1/10.0 -fleet@10.0"}; !slices.Equal(got, want) {
+		t.Errorf("reactions = %v, want %v", got, want)
+	}
+	if len(obs.changes) != 0 {
+		t.Errorf("the older chain's terminal told the observer %v", obs.changes)
+	}
+	g.applyTerminalMark(rec, "b", lib.StateCompleted)
+	if want := []string{"slack:C1/10.0 /"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("changes = %v, want %v (the latest ask's end)", obs.changes, want)
+	}
+}
