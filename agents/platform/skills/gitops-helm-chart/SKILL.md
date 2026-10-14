@@ -58,16 +58,15 @@ search the filesystem for credentials or a repository; a card that says
 "install and verify" is still answered by the stop.
 
 The first stop comes before anything else: the install must have a GitOps
-repository registered. The registry is the agent's `<agent>-gitops-state`
-ConfigMap in the agent's namespace (`platform-agent-gitops-state` in
-`kubeagents-system` on a default install; the gateway also carries it as
-`$GITOPS_STATE_CONFIGMAP`, which your shell does not). One read answers it:
+repository registered. The registry is mounted in your shell at
+`/etc/gitops/managed_repos`, one file, the same one `SOUL.md` names. One read
+answers it:
 
 ```bash
-kubectl get configmap platform-agent-gitops-state -n kubeagents-system -o jsonpath='{.data.managed_repos}'
+cat /etc/gitops/managed_repos
 ```
 
-Empty output, an empty list, or a ConfigMap with no data is the answer:
+A missing file, an empty file or an empty list is the answer:
 nothing is registered. Do not look for a repository anywhere else (the
 filesystem, `git`, Cloud Source Repositories, the source code). Stop with "This install has no
 registered GitOps repository, so `<chart>` cannot be declared for a
