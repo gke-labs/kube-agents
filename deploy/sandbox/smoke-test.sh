@@ -237,6 +237,12 @@ done
 check "every file in the staged trees is root's and writable by nobody else" "all root, go-w" \
   "$(docker exec "$NAME" sh -c 'out=$(find "$@" \( ! -user root -o -perm /022 \) 2>&1) &&
     [ -z "$out" ] && echo "all root, go-w" || echo "$out"' _ "${staged_trees[@]}" 2>&1)"
+# A root exec (what `kubectl exec` is) that imports from the reference tree
+# leaves no bytecode cache there, or the read-only copies stop matching it and
+# sandbox_tree_matches_image reads the cache as an edit (#3047).
+check "a root import from /opt/defaults/scripts writes no __pycache__" "no cache" \
+  "$(docker exec "$NAME" sh -c 'python3 -c "import sys; sys.path.insert(0, \"/opt/defaults/scripts\"); import workspace_paths" &&
+    out=$(find /opt/defaults -name __pycache__ 2>&1) && [ -z "$out" ] && echo "no cache" || echo "$out"' 2>&1)"
 
 echo
 echo "== 3. who may log in =="
