@@ -16,8 +16,8 @@ Installed around ``ToolCallGuardrailController.after_call`` by
 ``apply_permission_refusal_stop.py``: the stock method runs first, so its
 failure counters and loop caps see every call, and :func:`observe_refusal`
 then decides whether a refusal overrides its decision. It reads what the
-credential-proxy shim printed into the tool result, never the command's shell
-text: the policy that refused the command resolved its verb once
+credential-proxy shim printed into the tool result, and the command's own text
+only to tell a write chained before an exit-0 read from a read that echoed one: the policy that refused the command resolved its verb once
 (``command_policy.evaluate``), the proxy returns it, and the shim prints it
 beside the rule (``credential_proxy_client.py``)::
 
@@ -161,6 +161,9 @@ _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
 # literal carries, for reading each kubectl command's own argv out of a call's text.
 _SEPARATOR_RE = re.compile(r"\|\||&&|[;|&\n]")
 _LIST_PUNCT_RE = re.compile(r"[\[\],'\"()]")
+# A bracketed list literal, read before the separator split so one broken across
+# lines (a formatter's argv) is one argv.
+_BRACKET_LIST_RE = re.compile(r"\[[^\[\]]*\]")
 
 WARN_MESSAGE = (
     "Permission refused. This is a boundary, not an error to work around: the change is "
@@ -217,6 +220,7 @@ def _kubectl_verbs(command: str):
     except ImportError:
         return None
     verbs = []
+    command = _BRACKET_LIST_RE.sub(lambda m: m.group(0).replace("\n", " "), command)
     for piece in _SEPARATOR_RE.split(command):
         first = _KUBECTL_WORD_RE.search(piece)
         if first is None:

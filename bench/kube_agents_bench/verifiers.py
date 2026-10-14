@@ -1664,8 +1664,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     check ``status="error"``, since the read cannot be ordered.
     ``required_patterns`` still read every command. No result matching the
     pattern leaves nothing after it, which passes the forbidden set and says
-    so in the reason; no tagged terminal or ``execute_code`` call at all is ``status="error"``,
-    and so is a capture with gaps (``worker_capture_gaps``) that found no
+    so in the reason; no tagged call at all, or a tagged code-tool call whose
+    argument the pod withheld, is ``status="error"`` (a worker whose tagged
+    calls are all MCP or board calls, with an empty card log, grades as zero
+    commands), and so is a capture with gaps (``worker_capture_gaps``) that found no
     forbidden command, a required one missing or not: the retry, or the
     required command, may be in the part it did not read.
 
@@ -1677,8 +1679,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     appears as typed; and a result is clipped in the pod at
     ``worker_trajectory.MAX_RESULT_CHARS``, so a refusal chained behind a
     long output in one call can lose the text ``after_result_pattern`` looks
-    for. Fails closed like its siblings -- a run with no captured worker
-    commands is ``status="error"``, not a pass.
+    for. Fails closed like its siblings -- a run whose worker commands could
+    not be read is ``status="error"``, not a pass (above: what counts as read).
     """
 
     type: Literal["worker_commands"]

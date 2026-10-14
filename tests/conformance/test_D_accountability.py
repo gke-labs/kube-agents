@@ -117,18 +117,20 @@ class D1Attributable(unittest.TestCase):
     def test_D1_the_refusal_log_hint_names_no_caller_supplied_value(self) -> None:
         """KNOWN VIOLATION. A short gcloud path puts a positional in the log.
 
-        The refusal caps the logged command path at three words and the code
-        comment says this is "to exclude positionals". That holds for a
+        The refusal caps the logged command path at three words (a fourth
+        when it is a write verb that sits that deep). That holds for a
         three-word path -- `container clusters delete prod` logs
         `container.clusters.delete` -- and not for a two-word one:
         `gcloud projects delete acme-prod` logs
         `projects.delete.acme-prod`, and the third word is the caller's.
 
         Low severity. The value is sanitised and length-capped before it is
-        written, so it cannot forge a record, and it never reaches the caller's
-        refusal body -- A1's bound is intact. It is filed because the comment
+        written, so it cannot forge a record. The same words go to the caller
+        in the refusal body's `verb` field (the shim prints them as
+        `policy verb:`), so this is the one place A1's bound is not met;
+        the message and rule id stay fixed. It is filed because the cap
         asserts a property the code does not have, which is how the next person
-        widens the cap without checking.
+        widens it without checking.
 
         The fix is to cap at the length of the matched command path rather than
         at a constant, or to log only the words that matched an allowlist

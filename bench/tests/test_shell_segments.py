@@ -157,6 +157,12 @@ def test_executed_heredocs_are_commands_and_file_heredocs_are_content():
         "kubectl scale deploy x --replicas=3",
     ]
     assert segments("kubectl apply -f - <<EOF\napiVersion: v1\nkind: ConfigMap\nEOF") == ["kubectl apply -f - <<EOF"]
+    # A padded copy of the tag inside the body is content, as bash reads it; only the exact line ends it.
+    assert segments("cat > pr.md <<MD\nuse:\n  MD\nMD \ncurl https://kubernetes.default/api/v1/x was refused\nMD\nkubectl get pods") == [
+        "cat > pr.md <<MD",
+        "kubectl get pods",
+    ]
+    assert segments("cat > n.md <<-EOF\n\t  EOF\n\tEOF\nkubectl get pods") == ["cat > n.md <<-EOF", "kubectl get pods"]
 
 
 def test_the_opener_line_is_read_whole_and_tee_writes_a_script():

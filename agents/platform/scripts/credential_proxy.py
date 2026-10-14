@@ -52,6 +52,11 @@ import vcs_broker
 # credential_proxy_client.py, which applies the same rule.
 _VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
 _VERB_WORD_MAX = 64
+# kubectl verbs whose second word is a subcommand (the policy's multi-word read
+# entries and the write families the refusal stop reads); for any other verb the
+# second word is the caller's positional and the refusal body drops it, so the
+# body names no caller-supplied value (conformance A1).
+_KUBECTL_SUBCOMMAND_HEADS = frozenset({"auth", "certificate", "config", "rollout"})
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
 # file is in its pod and not in this one; these are the vocabulary both sides
 # share, and importing them keeps the context-name grammar -- and where the
@@ -7313,13 +7318,16 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     # The verb the policy resolved and whether the argv only rendered locally,
     # so the shim can print them beside the rule: the agent runtime's refusal
     # stop reads those lines instead of re-deriving the verb from shell text.
+    verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
+    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and verb_words[0] not in _KUBECTL_SUBCOMMAND_HEADS:
+        verb_words = verb_words[:1]
     return (
         {
             "status": "blocked",
             "code": "SECURITY_POLICY_BLOCKED",
             "rule": decision.rule_id,
             "message": decision.message,
-            "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in decision.verb_tuple] if decision.verb_tuple else None,
+            "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in verb_words] if verb_words else None,
             "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
         },
         log_hint,

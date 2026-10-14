@@ -1295,7 +1295,12 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         def fake_open(req, *args, **kwargs):
             raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body))
 
-        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+        with patch.dict("os.environ", environ, clear=False), patch.object(credential_proxy_client, "open_broker_request", fake_open):
             with patch("sys.stderr", new=stderr):
                 credential_proxy_client.execute("http://proxy", ["kubectl", "scale", "deploy/x\npolicy render: local"])
         err = stderr.getvalue()

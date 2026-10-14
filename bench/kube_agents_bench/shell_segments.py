@@ -51,7 +51,8 @@ directives are filled from later arguments, aliases and functions, a script
 written in one call and run in a later one, and anything after a quote that
 never closes. A content heredoc whose opener line also carries an interpreter
 joined by ``&&`` or ``;`` is read as that interpreter's body. The walk is
-linear in the call's length.
+linear in the call's length and stops eight interpreter levels deep (nested
+``eval``, ``$(...)``, ``sh -c``), below which nothing is emitted.
 """
 
 from __future__ import annotations
@@ -611,7 +612,7 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[list[str], str, b
                 line = text[pos:] if nl < 0 else text[pos:nl]
                 pos = n if nl < 0 else nl + 1
                 candidate = line.lstrip("\t") if strip_tabs else line
-                if candidate.strip() == tag:
+                if candidate == tag:  # bash: the line is the tag, tabs stripped only by <<-
                     break
                 body_lines.append(candidate if strip_tabs else line)
             heredocs.append((opener_pieces, "\n".join(body_lines), expands))

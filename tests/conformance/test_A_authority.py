@@ -65,9 +65,11 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
                     decision.allowed,
                     f"{argv} was allowed; this corpus is meant to be entirely refusals",
                 )
-                # The caller receives rule_id and message. verb_tuple and
-                # offending_flag are log-side and are covered by
-                # test_D_accountability.py.
+                # The caller receives rule_id and message, and for a kubectl
+                # refusal the verb words bounded to kubectl's own grammar
+                # (credential_proxy._KUBECTL_SUBCOMMAND_HEADS); a gcloud
+                # refusal's body carries the surface words the log does, which
+                # D1 covers. offending_flag is log-side.
                 self.assertNotIn(MARKER, decision.rule_id)
                 self.assertNotIn(MARKER, decision.message)
 

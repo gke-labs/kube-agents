@@ -2244,14 +2244,18 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         status, body = self.post({"argv": ["kubectl", "scale", "deploy/x", "--replicas=3"], "cwd": "/tmp"})
         self.assertEqual(403, status)
         self.assertEqual("kubernetes.read-only", body["rule"])
-        self.assertEqual(["scale", "deploy/x"], body["verb"])
+        self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
         self.assertFalse(body["local_render"])
         status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
         self.assertEqual(403, status)
-        self.assertEqual(["create", "deployment"], body["verb"])
+        self.assertEqual(["create"], body["verb"])
         self.assertTrue(body["local_render"])
-        status, body = self.post({"argv": ["kubectl", "scale", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
-        self.assertEqual(["scale", "deploy/x_policy_render:_local"], body["verb"])
+        status, body = self.post({"argv": ["kubectl", "rollout", "restart\npolicy render: local", "deploy/x"], "cwd": "/tmp"})
+        self.assertEqual(["rollout", "restart_policy_render:_local"], body["verb"])
+        status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
+        self.assertEqual(["certificate", "approve"], body["verb"])
+        # Every policy verb that lists a subcommand keeps it; the set is the policy's plus the write families.
+        self.assertTrue({v[0] for v in credential_proxy.command_policy.KUBECTL_READ_VERBS if len(v) > 1} <= credential_proxy._KUBECTL_SUBCOMMAND_HEADS)
 
     def test_a_config_flag_comes_back_as_a_policy_block(self):
         # Refused before the lease check, and with its own rule id: an agent
