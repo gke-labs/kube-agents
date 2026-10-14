@@ -69,8 +69,8 @@ Under ``spec.mode: next`` a card reaches the thread through the kanban
 notifier's chat.notify stand-in (``kanban_chat_notify``), which has no Slack
 client. The same moments go out as ``kube-agents.chat/v1`` messages
 (``agents/platform/scripts/chat_message.py``): the PR card once per thread and
-url, and the question with the ``update`` key ``question-<card>`` (``question-<card>-2``
-and on when the card asks again), whose choices
+url, and the question with the ``update`` key ``question-<card>-<blocked event id>``, so a
+card that asks again, before or after a restart, posts a new question, whose choices
 reply with the option and the card, as a click does here. Its settle is the
 same key with the choices gone; reading a typed answer back from the thread
 needs a Slack client, so the question settles without the answered line.
@@ -178,8 +178,8 @@ _questions: OrderedDict[tuple, tuple] = OrderedDict()
 _unsettled: OrderedDict[tuple, tuple] = OrderedDict()
 #: ``(channel, ts)`` of a question whose card resumed but whose settle failed: its retry still reads the answer.
 _resumed: OrderedDict[tuple, None] = OrderedDict()
-#: ``(card,) -> questions it has posted over chat.notify``, which numbers each one's update key, so a
-#: card that asks again posts a new question rather than editing its earlier one up the thread.
+#: ``(card,) -> questions it has posted over chat.notify``, which names a question's update key when
+#: its ``blocked`` event id is unknown (0); a known id names it otherwise, and survives a restart.
 _question_keys: OrderedDict[tuple, int] = OrderedDict()
 #: ``(channel, thread, reply ts)`` of a typed reply already shown as a question's answer, never credited twice.
 _credited: OrderedDict[tuple, None] = OrderedDict()
@@ -335,8 +335,7 @@ async def _needs_you_chat(adapter: Any, sub: dict, reason: str, event_id: int) -
         return True
     earlier = _questions.get(key)
     count = _question_keys.get((key[0],), 0) + 1
-    update = (_chat.QUESTION_UPDATE.format(card=key[0]) if count == 1
-              else _chat.QUESTION_UPDATE_NEXT.format(card=key[0], number=count))
+    update = _chat.QUESTION_UPDATE.format(card=key[0], event=int(event_id or 0) or f"n{count}")
     text = f"{reason.strip()}\n{QUESTION_CARD_NOTE.format(card=key[0])}" if key[0] else reason.strip()
     if not await _send_chat(adapter, sub, text, chat, update):
         return False

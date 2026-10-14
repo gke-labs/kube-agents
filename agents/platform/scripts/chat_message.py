@@ -77,14 +77,12 @@ ASK_BY_REACTION = {
 #: A needs-you choice's reply: the label, then the card it answers, as a click
 #: posts it today (``slack_ux_clicks.CARD_NOTE`` after a blank line).
 NEEDS_YOU_REPLY = "{label}\n\n(Clicked on the question from card {card}.)"
-#: The ``update`` keys a card's notifies carry: the thread's plan and a card's
-#: question, each later one in the same thread or card numbered after the
-#: first, and the alert the event watcher posted, which the triage edits
-#: (``chat_notify.alert_update_key``, one per alert).
-PLAN_UPDATE = "plan"
-PLAN_UPDATE_NEXT = "plan-{number}"
-QUESTION_UPDATE = "question-{card}"
-QUESTION_UPDATE_NEXT = "question-{card}-{number}"
+#: The ``update`` keys a card's notifies carry, each named by something durable
+#: so a key never repeats after a restart: a plan by its first card, a question
+#: by its card and the ``blocked`` event that asked it, and the alert the event
+#: watcher posted by its event session (``chat_notify.alert_update_key``).
+PLAN_UPDATE = "plan-{card}"
+QUESTION_UPDATE = "question-{card}-{event}"
 #: Plan item statuses whose title shows the note, so the note rides beside it.
 NOTE_STATUSES = frozenset({_status.TASK_RUNNING, _status.TASK_ERROR})
 #: Today's suffix on the recommended incident option's label; on next the

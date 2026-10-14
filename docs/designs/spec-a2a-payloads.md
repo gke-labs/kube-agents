@@ -717,10 +717,14 @@ the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the
 terminal keeps its default. The kanban notifier, in the Hermes gateway process where the
 board is, sends a card's work through `a2a notify --chat-file <object> --update <key>`
-with these keys: `plan` for a thread's plan, `question-<card>` for a card's question and
-its answered form (each later one in the same thread or card numbered after it, `plan-2`,
-`question-<card>-2`), and `alert-<event session>` for an incident's triage, which edits the
-event watcher's alert because the watcher posts it under that key. The alert is a
+with these keys: `plan-<first card>` for a thread's plan, `question-<card>-<blocked event>`
+for a card's question and its answered form, and `alert-<event session>` for an incident's
+triage, which edits the
+event watcher's alert because the watcher posts it under that key. Each key is named by
+something that outlives the notifier process, so a plan or question opened after a restart
+never takes an earlier one's key and edits its message, which the gateway still holds. The
+shared cases spell only the stem (`plan`, `question-<card>`); their runner matches a key
+that adds a `-` suffix to it. The alert is a
 home-channel post and its triage a reply in its thread, so the edit asks the gateway to
 keep `update` keys for a home-channel thread as it does for a conversation. The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`

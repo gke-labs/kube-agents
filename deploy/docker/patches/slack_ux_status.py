@@ -118,8 +118,8 @@ thread through the kanban notifier's chat.notify stand-in
 (``kanban_chat_notify``), which has no Slack client. The plan is the same
 state machine: :func:`_render` sends it as a ``kube-agents.chat/v1`` plan
 (``agents/platform/scripts/chat_message.py``) with an ``update`` key, so it is
-edited in place as here: ``plan`` for the thread's first plan in this
-process, ``plan-2`` and on for the ones after it. The message carries the
+edited in place as here, under ``plan-<the plan's first card>``, which a later
+plan in the thread, or one opened after a restart, does not share. The message carries the
 ask's reaction state as ``mark`` when it changes: the ask's kind (recorded on
 the conversation's route by the hermes-bridge) while a card runs, ⏸️ beside
 it while one waits on the user, and ``done`` or ``failed`` once all have
@@ -304,9 +304,7 @@ _lapsed: OrderedDict[tuple, list] = OrderedDict()
 _seen: OrderedDict[tuple, bool] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
-#: ``(channel, thread) -> how many plans the thread has posted over chat.notify``,
-#: which numbers each plan's ``update`` key (:func:`_render_chat`).
-_plan_keys: OrderedDict[tuple, int] = OrderedDict()
+
 #: ``(channel, thread) -> the mark the thread's plans last carried over chat.notify``. The
 #: mark is the thread's ask's state, so it is the thread's, not one plan's (:func:`_render_chat`).
 _marks_sent: OrderedDict[tuple, dict] = OrderedDict()
@@ -513,13 +511,17 @@ def _drawable(adapter: Any) -> bool:
     return hasattr(adapter, "_get_client") or _chat_route(adapter)
 
 
-def _plan_key(key: tuple) -> str:
-    """The ``update`` key of the thread's next plan: ``plan``, then ``plan-2`` and on."""
-    count = _plan_keys.get(key, 0) + 1
-    _remember(_plan_keys, key, count, SESSIONS_MAX)
+def _plan_key(key: tuple, plan: _Plan) -> str:
+    """The ``update`` key of a new plan: ``plan-<its first card>``.
+
+    Named by a card rather than counted in this process, so a plan opened after a
+    restart, or after the thread's count was evicted, cannot take an earlier plan's
+    key and edit that message, which the gateway still holds, down to its own rows.
+    """
     # A new plan is a new ask's: its first mark goes out even when it equals the last ask's.
     _marks_sent.pop(key, None)
-    return _chat.PLAN_UPDATE if count == 1 else _chat.PLAN_UPDATE_NEXT.format(number=count)
+    first = next(iter(plan.rows), "") or next(iter(plan.pending), "")
+    return _chat.PLAN_UPDATE.format(card=first)
 
 
 def _thread_rows(key: tuple, plan: _Plan) -> list:
@@ -559,7 +561,7 @@ async def _render_chat(adapter: Any, key: tuple, plan: _Plan, title: str | None,
     """:func:`_render` over chat.notify: the plan as a chat message, edited in place by its key."""
     chat_id, thread_ts = key
     chat = _chat.plan_message(title or _alert_title(key) or None, rows)
-    update = plan.ts or _plan_key(key)  # before the mark: a new plan's key starts the thread's mark memory over
+    update = plan.ts or _plan_key(key, plan)  # before the mark: a new plan's key starts the thread's mark memory over
     mark = _thread_mark(adapter, key, plan)
     if mark is not None:
         chat["mark"] = mark

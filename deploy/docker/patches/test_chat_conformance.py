@@ -82,7 +82,7 @@ def _sub(card: str, thread: str = THREAD) -> dict:
 
 
 def _reset_status() -> None:
-    for store in (slack_ux_status._plans, slack_ux_status._lapsed, slack_ux_status._seen, slack_ux_status._plan_keys,
+    for store in (slack_ux_status._plans, slack_ux_status._lapsed, slack_ux_status._seen,
                   slack_ux_status._marks_sent, slack_ux_status._titles, slack_ux_status._alert_titles):
         store.clear()
 
@@ -95,6 +95,23 @@ def _row(spec: dict) -> slack_ux_status._Row:
     row.result = spec.get("result") or ""
     row.status = spec["status"]
     return row
+
+
+def _as_case(outs: list, expected: list) -> list:
+    """``outs`` with each ``update`` key spelled as the case spells it.
+
+    The emitter names a key by something that outlives the process (``plan-<first card>``,
+    ``question-<card>-<event>``) so a restart never reuses one; the cases name only the
+    stem (``plan``, ``question-<card>``). A key that is the stem plus a ``-`` suffix
+    matches it; any other key is left as it is, and fails the comparison.
+    """
+    spelled = []
+    for out, want in zip(outs, expected):
+        stem = (want or {}).get("update", "")
+        if out and stem and out.get("update", "").startswith(stem + "-"):
+            out = dict(out, update=stem)
+        spelled.append(out)
+    return spelled + outs[len(expected):]
 
 
 def _out(chat: dict | None, carrier: str, update: str = "") -> dict | None:
@@ -147,7 +164,8 @@ class SharedCasesTest(unittest.TestCase):
             return self.run_card_events(given)
         if "rows" in given:
             rows = [_row(r) for r in given["rows"]]
-            return [_out(chat_message.plan_message(given.get("title"), rows), NOTIFY, chat_message.PLAN_UPDATE)]
+            update = chat_message.PLAN_UPDATE.format(card=rows[0].task_id)
+            return [_out(chat_message.plan_message(given.get("title"), rows), NOTIFY, update)]
         return self.run_marks(given, case["expected"])
 
     def run_question(self, given: dict) -> list:
@@ -243,7 +261,7 @@ class SharedCasesTest(unittest.TestCase):
         self.assertGreater(len(cases), 0)
         for case in cases:
             with self.subTest(case=case["name"]):
-                self.assertEqual(self.run_case(case), case["expected"])
+                self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
 
 
 class ChatRoutePlanTest(unittest.TestCase):
@@ -264,7 +282,7 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "1.33.4 = default", "seeded-a")
 
         asyncio.run(run())
-        self.assertEqual([s["update"] for s in adapter.sent], ["plan", "plan", "plan"])
+        self.assertEqual([s["update"] for s in adapter.sent], ["plan-t_a", "plan-t_a", "plan-t_a"])
         self.assertEqual({s["thread"] for s in adapter.sent}, {"slack:C1/1.2"})
         first, second, last = (s["chat"] for s in adapter.sent)
         self.assertEqual(first["mark"], {"ask": "fleet"})
@@ -284,7 +302,20 @@ class ChatRoutePlanTest(unittest.TestCase):
             await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "done", "two")
 
         asyncio.run(run())
-        self.assertEqual([s["update"] for s in adapter.sent], ["plan", "plan-2"])
+        self.assertEqual([s["update"] for s in adapter.sent], ["plan-t_a", "plan-t_b"])
+
+    def test_a_plan_after_a_restart_does_not_take_an_earlier_plans_key(self):
+        # The notifier restarted between two asks in one thread: its memory is gone,
+        # and the second plan must still not edit the first plan's message.
+        adapter = _ChatAdapter()
+
+        async def run(sub):
+            await slack_ux_status.settle_row(adapter, sub, "completed", "done", "one")
+
+        asyncio.run(run(dict(self.SUB)))
+        _reset_status()
+        asyncio.run(run(dict(self.SUB, task_id="t_b")))
+        self.assertEqual([s["update"] for s in adapter.sent], ["plan-t_a", "plan-t_b"])
 
     def test_the_mark_reads_every_plan_in_the_thread(self):
         # A card that gave up sets its plan aside; the next card runs on plan-2.
@@ -302,8 +333,8 @@ class ChatRoutePlanTest(unittest.TestCase):
 
         asyncio.run(run())
         marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent if "mark" in s["chat"]]
-        self.assertEqual(marks, [("plan", {"ask": "fleet"}), ("plan", {"settle": "failed"}), ("plan-2", {"ask": "fleet"}),
-                                 ("plan-2", {"settle": "done"})])
+        self.assertEqual(marks, [("plan-t_a", {"ask": "fleet"}), ("plan-t_a", {"settle": "failed"}),
+                                 ("plan-t_b", {"ask": "fleet"}), ("plan-t_b", {"settle": "done"})])
 
     def test_an_earlier_asks_failed_card_does_not_fail_a_later_ask(self):
         # A gave up and was never retried; the next ask's card succeeds, and its
@@ -331,7 +362,7 @@ class ChatRoutePlanTest(unittest.TestCase):
 
         asyncio.run(run())
         marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent]
-        self.assertEqual(marks, [("plan", {"settle": "done"}), ("plan-2", {"settle": "done"})])
+        self.assertEqual(marks, [("plan-t_a", {"settle": "done"}), ("plan-t_b", {"settle": "done"})])
 
     def test_with_no_recorded_ask_a_lifted_pause_still_goes(self):
         adapter = _ConversationAdapter(ask="")

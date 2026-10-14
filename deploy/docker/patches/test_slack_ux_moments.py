@@ -197,7 +197,24 @@ class PrOpenedTest(unittest.TestCase):
         self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 1)))
         _run(runtime.settle_question(adapter, SUB, "unblocked", 2))
         self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 3)))
-        self.assertEqual(sent, [("question-t_e0c1", True), ("question-t_e0c1", False), ("question-t_e0c1-2", True)])
+        self.assertEqual(sent, [("question-t_e0c1-1", True), ("question-t_e0c1-1", False), ("question-t_e0c1-3", True)])
+
+    def test_under_next_a_question_after_a_restart_takes_a_new_key(self):
+        # Named by its blocked event, the key does not repeat once the count is gone.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append(update)
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled, runtime._question_keys):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 7)))
+        for store in (runtime._questions, runtime._unsettled, runtime._question_keys):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 9)))
+        self.assertEqual(sent, ["question-t_e0c1-7", "question-t_e0c1-9"])
 
     def test_the_pr_sits_beside_a_green_bar_under_its_headline(self):
         adapter = _Adapter()
