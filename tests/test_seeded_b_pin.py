@@ -212,6 +212,19 @@ class MainTest(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("REGULAR", err)
 
+    def test_a_regular_entry_without_valid_versions_fails_rather_than_holding(self):
+        # An empty list would make every running patch "not carried" and hold
+        # the pin for good with exit 0; the document is wrong, so the read fails.
+        for missing in (None, []):
+            config = _server_config(regular_valid=missing or [])
+            if missing is None:
+                del [entry for entry in config["channels"] if entry["channel"] == "REGULAR"][0]["validVersions"]
+            gcloud = _Gcloud(server_config=config, describe={"currentMasterVersion": RUNNING_REGULAR})
+            code, out, err = _run(gcloud)
+            self.assertNotEqual(code, 0, repr(missing))
+            self.assertEqual(out, "")
+            self.assertIn("validVersions", err)
+
     def test_a_query_missing_a_key_fails(self):
         gcloud = _Gcloud(describe_error=NOT_FOUND)
         code, out, err = _run(gcloud, query={"project": PROJECT, "zone": ZONE})

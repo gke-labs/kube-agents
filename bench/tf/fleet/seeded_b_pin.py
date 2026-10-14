@@ -133,7 +133,13 @@ def read_server_config(project, zone):
     doc = _document(command, result.stdout)
     for entry in doc.get(SERVER_CONFIG_CHANNELS) or []:
         if isinstance(entry, dict) and entry.get(CHANNEL_NAME) == CHANNEL:
-            return str(entry.get(CHANNEL_DEFAULT) or ""), [str(version) for version in entry.get(CHANNEL_VALID) or []]
+            valid = [str(version) for version in entry.get(CHANNEL_VALID) or []]
+            if not valid:
+                # An empty list would read as "running patch not carried" and
+                # hold the pin for good, quietly; a document shaped like that
+                # is a failed read.
+                raise PinError("%s lists no %s for %s" % (command, CHANNEL_VALID, CHANNEL))
+            return str(entry.get(CHANNEL_DEFAULT) or ""), valid
     raise PinError("%s lists no %s channel" % (command, CHANNEL))
 
 
