@@ -77,9 +77,10 @@ provider "kubernetes" {
 # this value changes and left alone when only the patch does; the comment on
 # its lifecycle block says why.
 resource "terraform_data" "no_surge_pool_minor" {
-  # `try` for the same reason `local.lagging_version` carries one: on a cycle
-  # where REGULAR offers no previous minor the list is empty, and the message
-  # the operator must see is seeded_b's precondition, not a `split` error here.
+  # `try` for the same reason `local.lagging_version` can be null: on a cycle
+  # where REGULAR offers no previous minor and no seeded-b runs to hold, the
+  # message the operator must see is seeded_b's precondition, not a `split`
+  # error here.
   input = try(join(".", slice(split(".", local.lagging_version), 0, 2)), null)
 }
 

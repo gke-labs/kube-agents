@@ -80,7 +80,14 @@ provider answers a raised value with an operator-initiated `clusters.update` car
 down). That is what keeps the pin from rotting: a new patch inside the held minor moves
 the master onto it, and the day the REGULAR default rolls a minor, the derived pin
 recomputes and the next apply walks the master to the new default-minus-one, so the lag
-stays exactly one minor without anyone touching the file. `seeded-b`'s node pool is
+stays exactly one minor without anyone touching the file. The pin is drawn from
+REGULAR's own version list by `seeded_b_pin.py` (the stack's `external` data source),
+never from the provider's all-channel list: GKE lets a cluster running a patch its
+channel does not carry upgrade only within that minor, so a pin from a newer channel
+turns the next minor roll into a refused apply on every project (#3025). When
+`seeded-b` is found on such a patch, the script holds the pin instead, at the newest
+REGULAR patch of that minor above the running one if there is one, else at the running
+version, and the apply after that step does the minor bump. `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
 moves with the master; freezing it would leave the pool a minor (or, between minor
 rolls, a patch) behind the control plane, which is upgrade SOP 3.2 `pool-skew` and a
@@ -104,8 +111,9 @@ Second, it rolls the exclusion. The lag is held between reconciles by a
 `var.exclusion_window_hours`) is re-stamped from now on every apply — the plan always
 shows that one in-place update, by design; it is the window rolling forward, not
 drift. The exclusion gates GKE's _automatic_ upgrades only; manually initiated upgrades
-(including the provider's) begin immediately and ignore maintenance policy, which is
-why the two mechanisms do not fight. The window has a hard ceiling the API enforces: an
+(including the provider's) begin immediately and ignore maintenance policy. What gates
+those is GKE's channel rule above, which is why the pin stays inside REGULAR's own
+list. The window has a hard ceiling the API enforces: an
 exclusion cannot outlive the held minor's end of life (observed live: 1.34 capped at
 2027-01-25), so as EOL approaches, applies start failing with exactly that 400 — the
 built-in warning to shorten the window variable or plan the re-lag. The exclusion therefore dies in one of
@@ -230,9 +238,9 @@ finding, and churning eval clusters would randomize the audit run to run. The la
 value `seeded` is reserved for the clusters in this stack; labeling any other cluster
 with it changes the vote.
 
-`seeded-b`'s lag is derived at apply time (REGULAR channel default minus one minor,
-freshest patch of that minor), so the pin re-computes each reconcile instead of
-rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+`seeded-b`'s lag is derived at apply time (the newest patch REGULAR itself offers one
+minor behind its default, read by `seeded_b_pin.py`), so the pin re-computes each
+reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
 SOP's master-behind check compares a cluster's master minor against its own channel's
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is

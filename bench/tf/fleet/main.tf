@@ -180,30 +180,42 @@ resource "google_project_iam_member" "pool_state_readers" {
   member   = each.value.member
 }
 
-# seeded-b is held one minor version behind whatever the REGULAR channel
-# currently defaults to, derived live rather than hardcoded so the pin does
-# not rot: each apply re-computes "current default minus one". The cluster
-# is ENROLLED in REGULAR -- required, because the upgrade SOP's
-# master-behind check compares a master's minor against its own channel's
-# default, so a channel-less cluster falls out of the comparison and the
-# lag is invisible. What stops enrollment from healing the lag between
-# reconciles is the rolling NO_MINOR_UPGRADES maintenance exclusion on the
-# seeded_b resource below, re-stamped each apply and capped by the API at
-# the held minor's end of life.
+# seeded-b is held one minor behind the REGULAR channel's default, derived
+# live by seeded_b_pin.py (the `external` data source below) so the pin does
+# not rot. The cluster is ENROLLED in REGULAR -- required, because the upgrade
+# SOP's master-behind check compares a master's minor against its own
+# channel's default, so a channel-less cluster falls out of the comparison
+# and the lag is invisible. What stops enrollment from healing the lag
+# between reconciles is the rolling NO_MINOR_UPGRADES maintenance exclusion
+# on the seeded_b resource below, re-stamped each apply and capped by the API
+# at the held minor's end of life.
 #
-# min_master_version is NOT a creation-time floor, and the pin depends on
-# that: the field is not ForceNew and not ignored, and the provider's
-# update path answers a raised value with an operator-initiated
-# clusters.update carrying desiredMasterVersion -- "Only upgrade the master
-# if the current version is lower than the desired version"
-# (resource_container_cluster.go, the min_master_version branch). So the
-# reconcile CARRIES THE MASTER FORWARD, which is exactly what keeps the pin
-# from rotting: a new patch inside the held minor moves the master to it,
-# and the day REGULAR's default rolls a minor, local.lagging_version
+# The pin comes from REGULAR's OWN valid list (`gcloud container
+# get-server-config`, channels[REGULAR].validVersions), never from the
+# provider's all-channel valid_master_versions: that list leads with RAPID's
+# patches, and GKE lets a cluster running a patch its channel does not carry
+# upgrade only within that minor until the channel catches up
+# (release-channels#newer-patch-versions). Pinning RAPID's 1.34.12 and then
+# asking for RAPID's 1.35.8 is how every pool project's reconcile failed on
+# 2026-10-14 (#3025).
+#
+# min_master_version is NOT a creation-time floor: the field is neither
+# ForceNew nor ignored, and the provider answers a raised value with
+# clusters.update carrying desiredMasterVersion, upgrading only when the
+# recorded master is lower (resource_container_cluster.go). So the reconcile
+# CARRIES THE MASTER FORWARD: a new REGULAR patch inside the held minor moves
+# the master to it, and the day REGULAR's default rolls a minor the pin
 # recomputes and the next apply walks the master to the new
-# default-minus-one. Both are manual upgrades in GKE's sense, and
-# "manually-initiated upgrades begin immediately and ignore any maintenance
-# windows" -- the exclusion never had to gate them, and does not.
+# default-minus-one. Both are manual upgrades in GKE's sense, which the
+# exclusion does not gate; the channel rule above does. So when the running
+# patch is one REGULAR does not carry, the script HOLDS the pin instead of
+# asking for the refused bump: the newest REGULAR patch of the running minor
+# above it when there is one (the one upgrade GKE allows), else the running
+# version, and the rest of the project applies; the apply after the step does
+# the minor bump from an on-channel patch. As of 2026-10-14 REGULAR's newest
+# 1.34 is below seeded-b's 1.34.12-gke.1011000, so the hold lasts until
+# REGULAR ships a 1.34 patch above it; if REGULAR drops 1.34 first, no pin
+# can recover and the cluster is upgraded by hand or replaced.
 #
 # The provider only ever upgrades (cur < des) and a control plane cannot be
 # downgraded, so the pin is one-way: if the master ever gets AHEAD of it --
@@ -218,23 +230,20 @@ resource "google_project_iam_member" "pool_state_readers" {
 # and consistency-drift-outlier goes red there. Schedule it accordingly; the
 # README's activation timeline has the detail.
 # The seeded_b comment and the README carry the full account.
-data "google_container_engine_versions" "fleet" {
-  location = var.zone
-  project  = var.project_id
+data "external" "seeded_b_pin" {
+  program = ["python3", "${path.module}/seeded_b_pin.py"]
+  query = {
+    project = var.project_id
+    zone    = var.zone
+    cluster = "${var.cluster_prefix}-b"
+  }
 }
 
 locals {
-  regular_default = data.google_container_engine_versions.fleet.release_channel_default_version["REGULAR"]
-  default_minor   = tonumber(split(".", local.regular_default)[1])
-  lagging_versions = [
-    for v in data.google_container_engine_versions.fleet.valid_master_versions :
-    v if startswith(v, "1.${local.default_minor - 1}.")
-  ]
-  # valid_master_versions is newest-first, so [0] is the freshest patch of the
-  # previous minor: lagging by exactly one minor, not by every CVE since.
-  # try(): an empty candidate list must surface as the precondition's message
-  # on seeded_b, not as an index error that masks it.
-  lagging_version = try(local.lagging_versions[0], null)
+  # "" from the script: REGULAR offers nothing one minor behind its default
+  # and no seeded-b is running to hold. null here, so seeded_b's precondition
+  # names that instead of a create with an empty version.
+  lagging_version = data.external.seeded_b_pin.result.pin != "" ? data.external.seeded_b_pin.result.pin : null
 }
 
 # ---------------------------------------------------------------------------
@@ -453,7 +462,7 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 # entry, so (b)/(c) cannot evaluate; the earlier UNSPECIFIED design hid the
 # defect from the audit it was planted for. Branch (a) -- version offered by
 # no channel and absent from validMasterVersions -- stays false while the
-# pin, drawn from that very list, remains in it.
+# pin, drawn from REGULAR's own list, remains offered.
 #
 # What holds the lag under a channel: the maintenance exclusion below, at
 # scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now
@@ -480,9 +489,8 @@ resource "google_container_cluster" "seeded_b" {
   resource_labels          = local.cluster_labels
   deletion_protection      = false
 
-  # Assumes the freshest previous-minor patch is offered in REGULAR, which
-  # holds in practice (the channel serves ~3 minors); if GKE ever rejects
-  # the create, re-derive the pin from the channel's own list.
+  # REGULAR's own newest previous-minor patch, or the hold when the running
+  # patch is one REGULAR does not carry: the comment above the data source.
   min_master_version = local.lagging_version
   release_channel {
     channel = "REGULAR"
@@ -532,8 +540,8 @@ resource "google_container_cluster" "seeded_b" {
 
   lifecycle {
     precondition {
-      condition     = length(local.lagging_versions) > 0
-      error_message = "No valid master version exists one minor behind the REGULAR default; pick the lag manually this cycle."
+      condition     = local.lagging_version != null
+      error_message = "REGULAR offers no version one minor behind its default and no seeded-b is running to hold; pick the lag manually this cycle."
     }
   }
 }

@@ -148,14 +148,15 @@ DEFAULT_WORKERS = 1
 WORKER_DRAIN_SECONDS = INTERRUPT_GRACE_SECONDS + 30
 WORKER_JOIN_STEP_SECONDS = 0.2
 FLEET_SUBDIR = "bench/tf/fleet"
-# The files that change what a run applies: the stack and its lock file, and
-# the allowlist the inspection reads. README.md and fixtures.json live beside
+# The files that change what a run applies: the stack and its lock file, the
+# allowlist the inspection reads, and the program the stack's `external` data
+# source runs for seeded-b's pin. README.md and fixtures.json live beside
 # them and tofu never reads them, so they do not move the fleet tree: a
 # docs-only merge neither stops a running reconcile nor needs one. A new input
 # kind (a tfvars file, a templatefile source) goes here, into the postsubmit's
 # run_if_changed in oss-test-infra, and into docs/ci-pool-projects.md 6.2.
 FLEET_INPUT_SUFFIXES = (".tf", ".hcl")
-FLEET_INPUT_NAMES = ("reconcile-allow.json",)
+FLEET_INPUT_NAMES = ("reconcile-allow.json", "seeded_b_pin.py")
 GIT_TIMEOUT_SECONDS = 120
 # Prow's identifiers for the build, kept in the report and the markers.
 BUILD_ID_ENV = "BUILD_ID"
