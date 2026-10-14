@@ -115,9 +115,12 @@ func (g *Gateway) chatOutcome(conversation string, err error) bool {
 		return true
 	case errors.Is(err, ErrTextOnly):
 		g.metrics.chatMessage(chatTextOnly)
-	default:
+	case errors.Is(err, ErrLayoutRefused):
 		g.metrics.chatMessage(chatRefused)
 		g.log.Warn("chat message not rendered; posting its text fallback", "conversation", conversation, "err", err)
+	default:
+		// A failed call, not a refused layout: nothing to count.
+		g.log.Warn("chat message post or edit failed; trying its text", "conversation", conversation, "err", err)
 	}
 	return false
 }
@@ -143,6 +146,11 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 			// The backend shows text only, and will for the life of the
 			// task: from here the line is the text edit alone.
 			rs.lineTextOnly = true
+		} else if !errors.Is(err, ErrLayoutRefused) {
+			// The edit failed for another reason (a rate limit, an
+			// outage): not landed, so the next artifact tries again with
+			// the layout kept.
+			return false
 		} else {
 			// The backend refused this layout: it is not offered again
 			// until the progress chat message changes (applyArtifact).

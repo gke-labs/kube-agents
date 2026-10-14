@@ -293,7 +293,11 @@ func slackChatAfter(after []string) map[string]any {
 func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 	var children []map[string]any
 	if strings.TrimSpace(f.Text) != "" {
-		texts, err := slackFoldSections(f.Text, slackChatFoldChunk)
+		// chatChunks measures bytes and Slack's cap is characters, so the
+		// budget scales by the text's bytes per character: multibyte text
+		// gets as many characters a section as ASCII does.
+		budget := slackChatFoldChunk * len(f.Text) / max(1, utf8.RuneCountInString(f.Text))
+		texts, err := slackFoldSections(f.Text, budget)
 		if err != nil {
 			return nil, err
 		}

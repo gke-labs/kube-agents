@@ -788,7 +788,24 @@ func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, e
 	if err == nil {
 		s.trackQuestion(conversation, ts, m)
 	}
-	return ts, err
+	return ts, slackLayoutError(err)
+}
+
+// slackLayoutRefusals are the chat.postMessage and chat.update errors that
+// refuse what a message carries rather than the call itself.
+var slackLayoutRefusals = map[string]bool{
+	"invalid_blocks": true, "invalid_blocks_format": true, "invalid_attachments": true,
+	"msg_too_long": true, "too_many_attachments": true, "no_text": true,
+}
+
+// slackLayoutError wraps Slack's refusal of a layout in ErrLayoutRefused and
+// leaves any other error as it is.
+func slackLayoutError(err error) error {
+	var resp slack.SlackErrorResponse
+	if errors.As(err, &resp) && slackLayoutRefusals[resp.Err] {
+		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	return err
 }
 
 // EditMessage replaces a posted message with a message value. Without a chat
@@ -813,7 +830,7 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 	if err == nil {
 		s.trackQuestion(conversation, messageID, m)
 	}
-	return err
+	return slackLayoutError(err)
 }
 
 // slackMessageOptions is a message value as chat.postMessage and
@@ -826,11 +843,11 @@ func slackMessageOptions(m OutMessage) ([]slack.MsgOption, error) {
 			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
 	}
 	if utf8.RuneCountInString(text) > slackChatTextMax {
-		return nil, errSlackChatTooLarge
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
 	}
 	layout, err := renderSlackChat(m.Chat, text)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
 	}
 	return slackChatOptions(layout, text)
 }

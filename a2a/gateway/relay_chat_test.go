@@ -569,3 +569,28 @@ func TestRefusedProgressLayoutIsNotResent(t *testing.T) {
 		t.Fatalf("refused = %v, want the layout offered once", got)
 	}
 }
+
+// A laid-out edit that fails for a reason other than a refusal (a rate
+// limit, an outage) is no refusal: nothing is counted or remembered, and the
+// next artifact lays the same plan out.
+func TestTransientProgressFailureRetriesTheLayout(t *testing.T) {
+	r := startRig(t)
+	r.adapter.mu.Lock()
+	r.adapter.failChatEdits = 1
+	r.adapter.mu.Unlock()
+	origin := startChatTask(t, r, "discord:g1/transient-layout", true)
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "one"}, chatPart(t, testPlan)}, false, false)
+	waitFor(t, "the failed edit", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return r.adapter.failChatEdits == 0
+	})
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "two"}, chatPart(t, testPlan)}, false, false)
+	waitFor(t, "the plan laid out on the retry", func() bool {
+		edits := r.adapter.chatEditsCopy()
+		return len(edits) > 0 && edits[len(edits)-1] != nil
+	})
+	if got := chatCount(t, r, chatRefused); got != 0 {
+		t.Fatalf("refused = %v, want 0 for a transient failure", got)
+	}
+}

@@ -673,7 +673,7 @@ func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) b
 		return false
 	}
 	if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
-		// The text edit landed where the layout did not: a refusal.
+		// The text edit landed where the layout did not.
 		n.chatOutcome(conversation, layoutErr)
 	}
 	return true
@@ -689,9 +689,11 @@ func (n *Notifier) chatOutcome(conversation string, err error) bool {
 		return true
 	case errors.Is(err, ErrTextOnly):
 		n.metrics.chatMessage(chatTextOnly)
-	default:
+	case errors.Is(err, ErrLayoutRefused):
 		n.metrics.chatMessage(chatRefused)
 		n.log.Warn("notify: chat message not rendered; posting its text fallback", "conversation", conversation, "err", err)
+	default:
+		n.log.Warn("notify: chat message post or edit failed; trying its text", "conversation", conversation, "err", err)
 	}
 	return false
 }

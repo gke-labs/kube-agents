@@ -196,6 +196,13 @@ type OutMessage struct {
 // posts exactly what it posted before chat messages existed.
 var ErrTextOnly = errors.New("this backend posts text only")
 
+// ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
+// more than one message holds, or the API's own refusal of the blocks. It
+// is told apart from any other failure (a rate limit, an outage, a message
+// that is gone), which says nothing about the layout and is retried as
+// such rather than counted or remembered as a refusal.
+var ErrLayoutRefused = errors.New("the backend refused this layout")
+
 // postTextOnly is PostMessage for a backend that renders no chat message.
 func postTextOnly(post func(conversation, text string) (string, error), conversation string, m OutMessage) (string, error) {
 	if m.Chat != nil {

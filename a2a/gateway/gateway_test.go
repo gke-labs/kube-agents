@@ -185,8 +185,11 @@ type fakeAdapter struct {
 	// rendering fake refuse every chat message, as an API refusal would.
 	rendersChat bool
 	refuseChat  bool
-	chatPosts   []*chatmsg.Message
-	chatEdits   []*chatmsg.Message
+	// failChatEdits fails the next N laid-out edits with an error that is
+	// no refusal, as a rate limit or an outage would.
+	failChatEdits int
+	chatPosts     []*chatmsg.Message
+	chatEdits     []*chatmsg.Message
 	// stopped is closed when Run returns, so a test can assert that a
 	// backend was actually told to stop rather than left running.
 	stopped  chan struct{}
@@ -253,7 +256,7 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 		return "", ErrTextOnly
 	}
 	if refuseChat {
-		return "", errors.New("fake chat refusal")
+		return "", fmt.Errorf("%w: fake", ErrLayoutRefused)
 	}
 	id, err := a.Post(conversation, m.Text)
 	a.mu.Lock()
@@ -265,12 +268,19 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	a.mu.Lock()
 	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	transient := m.Chat != nil && a.failChatEdits > 0
+	if transient {
+		a.failChatEdits--
+	}
 	a.mu.Unlock()
+	if transient {
+		return errors.New("fake transient failure")
+	}
 	if m.Chat != nil && !rendersChat {
 		return ErrTextOnly
 	}
 	if m.Chat != nil && refuseChat {
-		return errors.New("fake chat refusal")
+		return fmt.Errorf("%w: fake", ErrLayoutRefused)
 	}
 	if err := a.Edit(conversation, messageID, m.Text); err != nil {
 		return err
