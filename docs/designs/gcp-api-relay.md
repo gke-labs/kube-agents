@@ -337,8 +337,9 @@ names. The review bar for a new `ApiRoute` is the bar for a new `GCLOUD_READ_COM
 one line, one reason in a comment, tests that hold the door one word away. The impersonated
 read-only identity above is what lowers that stake and should be scheduled with the pool.
 
-**What it does not touch.** The gateway pod's own ambient identity, which the `gke` remote MCP
-server uses today, is a separate open item and not made better or worse by this route.
+**What it does not touch.** The gateway pod's own ambient identity is a separate open item and not
+made better or worse by this route. The `gke` remote MCP server no longer uses it: it goes through
+the broker's MCP relay (`mcp_policy.py`), on the broker's credential.
 
 ## Tests
 

@@ -26,13 +26,13 @@ const GO_TRIM_RE = new RegExp(`^${GO_SPACE}+|${GO_SPACE}+$`, "g");
 const GO_SPACE_RE = new RegExp(GO_SPACE);
 /** A run of Go whitespace, for splitting words the way the trim bounds them. */
 export const GO_SPACE_RUN_RE = new RegExp(`${GO_SPACE}+`);
-/** a2a/gateway/text.go stopWords. */
+/** a2a/lib/chattext/commands.go stopWords. */
 const STOP_WORDS = new Set(["stop", "cancel", "abort"]);
-/** a2a/gateway/text.go isDelegate's word, separators and left-trim cutset. */
+/** a2a/lib/chattext/commands.go IsDelegate's word, separators and left-trim cutset. */
 const DELEGATE_WORD = "delegate";
 const DELEGATE_SEPARATORS = new Set([" ", "\t", "\n", ":", ",", "-", "\u2014"]);
 const DELEGATE_TRIM_RE = /^[:,\-\u2014 \t\n]+/;
-/** a2a/gateway/text.go slashSessionWord and slashOffWord. */
+/** a2a/lib/chattext/commands.go slashSessionWord and slashOffWord. */
 const SLASH = "/";
 const SESSION_WORD = "session";
 const SESSION_OFF_WORD = "off";
@@ -130,7 +130,7 @@ export function goTrim(s: string): string {
 // gateway's state, so it knows which turns can never come back as a task and
 // which come back under a different text.
 
-/** Mirrors a2a/gateway/text.go normalize. */
+/** Mirrors a2a/lib/chattext/commands.go Normalize. */
 export function normalizeTurn(s: string): string {
   let out = "";
   let lastSpace = true;
@@ -148,12 +148,12 @@ export function normalizeTurn(s: string): string {
   return goTrim(out);
 }
 
-/** Mirrors a2a/gateway/text.go isStop. */
+/** Mirrors a2a/lib/chattext/commands.go IsStop. */
 export function isStopTurn(text: string): boolean {
   return STOP_WORDS.has(normalizeTurn(text));
 }
 
-/** Mirrors a2a/gateway/text.go isDelegate: the task text, or null if the turn is not a delegation. */
+/** Mirrors a2a/lib/chattext/commands.go IsDelegate: the task text, or null if the turn is not a delegation. */
 export function delegateRest(text: string): string | null {
   const trimmed = goTrim(text);
   if (trimmed.length < DELEGATE_WORD.length || trimmed.slice(0, DELEGATE_WORD.length).toLowerCase() !== DELEGATE_WORD) {
@@ -165,7 +165,7 @@ export function delegateRest(text: string): string | null {
   return task === "" ? null : task;
 }
 
-/** Mirrors a2a/gateway/text.go isSessionCommand: the argument after `/session`, or null if the turn is not one. */
+/** Mirrors a2a/lib/chattext/commands.go IsSessionCommand: the argument after `/session`, or null if the turn is not one. */
 export function sessionCommandRest(text: string): string | null {
   const trimmed = goTrim(text);
   if (!trimmed.startsWith(SLASH)) return null;
@@ -176,7 +176,7 @@ export function sessionCommandRest(text: string): string | null {
   return word.replace(LONG_S, "s").toLowerCase() === SESSION_WORD ? rest : null;
 }
 
-/** Mirrors a2a/gateway/text.go isSessionOff. */
+/** Mirrors a2a/lib/chattext/commands.go IsSessionOff. */
 export function isSessionOffArg(rest: string): boolean {
   return normalizeTurn(rest) === SESSION_OFF_WORD;
 }

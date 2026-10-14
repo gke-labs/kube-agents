@@ -141,6 +141,14 @@ _NO_WORKER_CALLS_REASON = (
 )
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
+# A forge read that fails in transport (a socket timeout, a reset, a dropped
+# connection) is tried this many times, with this pause between tries, before
+# the check reports the API unreachable. One slow read must not red a run on
+# rung 2: gitlab.com's API times out a read now and then where GitHub's does
+# not, and the in-job GitLab helper retries its reads for the same reason. An
+# HTTP answer, whatever its status, is not retried: it is an observation.
+_FORGE_READ_ATTEMPTS = 3
+_FORGE_READ_RETRY_PAUSE_SEC = 2.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -1850,12 +1858,15 @@ class BootstrapFanoutVerifier(BaseVerifier):
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
-    """One GET against the GitHub REST API. The whole faked surface in tests.
+    """One GET against a forge's REST API. The whole faked surface in tests.
 
     Returns ``(status, decoded_json_or_None)``. Raises :class:`OSError`-family
     exceptions for transport failures, which the caller turns into
     ``status="error"`` rather than a fail — an unreachable API is the absence
-    of an observation, not a violation.
+    of an observation, not a violation. A transport failure is retried
+    ``_FORGE_READ_ATTEMPTS`` times first, so one slow read does not become
+    that error; an HTTP answer is returned on the first try, whatever its
+    status.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -1873,22 +1884,29 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         method="GET",
     )
     opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return response.status, json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        # 404 and 403 are answers, not transport failures: read the body so the
-        # caller can distinguish "no such issue" from "no such permission".
+    for attempt in range(1, _FORGE_READ_ATTEMPTS + 1):
         try:
-            payload = json.loads(exc.read().decode("utf-8", errors="replace"))
-        except (ValueError, OSError):
-            payload = None
-        return exc.code, payload
-    except json.JSONDecodeError as exc:
-        raise OSError(f"GitHub returned a body that is not JSON: {exc}") from exc
-    except http.client.HTTPException as exc:
-        raise OSError(f"{type(exc).__name__}: {exc}") from exc
+            with opener.open(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                return response.status, json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            # 404 and 403 are answers, not transport failures: read the body so the
+            # caller can distinguish "no such issue" from "no such permission".
+            try:
+                payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+            except (ValueError, OSError):
+                payload = None
+            return exc.code, payload
+        except json.JSONDecodeError as exc:
+            raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # URLError and a socket timeout are OSErrors; HTTPException is not.
+            if attempt == _FORGE_READ_ATTEMPTS:
+                if isinstance(exc, http.client.HTTPException):
+                    raise OSError(f"{type(exc).__name__}: {exc}") from exc
+                raise
+            time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
+    raise AssertionError("unreachable")
 
 
 def _parse_footer(body: str) -> tuple[str, datetime] | None:

@@ -94,7 +94,23 @@ const (
 	kubeAPIAccessMountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 	agentCredentialProxyTokenVolume = "agent-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
+	// mcpRelayURLEnvVar names the broker's remote MCP relay for the agent
+	// container. The agent configs interpolate it into each mcp-remote
+	// server's URL (`${KUBE_AGENTS_MCP_RELAY_URL}/gke`), so every
+	// `mcp__gke__*` call reaches Google through the broker's tool allowlist
+	// rather than on the gateway's own credential.
+	mcpRelayURLEnvVar = "KUBE_AGENTS_MCP_RELAY_URL"
+	// mcpRelayPath is the relay's route on the broker, without the trailing
+	// slash the server name follows. credential_proxy.py takes the prefix from
+	// mcp_policy.MCP_RELAY_PREFIX; tests/conformance holds the two equal.
+	mcpRelayPath = "/v1/mcp"
 )
+
+// mcpRelayURL is the value of mcpRelayURLEnvVar.
+func mcpRelayURL(agent *agentv1alpha1.PlatformAgent) string {
+	return credentialProxyBaseURL(agent) + mcpRelayPath
+}
 
 // credentialBrokerName is the name of the broker's Deployment and Service.
 func credentialBrokerName(agent *agentv1alpha1.PlatformAgent) string {
@@ -184,10 +200,10 @@ func a2aSessionBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
 // the broker. Audience-bound and one hour long, so a copy that escapes the Pod
 // is worth an hour of broker access and nothing else.
 //
-// credentialProxyChatAudience, not credentialProxyAudience: the chat relays are
-// the only thing in this Pod that calls the broker, and minting for the chat
-// audience is what stops this token opening the shell's routes if it does
-// escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
+// credentialProxyChatAudience, not credentialProxyAudience: the chat relays and
+// the remote MCP servers' mcp-remote children are the only things in this Pod
+// that call the broker, and minting for the chat audience is what stops this
+// token opening the shell's routes if it does escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
 func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	return corev1.Volume{
 		Name: agentCredentialProxyTokenVolume,
