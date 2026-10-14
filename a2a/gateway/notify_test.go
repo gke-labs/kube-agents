@@ -533,8 +533,10 @@ type fakeConversations struct {
 	// every EditMessage.
 	rendersChat bool
 	failEdits   bool
-	edits       []notifyPost
-	chats       []*chatmsg.Message
+	// failPosts fails every Post (and so every PostMessage).
+	failPosts bool
+	edits     []notifyPost
+	chats     []*chatmsg.Message
 	// marks records MarkConversation calls as "conversation ask/settle",
 	// with postsAtMark the number of posts made by then.
 	marks       []string
@@ -555,6 +557,9 @@ func (f *fakeConversations) ConversationContext(_ context.Context, key string) (
 func (f *fakeConversations) Post(conversation, text string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failPosts {
+		return "", errors.New("fake post failure")
+	}
 	f.posts = append(f.posts, notifyPost{thread: conversation, text: text})
 	return conversation + "/messages/c" + string(rune('0'+len(f.posts))), nil
 }

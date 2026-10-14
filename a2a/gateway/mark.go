@@ -126,8 +126,9 @@ func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkStat
 
 // applyTerminalMark is the default for the newest task ending with no mark
 // on its terminal, including a supervisor terminal: the ask comes off, a
-// blocked settle lifts, and failed sets the failed settle. A done or failed
-// settle already drawn stays. Not called for a terminal that carried a mark;
+// blocked settle lifts, and failed sets the failed settle. Otherwise a done
+// or failed settle already drawn stays (a failed end replaces a done).
+// Not called for a terminal that carried a mark;
 // that one is applyTaskMark's. The state is the end every observer is told
 // (handOffEnd): a session turn whose delegate request minted no child ends
 // failed, whatever its hand-off line's completed says.

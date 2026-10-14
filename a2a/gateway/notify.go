@@ -163,7 +163,7 @@ type Notifier struct {
 	// counts nothing (a Notifier armed without the gateway's
 	// conversations).
 	metrics *Metrics
-	// marks carries conversation marks to their own worker (drawMarks),
+	// marks carries conversation marks to their own worker (queueMark),
 	// started on the first one: drawing takes the conversation's session
 	// lock, which a turn or a relay batch can hold for a minute, and the
 	// route's one worker must not wait behind it. One worker, so a

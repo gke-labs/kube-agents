@@ -81,6 +81,28 @@ func TestNotifyConversationMarkIsDrawnAfterThePost(t *testing.T) {
 	}
 }
 
+// A notify whose post fails draws no mark: the ask's reaction must not come
+// off, or a settle land, with nothing in the thread.
+func TestNotifyConversationMarkIsNotDrawnWhenThePostFails(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	conv.mu.Lock()
+	conv.failPosts = true
+	conv.mu.Unlock()
+	settled := testReport
+	settled.Mark = &chatmsg.Mark{Settle: chatmsg.SettleDone}
+	got := serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, settled),
+		Conversation: testConversation, ContextID: testContext, Update: "plan"})
+	if got.Error == "" {
+		t.Fatalf("reply = %+v, want the post failure", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
+	if len(conv.marks) != 0 {
+		t.Errorf("marks = %v after a failed post", conv.marks)
+	}
+}
+
 // On a backend that renders none, or for a chat message that breaks a rule,
 // the request posts its text, chunked, as it always has.
 func TestNotifyConversationChatFallsBackToText(t *testing.T) {
