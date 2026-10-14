@@ -48,9 +48,10 @@
 # a red here points at GitLab, not at the agent. No ledger case is in the
 # lane: none passes three repetitions anywhere today (the compliance canary
 # publishes a ledger in about half its runs on either forge, the agent's
-# doing), so nothing grades the GitLab ledger issue until kube-agents#2920,
-# a per-run harness probe of the issue path, lands or a ledger case earns a
-# line here.
+# doing), so the ledger path is proven by the harness, not by a case: the
+# lease-time probe, probe_gitlab_ledger_path in the script and
+# docs/ci-pool-projects.md 5.6. That says the forge takes a ledger; whether
+# the agent publishes one is #2856's question.
 
 # A second proposal under a branch name whose first proposal was closed:
 # branch lookup, delete, push and open on the forge (pull_request_opened).

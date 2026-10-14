@@ -183,23 +183,6 @@ KNOWN_UNREGISTERED = {
         "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
         "nightly, and its empty trajectory grades every repetition blocked"
     ),
-    # Has its fixture and its eval record (three greens on a dev install, and
-    # a planted forwarded-churn record the stack's own observation catches --
-    # a ledger row or a DRIFT line, either one), and belongs
-    # in the nightly; held out for the same infra-lock budget as the case
-    # above. Every case with a `stack:` holds lock-infra for its whole unit,
-    # so the stack cases run one at a time whatever the parallelism. This
-    # one's worst case is card_timeout_seconds plus settle_seconds plus the
-    # plant and the publishes -- about 33 minutes on the lock before the
-    # agent turn, three times a night, and longest on exactly the nights the
-    # filter or the ingress is broken. Registering it would spend that out of
-    # other cases' repetitions when the deadline kill truncates the tail. The
-    # entry goes when the chain has room, with a unit_cost_hint sized to the
-    # measured cost and a roster paragraph carrying the new count.
-    "gitops-drift-noise-filtered-triage": (
-        "#2755: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
     # It grades what a chat channel received, and every CI install deploys with
     # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
     # relay posts nowhere there and the case can only fail. Run by hand against

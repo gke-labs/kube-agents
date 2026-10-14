@@ -4552,6 +4552,20 @@ validate_gitops_forge_flags() {
       print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
       return 1
     fi
+    # A regular file can be read now and again after the apply, so an empty
+    # one stops the run here, before anything is built. A one-shot source
+    # (/dev/stdin, /dev/fd/N, a process substitution) is not read here: a read
+    # can use it up, so create_gitlab_token_secret checks it after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITLAB_TOKEN_FILE"; then
+      local early_token=""
+      IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
+      early_token="$(gitlab_token_strip "$early_token")"
+      if [ -z "$early_token" ]; then
+        print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is empty."
+        return 1
+      fi
+      early_token=""
+    fi
   fi
   # A private CA is for a self-managed host only: gitlab.com presents a
   # certificate the public CAs sign, and a private CA must never vouch for it.
@@ -4584,10 +4598,10 @@ validate_gitops_forge_flags() {
       return 1
     fi
     # A regular file is checked now, before the apply records the Secret's
-    # name in install.env, the tfvars and the CR. /dev/stdin and a process
-    # substitution can be read only once, so they are checked when they are
-    # read, after the apply.
-    if [ -f "$PARAM_GITOPS_CA_FILE" ]; then
+    # name in install.env, the tfvars and the CR. /dev/stdin, /dev/fd/N and a
+    # process substitution can be read only once, so they are checked when
+    # they are read, after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
       local pem_problem
       pem_problem="$(gitlab_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
       if [ -n "$pem_problem" ]; then
@@ -4648,6 +4662,42 @@ apply_gitlab_token_secret() {
     print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
   fi
+}
+
+# True when PATH is a file the installer can read now and again later: a
+# regular file that is not a descriptor path (/dev/fd/N, /dev/stdin,
+# /dev/stdout, /dev/stderr, /proc/...), also after symlinks are resolved.
+# /dev/stdin, /dev/fd/N and a process substitution can be a redirected regular
+# file, and `[ -f ]` is then true. On macOS, opening /dev/fd/N shares the
+# descriptor's offset, so an early read moves it to the end and the read after
+# the apply finds nothing. Such a source is read only after the apply.
+gitops_source_is_rereadable() {
+  local path="$1" target="" dir="" hops=0
+  [ -f "$path" ] || return 1
+  # Every hop of a symlink chain is checked, not only its end: on Linux,
+  # /dev/stdin resolves through /proc/self/fd/0 to the redirected file itself.
+  # The directory part is made physical at each hop, so `//dev/fd/9`,
+  # `/./dev/fd/9`, a relative path and a symlinked directory are judged by
+  # where they lead. Only the paths that can share a descriptor's offset are
+  # refused; another file under /dev keeps the early check.
+  while :; do
+    dir="$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)" || return 1
+    path="${dir%/}/$(basename -- "$path")"
+    case "$path" in
+      /dev/fd/* | /dev/stdin | /dev/stdout | /dev/stderr | /proc/* | \
+        //dev/fd/* | //dev/stdin | //dev/stdout | //dev/stderr | //proc/*)
+        return 1
+        ;;
+    esac
+    [ -L "$path" ] || return 0
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 1
+    target="$(readlink -- "$path" 2>/dev/null)" || return 1
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="${dir%/}/$target" ;;
+    esac
+  done
 }
 
 # A token as GitLab issues it is one line; a file or a paste often carries a
@@ -5327,6 +5377,25 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
+        # from install.env, and if Slack moves to the A2A gateway under next,
+        # the settings it cannot use are refused (and again after the
+        # generator, for a bot token it recovers from the live Secret).
+        refuse_next_slack_gateway_settings_from_env || return 1
+        # Kept until the check after the generator has passed, so that a
+        # refusal there puts install.env back as it was.
+        # The copy holds install.env's credentials, so it is 0600 under a
+        # recognisable name, and an EXIT trap removes it if the arm dies
+        # before either path below does (a generator failure exits through
+        # on_error, and Ctrl-C exits too).
+        local install_env_before=""
+        if [ -f "$INSTALL_ENV_FILE" ]; then
+          install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
+          # Armed before the write, so a failed write leaves no copy either.
+          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
+          trap "rm -f $(printf '%q' "$install_env_before")" EXIT
+          cat "$INSTALL_ENV_FILE" >"$install_env_before"
+        fi
 
         # Into install.env, one key at a time, leaving the operator's comments
         # and ordering alone. This panel is the one place allowed to write
@@ -5383,6 +5452,27 @@ run_menu_system() {
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        # Again for a bot token the generator recovered from the live Secret.
+        # The keys are saved by now, so a refusal restores install.env and
+        # removes the tfvars that render the refused settings.
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          if [ -n "$install_env_before" ]; then
+            # A 0600 replacement (the .tmp is written under umask 077),
+            # moved into place complete, as save_env_var writes it (on_error
+            # removes a half-written .tmp), before the copy is let go.
+            (umask 077; cat "$install_env_before" >"${INSTALL_ENV_FILE}.tmp")
+            mv -f "${INSTALL_ENV_FILE}.tmp" "$INSTALL_ENV_FILE"
+            trap - EXIT
+            rm -f "$install_env_before"
+            print_info "${INSTALL_ENV_FILE} is put back as it was before this Save & Apply."
+          fi
+          rm -f "$(tf_compose_dir "$repo_dir")/terraform.tfvars"
+          return 1
+        fi
+        if [ -n "$install_env_before" ]; then
+          rm -f "$install_env_before"
+          trap - EXIT
+        fi
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -5555,8 +5645,9 @@ main() {
   fi
 
   # The GitOps forge's inputs need nothing but themselves, so they are judged
-  # before any work: a GitLab install handed a GitHub App, a bad host or an
-  # unreadable token source stops here, not after the cluster is built.
+  # before any work: a GitLab install handed a GitHub App, a bad host, an
+  # unreadable token source or an empty token file stops here, not after the
+  # cluster is built.
   validate_gitops_forge_flags || exit 1
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
@@ -5919,6 +6010,16 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
+    # Under next with Chat off the A2A gateway takes Slack (the mode was
+    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
+    # it takes one bot token, member IDs and a channel id. Those prompts say
+    # so and ask again on an answer the gateway cannot use, rather than let
+    # the refusal after this step throw the interview away. A run with nobody
+    # to ask keeps its values, and that refusal is its check.
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" true "$google_chat_enabled"; then
+      _prompt_slack_settings_for_gateway
+      return 0
+    fi
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
@@ -5926,6 +6027,54 @@ main() {
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
+    prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
+      slack_home_channel_name "$slack_home_channel_name"
+  }
+
+  # _prompt_slack_settings when the A2A gateway takes Slack. Reads the hints
+  # _prompt_slack_settings set (bash scopes them dynamically).
+  _prompt_slack_settings_for_gateway() {
+    local can_ask=true bad=""
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+        slack_bot_token "$slack_bot_token" true "$bot_hint"
+      bad="$(slack_bot_token_list_count "$slack_bot_token")"
+      if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
+      { [ -n "$bad" ] && $can_ask; } || break
+      if [ "$bad" = stray ]; then
+        print_error "SLACK_BOT_TOKEN holds a comma or space. Under spec.mode next the A2A gateway takes one bot token as it is; enter it without one."
+      else
+        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      fi
+      # Not the re-ask's default: prompt_read prints a default it has no
+      # label for, and this one is the list just typed under read -s.
+      slack_bot_token="" bot_hint=""
+    done
+    prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
+    while :; do
+      prompt_read "Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)" \
+        slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
+      bad="$(slack_allowlist_emails "$slack_allowed_users")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "These look like emails: ${bad}. Under spec.mode next the allowlist matches Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
+      # The refused list stays the default (an empty one would admit
+      # everyone), so the hint shows it rather than a label for another.
+      slack_allowed_hint=""
+    done
+    while :; do
+      prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
+        slack_home_channel "$slack_home_channel"
+      bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+      # Not the re-ask's default: the value is optional, and prompt_read
+      # turns an empty answer into the default, so a bad one could never be
+      # cleared.
+      slack_home_channel=""
+    done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
   }
@@ -6034,6 +6183,16 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
+  # The Slack settings are settled here, whether from a flag, install.env or
+  # an answer. If Slack moves to the A2A gateway under next, the settings it
+  # cannot use (an email in the allowlist, a home channel that is not a
+  # channel id, a list of bot tokens) are refused now, before the generator,
+  # install.env or any apply. A token the generator recovers from the live
+  # Secret is checked after it. A --dry-run applies nothing, so it is warned
+  # there instead, once, with the recovered token included.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+  fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
@@ -6876,6 +7035,18 @@ main() {
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
   require_slack_tokens_after_recovery
+  # Again on the exported keys, for a bot token the generator recovered from
+  # the live Secret (refuse_next_slack_gateway_settings). Still before
+  # install.env and the apply. The tfvars just written render the refused
+  # settings, so a refusal removes them: --generate-only hands that file to
+  # lifecycle.sh apply. A --dry-run warns instead.
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"
+  elif ! refuse_next_slack_gateway_settings_from_env flags; then
+    rm -f "$tfvars_file"
+    print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
+    exit 1
+  fi
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a

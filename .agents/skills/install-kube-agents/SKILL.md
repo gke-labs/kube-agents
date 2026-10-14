@@ -449,8 +449,9 @@ Rules for the agent:
   intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
   substitution for the CA. The installer refuses the flag without a self-managed `--gitops-host`.
   Use a release whose `install.sh --help` lists `--gitops-ca-file`.
-- The dry run checks only that the token source is readable. It does not read the token, and
-  `install.sh` never connects to GitLab. Only the stage 3 run reads the token, after the apply.
+- The dry run checks that the token source is readable, and stops if a regular token file is
+  empty. It stores no token, and `install.sh` never connects to GitLab. Only the stage 3 run
+  reads the token into the Secret, after the apply.
 - On a cluster that already exists, have the operator run the network-path test from the GitLab
   page before stage 3, in the `default` namespace: `kubeagents-system` does not exist yet. On a
   new cluster, run it after stage 3, in `kubeagents-system`. After stage 3, run the connection
@@ -470,8 +471,7 @@ The command below is a stage 2 dry run. Apply through stage 3 once the operator 
   --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
 ```
 
-Pass the same `--gitlab-token-file` source to the stage 3 run. The dry run only checks that it is
-readable.
+Pass the same `--gitlab-token-file` source to the stage 3 run. The dry run only checks it.
 
 ## Supported Command-Line Flags
 
@@ -518,7 +518,7 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gitops-repo=REPO`                    | GitOps IaC repository name. With `--gitops-forge=gitlab`, the project's full path (`group/subgroup/project`) or its `https://` URL on the GitLab host                                                                                                                                                                               | `gke-fleet-iac`                                                                                                                                    |
 | `--gitops-forge=FORGE`                  | Forge that holds the GitOps repository: `github` or `gitlab` (gitlab.com or a self-managed instance). A GitLab install has no GitHub App and no token minter                                                                                                                                                                        | `github`                                                                                                                                           |
 | `--gitops-host=HOST`                    | Self-managed GitLab hostname, with no scheme, port or path. A GitHub hostname is refused. Only with `--gitops-forge=gitlab`                                                                                                                                                                                                         | gitlab.com                                                                                                                                         |
-| `--gitlab-token-file=PATH`              | File, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the GitLab access token (scopes `api` and `write_repository`). Read into the Secret after the apply and never recorded. Without it, a non-interactive run prints the command that creates the Secret                                                     | _unset_                                                                                                                                            |
+| `--gitlab-token-file=PATH`              | File, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the GitLab access token (scopes `api` and `write_repository`). A regular file is checked before the apply. Read into the Secret after the apply and never recorded. Without it, a non-interactive run prints the command that creates the Secret         | _unset_                                                                                                                                            |
 | `--gitlab-token-secret=NAME`            | Kubernetes Secret that holds the GitLab token                                                                                                                                                                                                                                                                                       | `gitlab-forge-token`                                                                                                                               |
 | `--gitops-ca-file=PATH`                 | Regular PEM file with the CA certificates of a self-managed GitLab behind a private CA. Stored in Secret `gitlab-forge-ca` and trusted by the credential broker for that host only. Needs `--gitops-forge=gitlab` and a self-managed `--gitops-host`                                                                                | _unset_                                                                                                                                            |
 | `--github-app-id=ID`                    | Numeric GitHub App ID for the token minter                                                                                                                                                                                                                                                                                          | _unset_                                                                                                                                            |

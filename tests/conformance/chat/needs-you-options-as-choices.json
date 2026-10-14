@@ -1,0 +1,27 @@
+{
+  "name": "needs-you-options-as-choices",
+  "source": "agents/platform/scripts/test_slack_moments.py::NeedsYouTest.test_listed_options_become_choice_buttons",
+  "notes": "The renderer adds the waiting-on-you line under an open question.",
+  "input": {
+    "reason": "Which checkout-gateway did you mean?\nTwo clusters run one. Which?\n- seeded-reliability\n2) seeded-debug"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which checkout-gateway did you mean?",
+        "detail": "Two clusters run one. Which?",
+        "tone": "attention",
+        "choices": [
+          {
+            "text": "seeded-reliability"
+          },
+          {
+            "text": "seeded-debug"
+          }
+        ]
+      }
+    }
+  ]
+}

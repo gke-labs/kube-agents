@@ -1,0 +1,18 @@
+{
+  "name": "answer-headline-without-markup",
+  "source": "agents/platform/scripts/test_slack_presenter.py::SplitAnswerTest.test_markdown_stripped_from_headline",
+  "notes": "split_answer: the headline is the first sentence, plain; the rest is the detail, still markdown.",
+  "input": {
+    "markdown": "## **Yes**, [seeded-a](https://x) is `healthy`\n- one\n- two"
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Yes, seeded-a is healthy",
+        "detail": "- one\n- two"
+      }
+    }
+  ]
+}
