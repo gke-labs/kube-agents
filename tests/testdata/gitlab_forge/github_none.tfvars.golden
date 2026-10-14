@@ -61,6 +61,7 @@ openai_api_key    = ""
 anthropic_api_key = ""
 
 permission_set = "read-only"
+enable_calendar_mode_advice = false
 
 # The projects, folders, organisations, Shared VPC hosts and Metrics Scopes
 # beyond project_id whose GKE clusters get a Cluster Agent, and what to leave

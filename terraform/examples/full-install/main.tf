@@ -448,7 +448,10 @@ module "kube_agents_iam" {
   project_id    = var.project_id
   namespace     = var.namespace
   project_roles = local.agent_project_roles
-  scope         = var.scope
+  # Beside the permission set, not in it: the one-permission calendar-mode
+  # advice role, off unless asked for.
+  calendar_mode_advice_enabled = var.enable_calendar_mode_advice
+  scope                        = var.scope
   # The scoped service account pool, derived in the module from the same
   # scope object: armed by the switch alone, never by the scope.
   scoped_pool_enabled      = var.scoped_pool_enabled

@@ -38,6 +38,7 @@ their own copies:
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
 | `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`)                                                    |
+| `DEFAULT_ENABLE_CALENDAR_MODE_ADVICE`                                     | The one-permission `compute.advice.calendarMode` custom role (`false`)                 |
 | `DEFAULT_ENABLE_DRIFT_DETECTOR`                                           | Out-of-band change detection: the audit-log ingress and its consumer (`true`)          |
 | `DEFAULT_KUBE_AGENTS_STATE_BUCKET`                                        | The `KUBE_AGENTS_STATE_BUCKET` sentinel (`auto`) that derives the state bucket         |
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
@@ -218,7 +219,8 @@ on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that 
 `write_tfvars_from_state` finds a live Hindsight deployment (`hindsight-postgresql` or
 `hindsight-api`) on the target cluster, in which case `kube_agents_memory` is preserved
 (`--memory=file` or `MEMORY=file` is required to tear it down);
-`ENABLE_GKE_BACKUP_PLAN` absent destroys the backup plan; `ENABLE_STOCKOUT_INVESTIGATOR`
+`ENABLE_GKE_BACKUP_PLAN` absent destroys the backup plan; `ENABLE_CALENDAR_MODE_ADVICE` absent
+deletes the calendar-mode advice custom role and its binding; `ENABLE_STOCKOUT_INVESTIGATOR`
 absent destroys the stockout log sink, its alerts topic and subscription, and their IAM
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes
 the adapter plugin from the release (the
@@ -244,7 +246,7 @@ them: `write_tfvars_from_state` has to resolve the key against `install.defaults
 than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR`, in
 the paragraph above, clears the second and fails the first — it defaults to `true` and still
 destroys, because the generator hardcodes `${ENABLE_GVISOR:-false}`. `ENABLE_GKE_BACKUP_PLAN`,
-`ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
+`ENABLE_PUBSUB_PLATFORM`, `ENABLE_STOCKOUT_INVESTIGATOR` and `ENABLE_CALENDAR_MODE_ADVICE` clear the first and fail the
 second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
 project. A full

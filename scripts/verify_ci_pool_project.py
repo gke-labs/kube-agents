@@ -227,6 +227,16 @@ REPAIR_FLEET_APPLY = "apply bench/tf/fleet to {project_id} from a main checkout:
 # composition's; the LiteLLM GSA has a hand repair in the runbook.
 REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
 REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcloud iam service-accounts create kubeagents-litellm-gsa, roles/aiplatform.user, and its Workload Identity binding)"
+# The calendar-mode advice role on a project provisioned before the composition
+# created it: the role, then the binding, as docs/ci-pool-projects.md section 3
+# spells out. Two commands rather than _project_binding's one because the role
+# has to exist before it can be bound.
+REPAIR_CALENDAR_MODE_ROLE = (
+    "gcloud iam roles create {role_id} --project={project_id} "
+    '--title="Kube-Agents calendar-mode advice (read-only)" --permissions={permission} --stage=GA '
+    '&& gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
+    "(docs/ci-pool-projects.md section 3)"
+)
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
 REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"
 # The one version state `kms keys versions enable` takes; a scheduled or done
@@ -736,6 +746,21 @@ PLATFORM_GSA_ROLES = {
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
 }
+
+# Beside the read-only set, not in it: the project custom role carrying
+# compute.advice.calendarMode alone, which the full-install composition
+# creates under `enable_calendar_mode_advice = true` (the kube-agents-iam
+# module's `calendar_mode_advice_role_id`; PlatformGsaRolesMatchTerraformTest
+# pins the id). The pool turns it on because the nightly's
+# obtainability-window-planning-probe runs `gcloud beta compute advice
+# calendar-mode`, which no viewer role authorizes: without it the agent under
+# test blocks on the permission and the case fails every night on a credential
+# rather than on the agent's reasoning (#1833). A project provisioned before
+# the switch existed reports it missing here, with the hand repair below, since
+# section 8 of docs/ci-pool-projects.md forbids re-running the provisioning.
+PLATFORM_GSA_CALENDAR_MODE_ROLE_ID = "kubeAgentsCalendarModeAdvice"
+PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE = "projects/{project_id}/roles/" + PLATFORM_GSA_CALENDAR_MODE_ROLE_ID
+PLATFORM_GSA_CALENDAR_MODE_PERMISSION = "compute.advice.calendarMode"
 
 
 class Finding:
@@ -1534,8 +1559,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         _project_binding(project_id, FLEET_RECONCILER_MEMBER, role),
                     ))
 
-            platform_missing = PLATFORM_GSA_ROLES - platform_held
-            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            calendar_mode_role = PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE.format(project_id=project_id)
+            platform_expected = PLATFORM_GSA_ROLES | {calendar_mode_role}
+            platform_missing = platform_expected - platform_held
+            platform_extra = platform_held - platform_expected
             if platform_missing and not platform_absent:
                 passed = False
                 details.append(
@@ -1545,10 +1572,20 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "credential the agent lacks rather than on the agent's reasoning"
                 )
                 for role in sorted(platform_missing):
+                    if role == calendar_mode_role:
+                        repair = REPAIR_CALENDAR_MODE_ROLE.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                            member=platform_member,
+                            role=role,
+                        )
+                    else:
+                        repair = _project_binding(project_id, platform_member, role)
                     findings.append(Finding(
                         f"iam/platform-gsa/missing/{role}",
                         f"The platform agent GSA is missing {role} on {project_id}",
-                        _project_binding(project_id, platform_member, role),
+                        repair,
                     ))
             if platform_extra:
                 passed = False

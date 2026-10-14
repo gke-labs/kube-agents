@@ -642,6 +642,15 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # granting one leases fine and dies the first night the other draws it.
     # Topic-scoped, so this is publish on one topic rather than a Pub/Sub role
     # on the project.
+    #
+    # enable_calendar_mode_advice binds the one-permission
+    # compute.advice.calendarMode custom role to kubeagents-platform-gsa beside
+    # the read-only set. The nightly's obtainability-window-planning-probe runs
+    # `gcloud beta compute advice calendar-mode`, which no viewer role
+    # authorizes, so without it the agent under test blocks on the permission
+    # and the case fails on a credential rather than on its reasoning (#1833).
+    # verify_ci_pool_project.py expects the role, so a project provisioned
+    # before this line reports it missing with the section 3 hand repair.
     cat > "${TFVARS}" <<EOF
 project_id          = "${PROJECT_ID}"
 cluster_name        = "${HOST_CLUSTER_NAME}"
@@ -650,6 +659,7 @@ api_server_key      = "$(openssl rand -hex 16)"
 model_provider      = "vertex_ai"
 enable_drift_pubsub = true
 drift_pubsub_topic_publishers = ["${PROW_RUNNER_SA}", "${NIGHTLY_RUNNER_SA}"]
+enable_calendar_mode_advice = true
 EOF
 
     KUBE_AGENTS_STATE_BUCKET="${STATE_BUCKET}" \

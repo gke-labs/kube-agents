@@ -185,6 +185,11 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # permission_set either way. There is no admin bundle -- widening access
 # means naming the roles, so that the grant is explicit and reviewed.
 # permission_set = "read-only"
+# Beside the set, not in it: a project custom role carrying
+# compute.advice.calendarMode alone, bound to the agent, for the
+# capacity-obtainability skill's future-window probe (`gcloud beta compute
+# advice calendar-mode`). No viewer role carries the permission.
+# enable_calendar_mode_advice = true
 
 # Multi-project scope: the projects, folders, organisations, Shared VPC hosts
 # and Metrics Scopes beyond project_id whose GKE clusters get a Cluster Agent, and what to leave

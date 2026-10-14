@@ -88,6 +88,19 @@ Every registered project was provisioned before the script ran this step. Measur
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
   ```
+- **The platform GSA's calendar-mode advice role.** Beside its read-only role set, `kubeagents-platform-gsa` holds the project custom role `kubeAgentsCalendarModeAdvice`, one permission (`compute.advice.calendarMode`) and no writes. The nightly's `obtainability-window-planning-probe` runs `gcloud beta compute advice calendar-mode`, which no viewer role authorizes, so a project without the role fails that case every night on a credential the agent lacks rather than on the agent's reasoning. `scripts/provision_ci_pool_project.sh` turns it on with `enable_calendar_mode_advice = true` in the full-install tfvars (the [`kube-agents-iam`](../terraform/modules/kube-agents-iam/) module creates and binds it), and `scripts/verify_ci_pool_project.py` counts it in the platform GSA's closed role set, so a registered project provisioned before the switch existed reports it missing. Section 8 forbids re-running the script on such a project; the repair is by hand, the role first and then the binding:
+
+  ```bash
+  gcloud iam roles create kubeAgentsCalendarModeAdvice --project="${PROJECT_ID}" \
+    --title="Kube-Agents calendar-mode advice (read-only)" \
+    --permissions=compute.advice.calendarMode --stage=GA
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="projects/${PROJECT_ID}/roles/kubeAgentsCalendarModeAdvice" --quiet >/dev/null
+  ```
+
+  A hand-created role is outside the project's Terraform state; a later full apply against that state with `enable_calendar_mode_advice = true` would try to create it again and fail on the existing id, so a project repaired this way keeps the tfvars key off (its default) unless the role is imported first.
+
 - **The LiteLLM gateway's Vertex AI identity**: Google Service Account `kubeagents-litellm-gsa@${PROJECT_ID}.iam.gserviceaccount.com` holding `roles/aiplatform.user` on the project, bound to KSA `kubeagents-litellm` in `kubeagents-system`. The eval installs route model traffic through Vertex AI (`hack/ci-deploy.sh` sets `litellm.modelProvider=vertex_ai`; the `GEMINI_API_KEY` path's fixed paid-tier-3 quota redded every smoke run on 2026-09-02 — [#1097](https://github.com/gke-labs/kube-agents/issues/1097), diagnosis on [#1184](https://github.com/gke-labs/kube-agents/issues/1184)), and a project missing this pair reds every presubmit that leases it at the deploy's model-call gate. It is deliberately not the platform agent's GSA — see [Security and IAM](site/src/content/docs/reference/security-and-iam.md)'s "The Vertex AI gateway is a separate identity". `scripts/provision_ci_pool_project.sh` creates it through the full-install composition (`model_provider = "vertex_ai"` in its tfvars instantiates the `litellm_vertex_iam` module), and the verifier checks the binding. For a **registered** project provisioned before that line existed, the hand repair below is the only path: section 8 forbids re-running the provisioning after registration, and a composition re-apply is worse than the key rotation section 8 names — the fresh `api_server_key` rides in through `helm_release.kube_agents`, the same release the leased run's `hack/ci-deploy.sh` upgraded, so the re-apply also carries the composition's whole value set (image tags, `gitRepo`, a credentials map without the run's `GEMINI_API_KEY`) over whatever that run installed. The repair:
 
   ```bash
@@ -164,7 +177,7 @@ Every registered project was provisioned before the script ran this step. Measur
 
   Boskos leases at random, so a project that differs grades differently from the rest of the pool — a case can pass on the grant rather than on the agent, and only on the runs that happen to lease that project. Note that re-running the install does **not** strip roles it no longer grants; correcting an over-privileged project is the hand-swap in [Security and IAM](site/src/content/docs/reference/security-and-iam.md).
 
-  A role reported _missing_ here reaches every registered project at once when the bundle grows (`roles/serviceusage.serviceUsageConsumer`, 2026-09-08 to 2026-09-23, #1927): the install grants new projects, nothing grants registered ones. The repair is one idempotent binding per project, with the role the verifier or the pool-state issue named:
+  A role reported _missing_ here reaches every registered project at once when the bundle grows (`roles/serviceusage.serviceUsageConsumer`, 2026-09-08 to 2026-09-23, #1927): the install grants new projects, nothing grants registered ones. The repair is one idempotent binding per project, with the role the verifier or the pool-state issue named (the calendar-mode advice role above is the exception: it is created before it is bound, and its finding carries both commands):
 
   ```bash
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \

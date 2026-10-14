@@ -381,8 +381,8 @@
 # several pull requests a day against the shared install, does not -- so this
 # case has a reason to stay nightly that no measurement will retire.
 #
-# `validated: false`, in step with every case in this file -- none sets it
-# true. It has been run: three runs against a dev install, all five
+# `validated: false`: it has not yet been watched both pass and fail, which
+# is what the flag records. It has been run: three runs against a dev install, all five
 # deterministic checks green in each, and two checks it shipped with were cut
 # because those runs showed they could not hold. What the nightly adds is a
 # record built without anyone watching, on an install nobody prepared for it.
@@ -623,8 +623,10 @@
 # CUJ3's Day-2 window planning, graded on the report and the worker
 # commands through the eval harness (their live siblings under bench/cuj/
 # need a full install and stay manual). Both probe live GCP advice APIs in
-# the eval project; neither reads the seeded fleet. `validated: false`
-# until their first observed runs.
+# the eval project; neither reads the seeded fleet. The window-planning
+# probe needs the pool project's kubeAgentsCalendarModeAdvice role
+# (docs/ci-pool-projects.md section 3): a project without it blocks the
+# agent on compute.advice.calendarMode and the case fails on a credential.
 ./tasks/obtainability-design-quota-vs-capacity/task.yaml
 ./tasks/obtainability-window-planning-probe/task.yaml
 

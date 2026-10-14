@@ -3286,7 +3286,12 @@ class IamGrantsTest(unittest.TestCase):
         reconciler = checker.FLEET_RECONCILER_ROLES if reconciler_roles is None else reconciler_roles
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         nightly = checker.PROW_RUNNER_ROLES if nightly_roles is None else nightly_roles
-        platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
+        if platform_roles is None:
+            platform = checker.PLATFORM_GSA_ROLES | {
+                checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE.format(project_id=project_id)
+            }
+        else:
+            platform = platform_roles
         litellm = checker.LITELLM_GSA_ROLES if litellm_roles is None else litellm_roles
         bot = checker.POOL_STATE_READER_ROLES if bot_roles is None else bot_roles
         platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
@@ -3683,6 +3688,42 @@ class IamGrantsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
 
+    def test_platform_gsa_missing_the_calendar_mode_role_fails_with_the_create_then_bind_repair(self):
+        # A project provisioned before enable_calendar_mode_advice existed: the
+        # nine read-only roles are there and the custom role is not. The
+        # repair creates the role before binding it, because add-iam-policy-binding
+        # on a role that does not exist fails.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(platform_roles=set(checker.PLATFORM_GSA_ROLES))),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        role = "projects/kube-agents-evals-3/roles/kubeAgentsCalendarModeAdvice"
+        finding = next(f for f in result.findings if f.id == f"iam/platform-gsa/missing/{role}")
+        member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id="kube-agents-evals-3")
+        self.assertIn("gcloud iam roles create kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3", finding.repair)
+        self.assertIn("--permissions=compute.advice.calendarMode", finding.repair)
+        self.assertIn(f'gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
+        self.assertNotIn(checker.REPAIR_CONFIRM_PREFIX, finding.repair)
+
+    def test_platform_gsa_holding_the_calendar_mode_role_is_not_an_extra(self):
+        # The default policy carries it, so the closed-set check must read it
+        # as expected rather than as a role beyond the read-only set.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse([f for f in result.findings if f.id.startswith("iam/platform-gsa/extra/")], result.findings)
+
     def test_a_public_binding_fails(self):
         # Neither identity check would see this: both scan for one literal
         # member, and allUsers is not either of them.
@@ -3878,6 +3919,17 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
             main, r"^[ \t]*read_only_roles[ \t]*=[ \t]*\[(.*?)\]", "local.read_only_roles in full-install/main.tf"
         )
         self.assertEqual(applied, checker.PLATFORM_GSA_ROLES)
+
+    def test_the_calendar_mode_role_id_matches_the_module(self):
+        # The custom role is the module's, keyed on a fixed role_id; the
+        # verifier names a pool project's role by that id.
+        main = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf").read_text()
+        declared = re.search(r'calendar_mode_advice_role_id\s*=\s*"([^"]+)"', main)
+        self.assertIsNotNone(declared, "could not find calendar_mode_advice_role_id in the module")
+        self.assertEqual(declared.group(1), checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_ID)
+        permissions = re.search(r'permissions\s*=\s*\[([^\]]*)\]', main)
+        self.assertIsNotNone(permissions, "could not find the custom role's permissions")
+        self.assertEqual(re.findall(r'"([^"]+)"', permissions.group(1)), [checker.PLATFORM_GSA_CALENDAR_MODE_PERMISSION])
 
     def test_the_module_default_matches_the_composition(self):
         tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()

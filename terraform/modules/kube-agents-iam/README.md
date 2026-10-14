@@ -16,6 +16,13 @@ By default the module grants the read-only role set (the composition's
 nothing and manage roles yourself — but note the agent fails every GCP call until an
 equivalent role set exists.
 
+`calendar_mode_advice_enabled = true` adds one thing beside `project_roles`, not to it: a project
+custom role, `kubeAgentsCalendarModeAdvice`, holding `compute.advice.calendarMode` alone, bound to
+the agent. It is the permission behind `gcloud beta compute advice calendar-mode`, the
+capacity-obtainability skill's future-window probe, which no viewer role carries and every
+predefined role that carries it pairs with reservation writes. Off by default; the composition's
+`enable_calendar_mode_advice` and the installer's `ENABLE_CALENDAR_MODE_ADVICE` set it.
+
 There is no admin preset to mirror: the `gke-admin` bundle was removed (see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),
 and this module has never had one. Passing admin roles through `project_roles` is
@@ -108,7 +115,9 @@ is wide; the design is
 `tests/*.tftest.hcl` plan the module against a mocked `google` provider and assert which bindings a
 declaration plans (the intersected allowlist per project, the scoping project and a lookup-only host
 included, nothing in the management project) and which declarations the preconditions refuse,
-the whole-set cap's counting among them; which accounts the scoped service account pool derives
+the whole-set cap's counting among them; that `calendar_mode_advice_enabled` off plans no role and on
+plans the one-permission role and its binding with `project_roles` untouched
+(`tests/calendar_mode_advice.tftest.hcl`); which accounts the scoped service account pool derives
 from a declaration, keyed on the project, a container's listed members among them and bound
 nowhere else, the `scoped_pool_max_accounts` refusal and the refusal of an armed pool beside a
 container `scope_container_members` has no entry for

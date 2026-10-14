@@ -3512,6 +3512,10 @@ write_tfvars_from_state() {
     if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
+    # Beside the set, not in it: the one-permission compute.advice.calendarMode
+    # custom role (ENABLE_CALENDAR_MODE_ADVICE in install.env). Always written,
+    # like enable_gke_backup_plan, so the key absent destroys the role.
+    echo "enable_calendar_mode_advice = $(hcl_bool "${ENABLE_CALENDAR_MODE_ADVICE:-$DEFAULT_ENABLE_CALENDAR_MODE_ADVICE}")"
     echo ""
     echo "# The projects, folders, organisations, Shared VPC hosts and Metrics Scopes"
     echo "# beyond project_id whose GKE clusters get a Cluster Agent, and what to leave"

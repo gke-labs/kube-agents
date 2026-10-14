@@ -25,7 +25,10 @@ install without the interview.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
   module): a service account (`kubeagents-platform-gsa` by default; a second
   install in the same project sets `agent_service_account_id` — see
-  [Remote state](#remote-state)), its read-only project roles, and the Workload
+  [Remote state](#remote-state)), its read-only project roles, optionally
+  (`enable_calendar_mode_advice = true`) a project custom role carrying
+  `compute.advice.calendarMode` alone for the capacity-obtainability skill's
+  future-window probe, and the Workload
   Identity binding to the agent KSA (`agent_ksa_name`,
   `kubeagents-platform-agent` by default; see
   [IAM roles](#iam-roles-permission_set-and-project_roles) below), and, when
@@ -559,6 +562,11 @@ nothing and leaves IAM to you (the agent fails every GCP call until an
 equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
+
+`enable_calendar_mode_advice = true` adds one grant beside either set rather
+than widening it: a project custom role carrying `compute.advice.calendarMode`
+alone, bound to the agent, for the capacity-obtainability skill's
+future-window probe. Off by default.
 
 ### Projects, folders, organisations and selectors in scope (`scope`)
 

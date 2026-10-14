@@ -136,3 +136,33 @@ resource "google_project_iam_member" "agent_roles" {
   role    = each.value
   member  = "serviceAccount:${google_service_account.agent.email}"
 }
+
+# The one permission the capacity-obtainability skill's future-window probe
+# needs and no viewer role carries, as its own custom role rather than a
+# predefined one: every predefined role that holds compute.advice.calendarMode
+# holds reservation writes beside it. Kept out of local.agent_project_roles on
+# purpose -- that list is the permission set the security reference documents
+# and tests/test_agent_iam_ceiling.py pins, and this is a switch beside it.
+# The role id is fixed, one per project like the service account, and
+# scripts/verify_ci_pool_project.py names a pool project's by this id.
+locals {
+  calendar_mode_advice_role_id = "kubeAgentsCalendarModeAdvice"
+}
+
+resource "google_project_iam_custom_role" "calendar_mode_advice" {
+  count = var.calendar_mode_advice_enabled ? 1 : 0
+
+  project     = var.project_id
+  role_id     = local.calendar_mode_advice_role_id
+  title       = "Kube-Agents calendar-mode advice (read-only)"
+  description = "compute.advice.calendarMode alone, so the kube-agents platform agent can ask the AdviceService for future capacity windows. No reservation writes."
+  permissions = ["compute.advice.calendarMode"]
+}
+
+resource "google_project_iam_member" "calendar_mode_advice" {
+  count = var.calendar_mode_advice_enabled ? 1 : 0
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.calendar_mode_advice[0].id
+  member  = "serviceAccount:${google_service_account.agent.email}"
+}

@@ -71,6 +71,23 @@ variable "project_roles" {
   ]
 }
 
+variable "calendar_mode_advice_enabled" {
+  description = <<-EOT
+    Create a project-level custom role carrying the single permission
+    compute.advice.calendarMode and bind it to the agent's service account
+    beside project_roles. The permission is what `gcloud beta compute advice
+    calendar-mode`, the capacity-obtainability skill's future-window probe,
+    needs; no viewer role carries it, and the predefined roles that do
+    (roles/compute.futureReservationUser, roles/compute.admin) carry
+    reservation writes with it. False, the default, creates no role, so an
+    install that never plans a future capacity window gets nothing new. The
+    role is bound in the host project only: the scope's per-project bindings
+    (scope.tf) are drawn from project_roles and never carry a custom role.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "scoped_pool_enabled" {
   description = <<-EOT
     Arms the scoped service account pool: one reader service account per

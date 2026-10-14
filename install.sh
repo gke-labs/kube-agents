@@ -2604,6 +2604,10 @@ bootstrap_install_env_file() {
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_CUSTOM_ROLES "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   fi
+  # No flag and no interview question, like GVISOR_POOL_NAME: install.env is
+  # the one place that sets it, and the generator applies the default when
+  # nothing does. Recorded so the file carries the key an upgrade reads.
+  write_env_var "$tmp" ENABLE_CALENDAR_MODE_ADVICE "${ENABLE_CALENDAR_MODE_ADVICE:-$DEFAULT_ENABLE_CALENDAR_MODE_ADVICE}"
   # Recorded even when empty: the generator renders the scope block from these
   # on every run, and a later upgrade.sh that finds no line renders the same
   # empty block, so the presence of the keys is what tells an operator where
@@ -6742,7 +6746,8 @@ main() {
   if [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; then
     export ACCEPT_NO_NETWORK_POLICY="$PARAM_ACCEPT_NO_NETWORK_POLICY"
   fi
-  # No GVISOR_POOL_NAME. It has no flag and no interview question, so anything
+  # No GVISOR_POOL_NAME, and no ENABLE_CALENDAR_MODE_ADVICE for the same
+  # reason. Neither has a flag or an interview question, so anything
   # exported here would be a constant written over whatever install.env says --
   # the generator already applies DEFAULT_GVISOR_POOL_NAME when nothing sets it,
   # which leaves the operator's value free to win.
