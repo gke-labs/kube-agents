@@ -1,17 +1,28 @@
 import dataclasses
+import enum
 import json
 import os
 import sys
 import types
 import unittest
 import urllib.error
+from typing import Any
 from unittest import mock
+
+RELAY_URL = "http://127.0.0.1:8642"
 
 
 def _register_fake_modules():
+    """Stand in for the Hermes gateway with the symbol names and shapes the
+    patch imports (``gateway.config``, ``gateway.platforms.base`` and
+    ``gateway.platform_registry`` as of hermes-agent v2026.9.14), so the
+    adapter under test is built on a base, not on a stub of its own."""
     if "gateway.platform_registry" in sys.modules:
         return
     gateway = types.ModuleType("gateway")
+    config_mod = types.ModuleType("gateway.config")
+    platforms_mod = types.ModuleType("gateway.platforms")
+    base_mod = types.ModuleType("gateway.platforms.base")
     registry_mod = types.ModuleType("gateway.platform_registry")
 
     @dataclasses.dataclass
@@ -22,6 +33,7 @@ def _register_fake_modules():
         check_fn: object = None
         is_connected: object = None
         standalone_sender_fn: object = None
+        source: str = "plugin"
 
     class PlatformRegistry:
         def __init__(self):
@@ -37,12 +49,98 @@ def _register_fake_modules():
         def get(self, name):
             return self._entries.get(name)
 
+        def is_registered(self, name):
+            return name in self._entries
+
     registry_mod.PlatformEntry = PlatformEntry
     registry_mod.PlatformRegistry = PlatformRegistry
     registry_mod.platform_registry = PlatformRegistry()
+
+    class Platform(enum.Enum):
+        SLACK = "slack"
+
+        @classmethod
+        def _missing_(cls, value):
+            # Upstream admits a name only once the registry knows it.
+            if isinstance(value, str) and registry_mod.platform_registry.is_registered(value):
+                pseudo = object.__new__(cls)
+                pseudo._value_ = value
+                pseudo._name_ = value.upper()
+                cls._value2member_map_[value] = pseudo
+                return pseudo
+            return None
+
+    @dataclasses.dataclass
+    class PlatformConfig:
+        enabled: bool = False
+        typing_status_text: str | None = None
+        extra: dict = dataclasses.field(default_factory=dict)
+
+    class MessageType(enum.Enum):
+        TEXT = "text"
+
+    @dataclasses.dataclass
+    class MessageEvent:
+        text: str
+        message_type: MessageType = MessageType.TEXT
+        user_id: str | None = None
+        user_name: str | None = None
+        source: Any = None
+        raw_message: Any = None
+        message_id: str | None = None
+
+    @dataclasses.dataclass
+    class SendResult:
+        success: bool
+        message_id: str | None = None
+        error: str | None = None
+        raw_response: Any = None
+
+    @dataclasses.dataclass
+    class SessionSource:
+        chat_id: str
+        chat_name: str | None = None
+        chat_type: str = "dm"
+        user_id: str | None = None
+        user_name: str | None = None
+        thread_id: str | None = None
+
+    class BasePlatformAdapter:
+        def __init__(self, config, platform):
+            self.config = config
+            self.platform = platform
+            self._message_handler = None
+
+        def set_message_handler(self, handler):
+            self._message_handler = handler
+
+        def build_source(self, chat_id, chat_name=None, chat_type="dm", user_id=None,
+                         user_name=None, thread_id=None):
+            return SessionSource(chat_id, chat_name, chat_type, user_id, user_name, thread_id)
+
+        async def handle_message(self, event):
+            if self._message_handler is not None:
+                return await self._message_handler(event)
+            return None
+
+    config_mod.Platform = Platform
+    config_mod.PlatformConfig = PlatformConfig
+    base_mod.BasePlatformAdapter = BasePlatformAdapter
+    base_mod.MessageEvent = MessageEvent
+    base_mod.MessageType = MessageType
+    base_mod.SendResult = SendResult
+    platforms_mod.base = base_mod
+    gateway.config = config_mod
+    gateway.platforms = platforms_mod
     gateway.platform_registry = registry_mod
-    sys.modules["gateway"] = gateway
-    sys.modules["gateway.platform_registry"] = registry_mod
+    for name, module in (
+        ("gateway", gateway),
+        ("gateway.config", config_mod),
+        ("gateway.platforms", platforms_mod),
+        ("gateway.platforms.base", base_mod),
+        ("gateway.platform_registry", registry_mod),
+    ):
+        sys.modules[name] = module
 
 
 _register_fake_modules()
@@ -59,15 +157,22 @@ from teams_relay_patch import (
 )
 
 
-class _FakePlatformConfig:
-    """Attribute-style PlatformConfig mirroring gateway.config.PlatformConfig."""
-
-    def __init__(self, *, extra=None, typing_status_text="Custom thinking…"):
-        self.extra = extra
-        self.typing_status_text = typing_status_text
-
-
 class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # The adapter reads TEAMS_* from the process environment; a developer's
+        # own tenant or allowlist must not reach the code under test.
+        saved = {k: v for k, v in os.environ.items() if k.startswith("TEAMS_")}
+        for key in saved:
+            os.environ.pop(key, None)
+        os.environ["TEAMS_RELAY_URL"] = RELAY_URL
+
+        def restore():
+            for key in [k for k in os.environ if k.startswith("TEAMS_")]:
+                os.environ.pop(key, None)
+            os.environ.update(saved)
+
+        self.addCleanup(restore)
+
     def test_parse_allowed_users(self):
         raw = "user1@example.com, USER2@example.com , 1234-abcd-5678 "
         parsed = parse_allowed_users(raw)
@@ -189,10 +294,9 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("attachments", plain_payload)
 
     def test_install_noop_without_relay_url(self):
-        with mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": ""}):
-            teams_relay_patch.install()
+        os.environ["TEAMS_RELAY_URL"] = ""
+        teams_relay_patch.install()
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_teams_relay_adapter_lifecycle_and_message_processing(self):
         from gateway.platform_registry import PlatformRegistry, platform_registry
 
@@ -204,6 +308,11 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "teams", config={"extra": {"adaptive_cards": True}}
         )
         self.assertIsNotNone(adapter)
+        # Built on the gateway's base with the platform the registry admitted.
+        from gateway.config import Platform
+
+        self.assertIs(adapter.platform, Platform("teams"))
+        self.assertEqual(adapter.platform.value, "teams")
 
         handled_messages = []
 
@@ -238,13 +347,13 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["activityId"], "act-12345")
         self.assertEqual(meta["tenantId"], "tenant-1")
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_base_platform_adapter_handle_message_and_platform_config_object(self):
+        from gateway.config import PlatformConfig
         from gateway.platform_registry import PlatformRegistry
 
         teams_relay_patch.install()
         registry = PlatformRegistry()
-        cfg = _FakePlatformConfig(
+        cfg = PlatformConfig(
             extra={"adaptive_cards": False}, typing_status_text="Custom thinking…"
         )
         adapter = registry.create_adapter("teams", cfg)
@@ -280,8 +389,9 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received_events), 1)
         self.assertEqual(received_events[0].text, "check pods")
         self.assertEqual(received_events[0].message_id, "act-777")
+        self.assertEqual(received_events[0].source.chat_id, "conv-777")
+        self.assertEqual(received_events[0].source.user_id, "aad-u1")
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_send_and_send_typing(self):
         from gateway.platform_registry import PlatformRegistry
 
@@ -304,15 +414,14 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
                     "serviceUrl": "https://smba.trafficmanager.net/teams/",
                 },
             )
-            self.assertEqual(res, {"id": "msg-1"})
-            self.assertTrue(getattr(res, "success", False))
-            self.assertEqual(getattr(res, "message_id", None), "msg-1")
+            self.assertTrue(res.success)
+            self.assertEqual(res.message_id, "msg-1")
+            self.assertEqual(res.raw_response, {"id": "msg-1"})
 
             await adapter.send_typing(
                 "conv-123", "https://smba.trafficmanager.net/teams/"
             )
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_unauthorized_tenant_rejected(self):
         from gateway.platform_registry import PlatformRegistry
 
@@ -332,7 +441,6 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         await adapter._process_activity(activity)
         self.assertEqual(len(handled), 0)
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_unauthorized_user_rejected_and_warned(self):
         from gateway.platform_registry import PlatformRegistry
 
@@ -363,7 +471,6 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             await adapter._process_activity(activity)
             self.assertTrue(mock_urlopen.called)
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_malformed_activity_and_untrusted_service_url_dropped(self):
         from gateway.platform_registry import PlatformRegistry
 
@@ -389,7 +496,6 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
                 await adapter._process_activity(bad_activity)
             mock_urlopen.assert_not_called()
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_non_message_ignored(self):
         from gateway.platform_registry import PlatformRegistry
 
@@ -402,7 +508,6 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         await adapter._process_activity({"type": "conversationUpdate"})
         self.assertEqual(len(handled), 0)
 
-    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": "http://127.0.0.1:8642"})
     async def test_connect_waits_for_sidecar_and_disconnects(self):
         from gateway.platform_registry import PlatformRegistry
 
