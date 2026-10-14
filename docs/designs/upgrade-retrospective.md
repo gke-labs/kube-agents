@@ -180,7 +180,9 @@ removes both. The first-run stage skips every audit when no GitOps repository is
 the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
 streams it serves exist to file a ledger. This stream does not: the collector needs no repository
 and the report on the volume is the record. Where a repository is configured and the run is full,
-the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
+the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6; a probe that
+names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
+`finish`), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
 refuses a manifest older than the run); without a repository it runs the collector alone, manifest
 included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
@@ -849,7 +851,9 @@ nothing: an after-upgrade wake locked out by the Sunday run exits the same way, 
 reviews the same operation, and the route's next wake or sweep finds it in the reviewed list and
 prints nothing; an on-demand run locked out answers from the latest saved report and says a run
 is in progress. A
-dry run reads without the lock. Reports are named by their finish time in UTC, full
+dry run reads without the lock; `--reset-ledger` takes the lock as a run does, waits as a run
+does, and prints the lock-held line when another run holds it, so its archive and marker never
+interleave with a run's writes. Reports are named by their finish time in UTC, full
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
 fleet-audit report store uses, and only a full run moves the latest link. Each file is written to a
@@ -892,8 +896,11 @@ repairing the JSON or moving `<file>.unreadable-<stamp>` back under the file's n
 as that run wrote it). The second is `--reset-ledger`, run by an operator on purpose: it archives
 the records and the live ledger and guards files under `archive/<stamp>/` and marks the store, so
 the next full run is a baseline that reviews every cluster as new under the first-run rules of
-§3.2, writes its manifest with `after_reset: true`, and the SOP calls no `finish` for it; the
-ledger issue keeps its findings until the following full run files them again from its own reads
+§3.2, writes its manifest with `after_reset: true`, and the SOP calls no `finish` for it. The SOP learns
+of the pending reset before `start`: the collector's `--probe-lock`, which every route that calls
+`start` runs first, names the marker on its line, and the SOP then runs the baseline as it runs the
+no-repository route, the collector alone with no `start`, so no in-flight note is left standing
+(the case §3.1a's one refusal would otherwise gain). The ledger issue keeps its findings until the following full run files them again from its own reads
 or resolves them, and every guard's first-seen date and review count restart. Every run between
 the reset and that baseline carries the same marker. A run starts
 from an empty ledger on its own only when neither a ledger nor a crash record exists, and only on a
@@ -993,7 +1000,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    platform `AGENTS.md`; the roster entry
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` entry with the six check ids §3.3 lists, so findings file, with check
    ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (the `fleet_scope` call, the lock probe, `start`, the collector and `finish` with its
-   manifest where a repository is linked, with the recovery `finish` for a collector exit without a manifest after `start`, §3.6; the collector alone without one) and the first-run stage
+   manifest where a repository is linked, with the recovery `finish` for a collector exit without a manifest after `start`, §3.6; the
+   collector alone without one, and on either install when the probe names a pending reset, §3.6) and the first-run stage
    marking this job due without a repository; the `upgrade-retrospective-after-upgrade` roster
    entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
    selection) and `agents/platform/scripts/upgrade_retrospective_watch.py` with its `no_agent`
@@ -1101,7 +1109,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   refused on the next run as the ledger's record is, the line naming the file; a `guards.json`
   absent beside a live ledger refused the same way; `--reset-ledger` archiving the records and the
   live files and marking the store, the next full run a baseline whose manifest carries
-  `after_reset: true`, the runs before it too, and the run after it not; a root run writing the
+  `after_reset: true`, the runs before it too, and the run after it not, the probe naming the pending
+  reset so the SOP runs the baseline without `start`, and the reset taking the lock and printing
+  the lock-held line while a run holds it; a root run writing the
   report, the JSON, the lock and a store directory with a symlink planted at each name, the
   targets untouched; the recovery `finish` of a run that lost the lock on a first
   run, with no saved report: `scope.clusters` from the listing of the projects the exit line
