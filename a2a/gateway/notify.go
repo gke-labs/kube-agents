@@ -924,8 +924,12 @@ func (c gatewayConversations) MarkConversation(conversation string, mark MarkSta
 	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
 	defer cancel()
 	rec, err := g.reg.Get(ctx, conversation)
-	if err != nil || rec == nil {
-		g.log.Warn("notify: mark not drawn; no session record", "conversation", conversation, "err", err)
+	if err != nil {
+		g.log.Warn("notify: mark not drawn; session record unreadable", "conversation", conversation, "err", err)
+		return
+	}
+	if rec == nil {
+		g.log.Warn("notify: mark not drawn; no session record", "conversation", conversation)
 		return
 	}
 	if !g.applyNotifyMark(rec, mark) {
