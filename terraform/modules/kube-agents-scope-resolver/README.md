@@ -54,7 +54,7 @@ numeric IDs), with the Cloud Asset Inventory search the reconcile runs for a con
 `searchAllResources` call scoped to it, filtered to `container.googleapis.com/Cluster`, the project
 read out of each asset name. The pool's accounts are Terraform's, one per project, so a member the
 reconcile would discover under the container has to be known at plan time to get one. The members
-get a pool account and nothing else: no binding of their own, since the container's grant is
+get a pool account and nothing else (no drift audit-log sink: which projects get one is the drift-pubsub README's "Exporting the scope's other projects"): no binding of their own, since the container's grant is
 inherited, and no place in the resolved-set cap, which counts containers at runtime after the
 explicit projects and the selectors. A project created under the container between applies is
 discovered and gets its profile, and every kubectl for it is refused until the next `upgrade.sh`

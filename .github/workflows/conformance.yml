@@ -31,6 +31,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# One run per pull request, newest wins: a second push cancels the first push's
+# queued or running suite instead of queueing behind it. Push and dispatch runs
+# fall back to the run id, so none of those is ever cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

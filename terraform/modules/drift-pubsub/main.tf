@@ -17,11 +17,22 @@ locals {
   # profile; filtering in the sink would discard the denominators and make a
   # mistuned automation allowlist impossible to debug. The lease carve-out
   # below is the one deliberate exception.
-  base_filter = <<-EOT
-    logName="projects/${var.project_id}/logs/cloudaudit.googleapis.com%2Factivity"
+  activity_filter = <<-EOT
     resource.type="k8s_cluster"
     protoPayload.methodName=~"create|patch|update|delete"
   EOT
+
+  # The logName clause names the project the sink sits in, so it is written
+  # per sink: the host's here, each source project's below.
+  activity_log_name = {
+    for project in setunion(local.source_projects, toset([var.project_id])) :
+    project => "logName=\"projects/${project}/logs/cloudaudit.googleapis.com%2Factivity\""
+  }
+
+  base_filter = "${local.activity_log_name[var.project_id]}\n${trimspace(local.activity_filter)}"
+
+  # Cloud Logging's bound on a sink's name; the source sinks join two names.
+  sink_name_max_chars = 100
 
   # Leader-election and node-heartbeat Leases dominate this stream and carry no
   # drift signal. A Lease is created at runtime by the controller that holds it,
@@ -92,6 +103,41 @@ locals {
   # out: it moves the grant and the postcondition together, so setting it to
   # what Logging reported makes the apply correct rather than merely quiet.
   expected_sink_writer_identity = coalesce(var.sink_writer_identity_override, local.derived_sink_writer_identity)
+
+  # The scope's other projects (the section below the host's sink). Never the
+  # host, whose sink is the one above, whatever the caller passed.
+  source_projects = setsubtract(toset(var.source_projects), toset([var.project_id]))
+
+  # One name for every source sink, the host's sink name with the host project
+  # appended. Sink names are unique per project, and a source project may hold
+  # a sink of another install's: its own, named sink_name, when it is that
+  # install's management project, or another install's source sink when two
+  # installs list it in their scopes. The host project is what tells them apart.
+  source_sink_name = "${var.sink_name}-${var.project_id}"
+
+  # The source sinks carry the shared clauses and the lease carve-out, and not
+  # cluster_names: those are bare names in the host project, and a cluster of
+  # the same name elsewhere is another cluster.
+  source_sink_filter = {
+    for project in local.source_projects :
+    project => join("\n", compact([
+      local.activity_log_name[project],
+      trimspace(local.activity_filter),
+      local.lease_filter,
+    ]))
+  }
+
+  # Each source project's Logging service agent, from its own number, for the
+  # same reason as the host's: the grant has to precede the sink. The same
+  # override exists per project, for the same dead end.
+  source_derived_sink_writer_identity = {
+    for project, source in data.google_project.source :
+    project => "serviceAccount:service-${source.number}@gcp-sa-logging.iam.gserviceaccount.com"
+  }
+  source_expected_sink_writer_identity = {
+    for project in local.source_projects :
+    project => coalesce(lookup(var.source_sink_writer_identity_overrides, project, null), local.source_derived_sink_writer_identity[project])
+  }
 }
 
 data "google_project" "this" {
@@ -334,8 +380,150 @@ resource "google_logging_project_sink" "drift_audit" {
   depends_on = [time_sleep.sink_drain]
 }
 
-// Nobody, on an install: the sink above is the only publisher, which is what
-// makes a record on this topic evidence that the API server recorded the call.
+# The scope's other projects.
+#
+# spec.scope lets one install discover clusters in projects beyond the one it
+# runs in (docs/designs/multi-project-scope.md). Admin Activity audit logs are
+# per project by construction -- a project-level sink exports its own
+# project's entries and nothing else -- so each project the scope lists needs
+# a sink of its own, routed into this install's one topic. One topic, one
+# subscription and one detector: the detector routes every record by the
+# project, location and cluster it names and reads the cluster through the
+# Cluster Agent profile the reconcile wrote for it, so what it joins is
+# bounded by which projects' records reach the subscription, which is what
+# these sinks decide.
+#
+# Each source project gets the four pieces the host has, in the host's
+# order: its Logging service agent minted up front, roles/pubsub.publisher on
+# the host topic for that agent, derived from the source project's number so
+# the grant precedes the sink, a drain of its own, and the sink last. A drain
+# per source project rather than the host's shared one, because a source sink
+# is destroyed on its own: a project removed from the scope, or excluded,
+# takes its sink and its grant out of the plan while the host's drain stays,
+# and a drain that stays waits for nothing.
+# Keyed on the project, a drain leaves with the sink it guards: that project's
+# sink is deleted, its drain waits, and only then is its grant revoked -- the
+# order a shrink needs in the SOURCE project, whose owners the mail would
+# otherwise reach. On a full destroy every drain runs, each behind its own
+# sink.
+#
+# A folder's or organisation's members are never among these: the composition
+# feeds this list from the declaration and the selectors (kube-agents-iam's
+# scope_export_projects), not from the Cloud Asset Inventory listing the
+# scoped service account pool uses, whose gaps would churn a sink. A
+# container's clusters are discovered at runtime and their audit logs are not
+# exported here. An
+# aggregated sink on the container would cover them in one piece and is its
+# own design: Logging documents no writer-identity form for a folder or
+# organisation sink, so its grant could not precede it the way these do, and
+# include_children exports every project under the container, the excluded
+# ones included.
+data "google_project" "source" {
+  for_each = local.source_projects
+
+  project_id = each.key
+}
+
+# As google_project_service_identity.logging above, per source project: the
+# first sink in a project is what would otherwise mint its agent, after the
+# grant that has to name it.
+resource "google_project_service_identity" "source_logging" {
+  for_each = local.source_projects
+  provider = google-beta
+
+  project = each.key
+  service = "logging.googleapis.com"
+}
+
+# As time_sleep.logging_identity above, per source project, for the same race:
+# the grant below names an agent Service Usage may not have bound yet, and a
+# source project whose agent did not pre-exist fails the apply with "Service
+# account ... does not exist" exactly as the host did (#2693). Same duration,
+# same two trigger keys, for the same reasons; one per project, so a project
+# added to the scope pays its own wait and a re-minted agent re-pays its own.
+resource "time_sleep" "source_logging_identity" {
+  for_each = local.source_projects
+
+  create_duration = var.logging_identity_propagation_duration
+
+  triggers = {
+    logging_service_identity = google_project_service_identity.source_logging[each.key].id
+    duration                 = var.logging_identity_propagation_duration
+  }
+}
+
+# On the host topic, for the source project's agent: the sink in that project
+# publishes across projects as that project's identity, so the grant lives
+# where the topic does and names an identity from elsewhere. `.id`, as the
+# host's grant says. Behind the wait above, as the host's grant is behind its
+# wait. The member is a function of data.google_project.source,
+# so the replacement the host grant's comment describes -- a caller's
+# depends_on deferring the module's data sources, member read as unknown,
+# ForceNew -- reaches these too, one per source project, with the window's
+# mail going to that project's owners; source_sink_writer_identity_overrides
+# pins a member against it as the host's override does.
+resource "google_pubsub_topic_iam_member" "source_sink_writer" {
+  for_each = local.source_projects
+
+  project = var.project_id
+  topic   = google_pubsub_topic.drift_audit.id
+  role    = "roles/pubsub.publisher"
+  member  = local.source_expected_sink_writer_identity[each.key]
+
+  depends_on = [time_sleep.source_logging_identity]
+}
+
+# One per source project, for the reason the section comment gives; the same
+# duration as the host's, read from state on destroy like the host's.
+resource "time_sleep" "source_sink_drain" {
+  for_each = local.source_projects
+
+  destroy_duration = var.sink_drain_duration
+
+  depends_on = [google_pubsub_topic_iam_member.source_sink_writer]
+}
+
+resource "google_logging_project_sink" "source_drift_audit" {
+  for_each = local.source_projects
+
+  project     = each.key
+  name        = local.source_sink_name
+  destination = "pubsub.googleapis.com/${google_pubsub_topic.drift_audit.id}"
+  filter      = local.source_sink_filter[each.key]
+
+  # The source project's own Logging service agent, as for the host; without
+  # it every source sink would publish as the one identity shared across
+  # every Google Cloud customer, and the grant above could not be narrower.
+  unique_writer_identity = true
+
+  lifecycle {
+    # Sink names are capped at 100 characters, and this one is two names
+    # joined; a refusal here names both halves where the API would name
+    # neither.
+    precondition {
+      condition     = length(local.source_sink_name) <= local.sink_name_max_chars
+      error_message = "the source sinks would be named ${local.source_sink_name} (sink_name with project_id appended), ${length(local.source_sink_name)} characters, over Cloud Logging's ${local.sink_name_max_chars}; shorten sink_name."
+    }
+    # As the host sink's postcondition: a source sink publishing as anything
+    # but the granted identity is live and exporting as an identity with no
+    # publish role, and the mail goes to every owner of the SOURCE project.
+    postcondition {
+      condition     = self.writer_identity == local.source_expected_sink_writer_identity[each.key]
+      error_message = "sink ${local.source_sink_name} in ${each.key} publishes as ${self.writer_identity}, not the ${local.source_expected_sink_writer_identity[each.key]} that roles/pubsub.publisher on ${var.topic_name} was granted to, so it cannot write to the topic. The sink already exists and is exporting: this check runs after it is created and does not remove it, so until you resolve this every export fails with topic_permission_denied and Cloud Logging mails every principal holding roles/owner on ${each.key}. To stop that now, delete the sink (gcloud logging sinks delete ${local.source_sink_name} --project=${each.key}) or grant roles/pubsub.publisher on ${var.topic_name} in ${var.project_id} to ${self.writer_identity} by hand -- the hand grant stops the mail but will NOT clear this check. The fix that clears it is source_sink_writer_identity_overrides = { \"${each.key}\" = \"${self.writer_identity}\" }, which moves the grant and this check onto the identity Logging reported; on the full-install composition the variable is drift_pubsub_source_sink_writer_identity_overrides, set as a TF_VAR_ line in install.env through the front doors (they regenerate terraform.tfvars on every run) or in terraform.tfvars for a hand-driven apply. Then open an issue: the module derives the identity from the project number and this project does not follow that form."
+    }
+  }
+
+  depends_on = [time_sleep.source_sink_drain]
+}
+
+// Nobody, on an install: the sinks above are the only publishers -- the
+// host's and, on a scoped install, each source project's, each publishing as
+// its project's Logging service agent -- which is what makes a record on this
+// topic evidence that an API server recorded the call. The boundary that
+// draws is per project, not per sink: unique_writer_identity is unique per
+// project, so whoever can create a sink in the host project, or in a source
+// project, can publish here as that project's agent; the module README's
+// section on the source projects says so, since a scope widens that set.
 // The evaluation pool is the exception and the variable's description says why
 // the exception is confined to it. Topic-scoped and for_each'd over the
 // members, so a project that sets it grants publish on this one topic and the
