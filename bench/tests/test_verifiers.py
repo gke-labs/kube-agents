@@ -6953,14 +6953,17 @@ def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, fa
 
 
 _WEBHOOK_RUN = "the-readiness-run-happened"
-_WEBHOOK_RUNS = next(e["check"]["required_runs"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# The route objective's whole check, the run it requires and the hand survey it forbids, so the
+# table below exercises both halves as the case runs them.
+_WEBHOOK_RUN_CHECK = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+_WEBHOOK_RUNS = _WEBHOOK_RUN_CHECK["required_runs"]
 _SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
 _SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
 
 
 def _run_objective(command: str) -> str:
     _stash_commands([command])
-    return WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS).verify(5.0).status
+    return WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status
 
 
 # The run objective reads each command's argv as the shell splits it: the script by any path or
@@ -6999,6 +7002,13 @@ def _run_objective(command: str) -> str:
         ('python3 "$DIR/fleet_upgrade_report.py" --readiness', True),
         # not a run: the survey, a mention of the file, a run without the mode, a usage call
         ("kubectl get pdb,validatingwebhookconfigurations -A -o json", False),
+        # the hand survey the bullet forbids is refused by the forbid wherever kubectl's global flags stand, and
+        # beside the run too; a kubectl of something else beside the run is not the survey
+        ("kubectl --context gke_p_us-central1_seeded-b get pdb -A", False),
+        ("kubectl --kubeconfig /opt/data/.kubeconfigs/m.yaml get validatingwebhookconfigurations -o json", False),
+        ("kubectl -n seeded-upgrade describe pdb pinned-batch-runner", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl --context c get pdb -A", False),
+        (f"python3 {_SCRIPT_PATH} --readiness && kubectl --context c get nodes", True),
         (f"grep -n readiness {_SCRIPT_PATH}", False),
         ("cat fleet_upgrade_report.py | grep -- --readiness", False),
         (f"python3 {_SCRIPT_PATH} --target-version 1.33", False),
@@ -7158,6 +7168,16 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
         with pytest.raises(ValueError):
             WorkerRun(**bad)
+
+
+def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
+    # The forbid, not the run reader, is what refuses a survey that stands beside the dictated
+    # run: with the survey the objective fails and names the pattern; without it, it passes.
+    _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get pdb -A -o json"])
+    res = WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0)
+    assert res.status == "fail" and "forbidden" in res.reason.lower(), res.reason
+    _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get nodes"])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
 
 
 def test_worker_commands_required_run_names_what_did_not_run():
