@@ -152,9 +152,12 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
 def read_json(path: Path) -> object | None:
     """Parse `path` as JSON, or None if it is absent, unreadable, or malformed.
 
-    None is "no usable prior state", and every caller treats that as "let the
-    image's copy stand". A half-written jobs.json must not take the profile's
-    whole cron roster down with it.
+    None is "no usable prior state"; what a caller does with it depends on who
+    owns the file. The cron merge lets the image's copy stand, since a
+    half-written jobs.json must not take the profile's whole cron roster down
+    with it; the volume-wins merge holds the volume's file and merges nothing,
+    since a criteria file the operator tuned must not be replaced by the
+    image's empty template.
     """
     try:
         return json.loads(path.read_text(encoding="utf-8"))
