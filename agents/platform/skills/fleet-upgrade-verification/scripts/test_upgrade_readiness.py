@@ -778,15 +778,16 @@ class WebhookScopeTest(unittest.TestCase):
         return r.upgrade_path_matches({"rules": rules})
 
     def test_a_gate_outside_the_upgrade_path_is_an_outage_not_a_blocker(self):
-        # The seeded fleet's fixture: a gate on ConfigMaps with no Service, scoped to its own
-        # namespace (bench/tf/fleet/defects-b.tf). It is an outage because its rules match
-        # ConfigMaps only, which neither graded list carries; the scope confines the gate.
-        gate = scoped(hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate")), {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}})
+        # The seeded fleet's fixture, as bench/tf/fleet/defects-b.tf writes it: a gate on
+        # `CREATE configmaps` in the core group at `v1`, no Service, scoped to its own namespace.
+        # It is an outage because its rule matches ConfigMaps only, which neither graded list
+        # carries; the scope confines the gate; the cell carries the pinned `v1`.
+        gate = scoped(hook("gate.seeded.invalid", [rule(["configmaps"], versions=("v1",))], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate")), {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}})
         graded = grade([gate])
         self.assertEqual(graded["blocking"], [])
         self.assertEqual(len(graded["outage"]), 1)
-        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
-        self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps"])
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails now every request the server sends it; reported, not graded", r.describe_webhook_finding(graded["outage"][0]))
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps at v1"])
 
     def test_an_outage_cell_names_every_rule_with_its_group(self):
         # GKE's managed Prometheus operator gate, outside the path: the cell says what it does match.
