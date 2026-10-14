@@ -1058,9 +1058,12 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     is pinned, and of the pinned rule alone when a live rule sits beside it.
     Fail-open webhooks are counted
     (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
-    which nothing read here can check.
+    which nothing read here can check, and fail-closed webhooks with no `rules` (`no_rules`),
+    which match no request: the server never calls such a webhook, so a dead backend behind
+    it fails nothing now and blocks nothing (a policy engine's configuration before any policy
+    selects a resource is the usual shape).
     """
-    result = {"blocking": [], "outage": [], "evaluated": 0, "fail_open": 0, "url_backends": 0}
+    result = {"blocking": [], "outage": [], "evaluated": 0, "fail_open": 0, "url_backends": 0, "no_rules": 0}
     for config in configs:
         config_kind = config.get("kind")
         config_name = (config.get("metadata") or {}).get("name", "")
@@ -1073,6 +1076,9 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             service_ref = (hook.get("clientConfig") or {}).get("service")
             if not isinstance(service_ref, dict):
                 result["url_backends"] += 1
+                continue
+            if not _rules(hook):
+                result["no_rules"] += 1
                 continue
             result["evaluated"] += 1
             reason = backend_problem(service_ref, services, slices)

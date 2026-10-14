@@ -490,6 +490,18 @@ class WebhookBackendTest(unittest.TestCase):
         slices = [endpoint_slice("scen", "other-svc", [True]), endpoint_slice("prod", "gate-svc", [True])]
         self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
 
+    def test_a_webhook_with_no_rules_is_counted_not_graded(self):
+        # `rules` is optional and a webhook with none matches no request, so the server never
+        # calls it: a dead backend behind it fails nothing now and is not an outage to report.
+        for rules in ([], None):
+            with self.subTest(rules=rules):
+                config = webhook_config("ValidatingWebhookConfiguration", "gate", [hook("empty.example.com", rules, policy="Fail")])
+                if rules is None:
+                    del config["webhooks"][0]["rules"]
+                graded = r.grade_webhooks([config], [], [])
+                self.assertEqual((graded["blocking"], graded["outage"]), ([], []))
+                self.assertEqual((graded["no_rules"], graded["evaluated"]), (1, 0))
+
     def test_fail_open_and_url_backends_are_counted_not_graded(self):
         graded = grade([hook("a.example.com", POD_GATE, policy="Ignore"), hook("e.example.com", POD_GATE, policy="Fail", service=None, url="https://localhost:5443/v")])
         self.assertEqual((graded["blocking"], graded["outage"]), ([], []))

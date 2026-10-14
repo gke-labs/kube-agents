@@ -1058,9 +1058,10 @@ def save_state(path: str, state: dict) -> None:
 
 
 def clear_output(path: str) -> str | None:
-    """Removes the `--output` file a previous run left at `path`, before this run reads anything,
-    so a run that dies or is refused leaves no file rather than the previous question's report
-    where a reader was told the answer is. Returns the error to report when a file is there and
+    """Removes the `--output` file a previous run left at `path`, as soon as the flags parse and
+    before any check that can refuse the run, so a run that dies or is refused leaves no file
+    rather than the previous question's report where a reader was told the answer is; only a
+    run argparse itself refuses (an unknown or mistyped flag) ends before this runs. Returns the error to report when a file is there and
     cannot be removed; None when there is none or it is gone. A directory at the path is left
     for the write to report, as before."""
     if os.path.isdir(path):
@@ -1250,6 +1251,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)
 
+    # First thing after the flags parse, ahead of every check that can refuse the run, so a
+    # refused or killed run leaves no previous report at the path a reader was sent to. Only
+    # argparse's own exits (an unknown or mistyped flag) come before this.
+    if args.output:
+        clear_error = clear_output(args.output)
+        if clear_error:
+            sys.stderr.write(clear_error + "\n")
+            return EXIT_USAGE
+
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")
         return EXIT_USAGE
@@ -1266,12 +1276,6 @@ def main(argv: list[str] | None = None) -> int:
     elif args.at or args.kubeconfig_dir:
         sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
         return EXIT_USAGE
-
-    if args.output:
-        clear_error = clear_output(args.output)
-        if clear_error:
-            sys.stderr.write(clear_error + "\n")
-            return EXIT_USAGE
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)

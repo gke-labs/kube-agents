@@ -536,6 +536,19 @@ class OutputShapeTest(unittest.TestCase):
                 report.main(["--project", "p1", "--target-version", self.target, "--output", out_path])
         self.assertFalse(os.path.exists(out_path))
 
+    def test_a_run_refused_by_a_flag_value_leaves_no_previous_output(self):
+        # The clear runs ahead of every check that can refuse the run, so a --target-version or
+        # --at that does not parse leaves no earlier report where the worker is sent.
+        for argv in (["--target-version", "1.35"], ["--readiness", "--at", "yesterday"], ["--at", self.target]):
+            with self.subTest(argv=argv):
+                out_path = os.path.join(tempfile.mkdtemp(), "fleet_readiness.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write('{"stale": true}')
+                with patch.object(report, "run_cmd", side_effect=AssertionError("nothing is read")), redirect_stderr(io.StringIO()):
+                    rc = report.main(["--project", "p1", *argv, "--output", out_path])
+                self.assertEqual(rc, report.EXIT_USAGE)
+                self.assertFalse(os.path.exists(out_path))
+
     def test_main_refuses_an_output_it_cannot_clear(self):
         # The previous file cannot be removed (its directory is read-only): the run refuses
         # rather than read the fleet and leave that file where the answer is expected.

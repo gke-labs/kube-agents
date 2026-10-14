@@ -228,7 +228,7 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
   `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
-  GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`).
+  GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`), and so is a fail-closed webhook with no `rules` (`no_rules`): it matches no request, so the server never calls it and a dead backend behind it fails nothing now.
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
   RFC 3339 instant, by default now. An exclusion in effect blocks when its scope covers the upgrade
   the target needs: `NO_UPGRADES` (the default when the record carries no scope) always;
