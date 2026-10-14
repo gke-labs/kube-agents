@@ -25263,6 +25263,21 @@ class TestSopPath(unittest.TestCase):
                 "/srv/agent/profiles/platform/governance/compliance_audit_sop.md",
             )
 
+    def test_audit_documents_run_skill_scripts_by_full_path(self):
+        """A kanban worker starts in its card's workspace, where `./skills/...`
+        names nothing; the SOPs and the audit skills must not send it there."""
+        platform = Path(__file__).resolve().parents[3]
+        documents = sorted((platform / "governance").glob("*_sop.md")) + [
+            platform / "skills" / name / "SKILL.md"
+            for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
+        ]
+        relative = re.compile(r"(?<![\w/.-])(?:\./)?skills/[\w-]+/scripts/")
+        for document in documents:
+            with self.subTest(document=document.name):
+                self.assertEqual(
+                    [], relative.findall(document.read_text(encoding="utf-8"))
+                )
+
     def test_a_rejection_points_at_the_sop_by_full_path(self):
         self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))
 

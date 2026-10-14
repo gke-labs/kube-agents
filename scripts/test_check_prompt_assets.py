@@ -901,6 +901,13 @@ class CheckoutPathTests(unittest.TestCase):
         )
         self.assertEqual(len(self._findings()), 1)
 
+    def test_runtime_state_under_the_profile_home_is_not_reported(self):
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/SETTINGS.md` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
     def test_the_finding_names_the_spelling_that_would_work(self):
         """The author checked that the file exists; saying only "does not
         resolve" reads as the checker being wrong. Hand them the rewrite."""
