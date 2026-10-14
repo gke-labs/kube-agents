@@ -319,6 +319,7 @@ BUDGET_SPENT_REASON = "not read this run: the read budget ({seconds} s) was spen
 RECHECK_DEFERRED_TEXT = "the read budget ({seconds} s) was spent before its re-check started"
 RECHECK_DEFERRED_LINE = "re-check not started, the read budget spent; {guards} guard(s) held"
 INFO_BUDGET_SPENT = "Read budget spent: {seconds} s after {reviewed} review(s) and {rechecked} re-check(s); {cut} review(s) and {cut_rechecks} re-check(s) cut mid-read, {deferred} cluster(s) held for the next run, {deferred_rechecks} re-check(s) not started."
+PRUNE_FAILED_FORMAT = "reports not pruned this run: {error}"
 INFO_AFTER_RESET = "Baseline after --reset-ledger: the store was archived under {archive} at {at}; every cluster is reviewed as new, the manifest carries after_reset, and the SOP files nothing from this run."
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
@@ -2622,6 +2623,11 @@ def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded
             continue
         spec = {k: v for k, v in (pdb.get("spec") or {}).items() if k != "selector"}
         expected, healthy = status.get("expectedPods"), status.get("currentHealthy")
+        if isinstance(expected, int) and not isinstance(expected, bool) and expected == 0:
+            # The controller counts no pod (a workload scaled to zero, its
+            # pods still terminating): the budget blocks no drain and is
+            # graded on neither leg, as `budget_shapes` grades it.
+            continue
         forbids = _budget_allows_no_disruption(spec, expected if isinstance(expected, int) else (len(covered) or None))
         out.append({
             "spec": spec,
@@ -3434,7 +3440,7 @@ def version_skew_symptoms(cluster: dict, now: datetime | None, first_seen: dict[
     return rows
 
 
-def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
+def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver, now: datetime | None = None) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
     """What the API server itself says is failing: a pod whose phase, or a
     container state the kubelet wrote, shows it, and an owner whose
     controller set a failure condition -- by pod and by top owner. These are
@@ -3443,9 +3449,10 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     failing_objects: dict[str, str] = {}
     for pod in pods:
         meta, status = pod.get("metadata") or {}, pod.get("status") or {}
-        if _pod_is_gated(pod) or meta.get("deletionTimestamp"):
-            # Waiting for admission, or being deleted: not a failure anything
-            # agrees with.
+        if _pod_is_gated(pod) or meta.get("deletionTimestamp") or _pod_is_starting(pod, now):
+            # Waiting for admission, being deleted, or still starting inside
+            # the grace: not a failure anything agrees with, so event text on
+            # such a pod keeps its own grade.
             continue
         what = ""
         for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []):
@@ -3488,7 +3495,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         if pool and pool not in upgraded and (pod.get("status") or {}).get("phase") == PHASE_RUNNING and _condition(pod, "Ready").get("status") == "True":
             untouched_images.update(c.get("image") or "" for c in (pod.get("spec") or {}).get("containers") or [])
     resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or [])
-    failing_pods, failing_objects = _api_set_failures(reads.get("pods") or [], reads.get("owners") or [], resolver)
+    failing_pods, failing_objects = _api_set_failures(reads.get("pods") or [], reads.get("owners") or [], resolver, now=now)
     ctx = Context(
         cgroup_modes=pool_cgroup_modes(cluster),
         node_pool=node_pool,
@@ -6019,9 +6026,10 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     result["report"] = render_report(result)
     if args.dry_run:
         return result
-    # Write order: report, JSON, guards, ledger last -- each atomic -- so a
-    # crash leaves at most a report with no ledger advance. Names carry the
-    # finish time; a scoped run never moves the fleet link.
+    # Write order: report, JSON, manifest, guards, ledger last -- each
+    # atomic -- so a crash leaves at most a report with no ledger advance,
+    # and the pruning after all of them. Names carry the finish time; a
+    # scoped run never moves the fleet link.
     finish = (now if clock_fixed else now_utc()).strftime(REPORT_TS_FORMAT)
     suffix = SCOPED_SUFFIX if scoped else ""
     reports_dir = data_dir() / REPORTS_SUBDIR
@@ -6036,13 +6044,19 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         result["manifest"] = build_manifest(result, ledger, started_at=seen_at, finished_at=fmt_ts(now_utc() if not clock_fixed else now))
         write_json_atomically(Path(args.manifest_file), result["manifest"])
         result["manifest_path"] = str(args.manifest_file)
-    prune_reports(reports_dir)
     write_json_atomically(guards_path, new_guards)
     write_json_atomically(ledger_path, new_ledger)
     if after_reset and not scoped:
         # The baseline is written: the runs from here on file as usual.
         with contextlib.suppress(FileNotFoundError):
             reset_marker_path.unlink()
+    # Housekeeping, after the state writes: a refusal here (a link planted at
+    # `reports/`, a file this uid cannot unlink) leaves the run's state
+    # consistent with the manifest `finish` reads, and is one logged line.
+    try:
+        prune_reports(reports_dir)
+    except (StateUnreadable, OSError) as exc:
+        log(PRUNE_FAILED_FORMAT.format(error=exc))
     return result
 
 

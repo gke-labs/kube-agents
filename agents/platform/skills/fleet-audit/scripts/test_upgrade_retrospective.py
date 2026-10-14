@@ -1152,6 +1152,31 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual((rows, gated), ([], ["apps/queued"]))
         resolver = ur.Resolver([queued], [], [])
         self.assertEqual(ur._api_set_failures([queued], [], resolver), ({}, {}))
+        # Nor does a pod still starting inside the grace: given the clock, the API-set test skips it as
+        # the symptom pass does, so a scheduler or kubelet Warning event on it keeps its own grade
+        # rather than reading as agreed by the API server; without the clock it would count.
+        fresh = pod("fresh", phase="Pending", statuses=[{"name": "c0", "state": {"waiting": {"reason": "ContainerCreating"}}, "restartCount": 0}])
+        fresh["metadata"]["creationTimestamp"] = "2026-10-08T17:58:00Z"
+        fresh["status"]["startTime"] = "2026-10-08T17:58:00Z"
+        fresh["status"]["conditions"] = [{"type": "PodScheduled", "status": "True"}]
+        resolver = ur.Resolver([fresh], [], [])
+        self.assertEqual(ur._api_set_failures([fresh], [], resolver, now=NOW), ({}, {}))
+        self.assertTrue(ur._api_set_failures([fresh], [], resolver)[0])
+        warned = event("FailedScheduling", "0/4 nodes are available: 4 Insufficient cpu.", kind="Pod", name="fresh", namespace="apps")
+        rows = ur.collect_symptoms(cluster_doc("seeded-a"), {"pods": [fresh], "nodes": READS["seeded-a"]["nodes"], "events": [warned], "pdbs": [], "owners": []}, ops_for("seeded-a"), SINCE, now=NOW)
+        self.assertTrue(rows)
+        self.assertTrue(all(c["confidence"] == ur.MEDIUM and ur.FROM_EVENT_TEXT_DETAIL.format(source="event text") in c["detail"] for r in rows for c in r["classifications"]), rows)
+
+    def test_a_budget_the_controller_counts_no_pod_for_is_no_symptom(self):
+        # A budget at zero with expectedPods 0 (a Deployment scaled to zero during the window, its pods
+        # still terminating on the drained pool): the controller counts no pod, so the budget blocks
+        # no drain and files no row on either leg, as `budget_shapes` grades it.
+        pdbs = copy.deepcopy(READS["seeded-a"]["pdbs"])
+        for budget in pdbs:
+            if budget["metadata"]["name"] == "inference-server":
+                budget["status"] = {"disruptionsAllowed": 0, "expectedPods": 0, "currentHealthy": 0, "desiredHealthy": 0}
+        self.assertEqual([s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pdbs": pdbs}) if s["category"] == "pdb" and s["object"].endswith("/inference-server")], [])
+        self.assertTrue([s for s in symptoms_of("seeded-a") if s["category"] == "pdb" and s["object"].endswith("/inference-server")])
 
     def test_pending_pod_preference_on_a_custom_label_gates_on_that_pool(self):
         # inference-server pins `seeded-role: pinned-inference`, a label only pinned-inference-pool's node carries.
@@ -3700,6 +3725,28 @@ class LedgerAndGuardsTest(unittest.TestCase):
             again = ur.acquire_lock(lock_path, wait=timedelta(0))
             self.assertIsNotNone(again)
             again.close()
+
+    def test_pruning_runs_after_the_state_writes_and_its_refusal_is_one_line(self):
+        # Under --no-report with an outside --output and --manifest-file nothing touches reports/ until
+        # the pruning; a link planted there is met after the guards and the ledger are written, so the
+        # manifest `finish` reads and the state agree, and the refusal is one logged line, not an exit.
+        self.collect()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        elsewhere = Path(outside.name) / "elsewhere"
+        elsewhere.mkdir()
+        reports = self.home / ur.REPORTS_SUBDIR
+        reports.rename(self.home / "reports-before")
+        reports.symlink_to(elsewhere)
+        manifest, output = str(Path(outside.name) / "manifest.json"), str(Path(outside.name) / "result.json")
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                rc = ur.main(["--full", "--scope-projects", PROJECT, "--no-report", "--output", output, "--manifest-file", manifest])
+        self.assertEqual(rc, 0)
+        self.assertEqual((ur.load_json(self.home / ur.LEDGER_FILENAME, {})["updated_at"], ur.load_json(self.home / ur.GUARDS_FILENAME, {})["updated_at"]), ("2026-10-15T18:00:00Z", "2026-10-15T18:00:00Z"))
+        self.assertTrue(Path(manifest).exists() and Path(output).exists())
+        self.assertIn(ur.PRUNE_FAILED_FORMAT.format(error=ur.STORE_IS_SYMLINK_TEXT.format(path=reports)), err.getvalue())
+        self.assertEqual((sorted(p.name for p in elsewhere.iterdir()), reports.is_symlink()), ([], True))
 
     def test_an_absent_guards_file_beside_a_live_ledger_is_a_crash_record(self):
         # Every run writes the guards and then the ledger, so a live ledger beside no guards file is a
