@@ -247,8 +247,8 @@ backend is unreachable and whose rules reach the upgrade's path (the writes a no
 join make, as `UPGRADE_PATH_TARGETS` in `./skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
 a drain that will not finish, or whose rules reach the bootstrap RBAC writes a new master reconciles (ClusterRoles and ClusterRoleBindings
 always; Roles and RoleBindings in `kube-system` or `kube-public` when its namespace selector admits that
-namespace), which is a cause of a master that will not start. The PDB read costs one
-`get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
+namespace), which is a cause of a master that will not start. The two reads cost one
+`get-credentials` and two `kubectl get` per member and leave a per-member kubeconfig under
 `${HERMES_HOME:-/opt/data}/.kubeconfigs/`; an exclusion is reported as holding back automatic
 upgrades only.
 

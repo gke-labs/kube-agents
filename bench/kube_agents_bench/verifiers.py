@@ -1575,8 +1575,8 @@ def _unfold_substitutions(word: str, spans: list[str]) -> str:
 def _shell_words(command: str) -> list[str]:
     """The command line as the shell's words, quotes honoured and removed, operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
-    quotes do not balance is one bash refuses and runs nothing of, so it yields no words, and
-    neither a run nor a mention is credited from it. Comments come off and substitutions
+    quotes do not balance is one bash refuses and runs nothing of, so it yields no words and
+    no run is credited from it. Comments come off and substitutions
     fold into their words first, in one pass (:func:`_read_shell_line`), so the lexer's own
     ``#`` commenter is off, as in ``shlex.split``: it would cut a word at a ``#`` inside it
     (``readiness-#2.json``), which bash does not."""
@@ -1715,7 +1715,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     word, so a script a case names this way is built with ``allow_abbrev=False``
     (argparse's default lets ``--readi`` run ``--readiness``), as
     ``fleet_upgrade_report.py`` is; and a line bash refuses (an unclosed quote)
-    yields no words, so nothing on it is credited or forbidden; and no shell
+    yields no words, so no run is credited from it (``forbidden_patterns``
+    read the text and still match it); and no shell
     expansion is resolved, so a run spelled through a variable that holds the
     whole path (``python3 "$SCRIPT" ...``), a backtick capture or a quoted
     ``$(...)`` is not read as one -- the dictated command spells the path in

@@ -16,8 +16,9 @@ active (another member moved, or `--rollout-in-progress` was passed).
 
 With `--readiness`, each member is also graded on whether it can take the upgrade to its
 target: drain-blocking PodDisruptionBudgets and fail-closed admission webhooks with an
-unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role
-and RoleBinding writes (read with two `kubectl get` per member after
+unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC
+writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and
+kube-public; read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane. The rules live in

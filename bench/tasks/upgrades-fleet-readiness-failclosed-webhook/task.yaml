@@ -22,7 +22,8 @@
 # What the deterministic checks read, and what they leave to the judge. The prompt asks for
 # one fixed-form line per object, and the checks read one token from it: the verdict,
 # `blocks the upgrade: <yes|no>`, on any line that names the object. Nothing else on the line
-# is graded -- not the cluster prefix, the kind field or the backend field -- because three
+# is graded -- not the cluster prefix or the backend field, and the kind field on the budget's
+# lines alone (below) -- because three
 # rounds of runs rendered the same correct judgement three ways (`seeded-b/<object>`,
 # `<project>/<cluster>/<object>`, `<project>/<object>`, the webhook named by its webhook
 # rather than its configuration), and anchoring on the rendering graded the agent's
