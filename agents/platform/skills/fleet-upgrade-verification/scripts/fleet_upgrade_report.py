@@ -275,6 +275,7 @@ KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 # same second won the move-aside): not a refusal, as the shared rule reads it.
 KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
 KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
+KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubeconfig may not be, and could not be removed ({error})"
 ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
@@ -765,7 +766,14 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
                 return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(current.st_mode & KUBECONFIG_DIR_MODE_MASK), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
             finally:
                 os.close(opened)
-    if os.path.exists(path) and not os.access(path, os.W_OK):
+    if os.path.islink(path):
+        # A link planted at the file's name is removed, never written
+        # through, as the shared rule removes it.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return KUBECONFIG_LINK_NOT_REMOVED_FORMAT.format(path=path, error=exc)
+    elif os.path.exists(path) and not os.access(path, os.W_OK):
         try:
             os.unlink(path)
         except OSError as exc:

@@ -12445,6 +12445,20 @@ class CredentialsNoteTest(unittest.TestCase):
                 _, ok = collect.fetch_credentials("p", "c", "l", run=recording)
             self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
 
+def owned_by(path, uid):
+    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if self == path:
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return patch.object(Path, "stat", fake)
+
+
 class PrepareKubeconfigTest(unittest.TestCase):
     """The shared `.kubeconfigs` after a hand run as another uid, in either
     order: root first, or uid 1000 first."""
@@ -12501,9 +12515,32 @@ class PrepareKubeconfigTest(unittest.TestCase):
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
             kc.write_text("the tick's")
-            with patch.object(os, "geteuid", return_value=collect.ROOT_UID):
+            # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
+            # exercised whoever runs the suite, root included; the log shows no move-aside.
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertNotIn("moved aside", err.getvalue())
             self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, True, [".kubeconfigs"]))
+
+    def test_a_symlink_at_the_kubeconfig_file_name_is_removed_not_written_through(self):
+        # The directory is the tick's and 01777, so its account can plant a link at the file's name;
+        # `exists()` follows it and root's `os.access` would keep it, and gcloud would then write a
+        # root-owned kubeconfig wherever it points. The rule removes the link (an lstat, before the
+        # access test) so gcloud writes a fresh file; the target is untouched, for the tick and for a
+        # root run over a directory another uid owns.
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            target.write_text("root's secret")
+            target.chmod(0o600)
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.symlink_to(target)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), target.read_text(), target.stat().st_mode & 0o7777), (False, "root's secret", 0o600))
+            kc.symlink_to(target)
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), target.read_text(), target.stat().st_mode & 0o7777), (False, "root's secret", 0o600))
 
     def test_a_rename_another_thread_won_is_already_moved_not_a_refusal(self):
         # The first wave's threads start at once on a directory another uid left: each stats it, one

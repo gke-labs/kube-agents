@@ -92,6 +92,20 @@ def fleet_scope_env():
 ZONE_TIMEOUT_STDERR = "WARNING: The following zones did not respond: us-central1-b. List results may be incomplete."
 
 
+def owned_by(path, uid):
+    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if self == path:
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return mock.patch.object(Path, "stat", fake)
+
+
 def run_of(rc=0, stdout="", stderr=""):
     return ur.Run(["x"], rc, stdout, stderr, 0.01)
 
@@ -1750,6 +1764,29 @@ class ShapeTest(unittest.TestCase):
             self.assertEqual(singleton(allows_none), [("seeded-debug/Deployment/payments-api", ur.HIGH)], allows_none)
         [evidence] = [s["evidence"] for s in ur.budget_shapes([{**pdb, "spec": {"maxUnavailable": 0, "selector": shared}}], workloads) if s["object"] == "seeded-debug/Deployment/payments-api"]
         self.assertIn("covering 4 pod(s)", evidence)
+        # The controller's rounding, in the budget's own grade as in the singleton's: a minAvailable
+        # percentage rounds up to the pods that must stay, so 50% of one pod, 60% of two or 80% of four
+        # allow nothing while 50% of four allows two; with the covered count unknown only 100% does.
+        for spec, replicas, expected in (({"minAvailable": "50%"}, 1, True), ({"minAvailable": "60%"}, 2, True), ({"minAvailable": "80%"}, 4, True), ({"minAvailable": "50%"}, 4, False), ({"minAvailable": "50%"}, None, False), ({"minAvailable": "100%"}, None, True), ({"maxUnavailable": "10%"}, 4, False), ({"maxUnavailable": "0%"}, None, True)):
+            self.assertEqual(ur._budget_allows_no_disruption(spec, replicas), expected, (spec, replicas))
+        at_zero = {**pdb, "spec": {"minAvailable": "80%", "selector": shared}, "status": {"disruptionsAllowed": 0, "expectedPods": 4, "currentHealthy": 4}}
+        [budget_shape] = [s for s in ur.budget_shapes([at_zero], workloads) if s["object"] == "seeded-debug/PodDisruptionBudget/payments"]
+        self.assertEqual(budget_shape["confidence"], ur.HIGH)
+        # The pods the selector covers are counted as the controller counts them: a DaemonSet's (a
+        # Job's, a bare pod's) under the same labels join the Deployments' replicas, and the
+        # controller's own `expectedPods` wins when it has written it.
+        agents = []
+        for i in range(3):
+            agent = pod(f"node-agent-{i}", namespace="seeded-debug", owner="DaemonSet")
+            agent["metadata"]["labels"]["tier"] = "payments"
+            agents.append(agent)
+        alone = {**pdb, "spec": {"minAvailable": 1, "selector": shared}}
+        self.assertEqual([s["object"] for s in ur.budget_shapes([alone], [payments], agents) if s["object"].startswith("seeded-debug/Deployment/")], [])
+        [only] = [s for s in ur.budget_shapes([alone], [payments]) if s["object"].startswith("seeded-debug/Deployment/")]
+        self.assertIn("covering 1 pod(s)", only["evidence"])
+        self.assertEqual([s["object"] for s in ur.budget_shapes([{**alone, "status": {"disruptionsAllowed": 3, "expectedPods": 4}}], [payments]) if s["object"].startswith("seeded-debug/Deployment/")], [])
+        [with_agents] = [s for s in ur.budget_shapes([{**pdb, "spec": {"maxUnavailable": 0, "selector": shared}}], [payments], agents) if s["object"].startswith("seeded-debug/Deployment/")]
+        self.assertIn("covering 4 pod(s)", with_agents["evidence"])
 
     def test_entry_19_in_tree_volume_and_class(self):
         pv = self.shape("PersistentVolume/intree-pd", 19)
@@ -3006,8 +3043,12 @@ class LedgerAndGuardsTest(unittest.TestCase):
             kc.parent.chmod(0o755)
             kc.write_text("stale")
             kc.chmod(0o400)
-            self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
-            self.assertEqual((stat.S_IMODE(kc.parent.stat().st_mode), kc.exists()), (fleet_collect.KUBECONFIG_DIR_MODE, os.geteuid() == 0))
+            # The stale file is one this uid cannot write, the test's own fact (root would pass the
+            # access test): removed before gcloud, whoever runs the suite.
+            real_access = os.access
+            with mock.patch.object(os, "access", lambda p, mode, *a, **k: False if Path(p) == kc else real_access(p, mode, *a, **k)):
+                self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            self.assertEqual((stat.S_IMODE(kc.parent.stat().st_mode), kc.exists()), (fleet_collect.KUBECONFIG_DIR_MODE, False))
             # Another uid's directory: moved aside in the parent, which is this uid's, and remade.
             kc.write_text("root's")
             with mock.patch.object(os, "geteuid", return_value=kc.parent.stat().st_uid + 1), redirect_stderr(io.StringIO()):
@@ -3021,8 +3062,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
             # keeps it rather than moving the tick's files aside (the `os.access` keep of a stale file
             # root can write is the one branch that needs a real root).
             kc.write_text("the tick's")
-            with mock.patch.object(os, "geteuid", return_value=fleet_collect.ROOT_UID):
+            # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
+            # exercised whoever runs the suite, root included; the log shows no move-aside.
+            with mock.patch.object(os, "geteuid", return_value=fleet_collect.ROOT_UID), owned_by(kc.parent, fleet_collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(ur.fetch_credentials(seeded, run=FakeFleet()), (kc, None))
+            self.assertNotIn("moved aside", err.getvalue())
             self.assertEqual((kc.exists(), stat.S_IMODE(kc.parent.stat().st_mode), len([p for p in Path(home).iterdir() if p.name.startswith(ur.KUBECONFIG_SUBDIR + ".unusable-")])), (True, fleet_collect.KUBECONFIG_DIR_MODE, 1))
             # The rename race in the worker pool: the thread whose rename finds the directory already
             # moved (the winner remade it between this thread's stat and rename) reads what stands there
@@ -3795,6 +3839,34 @@ class LedgerAndGuardsTest(unittest.TestCase):
         third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         self.assertEqual(([r["cluster"] for r in third["reviews"]], sorted(u["cluster"] for u in third["unchanged"])), ([], [GEMMA, SEEDED]))
 
+    def test_a_cluster_not_running_is_listed_but_not_read(self):
+        # A cluster in PROVISIONING, STOPPING or ERROR (anything but the siblings' AUDITABLE_STATUSES)
+        # is listed, so it is never pruned, and held with its status as the reason: not selected, not
+        # read, its ledger entry and guards untouched, a `gate-failed` manifest entry, a line under
+        # Reads that failed and no stale-guard Warning; back in RUNNING it is unchanged, not new.
+        first, _ = self.collect()
+        gemma_guards = {g["id"] for g in first["guards"] if g["cluster"] == GEMMA}
+        provisioning = cluster_doc("gemma-gpu-upgraded")
+        provisioning["status"] = "PROVISIONING"
+        broken = cluster_doc("seeded-a")
+        broken.update(name="stuck", status="ERROR")
+        fleet = FakeFleet(clusters=[cluster_doc("seeded-a"), provisioning, broken])
+        result, _ = self.collect(fleet, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), manifest_file=str(self.home / "manifest.json"))
+        stuck = f"{PROJECT}/{LOCATION}/stuck"
+        self.assertEqual((sorted(result["not_running"]), result["removed_clusters"], [r["cluster"] for r in result["reviews"]], [u["cluster"] for u in result["unchanged"]]), (sorted([GEMMA, stuck]), [], [], [SEEDED]))
+        self.assertEqual(result["not_running"][GEMMA], ur.NOT_RUNNING_REASON_FORMAT.format(status="PROVISIONING"))
+        self.assertFalse(any("get-credentials" in c and ("gemma-gpu-upgraded" in c or "stuck" in c) for c in fleet.calls))
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"]
+        self.assertEqual((ledger[GEMMA]["last_run"], stuck in ledger), ("2026-10-08T18:00:00Z", False))
+        self.assertTrue(gemma_guards <= {g["id"] for g in result["guards"]})
+        self.assertIn(f"- {GEMMA}: " + ur.NOT_RUNNING_REASON_FORMAT.format(status="PROVISIONING"), ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
+        manifest = json.loads(Path(self.home / "manifest.json").read_text())
+        by_name = {e["name"]: e for e in manifest["clusters"]}
+        self.assertEqual((by_name[GEMMA]["outcome"], by_name[GEMMA]["error"], by_name[stuck]["outcome"], manifest["partial"]), (ur.MANIFEST_OUTCOME_GATE_FAILED, ur.NOT_RUNNING_REASON_FORMAT.format(status="PROVISIONING"), ur.MANIFEST_OUTCOME_GATE_FAILED, True))
+        self.assertEqual([w for w in result["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["cluster"] == GEMMA], [])
+        third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(([r["cluster"] for r in third["reviews"]], sorted(u["cluster"] for u in third["unchanged"])), ([], [GEMMA, SEEDED]))
+
     def test_newly_displaced_replicas_make_an_already_recorded_row_new(self):
         # A StatefulSet carries no dated failure condition, so its pods are dated by their own evidence.
         def sts_pod(name, scheduled_at, created_at):
@@ -4069,13 +4141,19 @@ class LedgerAndGuardsTest(unittest.TestCase):
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         [held] = [c for e in manifest["clusters"] if e["name"] == SEEDED for c in e.get("candidates") or [] if (c["namespace"], c["object"]) == ("seeded-debug", "Deployment/payments-api")]
         self.assertEqual((held["severity"], held["persistence"], held["check"]), (ur.MANIFEST_SEVERITY_MINOR, ["persists since 2026-10-08T18:00:00Z, 2 review(s)"], kept["check"]))
-        # The same review with the pod healthy again: nothing holds the guard, and it is cleared.
+        # The same review with the pod healthy again and a replica merely starting beside it (Pending,
+        # scheduled, twenty seconds old): nothing holds the guard, since the still-failing set is graded
+        # as the re-check grades it, with the starting grace, and it is cleared.
         pods = copy.deepcopy(READS["seeded-a"]["pods"])
-        for pod in pods:
-            if pod["metadata"]["name"].startswith("payments-api-"):
-                pod["status"]["phase"] = ur.PHASE_RUNNING
-                pod["status"]["containerStatuses"] = [{"name": "api", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": "2026-10-15T10:00:00Z"}}}]
-                pod["status"]["conditions"] = [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-10-15T10:00:00Z"}]
+        for pod_doc in pods:
+            if pod_doc["metadata"]["name"].startswith("payments-api-"):
+                pod_doc["status"]["phase"] = ur.PHASE_RUNNING
+                pod_doc["status"]["containerStatuses"] = [{"name": "api", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": "2026-10-15T10:00:00Z"}}}]
+                pod_doc["status"]["conditions"] = [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-10-15T10:00:00Z"}]
+        newborn = copy.deepcopy(next(p for p in pods if p["metadata"]["name"].startswith("payments-api-")))
+        newborn["metadata"]["name"] = "payments-api-5f6d7c8b9-new00"
+        newborn["status"] = {"phase": ur.PHASE_PENDING, "startTime": "2026-10-16T17:59:40Z", "containerStatuses": [], "conditions": [{"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-10-16T17:59:40Z"}]}
+        pods.append(newborn)
         with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": pods, "events": []}}):
             third, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
         self.assertNotIn(gid, {g["id"] for g in third["guards"]})

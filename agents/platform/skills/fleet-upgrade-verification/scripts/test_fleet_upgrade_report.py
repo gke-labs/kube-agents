@@ -1041,6 +1041,20 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+def owned_by(path, uid):
+    """`os.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = os.stat
+
+    def fake(target, *args, **kwargs):
+        result = real(target, *args, **kwargs)
+        if isinstance(target, (str, bytes, os.PathLike)) and os.fspath(target) == os.fspath(path):
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return patch.object(os, "stat", fake)
+
+
 class PrepareKubeconfigTest(unittest.TestCase):
     def test_the_default_directory_is_shared_and_a_named_one_keeps_the_umask(self):
         # The default `$HERMES_HOME/.kubeconfigs` follows the fleet-audit collectors' rule: sticky and
@@ -1115,9 +1129,24 @@ class PrepareKubeconfigTest(unittest.TestCase):
             os.mkdir(shared, 0o755)
             with open(path, "w", encoding="utf-8") as f:
                 f.write("the tick's")
-            with patch.object(os, "geteuid", return_value=report.ROOT_UID):
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertNotIn("moved aside", err.getvalue())
             self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, True, [".kubeconfigs"]))
+            # A link planted at the file's name is removed, never written through, the target untouched.
+            target = os.path.join(root, "target")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("root's secret")
+            os.chmod(target, 0o600)
+            os.unlink(path)
+            os.symlink(target, path)
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            with open(target, encoding="utf-8") as f:
+                kept = f.read()
+            self.assertEqual((os.path.lexists(path), kept, os.stat(target).st_mode & 0o7777), (False, "root's secret", 0o600))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("the tick's")
             other = os.stat(shared).st_uid + 1
             real_rename = os.rename
 

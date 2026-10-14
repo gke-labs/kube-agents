@@ -121,8 +121,11 @@ KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIS
 # plant, is never followed: the rule refuses it with a note, its chmod goes
 # through a descriptor opened without following, and `fetch_credentials`
 # runs no gcloud through a directory the rule refused, so a root run neither
-# chmods nor writes into whatever the link points at.
+# chmods nor writes into whatever the link points at. A link planted at the
+# kubeconfig file's name is removed before gcloud writes it: `exists()` would
+# follow it and root's `os.access` would keep it.
 KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
+KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubeconfig may not be, and could not be removed ({error})"
 # The rc a refused directory stands for in the credentials result: gcloud
 # was not run, and the note is the result's error.
 KUBECONFIG_REFUSED_RC = 1
@@ -801,7 +804,13 @@ def prepare_kubeconfig(kc: Path) -> str | None:
     note = usable_kubeconfig_dir(kc.parent)
     if note:
         return note
-    if kc.exists() and not os.access(kc, os.W_OK):
+    if os.path.islink(kc):
+        # Never written through: removed, and gcloud writes a fresh file.
+        try:
+            kc.unlink()
+        except OSError as exc:
+            return KUBECONFIG_LINK_NOT_REMOVED_FORMAT.format(path=kc, error=exc)
+    elif kc.exists() and not os.access(kc, os.W_OK):
         try:
             kc.unlink()
         except OSError as exc:

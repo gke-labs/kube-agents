@@ -577,6 +577,12 @@ LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger
 # read that as an incomplete listing, and so does this collector, since a
 # cluster missing from it has not left.
 LISTING_INCOMPLETE_FORMAT = "clusters list incomplete: {detail}"
+# A cluster whose status rules out reading it (PROVISIONING, STOPPING,
+# ERROR: anything but the siblings' `AUDITABLE_STATUSES`) is listed, so it
+# is never pruned, and held with its status as the reason: not selected,
+# not read, its ledger entry and guards untouched.
+NOT_RUNNING_REASON_FORMAT = "cluster status {status}: not read; ledger entry and guards kept unchanged"
+NOT_RUNNING_TEXT = "{cluster}: " + NOT_RUNNING_REASON_FORMAT
 # A crash record beside no ledger or guards file, or a guards file absent
 # beside a live ledger, blocks every run until the operator restores the
 # file or runs --reset-ledger, which archives the records and the live files
@@ -850,6 +856,10 @@ WEBHOOK_POD_OPERATIONS = ("CREATE", "*")
 WEBHOOK_CONFIGURATION_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
 ENDPOINTSLICE_SERVICE_LABEL = "kubernetes.io/service-name"
 SINGLE_REPLICA = 1
+# A pod whose controller has a scale (a ReplicaSet's, a StatefulSet's) is
+# counted by its workload's replicas; any other covered pod (a DaemonSet's,
+# a Job's, a bare pod) by itself, as the disruption controller counts them.
+SCALED_POD_OWNER_KINDS = ("ReplicaSet", "StatefulSet")
 PERCENT_ALL = 100
 # Namespaces whose DaemonSets are GKE's own agents: they move with the node
 # image, so 13 and 17 there are counted on one line, not reported or guarded.
@@ -3833,16 +3843,22 @@ def shapes_in_spec(obj: dict, spec: dict) -> list[dict]:
 
 
 def _budget_allows_no_disruption(spec: dict, replicas: int | None) -> bool:
-    """The catalogue's before-signal for entry 1: `maxUnavailable` 0, or
-    `minAvailable` at (or above) the replica count the budget covers. A
-    budget at `disruptionsAllowed` 0 for another reason (pods not ready
-    behind a `maxUnavailable` 1) clears on its own."""
+    """The catalogue's before-signal for entry 1: `maxUnavailable` 0 or
+    `0%`, or `minAvailable` at or above the pods the budget covers, a
+    percentage rounded up as the controller rounds it (`50%` of one pod,
+    `60%` of two or `80%` of four demand every pod); with the covered count
+    unknown a percentage forbids disruption only at 100%. A budget at
+    `disruptionsAllowed` 0 for another reason (pods not ready behind a
+    `maxUnavailable` 1) clears on its own."""
     max_unavailable = spec.get("maxUnavailable")
     if max_unavailable is not None:
         return str(max_unavailable).rstrip("%") == "0"
     min_available = spec.get("minAvailable")
-    if isinstance(min_available, str) and min_available.endswith("%"):
-        return min_available.rstrip("%").isdigit() and int(min_available.rstrip("%")) >= PERCENT_ALL
+    pct = _percent(min_available)
+    if pct is not None:
+        if replicas is not None:
+            return -(-(pct * replicas) // PERCENT_ALL) >= replicas
+        return pct >= PERCENT_ALL
     if isinstance(min_available, int) and replicas is not None:
         return min_available >= replicas
     return False
@@ -3858,27 +3874,23 @@ def _budget_demands_the_only_pod(spec: dict, covered: int | None) -> bool:
     """The catalogue's third entry-1 before-signal: a single-replica workload
     behind a budget whose spec forbids evicting its only pod. The budget's
     controller counts every pod the selector covers together (`covered`), so
-    a selector spanning several workloads asks whether the spec allows no
-    disruption across the set: `maxUnavailable` 0 or `0%` (a positive one,
-    by count or by percentage, allows at least one eviction, since the
-    controller rounds a percentage up); `minAvailable` at the covered count,
-    or a percentage the controller rounds up to every pod. A budget that
-    still allows one eviction across the set does not demand the singleton's
-    pod; over one covered pod any `minAvailable` percentage above zero does."""
-    total = covered or SINGLE_REPLICA
-    if _budget_allows_no_disruption(spec, total):
-        return True
-    if spec.get("maxUnavailable") is not None:
-        return False
-    min_available = _percent(spec.get("minAvailable"))
-    return min_available is not None and -(-(min_available * total) // PERCENT_ALL) >= total
+    the question is whether the spec allows no disruption across the set
+    (`_budget_allows_no_disruption`, with the controller's rounding): a
+    positive `maxUnavailable`, by count or by percentage, allows at least one
+    eviction and never demands the singleton's pod; over one covered pod any
+    `minAvailable` percentage above zero does."""
+    return _budget_allows_no_disruption(spec, covered or SINGLE_REPLICA)
 
 
-def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
+def budget_shapes(pdbs: list[dict], workloads: list[dict], pods: list[dict] | None = None) -> list[dict]:
     """Entry 1, the catalogue's three before-signals: a budget whose spec
     allows no disruption (high), one at `disruptionsAllowed` 0 for a reason
     that will clear (medium), and a single-replica Deployment or StatefulSet
-    behind a budget whose spec demands its only pod (high)."""
+    behind a budget whose spec demands its only pod (high). The pods a budget
+    covers are counted as its controller counts them: `status.expectedPods`
+    when the controller has written it, else the covered Deployments' and
+    StatefulSets' `spec.replicas` plus every covered pod of another owner (a
+    DaemonSet's, a Job's, a bare pod), which has no scale to read."""
     out = []
     for pdb in pdbs:
         meta, status = pdb.get("metadata") or {}, pdb.get("status") or {}
@@ -3888,7 +3900,15 @@ def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
         spec = {k: v for k, v in full_spec.items() if k != "selector"}
         selector = full_spec.get("selector")
         covered = [] if selector is None else [w for w in workloads if w.get("kind") in ("Deployment", "StatefulSet") and (w.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, _template_labels(w))]
-        replicas = sum((w.get("spec") or {}).get("replicas") or 0 for w in covered) if covered else None
+        covered_pods = [] if selector is None else [p for p in pods or [] if (p.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, (p.get("metadata") or {}).get("labels") or {})]
+        unmanaged = [p for p in covered_pods if (_controller_of(p) or ("", ""))[0] not in SCALED_POD_OWNER_KINDS]
+        expected = status.get("expectedPods")
+        if selector is not None and isinstance(expected, int) and not isinstance(expected, bool):
+            replicas: int | None = expected
+        elif covered or unmanaged:
+            replicas = sum((w.get("spec") or {}).get("replicas") or 0 for w in covered) + len(unmanaged)
+        else:
+            replicas = None
         if status.get("disruptionsAllowed") == 0:
             if _budget_allows_no_disruption(spec, replicas):
                 out.append(_shape(obj, ENTRY_BUDGET, HIGH, f"disruptionsAllowed=0 by spec {json.dumps(spec, sort_keys=True)}" + (f" over {replicas} replica(s)" if replicas is not None else ""), f"budget {name}"))
@@ -4055,7 +4075,7 @@ def collect_risks(cluster: dict, reads: dict[str, list]) -> tuple[list[dict], in
     for obj, spec, _ in pod_specs_by_owner(workloads, pods, resolver).values():
         shapes += shapes_in_spec(obj, spec)
         shapes += runtime_shapes(obj, spec, sorted(pools_of.get(obj["object"], ())), cluster)
-    shapes += budget_shapes(reads.get("pdbs") or [], workloads)
+    shapes += budget_shapes(reads.get("pdbs") or [], workloads, pods)
     shapes += storage_shapes(reads.get("storage") or [], cluster)
     shapes += webhook_shapes(reads.get("webhooks") or [], reads.get("endpointslices") if "endpointslices" in reads else None)
     managed_agents: set[str] = set()
@@ -4533,12 +4553,14 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     # Workloads still unavailable, for the entry-3 keep rule: the operation
     # the outage fell inside is outside a later window, the outage is not.
     review["unavailable_workloads"] = sorted(_unavailable_workloads(reads.get("workloads") or [])) if "workloads" not in failed else []
-    # The objects the API itself shows failing, from the whole pods read and
-    # not the window: a failure guard on one of them is held by the merge as
-    # a re-check holds it, since a pod that lost readiness, or a Job pod in
-    # phase Failed, before the window's first operation is not graded again
-    # by the symptom pass yet still fails.
-    review["failing_objects"] = sorted(_api_set_failures(reads.get("pods") or [], reads.get("owners") or [], Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or []))[1]) if "pods" not in failed else []
+    # The objects still failing when the window is ignored, graded as the
+    # re-check grades them (the symptom pass at EPOCH, the starting grace
+    # and the scheduling gates applied, so a replica merely starting is no
+    # failure): a failure guard on one of them that this review filed nothing
+    # for is held by the merge as a re-check holds it, since a pod that lost
+    # readiness, or a Job pod in phase Failed, before the window's first
+    # operation is not graded again by the windowed pass yet still fails.
+    review["failing_objects"] = sorted({g["object"] for g in guards_for(selection.key, collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, [], EPOCH, now=now), "")}) if "pods" not in failed else []
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
     shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
@@ -5183,6 +5205,13 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
         entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_UNREACHABLE, "error": reason[:ERROR_EXCERPT_CHARS]})
+    # A cluster whose status rules out reading it: listed, held with the status.
+    for key, reason in sorted((result.get("not_running") or {}).items()):
+        if key in seen:
+            continue
+        seen.add(key)
+        project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
+        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": reason[:ERROR_EXCERPT_CHARS]})
     # Clusters the run's deadline left unread: held, with the budget as the reason.
     for key in result.get("deferred") or []:
         if key in seen:
@@ -5609,12 +5638,22 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # clusters carry no operation entry, and the SOP names the gap.
     operations_commands: dict[str, str] = {}
     operations_unread: set[str] = set()
+    from collect import AUDITABLE_STATUSES  # noqa: PLC0415 -- the siblings' statuses a cluster can be read in
+
+    not_running: dict[str, str] = {}
     for project in projects:
         found, list_error = enumerate_clusters(project, run=run)
         error = list_error
         if error:
             failed_reads.append(f"{project}: {error}")
-        clusters.extend(found)
+        for c in found:
+            status = c.get("status")
+            if status and status not in AUDITABLE_STATUSES:
+                key = cluster_key(project, c["location"], c["name"])
+                not_running[key] = NOT_RUNNING_REASON_FORMAT.format(status=status)
+                failed_reads.append(NOT_RUNNING_TEXT.format(cluster=key, status=status))
+            else:
+                clusters.append(c)
         known = [parse_ts((ledger.get("clusters") or {}).get(cluster_key(project, c["location"], c["name"]), {}).get("last_run")) for c in found]
         # The listing reaches every operation guard of the project, so a
         # failed operation older than the window is still re-checked.
@@ -5935,10 +5974,11 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         "scope_reason": "; ".join(scope_reasons),
         "fleet": sorted(new_fleet),
         "outside_fleet": sorted(outside),
-        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters | set(unread_clusters) | set(held_clusters) | set(deferred), operation_guards=operation_guards, listing_unread=operations_unread),
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters | set(unread_clusters) | set(held_clusters) | set(not_running) | set(deferred), operation_guards=operation_guards, listing_unread=operations_unread),
         "operation_guards": operation_guards,
         "unread_clusters": unread_clusters,
         "held_clusters": held_clusters,
+        "not_running": not_running,
         "deferred": deferred,
         "deferred_rechecks": deferred_rechecks,
         "budget_spent": budget_spent,

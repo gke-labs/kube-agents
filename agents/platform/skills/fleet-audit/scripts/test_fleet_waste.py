@@ -8091,6 +8091,20 @@ class CredentialsNoteTest(unittest.TestCase):
                 _, ok = fw.fetch_credentials("p", "c", "l", run=recording)
             self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
 
+def owned_by(path, uid):
+    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if self == path:
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return patch.object(Path, "stat", fake)
+
+
 class PrepareKubeconfigTest(unittest.TestCase):
     def test_fetch_credentials_prepares_the_shared_directory(self):
         # The shared `.kubeconfigs` is prepared by `collect.prepare_kubeconfig`, the one rule for the
@@ -8118,7 +8132,7 @@ class PrepareKubeconfigTest(unittest.TestCase):
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir(0o755)
             kc.write_text("the tick's")
-            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0):
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1):
                 path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o1777, True, [".kubeconfigs"]))
 
