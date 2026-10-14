@@ -11,7 +11,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
@@ -123,7 +123,7 @@ wrong about its own evidence.
 **Run the collector before evaluating any facet below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/fleet_drift.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_fleet-consistency-drift.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/fleet_drift.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_fleet-consistency-drift.json
 ```
 
 Once per repository, inside §0's loop, and after that repository's `start`. The path is fixed, so the previous repository's manifest is still sitting at it — and `finish` refuses a manifest whose `finished_at` predates this run's `start`, which is what a carried-over one looks like. The fleet does not change between two repositories of the same loop, so reusing the manifest is the tempting thing to do and costs the second repository its cross-check. Re-running is one `clusters list` per project.
@@ -305,7 +305,7 @@ Worked example, for a 4.4 network-policy outlier:
 ### 7. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
   --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json \
   --manifest-file /opt/data/scratch/manifest_fleet-consistency-drift.json \
   [--repo "<owner>/<repo>"]
@@ -321,7 +321,7 @@ Pass `--manifest-file`: it is what lets `finish` check the document against what
 - `CLEAN` with `resolved: > 0` → the fleet converged. Report the issue URL and how many drifts closed with it: a fleet that came back into line is worth a sentence, and it is the only good news this audit has to give.
 - `CLEAN` with `partial: true` → nothing diverged among the clusters you could compare, and the ledger stayed open because that is not the whole fleet. One line with the result, the `coverage_gaps`, and the issue URL.
 - `OPENED`, or `UPDATED` with a non-zero `new` or `resolved` → one line naming the audit, the `new` and `resolved` counts, the ledger issue URL, and anything in `prs_opened` / `prs_closed`.
-- A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`skills/fleet-audit/SKILL.md`, step 3). Never work around a validation error by deleting the finding that triggered it.
+- A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`, step 3). Never work around a validation error by deleting the finding that triggered it.
 
 ---
 

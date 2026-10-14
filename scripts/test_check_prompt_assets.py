@@ -885,6 +885,22 @@ class CheckoutPathTests(unittest.TestCase):
         )
         self.assertEqual([], self._findings())
 
+    def test_the_profile_home_spelling_of_a_file_it_ships_passes(self):
+        self.fixture.write("agents/platform/skills/thing/scripts/run.py", "")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Run `/opt/data/profiles/platform/skills/thing/scripts/run.py` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
+    def test_the_profile_home_spelling_of_a_missing_file_is_reported(self):
+        """Named in full for a kanban worker, it is still a file the image ships."""
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Run `/opt/data/profiles/platform/skills/thing/scripts/gone.py` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
     def test_the_finding_names_the_spelling_that_would_work(self):
         """The author checked that the file exists; saying only "does not
         resolve" reads as the checker being wrong. Hand them the rewrite."""

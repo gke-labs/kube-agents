@@ -16,7 +16,7 @@ Open the run first with the `fleet-audit` harness's `start` (SOP §0): `finish` 
 Call the platform_control `fleet_scope` tool first (SOP §1) and paste its `collector_args`; on an install that declares a scope the collector refuses a run without them, and a `--project-id` must name a project the tool lists.
 
 ```bash
-python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 ./skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
+python3 /opt/data/profiles/platform/skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
 ```
 
 `draft` writes the findings document (`findings_gcp-networking-fabric-audit.json`) from the manifest. Write each `recommendation` and `remediation` in it. The manifest is not a findings document.

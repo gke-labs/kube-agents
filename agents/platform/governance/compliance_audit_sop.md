@@ -10,10 +10,10 @@
 
 ### 0. Open the audit run
 
-The lifecycle is the `fleet-audit` skill's (`skills/fleet-audit/SKILL.md`, "The two-command lifecycle" and "Step 1 — `start`"): what `start` prints; what `workspace`, `findings_path`, `pending_remediation_requests` and `carried` oblige you to do; that there is no report branch; and that no issue body, PR body, commit or forge call is ever yours to write. This stream's invocation:
+The lifecycle is the `fleet-audit` skill's (`/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`, "The two-command lifecycle" and "Step 1 — `start`"): what `start` prints; what `workspace`, `findings_path`, `pending_remediation_requests` and `carried` oblige you to do; that there is no report branch; and that no issue body, PR body, commit or forge call is ever yours to write. This stream's invocation:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
 ```
 
 What the skill does not say:
@@ -92,7 +92,7 @@ kubectl auth can-i list pods --all-namespaces
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/collect.py compliance-audit --workspace "<the workspace Step 0 returned>" <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_compliance-audit.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit --workspace "<the workspace Step 0 returned>" <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_compliance-audit.json
 ```
 
 This is the tested, procedural implementation of every check below — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers. Unlike a single-dump stream, compliance-audit's collector issues nine distinct reads per cluster on a Standard cluster and twelve on an Autopilot one — five `kubectl` dumps (workloads; RBAC; NetworkPolicy plus Namespace; every ServiceAccount, for §2.7 and §2.14; Services, for §2.15), a best-effort `kubectl get ccnp` for §2.6's Dataplane V2 case, a best-effort `kubectl get gcp -A` for §2.12, `gcloud container clusters describe`, and then either `gcloud container node-pools list` on a Standard cluster or a best-effort `kubectl get` of each of the four allowlist types on an Autopilot one — and fails the whole cluster closed if any one of them cannot be gated. Three reads are the exception, all best-effort because their CRDs are not installed everywhere: `ccnp`, where a type the server does not serve reads as zero cluster-wide policies; the allowlist reads, one per type, where a type the server does not serve reads as no exemptions of that type; and `gcp`, whose absence means no Config Connector here and declares §2.12 inapplicable rather than clearing it. Absence is only the API server's own answer that it does not serve the type (`doesn't have a resource type`). Any other failure — forbidden, a timeout, a 5xx — is a read that did not happen: an unread allowlist type withholds all three Autopilot declarations, since the reads cannot vouch for their no-WorkloadAllowlist clause, and a failed `gcp` or `ccnp` read leaves §2.12 or §2.6 unevaluated rather than inapplicable. Its last line on stderr counts the candidates per check, and that count is the floor on `findings` — the candidates sit under each cluster's entry in `clusters[].candidates`, below its `commands`, so a read of the file's head shows none of them. Read the manifest before doing anything else:
@@ -410,7 +410,7 @@ The document's schema and every rule the validator enforces — `checks_run`, `c
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
   --findings-file /opt/data/scratch/findings_compliance-audit.json \
   --manifest-file /opt/data/scratch/manifest_compliance-audit.json \
   [--repo "<owner>/<repo>"]

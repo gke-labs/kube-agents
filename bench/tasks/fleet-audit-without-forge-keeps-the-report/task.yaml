@@ -13,6 +13,11 @@
 # store under `no_forge/local` with status NO_FORGE, and the run's answer
 # carries a summary that says no forge is configured.
 #
+# It also grades that the worker ran `start` at all. A kanban worker starts in
+# its card's workspace, where the fleet-audit skill's relative paths named
+# nothing; a worker that searched there for the SOP audited by hand and never
+# reached the harness.
+#
 # The fixture is an install with no forge: a PlatformAgent with no
 # spec.integration, so the gitops-state ConfigMap holds no managed_repos. The
 # CI eval install always has a GitHub forge (hack/ci-deploy.sh renders
@@ -62,9 +67,9 @@ verification_spec:
       status: NO_FORGE
       required_finding_phrases: ["debug-binding"]
   # The worker reached the audit's own entry point. A kanban worker starts in
-  # its card's workspace, where the skill's relative paths named nothing, and
-  # in 4 of 5 runs on 2026-10-13 it searched there, found no SOP, and audited
-  # by hand without ever calling `start`.
+  # its card's workspace, so a worker that looks for the SOP there finds
+  # nothing and audits by hand; without this check that run grades the same as
+  # a `start` that failed.
   - name: the-worker-ran-start
     role: objective
     mode: assert

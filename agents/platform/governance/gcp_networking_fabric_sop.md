@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit [--repo "<owner>/<repo>"]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
@@ -40,7 +40,7 @@ The collector (§2) applies all of this itself: it sweeps the `--scope-projects`
 **Run the collector after §0's `start` and before evaluating any check below by hand.** `finish` refuses a manifest that finished before `start` did, as an earlier run's.
 
 ```bash
-python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 ./skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
+python3 /opt/data/profiles/platform/skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
 ```
 
 `draft` writes the findings document from the manifest: the scope, `checks_run`, and one finding for each candidate with its evidence. Write each `recommendation` and `remediation` in that file, then give it to `finish` as `--findings-file`. Never give the manifest as `--findings-file`. The collector sweeps §1's scope once: the `--scope-projects` you pass from `fleet_scope`, else the scope it resolves itself. Pass `--project-id <id>` only to scope a run to one project the tool lists, with the `collector_args` beside it; the narrowing is recorded as `project/UNENUMERATED_PROJECTS`. On this install's sandbox the collector knows whether a scope is declared and, if it is, refuses a run without the `collector_args`, so the fall-through cannot cross the boundary. Read the manifest before doing anything else:
@@ -204,7 +204,7 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
   --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json \
   [--repo "<owner>/<repo>"]

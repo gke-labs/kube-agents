@@ -49,8 +49,10 @@ nothing:
   ``manifests/vendor/x.yaml`` out of the report without an allowlist anyone has
   to maintain;
 * ``/opt/data/**`` is runtime state that exists only in a live pod, and is
-  skipped. So is any reference holding a shell variable or an obvious
-  placeholder;
+  skipped, except the platform profile home ``/opt/data/profiles/platform/``,
+  which the image fills from ``agents/platform`` and which skills and SOPs name
+  in full for a kanban worker; it resolves like ``/opt/platform-template/``. So
+  is any reference holding a shell variable or an obvious placeholder;
 * nothing resolves against the repository root. A checkout is not mounted into
   any agent, so ``agents/platform/skills/x/y.md`` -- which names a real file
   here, and survives every review a human gives it -- is a finding: that tree
@@ -169,8 +171,15 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
 
 # The profile templates the entrypoint scaffolds from. Unlike /opt/defaults
 # these are plain directory copies, so the mapping is one line each.
+# The platform profile's home in a running pod.
+PLATFORM_PROFILE_HOME = "/opt/data/profiles/platform/"
+
 OPT_TEMPLATES: tuple[tuple[str, str], ...] = (
     ("/opt/platform-template/", "agents/platform"),
+    # The platform profile home, filled from the template at startup and
+    # named in full where a kanban worker, which starts in its card's
+    # workspace, is sent to a skill script or an SOP.
+    (PLATFORM_PROFILE_HOME, "agents/platform"),
     ("/opt/cluster-template/", "agents/cluster"),
     ("/opt/chat-template/", "agents/chat"),
 )
@@ -330,7 +339,7 @@ def _is_placeholder(ref: str) -> bool:
     absent from a checkout. The rest are references written as templates --
     `$HERMES_HOME/...`, `memory/YYYY-MM-DD.md`, `<cluster>/kustomization.yaml`.
     """
-    if ref.startswith("/opt/data/"):
+    if ref.startswith("/opt/data/") and not ref.startswith(PLATFORM_PROFILE_HOME):
         return True
     if any(ch in ref for ch in "$<>{}*?"):
         return True
@@ -490,9 +499,7 @@ def _resolves(ref: str, path: Path, roots: list[Path]) -> bool:
         # the profile home for a persona or an SOP and the bundle for a skill --
         # not the directory the sentence happens to be written in. A skill's
         # reference page says `./assets/x.sh` for an asset one level up from
-        # itself, and the fleet-audit SKILL.md says
-        # `./skills/fleet-audit/scripts/audit_report.py` for its own script.
-        # Both are right, and both are wrong if `./` is read literally.
+        # itself: right, and wrong if `./` is read literally.
         bare = ref[2:]
         if (path.parent / bare).exists():
             return True

@@ -398,9 +398,9 @@ COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-sessi
 #                 happens in the agent pod, which reads SKILL.md from the platform
 #                 profile and puts it in the prompt; what arrives here is only the
 #                 part the resulting shell command touches.
-#   governance/ — the SOPs. `fleet-audit` cites them by relative path
-#                 (`governance/compliance_audit_sop.md`) and the model reads them
-#                 with a file tool, which is also over SSH now.
+#   governance/ — the SOPs. `fleet-audit` sends the model to them by full path
+#                 (`/opt/data/profiles/platform/governance/compliance_audit_sop.md`)
+#                 and the model reads them with a file tool, which is also over SSH now.
 #   scripts/    — the shared modules, as an allowlist rather than the directory.
 #
 # Hermes' own ssh backend separately syncs a skills tree to /home/agent/.hermes/skills.

@@ -763,10 +763,11 @@ DNS_ACCESS_COMMENT = (
 # tested — which is how the clone that never happened survived this long.
 SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitops"
-# Where the SOPs live: `<agent home>/profiles/platform/governance`, the same path
-# in the gateway and the sandbox. Named in full wherever a worker is sent to one,
-# because a kanban worker starts in its card's workspace, where a path relative
-# to the profile home names nothing.
+# Where the SOPs live: `<agent home>/profiles/platform/governance`. The worker's
+# commands run in the sandbox, whose agent home is `/opt/data`, where this
+# script runs too. Named in full wherever a worker is sent to one, because a
+# kanban worker starts in its card's workspace, where a path relative to the
+# profile home names nothing.
 PLATFORM_PROFILE_SUBDIR = "profiles/platform"
 GOVERNANCE_DIR_NAME = "governance"
 

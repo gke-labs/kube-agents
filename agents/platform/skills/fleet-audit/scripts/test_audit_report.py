@@ -25261,12 +25261,8 @@ class TestSopPath(unittest.TestCase):
                 "/srv/agent/profiles/platform/governance/compliance_audit_sop.md",
             )
 
-    def test_every_stream_names_a_file_the_profile_ships(self):
-        governance = Path(__file__).resolve().parents[3] / "governance"
-        for audit_id in audit_report.AUDITS:
-            with self.subTest(audit=audit_id):
-                name = Path(audit_report.sop_path(audit_id)).name
-                self.assertTrue((governance / name).is_file(), name)
+    def test_a_rejection_points_at_the_sop_by_full_path(self):
+        self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))
 
 
 if __name__ == "__main__":

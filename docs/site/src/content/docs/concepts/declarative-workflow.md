@@ -58,9 +58,9 @@ Source: [`agents/platform/skills/fleet-audit/`](https://github.com/gke-labs/kube
 The agent's only output is a validated `findings.json` — one entry per deviation, each carrying the literal read-only command that proves it and a `recommendation` (action, rationale, risk). `audit_report.py` does the rest:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
 # … the agent inspects the fleet read-only and writes findings.json …
-./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <path>
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <path>
 ```
 
 What it publishes to the GitOps repository has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff. An install with no GitOps repository gets neither tier: the run keeps its findings in the report store and reports them in chat.
