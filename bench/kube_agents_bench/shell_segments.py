@@ -115,7 +115,10 @@ _WRITERS = frozenset({"echo", "printf", "tee"})
 _PYTHON_SUFFIX = ".py"
 _SHELL_SUFFIXES = (".sh", ".bash")
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
-_WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-p)\s+(\S+)$")
+_WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-p)\s+(\S+)(?:\s+\d*[<>].*|\s*\|\|.*)?$")
+# Quotes and backslashes inside a command word (``cu''rl``, ``"cu"rl``, ``cur\l``) are
+# the shell's, not the word's.
+_WORD_QUOTING_RE = re.compile(r'\\(.)|[\'"]')
 # ``<<`` or ``<<-``, then a tag: quoted, backslashed, or bare; a bare tag is a
 # shell word, and only a bare tag's body is expanded.
 _HEREDOC_RE = re.compile(r"<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|(\\)?([^\s;&|<>()'\"\\]+))")
@@ -209,13 +212,14 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
     if index is None:
         return
     _, end, word = tokens[index]
-    unquoted = _unquote(word)
+    unquoted = _bare_word(_unquote(word))
     inner = _substituted_command(unquoted)
     if inner is not None:
+        # ``$(which x …)`` and ``$(command -v x …)`` read as ``x``; any other
+        # substitution stays the word it is, and the piece is still a segment.
         which = _WHICH_RE.match(inner.strip())
-        if not which:
-            return
-        unquoted = which.group(1)
+        if which:
+            unquoted = which.group(1)
     if unquoted in _BLOCK_CLOSERS:
         return
     out.append((unquoted + piece[end:]).strip())
@@ -445,6 +449,13 @@ def _substituted_command(word: str) -> str | None:
     if len(word) >= 2 and word[0] == "`" and word[-1] == "`":
         return word[1:-1]
     return None
+
+
+def _bare_word(word: str) -> str:
+    """A command word with the shell's quoting removed throughout."""
+    if word.startswith(("$(", "`")):
+        return word
+    return _WORD_QUOTING_RE.sub(lambda m: m.group(1) or "", word)
 
 
 def _unquote(token: str) -> str:

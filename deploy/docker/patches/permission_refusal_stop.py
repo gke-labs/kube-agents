@@ -155,9 +155,6 @@ _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
 # literal carries, for reading each kubectl command's own argv out of a call's text.
 _SEPARATOR_RE = re.compile(r"\|\||&&|[;|&\n]")
 _LIST_PUNCT_RE = re.compile(r"[\[\],'\"()]")
-# ``kubectl auth can-i <verb> …`` names a verb in a read's arguments; the phrase is
-# dropped before the word test.
-_CAN_I_RE = re.compile(r"(?<![\w-])kubectl(?:[ \t]+[^\s;|&]+)*?[ \t]+auth[ \t]+can-i\b[^;|&\n]*")
 
 WARN_MESSAGE = (
     "Permission refused. This is a boundary, not an error to work around: the change is "
@@ -210,7 +207,7 @@ def _kubectl_verbs(command: str):
     word on, quotes and Python list punctuation as spaces, so an argv literal, a quoted
     argument and a bare word all read as their words."""
     try:
-        from tools.command_policy import _kubectl_verb_and_flag
+        from tools.command_policy import _kubectl_verb_and_flag, local_render
     except ImportError:
         return None
     verbs = []
@@ -222,30 +219,22 @@ def _kubectl_verbs(command: str):
         # argument and a bare word all read as their words.
         argv = _LIST_PUNCT_RE.sub(" ", piece[first.start():]).split()
         verb, _ = _kubectl_verb_and_flag(argv) if argv else (None, None)
-        if verb:
+        if verb and not local_render(argv):  # a client render or a help read is not a write
             verbs.append(list(verb))
     return verbs
 
 
 def names_a_write(command) -> bool:
-    """Whether the call's own text runs a kubectl command whose verb is mutating (used only
-    to tell a refused write chained before an exit-0 read from a read that echoed a
-    refusal). The verb is kubectl's first subcommand as the policy reads it, so a verb word
-    elsewhere in the text (a namespace, a ``grep`` argument, ``auth can-i <verb>``) is not
-    one; without the policy module a word test over the text after ``kubectl`` stands in."""
+    """Whether the call's own text runs a kubectl write (used only to tell a refused write
+    chained before an exit-0 read from a read that echoed a refusal). The verb is kubectl's
+    first subcommand as the policy reads it and a render or help read is not a write, so a
+    verb word elsewhere in the text (a namespace, a ``grep`` argument, ``auth can-i <verb>``)
+    is not one. The policy module ships in the image beside this one (the build gate imports
+    it); without it nothing is counted."""
     if not isinstance(command, str):
         return False
     verbs = _kubectl_verbs(command)
-    if verbs is not None:
-        return any(verb_is_mutating(v) for v in verbs)
-    text = _CAN_I_RE.sub("", command)
-    first = _KUBECTL_WORD_RE.search(text)
-    if first is None:
-        return False
-    words = set(re.split(r"[\s\"'`;|&()\[\],]+", text[first.end():]))
-    return bool(words & MUTATING_VERBS) or any(
-        head in words and words & subs for head, subs in MUTATING_SUBVERBS.items()
-    )
+    return bool(verbs) and any(verb_is_mutating(v) for v in verbs)
 
 
 def refusal_blocks(result: str) -> list[tuple[str, list[str], bool]]:

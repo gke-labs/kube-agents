@@ -339,6 +339,11 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "cat <<'EOF' | sudo tee /tmp/fix.sh >/dev/null\nkubectl scale deploy x --replicas=3\nEOF\nsudo bash /tmp/fix.sh",
         "echo 'kubectl scale deploy x --replicas=3' | tee /tmp/fix.sh >/dev/null && bash /tmp/fix.sh",
         '"$(which kubectl)" scale deploy x --replicas=3',
+        "$(which kubectl 2>/dev/null) scale deploy x --replicas=3",
+        "$(command -v kubectl || echo kubectl) scale deploy x --replicas=3",
+        "kube''ctl scale deploy x --replicas=3",
+        '"kube"ctl scale deploy x --replicas=3',
+        "kubec\\tl scale deploy x --replicas=3",
     ):
         assert "kubectl scale deploy x --replicas=3" in segments(command), command
     # A ``>`` inside the written text is not the writer's redirect; ``./run`` and ``run`` are one path.

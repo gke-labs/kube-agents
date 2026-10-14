@@ -232,6 +232,10 @@ class ClassifyTests(unittest.TestCase):
         ):
             self.assertEqual(stop.classify_refusal(command, _result(lines, 0), failed=False), "advisory", command)
         self.assertEqual(stop.classify_refusal("kubectl -n kube-system scale deploy/kube-dns --replicas=3 || true; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "policy")
+        # A client render or a help read chained before the cat is not a write either.
+        self.assertEqual(stop.classify_refusal("kubectl create deployment kube-dns --image=x --dry-run=client -o yaml > /tmp/m.yaml; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
+        self.assertEqual(stop.classify_refusal("kubectl scale --help; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
+        self.assertEqual(stop.classify_refusal("kubectl scale deploy/kube-dns --replicas=3 --dry-run=false || true; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "policy")
         # A shell prologue's ``set`` is before the kubectl word, so it is not the verb.
         self.assertEqual(stop.classify_refusal("set -euo pipefail; kubectl get deploy kube-dns -n kube-system -o yaml > /tmp/c.yaml; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
 

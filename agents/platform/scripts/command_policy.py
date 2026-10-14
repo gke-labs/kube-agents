@@ -104,10 +104,11 @@ _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
 # a help flag is (the verb's usage text, nothing attempted).
 _LOCAL_RENDER_FLAGS = frozenset({"--local", "--list"})
-# kubectl's ``--dry-run`` strategy reaches the server for these two values only;
-# ``client``, the bare flag's ``unchanged``, the ParseBool true spellings, an empty
-# or unknown value all end on the client (a render, or an error before any request).
-_DRY_RUN_WRITE_VALUES = frozenset({"none", "server"})
+# kubectl's ``--dry-run`` strategy reaches the server for ``none``, ``server`` and
+# the ParseBool false spellings (``0``, ``f``, ``false``, case-folded); ``client``,
+# the bare flag's ``unchanged``, the true spellings, an empty or unknown value all
+# end on the client (a render, or an error before any request).
+_DRY_RUN_WRITE_VALUES = frozenset({"none", "server", "false", "f", "0"})
 _HELP_FLAGS = frozenset({"-h", "--help"})
 _LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
@@ -718,6 +719,11 @@ _GCLOUD_HELP_FLAGS = _HELP_FLAGS  # the same two words, read by the gcloud surfa
 #: not cover, so the prefix defeated the exclusion precisely where it was the
 #: only gate.
 _GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+# How many words of a gcloud argv, past a release track, the refusal's verb tuple
+# keeps: the deepest write surfaces are four words (`compute instance-groups
+# managed resize`, `iam service-accounts keys create`); a shorter surface's
+# positional rides along, sanitised by the proxy before it is printed.
+_GCLOUD_VERB_WORDS = 4
 # The one rule whose refusal carries a render flag (``local_render``).
 KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 
@@ -1351,7 +1357,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "rather than working around it. "
                     + _ACTION_BOUNDARY_NOTICE
                 ),
-                verb_tuple=tuple((words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else words)[:3]),  # past a release track; 3 words, no positionals
+                verb_tuple=tuple((words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else words)[:_GCLOUD_VERB_WORDS]),
             )
         return _ALLOWED
 
