@@ -572,9 +572,9 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
 	if len(reading.Problems) > 0 {
 		n.metrics.chatMessage(chatInvalid)
+		what := "notify: " + chatDroppedWhat(chatmsg.Notify, reading)
 		for _, p := range reading.Problems {
-			n.log.Warn("notify: chat message dropped; its text fallback stands",
-				"conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
+			n.log.Warn(what, "conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
 		}
 	}
 	m := OutMessage{Text: job.req.Text, Chat: reading.Message}

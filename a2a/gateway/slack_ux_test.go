@@ -227,6 +227,11 @@ func TestSlackTypedReplyAnswersTheOpenQuestion(t *testing.T) {
 	if len(api.updated) != 0 {
 		t.Fatal("a stop is a command, not an answer")
 	}
+	a.mu.Lock()
+	if st := a.sessionStates["slack:C1/40.0"]; st != nil && st.askText != "" {
+		t.Errorf("a command was kept as the thread's ask: %q", st.askText)
+	}
+	a.mu.Unlock()
 	unmapped := InboundMessage{Conversation: "slack:C1/40.0", AuthorID: "U9", MessageID: "80.5", Text: "B obviously"}
 	a.notePending(unmapped)
 	a.InboundVerified(unmapped.Conversation, unmapped.MessageID, false)
@@ -279,6 +284,114 @@ func TestSlackPostedQuestionIsAnsweredByATypedReplyAndKeepsItsLine(t *testing.T)
 	}
 	if b := api.updatedBlocks[1]; !strings.Contains(b, "✓ jay: prod-us please") {
 		t.Errorf("the settle edit lost the answered line: %s", b)
+	}
+}
+
+// An incident option's click sends its reply as the emitter wrote it (G2:
+// "<title> — apply Option B", led by the label it shows), the answered line
+// names the label, and a typed "apply Option B" answers the same question.
+func TestSlackIncidentOptionReplyAndTypedApply(t *testing.T) {
+	const label, reply = "Raise the memory limit", "Raise the memory limit — apply Option B"
+	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {Name: "jay"}}}
+	a, _ := newUXSlackAdapter(api)
+	msg, ok := a.interactive(clickPayload(t, "U1", "T1", "C1", "40.0", "kage.choice.1", label, reply, "61.0"))
+	if !ok || msg.Text != reply {
+		t.Fatalf("turn = %+v ok=%v, want the reply verbatim", msg, ok)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if b := api.updatedBlocks[0]; !strings.Contains(b, "✓ jay: "+label) || strings.Contains(b, "apply Option B") {
+		t.Errorf("answered line should name the label it showed: %s", b)
+	}
+	conv := "slack:C1/41.0"
+	a.noteQuestion(conv, slackQuestion{channel: "C1", ts: "70.0", text: "triage", blocks: json.RawMessage(uxQuestionBlocks)})
+	typed := InboundMessage{Conversation: conv, AuthorID: "U1", MessageID: "71.0", Text: "apply Option B"}
+	a.notePending(typed)
+	a.InboundVerified(conv, typed.MessageID, true)
+	if b := api.updatedBlocks[len(api.updatedBlocks)-1]; !strings.Contains(b, "✓ jay: apply Option B") || strings.Contains(b, "kage.choice") {
+		t.Errorf("typed apply rewrite = %s", b)
+	}
+}
+
+// A card asking again on the same message (its update key) is a fresh
+// question: the earlier answer does not block its buttons.
+func TestSlackReaskedQuestionTakesAClick(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	conv := "slack:C1/40.0"
+	question := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which one?", Choices: []chatmsg.Choice{{Text: "Option A"}, {Text: "Option B"}}}
+	msg, _ := a.interactive(clickPayload(t, "U1", "T1", "C1", "40.0", "kage.choice.0", "Option A", "Option A: restart", "60.1"))
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if err := a.EditMessage(conv, "50.0", OutMessage{Text: "Which one now?", Chat: question}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.interactive(clickPayload(t, "U1", "T1", "C1", "40.0", "kage.choice.1", "Option B", "Option B", "60.2")); !ok {
+		t.Error("a question asked again on the same message must take a click")
+	}
+}
+
+// A typed reply verified before a click that was claimed after it answers
+// the question; the click's turn still goes, but nothing is rewritten twice.
+func TestSlackClickThatLostToATypedReplyRewritesNothing(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	conv := "slack:C1/40.0"
+	a.noteQuestion(conv, slackQuestion{channel: "C1", ts: "50.0", text: "Which one?", blocks: json.RawMessage(uxQuestionBlocks)})
+	reply := InboundMessage{Conversation: conv, AuthorID: "U1", MessageID: "55.0", Text: "B"}
+	a.notePending(reply)
+	click, ok := a.interactive(clickPayload(t, "U2", "T1", "C1", "40.0", "kage.choice.0", "Option A", "Option A: restart", "56.0"))
+	if !ok {
+		t.Fatal("the click was claimed before the reply was verified, so it is a turn")
+	}
+	a.InboundVerified(conv, reply.MessageID, true)
+	a.InboundVerified(click.Conversation, click.MessageID, true)
+	if len(api.updated) != 1 {
+		t.Fatalf("updates = %d, want the typed answer's rewrite alone", len(api.updated))
+	}
+}
+
+// A text-only settle of an answered question keeps the answered line.
+func TestSlackTextSettleKeepsTheAnsweredLine(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {Name: "jay"}}}
+	a, _ := newUXSlackAdapter(api)
+	msg, _ := a.interactive(clickPayload(t, "U1", "T1", "C1", "40.0", "kage.choice.0", "Option A", "Option A: restart", "60.1"))
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if err := a.EditMessage("slack:C1/40.0", "50.0", OutMessage{Text: "Which one? (answered)"}); err != nil {
+		t.Fatal(err)
+	}
+	if b := api.updatedBlocks[len(api.updatedBlocks)-1]; !strings.Contains(b, "✓ jay: Option A") || !strings.Contains(b, "Which one? (answered)") {
+		t.Errorf("text settle blocks = %s", b)
+	}
+}
+
+// A rewrite Slack refuses leaves no line behind, so the card's settle does
+// not show the answer a second time beside the one posted in the thread.
+func TestSlackRefusedRewriteRecordsNoLine(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.mu.Lock()
+	a.uxLocked().answered["C1/50.0"] = true
+	a.mu.Unlock()
+	a.rewriteAnswered(slackQuestion{channel: "C1", thread: "40.0", ts: "50.0", blocks: json.RawMessage(`not json`)}, "U1", "A")
+	if line := a.answeredLine("C1", "50.0"); line != "" {
+		t.Errorf("line = %q after a refused rewrite", line)
+	}
+	if len(api.posted) != 1 || api.posted[0].thread != "40.0" {
+		t.Errorf("posted = %+v, want the line in the question's thread root", api.posted)
+	}
+}
+
+// Blocks slack-go does not model travel as written: a fold's container keeps
+// its children through the rewrite.
+func TestSlackAnsweredLayoutKeepsBlocksSlackGoDoesNotModel(t *testing.T) {
+	blocks := `[{"type":"container","block_id":"f","children":[{"type":"section","text":{"type":"mrkdwn","text":"why"}}]},
+	 {"type":"actions","elements":[{"type":"button","action_id":"kage.choice.0","text":{"type":"plain_text","text":"Yes"},"value":"Yes"}]}]`
+	got, _, err := slackAnsweredLayout(json.RawMessage(blocks), nil, "✓ A: Yes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(got)
+	if !strings.Contains(string(raw), `"children"`) || !strings.Contains(string(raw), "why") {
+		t.Errorf("rewrite dropped the container's children: %s", raw)
 	}
 }
 
@@ -340,17 +453,18 @@ func TestSlackSessionFollowsTheChainAndItsCardWork(t *testing.T) {
 	}
 }
 
-func TestSlackSessionDirectAnswerClosesAndANeverOpenedThreadIsLeftAlone(t *testing.T) {
+func TestSlackSessionDirectAnswerClosesAndARestartedThreadIsClosedToo(t *testing.T) {
 	a, sessions := newUXSlackAdapter(&fakeSlackAPI{})
-	a.MarkChanged("slack:C1/9.0", "", "")
-	a.TaskTerminal("slack:C1/9.0", "t", lib.StateFailed, TerminalFromGateway, "")
 	a.TaskStarted("slack:dm/D1", "t")
 	if got := sessions.got(); len(got) != 0 {
-		t.Errorf("calls = %v; a thread never opened is not closed, and a thread-less DM has no session", got)
+		t.Errorf("calls = %v; a thread-less DM has no session", got)
 	}
+	// A chain this process never saw start (a restart mid-chain) still
+	// closes: the previous process's Working… is on the thread.
+	a.TaskTerminal("slack:C1/9.0", "t", lib.StateFailed, TerminalFromExecutor, "")
 	a.TaskStarted("slack:dm/D1/5.0", "t")
 	a.TaskTerminal("slack:dm/D1/5.0", "t", lib.StateCompleted, TerminalFromExecutor, "")
-	want := []string{"status D1/5.0 processing", "status D1/5.0 closed"}
+	want := []string{"status C1/9.0 closed", "status D1/5.0 processing", "status D1/5.0 closed"}
 	if got := sessions.got(); !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
 	}

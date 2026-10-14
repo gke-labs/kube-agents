@@ -51,10 +51,25 @@ func (g *Gateway) noteChatProblems(conversation, taskID string, c chatmsg.Carrie
 		return
 	}
 	g.metrics.chatMessage(chatInvalid)
+	what := chatDroppedWhat(c, r)
 	for _, p := range r.Problems {
-		g.log.Warn("chat message dropped; its text fallback stands",
+		g.log.Warn(what,
 			"conversation", conversation, "taskId", taskID, "carrier", string(c),
 			"rule", truncateRunes(p.Error(), chatProblemMax))
+	}
+}
+
+// chatDroppedWhat says what a reading with problems kept: a bad mark is
+// dropped alone with the layout still posted, and a terminal has no fallback
+// to stand.
+func chatDroppedWhat(c chatmsg.Carrier, r chatmsg.Reading) string {
+	switch {
+	case c == chatmsg.Terminal:
+		return "terminal mark dropped"
+	case r.Message != nil:
+		return "chat message's mark dropped; its layout stands"
+	default:
+		return "chat message dropped; its text fallback stands"
 	}
 }
 

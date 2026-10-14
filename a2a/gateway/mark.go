@@ -126,10 +126,15 @@ func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkStat
 // on its terminal, including a supervisor terminal: the ask comes off, a
 // blocked settle lifts, and failed sets the failed settle. A done or failed
 // settle already drawn stays. Not called for a terminal that carried a mark;
-// that one is applyTaskMark's.
+// that one is applyTaskMark's. The state is the end every observer is told
+// (handOffEnd): a session turn whose delegate request minted no child ends
+// failed, whatever its hand-off line's completed says.
 func (g *Gateway) applyTerminalMark(rec *SessionRecord, taskID string, state lib.TaskState) {
 	if !rec.chainNewest(taskID) {
 		return
+	}
+	if replaced, _, handOff := rec.handOffEnd(taskID, state); handOff {
+		state = replaced
 	}
 	i := rec.chainRootIndex(taskID)
 	if i < 0 {

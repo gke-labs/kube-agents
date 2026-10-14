@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -50,7 +49,9 @@ const (
 	slackBlockActions  = "block_actions"
 	slackBlockActionsT = "actions"
 	slackContextBlock  = "context"
+	slackSectionBlock  = "section"
 	slackPlainText     = "plain_text"
+	slackMrkdwnText    = "mrkdwn"
 
 	// slackUXCap bounds each of the click and question maps, oldest first.
 	slackUXCap = 512
@@ -168,9 +169,11 @@ func (s *SlackAdapter) noteQuestion(conversation string, q slackQuestion) {
 
 // trackQuestion keeps the open-question record in step with a message the
 // adapter just posted or edited at ts: one whose chat message carries
-// choices becomes the conversation's open question, and an edit that leaves
-// the open question without them (a card's question settled on the notify
-// route by its update key) closes it. Called once Slack has the message.
+// choices becomes the conversation's open question, a fresh one even when
+// the message was answered before (a card asking again on its update key),
+// and an edit that leaves the open question without them (a card's question
+// settled on the notify route by its update key) closes it. Called once
+// Slack has the message.
 func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	channel, thread, _ := slackChannelThread(conversation)
 	if m.Chat == nil || len(m.Chat.Choices) == 0 {
@@ -197,14 +200,35 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 			return
 		}
 	}
+	s.mu.Lock()
+	ux := s.uxLocked()
+	delete(ux.answered, channel+"/"+ts)
+	delete(ux.lines, channel+"/"+ts)
+	s.mu.Unlock()
 	s.noteQuestion(conversation, slackQuestion{channel: channel, thread: thread, ts: ts, text: text, blocks: blocks, attachments: attachments})
 }
 
-// slackAnsweredOptions is slackMessageOptions for a chat message laid out
-// over a question already answered: the same layout with the answered line
-// added where slackAnsweredLayout would put it.
+// slackAnsweredOptions is slackMessageOptions for a message laid over a
+// question already answered: the same layout with the answered line added
+// where slackAnsweredLayout would put it, or, for text alone, the text as a
+// section with the line under it (text past a section's cap posts as text
+// alone, without the line).
 func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
 	text := toMrkdwn(m.Text)
+	note := map[string]any{"type": slackContextBlock, "elements": []any{
+		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
+	if m.Chat == nil {
+		if utf8.RuneCountInString(text) > slackChatSectionMax {
+			return slackMessageOptions(m)
+		}
+		set, err := slackRawBlocks([]map[string]any{
+			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note})
+		if err != nil {
+			return nil, err
+		}
+		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(set...),
+			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
+	}
 	if utf8.RuneCountInString(text) > slackChatTextMax {
 		return nil, errSlackChatTooLarge
 	}
@@ -212,8 +236,6 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 	if err != nil {
 		return nil, err
 	}
-	note := map[string]any{"type": slackContextBlock, "elements": []any{
-		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
 	if n := len(layout.Attachments); n > 0 {
 		last := layout.Attachments[n-1]
 		inner, _ := last["blocks"].([]map[string]any)
@@ -337,7 +359,9 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 	case p.click:
 		claim := p.question.channel + "/" + p.question.ts
 		delete(ux.claims, claim)
-		if !verified {
+		// A typed reply verified first answered it already: the click's turn
+		// has gone to the gateway, but the question is not rewritten twice.
+		if !verified || ux.answered[claim] {
 			s.mu.Unlock()
 			return
 		}
@@ -357,7 +381,8 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		}
 	}
 	s.mu.Unlock()
-	if verified && !p.click {
+	if verified && !p.click && !chattext.IsCommand(p.text) {
+		// A command neither answers nor titles.
 		s.noteAsk(conversation, p.text)
 	}
 	if q.ts == "" {
@@ -420,9 +445,6 @@ func (s *SlackAdapter) slackUserName(userID string) string {
 // instead, so an answer always shows once.
 func (s *SlackAdapter) rewriteAnswered(q slackQuestion, userID, label string) {
 	line := fmt.Sprintf(slackAnsweredLine, s.slackUserName(userID), label)
-	s.mu.Lock()
-	s.uxLocked().lines[q.channel+"/"+q.ts] = line
-	s.mu.Unlock()
 	blocks, attachments, err := slackAnsweredLayout(q.blocks, q.attachments, line)
 	if err == nil {
 		opts := []slack.MsgOption{slack.MsgOptionText(q.text, false), slack.MsgOptionBlocks(blocks.BlockSet...)}
@@ -432,6 +454,14 @@ func (s *SlackAdapter) rewriteAnswered(q slackQuestion, userID, label string) {
 		_, _, _, err = s.api.UpdateMessage(q.channel, q.ts, opts...)
 	}
 	if err == nil {
+		// Only once it is on the message: a later edit keeps the line it
+		// shows (answeredLine), and one posted in the thread instead below
+		// must not show twice.
+		s.mu.Lock()
+		if s.uxLocked().answered[q.channel+"/"+q.ts] {
+			s.uxLocked().lines[q.channel+"/"+q.ts] = line
+		}
+		s.mu.Unlock()
 		return
 	}
 	s.log.Warn("slack: rewriting an answered question failed; posting the answer in its thread", "channel", q.channel, "ts", q.ts, "err", err)
@@ -486,27 +516,27 @@ func slackAnsweredLayout(rawBlocks, rawAttachments json.RawMessage, line string)
 	if !placed {
 		top = append(top, note)
 	}
-	raw, err := json.Marshal(top)
+	// Sent as written, as the renderer sends them (slackRawBlocks):
+	// slack-go's typed blocks drop what they do not model, a fold's
+	// container children and a plan's task cards among it.
+	set, err := slackRawBlocks(top)
 	if err != nil {
 		return slack.Blocks{}, nil, err
 	}
-	var blocks slack.Blocks
-	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return slack.Blocks{}, nil, err
-	}
+	blocks := slack.Blocks{BlockSet: set}
 	if atts == nil {
 		return blocks, nil, nil
 	}
-	raw, err = json.Marshal(atts)
-	if err != nil {
-		return slack.Blocks{}, nil, err
-	}
-	var attachments []slack.Attachment
-	if err := json.Unmarshal(raw, &attachments); err != nil {
-		return slack.Blocks{}, nil, err
-	}
-	if len(attachments) == 0 {
-		return slack.Blocks{}, nil, errors.New("slack: attachments did not survive the rewrite")
+	attachments := make([]slack.Attachment, 0, len(atts))
+	for _, a := range atts {
+		list, _ := a["blocks"].([]map[string]any)
+		inner, err := slackRawBlocks(list)
+		if err != nil {
+			return slack.Blocks{}, nil, err
+		}
+		color, _ := a["color"].(string)
+		fallback, _ := a["fallback"].(string)
+		attachments = append(attachments, slack.Attachment{Color: color, Fallback: fallback, Blocks: slack.Blocks{BlockSet: inner}})
 	}
 	return blocks, attachments, nil
 }

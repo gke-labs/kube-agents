@@ -1653,15 +1653,18 @@ added, the name from `users.info` (display name, real name, handle; never an id)
 typed reply in a conversation whose question is still open answers it the same way, with the
 reply's first words; a gateway command (a stop, a status ask, `/session`, a delegate) answers
 nothing. A question is answered once, and a second click on it is dropped. The open question
-is the latest message the adapter laid out with choices in the conversation; an edit that
-takes its choices away (a card's question settled by its notify `update` key) closes it, and
-keeps the answered line when one was drawn. The open question and the answered set live in
+is the latest message the adapter laid out with choices in the conversation, and one laid out
+with choices again is a fresh question whatever answered it before; an edit that takes its
+choices away (a card's question settled by its notify `update` key, laid out or as text) closes
+it, and keeps the answered line when one was drawn. The open question and the answered set live in
 the process, so a question posted before a restart keeps its
 buttons until clicked, and a typed reply then rewrites nothing. A thread's Agent Session is
 `processing` from `TaskStarted` until the chain ends, and past that while the chain's mark
 still carries its ask (card work still open), `suspended` while the settle is `blocked`, and
-`closed` after; the thread is renamed once from its first verified ask, with today's title
-sanitiser. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
+`closed` after, sent even for a thread this process never opened, since a restarted gateway
+otherwise leaves the old process's Working… on it; the thread is renamed once from its first
+verified ask that is not a gateway command, with today's title sanitiser. That state is process
+memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
 three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
@@ -1755,7 +1758,8 @@ chunk since an edit reaches only one message, and a later request with the same 
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or an edit that fails posts anew.
 A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the oldest forgotten
-first. A notify's `mark` is not applied yet.
+first. A notify's `mark` is drawn once its post lands, on the ask of the conversation's latest
+chain (Reactions, clicks and Agent Sessions, above).
 
 ## The console adapter (added 9/23)
 

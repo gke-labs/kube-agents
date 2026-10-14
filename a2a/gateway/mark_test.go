@@ -100,6 +100,19 @@ func TestMarkTerminalDefault(t *testing.T) {
 	}
 }
 
+// A session turn whose delegate request minted no child ends failed to
+// every observer (handOffEnd), and its mark settles the same way.
+func TestMarkTerminalDefaultFollowsTheHandOffEnd(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{{ID: "h", RootTaskID: "h", AskMessageID: "10.0",
+		DelegationEnd: "reason: delegation-refused - not on the list", Mark: &MarkState{Ask: "fleet"}}}}
+	g.applyTerminalMark(rec, "h", lib.StateCompleted)
+	want := []string{"slack:C1/10.0 -fleet@10.0", "slack:C1/10.0 +failed@10.0"}
+	if got := obs.reactionCalls(); !slices.Equal(got, want) {
+		t.Errorf("reactions = %v, want %v", got, want)
+	}
+}
+
 func TestMarkNotifyIsDroppedWhileAChainRuns(t *testing.T) {
 	g, obs := markRig()
 	rec := chainRecord()

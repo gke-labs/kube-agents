@@ -34,9 +34,12 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
      bot_user:
        display_name: kube-agents
        always_online: true
+     assistant_view:
+       assistant_description: Ask kube-agents about your clusters.
    oauth_config:
      scopes:
        bot:
+         - assistant:write
          - channels:history
          - channels:read
          - chat:write
@@ -46,15 +49,18 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
          - im:read
          - mpim:history
          - mpim:read
+         - reactions:write
+         - users:read
    settings:
      event_subscriptions:
        bot_events:
+         - assistant_thread_started
          - message.channels
          - message.groups
          - message.im
          - message.mpim
      interactivity:
-       is_enabled: false
+       is_enabled: true
      socket_mode_enabled: true
      token_rotation_enabled: false
    ```
@@ -64,23 +70,24 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
 What the manifest covers, so you can check an existing app instead:
 
 - **Events.** The gateway reads messages only: `message.im` for DMs, and `message.channels`, `message.groups` and `message.mpim` for public, private and group channels. Each event needs its history scope (`im:history`, `channels:history`, `groups:history`, `mpim:history`); without it the app connects normally and is never sent the message. In a channel the gateway answers only a message that mentions the app, or a reply in a thread it is already answering; it finds mentions in the message text, so `app_mention` is not needed.
-- **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed, in a DM either.
+- **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed for it, in a DM either. `reactions:write` puts the reactions on your message, `users:read` names who answered a question, and `assistant:write` shows Working… on a thread, titles it and sets the suggested prompts; without them the answers still arrive and only those go missing ([ChatOps](/kube-agents/concepts/chatops/#slack)).
+- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. An app using agent view subscribes `app_home_opened` instead, which the gateway answers on the Messages tab.
 - **Messages tab.** Without it, members cannot DM the app.
-- **No slash commands and no interactivity.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error.
+- **No slash commands.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error.
 
 ### Moving an existing app to `next`
 
 An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs, so it keeps its tokens and needs no new install. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
 
 1. After the switch, open the app's **App Manifest** page.
-2. Delete the `features.slash_commands` block, and set `settings.interactivity.is_enabled` to `false`.
+2. Delete the `features.slash_commands` block. Leave interactivity on: the gateway answers button clicks.
 3. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
 
-Do it after the switch rather than before, because the `today` listener answers both until then. Until you do, a slash command or a button click under `next` shows the member Slack's timeout error. Switching back to `today` means putting both back, which the full manifest from `hermes slack manifest` does.
+Do it after the switch rather than before, because the `today` listener answers slash commands until then. Until you do, a slash command under `next` shows the member Slack's timeout error. Switching back to `today` means putting the block back, which the full manifest from `hermes slack manifest` does.
 
 ### For `spec.mode: today` (the Hermes listener)
 
-The Hermes listener needs more than the gateway: slash commands, reactions, files, and the assistant surface. Its manifest is the one `hermes slack manifest` prints. [`INSTALL.md` Step 5](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) owns the procedure: create the app from that manifest (**Create New App → From a manifest**), which the command prints on an install where Slack is not configured yet, and its options (`--no-assistant`, `--slashes-only`). A manifest that turns on Slack's [agent view](/kube-agents/concepts/chatops/#agent-view) cannot be undone, so read that section before you apply one.
+The Hermes listener needs more than the gateway: slash commands and files on top of the reactions and assistant surface both use. Its manifest is the one `hermes slack manifest` prints. [`INSTALL.md` Step 5](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) owns the procedure: create the app from that manifest (**Create New App → From a manifest**), which the command prints on an install where Slack is not configured yet, and its options (`--no-assistant`, `--slashes-only`). A manifest that turns on Slack's [agent view](/kube-agents/concepts/chatops/#agent-view) cannot be undone, so read that section before you apply one.
 
 ## Get the tokens
 

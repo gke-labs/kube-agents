@@ -204,12 +204,13 @@ func (s *SlackAdapter) sendSession(conversation string, st *slackSession, seq ui
 		return
 	}
 	want := st.wanted()
+	// A closed is sent even for a thread this process never opened: after a
+	// restart the previous process's processing is still on it, and Slack
+	// documents no expiry.
 	fresh := st.sent == want && (want != slackSessionProcessing || s.now().Sub(st.sentAt) < slackSessionRefresh)
-	// A thread never opened is not closed: there is nothing on it to clear.
-	never := st.sent == "" && want == slackSessionClosed
 	api := s.sessionsAPI
 	s.mu.Unlock()
-	if api == nil || never {
+	if api == nil {
 		return
 	}
 	channel, thread, _ := slackChannelThread(conversation)
