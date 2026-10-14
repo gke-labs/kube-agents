@@ -182,7 +182,11 @@ it ran on every pull request, could not red one on rungs 4 or 6, redded one on r
 every case, and built the record step 3 read at presubmit volume instead of one night at a time.
 The Cases page read it as held out, undated, until the roster line. The bar step 3 set: three
 clean days at ≥ 90 % of graded repetitions under `pull_request_opened` with no all-reps
-collapse, infra classes the harness excludes not counted. One miss shape the seat showed before #2260 was graded and counted against the case: a
+collapse, infra classes the harness excludes not counted, read on the Cases page on either
+tier it shows; the eval crew took the roster line on the writers nightlies of 2026-10-12 to
+10-14 with the presubmit at 90.2 % in aggregate, and the dominant remaining miss (the worker
+declining to open a pull request into a repository that holds no manifest for the workload) as
+a known cost rather than a reason to wait. One miss shape the seat showed before #2260 was graded and counted against the case: a
 job's three repetitions shared the leased repository, the sweep closed leftovers between leases
 and not between them, and submit-suggestion derives its branch from the change, so repetitions 2
 and 3 met repetition 1's open pull request. A repetition that pushed its own commit onto that pull

@@ -102,12 +102,13 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: green presubmit runs since 2026-09-26 and the four clean nightlies at
 #: parallelism 8 (docs/designs/eval-scorer.md, "Sizing the aggregate
 #: margin"). With twelve admitted cases at three repetitions the pull
-#: request's side is 36 units (39 since 2026-10-14, when pdb-remediation-pr
-#: joined the roster: steps of 1/39), so the rate moves in steps of 1/36 = 0.028
+#: request's side was 36 units, so the rate moved in steps of 1/36 = 0.028
 #: and the margin is really a count of failed repetitions: at main's window
-#: rate of 0.924 (2026-09-29) it tolerates six failures out of 36 and reds
+#: rate of 0.924 (2026-09-29) it tolerated six failures out of 36 and redded
 #: the seventh; once the outage-era lines leave the window and main sits
-#: near 0.94 it tolerates five and reds the sixth. The worst green run in
+#: near 0.94 it tolerates five and reds the sixth. Since 2026-10-14
+#: (pdb-remediation-pr on the roster) the side is 39 units, steps of 1/39 =
+#: 0.026: six failures still pass at 0.924 and at 0.94, five at 0.96. The worst green run in
 #: the sample had five (0.861 against 0.924, a deficit of 0.063, which the
 #: old 0.05 would have redded); the next worst had four. 0.10 leaves 0.037
 #: of headroom over that worst run, more than one unit of 36, and holds
@@ -115,7 +116,7 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: test at one-sided 5% reds none of the same runs either (its largest z
 #: was 1.26, on that five-failure run); it sits one failed repetition
 #: stricter than 0.10 at today's window. Revisit if main's window rate
-#: exceeds 0.96 or the roster leaves twelve.
+#: exceeds 0.96 or the roster leaves thirteen.
 DEFAULT_AGGREGATE_MARGIN = 0.10
 
 #: Scored repetitions the aggregate needs before it may BLOCK. Below this it

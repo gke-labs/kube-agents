@@ -24,9 +24,11 @@
 # 2026-09-28. One nightly data point a night
 # would take weeks to show that fix landing; a held-out seat shows it at
 # ~40 runs a day.
-# WHAT IT NEEDS. #2016 step 3: three clean days at >= 90 % of graded
+# WHAT IT NEEDED. #2016 step 3: three clean days at >= 90 % of graded
 # repetitions under pull_request_opened, no all-reps collapse, infra classes
-# the harness excludes not counted. Before #2260 one graded miss shape was
+# the harness excludes not counted, read on the Cases page on either tier
+# (met on the writers nightlies 2026-10-12 to 10-14, the eval crew's call,
+# with the presubmit at 90.2 % in aggregate). Before #2260 one graded miss shape was
 # this case's own and counted: the job's three repetitions shared the
 # leased repository and the pool sweep (#1832) ran between leases, not
 # between them, so repetitions 2 and 3 met repetition 1's open pull

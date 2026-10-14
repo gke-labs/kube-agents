@@ -165,7 +165,10 @@
 # an erroring check, a record that is not a real run -- block for it as for
 # every case, admitted or not. It sits here to earn its record at presubmit
 # volume (~40 runs a day) instead of one nightly a night; the tracker
-# watches three clean days, then the roster line lands and the entry moves
+# watches three clean days on the Cases page, on either tier it shows (the
+# eval crew's approval of the roster line is where the reading is judged;
+# #2016's was taken on the writers nightlies with the presubmit at 90 % in
+# aggregate), then the roster line lands and the entry moves
 # up into the list above. Its line leaves nightly-cases.txt (the nightly
 # runs both files). scripts/test_eval_rosters.py pins the set as
 # HELD_OUT_IN_PRESUBMIT; roster ⊆ presubmit still holds, presubmit == roster
