@@ -65,3 +65,4 @@ The design goal: fleet issues stop rotting silently while the on-call queue is q
 - [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) — how cron ticks become tool calls.
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the `submit-suggestion` + Minty PR path.
 - [Governance SOPs](/kube-agents/concepts/governance-sops/) — the playbooks the watchdogs execute.
+- [A day with kube-agents](/kube-agents/overview/day-in-the-life/) — three scenarios from trigger to pull request.

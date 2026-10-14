@@ -338,13 +338,6 @@ def test_parents_ignores_a_predecessor_link_when_the_creator_table_is_there(data
     assert worker_trajectory.parents(payload) == {}
 
 
-def test_created_reads_the_fan_out_times_and_tolerates_their_absence() -> None:
-    assert worker_trajectory.created(None) is None
-    assert worker_trajectory.created({"cards": [{"task": "t_a", "fanned_out": ["t_b"]}]}) == {}
-    assert worker_trajectory.created({"cards": [{"task": "t_a", "fanned_out": ["t_b"], "fanned_out_at": {"t_b": 1700000005}}]}) == {"t_b": 1700000005.0}
-    assert worker_trajectory.created({"cards": [{"task": "t_a", "fanned_out_at": {"t_b": "x"}}, "t_c"]}) == {}
-
-
 def test_parents_reads_only_the_fanned_out_edges() -> None:
     assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": []}]}) == {}
     assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": ["t_b"]}]}) == {"t_b": "t_a"}

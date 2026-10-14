@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -228,22 +228,14 @@ repetition's, unless the case sets `accepts_stream_pull_request` and runs on an 
 prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
-case it runs), `worker_commands` (regular expressions over the terminal commands
-the delegated workers ran, read from each card's worker log before the harness
-purges it; with `match: segments` the source is the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, and each pattern is tried against every simple command inside a
-call as a shell runs it, behind joins, lines and `$(...)`, in `sh -c` strings and executed heredocs,
-wrapper words and assignments stripped, comments and content heredocs yielding nothing, and quoted text opening no segment of its own, so only a pattern anchored on the command word is shielded from a quoted argument; a pattern opening with `(?#program)` is tried against Python text only (an `execute_code` body; a `-c` string, an executed Python heredoc or written script inside a call), one opening with `(?#shell)` against shell segments only; with `after_result_pattern` the forbidden set applies only to the commands
-a worker issued after its first call whose result matched and whose command matched
-`after_command_pattern` (one pattern or a list, any of which), or without one its first call whose result matched, failed or not; `forbidden_result_patterns` then grade the results inside the window too (what the credential proxy's shim printed for a refused command, whatever launched it; in the opening call the result is read after its opening block, a further block there counting unless it is the opening one printed again; the opening call's text is read by the command patterns other than the opener patterns, so a case whose forbidden command patterns could match the attempt names it in `after_command_pattern` or opens them with `(?#later)`, which keeps them to the later calls), one window per delegated card and the cards its worker fanned out after the refusal (a sibling fanned out before it, by the creator table's `created_at`, is its own attempt), read from the workers' `terminal` and `execute_code` calls in the
-trajectory, which carry results as the record stores them, a JSON string with newlines
-escaped; with either `after_result_pattern` or `match: segments` a trajectory with no tagged call at all, a tagged code-tool call whose argument the pod withheld, or a capture with gaps and no hit, is `status: "error"` where the log path would grade an empty list (a worker whose tagged calls are all MCP or board calls, with an empty card log, grades as zero commands), and with a window so is a call with no numeric time), `worker_agents` (regular expressions every one of which must match the
+case it runs), `worker_commands` (regular expressions over the terminal commands the delegated workers ran, read from each card's worker log before the harness purges it; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, a tagged code-tool call whose argument the pod withheld, a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), and `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule).
 
-Nine read the install under test, eight of them from that file. `bootstrap_fanout` compares the
+Eleven read the install under test, nine of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -274,7 +266,10 @@ staged skills, scripts and governance against the copies the sandbox runs, so a 
 grade an edit to them by its effect. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
-case's plant is missing. `oobe_audits_started`, in its own module
+case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
+sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
+the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
+finding in its `document` whose id contains it. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
