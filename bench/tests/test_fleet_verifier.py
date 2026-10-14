@@ -862,11 +862,28 @@ def _task_specs() -> list[tuple[Path, dict]]:
     return out
 
 
+def _parked_cases() -> set[str]:
+    """The validator's FIXTURE_NOT_READY set, loaded by path. A case parked there
+    names a role the catalogue no longer carries, by design: the exit for a
+    retired role (bench/tf/fleet/README.md) parks the cases that name it, and
+    scripts/validate_bench_cases.py exempts them the same way."""
+    import importlib.util
+
+    validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
+    spec = importlib.util.spec_from_file_location("validate_bench_cases_for_fleet_tests", validator)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.FIXTURE_NOT_READY)
+
+
 def test_every_role_a_task_names_exists_in_the_catalog():
     """The drift that would otherwise surface as a red presubmit."""
     roles = _catalog()["roles"]
+    parked = _parked_cases()
     used = {}
     for path, spec in _task_specs():
+        if path.parent.name in parked:
+            continue
         for entry in spec.get("verification_spec") or []:
             check = entry.get("check") or {}
             if check.get("type") == "fleet_resource_property":
