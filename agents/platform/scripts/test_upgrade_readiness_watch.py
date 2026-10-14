@@ -112,8 +112,12 @@ class FakeSandbox:
             raise subprocess.TimeoutExpired(argv, timeout)
         if any(p in self.refused_projects for p in asked):
             # The script's usage exit, no report, the reason on stderr, as the real one answers an override outside the handed scope.
-            handed = next((report_argv[i + 1] for i, flag in enumerate(report_argv) if flag == fleet_scope_targets.SCOPE_PROJECTS_FLAG), "")
-            reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=handed.replace(",", ", "))
+            flags = {report_argv[i]: report_argv[i + 1] for i, flag in enumerate(report_argv) if flag in (fleet_scope_targets.SCOPE_PROJECTS_FLAG, fleet_scope_targets.SCOPE_UNREAD_FLAG)}
+            unread = dict(fleet_scope_args.parse_scope_unread(flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG)))
+            if asked[0] in unread:
+                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project=asked[0], outcome=unread[asked[0]])
+            else:
+                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG, "").replace(",", ", ") or "none readable")
             body = {"exit": 2, "tables": "", "report": None}
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
         body = self.readiness if wanted else self.versions
@@ -1429,14 +1433,14 @@ class DeclaredScope(Base):
             self.assertNotIn("collector_args", out)
             self.assertNotIn("fleet_scope", out)
             self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a)", out)
-            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script"])
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
             code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
             self.assertEqual((code, out.strip()), (0, ""))
             code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}, table_failing_projects={"p1"}))
             self.assertEqual(code, 0)
             self.assertIn("the version table was partial (2 read error(s)", out)
             self.assertIn("p1: version table for p1 failed: sandbox exited 255 without a report: ssh: lost connection", out)
-            self.assertCountEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script", "table failed"])
+            self.assertCountEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope", "table failed"])
 
     def test_pending_clusters_of_a_refused_project_are_an_ungraded_line_in_the_install_s_terms_posted_once_then_weekly(self) -> None:
         """A project the scope does not list but whose clusters the ledger
@@ -1457,7 +1461,7 @@ class DeclaredScope(Base):
                 out,
             )
             self.assertNotIn("collector_args", out)
-            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused"]])
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: outside the resolved scope"]])
             self.assertEqual(self.ledger()["targets"][OLDER_TARGET]["pending"], ["p2/us-central1-a/c"])
             code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
             self.assertEqual((code, out.strip()), (0, ""))
@@ -1491,7 +1495,7 @@ class DeclaredScope(Base):
         )
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
-    def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_for_its_cause(self) -> None:
+    def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_and_cause_it_has(self) -> None:
         label = "(declared scope: fleet_scope): "
         roster = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
         outside, unread = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR, fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR
@@ -1499,43 +1503,69 @@ class DeclaredScope(Base):
         wide = ", ".join(f"tenant-{i:03d}" for i in range(150))
         self.assertEqual(
             watch.refusal_detail(label + outside.format(project="p2", projects=wide) + "\n", resolved),
-            "refused by the report script: the install's declared scope does not list p2; it lists tenant-000, tenant-001, tenant-002, tenant-003, "
-            f"tenant-004, tenant-005, +144 more; the remedy is on the install, not this job: name the project in spec.scope, {roster}",
+            (
+                "refused by the report script: the install's declared scope does not list p2; it lists tenant-000, tenant-001, tenant-002, tenant-003, "
+                f"tenant-004, tenant-005, +144 more; the remedy is on the install, not this job: name the project in spec.scope, {roster}",
+                "outside the resolved scope",
+            ),
         )
         self.assertEqual(
             watch.refusal_detail(label + unread.format(project="p2", outcome="denied"), resolved),
-            "refused by the report script: the install's declared scope lists p2 but the install could not read it (denied); "
-            f"the remedy is on the install, not this job: give the install read access to the project, {roster}",
+            (
+                "refused by the report script: the install's declared scope lists p2 but the install could not read it (denied); "
+                f"the remedy is on the install, not this job: give the install read access to the project, {roster}",
+                "listed but unread (denied)",
+            ),
         )
         self.assertEqual(
             watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012"), resolved),
-            "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
-            "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
+            (
+                "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
+                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
+                "project number unresolved",
+            ),
         )
         # The sandbox froze the marker at its start; this pod reads the declaration live.
         self.assertEqual(
             watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, resolved),
-            "refused by the report script: the sandbox says the install declares a scope, but this pod reads no declaration; "
-            "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
+            (
+                "refused by the report script: the sandbox says the install declares a scope, but this pod reads no declaration; "
+                "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
+                "sandbox marker stale",
+            ),
         )
-        # The remedy follows the cause, not the message: one unread message covers a project over the cap, one an hour from being resolved, and one the install cannot reach.
-        self.assertTrue(watch.refusal_detail(label + unread.format(project="p2", outcome="over-cap"), resolved).endswith(f"not this job: raise spec.scope.maxProjects, {roster}"))
-        self.assertTrue(watch.refusal_detail(label + unread.format(project="p2", outcome="unresolved"), resolved).endswith("; " + watch.REMEDY_UNRESOLVED))
-        self.assertTrue(watch.refusal_detail(label + unread.format(project="p2", outcome="unreachable"), resolved).endswith(f"give the install read access to the project, {roster}"))
-        # The render answered with a management project known by number: nothing readable, and the scope's own note says why.
+        # The remedy and the cause follow what the message captured, not the message: one unread message covers a
+        # project over the cap, one an hour from being resolved, and one the install cannot reach.
+        detail, cause = watch.refusal_detail(label + unread.format(project="p2", outcome="over-cap"), resolved)
+        self.assertTrue(detail.endswith(f"not this job: raise spec.scope.maxProjects, {roster}"), detail)
+        self.assertEqual(cause, "listed but unread (over-cap)")
+        detail, cause = watch.refusal_detail(label + unread.format(project="p2", outcome="unresolved"), resolved)
+        self.assertTrue(detail.endswith("; " + watch.REMEDY_UNRESOLVED), detail)
+        self.assertEqual(cause, "listed but unread (unresolved)")
+        detail, _ = watch.refusal_detail(label + unread.format(project="p2", outcome="unreachable"), resolved)
+        self.assertTrue(detail.endswith(f"give the install read access to the project, {roster}"), detail)
+        # Outside a scope the reconcile has not resolved (the render window with a management project known by
+        # number; a carried tick): the line names both ways out, and the cause changes when the scope resolves.
         numeric = fleet_scope_targets.ScopeTargets(projects=(), unread=(("declared-scope", "unresolved"),), resolved_at=None, path="render", note=fleet_scope_targets.RENDER_NUMERIC_HOST_NOTE)
         self.assertEqual(
             watch.refusal_detail(label + outside.format(project="my-mgmt", projects="none readable"), numeric),
-            "refused by the report script: the declared scope resolved to no readable project this tick, so it does not list my-mgmt; "
-            + fleet_scope_targets.RENDER_NUMERIC_HOST_NOTE + "; " + watch.REMEDY_UNRESOLVED,
+            (
+                "refused by the report script: the declared scope resolved to no readable project this tick, so it does not list my-mgmt; "
+                + watch.REMEDY_OUTSIDE_UNRESOLVED.format(note=fleet_scope_targets.RENDER_NUMERIC_HOST_NOTE),
+                "outside a scope not yet resolved",
+            ),
         )
-        # A carried tick: the set is there but a container's members are not, so a project outside it may still be inside the declaration.
         carried = scope_targets("p1", unread=(("declared-scope", "unresolved"),))
         self.assertEqual(
             watch.refusal_detail(label + outside.format(project="p2", projects="p1"), carried),
-            "refused by the report script: the install's declared scope does not list p2; it lists p1; " + fleet_scope_args.UNRESOLVED_SCOPE_NOTE + "; " + watch.REMEDY_UNRESOLVED,
+            (
+                "refused by the report script: the install's declared scope does not list p2; it lists p1; "
+                + watch.REMEDY_OUTSIDE_UNRESOLVED.format(note=fleet_scope_args.UNRESOLVED_SCOPE_NOTE),
+                "outside a scope not yet resolved",
+            ),
         )
-        for detail in (
+        self.assertIn("a lookup that keeps failing needs the install's read access", watch.REMEDY_OUTSIDE_UNRESOLVED)
+        for detail, _ in (
             watch.refusal_detail(label + m, resolved) for m in (
                 outside.format(project="p2", projects="p1"),
                 unread.format(project="p2", outcome="denied"),
@@ -1547,6 +1577,52 @@ class DeclaredScope(Base):
             self.assertNotIn("fleet_scope tool", detail)
         # A usage exit this job does not know is not a refusal: it stays the plain failure, as the script wrote it.
         self.assertIsNone(watch.refusal_detail("no project: pass --project\n", resolved))
+
+    def test_a_refusal_whose_cause_changes_is_announced_again_with_the_new_remedy(self) -> None:
+        """The operator names p2 in spec.scope and the reconcile records it
+        denied: the remedy moves from the declaration to read access, so the
+        line posts again; the same refusal after that is quiet."""
+        versions = envelope([member("a", "current")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
+            self.declare_scope(["p1"], unread=["p2"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn(
+                "p2: version table for p2 refused by the report script: the install's declared scope lists p2 but the install could not read it (denied); "
+                "the remedy is on the install, not this job: give the install read access to the project",
+                out,
+            )
+            self.assertNotIn("name the project in spec.scope", out)
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+
+    def test_a_second_refused_project_is_announced_while_the_first_stands(self) -> None:
+        versions = envelope([member("a", "current")])
+        self.declare_scope(["p1"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("p2: version table for p2 refused", out)
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p4"}):
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2", "p4"}))
+            self.assertIn("the version table was partial (2 read error(s)", out)
+            self.assertIn("p4: version table for p4 refused", out)
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2", "p4"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+
+    def test_an_unreadable_render_fails_the_tick_before_any_sandbox_call(self) -> None:
+        """With no roster and no project variable the projects come from a
+        sandbox call; the scope is read first, so an unreadable render costs none."""
+        sandbox = FakeSandbox(envelope([]))
+        with mock.patch.dict(
+            os.environ,
+            {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "", fleet_scope_targets.SCOPE_FILE_ENV: str(Path(self.tmp.name) / "absent.json")},
+        ), mock.patch.object(watch, "roster_projects", return_value=set()):
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.calls, [])
+        self.assertIn("the operator's scope render could not be read", out)
 
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
@@ -1630,6 +1706,15 @@ class Loader(unittest.TestCase):
         self.assertIn("shutil.rmtree(private", source)
         self.assertIn(watch.ENVELOPE_SENTINEL, source)
         self.assertNotIn("/tmp/upgrade-readiness", source)
+
+    def test_the_loader_hands_the_sandbox_this_image_s_fleet_scope_args(self) -> None:
+        """The report script formats a refusal with the constants this job
+        parses it by, whatever copy the sandbox image carries."""
+        source = watch.loader_source(["--project", "p1"])
+        self.assertIn('sys.modules["fleet_scope_args"]', source)
+        self.assertIn(json.dumps(str(watch.scope_args_path())), source)
+        self.assertEqual(watch.scope_args_path(), Path(watch.__file__).resolve().parent / "fleet_scope_args.py")
+        self.assertLess(source.index('sys.modules["fleet_scope_args"]'), source.index("exec(compile(REPORT_SRC"))
 
     def test_the_report_argv_carries_the_projects_and_the_sandbox_side_kubeconfig_dir(self) -> None:
         self.assertEqual(
