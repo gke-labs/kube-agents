@@ -9160,19 +9160,31 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
             )
             return
+        relayed = upstream.body
+        if decision.rule_id == watcher_policy.RULE_GCP_CLUSTER_GET and upstream.status == HTTPStatus.OK:
+            # Only the fields the watchers read; never masterAuth's client key.
+            projected = watcher_policy.project_cluster(upstream.body)
+            if projected is None:
+                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                )
+                return
+            relayed = projected
         LOGGER.info(
             "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
             request_id,
             decision.rule_id,
             upstream.status,
-            len(upstream.body),
+            len(relayed),
         )
         self.send_response(upstream.status)
         if upstream.content_type:
             self.send_header("Content-Type", sanitize_header(upstream.content_type))
-        self.send_header("Content-Length", str(len(upstream.body)))
+        self.send_header("Content-Length", str(len(relayed)))
         self.end_headers()
-        self.wfile.write(upstream.body)
+        self.wfile.write(relayed)
 
     def _watcher_cluster_endpoint(self, target: dict[str, str], request_id: str) -> tuple[str, str] | None:
         """`(host, CA PEM or "")` for a fleet cluster's control plane, or None after answering.
@@ -9276,10 +9288,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         watching = watcher_policy.is_watch(query)
         read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
-        connection = self._watcher_k8s_connection(host, ca_pem)
+        # Built inside the try: a cached CA that will not load is a TLS failure
+        # like any other, answered 502 and forgotten, not an unanswered request.
+        connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
         answered = False
         try:
+            connection = self._watcher_k8s_connection(host, ca_pem)
             connection.connect()
             connection.sock.settimeout(read_timeout)
             target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
@@ -9346,7 +9361,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         {"error": "the API server could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
                     )
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.

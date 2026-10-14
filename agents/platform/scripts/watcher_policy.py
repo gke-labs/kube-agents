@@ -46,6 +46,7 @@ RULE_GCP_METHOD = "gcp.watcher.method"
 RULE_GCP_ROUTE = "gcp.watcher.route"
 RULE_GCP_SUBSCRIPTION = "gcp.watcher.subscription"
 RULE_GCP_BODY = "gcp.watcher.body"
+RULE_GCP_CLUSTER_GET = "gcp.watcher.cluster-get"
 RULE_K8S_METHOD = "kubernetes.watcher.method"
 RULE_K8S_TARGET = "kubernetes.watcher.target"
 RULE_K8S_PATH = "kubernetes.watcher.path"
@@ -122,6 +123,31 @@ EVENTS_QUERY_KEYS = frozenset(
 NAMED_QUERY_KEYS = frozenset({"resourceVersion"})
 
 
+# What of a GKE `Cluster` the watchers are relayed: the fields the Go side reads
+# (clusterprofiles.ClientConfigForIdentity and Discover) and nothing else. The
+# rest of `clusters.get` is not theirs, and `masterAuth` is the sharp part: on a
+# cluster with client certificate issuance on, it carries `clientCertificate`
+# and `clientKey`, a credential for that cluster's API server far wider than the
+# GET-only route the watcher role is held to. Only its CA, which is public, is kept.
+CLUSTER_FIELDS = frozenset({"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot"})
+CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})
+
+
+def project_cluster(body: bytes) -> bytes | None:
+    """The relayed form of a `clusters.get` answer, or None if it is not one."""
+    try:
+        cluster = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(cluster, dict):
+        return None
+    kept = {k: v for k, v in cluster.items() if k in CLUSTER_FIELDS}
+    master_auth = cluster.get("masterAuth")
+    if isinstance(master_auth, dict):
+        kept["masterAuth"] = {k: v for k, v in master_auth.items() if k in CLUSTER_MASTER_AUTH_FIELDS}
+    return json.dumps(kept, separators=(",", ":")).encode()
+
+
 def _refuse(rule_id: str, message: str) -> Decision:
     return Decision(allowed=False, rule_id=rule_id, message=message)
 
@@ -136,7 +162,7 @@ def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: s
         return _refuse(RULE_GCP_METHOD, "The watcher relay forwards GET and POST only.")
     if host == GKE_HOST:
         if method == METHOD_GET and _GKE_CLUSTER_GET.fullmatch(path):
-            return Decision(allowed=True, rule_id="gcp.watcher.cluster-get", message="")
+            return Decision(allowed=True, rule_id=RULE_GCP_CLUSTER_GET, message="")
         return _refuse(RULE_GCP_ROUTE, "The watcher relay reads one GKE cluster by name and nothing else.")
     if host == PUBSUB_HOST:
         match = _PUBSUB_SUBSCRIPTION.fullmatch(path)

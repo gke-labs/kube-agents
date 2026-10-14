@@ -323,8 +323,9 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 // that change would have been silently missed. Asking the GKE API for the
 // address removes the dependency rather than reinstating it — and it has to be
 // removed rather than reinstated, because anything read back out of the sandbox
-// is writable by the model, and a caller attaches a cloud-platform token to
-// whatever host it is told to talk to.
+// is writable by the model, and a caller attaches a credential to whatever host
+// it is told to talk to (a cloud-platform token without a broker; with one,
+// every request goes to the broker, which resolves the address itself).
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
@@ -364,10 +365,10 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		return nil, nil
 	}
 	var clusters []Cluster
-	// Minted on first use, then shared: every profile authenticates as the same
-	// pod identity, and a process with no cluster profiles at all -- which is
-	// every single-cluster install -- should not pay for a credential it never
-	// uses.
+	// Without a broker: minted on first use, then shared. Every profile
+	// authenticates as the same pod identity, and a process with no cluster
+	// profiles at all -- which is every single-cluster install -- should not pay
+	// for a credential it never uses. With a broker none is minted at all.
 	var tokenSource oauth2.TokenSource
 	// Keyed on the full project/location/cluster triple, not the bare name:
 	// two clusters called "prod" in different locations are two clusters, and

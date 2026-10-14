@@ -25,8 +25,15 @@ CLUSTER = {
     "controlPlaneEndpointsConfig": {
         "dnsEndpointConfig": {"endpoint": "fleet-a.example.internal", "allowExternalTraffic": True}
     },
+    # What clusters.get also returns, and the watcher route must not relay: a
+    # client certificate and key where issuance is on, and fields no watcher reads.
+    "masterAuth": {"clusterCaCertificate": "Q0EtUEVN", "clientCertificate": "Q0VSVA==", "clientKey": "S0VZ"},
+    "nodePools": [{"name": "default-pool"}],
+    "legacyAbac": {"enabled": True},
 }
 EVENT_GAP_S = 0.3
+# Captured before any test points the seam at a fake.
+REAL_K8S_CONNECTION = CredentialProxyHandler._watcher_k8s_connection
 
 
 class WatcherRelayOverTheSocketTest(unittest.TestCase):
@@ -206,6 +213,15 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
                 self.assertEqual(status, 400)
         self.assertEqual(self.google_requests, [])
 
+    def test_a_cluster_read_relays_only_the_fields_the_watchers_read(self):
+        path = "/v1/watcher/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a"
+        status, body = self._request("GET", path + "?alt=json&prettyPrint=false")
+        self.assertEqual(status, 200, body)
+        cluster = json.loads(body)
+        self.assertEqual(cluster["masterAuth"], {"clusterCaCertificate": "Q0EtUEVN"})
+        self.assertEqual(set(cluster), {"name", "endpoint", "controlPlaneEndpointsConfig", "masterAuth"})
+        self.assertNotIn(b"S0VZ", body)
+
     def test_a_query_key_beyond_alt_and_prettyprint_is_refused(self):
         path = "/v1/watcher/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a?key=x"
         status, _ = self._request("GET", path)
@@ -273,6 +289,17 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
             CredentialProxyHandler._watcher_k8s_connection = original
         self.assertEqual(status, 502)
         self.assertNotIn(("kagents-dev", "us-east4", "fleet-a"), CredentialProxyHandler.watcher_endpoints)
+
+    def test_a_cached_ca_that_will_not_load_is_answered_and_forgotten(self):
+        # The real connection builder, so the TLS context is built from the
+        # cached CA and fails to load it.
+        key = ("kagents-dev", "us-east4", "fleet-a")
+        CredentialProxyHandler.watcher_endpoints[key] = (time.monotonic() + 300, "10.0.0.9", "not a certificate")
+        CredentialProxyHandler._watcher_k8s_connection = REAL_K8S_CONNECTION
+        status, body = self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events")
+        self.assertEqual(status, 502, body)
+        self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAVAILABLE")
+        self.assertNotIn(key, CredentialProxyHandler.watcher_endpoints)
 
     # -- who may call it ---------------------------------------------------
 

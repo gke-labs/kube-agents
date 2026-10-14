@@ -109,7 +109,6 @@ class C1IsolationIsStructural(unittest.TestCase):
         # ServiceAccount the sandbox pod actually names.
         self.assertIn("shellSandboxServiceAccountName(agent)", body)
 
-    _WATCHER_TOKEN_VOLUME = "watcher-credential-proxy-token"
     _WATCHER_AUDIENCE = "kubeagents-credential-proxy-watcher"
 
     def test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth(self) -> None:
@@ -145,6 +144,20 @@ class C1IsolationIsStructural(unittest.TestCase):
                 {(gateways[0], "agent-api-auth")},
                 f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
             )
+
+    def test_C1_the_watcher_cluster_read_never_relays_a_client_credential(self) -> None:
+        """A GKE clusters.get answer carries masterAuth's client certificate and key
+        on a cluster with issuance on: a credential for that API server, wider
+        than anything the watcher role may do. The broker relays the CA only."""
+        import json
+
+        answer = json.dumps({
+            "name": "c",
+            "masterAuth": {"clusterCaCertificate": "CA", "clientCertificate": "CERT", "clientKey": "KEY",
+                           "username": "admin", "password": "pw"},
+        }).encode()
+        relayed = json.loads(h.watcher_policy.project_cluster(answer))
+        self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
 
     def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
         policy = h.watcher_policy

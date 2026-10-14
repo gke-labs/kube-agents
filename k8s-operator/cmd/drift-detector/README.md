@@ -59,9 +59,10 @@ a spent budget shows up.
 
 The join has two credential sources and they are additive. `--in-cluster` or `--kubeconfig` gives it
 the one directly reachable cluster; `--profiles-dir` gives it every cluster that has a Cluster
-Agent profile, whichever project it is in, reached as the pod's own Google identity through
-[`internal/clusterprofiles`](../../internal/clusterprofiles/) — one shared token source, not a
-credential per cluster. With neither set the join reaches nothing and every record naming a live
+Agent profile, whichever project it is in, reached through
+[`internal/clusterprofiles`](../../internal/clusterprofiles/) with one credential, not one per
+cluster: in the agent pod, the credential proxy's, through its watcher routes; without a broker
+configured, as on a local run, the pod's own Google identity. With neither set the join reaches nothing and every record naming a live
 object comes out `unreachable`. The subscription carries whatever the install's sinks export, so any
 cluster they cover that neither source reaches still comes out `unreachable`, and two shutdown lines name those
 clusters, split by what became of their records.
@@ -237,8 +238,9 @@ The join needs Kubernetes permissions on top of that, and they are not the same 
 groups including CRDs. A resource it cannot read comes out `failed` with the RBAC error on the
 line, not silently unenriched.
 
-`--profiles-dir` needs two more grants, and they attach to the pod's **Google** identity rather
-than to its ServiceAccount, because that is what a profile cluster is reached as. Addressing the
+`--profiles-dir` needs two more grants, and they attach to a **Google** identity rather than to
+the pod's ServiceAccount, because that is what a profile cluster is reached as: the credential
+proxy's, in the agent pod, and the pod's own only without a broker. Addressing the
 cluster at all takes `container.clusters.get` — `roles/container.viewer` is the usual shape — in
 every project a profile names, which is the scope grant that let the reconcile write the profile
 there. Without the grant every profile in that project is skipped at startup with
@@ -250,7 +252,7 @@ clusters' records still come out `unreachable` and are still injected, thin: the
 them, so they are inside the scope and the hold above does not apply, and the thin cards are how the
 missing grant shows up in chat.
 Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
-on every cluster in the fleet. A cluster where only the second is missing still starts: its records
+on every cluster in the fleet (through the broker, for the kinds its watcher route reads). A cluster where only the second is missing still starts: its records
 come out `failed` with the RBAC error, which is the difference between a cluster that was not
 addressed and one that was and refused.
 
@@ -430,8 +432,9 @@ entry per Cluster Agent profile; `--in-cluster`/`--kubeconfig` contributes the c
 itself can reach. They overlap on every install, because reconcile gives the management cluster a
 profile like any other cluster, and the direct credential is kept: it reaches
 `kubernetes.default.svc` as the pod's Kubernetes service account and never leaves the cluster, where
-a profile authenticates as the pod's Google identity against the control-plane endpoint, which IAM
-without `roles/container.viewer` or a master authorized network can refuse. That profile is declined
+a profile authenticates as a Google identity against the control-plane endpoint (the broker's,
+from the broker's egress, in the agent pod; the pod's without a broker), which IAM without
+`roles/container.viewer` or a master authorized network can refuse. That profile is declined
 during the scan rather than dropped after it, because addressing it is not free: it costs a GKE
 describe for a getter that is discarded, and on an install without
 `container.clusters.get` the describe fails and the profile is reported as skipped — telling an
