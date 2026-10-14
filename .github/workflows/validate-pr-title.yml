@@ -10,6 +10,31 @@ on:
   merge_group:
     branches: [main]
 
+# One run per pull request head, newest wins. Without a group every push and
+# every title or body edit queued a run behind the one before it: on
+# 2026-10-13 eight pull requests each held two queued runs of this workflow at
+# once, and 44% of its runs over 36 hours repeated a head another run had
+# already covered (#2943). `synchronize` stays in the list above, because the
+# context is a required check that GitHub records per commit: a new head with
+# no run of its own could never merge. A cancelled run on the same head (two
+# edits seconds apart) is superseded by the newer check run under the same
+# name, which is what branch protection and Tide both read.
+#
+# The head SHA is in the key, not just the number, the way `risk_classify.yml`
+# keys its group, and for the same reason (#1364): `edited` does not advance
+# the head, and nothing orders run creation by event. An `edited` run still
+# carrying the old head, created a second after the `synchronize` run for the
+# new one, would share a per-number group with it and cancel it -- or, with
+# that run still pending in a queue, displace it, since GitHub holds one
+# pending run per group whatever `cancel-in-progress` says -- and the new head
+# would carry no check run under this name until the next push or edit. Keyed
+# by head, a run can only supersede runs for its own head, and a superseded
+# head's run finishes in seconds on a head that is not the one merging.
+# Merge-queue runs fall back to the run id and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   pull-requests: read
 
