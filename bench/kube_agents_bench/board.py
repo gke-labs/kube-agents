@@ -45,7 +45,7 @@ import json
 import logging
 import re
 import shlex
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -385,9 +385,10 @@ DESCENDANTS_PRESENT = "__KANBAN_DESCENDANTS__"
 _DESCENDANTS_SCRIPT = r"""
 import json, sqlite3, sys
 
-ROOT, BOARD, SENTINEL, MAX_ARG = sys.argv[1:5]
+ROOT, BOARD, SENTINEL, MAX_ARG, EXCLUDE_ARG = sys.argv[1:6]
 MAX_CARDS = int(MAX_ARG)
-roots = [a for a in sys.argv[5:] if a]
+exclude = set(a for a in EXCLUDE_ARG.split(",") if a)
+roots = [a for a in sys.argv[6:] if a]
 SQLITE_BUSY_TIMEOUT = 10
 out = {"descendants": [], "truncated": False, "error": None}
 TERMINAL_STATUSES = ("done", "archived", "blocked", "failed", "cancelled")
@@ -397,12 +398,37 @@ def has_table(conn, name):
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
     ).fetchone() is not None
 
+def columns(conn, name):
+    return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % name)}
+
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     # tasks is hermes's core table: a store without it is not a board, so the
     # read fails to None here rather than walking nothing and reporting [].
     conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
     has_children = has_table(conn, "kanban_worker_children")
+    task_cols = columns(conn, "tasks")
+    has_created_at = "created_at" in task_cols
+    has_idempotency_key = "idempotency_key" in task_cols
+
+    min_root_created_at = None
+    if has_created_at and roots:
+        placeholders = ",".join("?" for _ in roots)
+        root_rows = conn.execute(
+            "SELECT created_at FROM tasks WHERE id IN (%s)" % placeholders,
+            tuple(roots),
+        ).fetchall()
+        times = [r[0] for r in root_rows if r[0] is not None]
+        if times:
+            min_root_created_at = min(times)
+
+    query_cols = ["status"]
+    if has_created_at:
+        query_cols.append("created_at")
+    if has_idempotency_key:
+        query_cols.append("idempotency_key")
+    task_query = "SELECT " + ", ".join(query_cols) + " FROM tasks WHERE id = ?"
+
     queue = list(roots)
     seen = set(roots)
     descendants = []
@@ -420,19 +446,39 @@ try:
                 if cid:
                     children.append(cid)
         for child in children:
-            if child not in seen:
-                seen.add(child)
-                queue.append(child)
-                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
-                if row is None:
+            if child in seen:
+                continue
+            seen.add(child)
+            queue.append(child)
+            if child in exclude:
+                continue
+            row = conn.execute(task_query, (child,)).fetchone()
+            if row is None:
+                continue
+            status = str(row[0]) if row[0] is not None else None
+            col_idx = 1
+            if has_created_at:
+                child_created_at = row[col_idx]
+                col_idx += 1
+                if (
+                    min_root_created_at is not None
+                    and child_created_at is not None
+                    and child_created_at < min_root_created_at
+                ):
+                    # Pre-dates root: idempotent re-create of an older card
                     continue
-                status = str(row[0]) if row[0] is not None else None
-                if status not in TERMINAL_STATUSES:
-                    if len(descendants) < MAX_CARDS:
-                        descendants.append(child)
-                    else:
-                        truncated = True
-                        break
+            if has_idempotency_key:
+                child_idem_key = row[col_idx]
+                col_idx += 1
+                if child_idem_key:
+                    # Idempotent card: shared across parallel repetitions
+                    continue
+            if status not in TERMINAL_STATUSES:
+                if len(descendants) < MAX_CARDS:
+                    descendants.append(child)
+                else:
+                    truncated = True
+                    break
     conn.close()
     out["descendants"] = descendants
     out["truncated"] = truncated
@@ -444,9 +490,12 @@ print(json.dumps(out))
 
 
 def command_descendants(
-    task_ids: list[str], max_cards: int = MAX_DESCENDANTS_SCANNED
+    task_ids: list[str],
+    max_cards: int = MAX_DESCENDANTS_SCANNED,
+    exclude: Iterable[str] = (),
 ) -> str:
     """The ``sh -c`` line that reads ``task_ids``' descendants in the pod."""
+    exclude_arg = ",".join(str(e) for e in exclude if e)
     args = " ".join(
         shlex.quote(a)
         for a in [
@@ -454,6 +503,7 @@ def command_descendants(
             BOARD_FILE,
             DESCENDANTS_PRESENT,
             str(max_cards),
+            exclude_arg,
             *task_ids,
         ]
     )
@@ -468,13 +518,18 @@ def read_descendants(
     task_ids: list[str],
     timeout: float,
     max_cards: int = MAX_DESCENDANTS_SCANNED,
+    exclude: Iterable[str] = (),
 ) -> list[str] | None:
     """The unsettled descendant card ids filed under ``task_ids``, or ``None``.
 
     Walks ``kanban_worker_children`` (fanned-out children created by workers)
     recursively, skipping cards that are already settled (statuses in
-    :data:`TERMINAL_STATUSES`) or no longer exist on the board (missing
-    ``tasks`` row).
+    :data:`TERMINAL_STATUSES`), no longer exist on the board (missing
+    ``tasks`` row), predate the root card's creation, or carry an
+    ``idempotency_key`` (idempotent cards that may be shared across parallel
+    repetition runs). Cards in ``exclude`` (e.g. already-attempted cards from
+    earlier rounds) are traversed to find deeper descendants but omitted from
+    the returned list so they do not consume scan slots.
 
     ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
     module stays importable without the harness and testable with a canned
@@ -486,7 +541,7 @@ def read_descendants(
     """
     if not task_ids:
         return []
-    reply = shell(command_descendants(task_ids, max_cards=max_cards), timeout)
+    reply = shell(command_descendants(task_ids, max_cards=max_cards, exclude=exclude), timeout)
     marker = reply.find(DESCENDANTS_PRESENT)
     if marker < 0:
         _log.debug("kanban board descendants could not be read for %s", ", ".join(task_ids))
@@ -514,14 +569,14 @@ def read_descendants(
             dropped += 1
     if dropped:
         _log.warning(
-            "kanban board descendants ignored %d non-conforming card id(s)",
+            "kanban board descendants ignored %d non-conforming card id(s); their workers may still hold dispatcher slots",
             dropped,
         )
     result = valid
     if payload.get("truncated"):
         _log.warning(
             "kanban board descendants truncated at %d cards; some fan-out workers may still hold slots",
-            len(result),
+            max_cards,
         )
     return result
 

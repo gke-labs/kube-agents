@@ -597,3 +597,94 @@ def test_read_descendants_returns_none_on_error_or_missing_sentinel(tmp_path: Pa
     assert board.read_descendants(lambda script, timeout: f"{board.DESCENDANTS_PRESENT}\nnot json", ["t_root"], 5.0) is None
     assert board.read_descendants(lambda script, timeout: "", [], 5.0) == []
 
+
+def test_read_descendants_skips_card_predating_root_creation(tmp_path: Path) -> None:
+    # Review finding: a card reached through an idempotent re-create whose creation
+    # predates the root card's own creation must not be archived when the root stalls.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_old_card", "running", 100),
+                ("t_root", "running", 200),
+                ("t_valid_child", "running", 300),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_old_card", "t_root", 210),
+                ("t_valid_child", "t_root", 305),
+            ],
+        )
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == ["t_valid_child"]
+
+
+def test_read_descendants_skips_card_with_idempotency_key(tmp_path: Path) -> None:
+    # Review finding: a card created or reached with an idempotency_key is an idempotent
+    # card that can be shared across parallel repetitions, so it must not be archived.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER, idempotency_key TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status, created_at, idempotency_key) VALUES (?, ?, ?, ?)",
+            [
+                ("t_root", "running", 200, None),
+                ("t_shared_child", "running", 210, "idem-key-123"),
+                ("t_private_child", "running", 220, None),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_shared_child", "t_root", 215),
+                ("t_private_child", "t_root", 225),
+            ],
+        )
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == ["t_private_child"]
+
+
+def test_read_descendants_excludes_attempted_cards_while_walking_grandchildren(tmp_path: Path) -> None:
+    # Review finding: cards in exclude are omitted from returned descendants so they do
+    # not consume scan slots, but their children are still walked.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status) VALUES (?, ?)",
+            [
+                ("t_root", "running"),
+                ("t_child_1", "running"),
+                ("t_child_2", "running"),
+                ("t_grandchild_1", "running"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_child_1", "t_root", 100),
+                ("t_child_2", "t_root", 110),
+                ("t_grandchild_1", "t_child_1", 200),
+            ],
+        )
+
+    descendants = board.read_descendants(
+        _descendants_shell_for(tmp_path), ["t_root"], 5.0, exclude=["t_child_1"]
+    )
+    assert descendants == ["t_child_2", "t_grandchild_1"]
+
+

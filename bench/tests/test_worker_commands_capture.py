@@ -212,8 +212,8 @@ def test_stalled_cards_archive_fanned_out_children(monkeypatch, caplog):
     assert "'t_child_1'" in archive_calls[1]
     assert "'t_child_2'" in archive_calls[2]
     assert "archived stalled card t_parent" in caplog.text
-    assert "archived stalled card t_child_1" in caplog.text
-    assert "archived stalled card t_child_2" in caplog.text
+    assert "archived fan-out child card t_child_1" in caplog.text
+    assert "archived fan-out child card t_child_2" in caplog.text
 
 
 def test_archive_stalled_cards_warns_when_descendants_read_fails(monkeypatch, caplog):
@@ -315,6 +315,46 @@ def test_archive_stalled_cards_bounds_fixpoint_loop_rounds_and_warns(monkeypatch
         f"fan-out child archive loop reached round cap ({harness._MAX_DESCENDANT_ARCHIVE_ROUNDS}) for t_parent; some child workers may still hold dispatcher slots"
         in caplog.text
     )
+
+
+def test_archive_stalled_cards_passes_attempted_cards_as_exclude_to_avoid_early_fixpoint(monkeypatch):
+    # Review finding: when cards fail archiving in round 1, they must be passed in exclude
+    # to subsequent reads so they do not occupy scan slots or cause an early fixpoint exit.
+    calls = []
+    read_round = 0
+
+    def fake_shell(script, timeout):
+        nonlocal read_round
+        calls.append(script)
+        if getattr(board, "DESCENDANTS_PRESENT", "__KANBAN_DESCENDANTS__") in script:
+            read_round += 1
+            if read_round == 1:
+                # First read returns t_fail_child without exclusion
+                return f"__KANBAN_DESCENDANTS__\n{json.dumps({'descendants': ['t_fail_child'], 'truncated': False, 'error': None})}\n"
+            # Subsequent reads must verify that t_fail_child is in the exclude argument
+            assert "t_fail_child" in script
+            if read_round == 2:
+                # Second read returns next card t_next_child
+                return f"__KANBAN_DESCENDANTS__\n{json.dumps({'descendants': ['t_next_child'], 'truncated': False, 'error': None})}\n"
+            return f"__KANBAN_DESCENDANTS__\n{json.dumps({'descendants': [], 'truncated': False, 'error': None})}\n"
+        if "kanban archive" in script:
+            if "t_fail_child" in script:
+                # Simulate failed archive for t_fail_child
+                return ""
+            tid = script.split("kanban archive")[1].strip().split()[0].strip("'\"")
+            return f"Archived {tid}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    harness._archive_stalled_cards(["t_parent"], 5.0)
+
+    # Both t_fail_child and t_next_child must have been attempted
+    archive_calls = [s for s in calls if "kanban archive" in s]
+    assert len(archive_calls) == 3
+    assert "'t_parent'" in archive_calls[0]
+    assert "'t_fail_child'" in archive_calls[1]
+    assert "'t_next_child'" in archive_calls[2]
+
 
 
 def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):

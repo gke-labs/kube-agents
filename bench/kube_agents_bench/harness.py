@@ -688,7 +688,7 @@ def _canonical_session_tokens(
 # have a worker or the dispatcher behind them. A failed card left out of this
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
-_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+_TERMINAL_STATUSES = board.TERMINAL_STATUSES
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
 # can file a card can always read one back.
@@ -1049,28 +1049,35 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     if not stalled:
         return
 
-    def _archive(cid: str) -> bool:
+    def _archive(cid: str, *, is_child: bool = False) -> bool:
         script = (
             f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
             f'"$H" kanban archive {_shell_quote(cid)} 2>&1 || true'
         )
         out = _agent_shell(script, timeout).strip()
         if out.startswith(_ARCHIVED_PREFIX):
-            _log.info("archived stalled card %s", cid)
+            if is_child:
+                _log.info("archived fan-out child card %s", cid)
+            else:
+                _log.info("archived stalled card %s", cid)
             return True
+        kind = "fan-out child" if is_child else "stalled"
         _log.warning(
-            "could not archive stalled card %s; its worker may still hold a dispatcher slot (%s)",
+            "could not archive %s card %s; its worker may still hold a dispatcher slot (%s)",
+            kind,
             cid,
             out[:_LOG_EXCERPT_CHARS] or "no output",
         )
         return False
 
     for tid in stalled:
-        _archive(tid)
+        _archive(tid, is_child=False)
 
     archived = set(stalled)
     for _ in range(_MAX_DESCENDANT_ARCHIVE_ROUNDS):
-        descendants = board.read_descendants(_agent_shell, list(stalled), timeout)
+        descendants = board.read_descendants(
+            _agent_shell, list(stalled), timeout, exclude=archived
+        )
         if descendants is None:
             _log.warning(
                 "could not read the fan-out children of %s; their workers may still hold dispatcher slots",
@@ -1082,7 +1089,7 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
             break
         for cid in unarchived:
             archived.add(cid)
-            _archive(cid)
+            _archive(cid, is_child=True)
     else:
         _log.warning(
             "fan-out child archive loop reached round cap (%d) for %s; some child workers may still hold dispatcher slots",
