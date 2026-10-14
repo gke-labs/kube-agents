@@ -2240,6 +2240,17 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("git.workspace.lease", body["rule"])
         self.assertIn("audit_report.py start", body["message"])
 
+    def test_a_refused_kubectl_write_carries_its_verb_and_render_flag(self):
+        status, body = self.post({"argv": ["kubectl", "scale", "deploy/x", "--replicas=3"], "cwd": "/tmp"})
+        self.assertEqual(403, status)
+        self.assertEqual("kubernetes.read-only", body["rule"])
+        self.assertEqual(["scale", "deploy/x"], body["verb"])
+        self.assertFalse(body["local_render"])
+        status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
+        self.assertEqual(403, status)
+        self.assertEqual(["create", "deployment"], body["verb"])
+        self.assertTrue(body["local_render"])
+
     def test_a_config_flag_comes_back_as_a_policy_block(self):
         # Refused before the lease check, and with its own rule id: an agent
         # that gets "take a lease" back for `git -c` would take a lease and try

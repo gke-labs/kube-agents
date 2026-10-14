@@ -61,15 +61,19 @@ import re
 # tokens; the named options take one value token more; ``timeout`` takes a
 # duration after its options.
 _WRAPPERS = frozenset(
-    {"env", "sudo", "time", "nohup", "nice", "timeout", "xargs", "command", "builtin", "exec",
+    {"env", "sudo", "time", "nohup", "nice", "ionice", "stdbuf", "watch", "timeout", "xargs",
+     "command", "builtin", "exec",
      "if", "!", "while", "until", "then", "else", "elif", "do", "{"}
 )
 _WRAPPER_VALUE_OPTIONS = {
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-T", "-U"},
-    "nice": {"-n"},
-    "xargs": {"-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a"},
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-T", "-U", "--user", "--group"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "watch": {"-n", "-d", "--interval"},
+    "xargs": {"-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--replace"},
     "env": {"-u", "-C", "-S"},
-    "timeout": {"-s", "-k"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
 }
 _WRAPPER_POSITIONAL = {"timeout": 1}
 # Words that end a block; never a command.

@@ -7239,12 +7239,17 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     elif decision.offending_flag:
         log_hint = decision.offending_flag
 
+    # The verb the policy resolved and whether the argv only rendered locally,
+    # so the shim can print them beside the rule: the agent runtime's refusal
+    # stop reads those lines instead of re-deriving the verb from shell text.
     return (
         {
             "status": "blocked",
             "code": "SECURITY_POLICY_BLOCKED",
             "rule": decision.rule_id,
             "message": decision.message,
+            "verb": list(decision.verb_tuple) if decision.verb_tuple else None,
+            "local_render": command_policy.local_render(argv),
         },
         log_hint,
     )

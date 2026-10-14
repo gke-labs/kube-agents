@@ -97,6 +97,14 @@ _FLAG_BOUNDARY_NOTICE = (
 # Only these two reach a cluster or a cloud project. Everything else the proxy
 # executes is governed elsewhere.
 _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
+# kubectl spellings that render or read a manifest without touching the cluster.
+# The policy refuses them like any unlisted verb (the dry-run carve-out was never
+# made, see above); ``local_render`` tells the refusal's readers that nothing was
+# attempted against the cluster, so the agent's runtime does not count it as a
+# refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
+# a help flag is (the verb's usage text, nothing attempted).
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list", "--dry-run", "--dry-run=client", "--dry-run=true", "-h", "--help"})
+_LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
 # effect depends on its subcommand can say which subcommand it meant: `rollout
@@ -1104,6 +1112,12 @@ def _gcloud_refuses_identity_change(argv: list[str]) -> str | None:
         if name in _GCLOUD_IDENTITY_FLAGS:
             return name
     return None
+
+
+def local_render(argv: list[str]) -> bool:
+    """Whether a kubectl ``argv`` only renders or reads a manifest locally."""
+    own = argv[: argv.index("--")] if "--" in argv else argv
+    return any(t in _LOCAL_RENDER_FLAGS for t in own) or _LOCAL_RENDER_SUBCOMMAND in own
 
 
 def evaluate(argv: list[str]) -> Decision:

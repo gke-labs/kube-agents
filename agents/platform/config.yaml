@@ -240,8 +240,9 @@ tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
   # Definitive permission refusals (the command policy's kubernetes.read-only
-  # rule refusing a mutating kubectl verb) in one run before the runtime halts
-  # it (deploy/docker/patches/permission_refusal_stop.py).
+  # rule refusing a mutating kubectl verb, as the credential-proxy shim's
+  # `policy verb:` line reports it) in one run before the runtime halts it
+  # (deploy/docker/patches/permission_refusal_stop.py).
   # The policy's notice says the change is refused however it is attempted, so
   # the first one ends the run with the refusal on the board instead of the
   # workaround hunt #1943 describes; live runs showed the model reading the

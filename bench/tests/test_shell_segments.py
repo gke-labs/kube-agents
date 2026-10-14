@@ -304,6 +304,15 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     assert segments("echo 'kubectl scale deploy x --replicas=3'>/tmp/run.sh && bash /tmp/run.sh")[0] == (
         "kubectl scale deploy x --replicas=3"
     )
+    # Wrappers the runtime knows too, with their long-form value options.
+    for command in (
+        "stdbuf -oL kubectl scale deploy x --replicas=3",
+        "sudo --user root kubectl scale deploy x --replicas=3",
+        "timeout --kill-after 5 30 kubectl scale deploy x --replicas=3",
+        "xargs --max-args 1 kubectl scale --replicas=3",
+        "watch -n 5 kubectl scale deploy x --replicas=3",
+    ):
+        assert segments(command) == ["kubectl scale deploy x --replicas=3" if "xargs" not in command else "kubectl scale --replicas=3"], command
     # A chmod that does not add execute does not make the file a script.
     assert segments("echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes && chmod 600 /tmp/notes") == [
         "echo 'kubectl scale deploy x --replicas=3 was refused' > /tmp/notes",

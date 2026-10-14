@@ -3,6 +3,7 @@ import shlex
 import unittest
 from pathlib import Path
 
+import command_policy
 from command_policy import (
     evaluate,
     GCLOUD_READ_COMMANDS,
@@ -1951,3 +1952,26 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalRenderTests(unittest.TestCase):
+    def test_client_renders_and_manifest_reads_are_local(self):
+        for argv in (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml"],
+            ["kubectl", "patch", "--local", "-f", "m.yaml", "-p", "{}", "-o", "yaml"],
+            ["kubectl", "label", "pod", "x", "--list"],
+            ["kubectl", "apply", "view-last-applied", "deploy/x"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run"],
+            ["kubectl", "scale", "--help"],
+            ["kubectl", "-n", "kube-system", "patch", "-h"],
+        ):
+            self.assertTrue(command_policy.local_render(argv), argv)
+
+    def test_server_dry_runs_real_writes_and_passthroughs_are_not(self):
+        for argv in (
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=server"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=none"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "exec", "pod", "--", "kubectl", "apply", "--dry-run=client", "-f", "x"],
+        ):
+            self.assertFalse(command_policy.local_render(argv), argv)

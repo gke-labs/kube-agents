@@ -1230,14 +1230,19 @@ _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
 _CODE_TOOLS = frozenset({_TERMINAL_TOOL, "execute_code"})
 _CODE_ARG = "code"
+#: Marks a command string that is program text (an ``execute_code`` body): the
+#: patterns see it whole, never through the shell segmenter.
+_PROGRAM_TEXT = "\x00program-text\x00"
 _COMMAND_ARG = "command"
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
 _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
+_CLIPPED_CODE_HEAD_RE = re.compile(r'"code"\s*:\s*"((?:[^"\\]|\\.)*)')
 
 
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
     """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+    An ``execute_code`` body is returned prefixed with :data:`_PROGRAM_TEXT` so ``_texts`` reads it whole.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -1262,18 +1267,22 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
             continue
         if set(args) == {"raw"} and isinstance(args["raw"], str):
             raw = args["raw"]
-            args = _clipped_string_args(raw, {_COMMAND_ARG: ""})
-            if _COMMAND_ARG not in args:
-                head = _CLIPPED_COMMAND_HEAD_RE.search(raw)
-                if head is not None:
-                    try:
-                        args = {_COMMAND_ARG: json.loads('"' + head.group(1) + '"')}
-                    except ValueError:
-                        args = {_COMMAND_ARG: head.group(1)}
+            args = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
+            if _COMMAND_ARG not in args and _CODE_ARG not in args:
+                # The value itself was cut: read its head, as far as the clip kept it.
+                for name, head_re in ((_COMMAND_ARG, _CLIPPED_COMMAND_HEAD_RE), (_CODE_ARG, _CLIPPED_CODE_HEAD_RE)):
+                    head = head_re.search(raw)
+                    if head is not None:
+                        try:
+                            args = {name: json.loads('"' + head.group(1) + '"')}
+                        except ValueError:
+                            args = {name: head.group(1)}
+                        break
         command = args.get(_COMMAND_ARG)
         if entry.get("name") != _TERMINAL_TOOL:
             # ``execute_code``: the program text is the command, read as one segment.
             command = args.get(_CODE_ARG)
+            command = _PROGRAM_TEXT + command if isinstance(command, str) else None
         if not isinstance(command, str):
             continue
         at = entry.get("at")
@@ -1430,7 +1439,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         return self
 
     def _texts(self, command: str) -> list[str]:
-        """What a pattern is tried against for ``command``, per ``match``."""
+        """What a pattern is tried against for ``command``, per ``match``; program text is one piece."""
+        if command.startswith(_PROGRAM_TEXT):
+            return [command[len(_PROGRAM_TEXT):]]
         if self.match == "segments":
             return _shell_segments(command) or []
         return [command]
@@ -1475,7 +1486,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             commands = [command for _, _, command, _, _ in calls]
             untimed = [command for _, at, command, _, _ in calls if at is None]
             if untimed:
-                shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
+                shown = "; ".join(repr(c.replace(_PROGRAM_TEXT, "")[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
                 return VerificationResult(
                     success=False,
                     status="error",
@@ -1501,7 +1512,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 opened_at = own[opener][1]
                 after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
                 graded.extend(after)
-                opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
+                opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
             if not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"

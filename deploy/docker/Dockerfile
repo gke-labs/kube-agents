@@ -1293,19 +1293,22 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # budget ran out; the stock loop guardrails count identical retries and reset on
 # any success, so they never fired. ToolCallGuardrailController.after_call is
 # wrapped (the stock method keeps running first, under a new name) and the
-# wrapper classifies every tool result: a
-# definitive policy refusal (kubernetes.read-only's, of a command naming a
-# mutating kubectl verb, with the action boundary notice) is counted across
-# the turn and halts on the configured one
+# wrapper classifies every tool result by the lines the credential-proxy shim
+# printed into it, never by the command's shell text: a definitive policy
+# refusal (kubernetes.read-only, the action boundary notice, a `policy verb:`
+# line naming a mutating kubectl verb, no `policy render: local` line) is
+# counted across the turn and halts on the configured one
 # (tool_loop_guardrails.permission_refusal_halt_after, default 1, read by a
 # second insert in ToolCallGuardrailConfig.from_mapping; below it a refusal
 # only appends guidance). The halt leaves through kanban_guardrail_exit's
 # nudge, which names the refusal and the board call, and a third insert in
 # run_agent.py makes it a chat turn's reply. An API 403, gcp.read-only's
-# refusal and kubernetes.read-only's refusal of a read spelling (both rules
-# are allowlists that refuse unlisted reads with the same notice) only warn,
-# so an investigation goes on past a project it may not read or a spelling
-# the list lacks. See
+# refusal, a local render or help read, and kubernetes.read-only's refusal of
+# a read spelling (both rules are allowlists that refuse unlisted reads with
+# the same notice) only warn, so an investigation goes on past a project it
+# may not read or a spelling the list lacks. The verb and render lines come
+# from command_policy.py through the proxy and the shim, so the proxy and
+# sandbox images of the same tree are needed for the halt to fire. See
 # the module docstring in deploy/docker/patches/permission_refusal_stop.py.
 #
 # ssh_shared_master rides it too (#2174): every working environment in the pod

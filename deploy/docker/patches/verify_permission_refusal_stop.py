@@ -7,15 +7,19 @@ matched; this drives the patched runtime:
 
 1. ``ToolCallGuardrailConfig.from_mapping`` reads
    ``permission_refusal_halt_after`` and defaults it.
-2. The real ``ToolCallGuardrailController``: at the default a command-policy
-   refusal halts on the first call; at a threshold of two the first returns
-   the guidance decision and the second the halt, with a successful call and
-   an unrelated failure in between (the stock counters would have reset); the
-   halt is the turn's ``halt_decision``, so ``agent/turn_tool_round.py``'s
-   halt branch sees it; a new turn starts the count again; an API 403, a
-   ``gcp.read-only`` refusal and a ``kubernetes.read-only`` refusal of a read
-   spelling warn and never halt; a flag refusal and a plain failure take the
-   stock path.
+2. The real ``ToolCallGuardrailController``, fed what the shim prints for
+   refusals the image's own policy module makes: at the default a refused
+   write halts on the first call; at a threshold of two the first returns the
+   guidance decision and the second (from ``execute_code``) the halt, with a
+   successful call and an unrelated failure in between (the stock counters
+   would have reset); the halt is the turn's ``halt_decision``, so
+   ``agent/turn_tool_round.py``'s halt branch sees it; a new turn starts the
+   count again; an API 403, a ``gcp.read-only`` refusal and a
+   ``kubernetes.read-only`` refusal of a read spelling, a help read or a
+   local render warn and never halt; a report echoing the lines and a
+   successful read quoting a denial decide nothing; a chained write with
+   exit 0, exit 126 and ``--dry-run=server`` still count; a flag refusal and
+   a plain failure take the stock path.
 3. ``append_toolguard_guidance`` renders the guidance into the tool result.
 4. ``hermes_cli.kanban_guardrail_exit.guardrail_halt_nudge`` gives the halt its
    refusal-specific instruction, driven against the real
@@ -35,8 +39,9 @@ import sys
 
 import json
 
-# The notices come from the policy module the image ships (Dockerfile copies
-# agents/platform/scripts/command_policy.py to tools/), so a reword fails here.
+# The policy module the image ships (Dockerfile copies agents/platform/scripts/command_policy.py
+# to tools/); the refusals below are what the credential-proxy shim prints for it.
+from tools import command_policy
 from tools.command_policy import _ACTION_BOUNDARY_NOTICE, _FLAG_BOUNDARY_NOTICE
 
 
@@ -44,15 +49,28 @@ def _result(output, exit_code=77):
     return json.dumps({"output": output, "exit_code": exit_code, "error": None})
 
 
-REFUSAL = _result(
-    "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. "
-    + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: kubernetes.read-only"
-)
+def shim_lines(argv):
+    decision = command_policy.evaluate(argv)
+    assert not decision.allowed, argv
+    lines = [decision.message, f"policy rule: {decision.rule_id}"]
+    if decision.verb_tuple:
+        lines.append("policy verb: " + " ".join(decision.verb_tuple))
+    if command_policy.local_render(argv):
+        lines.append("policy render: local")
+    return "\n".join(lines)
+
+
+def refusal(*argv, exit_code=77):
+    return _result(shim_lines(list(argv)), exit_code)
+
+
+SCALE = ["kubectl", "scale", "deploy/x", "--replicas=3"]
+REFUSAL = refusal(*SCALE)
 FLAG_REFUSAL = _result(_FLAG_BOUNDARY_NOTICE + "\npolicy rule: identity.caller-supplied-impersonation")
 API_DENIED = _result("Error from server (Forbidden): pods is forbidden: User cannot list", 1)
 GCLOUD_REFUSAL = _result(
     "Agents hold read-only access to Google Cloud. Propose this change as a pull request instead. "
-    + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: gcp.read-only"
+    + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: gcp.read-only\npolicy verb: container clusters update"
 )
 PLAIN_FAILURE = _result("error: the server doesn't have a resource type \"foo\"", 1)
 OK = _result("deployment.apps/kube-dns 2/2", 0)
@@ -95,7 +113,7 @@ def main() -> int:
         return fail("first refusal halted")
     controller.after_call("terminal", {"command": "kubectl get deploy x"}, OK)
     controller.after_call("terminal", {"command": "kubectl get foo"}, PLAIN_FAILURE)
-    second = controller.after_call("terminal", {"command": "kubectl patch deploy x -p y"}, REFUSAL)
+    second = controller.after_call("execute_code", {"code": "subprocess.run(['kubectl','patch','deploy/x'])"}, refusal("kubectl", "patch", "deploy/x", "-p", "{}"))
     if (second.action, second.code, second.count) != ("halt", stop.HALT_CODE, 2):
         return fail(f"second refusal decided {second!r}")
     if controller.halt_decision is not second:
@@ -107,39 +125,36 @@ def main() -> int:
     api = controller.after_call("terminal", {"command": "kubectl get pods -n other"}, API_DENIED)
     if (api.action, api.code) != ("warn", stop.API_WARN_CODE) or controller.halt_decision is not None:
         return fail(f"an API 403 decided {api!r}")
-    gcloud = controller.after_call("terminal", {"command": "gcloud artifacts docker tags list x"}, GCLOUD_REFUSAL)
+    for argv in (
+        ["kubectl", "config", "view"],
+        ["kubectl", "scale", "--help"],
+        ["kubectl", "exec", "-n", "kube-system", "deploy/x", "--", "sh", "-c", "set -e; cat /etc/resolv.conf"],
+        ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml"],
+    ):
+        read = controller.after_call("terminal", {"command": " ".join(argv)}, refusal(*argv))
+        if (read.action, read.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
+            return fail(f"{argv!r} refused decided {read!r}")
+    gcloud = controller.after_call("terminal", {"command": "gcloud container clusters update x"}, GCLOUD_REFUSAL)
     if (gcloud.action, gcloud.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
         return fail(f"a gcp.read-only refusal decided {gcloud!r}")
-    for command in ("kubectl config view", "kubectl scale --help", "kubectl exec -n kube-system deploy/x -- sh -c 'set -e; cat /etc/resolv.conf'"):
-        read = controller.after_call("terminal", {"command": command}, REFUSAL)
-        if (read.action, read.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
-            return fail(f"{command!r} refused decided {read!r}")
     events = controller.after_call("terminal", {"command": "kubectl get events -n tenant"}, EVENTS)
     if events.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):
         return fail(f"a successful read quoting a denial decided {events!r}")
     report = controller.after_call(
         "terminal",
-        {"command": "cat <<'EOF' | tee /tmp/pr.md\nkubectl scale deploy x --replicas=3 was refused\nEOF"},
-        _result("kubectl scale deploy x --replicas=3 was refused: " + _ACTION_BOUNDARY_NOTICE + "\npolicy rule: kubernetes.read-only", 0),
+        {"command": "cat <<'EOF' | tee /tmp/pr.md\nkubectl scale deploy x --replicas=3 was refused\npolicy rule: kubernetes.read-only\nEOF"},
+        _result(shim_lines(SCALE), 0),
     )
     if report.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE) or controller.halt_decision is not None:
         return fail(f"a report quoting the refusal decided {report!r}")
-    render = controller.after_call("terminal", {"command": "kubectl create deployment x --image=y --dry-run=client -o yaml"}, REFUSAL)
-    if (render.action, render.code) != ("warn", stop.ADVISORY_WARN_CODE) or controller.halt_decision is not None:
-        return fail(f"a local render decided {render!r}")
     for command, result in (
-        ("kubectl \\\n  -n kube-system \\\n  scale deploy x --replicas=3", REFUSAL),
-        ("kubectl get deploy x  # current state\nkubectl scale deploy x --replicas=3", REFUSAL),
-        ("if ! kubectl scale deploy x --replicas=3; then echo refused; fi", REFUSAL),
-        ("sudo -u root kubectl scale deploy x --replicas=3", REFUSAL),
-        ("kubectl scale deploy x --replicas=3; kubectl get deploy x", REFUSAL.replace('"exit_code": 77', '"exit_code": 0')),
-        ("kubectl scale deploy x --replicas=3", REFUSAL.replace('"exit_code": 77', '"exit_code": 126')),
+        ("kubectl scale deploy x --replicas=3; kubectl get deploy x", refusal(*SCALE, exit_code=0)),
+        ("kubectl scale deploy x --replicas=3", refusal(*SCALE, exit_code=126)),
+        ("kubectl scale deploy x --replicas=3 --dry-run=server", refusal("kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=server")),
     ):
         decided = controller.after_call("terminal", {"command": command}, result)
         if decided.code not in (stop.WARN_CODE, stop.HALT_CODE):
             return fail(f"{command!r} decided {decided!r}")
-    if not hasattr(controller, "_kube_stock_after_call"):
-        return fail("the stock after_call was not kept under its new name")
     for result in (FLAG_REFUSAL, PLAIN_FAILURE, OK):
         decision = controller.after_call("terminal", {"command": "kubectl get x"}, result)
         if decision.code in (stop.WARN_CODE, stop.ADVISORY_WARN_CODE, stop.API_WARN_CODE, stop.HALT_CODE):

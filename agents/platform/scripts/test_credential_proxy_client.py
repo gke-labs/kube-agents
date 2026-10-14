@@ -1246,6 +1246,8 @@ class TestExecutePolicyBlocked(unittest.TestCase):
             "code": "SECURITY_POLICY_BLOCKED",
             "message": "kubectl delete is not permitted.",
             "rule": "kubernetes.read-only",
+            "verb": ["delete", "pod"],
+            "local_render": False,
         }
         body = json.dumps(refusal_payload).encode("utf-8")
         error_file = io.BytesIO(body)
@@ -1278,6 +1280,8 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         err = stderr.getvalue()
         self.assertIn("kubectl delete is not permitted.", err)
         self.assertIn("policy rule: kubernetes.read-only", err)
+        self.assertIn("policy verb: delete pod", err)
+        self.assertNotIn("policy render:", err)
 
     @unittest.skipUnless(HAS_HERMES, "needs hermes-agent runtime (tools.terminal_hints) importable")
     def test_exit_77_receives_no_runtime_execution_hint(self):

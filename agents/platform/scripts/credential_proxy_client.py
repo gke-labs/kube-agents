@@ -822,6 +822,12 @@ def execute(
                 file=sys.stderr,
             )
             print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+            # The verb the policy resolved and whether this was a local render:
+            # the agent runtime's refusal stop reads these two lines.
+            if payload.get("verb"):
+                print(f"policy verb: {' '.join(str(w) for w in payload['verb'])}", file=sys.stderr)
+            if payload.get("local_render"):
+                print("policy render: local", file=sys.stderr)
             return EXIT_SECURITY_POLICY_BLOCKED
         print(payload.get("error", str(exc)), file=sys.stderr)
         return 1
