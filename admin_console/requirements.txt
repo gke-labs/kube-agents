@@ -1,4 +1,12 @@
-streamlit>=1.65.0,<2
+# Capped below 1.66.0 because that release changed the AppTest harness
+# ("Keep AppTest page widget state on rerun"): the page hash is kept between
+# AppTest.run() calls, the sidebar's polling fragment no longer executes on
+# later runs, and 14 of the 41 tests in tests/test_admin_portal_ui.py fail
+# because a finished connect job is never applied. The console itself is not
+# known to be affected. Lift the cap together with the streamlit ignore rule
+# in .github/dependabot.yml once that suite passes on the new line, which
+# means adapting the console or its tests to the retained page state.
+streamlit>=1.65.0,<1.66.0
 plotly>=7.1.0,<8
 fastapi>=0.142.2,<1
 httpx>=0.28.1,<1

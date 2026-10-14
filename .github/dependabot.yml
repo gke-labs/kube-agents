@@ -91,10 +91,20 @@ updates:
     # version, and the cap is a bare range rather than an `==` pin, so there is
     # none. Remove this rule and lift the pin in one change when Streamlit
     # lifts its own.
+    #
+    # admin_console/requirements.txt also caps streamlit below 1.66.0: that
+    # release keeps AppTest page state between runs and 14 of the console's
+    # UI tests fail on it, so a grouped bump that reaches it drags the whole
+    # python group red. Same `versions` form as above, for the same reason.
+    # Remove this rule and that cap in one change, once the console's tests
+    # pass on the new line.
     ignore:
       - dependency-name: "websockets"
         versions:
           - ">=17"
+      - dependency-name: "streamlit"
+        versions:
+          - ">=1.66"
     groups:
       python:
         patterns:
