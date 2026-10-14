@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import mcp_policy
 import providers
 import repo_ref
 import scoped_sa_pool
@@ -304,6 +305,33 @@ API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token",
 # two. Every header the caller sent is dropped.
 API_RELAY_ACCEPT = "application/json"
 API_RELAY_UPSTREAM_PORT = 443
+# The method the MCP relay forwards with. The Cloud API relay never sends it.
+API_RELAY_POST = "POST"
+
+# The remote MCP relay, `POST /v1/mcp/<server>`. `mcp_policy` decides what is
+# relayed; it shares the Cloud API relay's credential, connect timeout,
+# deadline and response cap, which bound how.
+#
+# The body the upstream receives is the broker's own re-serialisation of the
+# message it evaluated, never the caller's bytes, so no parser difference
+# between this process and Google's front end can make the two read different
+# requests.
+MCP_RELAY_CONTENT_TYPE = "application/json"
+# The headers forwarded beyond `Authorization`, `Accept`, `Content-Type` and
+# `Content-Length`, each only when the caller's value has this shape. Every
+# other header the caller sent is dropped, `Mcp-Session-Id` included: the
+# servers in the table are stateless and never issue one.
+#
+# `User-Agent` is what the API teams key their dashboards on; the agent's
+# configs set it (deploy/shared/defaults/config.yaml carries the reason).
+# Printable ASCII and bounded, so the value cannot fold or inject a header.
+MCP_RELAY_USER_AGENT = "User-Agent"
+MCP_RELAY_USER_AGENT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+MCP_RELAY_PROTOCOL_VERSION = "MCP-Protocol-Version"
+MCP_RELAY_PROTOCOL_VERSION_SHAPE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+# The quota project, from the broker's own credential. The agent's mcp-remote
+# used to send it from its own ADC lookup; it no longer has one.
+MCP_RELAY_USER_PROJECT = "X-Goog-User-Project"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -907,6 +935,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # _role_permits then admits every role, so a prefix spelled twice is a
     # rename away from opening the relay to the gateway.
     (API_RELAY_PREFIX, (CALLER_ROLE_SHELL,)),
+    # The remote MCP relay belongs to the gateway, where Hermes runs the
+    # mcp-remote children; the sandbox has no MCP client. Session pods are not
+    # admitted here yet: that is a new read path for them, argued in the change
+    # that wires them, not by default.
+    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -2257,8 +2290,10 @@ class GoogleApiRelay:
     route answers 503 rather than the process refusing to come up.
 
     `AuthorizedSession` is deliberately not used. The upstream request is built
-    by hand in `fetch` so that exactly two headers leave this process and no
-    header the caller sent can ride along.
+    by hand in `fetch` so that the Cloud API relay sends exactly two headers and
+    no header the caller sent can ride along. The MCP relay passes `fetch` the
+    extra headers it chose itself (`_handle_mcp_relay` names them and the shape
+    each caller value must have); nothing is copied from the request wholesale.
 
     `connection` is the seam a test replaces with a plain HTTPConnection to a
     fake upstream; everything above it -- the header set, the deadline, the
@@ -2269,6 +2304,7 @@ class GoogleApiRelay:
 
     def __init__(self) -> None:
         self._credentials: Any = None
+        self._project_id = ""
         self._lock = threading.Lock()
         # Built once: create_default_context loads the CA bundle, and a
         # context is safe to share across connections.
@@ -2280,12 +2316,23 @@ class GoogleApiRelay:
             if self._credentials is None:
                 import google.auth
 
-                self._credentials, _ = google.auth.default(scopes=list(self.SCOPES))
+                self._credentials, project_id = google.auth.default(scopes=list(self.SCOPES))
+                self._project_id = project_id or ""
             if not self._credentials.valid:
                 from google.auth.transport.requests import Request
 
                 self._credentials.refresh(Request())
             return f"Bearer {self._credentials.token}"
+
+    def project_id(self) -> str:
+        """The project `google.auth.default()` resolved with the credential, or "".
+
+        Read after `authorization_header`, which is what resolves it. The MCP
+        relay sends it as `X-Goog-User-Project`, the header the agent's
+        mcp-remote used to send from its own ADC lookup.
+        """
+        with self._lock:
+            return self._project_id
 
     def connection(self, host: str) -> http.client.HTTPConnection:
         """A fresh TLS connection to `host`, with the connect bounded."""
@@ -2303,14 +2350,26 @@ class GoogleApiRelay:
             raise TimeoutError("the relay deadline passed")
         return remaining
 
-    def fetch(self, host: str, target: str, authorization: str) -> ApiRelayResponse:
-        """One `GET https://{host}{target}` on the broker's credential.
+    def fetch(
+        self,
+        host: str,
+        target: str,
+        authorization: str,
+        *,
+        body: bytes | None = None,
+        headers: tuple[tuple[str, str], ...] = (),
+    ) -> ApiRelayResponse:
+        """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
         `TimeoutError` when API_RELAY_DEADLINE_S passes at any point, and lets
         `OSError` and `http.client.HTTPException` through for the handler to
         answer 502; redirects are not followed, the 3xx comes back as a status.
+
+        `body` and `headers` are the MCP relay's: a POST of a body the broker
+        re-serialised itself, with the extra headers it chose. The Cloud API
+        relay passes neither, and its request is byte-for-byte what it was.
         """
         deadline = time.monotonic() + API_RELAY_DEADLINE_S
         connection = self.connection(host)
@@ -2333,10 +2392,15 @@ class GoogleApiRelay:
             sock.settimeout(self._remaining(deadline))
             # `skip_accept_encoding`: without it http.client adds a third
             # header of its own. `Host` is added, because HTTP/1.1 requires it.
-            connection.putrequest("GET", target, skip_accept_encoding=True)
+            method = API_RELAY_POST if body is not None else api_policy.API_READ_METHOD
+            connection.putrequest(method, target, skip_accept_encoding=True)
             connection.putheader("Authorization", authorization)
             connection.putheader("Accept", API_RELAY_ACCEPT)
-            connection.endheaders()
+            for name, value in headers:
+                connection.putheader(name, value)
+            if body is not None:
+                connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body)
             response = connection.getresponse()
             chunks: list[bytes] = []
             received = 0
@@ -5711,14 +5775,17 @@ class CommandExecutor:
             #
             # Do not read that as "kubectl is the only way to reach a Kubernetes
             # object." It is not, and the difference matters. The `gke` remote
-            # MCP server in every profile's config.yaml proxies to
-            # container.googleapis.com/mcp from the *agent* container, on the
-            # ambient Workload Identity credential, with no part of this file in
-            # the path. Nothing here scopes it and nothing here can.
+            # MCP server in every profile's config.yaml reaches
+            # container.googleapis.com/mcp through this process's `/v1/mcp/`
+            # relay, on the broker's own credential and not on any pool member:
+            # `mcp_policy` bounds it per tool, and this kubeconfig selection
+            # plays no part. What a permitted read returns is bounded by the
+            # broker identity's grant.
             #
-            # What scopes it is the size of the agent's own grant — which is why
-            # taking roles/container.viewer off that identity is not a tidy-up
-            # alongside this work but the half of it that covers this door.
+            # And the gateway pod still runs as the Workload Identity-annotated
+            # ServiceAccount it shares with this pod, so the agent's own grant
+            # still bounds anything there that reaches the metadata server.
+            # Splitting the two identities is the change that closes that.
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
@@ -7988,6 +8055,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()
             return
+        if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
+            # The optional server-to-client SSE channel. None of the relayed
+            # servers streams, and the spec's answer for that is 405.
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.send_header("Allow", API_RELAY_POST)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
                 self._json(
@@ -8049,6 +8124,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # `gcp.api.method`, named in the audit line, rather than a 404
             # that reads as "no such route". The body is never read.
             self._handle_api_relay()
+            return
+        if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
+            self._handle_mcp_relay()
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
@@ -8497,6 +8575,134 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+    def _relay_authorization(self, label: str, request_id: str) -> str | None:
+        """The broker's own `Authorization` value, or None after answering 503.
+
+        Shared by the Cloud API relay and the MCP relay; `label` is the first
+        word of their audit lines.
+        """
+        try:
+            return self.api_relay.authorization_header()
+        except Exception as exc:
+            # The type and not the message: google-auth's messages can name
+            # the credential file it looked for.
+            LOGGER.warning(
+                "%s credential unavailable request_id=%s type=%s",
+                label,
+                request_id,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the credential proxy could not obtain its own credential",
+                    "code": "RELAY_CREDENTIAL_UNAVAILABLE",
+                },
+            )
+            return None
+
+    def _relay_fetch(
+        self,
+        label: str,
+        request_id: str,
+        host: str,
+        target: str,
+        authorization: str,
+        **kwargs: Any,
+    ) -> ApiRelayResponse | None:
+        """`GoogleApiRelay.fetch`, or None after answering the upstream failure.
+
+        Every failure answers the way the Cloud API relay always has, with the
+        same codes; `label` is the first word of the audit line. `kwargs` go to
+        `fetch` unchanged.
+        """
+        try:
+            return self.api_relay.fetch(host, target, authorization, **kwargs)
+        except ApiRelayConnectTimeout:
+            LOGGER.warning(
+                "%s upstream connect timeout request_id=%s host=%s connect_timeout_s=%d",
+                label,
+                request_id,
+                host,
+                API_RELAY_CONNECT_TIMEOUT_S,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return None
+        except TimeoutError:
+            LOGGER.warning(
+                "%s upstream timeout request_id=%s host=%s deadline_s=%d",
+                label,
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            self._json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {
+                    "error": "the upstream did not answer within the relay deadline",
+                    "code": "UPSTREAM_TIMEOUT",
+                },
+            )
+            return None
+        except (UnicodeError, http.client.InvalidURL) as exc:
+            # Belt to the query check's braces: what putrequest raises for a
+            # target it will not send -- a non-ASCII byte, a control character
+            # -- is the caller's text, and a 400 that names it beats a
+            # traceback and a closed connection. UnicodeError and not
+            # ValueError: ssl.SSLCertVerificationError is a ValueError too, and
+            # a TLS fault is the upstream's, answered 502 below.
+            LOGGER.warning(
+                "%s rejected request_id=%s code=%s reason=%s",
+                label,
+                request_id,
+                API_RELAY_BAD_QUERY,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "the request could not be placed on an upstream request line",
+                    "code": API_RELAY_BAD_QUERY,
+                },
+            )
+            return None
+        except http.client.IncompleteRead as exc:
+            # The upstream closed before delivering what it announced. Its own
+            # code, so an operator can tell a page cut short from a host that
+            # never answered; nothing of the partial body is relayed.
+            LOGGER.warning(
+                "%s upstream truncated request_id=%s host=%s received=%d expected=%d",
+                label,
+                request_id,
+                host,
+                len(exc.partial),
+                len(exc.partial) + (exc.expected or 0),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "the upstream closed before sending the whole response",
+                    "code": "UPSTREAM_TRUNCATED",
+                },
+            )
+            return None
+        except (OSError, http.client.HTTPException) as exc:
+            LOGGER.warning(
+                "%s upstream unreachable request_id=%s host=%s type=%s",
+                label,
+                request_id,
+                host,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return None
+
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
 
@@ -8563,107 +8769,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        try:
-            authorization = self.api_relay.authorization_header()
-        except Exception as exc:
-            # The type and not the message: google-auth's messages can name
-            # the credential file it looked for.
-            LOGGER.warning(
-                "api credential unavailable request_id=%s type=%s",
-                request_id,
-                type(exc).__name__,
-            )
-            self._json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {
-                    "error": "the credential proxy could not obtain its own credential",
-                    "code": "RELAY_CREDENTIAL_UNAVAILABLE",
-                },
-            )
+        authorization = self._relay_authorization("api", request_id)
+        if authorization is None:
             return
         query = strip_credential_query_keys(parts.query)
         target = f"/{path}?{query}" if query else f"/{path}"
         started = time.monotonic()
-        try:
-            upstream = self.api_relay.fetch(host, target, authorization)
-        except ApiRelayConnectTimeout:
-            LOGGER.warning(
-                "api upstream connect timeout request_id=%s host=%s connect_timeout_s=%d",
-                request_id,
-                host,
-                API_RELAY_CONNECT_TIMEOUT_S,
-            )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
-            )
-            return
-        except TimeoutError:
-            LOGGER.warning(
-                "api upstream timeout request_id=%s host=%s deadline_s=%d",
-                request_id,
-                host,
-                API_RELAY_DEADLINE_S,
-            )
-            self._json(
-                HTTPStatus.GATEWAY_TIMEOUT,
-                {
-                    "error": "the upstream did not answer within the relay deadline",
-                    "code": "UPSTREAM_TIMEOUT",
-                },
-            )
-            return
-        except (UnicodeError, http.client.InvalidURL) as exc:
-            # Belt to the query check's braces: what putrequest raises for a
-            # target it will not send -- a non-ASCII byte, a control character
-            # -- is the caller's text, and a 400 that names it beats a
-            # traceback and a closed connection. UnicodeError and not
-            # ValueError: ssl.SSLCertVerificationError is a ValueError too, and
-            # a TLS fault is the upstream's, answered 502 below.
-            LOGGER.warning(
-                "api rejected request_id=%s code=%s reason=%s",
-                request_id,
-                API_RELAY_BAD_QUERY,
-                type(exc).__name__,
-            )
-            self._json(
-                HTTPStatus.BAD_REQUEST,
-                {
-                    "error": "the request could not be placed on an upstream request line",
-                    "code": API_RELAY_BAD_QUERY,
-                },
-            )
-            return
-        except http.client.IncompleteRead as exc:
-            # The upstream closed before delivering what it announced. Its own
-            # code, so an operator can tell a page cut short from a host that
-            # never answered; nothing of the partial body is relayed.
-            LOGGER.warning(
-                "api upstream truncated request_id=%s host=%s received=%d expected=%d",
-                request_id,
-                host,
-                len(exc.partial),
-                len(exc.partial) + (exc.expected or 0),
-            )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {
-                    "error": "the upstream closed before sending the whole response",
-                    "code": "UPSTREAM_TRUNCATED",
-                },
-            )
-            return
-        except (OSError, http.client.HTTPException) as exc:
-            LOGGER.warning(
-                "api upstream unreachable request_id=%s host=%s type=%s",
-                request_id,
-                host,
-                type(exc).__name__,
-            )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
-            )
+        upstream = self._relay_fetch("api", request_id, host, target, authorization)
+        if upstream is None:
             return
         duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
         if upstream.over_cap:
@@ -8719,6 +8832,169 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(upstream.body)))
         self.end_headers()
         self.wfile.write(upstream.body)
+
+    def _handle_mcp_relay(self) -> None:
+        """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.
+
+        The agent's `mcp-remote` children point here instead of at Google, so
+        every `mcp__gke__*` call reaches the upstream on the broker's
+        credential, after `mcp_policy` has read it. In order: the body, bounded
+        by `max_request_bytes`; the decision; for a refusal, a reply the model
+        can read; otherwise the upstream POST of the broker's re-serialisation
+        of the message, and the passthrough of status and body, with
+        `tools/list` cut down to the table. Two audit lines per request, as the
+        Cloud API relay writes them.
+
+        A refusal of a request with an id answers HTTP 200. mcp-remote's SDK
+        throws away the body of any non-2xx reply, so a 403 would reach the
+        model as a transport error with no rule id in it.
+        """
+        principal = self.principal
+        request_id = str(uuid.uuid4())
+        server_name = urllib.parse.urlsplit(self.path).path[len(mcp_policy.MCP_RELAY_PREFIX) :]
+        entry = mcp_policy.server(server_name)
+        LOGGER.info(
+            "mcp request_id=%s principal=%s server=%s",
+            request_id,
+            _sanitize_for_logging(
+                principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
+            ),
+            _sanitize_for_logging(server_name),
+        )
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            # The two answers /v1/exec gives: 400 for a length that is not a
+            # number, 413 for one out of range.
+            LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+            return
+        if content_length <= 0 or content_length > self.max_request_bytes:
+            # Nothing to drain: a body over the cap is one drain_request_body
+            # declines, and an empty length announces none.
+            LOGGER.warning("mcp rejected request_id=%s reason=content-length", request_id)
+            self._json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "MCP request is empty or exceeds the configured size limit"},
+            )
+            return
+        message = mcp_policy.parse(self.rfile.read(content_length))
+        decision = mcp_policy.evaluate(server_name, message)
+        if not decision.allowed:
+            LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            reply = mcp_policy.refusal(message, decision) if entry is not None else None
+            if reply is None:
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": decision.rule_id,
+                        "message": decision.message,
+                    },
+                )
+                return
+            self._json(HTTPStatus.OK, reply)
+            return
+        # From here on `server_name` is a table entry and `decision.rule_id` is
+        # one of mcp_policy.RELAYED_METHODS, so both are logged as-is.
+        if self.api_relay is None:
+            LOGGER.warning("mcp disabled request_id=%s method=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
+            )
+            return
+        authorization = self._relay_authorization("mcp", request_id)
+        if authorization is None:
+            return
+        headers = [("Content-Type", MCP_RELAY_CONTENT_TYPE)]
+        for name, shape in (
+            (MCP_RELAY_USER_AGENT, MCP_RELAY_USER_AGENT_SHAPE),
+            (MCP_RELAY_PROTOCOL_VERSION, MCP_RELAY_PROTOCOL_VERSION_SHAPE),
+        ):
+            value = self.headers.get(name)
+            if value is not None and shape.match(value):
+                headers.append((name, value))
+        project_id = self.api_relay.project_id()
+        if re.fullmatch(api_policy.PROJECT, project_id):
+            headers.append((MCP_RELAY_USER_PROJECT, project_id))
+        body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        started = time.monotonic()
+        upstream = self._relay_fetch(
+            "mcp",
+            request_id,
+            entry.host,
+            entry.path,
+            authorization,
+            body=body,
+            headers=tuple(headers),
+        )
+        if upstream is None:
+            return
+        duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
+        refused: tuple[str, str] | None = None
+        if upstream.over_cap:
+            refused = ("UPSTREAM_RESPONSE_TOO_LARGE", "the upstream response exceeded the relay cap")
+        elif HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
+            refused = (
+                "UPSTREAM_REDIRECTED",
+                "the upstream answered with a redirect, which the relay does not follow",
+            )
+        elif upstream.status == HTTPStatus.UNAUTHORIZED:
+            # Google refusing the broker's own credential. Passed through, it would
+            # read to mcp-remote as its own token refused and send it after an
+            # OAuth login; the caller's token is the broker's to judge, and it did.
+            refused = (
+                "UPSTREAM_UNAUTHORIZED",
+                "the upstream refused the credential proxy's own credential",
+            )
+        elif upstream.body and not upstream.content_type.lower().startswith(
+            MCP_RELAY_CONTENT_TYPE
+        ):
+            # text/event-stream included: a stream cannot be read whole, so
+            # tools/list could not be filtered, and no server here sends one.
+            refused = (
+                "UPSTREAM_NOT_JSON",
+                "the upstream answered with something other than one JSON message",
+            )
+        reply_body = upstream.body
+        if (
+            refused is None
+            and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
+            and upstream.status < HTTPStatus.MULTIPLE_CHOICES
+        ):
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body)
+            if filtered is None:
+                refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
+            else:
+                reply_body = filtered
+        if refused is not None:
+            code, reason = refused
+            LOGGER.warning(
+                "mcp upstream refused request_id=%s server=%s status=%d code=%s",
+                request_id,
+                server_name,
+                upstream.status,
+                code,
+            )
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": reason, "code": code})
+            return
+        LOGGER.info(
+            "mcp forwarded request_id=%s server=%s method=%s status=%d bytes=%d duration_ms=%d",
+            request_id,
+            server_name,
+            decision.rule_id,
+            upstream.status,
+            len(reply_body),
+            duration_ms,
+        )
+        self.send_response(upstream.status)
+        if reply_body:
+            self.send_header("Content-Type", MCP_RELAY_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(reply_body)))
+        self.end_headers()
+        self.wfile.write(reply_body)
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.

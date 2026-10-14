@@ -1217,6 +1217,36 @@ reset_audit_ledgers() { # <label> [audit-id]
   return 0
 }
 
+# The ledger-path probe (kube-agents#2920). No case in the GitLab lane grades a
+# ledger issue, so at lease time the harness proves the path itself: one
+# ledger-shaped issue opened with the agent token, read back with the ledger
+# token (the labels and footer the bench reads, the title and author the
+# reset needs), closed through the same reset that retires real ledgers, the
+# close read back. A fault stops the run here, as a
+# dead token stops it at preflight: a lane that cannot publish or read a
+# ledger has nothing to say about the agent. GitHub runs grade ledgers through
+# the compliance case and skip this. Tokens ride in the one process's
+# environment, never on argv.
+probe_gitlab_ledger_path() { # <label>
+  local label="$1" out rc=0
+  [ "${EVAL_FORGE:-github}" = "gitlab" ] || return 0
+  if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
+    echo "Ledger probe (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitLab project (gitlab_project_for_project in hack/ci-deploy.sh)"
+    return 0
+  fi
+  if [ -z "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || [ -z "${BENCH_GITLAB_TOKEN:-}" ]; then
+    echo "ERROR: Ledger probe (${label}): the pool's token pair is not in hand (read_gitlab_tokens at preflight); not running without the probe." >&2
+    return 1
+  fi
+  out="$(GITLAB_PROBE_TOKEN="${EVAL_GITLAB_AGENT_TOKEN}" GITLAB_PROBE_LEDGER_TOKEN="${BENCH_GITLAB_TOKEN}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" probe-ledger --path "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" --host "${GITLAB_FORGE_HOST}" 2>&1)" || rc=$?
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger probe (${label}): /"
+  if [ "${rc}" -ne 0 ]; then
+    echo "ERROR: Ledger probe (${label}): the GitLab ledger path is broken in ${EVAL_LEDGER_REPO} (the lines above say which step); a ledger the agent published could not be graded here, so this run stops (kube-agents#2920, docs/ci-pool-projects.md 5.6)." >&2
+    return 1
+  fi
+  return 0
+}
+
 # ─── Empty repository: the agent's pull requests and branches go too ─────────
 # A remediation case opens a pull request in the leased repository and nothing
 # closed it before the next lease or the next repetition, so the next agent
@@ -1504,6 +1534,7 @@ else
 fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
+probe_gitlab_ledger_path "lease" || exit 1
 scheduled_audits pause "lease"
 
 # For opentofu provider
@@ -2588,6 +2619,13 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Another of the same shape: infra lock, a plant that publishes a burst and
+    # then waits out the human record's card, then an agent turn that is a
+    # board read. Priced at the band rather than at the 566-677s its
+    # dev-install repetitions measured, because those met a quiet board and the
+    # nightly's is shared. hack/eval/nightly-cases.txt's 2026-10-13 paragraph
+    # carries the measurements and the budget arithmetic.
+    gitops-drift-noise-filtered-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev

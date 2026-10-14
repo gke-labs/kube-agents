@@ -1475,7 +1475,7 @@ func (a *InjectAdapter) forgetDirectLocked(author string) {
 // on the conversation.
 //
 // A route rather than the text path. The gateway reaches cancel from a
-// message whose whole text is "stop" (text.go), which is the right
+// message whose whole text is "stop" (chattext.IsStop), which is the right
 // affordance for a human and the wrong one for a program: it makes a control
 // action depend on a phrase list, it cannot be told apart from a user asking
 // the agent to stop something in the world, and a caller that means "cancel"

@@ -208,7 +208,9 @@ that check entirely, so on an install whose CR narrows the platform agent's allo
 no longer admit the same people. The view retires on the default flip (#2371); until then, on an
 install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
 a person the gateway refuses a delegation to `platform` can still read its clusters through a
-session's view.
+session's view. The flag stays off by default for that reason. An install with a single user, or
+whose allowed users are the same people the platform agent admits, can turn it on, and gets
+sessions that answer cluster questions themselves instead of delegating each one.
 
 ## Per-feature overrides - sketched, not built
 
