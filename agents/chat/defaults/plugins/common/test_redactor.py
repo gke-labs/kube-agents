@@ -500,8 +500,9 @@ class TestRedactText(unittest.TestCase):
         )
 
     def test_an_address_glued_to_the_end_of_another_is_redacted_too(self):
-        # The second address starts where the pattern's lookbehind forbids a
-        # start, so the bare shape is tried at the end of each match.
+        # The second address starts where EMAIL_RUN_START_PATTERN's lookbehind
+        # forbids a start, so the complete shape is tried at the end of each
+        # match, and it carries the service-account exemption and its edges.
         for text, expected in (
             (
                 "alice@example.com-bob@example.org",
@@ -509,6 +510,15 @@ class TestRedactText(unittest.TestCase):
             ),
             ("a@b.cc1c@d.cc1e@f.cc", "[REDACTED_EMAIL][REDACTED_EMAIL][REDACTED_EMAIL]"),
             ("x@y.com,z@w.org", "[REDACTED_EMAIL],[REDACTED_EMAIL]"),
+            (
+                "bob@example.com-sa@p.iam.gserviceaccount.com",
+                "[REDACTED_EMAIL]-sa@p.iam.gserviceaccount.com",
+            ),
+            (
+                "bob@example.com-victim@corp.gserviceaccount.com.attacker.io",
+                "[REDACTED_EMAIL][REDACTED_EMAIL]",
+            ),
+            ("bob@example.com-a@notgserviceaccount.com", "[REDACTED_EMAIL][REDACTED_EMAIL]"),
         ):
             with self.subTest(text=text):
                 self.assertEqual(AuditRedactor.redact_text(text), expected)
