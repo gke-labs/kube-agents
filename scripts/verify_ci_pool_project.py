@@ -240,7 +240,7 @@ REPAIR_CALENDAR_MODE_ROLE = (
     "|| gcloud iam roles create {role_id} --project={project_id} "
     '--title="Kube-Agents calendar-mode advice (read-only)" --permissions={permission} --stage=GA; '
     'gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
-    "(docs/ci-pool-projects.md section 3)"
+    "# docs/ci-pool-projects.md section 3"
 )
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
 REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"

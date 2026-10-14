@@ -3728,6 +3728,10 @@ class IamGrantsTest(unittest.TestCase):
         self.assertIn(f'; gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
         self.assertNotIn("&&", finding.repair)
         self.assertNotIn(checker.REPAIR_CONFIRM_PREFIX, finding.repair)
+        # Pasteable as the pool-drift issue carries it: the runbook pointer is
+        # a shell comment, not a parenthesised tail bash stops on.
+        self.assertTrue(finding.repair.endswith("# docs/ci-pool-projects.md section 3"), finding.repair)
+        self.assertNotIn("(docs/", finding.repair)
 
     def test_platform_gsa_holding_the_calendar_mode_role_is_not_an_extra(self):
         # The default policy carries it, so the closed-set check must read it

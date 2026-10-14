@@ -840,7 +840,9 @@ scan's finding lines), as is the bot's own issue when its title fell back to a
 count, matched on the finding ids its hidden marker carries. A finding a leased
 run passes with is said the other way round: the verifier lists those in
 `LEASE_SILENT_FINDINGS` (today `gke/host-otel-scope`, a host cluster that serves
-the lease and exports no traces), `health.py` splits the firing findings once,
+the lease and exports no traces, and `iam/platform-gsa/missing/calendar-mode-advice-role`,
+a project whose agent lacks the one permission only a nightly-only case
+exercises), `health.py` splits the firing findings once,
 into the incident's `passes_leases` and `reds_runs` with the projects one of
 the latter is on under `reds_runs_projects` (the `pool_state` block carries the
 same three over every drifted project), and the advice, the Chat sentence, the
