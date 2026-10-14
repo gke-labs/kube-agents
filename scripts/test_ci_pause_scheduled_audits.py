@@ -50,6 +50,10 @@ FAKE_HERMES = textwrap.dedent('''\
     assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
     if mode == "noop":
         sys.exit(0)
+    if mode.startswith("die-at:") and sys.argv[5] == mode.split(":", 1)[1]:
+        import signal
+        os.kill(os.getppid(), signal.SIGKILL)  # the pod going away mid-loop
+        sys.exit(1)
     path = os.environ["FAKE_ROSTER"]
     store = json.load(open(path))
     for job in store["jobs"]:
@@ -174,6 +178,38 @@ class PauseTest(unittest.TestCase):
         self.assertEqual(store["theirs"]["state"], "paused")
         self.assertFalse(record.exists())
 
+    def test_a_retry_after_a_partial_pause_still_resumes_everything(self):
+        # Attempt 1 pauses c and dies at d, before its readback; the record written
+        # before acting still names c, so the retry's view of c as "already paused"
+        # doesn't lose it from --resume.
+        self.write_roster([{"id": "c", "enabled": True}, {"id": "d", "enabled": True}])
+        first, store = self.run_script(mode="die-at:d")
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(store["c"]["state"], "paused")
+        record = self.home / ".ci-paused-audits.json"
+        self.assertEqual(json.loads(record.read_text()), ["c", "d"])
+        result, _ = self.run_script()
+        self.assertIn("paused d;", result.stdout)
+        self.assertIn("c (already paused)", result.stdout)
+        result, store = self.run_script(resume=True)
+        self.assertIn("resumed c, d", result.stdout)
+        self.assertTrue(store["c"]["enabled"] and store["d"]["enabled"])
+
+    def test_a_job_recorded_but_never_paused_is_harmless(self):
+        self.write_roster([{"id": "c", "enabled": True}])
+        (self.home / ".ci-paused-audits.json").write_text('["c", "gone"]')
+        result, store = self.run_script(resume=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("resumed nothing", result.stdout)
+        self.assertFalse((self.home / ".ci-paused-audits.json").exists())
+
+    def test_resume_names_a_job_the_store_still_shows_paused(self):
+        self.write_roster([{"id": "c", "enabled": False, "state": "paused", "paused_at": "x"}])
+        (self.home / ".ci-paused-audits.json").write_text('["c"]')
+        result, _ = self.run_script(mode="noop", resume=True)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("FAILED c (still paused in the store)", result.stdout)
+
     def test_resume_with_no_record_does_nothing(self):
         self.write_roster([{"id": "c", "enabled": False, "state": "paused", "paused_at": "x"}])
         result, store = self.run_script(resume=True)
@@ -232,8 +268,9 @@ class RestartTest(unittest.TestCase):
         self.assertTrue(after["enabled"])
         self.assertEqual(after["state"], "paused")
         self.assertEqual(after["paused_at"], "2026-10-14T15:02:02+00:00")
-        for key in ("state", "paused_at"):
-            self.assertNotIn(key, job, "the image now ships a pause key; the merge would reset it")
+        for shipped_job in shipped["jobs"]:
+            for key in ("state", "paused_at"):
+                self.assertNotIn(key, shipped_job, f"{shipped_job['id']}: the image now ships a pause key; the merge would reset it")
 
 
 class RunnerTest(unittest.TestCase):

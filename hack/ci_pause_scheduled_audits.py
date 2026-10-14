@@ -98,7 +98,7 @@ def paused(job):
 
 
 def hermes(action, jid):
-    """One `hermes cron <action>`; returns (retryable, failure) or (False, None)."""
+    """One `hermes cron <action>`; returns (retryable, failure line) or (False, None)."""
     try:
         result = subprocess.run(
             [HERMES_BIN, "-p", PROFILE, "cron", action, jid],
@@ -154,12 +154,23 @@ def pause():
         else:
             targets.append(jid)
 
-    failed, retryable = [], False
+    # Intent before action: a run cut off between pauses (the pod rolling) or before
+    # its readback would otherwise leave paused jobs no record names, and the retry
+    # sees them as already paused. A recorded job that never paused is harmless:
+    # --resume lifts only what the store shows paused.
+    if targets:
+        try:
+            write_record(set(read_record()) | set(targets))
+        except OSError as exc:
+            print(f"nothing paused: could not write {RECORD}: {exc}")
+            return RETRY
+    failed, failed_ids, retryable = [], set(), False
     for jid in targets:
         again, failure = hermes("pause", jid)
         retryable |= again
         if failure:
             failed.append(failure)
+            failed_ids.add(jid)
 
     # Believe the store, not the exit codes.
     try:
@@ -168,13 +179,7 @@ def pause():
         print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
         return RETRY
     done = [jid for jid in targets if paused(after.get(jid, {}))]
-    named = {f.split(" ", 1)[0] for f in failed}
-    failed += [f"{jid} (not paused in the store)" for jid in targets if jid not in done and jid not in named]
-    if done:
-        try:
-            write_record(set(read_record()) | set(done))
-        except OSError as exc:
-            failed.append(f"record ({exc}; --resume will not know these)")
+    failed += [f"{jid} (not paused in the store)" for jid in targets if jid not in done and jid not in failed_ids]
     print(
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")
@@ -194,13 +199,14 @@ def resume():
     except (OSError, ValueError) as exc:
         print(f"could not read the roster to resume {', '.join(ids)}: {exc}")
         return RETRY
-    failed, retryable = [], False
+    failed, failed_ids, retryable = [], set(), False
     targets = [jid for jid in ids if paused(live.get(jid, {}))]
     for jid in targets:
         again, failure = hermes("resume", jid)
         retryable |= again
         if failure:
             failed.append(failure)
+            failed_ids.add(jid)
     try:
         after = {job["id"]: job for job in jobs_in(ROSTER)}
     except (OSError, ValueError) as exc:
@@ -209,9 +215,10 @@ def resume():
     still = [jid for jid in targets if paused(after.get(jid, {}))]
     if not still:
         os.remove(RECORD)
+    failed += [f"{jid} (still paused in the store)" for jid in still if jid not in failed_ids]
     print(
         f"resumed {', '.join(jid for jid in targets if jid not in still) or 'nothing'}"
-        + (f"; FAILED {', '.join(failed) or ', '.join(still)}" if still else "")
+        + (f"; FAILED {', '.join(failed)}" if still else "")
     )
     if not still:
         return OK
