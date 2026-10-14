@@ -110,7 +110,7 @@
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
 # 2026-09-29: the canary returned to the presubmit file held out (#2013) and
 # pdb-remediation-pr moved there held out beside it (#2016, seat opened
-# 2026-09-28), so this file's share was thirty-eight cases (114 units) of the
+# 2026-09-28; roster line 2026-10-14), so this file's share was thirty-eight cases (114 units) of the
 # fifty-two-case, 156-unit matrix before the declared-intent addition below; the
 # nightly runs both files, so its matrix and its price do not change.
 # fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
@@ -340,9 +340,8 @@
 #      report_contains on the four graded nights 2026-09-16 to 09-20;
 #      nothing on any graded night under pull_request_opened, #1780) and the
 #      miss shape the seat counts as the case's own; this file never lists a
-#      presubmit case twice. With rca-remediation-pr below still nightly,
-#      the remediation domain has no roster case and sits on the
-#      docs/designs/domains.yaml allowlist until #2016 step 4.
+#      presubmit case twice. pdb-remediation-pr took the remediation roster
+#      line on 2026-10-14 (#2016 step 4); rca-remediation-pr below stays nightly.
 ./tasks/chat-routing-board-read/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed

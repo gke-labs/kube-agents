@@ -102,7 +102,8 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: green presubmit runs since 2026-09-26 and the four clean nightlies at
 #: parallelism 8 (docs/designs/eval-scorer.md, "Sizing the aggregate
 #: margin"). With twelve admitted cases at three repetitions the pull
-#: request's side is 36 units, so the rate moves in steps of 1/36 = 0.028
+#: request's side is 36 units (39 since 2026-10-14, when pdb-remediation-pr
+#: joined the roster: steps of 1/39), so the rate moves in steps of 1/36 = 0.028
 #: and the margin is really a count of failed repetitions: at main's window
 #: rate of 0.924 (2026-09-29) it tolerates six failures out of 36 and reds
 #: the seventh; once the outage-era lines leave the window and main sits

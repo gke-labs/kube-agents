@@ -1368,10 +1368,10 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
         # was withdrawn until it has a record under its #1780 grader. The
-        # canary (#2013, seated 2026-09-29) and pdb-remediation-pr (#2016, seat
-        # opened 2026-09-28) are held out in the presubmit file; only a roster
-        # line counts.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
+        # canary (#2013, seated 2026-09-29) is held out in the presubmit file;
+        # only a roster line counts. pdb-remediation-pr took its roster line on
+        # 2026-10-14 (#2016), which covered remediation again.
+        self.assertEqual(cov["uncovered"], ["fleet-audits"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
@@ -1379,7 +1379,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
-        self.assertIn("pdb-remediation-pr", active)  # held out in the presubmit, seat opened 2026-09-28 (#2016), off the roster
+        self.assertIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster since 2026-10-14 (#2016)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 
