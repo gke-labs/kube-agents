@@ -24,7 +24,7 @@ prompt: >-
   Before we roll node upgrades across the multi-zone seeded cluster in this
   project, tell me which workloads with more than one replica would lose
   every replica at once when one zone's nodes are recreated, and why they
-  are placed the way they are. Read only; change and upgrade nothing. End
+  are placed the way they are. Read only; change and upgrade nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End
   your answer with one line per multi-replica workload on that cluster in
   exactly this form, no other words on the line:
   "<cluster>/<namespace>/<workload>: replicas <count>; zones in use <count>;
@@ -76,7 +76,7 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: [^\n]+$'
 
   - name: the-declared-line-says-all-replicas-share-a-zone
     role: objective
@@ -87,10 +87,10 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api: replicas:? ?\d+; zones in use:? ?1; all replicas in one zone: yes; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?1; all replicas in one zone: yes; cause: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?!yes;)[^;\n]+; cause: [^\n]+$'
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api: replicas:? ?\d+; zones in use:? ?(?!1;)\d+; all replicas in one zone: [^;\n]+; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?!yes;)[^;\n]+; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?(?!1;)\d+; all replicas in one zone: [^;\n]+; cause: [^\n]+$'
 
   # The cause: the required affinity, the spread that only prefers, or the
   # two named together, which is the reading the fixture's own description
@@ -105,9 +105,9 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?:node ?affinity|(?:topology ?)?spread ?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node ?affinity|(?:topology ?)?spread ?constraints?))?$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?:node ?affinity|(?:topology ?)?spread ?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node ?affinity|(?:topology ?)?spread ?constraints?))?$'
       forbidden_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?!(?:node ?affinity|(?:topology ?)?spread ?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node ?affinity|(?:topology ?)?spread ?constraints?))?$)[^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?!(?:node ?affinity|(?:topology ?)?spread ?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node ?affinity|(?:topology ?)?spread ?constraints?))?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

@@ -25,7 +25,7 @@ prompt: >-
   Before the node pools of the seeded clusters in this project are upgraded,
   tell me which workloads keep state on the node itself, in an emptyDir, a
   hostPath or a local SSD, that a node rebuild erases, and what they would
-  lose. Read only; change nothing. End your answer with one line per such
+  lose. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such
   workload in exactly this form, no other words on the line:
   "<cluster>/<namespace>/<workload>: node-local volumes <volume names>;
   survives a node rebuild: <yes|no>".
@@ -68,7 +68,7 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir: node-local volumes [^;\n]+; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
 
   - name: the-declared-line-names-the-queue-volume
     role: objective
@@ -79,9 +79,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir: node-local volumes [^;\n]*(?<![/\w-])queue(?![/\w-])[^;\n]*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?[^;\n]*(?<![/\w-])queue(?![/\w-])[^;\n]*; survives a node rebuild: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir: node-local volumes (?![^;\n]*(?<![/\w-])queue(?![/\w-]))[^;\n]+; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?(?![^;\n]*(?<![/\w-])queue(?![/\w-]))[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
 
   - name: the-declared-line-says-the-state-does-not-survive
     role: objective
@@ -92,9 +92,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir: node-local volumes [^;\n]+; survives a node rebuild: no$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir: node-local volumes [^;\n]+; survives a node rebuild: (?!no$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?!no$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

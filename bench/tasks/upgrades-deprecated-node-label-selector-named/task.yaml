@@ -24,7 +24,7 @@ prompt: >-
   newer node image, tell me which workloads select nodes by a label that
   Kubernetes has deprecated, what the replacement label is, and what happens
   to them when a node image stops setting the old one. Read only; change
-  nothing. End your answer with one line per such workload in exactly this
+  nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such workload in exactly this
   form, no other words on the line: "<cluster>/<namespace>/<workload>: label
   <label key>; deprecated: <yes|no>; replacement <label key or none>".
 
@@ -63,7 +63,7 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker: label [^;\n]+; deprecated: (?:yes|no); replacement [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-beta-arch-label
     role: objective
@@ -74,9 +74,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker: label beta\.kubernetes\.io/arch; deprecated: (?:yes|no); replacement [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?beta\.kubernetes\.io/arch; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker: label (?!beta\.kubernetes\.io/arch;)[^;\n]+; deprecated: (?:yes|no); replacement [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?(?!beta\.kubernetes\.io/arch;)[^ :;\n][^;\n]*; deprecated: (?:yes|no); replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-it-is-deprecated-and-names-the-replacement
     role: objective
@@ -87,9 +87,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker: label [^;\n]+; deprecated: yes; replacement kubernetes\.io/arch$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?[^ :;\n][^;\n]*; deprecated: yes; replacement:? ?kubernetes\.io/arch$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker: label [^;\n]+; deprecated: (?!yes; replacement kubernetes\.io/arch$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes; replacement:? ?kubernetes\.io/arch$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

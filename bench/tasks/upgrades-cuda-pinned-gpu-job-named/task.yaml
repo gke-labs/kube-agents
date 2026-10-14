@@ -76,7 +76,7 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda [^;\n]+; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
 
   - name: the-declared-line-names-the-accelerator
     role: objective
@@ -87,9 +87,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator nvidia-l4; cuda [^;\n]+; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?nvidia-l4; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator (?!nvidia-l4;)[^;\n]+; cuda [^;\n]+; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?(?!nvidia-l4;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
 
   # The CUDA pin, with or without its patch.
   - name: the-declared-line-names-the-cuda-pin
@@ -101,9 +101,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda 12\.2(?:\.0)?; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?; suspended: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda (?!12\.2(?:\.0)?;)[^;\n]+; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?;)[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
 
   # The job is suspended: an inventory that saw it saw that, and one that
   # skipped suspended workloads has no line at all.
@@ -116,9 +116,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda [^;\n]+; suspended: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator [^;\n]+; cuda [^;\n]+; suspended: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

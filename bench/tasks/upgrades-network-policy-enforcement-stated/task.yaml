@@ -2,11 +2,12 @@
 # shape the seeded fleet holds it: every seeded cluster runs the legacy
 # dataplane with the NetworkPolicy add-on off, and three of them carry
 # NetworkPolicy objects that nothing enforces (seeded-a's default-deny
-# policies in seeded-reliability, seeded-debug and seeded-capacity and the
-# apiserver-egress-only policy in seeded-deprecation; seeded-b's and
-# seeded-d's default-deny in seeded-upgrade and seeded-topology; a fleet
-# applied from a newer catalogue carries more, in seeded-intent and
-# seeded-stall). GKE's NETWORK_POLICIES_UNRECONCILED insight says the same
+# policies in seeded-reliability, seeded-debug, seeded-capacity,
+# seeded-stall, seeded-token and seeded-headroom, its apiserver-egress-only
+# policy in seeded-deprecation, and, once the seeded-a shapes are applied,
+# default-deny in seeded-shapes and seeded-defaults, with seeded-intent
+# carrying none on purpose; seeded-b's and seeded-d's default-deny in
+# seeded-upgrade and seeded-topology). GKE's NETWORK_POLICIES_UNRECONCILED insight says the same
 # when it publishes it. A dataplane change that
 # turns enforcement on makes every one of those policies take effect at once,
 # which is the break the catalogue entry describes.
@@ -48,9 +49,10 @@ expected_output: >-
   It reads each seeded cluster's dataplane provider and NetworkPolicy add-on
   from the GKE API and the NetworkPolicy objects from the Kubernetes API, and
   reports that every seeded cluster runs the legacy dataplane with
-  enforcement off, so the policies on seeded-a (at least seeded-reliability,
-  seeded-debug, seeded-capacity and seeded-deprecation; a fleet applied from
-  a newer catalogue also has seeded-intent and seeded-stall), seeded-b
+  enforcement off, so the policies on seeded-a (seeded-reliability, seeded-debug,
+  seeded-capacity, seeded-stall, seeded-token, seeded-headroom and
+  seeded-deprecation, plus seeded-shapes and seeded-defaults once the
+  seeded-a shapes are applied; none in seeded-intent, on purpose), seeded-b
   (seeded-upgrade) and seeded-d (seeded-topology) are not enforced today and
   would all take effect if an upgrade or a dataplane migration turned
   enforcement on; seeded-c carries none. It names GKE's
@@ -75,8 +77,9 @@ owner: maintainers
 # The four roles are one per seeded slot, the way the zonal case names them:
 # the runner's per-slot credential is how a declared-line objective tells a
 # cluster the agent missed from a cluster the project does not have
-# (`fixture_roles`). No catalogue role carries the NetworkPolicies; the first
-# role names the namespace whose default-deny the safeguard reads.
+# (`fixture_roles`). No catalogue role carries the NetworkPolicies, so the
+# case has no mutation safeguard; the first role names a namespace whose
+# default-deny the declared line must list.
 fixtures:
   - no-pdb-workload
   - version-laggard
@@ -97,7 +100,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:b}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:d}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)'
+        - '(?ms)\A(?=.*^^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:b}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)(?=.*^^{cluster:d}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$)'
 
   # The fleet's clusters run the legacy dataplane with the add-on off.
   - name: every-seeded-cluster-runs-the-legacy-dataplane
@@ -112,9 +115,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane legacy[^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?legacy[^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane (?!legacy)[^;\n]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?(?!legacy)[^ :;\n][^;\n]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: [^\n]+$'
 
   - name: no-seeded-cluster-is-said-to-enforce-policy-today
     role: objective
@@ -128,9 +131,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: no; namespaces with policies: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: no; namespaces with policies: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: (?!no;)[^;\n]+; namespaces with policies: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: (?!no;)[^;\n]+; namespaces with policies: [^\n]+$'
 
   - name: seeded-a-lists-its-four-policy-namespaces
     role: objective
@@ -144,9 +147,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!none\b)(?=[^\n]*\bseeded-reliability(?![a-z0-9-]))(?=[^\n]*\bseeded-debug(?![a-z0-9-]))(?=[^\n]*\bseeded-capacity(?![a-z0-9-]))(?=[^\n]*\bseeded-deprecation(?![a-z0-9-]))[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!none\b)(?=[^\n]*\bseeded-reliability(?![a-z0-9-]))(?=[^\n]*\bseeded-debug(?![a-z0-9-]))(?=[^\n]*\bseeded-capacity(?![a-z0-9-]))(?=[^\n]*\bseeded-deprecation(?![a-z0-9-]))[^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!(?!none\b)(?=[^\n]*\bseeded-reliability(?![a-z0-9-]))(?=[^\n]*\bseeded-debug(?![a-z0-9-]))(?=[^\n]*\bseeded-capacity(?![a-z0-9-]))(?=[^\n]*\bseeded-deprecation(?![a-z0-9-]))[^\n]+$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!(?!none\b)(?=[^\n]*\bseeded-reliability(?![a-z0-9-]))(?=[^\n]*\bseeded-debug(?![a-z0-9-]))(?=[^\n]*\bseeded-capacity(?![a-z0-9-]))(?=[^\n]*\bseeded-deprecation(?![a-z0-9-]))[^\n]+$)[^\n]+$'
 
   # Slot c carries no NetworkPolicy: the drift outlier is a control-plane
   # shape, not a workload.
@@ -162,9 +165,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: none$'
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: none$'
       forbidden_patterns:
-        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane [^;\n?!]+; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!none$)[^\n]+$'
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: dataplane:? ?[^ :;\n?!][^;\n?!]*; networkpolicy enforced: [^;\n?!]+; namespaces with policies: (?!none$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
