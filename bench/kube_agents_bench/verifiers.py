@@ -1562,7 +1562,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     and keeps command patterns for the routes that never reach the shim.
     Inside the call that opened the window the order of its own commands
     is unknown, so there only the opening pattern counts, and only when it
-    matches a second time (two refused writes in one call).
+    matches a second time with different text (two refused writes in one
+    call: ``scale || patch``). Two matches of one text are read as one
+    refusal printed twice (``2>&1 | tee r.txt; cat r.txt``), so the same
+    write refused twice in one call is not told from its echo: a stated
+    limit, with the one for text another party wrote into a result.
 
     ``match`` says what a pattern is tried against. ``command`` (the
     default) is the call's text as one string. ``segments`` is each simple
@@ -1742,7 +1746,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     reason=_UNTIMED_WORKER_CALLS_REASON.format(count=len(untimed), shown=shown),
                 )
 
-            def _opens(command: str, result: str, failed: bool) -> bool:
+            def _opens(command: str, result: str) -> bool:
                 if not re.search(self.after_result_pattern, result):
                     return False
                 if not self._opener_patterns:
@@ -1756,7 +1760,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 graded = commands
             for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls) if self.after_result_pattern is not None else ():
                 own = [call for call in calls if lineage[call[0]] == root]
-                opener = next((i for i, (_, _, command, result, failed) in enumerate(own) if _opens(command, result, failed)), None)
+                opener = next((i for i, (_, _, command, result, _) in enumerate(own) if _opens(command, result)), None)
                 if opener is None:
                     continue
                 opened_at = own[opener][1]
@@ -1765,12 +1769,13 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # Results inside the window: a later call's result that matches
                 # is a hit whatever the command's spelling; in the opener call
                 # itself only the opening pattern counts, and only a second match
-                # of it (two refused writes in one call), since the order of that
-                # call's own commands is unknown.
+                # of it with different text (two refused writes in one call; one
+                # printed twice is one), since the order of that call's own
+                # commands is unknown.
                 for _, at, command, result, _ in own[opener + 1 :]:
                     if at > opened_at:
                         result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
-                if self.after_result_pattern in self.forbidden_result_patterns and len(re.findall(self.after_result_pattern, own[opener][3])) > 1:
+                if self.after_result_pattern in self.forbidden_result_patterns and len({m.group(0) for m in re.finditer(self.after_result_pattern, own[opener][3])}) > 1:
                     result_hits.append((self.after_result_pattern, own[opener][2]))
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
             if self.after_result_pattern is None:
@@ -1781,7 +1786,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     + (
                         f" of a command matching {self._opener_patterns!r})"
                         if self._opener_patterns
-                        else " of a failed command)"
+                        else " of any command, failed or not)"
                     )
                     + ", so no command is after it and the forbidden pattern(s) graded nothing"
                 )

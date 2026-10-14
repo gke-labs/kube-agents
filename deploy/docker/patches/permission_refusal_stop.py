@@ -24,7 +24,8 @@ beside the rule (``credential_proxy_client.py``)::
     <the policy's message, ending in the action boundary notice>
     policy rule: kubernetes.read-only
     policy verb: scale deploy/kube-dns
-    policy render: local          (only for --dry-run=client, --local, --list, view-last-applied)
+    policy render: local          (a local render: a client dry-run in any of kubectl's
+                                   spellings, --local, --list, apply view-last-applied, -h/--help)
 
 For every tool result :func:`classify_refusal` returns:
 
@@ -144,7 +145,7 @@ _COUNT_ATTR = "_kube_permission_refusals"
 _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
 # ``kubectl auth can-i <verb> …`` names a verb in a read's arguments; the phrase is
 # dropped before the word test.
-_CAN_I_RE = re.compile(r"(?<![\w-])kubectl(\s+-\S+)*\s+auth\s+can-i\b[^;|&\n]*")
+_CAN_I_RE = re.compile(r"(?<![\w-])kubectl(\s+[^\s;|&]+)*?\s+auth\s+can-i\b[^;|&\n]*")
 
 WARN_MESSAGE = (
     "Permission refused. This is a boundary, not an error to work around: the change is "

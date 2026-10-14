@@ -153,7 +153,7 @@ def _walk(text: str, out: list[str], depth: int) -> None:
         _walk(inner, out, depth + 1)
     executed = _executed_paths(pieces)
     for piece in pieces:
-        run = _find_exec_argv(piece)
+        run = _find_exec_argv(piece) or _env_split_string(piece)
         if run:
             _walk(run, out, depth + 1)
     for index, piece in enumerate(pieces):
@@ -215,15 +215,6 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
     out.append((unquoted + piece[end:]).strip())
     base = unquoted.rsplit("/", 1)[-1]
     rest = tokens[index + 1 :]
-    if base == "env":
-        # GNU ``env -S '<string>'`` splits and runs its string.
-        for n, (_, _, token) in enumerate(rest):
-            if token in ("-S", "--split-string") and n + 1 < len(rest):
-                _walk(_unquote(rest[n + 1][2]), out, depth + 1)
-                break
-            if token.startswith("-S") and len(token) > 2:
-                _walk(_unquote(token[2:]), out, depth + 1)
-                break
     if base in _SHELLS or base == "eval" or _PYTHONS.match(base):
         script = _dash_c_script(base, rest)
         if script is not None:
@@ -333,6 +324,25 @@ def _value_options(base: str) -> frozenset[str]:
     if _PYTHONS.match(base):
         return _PYTHON_VALUE_OPTIONS
     return _SHELL_VALUE_OPTIONS
+
+
+def _env_split_string(piece: str) -> str | None:
+    """What GNU ``env -S '<string>'`` splits and runs, or ``None``. ``env`` is a wrapper
+    word, so this is read from the raw tokens before the wrapper walk drops it."""
+    words = [t for _, _, t in _tokens(piece)]
+    while words and _ASSIGNMENT_RE.match(words[0]) and not words[0].startswith(("'", '"')):
+        words.pop(0)
+    if not words or _unquote(words[0]).rsplit("/", 1)[-1] != "env":
+        return None
+    words = words[1:]
+    for k, token in enumerate(words):
+        if token in ("-S", "--split-string") and k + 1 < len(words):
+            return _unquote(words[k + 1])
+        if token.startswith("-S") and len(token) > 2:
+            return _unquote(token[2:])
+        if not token.startswith("-"):
+            return None
+    return None
 
 
 def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
@@ -743,17 +753,18 @@ def _executed_kind(executed: dict[str, str], target: str) -> str | None:
 def _heredoc_target(opener_pieces: list[str]) -> str:
     """The file a heredoc's line writes to: a ``>`` redirect, ``tee``, or ``dd of=``."""
     for piece in opener_pieces:
+        # ``tee <file> >/dev/null``: tee's file, not the redirect that silences it.
+        found = _command_word(piece)
+        if found and found[0].rsplit("/", 1)[-1] == "tee":
+            positional = [a for a in found[1] if not a.startswith(("-", ">"))]
+            if positional:
+                return positional[0]
         redirect = _REDIRECT_TARGET_RE.search(piece)
         if redirect:
             return _unquote(redirect.group(1))
         dd = _DD_TARGET_RE.search(piece)
         if dd:
             return _unquote(dd.group(1))
-        found = _command_word(piece)
-        if found and found[0].rsplit("/", 1)[-1] == "tee":
-            positional = [a for a in found[1] if not a.startswith("-")]
-            if positional:
-                return positional[0]
     return ""
 
 
