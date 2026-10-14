@@ -207,7 +207,15 @@ def _validate_name(name: str) -> str:
 def load(root: Path, name: str) -> Capability:
     name = _validate_name(name)
     directory = root / name
-    criteria = _read_json(directory / CRITERIA_FILENAME)
+    try:
+        criteria = _read_json(directory / CRITERIA_FILENAME)
+    except CapabilityError as exc:
+        # The scaffold holds a volume file it cannot read rather than replacing it, so unlike the
+        # schema and the policy file a pod restart does not recover this one.
+        raise CapabilityError(
+            f"{name}/{exc}; a pod restart does not replace a criteria file it cannot read: remove the file from "
+            f"the volume and the next start re-seeds it empty ({CHANGELOG_FILENAME} keeps what was set)"
+        ) from exc
     if criteria is None:
         known = ", ".join(list_capabilities(root)) or "none"
         raise CapabilityError(f"unknown capability {name!r}; known: {known}")

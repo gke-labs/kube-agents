@@ -115,6 +115,19 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(cs.CapabilityError):
             cs.load(self.root, "torn")
 
+    def test_an_unreadable_criteria_file_names_its_recovery(self):
+        # The scaffold holds a volume criteria file it cannot read rather than replacing it, so a
+        # restart does not recover this one; the refusal has to say what does.
+        seed(self.root)
+        (self.root / "demo" / cs.CRITERIA_FILENAME).write_text("{not json")
+        for call in (lambda: cs.load(self.root, "demo"),
+                     lambda: cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")):
+            with self.assertRaises(cs.CapabilityError) as ctx:
+                call()
+            self.assertIn("remove the file", str(ctx.exception))
+            self.assertIn(cs.CRITERIA_FILENAME, str(ctx.exception))
+        self.assertFalse((self.root / "demo" / cs.CHANGELOG_FILENAME).exists(), "nothing was written")
+
     def test_a_capability_without_its_learning_policy_is_refused_not_downgraded(self):
         # Without the policy file every key would read as `propose`, and a key the image marks
         # `never` would take a confirmed write. Refused like the schema, naming the file.
