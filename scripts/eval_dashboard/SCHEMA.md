@@ -1037,7 +1037,7 @@ baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
 it is set. `near_deadline` is `null` or, on a `GREEN` tick, the near-deadline note
-(`{since, runs, max_s, max_build, deadline_s}`, `docs/ci-health.md`, "Close to the
+(`{since, runs, max_s, max_build, deadline_s, headroom_s, kills}`, `docs/ci-health.md`, "Close to the
 deadline").
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
@@ -1313,8 +1313,8 @@ is the same cut for [2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of
 them killed at the deadline with `eval_verdict: null` (#1880, #1894); the
 test asserts the `deadline_kill` OUTAGE from the third kill and a lull
 reading as recovering.
-`testdata_health/near-deadline-2026-09-17.json.gz` is the same cut for
-[2026-09-17 04:00Z, 2026-09-17 16:30Z) — four runs concluding on the afternoon
+`testdata_health/near-deadline-2026-09-17.json.gz` is a synthetic scenario modeling
+the timeline of [2026-09-17 04:00Z, 2026-09-17 16:30Z) — four runs concluding on the afternoon
 a 356-minute run finished with the gate staying GREEN (#2873); the test
 asserts the `near_deadline` note from 16:00Z that day and none at 04:00Z.
 

@@ -95,11 +95,35 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
+    from eval_dashboard.health import (
+        POOL_BREACH,
+        POOL_STALE,
+        POOL_UNMEASURED,
+        PROW_JOB_TIMEOUT,
+        SECONDS_PER_MINUTE,
+        minutes_text,
+        near_deadline_headroom_text,
+        near_deadline_margin,
+        pool_drift_split,
+        pool_span,
+        wait_text,
+    )
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly, periodics
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
+    from eval_dashboard.health import (
+        POOL_BREACH,
+        POOL_STALE,
+        POOL_UNMEASURED,
+        PROW_JOB_TIMEOUT,
+        SECONDS_PER_MINUTE,
+        minutes_text,
+        near_deadline_headroom_text,
+        near_deadline_margin,
+        pool_drift_split,
+        pool_span,
+        wait_text,
+    )
 
 STATE_SCHEMA_VERSION = 1
 
@@ -123,7 +147,7 @@ CONDITION_POOL_DRIFT = "pool_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
 CONDITION_DEADLINE_KILL = "deadline_kill"
 # The presubmit job's timeout in minutes, as health.py owns it.
-DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // 60)
+DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
@@ -833,18 +857,21 @@ def render_slow(health: dict) -> str:
 
 def near_deadline_text(nd: dict) -> str:
     max_min = minutes_text(nd.get("max_s"))
-    headroom_min = DEADLINE_MINUTES - int(nd.get("max_s", 0) // 60) if nd.get("max_s") is not None else 0
-    return f"slowest run {max_min} min in the last 24h, {headroom_min} min under the {DEADLINE_MINUTES}-minute Prow timeout"
+    return f"slowest run {max_min} min in the last 24h, {near_deadline_margin(nd)}"
 
 
 def render_near_deadline(health: dict) -> str:
     nd = health.get("near_deadline") or {}
+    tail = (
+        " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
+        if nd.get("kills", 0) > 0
+        else (
+            " Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
+        )
+    )
     return "\n".join(
         [
-            (
-                f"⏱ *Smoke gate: close to the deadline* — {near_deadline_text(nd)}. Not a break."
-                f" Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
-            ),
+            f"⏱ *Smoke gate: close to the deadline* — {near_deadline_text(nd)}.{tail}",
             dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
@@ -852,8 +879,7 @@ def render_near_deadline(health: dict) -> str:
 
 def near_deadline_digest_line(nd: dict) -> str:
     max_min = minutes_text(nd.get("max_s"))
-    headroom_min = DEADLINE_MINUTES - int(nd.get("max_s", 0) // 60) if nd.get("max_s") is not None else 0
-    return f"slowest run {max_min} min, {headroom_min} min of headroom"
+    return f"slowest run {max_min} min, {near_deadline_headroom_text(nd)}"
 
 
 def pool_numbers(pool: dict) -> list[str]:

@@ -1459,21 +1459,55 @@ def near_deadline(full_runs, now: datetime, prev: dict | None) -> dict | None:
         if max_s < fire_threshold_s:
             return None
 
+    deadline_s = int(PROW_JOB_TIMEOUT.total_seconds())
+    headroom_s = max(0, deadline_s - max_s)
+    kills = sum(1 for r in qualifying if r.deadline_kill)
+
     return {
         "since": (prev or {}).get("since") or iso(now),
         "runs": len(qualifying),
         "max_s": max_s,
         "max_build": slowest.build_id,
-        "deadline_s": int(PROW_JOB_TIMEOUT.total_seconds()),
+        "deadline_s": deadline_s,
+        "headroom_s": headroom_s,
+        "kills": kills,
     }
 
 
+def near_deadline_margin(nd: dict) -> str:
+    """The margin beside the slowest run for evidence and chat alert."""
+    max_s = nd.get("max_s", 0)
+    deadline_s = nd.get("deadline_s", int(PROW_JOB_TIMEOUT.total_seconds()))
+    headroom_s = nd.get("headroom_s")
+    if headroom_s is None:
+        headroom_s = max(0, deadline_s - max_s)
+    timeout_min = minutes_text(deadline_s)
+    if headroom_s > 0:
+        return f"{minutes_text(headroom_s)} min under the {timeout_min}-minute Prow timeout"
+    if max_s > deadline_s:
+        return f"{minutes_text(max_s - deadline_s)} min past the {timeout_min}-minute Prow timeout"
+    return "killed at the deadline"
+
+
+def near_deadline_headroom_text(nd: dict) -> str:
+    """The headroom phrase for timeline entries and daily digests."""
+    max_s = nd.get("max_s", 0)
+    deadline_s = nd.get("deadline_s", int(PROW_JOB_TIMEOUT.total_seconds()))
+    headroom_s = nd.get("headroom_s")
+    if headroom_s is None:
+        headroom_s = max(0, deadline_s - max_s)
+    if headroom_s > 0:
+        return f"{minutes_text(headroom_s)} min of headroom"
+    if max_s > deadline_s:
+        return f"{minutes_text(max_s - deadline_s)} min past the timeout"
+    return "killed at the deadline"
+
+
 def near_deadline_evidence(nd: dict) -> str:
-    headroom = (nd["deadline_s"] - nd["max_s"]) // 60
-    timeout = nd["deadline_s"] // 60
+    max_min = minutes_text(nd.get("max_s"))
     return (
-        f"close to deadline: slowest run {nd['max_s'] // 60} min in the last 24h"
-        f" ({headroom} min under the {timeout}-minute Prow timeout; {nd['runs']} runs)"
+        f"close to deadline: slowest run {max_min} min in the last 24h"
+        f" ({near_deadline_margin(nd)}; {nd['runs']} runs)"
     )
 
 
@@ -2612,6 +2646,8 @@ def timeline(ticks, every: bool = False) -> list[dict]:
                         "max_build": nd["max_build"],
                         "runs": nd["runs"],
                         "deadline_s": nd["deadline_s"],
+                        "headroom_s": nd.get("headroom_s", max(0, nd["deadline_s"] - nd["max_s"])),
+                        "kills": nd.get("kills", 0),
                     } if nd else None,
                 }
             )
@@ -2628,8 +2664,7 @@ def format_timeline(entries: list[dict]) -> str:
             flag += f" (slow since {slow['since']}: median {slow['median_s'] // 60} min against {slow['baseline_p50_s'] // 60})"
         nd = entry.get("near_deadline")
         if nd:
-            headroom = (nd["deadline_s"] - nd["max_s"]) // 60
-            flag += f" (near deadline since {nd['since']}: slowest run {nd['max_s'] // 60} min, {headroom} min of headroom)"
+            flag += f" (near deadline since {nd['since']}: slowest run {minutes_text(nd['max_s'])} min, {near_deadline_headroom_text(nd)})"
         lines.append(f"{entry['at']}  {entry['state']:<8}  {entry['cause']}{flag}")
     return "\n".join(lines)
 

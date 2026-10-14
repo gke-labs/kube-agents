@@ -298,6 +298,10 @@ and repeats it in the daily digest for as long as it lasts:
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
+When qualifying runs in the window include a deadline kill, headroom is reported as 0
+(or overrun minutes past the timeout), and the alert omits the "Not a break" assurance
+since a run was killed without an evaluation verdict.
+
 The timeout itself lives in `GoogleCloudPlatform/oss-test-infra` (`timeout: 360m`
 on `pull-kube-agents-smoke-test`). `data.json` does not carry the timeout; the
 warning reads `PROW_JOB_TIMEOUT` (`health.py`), which is kept in sync with the

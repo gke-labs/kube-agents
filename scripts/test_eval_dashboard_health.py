@@ -1270,6 +1270,8 @@ class NearDeadline(unittest.TestCase):
                 "max_s": 305 * 60,
                 "max_build": "1002",
                 "deadline_s": 360 * 60,
+                "headroom_s": 55 * 60,
+                "kills": 0,
             },
         )
         self.assertIn(
@@ -1321,7 +1323,52 @@ class NearDeadline(unittest.TestCase):
                 "max_s": 358 * 60,
                 "max_build": "3001",
                 "deadline_s": 360 * 60,
+                "headroom_s": 2 * 60,
+                "kills": 1,
             },
+        )
+        self.assertIn(
+            "close to deadline: slowest run 358 min in the last 24h (2 min under the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_killed_run_exceeding_prow_timeout_counted_with_zero_headroom(self):
+        killed_run = run(3002, 602, T0 - timedelta(hours=2), minutes=365, result="FAILURE", tasks=[task("case-0", "ppp")])
+        killed_run["eval_verdict"] = None
+        doc = data(killed_run)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(
+            result["near_deadline"],
+            {
+                "since": health.iso(T0),
+                "runs": 1,
+                "max_s": 365 * 60,
+                "max_build": "3002",
+                "deadline_s": 360 * 60,
+                "headroom_s": 0,
+                "kills": 1,
+            },
+        )
+        self.assertIn(
+            "close to deadline: slowest run 365 min in the last 24h (5 min past the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_non_integer_minute_wall_clock_evidence_does_not_drift(self):
+        # 21330s = 355.5m -> 270s headroom = 4.5m -> both floor to 4 min
+        finished = T0 - timedelta(hours=2)
+        started = finished - timedelta(seconds=21330)
+        r = run(3003, 603, finished, minutes=355, tasks=full_tasks())
+        r["started"] = started.isoformat()
+        r["duration_s"] = 21330
+        doc = data(r)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["near_deadline"]["headroom_s"], 270)
+        self.assertIn(
+            "close to deadline: slowest run 355 min in the last 24h (4 min under the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
         )
 
     def test_short_runs_ignored(self):
@@ -2375,7 +2422,7 @@ class SlowGateReplay(unittest.TestCase):
 
 
 class NearDeadlineReplay(unittest.TestCase):
-    """2026-09-17 (#2873): runs reaching 356 minutes while the gate stayed GREEN.
+    """2026-09-17 (#2873): synthetic replay scenario modeling runs reaching 356 minutes while the gate stayed GREEN.
     The note appears on 09-17 16:00Z with 4 minutes of headroom under the 360-minute
     Prow timeout."""
 
@@ -2391,6 +2438,7 @@ class NearDeadlineReplay(unittest.TestCase):
 
     def test_the_fixture_is_what_trim_produces(self):
         trimmed = self.data["trimmed"]
+        self.assertEqual(trimmed["source"], "synthetic scenario modeling data.json for 2026-09-17")
         start = health.parse_iso(trimmed["from"])
         end = health.parse_iso(trimmed["to"])
         assert start is not None and end is not None
@@ -2408,9 +2456,31 @@ class NearDeadlineReplay(unittest.TestCase):
                 "max_s": 21360,
                 "max_build": "2100456789012345678",
                 "deadline_s": 21600,
+                "headroom_s": 240,
+                "kills": 0,
             },
         )
         self.assertIn("close to deadline: slowest run 356 min in the last 24h (4 min under the 360-minute Prow timeout; 4 runs)", tick["evidence"])
+
+    def test_the_replay_timeline_shows_near_deadline_beside_the_state(self):
+        entries = health.timeline(self.every)
+        edge = next(e for e in entries if e["near_deadline"])
+        self.assertEqual(
+            edge["near_deadline"],
+            {
+                "since": "2026-09-17T16:00:00+00:00",
+                "max_s": 21360,
+                "max_build": "2100456789012345678",
+                "runs": 4,
+                "deadline_s": 21600,
+                "headroom_s": 240,
+                "kills": 0,
+            },
+        )
+        self.assertIn(
+            "2026-09-17T16:00:00+00:00  GREEN      (near deadline since 2026-09-17T16:00:00+00:00: slowest run 356 min, 4 min of headroom)",
+            health.format_timeline([edge]),
+        )
 
     def test_quiet_at_04_00z(self):
         self.assertIsNone(self.tick(health.parse_iso("2026-09-17T04:00:00+00:00"))["near_deadline"])

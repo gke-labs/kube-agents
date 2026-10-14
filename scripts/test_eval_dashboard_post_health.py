@@ -88,13 +88,17 @@ def slow(**note):
     return doc
 
 
-def near_deadline_note(since="2026-09-17T16:00:00+00:00", max_s=356 * 60, runs=14, max_build="183592847291", deadline_s=360 * 60):
+def near_deadline_note(since="2026-09-17T16:00:00+00:00", max_s=356 * 60, runs=14, max_build="183592847291", deadline_s=360 * 60, headroom_s=None, kills=0):
+    if headroom_s is None:
+        headroom_s = max(0, deadline_s - max_s)
     return {
         "since": since,
         "runs": runs,
         "max_s": max_s,
         "max_build": max_build,
         "deadline_s": deadline_s,
+        "headroom_s": headroom_s,
+        "kills": kills,
     }
 
 
@@ -876,6 +880,26 @@ class NearDeadlineNote(RunHarness):
             "⏱ *Smoke gate: close to the deadline* — slowest run 356 min in the last 24h, 4 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
         )
         self.assertEqual(lines[1], f"{URL}#view=agent")
+
+    def test_render_message_when_killed_past_deadline(self):
+        self.tick(near_deadline(max_s=365 * 60, kills=1), self.at(10))
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(
+            lines[0],
+            "⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
+        )
+        self.assertEqual(lines[1], f"{URL}#view=agent")
+
+    def test_non_integer_minute_wall_clock_does_not_drift(self):
+        # 21330s = 355.5m -> 270s headroom = 4.5m -> floors both to 4 min
+        self.tick(near_deadline(max_s=21330, headroom_s=270), self.at(10))
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(
+            lines[0],
+            "⏱ *Smoke gate: close to the deadline* — slowest run 355 min in the last 24h, 4 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
+        )
+        nd = near_deadline_note(max_s=21330, headroom_s=270)
+        self.assertEqual(post_health.near_deadline_digest_line(nd), "slowest run 355 min, 4 min of headroom")
 
 
 class PoolNote(RunHarness):
