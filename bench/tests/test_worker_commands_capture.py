@@ -312,7 +312,7 @@ def test_archive_stalled_cards_bounds_fixpoint_loop_rounds_and_warns(monkeypatch
 
     assert read_count == harness._MAX_DESCENDANT_ARCHIVE_ROUNDS
     assert (
-        f"fan-out child archive loop reached round cap ({harness._MAX_DESCENDANT_ARCHIVE_ROUNDS}) for t_parent; some child workers may still hold dispatcher slots"
+        f"fan-out child archive loop reached round cap ({harness._MAX_DESCENDANT_ARCHIVE_ROUNDS}) for t_parent; stopped re-reading, any child filed after the last read is not archived"
         in caplog.text
     )
 

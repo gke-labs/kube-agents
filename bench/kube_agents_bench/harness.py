@@ -1092,7 +1092,7 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
             _archive(cid, is_child=True)
     else:
         _log.warning(
-            "fan-out child archive loop reached round cap (%d) for %s; some child workers may still hold dispatcher slots",
+            "fan-out child archive loop reached round cap (%d) for %s; stopped re-reading, any child filed after the last read is not archived",
             _MAX_DESCENDANT_ARCHIVE_ROUNDS,
             ", ".join(stalled),
         )
