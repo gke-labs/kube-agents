@@ -4896,7 +4896,8 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertIsNotNone(body, f"{func} not found in {path}")
         letters = sorted(set(re.findall(rf"{re.escape(var)}\[0\] != '([A-Z])'", body.group(0))))
         self.assertTrue(letters, f"no prefix letters read from {func}")
-        self.assertIn("(r < 'A' || r > 'Z') && (r < '0' || r > '9')", body.group(0))
+        # The whole condition line, so a clause added on either side fails.
+        self.assertIn("\n\t\tif (r < 'A' || r > 'Z') && (r < '0' || r > '9') {\n", body.group(0))
         return "".join(letters), int(min_len.group(1))
 
     def test_the_regex_is_the_gateways_rule_and_the_operators(self):
