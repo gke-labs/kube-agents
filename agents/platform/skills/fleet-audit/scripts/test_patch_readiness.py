@@ -27,6 +27,9 @@ import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
+# The shipped criteria schema the store enforces; the flags here are held to it.
+CRITERIA_SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "capabilities", "security-patch-orchestrator", "criteria.schema.json")
+
 
 def run_of(rc: int, stdout: str = "", stderr: str = "") -> pr.Run:
     return pr.Run(["gcloud"], rc, stdout, stderr, 0.01)
@@ -3342,16 +3345,24 @@ class CriteriaTest(unittest.TestCase):
         """One flag per key of the shipped criteria schema, under the same
         name: a key the schema adds without a flag here is a value the operator
         can set that never reaches a candidate."""
-        schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "capabilities", "security-patch-orchestrator", "criteria.schema.json"
-        )
-        with open(schema_path, encoding="utf-8") as fh:
+        with open(CRITERIA_SCHEMA_PATH, encoding="utf-8") as fh:
             schema = json.load(fh)
         self.assertEqual(set(schema["properties"]), set(pr.Criteria._fields))
         self.assertEqual(set(pr.DEFAULT_CRITERIA.record()), set(pr.Criteria._fields))
         for key, spec in schema["properties"].items():
             shipped = pr.DEFAULT_CRITERIA.record()[key]
             self.assertEqual(sorted(spec["default"]) if isinstance(shipped, list) else spec["default"], shipped, key)
+
+    def test_an_image_type_entry_is_held_to_the_schemas_pattern(self):
+        # One pattern for an entry: the store's schema at write time, this flag at parse time,
+        # so a token the store would refuse is refused here by the same rule. It is end-anchored
+        # past a newline, the one whitespace a JSON string can carry into the store and the
+        # flag's grammar would split on.
+        with open(CRITERIA_SCHEMA_PATH, encoding="utf-8") as fh:
+            schema = json.load(fh)
+        self.assertEqual(schema["properties"]["deprecated_image_types"]["items"]["pattern"], pr.IMAGE_TYPE_TOKEN_PATTERN)
+        self.assertIsNone(pr.IMAGE_TYPE_TOKEN_RE.match("COS\n"))
+        self.assertIsNotNone(pr.IMAGE_TYPE_TOKEN_RE.match("cos_containerd"))
 
     def test_the_critical_rung_moves_with_the_criteria(self):
         c = cluster(master="1.33.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])

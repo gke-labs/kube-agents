@@ -199,9 +199,14 @@ LONG_FREEZE_DAYS = 30
 LONG_FREEZE = timedelta(days=LONG_FREEZE_DAYS)
 # The widest horizon the check's own arithmetic holds; past it `timedelta(days=...)` raises.
 MAX_FREEZE_HORIZON_DAYS = timedelta.max.days
-# What an image type is spelled as, once upper-cased: a token outside this is a JSON array's
-# bracket or quote pasted into the flag, which no pool's `imageType` can ever equal.
-IMAGE_TYPE_TOKEN_RE = re.compile(r"^[A-Z0-9_]+$")
+# What an image type is spelled as, letters, digits and underscores: the pattern the store's
+# schema holds each `deprecated_image_types` entry to at write time (criteria.schema.json
+# carries the same string; CriteriaTest pins the two), checked again here because the flag may
+# not carry what the store accepted. A token outside it is a JSON array's bracket or quote
+# pasted into the flag, which no pool's `imageType` can ever equal. `\Z`, not `$`: Python's `$`
+# also matches before a trailing newline.
+IMAGE_TYPE_TOKEN_PATTERN = r"^[A-Za-z0-9_]+\Z"
+IMAGE_TYPE_TOKEN_RE = re.compile(IMAGE_TYPE_TOKEN_PATTERN)
 # How `--deprecated-image-types` separates its entries.
 IMAGE_TYPE_LIST_SEPARATOR = ","
 # §3.8's escalation: a freeze beside a critical or major version finding.
@@ -2316,8 +2321,9 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     # an operator who emptied the list, not the default. The list grammar is
     # the one the scope flags on this same command line use, commas or
     # whitespace with each entry once, so one command line has one grammar.
-    deprecated = frozenset(item.upper() for item in fleet_scope_args.parse_scope_projects(args.deprecated_image_types))
-    malformed = sorted(item for item in deprecated if not IMAGE_TYPE_TOKEN_RE.match(item))
+    # Each entry is held to the schema's pattern as given, before the upper-casing.
+    entries = fleet_scope_args.parse_scope_projects(args.deprecated_image_types)
+    malformed = sorted(item for item in entries if not IMAGE_TYPE_TOKEN_RE.match(item))
     if malformed:
         parser.error(
             f"--deprecated-image-types: {', '.join(malformed)}: an image type is letters, digits and underscores; "
@@ -2327,7 +2333,7 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
         pool_skew_critical_minors=args.pool_skew_critical_minors,
         fleet_spread_min_minors=args.fleet_spread_min_minors,
         blocking_exclusion_min_days=args.blocking_exclusion_min_days,
-        deprecated_image_types=deprecated,
+        deprecated_image_types=frozenset(item.upper() for item in entries),
     )
 
 

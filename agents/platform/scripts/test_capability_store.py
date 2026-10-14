@@ -183,13 +183,16 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(torn.read_text(encoding="utf-8").split("\n")[0], fragment)
 
     def test_a_pattern_on_a_string_is_enforced(self):
-        # The flag that carries a list cannot carry an entry with a comma, a space or a quote, so
-        # the schema refuses it at the store and `get`, the flag and the manifest agree.
-        schema = {"type": "object", "additionalProperties": False, "properties": {"names": {"type": "array", "items": {"type": "string", "pattern": "^[A-Z0-9_]+$"}, "default": []}}}
+        # The flag that carries a list cannot carry an entry with a comma, a space, a quote or a
+        # newline, so the schema refuses it at the store and `get`, the flag and the manifest
+        # agree. `\Z`, not `$`: Python's `$` would let the newline through.
+        schema = {"type": "object", "additionalProperties": False, "properties": {"names": {"type": "array", "items": {"type": "string", "pattern": r"^[A-Z0-9_]+\Z"}, "default": []}}}
         seed(self.root, criteria={}, schema=schema)
-        with self.assertRaises(cs.CapabilityError) as ctx:
-            cs.apply_changes(self.root, "demo", {"names": ["COS CONTAINERD"]}, reason="x", confirmed_by="ops@example")
-        self.assertIn("must match", str(ctx.exception))
+        for bad in ("COS CONTAINERD", "COS,", '"COS"', "COS\n"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(cs.CapabilityError) as ctx:
+                    cs.apply_changes(self.root, "demo", {"names": [bad]}, reason="x", confirmed_by="ops@example")
+                self.assertIn("must match", str(ctx.exception))
         cs.apply_changes(self.root, "demo", {"names": ["COS_CONTAINERD"]}, reason="x", confirmed_by="ops@example")
         self.assertEqual(cs.load(self.root, "demo").criteria["names"], ["COS_CONTAINERD"])
 
@@ -390,6 +393,25 @@ class ShippedTemplatesTest(unittest.TestCase):
                     all("default" in spec for spec in cap.schema["properties"].values()),
                     f"{name}: every property needs a default, since the template ships none",
                 )
+
+    def test_a_shipped_pattern_refuses_a_trailing_newline(self):
+        # JSON Schema's `pattern` is ECMA-262, where `$` is the end of the input; the validator
+        # is Python's `re`, whose `$` also matches before a final newline. So a shipped pattern
+        # anchors its end with `\Z`, and the image-type entry the flag's grammar would split on
+        # a newline is refused at the store, like the comma, the space and the quote.
+        for name in cs.list_capabilities(SHIPPED):
+            for key, spec in cs.load(SHIPPED, name).properties().items():
+                for pattern in (spec.get("pattern"), (spec.get("items") or {}).get("pattern")):
+                    if pattern is not None:
+                        with self.subTest(name=name, key=key):
+                            self.assertFalse(pattern.endswith("$"), f"{pattern}: anchor the end with \\Z, not $")
+        schema = cs.load(SHIPPED, "security-patch-orchestrator").schema
+        for bad in ("COS\n", "COS CONTAINERD", "COS,", '"COS"', "[COS]"):
+            with self.subTest(bad=bad):
+                self.assertTrue(cs.validate(schema, {"deprecated_image_types": [bad]}))
+        for good in ("COS", "cos_containerd", "WINDOWS_SAC"):
+            with self.subTest(good=good):
+                self.assertEqual(cs.validate(schema, {"deprecated_image_types": [good]}), [])
 
     def test_every_shipped_capability_is_a_cron_job_on_the_platform_roster(self):
         roster = json.loads((REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json").read_text())

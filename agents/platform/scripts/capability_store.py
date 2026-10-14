@@ -29,6 +29,9 @@ saw the before/after — that round-trip is the agent's instruction
 ask. The validator is a deliberately small subset of JSON Schema (type, enum, pattern,
 minimum, maximum, maxLength, items, maxItems, required, additionalProperties) so
 this module stays on the standard library like the scaffolder that seeds it.
+``pattern`` runs through Python's ``re.search``, so a schema anchors the end of a
+value with ``\\Z``: Python's ``$`` also matches before a trailing newline, which
+JSON Schema's ECMA-262 ``$`` does not.
 """
 
 from __future__ import annotations
