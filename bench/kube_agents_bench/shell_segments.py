@@ -74,7 +74,7 @@ _KUBECTL_BOOLEAN_FLAGS = frozenset(
 )
 # ``find … -exec <command> {} \;`` runs its argument for every match.
 _FIND_EXEC_OPTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
-_FIND_EXEC_END = frozenset({";", "\;", "+"})
+_FIND_EXEC_END = frozenset({";", "\\;", "+"})
 # Escapes ``echo -e``, ``printf`` and ``$'…'`` expand before a script is written.
 _ESCAPES = (("\\n", "\n"), ("\\t", "\t"), ("\\r", "\r"))
 _WRAPPER_VALUE_OPTIONS = {
@@ -331,7 +331,7 @@ def _expand(text: str, expands: bool) -> str:
 
 
 def _find_exec_argv(piece: str) -> str | None:
-    """What a ``find -exec … \;`` runs, as one command string with its quoting kept, or ``None``."""
+    r"""What a ``find -exec … \;`` runs, as one command string with its quoting kept, or ``None``."""
     if "-exec" not in piece and "-ok" not in piece:  # cheap gate: the piece is tokenised again below
         return None
     tokens = _tokens(piece)

@@ -1622,8 +1622,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     the creator table's ``created_at``); a card with no recorded creation
     time counts, as it did before the times were read. The cards a window
     leaves out are read again for an opener of their own, so a sibling's own
-    refusal opens a window on its later calls. The reason names each window
-    by its lineage's smallest card id. Written for
+    refusal opens a window on its later calls. Two shapes are stated rather
+    than read: an ancestor's own first attempt issued after a child met the
+    refusal but before reading its result counts as a retry, and a card the
+    front agent files afresh after a blocked one, with no creator edge, is a
+    new lineage whose first attempt opens its own window. The reason names
+    each window by its lineage's smallest card id. Written for
     a retry-after-refusal
     check (#2173): the
     defect is a write after the policy refused one, and a pattern over write
