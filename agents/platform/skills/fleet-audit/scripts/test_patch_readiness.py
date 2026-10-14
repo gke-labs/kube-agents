@@ -3359,7 +3359,10 @@ class CriteriaTest(unittest.TestCase):
         raised = pr.check_pool_skew(c, critical_minors=4)[0]
         self.assertEqual(raised["severity"], "major")
         self.assertIn("past GKE's skew ceiling", raised["excerpt"])
-        self.assertIn("critical from 4", raised["excerpt"])
+        # The rung is the run's, recorded in the manifest's criteria block, not the pool's: an
+        # unchanged pool keeps unchanged evidence when the rung moves, so finish carries its wording.
+        self.assertNotIn("critical from", raised["excerpt"])
+        self.assertEqual(raised["excerpt"], pr.check_pool_skew(c, critical_minors=5)[0]["excerpt"])
         four_behind = cluster(master="1.34.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
         self.assertEqual(pr.check_pool_skew(four_behind, critical_minors=4)[0]["severity"], "critical")
 

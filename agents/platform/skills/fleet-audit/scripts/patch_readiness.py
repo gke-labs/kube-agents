@@ -871,7 +871,7 @@ def check_pool_skew(cluster: dict, *, critical_minors: int = POOL_SKEW_CRITICAL_
             # GKE's ceiling, which the excerpt still says, but under the
             # operator's rung for critical, which it names so the ledger
             # shows why this week's pool-skew finding is a major one.
-            hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, past GKE's skew ceiling; critical from {critical_minors} under this run's criteria", "severity": MAJOR})
+            hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, past GKE's skew ceiling", "severity": MAJOR})
         elif minor_gap == SKEW_CEILING_MINORS:
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, at GKE's skew ceiling", "severity": MAJOR})
         elif minor_gap == 1:
