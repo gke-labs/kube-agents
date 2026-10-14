@@ -720,10 +720,14 @@ _GCLOUD_HELP_FLAGS = _HELP_FLAGS  # the same two words, read by the gcloud surfa
 #: only gate.
 _GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
 # How many words of a gcloud argv, past a release track, the refusal's verb tuple
-# keeps: the deepest write surfaces are four words (`compute instance-groups
-# managed resize`, `iam service-accounts keys create`); a shorter surface's
-# positional rides along, sanitised by the proxy before it is printed.
-_GCLOUD_VERB_WORDS = 4
+# keeps: three, so a positional (a disk or cluster name) never reaches the log
+# hint or the shim's verb line. The write surfaces whose verb is the fourth word
+# keep it when that word is one of these, which no positional is named.
+_GCLOUD_VERB_WORDS = 3
+_GCLOUD_FOURTH_WORD_VERBS = frozenset(
+    {"create", "delete", "update", "patch", "resize", "set-autoscaling", "rolling-action",
+     "set-iam-policy", "add-iam-policy-binding", "remove-iam-policy-binding"}
+)
 # The one rule whose refusal carries a render flag (``local_render``).
 KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 
@@ -782,6 +786,14 @@ def _asset_search_type(argv: list[str]) -> str | None:
         elif token == _ASSET_SEARCH_TYPE_FLAG and i + 1 < len(argv):
             values.append(argv[i + 1])
     return values[0] if len(values) == 1 else None
+
+
+def _gcloud_verb_tuple(words: list[str]) -> tuple[str, ...]:
+    """The surface words a refusal names: three past a release track, a fourth when it is a
+    write verb that sits that deep (``compute instance-groups managed resize``)."""
+    surface = words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else list(words)
+    keep = _GCLOUD_VERB_WORDS + (1 if len(surface) > _GCLOUD_VERB_WORDS and surface[_GCLOUD_VERB_WORDS] in _GCLOUD_FOURTH_WORD_VERBS else 0)
+    return tuple(surface[:keep])
 
 
 def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | None]:
@@ -1357,7 +1369,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "rather than working around it. "
                     + _ACTION_BOUNDARY_NOTICE
                 ),
-                verb_tuple=tuple((words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else words)[:_GCLOUD_VERB_WORDS]),
+                verb_tuple=_gcloud_verb_tuple(words),
             )
         return _ALLOWED
 

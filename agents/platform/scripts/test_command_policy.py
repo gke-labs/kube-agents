@@ -793,7 +793,7 @@ class GcloudReadOnlyTest(unittest.TestCase):
         decision = evaluate(["gcloud", "container", "clusters", "--trace-token", "list", "delete", "my-cluster"])
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
-        self.assertEqual(("container", "clusters", "delete", "my-cluster"), decision.verb_tuple)  # four words: the deepest write surfaces need them
+        self.assertEqual(("container", "clusters", "delete"), decision.verb_tuple)
 
     def test_trace_token_and_delete_exploit(self):
         # Regression test for the exploit with --trace-token and delete. Once
@@ -1969,7 +1969,8 @@ class LocalRenderTests(unittest.TestCase):
         ):
             self.assertTrue(command_policy.local_render(argv), argv)
         # A release track is not part of the verb the shim prints.
-        self.assertEqual(("container", "clusters", "resize", "c"), command_policy.evaluate(["gcloud", "beta", "container", "clusters", "resize", "c", "--size", "3"]).verb_tuple)
+        self.assertEqual(("container", "clusters", "resize"), command_policy.evaluate(["gcloud", "beta", "container", "clusters", "resize", "c", "--size", "3"]).verb_tuple)
+        self.assertEqual(("compute", "disks", "delete"), command_policy.evaluate(["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]).verb_tuple)
         self.assertEqual(("compute", "instance-groups", "managed", "resize"), command_policy.evaluate(["gcloud", "compute", "instance-groups", "managed", "resize", "mig-1", "--size", "3", "--zone", "us-central1-a"]).verb_tuple)
         self.assertEqual(("iam", "service-accounts", "keys", "create"), command_policy.evaluate(["gcloud", "iam", "service-accounts", "keys", "create", "k.json"]).verb_tuple)
         # kubectl's false dry-run spellings reach the server.
