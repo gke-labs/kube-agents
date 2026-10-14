@@ -23,6 +23,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from test_skill_inline_commands import inline_code
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLATFORM_AGENTS = REPO_ROOT / "agents/platform/AGENTS.md"
 READINESS_SKILL = REPO_ROOT / "agents/platform/skills/fleet-upgrade-verification/SKILL.md"
@@ -44,41 +46,66 @@ OUTPUT_FLAG = "--output"
 # What makes the dictated output name this run's own: a timestamp and the shell's PID, since a
 # timestamp alone is second-resolution and two cards started in one second would share the name.
 PER_RUN_NAME_MARKS = ("$(date +%s)", "$$")
+BULLET_MARKER = "- "
 
 
-def _dictated_runs(path: Path) -> list[str]:
-    """The lines of ``path`` that dictate the readiness run: the script and its mode flag inside
-    one backtick span on the line, which is how the persona writes a command to type."""
+def _dictated_runs(text: str) -> list[tuple[int, str]]:
+    """The inline code spans of ``text`` that dictate the readiness run, each with the line it
+    opens on: the script and its mode flag inside one span, which is how the persona writes a
+    command to type. Read with the Markdown parser the skill tests use
+    (``test_skill_inline_commands.inline_code``), so a span written with double backticks or
+    wrapped onto a second line is one span, as a reader sees it."""
+    return [(line, span) for line, span in inline_code(text) if REPORT_SCRIPT in span and READINESS_FLAG in span]
+
+
+def _bullet_holding(text: str, line_number: int) -> str:
+    """The list item that holds ``line_number``, from its marker to that line, as one string."""
+    lines = text.splitlines()
+    start = line_number - 1
+    while start > 0 and not lines[start].lstrip().startswith(BULLET_MARKER):
+        start -= 1
+    return " ".join(line.strip() for line in lines[start:line_number])
+
+
+def _delegation_bullet_runs() -> list[tuple[str, str]]:
+    """(bullet, span) for each dictated run inside the Delegation bullet."""
+    text = PLATFORM_AGENTS.read_text(encoding="utf-8")
     runs = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        spans = line.split("`")[1::2]
-        if any(REPORT_SCRIPT in span and READINESS_FLAG in span for span in spans):
-            runs.append(line)
+    for line, span in _dictated_runs(text):
+        bullet = _bullet_holding(text, line)
+        if BULLET_LEAD in bullet:
+            runs.append((bullet, span))
     return runs
 
 
 class ReadinessRouteCarriesTheScopeTest(unittest.TestCase):
     def test_the_delegation_bullet_dictates_the_run(self):
-        bullets = [line for line in _dictated_runs(PLATFORM_AGENTS) if BULLET_LEAD in line]
-        self.assertEqual(len(bullets), 1, "the Delegation bullet dictates the readiness run once")
+        self.assertEqual(len(_delegation_bullet_runs()), 1, "the Delegation bullet dictates the readiness run once")
 
     def test_the_bullet_calls_fleet_scope_before_the_run(self):
-        (bullet,) = [line for line in _dictated_runs(PLATFORM_AGENTS) if BULLET_LEAD in line]
+        ((bullet, _),) = _delegation_bullet_runs()
         self.assertIn(SCOPE_TOOL, bullet)
         self.assertLess(bullet.index(SCOPE_TOOL), bullet.index(REPORT_SCRIPT), "the tool call comes first")
 
     def test_every_dictated_run_carries_the_collector_args_slot(self):
         for path in PERSONA_FILES:
-            for line in _dictated_runs(path):
-                with self.subTest(file=path.name):
-                    command = next(span for span in line.split("`")[1::2] if REPORT_SCRIPT in span and READINESS_FLAG in span)
+            for line, command in _dictated_runs(path.read_text(encoding="utf-8")):
+                with self.subTest(file=path.name, line=line):
                     self.assertIn(COLLECTOR_ARGS_SLOT, command, f"{path.name} dictates the run without the declared scope: {command}")
+
+    def test_the_reader_sees_a_double_backtick_or_wrapped_span(self):
+        # The guard above holds only if a dictated run reaches it however it is spelled: a
+        # double-backtick span and a span wrapped onto the next line are each one span.
+        text = (
+            f"- Lead: run ``python3 x/{REPORT_SCRIPT} {READINESS_FLAG}`` now.\n"
+            f"- Lead: run `python3 x/{REPORT_SCRIPT}\n  {READINESS_FLAG}` now, and `{REPORT_SCRIPT}` alone.\n"
+        )
+        self.assertEqual([(1, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG}"), (2, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG}")], _dictated_runs(text))
 
     def test_the_output_path_is_this_runs_own(self):
         # /opt/data/scratch is shared by every card, so a fixed --output name is two cards writing
         # one file; the dictated command names the file for this run alone.
-        (bullet,) = [line for line in _dictated_runs(PLATFORM_AGENTS) if BULLET_LEAD in line]
-        command = next(span for span in bullet.split("`")[1::2] if REPORT_SCRIPT in span and READINESS_FLAG in span)
+        ((_, command),) = _delegation_bullet_runs()
         # The name is the rest of the dictated command: a `$(date +%s)` inside it holds a space.
         output = command.split(OUTPUT_FLAG, 1)[1].strip()
         for mark in PER_RUN_NAME_MARKS:
