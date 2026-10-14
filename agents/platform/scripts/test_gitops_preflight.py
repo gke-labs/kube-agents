@@ -35,8 +35,8 @@ class _StateDir:
 
 
 class PreflightAnswersInOneLine(unittest.TestCase):
-    """SOUL.md and every PR-writing skill treat this script's line as final, so
-    each state's first word and exit code are pinned here."""
+    """Whoever runs this treats its line as final, so each state's first word
+    and exit code are pinned here."""
 
     def test_a_mount_without_the_key_is_no_registered_repo(self):
         with _StateDir(entries=None):
@@ -64,8 +64,29 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
         self.assertIn("acme/other is not registered", line)
 
+    def test_other_spellings_of_a_registered_name_are_the_same_repository(self):
+        answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        for spelling in ("Acme/Fleet", "github.com/acme/fleet", "https://github.com/acme/fleet/"):
+            with self.subTest(spelling=spelling), _StateDir(entries=ENTRY), patch(
+                "subprocess.run", return_value=answered
+            ):
+                code, line = gitops_preflight.preflight(spelling)
+            self.assertEqual(gitops_preflight.EXIT_REGISTERED, code, line)
+
+    def test_the_reach_probe_spends_the_credential(self):
+        # `capabilities` answers without the network, so it cannot tell a
+        # repository the credential reads from one it does not.
+        answered = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with _StateDir(entries=ENTRY), patch("subprocess.run", return_value=answered) as run:
+            gitops_preflight.preflight(REPO)
+        argv = run.call_args.args[0]
+        self.assertIn("proposal", argv)
+        self.assertNotIn("capabilities", argv)
+
     def test_a_registered_repository_the_broker_cannot_reach_is_unreachable(self):
-        refused = subprocess.CompletedProcess([], 1, stdout="", stderr="403 Forbidden")
+        refused = subprocess.CompletedProcess(
+            [], 1, stdout=json.dumps({"error": "403 Forbidden"}, indent=2), stderr=""
+        )
         with _StateDir(entries=ENTRY), patch("subprocess.run", return_value=refused):
             code, line = gitops_preflight.preflight(REPO)
         self.assertEqual(gitops_preflight.EXIT_REPO_UNREACHABLE, code)
@@ -114,6 +135,13 @@ class ListingShowsBothRegistries(unittest.TestCase):
             code, text = gitops_preflight.listing()
         self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
         self.assertEqual(f"MANAGED: {REPO}\nCONTEXT: github.com/acme/tf-live@prod", text)
+
+    def test_an_unreadable_context_registry_is_state_unreadable(self):
+        with _StateDir(entries=ENTRY), patch.object(
+            gitops_preflight.gitops_workspace, "get_context_repo_entries", side_effect=RuntimeError("boom")
+        ):
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_STATE_UNREADABLE, code)
 
     def test_an_unreadable_registry_is_state_unreadable(self):
         with patch.object(

@@ -6,11 +6,11 @@
 Prompt rules alone did not hold here: asked to install a chart on an install
 with no registered repository, workers read the registry, found it empty, and
 went on looking for another route until the delegation ceiling. This script
-is the authoritative answer every PR-writing skill and SOUL.md run first. It
-reads the registry the way the credential broker does
-(gitops_workspace.get_managed_repo_entries: the mounted
-/etc/gitops/managed_repos file, a mount without the key as known-empty) and
-prints exactly one line:
+is the authoritative answer a PR-writing skill runs first. It reads the
+registry through gitops_workspace.get_managed_repos, the list of usable
+entries the verbs accept (the mounted /etc/gitops/managed_repos file, a
+mount without the key as known-empty; a list with no usable entry reads as
+empty), and prints exactly one line:
 
     REGISTERED: <repo> [<repo> ...]                  exit 0
     NO_REGISTERED_REPO: stop now. ...                exit 3
@@ -24,14 +24,15 @@ gating: `managed_repos` (swept, audited, sent pull requests) and
     MANAGED: <repo> ... | MANAGED: none
     CONTEXT: <repo>[@<ref>] ... | CONTEXT: none      exit 0, or 5 if unreadable
 
-With --repo, the named repository must be registered and answer the
-broker's capabilities call; a repository not in the list is reported as
-NO_REGISTERED_REPO for that name. Every non-zero line tells the reader to
+With --repo, the named repository (any spelling gitops_workspace.qualify
+accepts) must be registered and must answer a read the broker serves with
+the install's forge credential (`vcs.py proposal list --limit 1`); a
+repository not in the list is reported as NO_REGISTERED_REPO for that name. Every non-zero line tells the reader to
 stop and block, because that is the whole point of having one.
 """
 
 import argparse
-import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -45,8 +46,11 @@ EXIT_REPO_UNREACHABLE = 4
 EXIT_STATE_UNREADABLE = 5
 
 REACH_TIMEOUT_SECONDS = 60
-VCS_SCRIPT_RELATIVE = Path("skills") / "version-control" / "scripts" / "vcs.py"
-DEFAULT_HERMES_HOME = "/opt/data"
+# This script ships in <profile>/scripts/; the version-control client in
+# <profile>/skills/version-control/scripts/.
+VCS_SCRIPT = Path(__file__).resolve().parents[1] / "skills" / "version-control" / "scripts" / "vcs.py"
+REACH_PROBE_LIMIT = "1"
+URL_SCHEME_SEPARATOR = "://"
 NONE = "none"
 
 REGISTRATION_STEPS = (
@@ -59,16 +63,18 @@ STOP = (
 )
 
 
-def _vcs_script() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME)
-    return home / VCS_SCRIPT_RELATIVE
-
-
 def _reachable(repo: str) -> tuple[bool, str]:
-    """Whether the broker answers its capabilities call for `repo`."""
+    """Whether the broker can read `repo` with the install's forge credential.
+
+    `capabilities` answers without the network, so the probe is a one-item
+    proposal list, which the broker serves only by spending the credential.
+    """
+    if not VCS_SCRIPT.is_file():
+        return False, f"the version-control client is missing at {VCS_SCRIPT}"
     try:
         result = subprocess.run(
-            [sys.executable, str(_vcs_script()), "capabilities", repo],
+            [sys.executable, str(VCS_SCRIPT), "proposal", "list",
+             "--limit", REACH_PROBE_LIMIT, "--repo", repo],
             capture_output=True,
             text=True,
             timeout=REACH_TIMEOUT_SECONDS,
@@ -77,9 +83,20 @@ def _reachable(repo: str) -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, type(exc).__name__
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        return False, detail[-1] if detail else f"exit {result.returncode}"
+        return False, _error_of(result)
     return True, ""
+
+
+def _error_of(result: subprocess.CompletedProcess) -> str:
+    """The client's `error` field (it prints one JSON object), else its stderr."""
+    try:
+        answer = json.loads(result.stdout)
+        if isinstance(answer, dict) and answer.get("error"):
+            return str(answer["error"])
+    except (json.JSONDecodeError, TypeError):
+        pass
+    detail = (result.stderr or "").strip().splitlines()
+    return detail[-1] if detail else f"exit {result.returncode}"
 
 
 def _context_names(entries: list[dict[str, str]]) -> list[str]:
@@ -121,7 +138,10 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
         )
     if repo is None:
         return EXIT_REGISTERED, "REGISTERED: " + " ".join(repos)
-    if repo not in repos:
+    if URL_SCHEME_SEPARATOR in repo:
+        repo = repo.split(URL_SCHEME_SEPARATOR, 1)[1].rstrip("/")
+    repo = gitops_workspace.qualify(repo, repos)
+    if repo.lower() not in {name.lower() for name in repos}:
         return EXIT_NO_REGISTERED_REPO, (
             f"NO_REGISTERED_REPO: {repo} is not registered on this install "
             f"(registered: {' '.join(repos)}); {STOP} {REGISTRATION_STEPS}"
@@ -129,7 +149,7 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
     ok, why = _reachable(repo)
     if not ok:
         return EXIT_REPO_UNREACHABLE, (
-            f"REPO_UNREACHABLE: {repo}: the broker cannot reach it ({why}); {STOP} "
+            f"REPO_UNREACHABLE: {repo}: the broker could not read it ({why}); {STOP} "
             "Check the repository exists and the install's forge credential can read it."
         )
     return EXIT_REGISTERED, f"REGISTERED: {repo}"
