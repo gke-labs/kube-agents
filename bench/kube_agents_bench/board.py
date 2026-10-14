@@ -383,15 +383,16 @@ def read_statuses(
 DESCENDANTS_PRESENT = "__KANBAN_DESCENDANTS__"
 
 _DESCENDANTS_SCRIPT = r"""
-import json, sqlite3, sys
+import json, re, sqlite3, sys
 
 ROOT, BOARD, SENTINEL, MAX_ARG, EXCLUDE_ARG = sys.argv[1:6]
 MAX_CARDS = int(MAX_ARG)
 exclude = set(a for a in EXCLUDE_ARG.split(",") if a)
 roots = [a for a in sys.argv[6:] if a]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"descendants": [], "truncated": False, "skipped": 0, "error": None}
+out = {"descendants": [], "truncated": False, "skipped": 0, "dropped": 0, "error": None}
 TERMINAL_STATUSES = ("done", "archived", "blocked", "failed", "cancelled")
+TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,64}\Z")
 
 def has_table(conn, name):
     return conn.execute(
@@ -433,6 +434,7 @@ try:
     seen = set(roots)
     descendants = []
     skipped = 0
+    dropped = 0
     truncated = False
     while queue and not truncated:
         curr = queue.pop(0)
@@ -450,11 +452,12 @@ try:
             if child in seen:
                 continue
             seen.add(child)
-            queue.append(child)
             if child in exclude:
+                queue.append(child)
                 continue
             row = conn.execute(task_query, (child,)).fetchone()
             if row is None:
+                queue.append(child)
                 continue
             status = str(row[0]) if row[0] is not None else None
             col_idx = 1
@@ -478,8 +481,12 @@ try:
                     skipped += 1
                 continue
 
+            queue.append(child)
+
             if status not in TERMINAL_STATUSES:
-                if len(descendants) < MAX_CARDS:
+                if not TASK_ID_RE.match(child):
+                    dropped += 1
+                elif len(descendants) < MAX_CARDS:
                     descendants.append(child)
                 else:
                     truncated = True
@@ -488,6 +495,7 @@ try:
     out["descendants"] = descendants
     out["truncated"] = truncated
     out["skipped"] = skipped
+    out["dropped"] = dropped
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc
 print(SENTINEL)
@@ -533,9 +541,13 @@ def read_descendants(
     :data:`TERMINAL_STATUSES`), no longer exist on the board (missing
     ``tasks`` row), predate the root card's creation, or carry an
     ``idempotency_key`` (idempotent cards that may be shared across parallel
-    repetition runs). Cards in ``exclude`` (e.g. already-attempted cards from
-    earlier rounds) are traversed to find deeper descendants but omitted from
-    the returned list so they do not consume scan slots.
+    repetition runs). When a card is keyed or predates the root, its entire
+    subtree is omitted from traversal so parallel runs are protected from
+    having their children archived. Cards in ``exclude`` (e.g. already-attempted
+    cards from earlier rounds) are traversed to find deeper descendants but
+    omitted from the returned list so they do not consume scan slots.
+    Non-conforming card IDs (failing :data:`_TASK_ID_RE`) are dropped in-pod
+    without taking scan slots, and warned about.
 
     ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
     module stays importable without the harness and testable with a canned
@@ -567,16 +579,19 @@ def read_descendants(
     if not isinstance(descendants, list):
         return None
     valid = []
-    dropped = 0
+    dropped_harness = 0
     for d in descendants:
         if isinstance(d, str) and _TASK_ID_RE.match(d):
             valid.append(d)
         else:
-            dropped += 1
-    if dropped:
+            dropped_harness += 1
+    dropped_raw = payload.get("dropped")
+    dropped_in_pod = dropped_raw if isinstance(dropped_raw, int) else 0
+    total_dropped = dropped_in_pod + dropped_harness
+    if total_dropped:
         _log.warning(
             "kanban board descendants ignored %d non-conforming card id(s); their workers may still hold dispatcher slots",
-            dropped,
+            total_dropped,
         )
     result = valid
     skipped = payload.get("skipped")

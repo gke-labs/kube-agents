@@ -763,3 +763,73 @@ def test_read_descendants_excludes_attempted_cards_while_walking_grandchildren(t
     assert descendants == ["t_child_2", "t_grandchild_1"]
 
 
+def test_read_descendants_does_not_walk_subtrees_of_keyed_or_predating_cards(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Review finding: a keyed or pre-dating card belongs to another tree or repetition;
+    # neither the card itself nor its fan-out descendants may be walked or archived.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER, idempotency_key TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, status, created_at, idempotency_key) VALUES (?, ?, ?, ?)",
+            [
+                ("t_root", "running", 200, None),
+                ("t_shared_child", "running", 210, "idem-key-abc"),
+                ("t_gc_keyed", "running", 220, None),
+                ("t_old_child", "running", 150, None),
+                ("t_gc_predating", "running", 230, None),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+            [
+                ("t_shared_child", "t_root", 215),
+                ("t_gc_keyed", "t_shared_child", 225),
+                ("t_old_child", "t_root", 216),
+                ("t_gc_predating", "t_old_child", 235),
+            ],
+        )
+
+    with caplog.at_level(logging.WARNING):
+        descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants == []
+    assert any("skipped 2 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+
+
+def test_read_descendants_non_conforming_ids_do_not_exhaust_scan_slots(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Review finding: non-conforming card IDs are dropped in-pod so they do not consume
+    # scan slots in descendants or cause premature false fixpoints.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER)")
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.execute("INSERT INTO tasks (id, status, created_at) VALUES ('t_root', 'running', 100)")
+        for i in range(64):
+            bad_id = f"bad id\n{i}"
+            conn.execute("INSERT INTO tasks (id, status, created_at) VALUES (?, 'in_progress', ?)", (bad_id, 200 + i))
+            conn.execute(
+                "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES (?, 't_root', ?)",
+                (bad_id, 200 + i),
+            )
+        conn.execute("INSERT INTO tasks (id, status, created_at) VALUES ('t_conforming_live', 'running', 500)")
+        conn.execute(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES ('t_conforming_live', 't_root', 500)"
+        )
+
+    with caplog.at_level(logging.WARNING):
+        descendants = board.read_descendants(
+            _descendants_shell_for(tmp_path), ["t_root"], 5.0, max_cards=64
+        )
+    assert descendants == ["t_conforming_live"]
+    assert any("ignored 64 non-conforming card id(s)" in r.message for r in caplog.records)
+
+
+
