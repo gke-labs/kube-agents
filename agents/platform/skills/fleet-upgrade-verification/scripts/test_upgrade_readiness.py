@@ -991,11 +991,20 @@ class WebhookScopeTest(unittest.TestCase):
         graded = grade([hook("cm.example.com", [rule(["configmaps"])], policy="Fail")])
         self.assertEqual([f["version_pinned"] for f in graded["outage"]], [[]])
         self.assertIn("it fails now every request the server sends it", r.describe_webhook_finding(graded["outage"][0]))
-        # A pinned rule beside a served one is a blocker, with nothing pinned.
+        # A pinned rule beside a served one is a blocker on the served rule. The record classes
+        # each rule by what the server serves it whichever bucket the finding is in, so the
+        # pinned rule is pinned there too, not live by the finding's bucket; the cell names the
+        # path write alone and says nothing of the classes.
         graded = grade([hook("mixed.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",)), rule(["pods"])], policy="Fail")])
-        self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [[]])
-        self.assertEqual([f["pinned_rules"] for f in graded["blocking"]], [[]])
-        self.assertIn("matches CREATE pods", r.describe_webhook_finding(graded["blocking"][0]))
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE pods"]])
+        self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [["CREATE certificatesigningrequests"]])
+        self.assertEqual([f["pinned_rules"] for f in graded["blocking"]], [["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]])
+        self.assertEqual([f["live_rules"] for f in graded["blocking"]], [["CREATE pods"]])
+        self.assertEqual([f["unknown_rules"] for f in graded["blocking"]], [[]])
+        cell = r.describe_webhook_finding(graded["blocking"][0])
+        self.assertIn("matches CREATE pods", cell)
+        self.assertNotIn("sends this webhook none of them", cell)
+        self.assertNotIn("v1beta1", cell.split("matches", 1)[1])
         # A rule on `*` alone carries no version suffix; one on `v1` alone carries `at v1`.
         for versions in (("*",), ("v1",)):
             with self.subTest(versions=versions):

@@ -1120,8 +1120,8 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either.
     `outage`: the backend is unreachable but the rules match none of those; the member is not graded on it, with
     what it does match named so the operator can judge it, because the list is what this
-    rule knows of the path, not a proof of safety. Each rule of an outage finding is classed
-    by what the server serves it (`_rule_served_class`): `live_rules` fail their requests now,
+    rule knows of the path, not a proof of safety. Each rule of a finding, blocking or outage, is
+    classed by what the server serves it (`_rule_served_class`): `live_rules` fail their requests now,
     `pinned_rules` (their writes in `version_pinned`, and in `unserved_pairs` any pair they
     spell that the server serves at no version) name graded resources only at a version the
     server does not serve, so it sends them nothing, and `unknown_rules` are at an unserved
@@ -1159,11 +1159,12 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             if reason is None:
                 continue
             matches = upgrade_path_matches(hook) + kube_system_write_matches(hook, namespace_labels)
-            # A blocking webhook is described by the path writes it matches; an outage one by
-            # what the server serves each of its rules.
+            # Every rule is classed by what the server serves it, whichever bucket the finding
+            # lands in: the cell describes a blocking webhook by the path writes it matches and an
+            # outage one by its classes, and the record says of each rule what is true of it.
             live, pinned, unknown = [], [], []
             for rule in _rules(hook):
-                served = RULE_LIVE if matches else _rule_served_class(rule, GRADED_TARGETS)
+                served = _rule_served_class(rule, GRADED_TARGETS)
                 (live if served == RULE_LIVE else pinned if served == RULE_PINNED else unknown).append(rule)
             version_pinned, unserved_pairs = _pinned_labels(pinned, hook, namespace_labels)
             finding = {

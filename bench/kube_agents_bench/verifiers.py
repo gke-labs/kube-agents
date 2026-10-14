@@ -1884,7 +1884,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     a program behind one that is not the script, a shell or
     an interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a
     run; which flags take a value is not tabled, so the word after a bare flag
-    is read as its value (``sudo -n ls <script> --readiness`` is still credited).
+    is read as its value (``sudo -n ls <script> --readiness`` is still credited); and a run
+    made through a script file or a shell's standard input (``bash run.sh``, ``nohup bash
+    /tmp/run.sh &``, ``echo "<command>" | bash``, ``bash -s < run.sh``) is not read
+    as one, since the argv names the file or the shell and not what was written to it, which
+    no reading of the argv recovers -- a case names a run this way where the persona dictates
+    one typed command, and a worker that runs it through a file is not credited.
     Fails closed
     like its siblings -- a run with no captured worker commands is
     ``status="error"``, not a pass.

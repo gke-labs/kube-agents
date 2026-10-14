@@ -206,7 +206,10 @@ verification_spec:
   # commands inside a command substitution, a process substitution or a backtick pair are read as
   # commands of their own, as the shell runs them; a run spelled through a variable holding the
   # whole path is not read, since no expansion is resolved and the Delegation bullet dictates the
-  # path in full; a quoted `>` or `;` is text, not an operator; a usage call
+  # path in full; a run made through a script file or a shell's standard input (`bash run.sh`,
+  # `printf … | bash`, `bash -s < run.sh`) is not read either, since the argv names the file or
+  # the shell and not what was written to it, and the bullet dictates one typed command; a
+  # quoted `>` or `;` is text, not an operator; a usage call
   # prints the help and runs nothing. The route is read both ways: the run must be there, and
   # the hand survey the bullet forbids must not be, since on an install that declares a scope
   # the dictated command without the `fleet_scope` call exits 2 and a worker that then surveys

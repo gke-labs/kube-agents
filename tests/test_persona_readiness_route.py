@@ -49,15 +49,36 @@ OUTPUT_FLAG = "--output"
 # timestamp alone is second-resolution and two cards started in one second would share the name.
 PER_RUN_NAME_MARKS = ("$(date +%s)", "$$")
 BULLET_MARKER = "- "
+# A line that ends in this continues on the next, which bash joins before it reads the words.
+LINE_CONTINUATION = "\\"
+
+
+def _folded_lines(lines: list[str], first_number: int):
+    """(line number, line) for ``lines``, numbered from ``first_number``, with a line that ends
+    in a backslash folded into the next, as bash removes a line continuation before it reads the
+    words; a folded line keeps the number it opens on."""
+    held, held_number = None, first_number
+    for offset, line in enumerate(lines):
+        if held is None:
+            held, held_number = line, first_number + offset
+        else:
+            held += line
+        if held.endswith(LINE_CONTINUATION):
+            held = held[: -len(LINE_CONTINUATION)]
+            continue
+        yield held_number, held
+        held = None
+    if held is not None:
+        yield held_number, held
 
 
 def _fenced_lines(text: str):
     """(line number, line) for every line inside a fenced code block of ``text``, the other
-    form a persona file uses for a command to type."""
+    form a persona file uses for a command to type; a line continued with a backslash is read
+    whole, as bash reads it."""
     for token in MarkdownIt("commonmark").parse(text):
         if token.type == "fence":
-            for offset, line in enumerate(token.content.splitlines()):
-                yield token.map[0] + 2 + offset, line
+            yield from _folded_lines(token.content.splitlines(), token.map[0] + 2)
 
 
 def _dictates_the_run(text: str) -> bool:
@@ -66,8 +87,9 @@ def _dictates_the_run(text: str) -> bool:
 
 def _dictated_runs(text: str) -> list[tuple[int, str]]:
     """The commands in ``text`` that dictate the readiness run, each with the line it opens on:
-    the script and its mode flag inside one inline code span, or on one line of a fenced block,
-    the two forms the persona writes a command to type in. Read with the Markdown parser the
+    the script and its mode flag inside one inline code span, or on one line of a fenced block
+    (a line continued with a backslash read whole), the two forms the persona writes a command
+    to type in. Read with the Markdown parser the
     skill tests use (``test_skill_inline_commands.inline_code``), so a span written with double
     backticks or wrapped onto a second line is one span, as a reader sees it."""
     runs = [(line, span) for line, span in inline_code(text) if _dictates_the_run(span)]
@@ -112,15 +134,22 @@ class ReadinessRouteCarriesTheScopeTest(unittest.TestCase):
 
     def test_the_reader_sees_a_double_backtick_a_wrapped_span_and_a_fenced_line(self):
         # The guard above holds only if a dictated run reaches it however it is spelled: a
-        # double-backtick span, a span wrapped onto the next line and a line of a fenced block
-        # are each one dictated run, at its own line.
+        # double-backtick span, a span wrapped onto the next line, a line of a fenced block and a
+        # fenced line continued with a backslash, as bash is usually typed, are each one dictated
+        # run, at the line it opens on.
         text = (
             f"- Lead: run ``python3 x/{REPORT_SCRIPT} {READINESS_FLAG}`` now.\n"
             f"- Lead: run `python3 x/{REPORT_SCRIPT}\n  {READINESS_FLAG}` now, and `{REPORT_SCRIPT}` alone.\n"
             f"\n```bash\necho first\npython3 x/{REPORT_SCRIPT} {READINESS_FLAG} --output r.json\n```\n"
+            f"\n```bash\npython3 x/{REPORT_SCRIPT} {LINE_CONTINUATION}\n  {READINESS_FLAG} --output r.json\n```\n"
         )
         self.assertEqual(
-            [(1, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG}"), (2, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG}"), (7, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG} --output r.json")],
+            [
+                (1, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG}"),
+                (2, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG}"),
+                (7, f"python3 x/{REPORT_SCRIPT} {READINESS_FLAG} --output r.json"),
+                (11, f"python3 x/{REPORT_SCRIPT}   {READINESS_FLAG} --output r.json"),
+            ],
             _dictated_runs(text),
         )
 
@@ -131,13 +160,19 @@ class ReadinessRouteCarriesTheScopeTest(unittest.TestCase):
         for path in PERSONA_FILES:
             text = path.read_text(encoding="utf-8")
             yielded = {line for line, _ in _dictated_runs(text)}
-            for number, line in enumerate(text.splitlines(), 1):
+            for number, line in _folded_lines(text.splitlines(), 1):
                 if _dictates_the_run(line):
                     with self.subTest(file=path.name, line=number):
                         self.assertIn(number, yielded, f"{path.name}:{number} names the run outside a span the reader yields: {line.strip()[:80]}")
         split = f"- Lead: run `{REPORT_SCRIPT}` with `{READINESS_FLAG}`.\n"
         self.assertEqual([], _dictated_runs(split))
         self.assertTrue(_dictates_the_run(split))
+        # A fenced dictation continued with a backslash names the run on no single raw line; the
+        # backstop reads the folded line, at the number the reader yields it under.
+        continued = f"```bash\npython3 x/{REPORT_SCRIPT} {LINE_CONTINUATION}\n  {READINESS_FLAG}\n```\n"
+        self.assertEqual([], [number for number, line in enumerate(continued.splitlines(), 1) if _dictates_the_run(line)])
+        self.assertEqual([2], [number for number, line in _folded_lines(continued.splitlines(), 1) if _dictates_the_run(line)])
+        self.assertEqual([2], [number for number, _ in _dictated_runs(continued)])
 
     def test_the_output_path_is_this_runs_own(self):
         # /opt/data/scratch is shared by every card, so a fixed --output name is two cards writing
