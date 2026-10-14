@@ -131,7 +131,7 @@ def create_minimal_tools_bin(temp_dir_path, exclude=()):
     essential_tools = [
         "bash", "sh", "git", "tr", "cut", "sed", "awk", "grep",
         "cat", "dirname", "basename", "echo", "mkdir", "rm", "cp", "mv",
-        "chmod", "date", "sort",
+        "chmod", "date", "sort", "tee",
         "mktemp", "touch", "ls", "head", "tail", "find", "tar", "gzip",
         "sha256sum", "shasum", "zip"
     ]

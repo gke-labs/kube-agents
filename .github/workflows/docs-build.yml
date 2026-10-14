@@ -33,6 +33,11 @@ jobs:
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          # No token: on a pull request the action then diffs with git instead
+          # of paging the file list through the GitHub API with no retry. The
+          # rule: .agents/rules/github_actions.md, "Detect changed files with
+          # git, not the API".
+          token: ""
           filters: |
             docs:
               - "docs/site/**"
