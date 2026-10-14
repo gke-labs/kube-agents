@@ -258,6 +258,8 @@ function normalizeHealth(raw) {
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
+      lease_failures: count(pool.lease_failures),
+      lease_failures_hours: count(pool.lease_failures_hours),
     } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
@@ -288,8 +290,9 @@ function poolSentence(h) {
     return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
   }
   if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
-  // What tripped the verdict, which is a single day's row or the live queue --
-  // never the seven-day window, which one bad day leaves inside its own limit.
+  // What tripped the verdict: a single day's row, the live queue or a refused
+  // acquire -- never the seven-day window, which one bad day leaves inside
+  // its own limit.
   // The backlog's start while there is one, the episode's otherwise: the
   // verdict spans a week, so the episode can have opened days before the jam
   // the present tense below is describing.
@@ -311,6 +314,12 @@ function poolSentence(h) {
   if (p.over_threshold && p.threshold_p95_s != null) {
     found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
   }
+  // The third trigger, as post_health.pool_numbers lists it: a breach can
+  // rest on refusals alone, with nothing queued and no stretch to quote.
+  if (p.lease_failures) {
+    const window = p.lease_failures_hours ? ` in the last ${p.lease_failures_hours}h` : "";
+    found.push(`${p.lease_failures} run${p.lease_failures === 1 ? "" : "s"} refused a project${window}`);
+  }
   if (!found.length) return "";
   // health.pool_note's waiting_now. The verdict lasts a week, so most renders
   // of an episode find the queue already drained, and "are waiting" then sends
@@ -319,7 +328,12 @@ function poolSentence(h) {
   const live = p.waiting_now;
   // False is "nothing has waited past the limit", not "the queue is empty".
   const cleared = live === false ? " No backlog right now." : "";
-  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
+  // A queued run starts late and passes; a refused run died at the acquire,
+  // so the tail says which, as post_health.render_pool does.
+  const tail = p.lease_failures
+    ? "A refused run did not start; retest once the pool has room."
+    : "Runs still pass; /retest makes the queue longer.";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} ${tail}`;
 }
 
 /* ---- URL contract ---- */

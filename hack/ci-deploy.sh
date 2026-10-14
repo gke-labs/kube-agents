@@ -1572,10 +1572,11 @@ fi
 # reds as an agent triage failure with nothing in this log saying the install
 # was wrong -- which is what this gate is for.
 #
-# Deliberately not a check that records are arriving. A project onboarded
-# before the ingress existed reaches the marker and then fails its pulls, and
-# failing the deploy for that would red the whole matrix over a gap only a
-# drift case cares about (docs/ci-pool-projects.md).
+# Deliberately not a check that records are arriving. A project without the
+# ingress reaches the marker and then fails its pulls, and failing the deploy
+# for that would red the whole matrix over a gap only a drift case cares
+# about. Section 3 of docs/ci-pool-projects.md says which projects those are;
+# it is not every older one, and the set is not re-checked between leases.
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying drift-detector startup ==="
 drift_detector_started=false
 # `grep -F ... >/dev/null` rather than `grep -qF`, and the difference is the

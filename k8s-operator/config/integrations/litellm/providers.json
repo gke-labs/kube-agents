@@ -60,7 +60,7 @@
       "id": "anthropic",
       "label": "Anthropic API",
       "defaultModel": "claude-opus-5",
-      "overlay": "base",
+      "overlay": "anthropic",
       "authentication": {
         "type": "api_key",
         "environmentVariable": "ANTHROPIC_API_KEY",

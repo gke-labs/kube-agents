@@ -1,0 +1,58 @@
+{
+  "name": "plan-window-last-six-steps",
+  "source": "agents/platform/scripts/test_slack_status.py::TaskCardTest.test_only_the_last_steps_are_kept",
+  "notes": "The emitter keeps the last 6 steps; stepCount still counts all 10. Steps are the card's notes, unmarked: the renderer draws today's ✓ and ◌ from the item's status (the last step of an in_progress item is the open one).",
+  "input": {
+    "title": null,
+    "rows": [
+      {
+        "task_id": "t_a",
+        "title": "x",
+        "lines": [
+          "n0",
+          "n1",
+          "n2",
+          "n3",
+          "n4",
+          "n5",
+          "n6",
+          "n7",
+          "n8",
+          "n9"
+        ],
+        "status": "in_progress",
+        "note": "n9",
+        "steps": 10
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "x",
+          "items": [
+            {
+              "id": "t_a",
+              "title": "n9 · step 10 ▸",
+              "status": "in_progress",
+              "steps": [
+                "n4",
+                "n5",
+                "n6",
+                "n7",
+                "n8",
+                "n9"
+              ],
+              "stepCount": 10,
+              "note": "n9"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}

@@ -3052,6 +3052,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// Unconditional and in both modes, unlike the chat relay URLs: the remote
+	// MCP servers are in every profile that runs here, and mcp-remote presents
+	// the token above to reach them. A plugin cannot redirect it; the operator
+	// always emits the name.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  mcpRelayURLEnvVar,
+		Value: mcpRelayURL(agent),
+	})
 	// The A2A bus, under `next` only: the address, and the name this container
 	// authenticates as. There is no password here since A5. The credential is
 	// the projected ServiceAccount token mounted below, the callout resolves it
