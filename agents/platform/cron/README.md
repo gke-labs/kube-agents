@@ -221,7 +221,9 @@ It runs the skill the way `stall-watch` runs `stall_report.py`: every module
 under the skill's `scripts/` except its tests, with the data files beside them,
 is read from the agent image's `/opt/platform-template/skills/` copy and handed
 to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
-serving the shipped set) before running `fleet_upgrade_report.main`. The
+serving the shipped set, the agent image's `fleet_scope_args` among them so the
+script formats a refusal with the constants the job parses it by) before
+running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
