@@ -399,7 +399,6 @@ def has_table(conn, name):
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     has_children = has_table(conn, "kanban_worker_children")
-    has_tasks = has_table(conn, "tasks")
     queue = list(roots)
     seen = set(roots)
     descendants = []
@@ -420,15 +419,10 @@ try:
             if child not in seen:
                 seen.add(child)
                 queue.append(child)
-                status = None
-                if has_tasks:
-                    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
-                    if row is None:
-                        continue
-                    if row[0] is not None:
-                        status = str(row[0])
-                else:
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
+                if row is None:
                     continue
+                status = str(row[0]) if row[0] is not None else None
                 if status not in TERMINAL_STATUSES:
                     if len(descendants) < MAX_CARDS:
                         descendants.append(child)

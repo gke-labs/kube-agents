@@ -511,6 +511,21 @@ def test_read_descendants_handles_missing_tables(tmp_path: Path) -> None:
     assert descendants == []
 
 
+def test_read_descendants_fails_to_none_when_tasks_table_is_missing(tmp_path: Path) -> None:
+    # When tasks table is missing from a SQLite database with children,
+    # read_descendants fails honestly to None rather than returning an empty list.
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO kanban_worker_children (child_id, creator_id, created_at) VALUES ('t_child', 't_root', 100)"
+        )
+
+    descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
+    assert descendants is None
+
+
 def test_read_descendants_truncates_and_warns(tmp_path: Path, caplog) -> None:
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
