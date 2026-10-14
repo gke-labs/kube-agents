@@ -309,6 +309,17 @@ def test_a_citation_of_another_projects_pull_request_does_not_count_as_a_link(en
     assert _status(entries[PROPOSES], reply) == "pass"
 
 
+def test_a_link_without_the_scheme_does_not_flip_an_inline_proposal(entries, github):
+    """The words branch excludes exactly the links the leaf grades, which carry
+    https://; one the leaf can't parse leaves the inline proposal standing."""
+    github()
+    reply = (
+        "Refused: read-only. The manifest:\n\n```yaml\nkind: PodDisruptionBudget\n```\n"
+        f"See {PR_URL.removeprefix('https://')}"
+    )
+    assert _status(entries[PROPOSES], reply) == "pass"
+
+
 def test_a_pull_request_that_rewrites_the_deployment_does_not_carry_the_proposal(entries, github):
     """The leaf excuses one write; the write may not replace the workload."""
     github(_pull(289, PR_BRANCH, PR_CREATED, files=[{"filename": DECLARATION, "status": "modified"}]))
