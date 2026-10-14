@@ -4862,24 +4862,34 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
 class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
     """The installer refuses a next switch whose SLACK_HOME_CHANNEL the A2A
     gateway would not arm on (#2812). Its regex copies the gateway's
-    slackIsHomeChannelID; this keeps the copy from drifting (docs/README.md
-    lists the rule's three homes)."""
+    slackIsHomeChannelID and the operator's a2aSlackHomeChannel; this keeps
+    the copy from drifting in either direction (docs/README.md lists the
+    rule's three homes)."""
 
-    def test_the_regex_is_the_gateways_rule(self):
+    def _rule(self, path, func, var, min_const):
+        """The (prefix letters, minimum length) a Go copy of the rule holds,
+        read out of its source, with the alphabet of the rest pinned as
+        both copies spell it."""
+        go = (_REPO_ROOT / path).read_text()
+        min_len = re.search(rf"^\s*{min_const}\s*=\s*(\d+)\s*$", go, re.MULTILINE)
+        self.assertIsNotNone(min_len, f"{min_const} not found in {path}")
+        body = re.search(rf"func {func}\(.*?\n\}}\n", go, re.DOTALL)
+        self.assertIsNotNone(body, f"{func} not found in {path}")
+        letters = sorted(set(re.findall(rf"{re.escape(var)}\[0\] != '([A-Z])'", body.group(0))))
+        self.assertTrue(letters, f"no prefix letters read from {func}")
+        self.assertIn("(r < 'A' || r > 'Z') && (r < '0' || r > '9')", body.group(0))
+        return "".join(letters), int(min_len.group(1))
+
+    def test_the_regex_is_the_gateways_rule_and_the_operators(self):
         shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
         regex = re.search(r"^readonly SLACK_HOME_CHANNEL_ID_RE='([^']+)'$", shell, re.MULTILINE)
         self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
-        go = (_REPO_ROOT / "a2a/gateway/slack.go").read_text()
-        min_len = re.search(r"^\s*slackMinChannelIDLen\s*=\s*(\d+)\s*$", go, re.MULTILINE)
-        self.assertIsNotNone(min_len, "slackMinChannelIDLen not found in a2a/gateway/slack.go")
-        body = re.search(r"func slackIsHomeChannelID\(id string\) bool \{\n(.*?)\n\}", go, re.DOTALL)
-        self.assertIsNotNone(body, "slackIsHomeChannelID not found in a2a/gateway/slack.go")
-        # The rule's two other parts, as the gateway spells them: the
-        # prefix letters, and the alphabet of the rest.
-        self.assertIn("id[0] != 'C' && id[0] != 'G'", body.group(1))
-        self.assertIn("(r < 'A' || r > 'Z') && (r < '0' || r > '9')", body.group(1))
-        self.assertEqual(regex.group(1), f"^[CG][A-Z0-9]{{{int(min_len.group(1)) - 1},}}$")
-
+        gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
+        operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+        self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
+        letters, min_len = gateway
+        self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
 
 if __name__ == "__main__":
     unittest.main()

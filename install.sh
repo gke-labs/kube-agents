@@ -5403,8 +5403,8 @@ run_menu_system() {
         # removes the tfvars that render the refused settings.
         if ! refuse_next_slack_gateway_settings_from_env; then
           if [ -n "$install_env_before" ]; then
-            # Into the existing file, which keeps its 0600.
-            # Moved into place complete, as save_env_var writes it (on_error
+            # A 0600 replacement (the .tmp is written under umask 077),
+            # moved into place complete, as save_env_var writes it (on_error
             # removes a half-written .tmp), before the copy is let go.
             (umask 077; cat "$install_env_before" >"${INSTALL_ENV_FILE}.tmp")
             mv -f "${INSTALL_ENV_FILE}.tmp" "$INSTALL_ENV_FILE"
