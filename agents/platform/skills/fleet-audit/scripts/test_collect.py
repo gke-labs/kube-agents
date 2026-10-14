@@ -12512,14 +12512,16 @@ class PrepareKubeconfigTest(unittest.TestCase):
             kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
             kc.parent.mkdir()
             kc.parent.chmod(0o755)
-            with patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+            # The directory's owner is the test's own fact, this run's euid on the path and on the
+            # opened descriptor alike, so the keep is the branch taken whoever runs the suite.
+            with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(collect.prepare_kubeconfig(kc))
             self.assertEqual(self.mode(kc.parent), 0o755)
             self.assertIn(collect.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kc.parent, mode="0o755", wanted=oct(collect.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
             for mode in (0o777, 0o555):
                 with self.subTest(mode=oct(mode)):
                     kc.parent.chmod(mode)
-                    with patch.object(os, "fchmod", side_effect=refused):
+                    with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
                         note = collect.prepare_kubeconfig(kc)
                     self.assertEqual(note, f"{kc.parent} is at mode {oct(mode)}, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
             kc.parent.chmod(0o755)
@@ -12650,10 +12652,12 @@ class PrepareKubeconfigTest(unittest.TestCase):
             self.assertIsNone(collect.prepare_kubeconfig(kc))
             kc.write_text("stale")
             kc.chmod(0o400)
+            # The keep follows `os.access`, which root alone answers true for a 0400 file: stated as
+            # that answer rather than as the runner's uid, so a mocked euid does not decide it.
+            kept = os.access(kc, os.W_OK)
             with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
                 path, _ = collect.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
-            # Root can write any file and keeps it; any other uid replaces it.
-            self.assertEqual((path, kc.exists()), (kc, os.geteuid() == 0))
+            self.assertEqual((path, kc.exists()), (kc, kept))
 
 
 def run_of(rc: int, stdout: str = "", stderr: str = "") -> collect.Run:

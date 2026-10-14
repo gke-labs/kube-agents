@@ -3540,13 +3540,15 @@ class PrepareKubeconfigTest(unittest.TestCase):
             kc.parent.mkdir(0o755)
             kc.write_text("stale")
             kc.chmod(0o400)
+            # The keep follows `os.access`, true for a 0400 file to root alone, not the runner's uid.
+            kept = os.access(kc, os.W_OK)
             mask = os.umask(0o077)
             try:
                 with patch.object(fs, "KUBECONFIG_DIR", kc.parent):
                     path, _ = fs.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
             finally:
                 os.umask(mask)
-            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o1777, os.geteuid() == 0))
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o1777, kept))
 
     def test_a_root_run_keeps_another_uids_directory(self):
         # The tick's directory, then a root hand run: from root's side it is another uid's, and root

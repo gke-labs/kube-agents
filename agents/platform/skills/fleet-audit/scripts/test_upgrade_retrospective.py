@@ -2294,7 +2294,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         denied = PermissionError(errno.EACCES, "Permission denied", str(self.home / "reports" / ".r.md.tmp"))
         (self.home / "reports").mkdir()
         uid = self.home.stat().st_uid
-        self.assertEqual(ur.store_denied_line(denied), ur.STORE_DENIED_FORMAT.format(path=denied.filename, error="Permission denied", note=""))
+        # This uid's own store names no owner: the run's uid is the store's owner as the test's own
+        # fact, so the line does not depend on who runs the suite.
+        with mock.patch.object(os, "geteuid", return_value=uid):
+            self.assertEqual(ur.store_denied_line(denied), ur.STORE_DENIED_FORMAT.format(path=denied.filename, error="Permission denied", note=""))
         with mock.patch.object(os, "geteuid", return_value=uid + 1):
             self.assertEqual(ur.store_denied_line(denied), ur.STORE_DENIED_FORMAT.format(path=denied.filename, error="Permission denied", note=ur.STORE_OWNER_NOTE_FORMAT.format(where=self.home / "reports", owner=uid, uid=uid + 1)))
         tail = ur.EXIT_PROJECTS_FORMAT.format(projects=PROJECT, note="")

@@ -1083,13 +1083,16 @@ class PrepareKubeconfigTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 f.write("stale")
             os.chmod(path, 0o400)
+            # The keep follows `os.access`, which root alone answers true for a 0400 file: stated as
+            # that answer rather than as the runner's uid, so a mocked euid does not decide it.
+            kept = os.access(path, os.W_OK)
             mask = os.umask(0o077)
             try:
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
             finally:
                 os.umask(mask)
             self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
-            self.assertEqual(os.path.exists(path), os.geteuid() == 0)
+            self.assertEqual(os.path.exists(path), kept)
             with open(path, "w", encoding="utf-8") as f:
                 f.write("root's")
             with patch.object(os, "geteuid", return_value=os.stat(shared).st_uid + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
@@ -1205,14 +1208,15 @@ class PrepareKubeconfigTest(unittest.TestCase):
             os.mkdir(shared)
             os.chmod(shared, 0o755)
             path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
-            with patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+            # The owner is the test's own fact, this run's euid on the path and on the descriptor.
+            with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
                 self.assertIsNone(report.prepare_kubeconfig(shared, path))
             self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o755)
             self.assertIn(report.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=shared, mode="0o755", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
             for mode in (0o777, 0o555):
                 with self.subTest(mode=oct(mode)):
                     os.chmod(shared, mode)
-                    with patch.object(os, "fchmod", side_effect=refused):
+                    with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
                         note = report.prepare_kubeconfig(shared, path)
                     self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode=oct(mode), wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
             os.chmod(shared, 0o755)
