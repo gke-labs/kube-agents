@@ -604,11 +604,12 @@ def test_read_descendants_returns_none_on_error_or_missing_sentinel(tmp_path: Pa
     assert board.read_descendants(lambda script, timeout: "", [], 5.0) == []
 
 
-def test_read_descendants_skips_card_predating_root_creation(
+def test_read_descendants_does_not_skip_unkeyed_card_with_earlier_timestamp(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Review finding: a card reached through an idempotent re-create whose creation
-    # predates the root card's own creation must not be archived when the root stalls.
+    # Review finding: a non-keyed card whose created_at is earlier than the root card's
+    # (e.g. due to wall-clock / NTP backward steps) belongs to this worker and must not
+    # be skipped; only keyed cards (shared across repetitions) are skipped.
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER)")
         conn.execute(
@@ -632,8 +633,9 @@ def test_read_descendants_skips_card_predating_root_creation(
 
     with caplog.at_level(logging.WARNING):
         descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
-    assert descendants == ["t_valid_child"]
-    assert any("skipped 1 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+    assert descendants is not None
+    assert sorted(descendants) == ["t_old_card", "t_valid_child"]
+    assert not any("skipped" in r.message for r in caplog.records)
 
 
 def test_read_descendants_skips_card_with_idempotency_key(
@@ -668,6 +670,7 @@ def test_read_descendants_skips_card_with_idempotency_key(
         descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == ["t_private_child"]
     assert any("skipped 1 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+    assert any("and did not walk their subtrees" in r.message for r in caplog.records)
 
 
 def test_read_descendants_skips_terminal_keyed_card_without_warning(
@@ -763,10 +766,10 @@ def test_read_descendants_excludes_attempted_cards_while_walking_grandchildren(t
     assert descendants == ["t_child_2", "t_grandchild_1"]
 
 
-def test_read_descendants_does_not_walk_subtrees_of_keyed_or_predating_cards(
+def test_read_descendants_does_not_walk_subtrees_of_keyed_cards(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Review finding: a keyed or pre-dating card belongs to another tree or repetition;
+    # Review finding: a keyed card belongs to another tree or repetition;
     # neither the card itself nor its fan-out descendants may be walked or archived.
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute(
@@ -781,8 +784,8 @@ def test_read_descendants_does_not_walk_subtrees_of_keyed_or_predating_cards(
                 ("t_root", "running", 200, None),
                 ("t_shared_child", "running", 210, "idem-key-abc"),
                 ("t_gc_keyed", "running", 220, None),
-                ("t_old_child", "running", 150, None),
-                ("t_gc_predating", "running", 230, None),
+                ("t_shared_child_2", "running", 215, "idem-key-def"),
+                ("t_gc_keyed_2", "running", 230, None),
             ],
         )
         conn.executemany(
@@ -790,8 +793,8 @@ def test_read_descendants_does_not_walk_subtrees_of_keyed_or_predating_cards(
             [
                 ("t_shared_child", "t_root", 215),
                 ("t_gc_keyed", "t_shared_child", 225),
-                ("t_old_child", "t_root", 216),
-                ("t_gc_predating", "t_old_child", 235),
+                ("t_shared_child_2", "t_root", 216),
+                ("t_gc_keyed_2", "t_shared_child_2", 235),
             ],
         )
 
@@ -799,6 +802,7 @@ def test_read_descendants_does_not_walk_subtrees_of_keyed_or_predating_cards(
         descendants = board.read_descendants(_descendants_shell_for(tmp_path), ["t_root"], 5.0)
     assert descendants == []
     assert any("skipped 2 keyed or pre-dating live child card(s)" in r.message for r in caplog.records)
+    assert any("and did not walk their subtrees" in r.message for r in caplog.records)
 
 
 def test_read_descendants_non_conforming_ids_do_not_exhaust_scan_slots(

@@ -409,23 +409,9 @@ try:
     conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
     has_children = has_table(conn, "kanban_worker_children")
     task_cols = columns(conn, "tasks")
-    has_created_at = "created_at" in task_cols
     has_idempotency_key = "idempotency_key" in task_cols
 
-    min_root_created_at = None
-    if has_created_at and roots:
-        placeholders = ",".join("?" for _ in roots)
-        root_rows = conn.execute(
-            "SELECT created_at FROM tasks WHERE id IN (%s)" % placeholders,
-            tuple(roots),
-        ).fetchall()
-        times = [r[0] for r in root_rows if r[0] is not None]
-        if times:
-            min_root_created_at = min(times)
-
     query_cols = ["status"]
-    if has_created_at:
-        query_cols.append("created_at")
     if has_idempotency_key:
         query_cols.append("idempotency_key")
     task_query = "SELECT " + ", ".join(query_cols) + " FROM tasks WHERE id = ?"
@@ -460,23 +446,10 @@ try:
                 queue.append(child)
                 continue
             status = str(row[0]) if row[0] is not None else None
-            col_idx = 1
-            child_created_at = None
-            if has_created_at:
-                child_created_at = row[col_idx]
-                col_idx += 1
-            child_idem_key = None
-            if has_idempotency_key:
-                child_idem_key = row[col_idx]
-                col_idx += 1
+            child_idem_key = row[1] if has_idempotency_key else None
 
-            is_predating = (
-                min_root_created_at is not None
-                and child_created_at is not None
-                and child_created_at < min_root_created_at
-            )
             is_keyed = bool(child_idem_key)
-            if is_predating or is_keyed:
+            if is_keyed:
                 if status not in TERMINAL_STATUSES:
                     skipped += 1
                 continue
@@ -539,9 +512,8 @@ def read_descendants(
     Walks ``kanban_worker_children`` (fanned-out children created by workers)
     recursively, skipping cards that are already settled (statuses in
     :data:`TERMINAL_STATUSES`), no longer exist on the board (missing
-    ``tasks`` row), predate the root card's creation, or carry an
-    ``idempotency_key`` (idempotent cards that may be shared across parallel
-    repetition runs). When a card is keyed or predates the root, its entire
+    ``tasks`` row), or carry an ``idempotency_key`` (idempotent cards that may
+    be shared across parallel repetition runs). When a card is keyed, its entire
     subtree is omitted from traversal so parallel runs are protected from
     having their children archived. Cards in ``exclude`` (e.g. already-attempted
     cards from earlier rounds) are traversed to find deeper descendants but
@@ -597,7 +569,7 @@ def read_descendants(
     skipped = payload.get("skipped")
     if isinstance(skipped, int) and skipped > 0:
         _log.warning(
-            "kanban board descendants skipped %d keyed or pre-dating live child card(s); their workers may still hold dispatcher slots",
+            "kanban board descendants skipped %d keyed or pre-dating live child card(s) and did not walk their subtrees; those workers, and any they fanned out, may still hold dispatcher slots",
             skipped,
         )
     if payload.get("truncated"):
