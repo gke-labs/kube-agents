@@ -166,6 +166,9 @@ readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
 readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=7200
 readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
+# pause_scheduled_audits: how long the one exec that pauses the clock-started audits
+# may take. Each pause is a `hermes cron pause`, a few seconds apiece.
+readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -1442,6 +1445,41 @@ wait_platform_runs() { # <label> <space-separated audit ids>
   return 0
 }
 
+# The Platform Agent's clock-started audits, paused once per lease before any unit
+# runs (#3020). hack/ci_pause_scheduled_audits.py does it in the gateway with Hermes'
+# own `cron pause`, and its header owns which jobs and why the pause outlives a
+# gateway restart. A pause that fails is a warning: the run goes on as it did before
+# this existed, with the audits on their clock. Pinned to AGENT_CLUSTER_CONTEXT and
+# refused for a context that does not name PROJECT_ID, as wait_platform_runs is.
+# Returns 0 whatever happens.
+pause_scheduled_audits() { # <label>
+  local label="$1" ns ctx out rc=0
+  ns="${TARGET_NAMESPACE:-}"
+  ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || ! command -v kubectl >/dev/null 2>&1; then
+    echo "WARNING: Scheduled audits (${label}): not paused, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing; they run on their clock" >&2
+    return 0
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) ;;
+    *)
+      echo "WARNING: Scheduled audits (${label}): not paused, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
+      return 0 ;;
+  esac
+  local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" \
+    < "${SCRIPT_DIR}/ci_pause_scheduled_audits.py" 2>&1)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo "Scheduled audits (${label}): ${out}"
+  else
+    echo "WARNING: Scheduled audits (${label}): exited ${rc}: ${out}; any audit not named as paused runs on its clock" >&2
+  fi
+  return 0
+}
+
 if [ "${EVAL_FORGE}" = "gitlab" ]; then
   EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 else
@@ -1449,6 +1487,7 @@ else
 fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
+pause_scheduled_audits "lease"
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"

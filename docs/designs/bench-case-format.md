@@ -125,6 +125,12 @@ unit on the stream, which waits for it first (`wait_platform_runs`), so an audit
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
 
+The runner pauses the Platform Agent's clock-started audits once per lease, before any unit
+(`pause_scheduled_audits`, #3020), so a scheduled run can't write to the GitOps repository in
+the middle of an eval and be charged to whichever cases are running. It leaves the four the
+`oobe` stage starts, the `no_agent` jobs, and any job the image doesn't ship. An audit case
+starts its own run from its prompt, which a paused schedule doesn't affect.
+
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
 
