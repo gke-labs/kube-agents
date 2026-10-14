@@ -1480,6 +1480,15 @@ func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
 	}
+	// The artifact goes out only once the state edit has been tried and
+	// failed. Published together, the two could reach the relay as one batch,
+	// whose one coalesced edit is the failed one, leaving nothing to retry on:
+	// the test then timed out on about three runs in ten.
+	waitFor(t, "the state edit to fail", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return r.adapter.failEdits == 0
+	})
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "step"}}}); err != nil {
 		t.Fatal(err)
 	}
