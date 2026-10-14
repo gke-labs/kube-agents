@@ -1012,7 +1012,8 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     partway through a long run, or to send something other than your final answer.
 
     Having called it, return exactly `[SILENT]` so the same finding is not also
-    delivered as the run's result. What you pass is posted as written, so write
+    delivered as the run's result. What you pass is posted as written (on Slack a
+    fleet-audit report is shown as a headline linking its ledger issue), so write
     `report` as the finished message for a human reader, not as notes to yourself.
 
     Prefer this over send_notification for scheduled work: send_notification posts
@@ -1102,7 +1103,7 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
         )
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {session}). "
-        "It is posted as written; do not also call send_notification for this report."
+        "It is posted to chat; do not also call send_notification for this report."
     )
 
 

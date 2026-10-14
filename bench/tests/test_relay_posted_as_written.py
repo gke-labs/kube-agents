@@ -83,6 +83,7 @@ class Install:
 
 @pytest.fixture
 def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Install:
+    monkeypatch.delenv("SESSION_KV_DB_PATH", raising=False)
     return Install(tmp_path, monkeypatch)
 
 
@@ -142,6 +143,27 @@ def test_a_delivered_send_with_no_thread_is_an_error_not_a_fail(install: Install
 
     assert status == "error"
     assert "registered no thread" in reason
+
+
+def test_the_containers_store_path_wins(install: Install, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The server and the probe read SESSION_KV_DB_PATH; the read does too."""
+    install.posted()
+    install.stored(REPORT)
+    monkeypatch.setenv("SESSION_KV_DB_PATH", str(install.kv_db))
+    monkeypatch.setattr(relay, "SESSION_KV_DB", str(tmp_path / "not-the-store.db"))
+
+    assert relay.verdict(install.read())[0] == "pass"
+
+
+def test_a_store_the_read_cannot_find_is_an_error(install: Install, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    install.posted()
+    monkeypatch.delenv("SESSION_KV_DB_PATH", raising=False)
+    monkeypatch.setattr(relay, "SESSION_KV_DB", str(tmp_path / "missing.db"))
+
+    status, reason = relay.verdict(install.read())
+
+    assert status == "error"
+    assert "not where the read looked" in reason
 
 
 def test_a_post_from_before_this_run_is_not_read(install: Install) -> None:

@@ -3557,18 +3557,20 @@ class TestSlackAuditHeadline(unittest.TestCase):
         )
 
     def test_flag_on_the_truncation_notice_is_not_the_reports_line(self):
-        # The cut takes the report's tail, ledger link and all: the post leads
-        # with the notice once and is not built into a headline from it.
+        # An over-cap report whose kept head ends on its ledger line: the notice
+        # leads the channel message once, and the headline is built from the
+        # report's line, not from the notice.
         os.environ["KAGE_SLACK_UX"] = "1"
-        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 40):
-            response, calls = self._post()
+        over = self.COMPOSED + "\n\n" + "x" * 50
+        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", len(self.COMPOSED)):
+            response, calls = self._post(composed=over)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(len(calls), 1)
         posted = calls[0].args[1]
         self.assertTrue(posted.startswith("[truncated]"), posted[:40])
         self.assertEqual(posted.count("[truncated]"), 1)
-        self.assertNotIn(self.HEADLINE, posted)
-        self.assertIn(self.COMPOSED[:40].rstrip(), posted)
+        headline = posted.split("\n\n", 1)[1].splitlines()
+        self.assertEqual(headline[0], self.HEADLINE)
 
     def test_flag_on_a_ledger_that_does_not_parse_falls_back(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -3811,13 +3813,17 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
 
     def test_a_truncated_report_posts_no_blocks_and_keeps_its_notice(self):
-        # Blocks have no place for the notice, so the relay being there changes nothing.
+        # Blocks have no place for the notice, so the relay being there changes
+        # nothing. The kept head ends on the ledger line, so a headline is built
+        # and the notice is what keeps it off Block Kit.
         self._blocks_on()
-        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 40):
-            response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        over = self.COMPOSED + "\n\n" + "x" * 50
+        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", len(self.COMPOSED)):
+            response, calls = self._post(composed=over, blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(self.posts, [])
         self.assertTrue(calls[0].args[1].startswith("[truncated]"), calls[0].args[1][:40])
+        self.assertIn(self.HEADLINE, calls[0].args[1])
 
     def test_a_refusal_that_is_not_about_blocks_posts_text_without_a_retry(self):
         self._blocks_on()
@@ -4042,9 +4048,9 @@ class TestRecentReportsIndex(unittest.TestCase):
         """The invariant, not an implementation detail.
 
         The caller prepends this to every unthreaded message in the space, and
-        `_store_incident_report` persists the relay's composed output rather
-        than the specialist's finding — so a preview line would carry
-        model-written text into all of them.
+        `_store_incident_report` persists the specialist's report, which quotes
+        third-party text — so a preview line would carry that text into all of
+        them.
         """
         self._report("T1", job_id="deploy-smoke")
         (report,) = self._fetch()

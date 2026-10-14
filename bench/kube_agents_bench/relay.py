@@ -44,7 +44,8 @@ from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERM
 # bench/tf/prebuilt/relay-report/relay_probe.py: STATE, JOB_ID and PROFILE.
 STATE_FILE = f"{DATA_ROOT}/.bench-relay-probe.json"
 PROFILE = "platform"
-# session_kv_server.py: SESSION_KV_DB_PATH, as the operator renders it.
+# session_kv_server.py: SESSION_KV_DB_PATH, as the operator renders it. The read
+# prefers the container's own value, as the server and the stack's probe do.
 SESSION_KV_DB = "/var/lib/kube-agents/session/session_kv.db"
 RELAY_READ = "__RELAY_READ__"
 DELIVERED = "delivered"
@@ -57,8 +58,9 @@ _READ_SCRIPT = """
 import json, os, sqlite3, sys
 from datetime import datetime, timezone
 state, kv_db, profile, sentinel = sys.argv[1:5]
+kv_db = os.environ.get("SESSION_KV_DB_PATH") or kv_db
 SQLITE_BUSY_TIMEOUT = 10
-out = {"state": None, "posted": [], "routed": 0, "threads": 0, "error": None}
+out = {"state": None, "posted": [], "routed": 0, "threads": 0, "store": False, "error": None}
 try:
     out["state"] = json.load(open(state))
 except FileNotFoundError:
@@ -69,7 +71,8 @@ try:
     since = datetime.fromisoformat(out["state"]["applied_at"])
     stamp = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     prefix = "cron-%s-%s-" % (profile, out["state"]["job_id"])
-    if os.path.exists(kv_db):
+    out["store"] = os.path.exists(kv_db)
+    if out["store"]:
         kv = sqlite3.connect("file:" + kv_db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
         threads = set()
         for (blob,) in kv.execute("SELECT metadata FROM session_metadata WHERE session_id LIKE ?", (prefix + "%",)):
@@ -120,6 +123,8 @@ def verdict(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     if state.get("status") != 200 or answer.get("status") != DELIVERED:
         return "fail", f"the relay did not deliver the report: HTTP {state.get('status')} {json.dumps(answer)[:EXCERPT_CHARS]}"
     posted = read.get("posted") or []
+    if not posted and not read.get("store", True):
+        return "error", "the relay answered delivered but the Session KV store is not where the read looked"
     if not posted and read.get("routed") and not read.get("threads"):
         # relay_cron_report answers delivered for a send whose outcome was unknown
         # (ALERT_SENT_WITHOUT_THREAD) and registers no thread for it, so the post

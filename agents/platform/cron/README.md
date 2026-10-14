@@ -435,8 +435,8 @@ child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
 `deliver: "chat"` hands the run's report to the relay instead, which posts it as
-written (a Slack fleet-audit report leads with a headline) and stores it against
-its thread, so the user's reply there reaches the
+written (on Slack, a fleet-audit report is replaced by a headline linking its
+ledger issue) and stores the full report against its thread, so the user's reply there reaches the
 Chat Agent with the report attached. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
