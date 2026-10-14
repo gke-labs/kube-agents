@@ -365,10 +365,27 @@ class AuditRedactor:
     # rather than `\b`, so a domain that merely *contains* the label sequence —
     # `victim@corp.gserviceaccount.com.attacker.io` — is redacted too, while an
     # address that simply ends a sentence still is not.
-    EMAIL_PATTERN = re.compile(
-        r"[a-zA-Z0-9._%+\-]+@(?!(?:[a-zA-Z0-9\-]+\.)*gserviceaccount\.com(?!\.?[\w\-]))"
+    #
+    # EMAIL_PATTERN opens with a negative lookbehind so that a match is tried
+    # only where a run of local-part characters starts. Without it a long run
+    # with no `@` after it -- a base64 blob, `a-a-a-…` -- is rescanned from
+    # every position, quadratic in the run's length (an 80 KB run took six
+    # seconds). A run that fails from its first character fails from every
+    # later one, since each reaches the same `@` and the same domain, so the
+    # guard changes nothing except at one position `re.sub` of the bare shape
+    # would have started from: the end of an address just matched, where a
+    # second address glued to the first begins
+    # (`alice@example.com-bob@example.org`). `_redact_emails` tries
+    # GLUED_EMAIL_PATTERN, the bare shape, anchored there, so the addresses
+    # redacted are the same as before the guard.
+    EMAIL_LOCAL_PART_CLASS = r"[a-zA-Z0-9._%+\-]"
+    EMAIL_SHAPE = (
+        EMAIL_LOCAL_PART_CLASS
+        + r"+@(?!(?:[a-zA-Z0-9\-]+\.)*gserviceaccount\.com(?!\.?[\w\-]))"
         r"[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
     )
+    EMAIL_PATTERN = re.compile(r"(?<!" + EMAIL_LOCAL_PART_CLASS + r")" + EMAIL_SHAPE)
+    GLUED_EMAIL_PATTERN = re.compile(EMAIL_SHAPE)
 
     SENSITIVE_KEYS = {
         "password",
@@ -771,8 +788,30 @@ class AuditRedactor:
         text = cls.OPENAI_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)
         text = cls.AWS_ACCESS_KEY_ID_PATTERN.sub(REDACTED_SECRET_MARKER, text)
         text = cls.SECRET_KV_PATTERN.sub(cls._mask_kv_value, text)
-        text = cls.EMAIL_PATTERN.sub("[REDACTED_EMAIL]", text)
+        text = cls._redact_emails(text)
         return text
+
+    @classmethod
+    def _redact_emails(cls, text: str) -> str:
+        """Replace every address with EMAIL_MARKER in one pass over the text.
+
+        EMAIL_PATTERN's lookbehind keeps the scan linear but forbids the one
+        start ``re.sub`` of the bare shape would take and it would not: the
+        end of the address just matched. GLUED_EMAIL_PATTERN is tried there,
+        anchored, before the guarded search resumes.
+        """
+        pieces = []
+        end = 0
+        match = cls.EMAIL_PATTERN.search(text)
+        while match:
+            pieces.append(text[end : match.start()])
+            pieces.append(EMAIL_MARKER)
+            end = match.end()
+            match = cls.GLUED_EMAIL_PATTERN.match(text, end) or cls.EMAIL_PATTERN.search(
+                text, end
+            )
+        pieces.append(text[end:])
+        return "".join(pieces)
 
     @classmethod
     def redact(cls, value: Any, rules: Optional[Iterable[RedactionRule]] = None) -> Any:
