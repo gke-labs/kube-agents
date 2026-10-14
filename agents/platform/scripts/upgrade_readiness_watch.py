@@ -123,6 +123,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_scope_args  # noqa: E402
 import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
@@ -229,11 +230,48 @@ BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could 
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
 TABLE_CUT_SHORT_DETAIL = "the version table's run for project {project} was cut short by its share of the budget"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
-TABLE_REFUSED_DETAIL = (
-    "version table for {project} refused by the report script: {error}; the remedy is on the install, not this job: "
-    "name the project in spec.scope, give the install read access to it, or take it out of the roster "
-    "(its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
+# A refusal, said once where the exception becomes text (``ReportRefused``):
+# the reason in the install's terms and the install's remedy, never the
+# agent's remedy the report script's own message ends with.
+TABLE_REFUSED_DETAIL = "version table for {project} {error}"
+PROJECT_RUN_REFUSED_DETAIL = "readiness run for {project} {error}"
+REFUSED_DETAIL = "refused by the report script: {reason}; {remedy}"
+INSTALL_REMEDY_PREFIX = "the remedy is on the install, not this job: "
+ROSTER_REMEDY = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
+# The refusals the report script can answer this job with, each a
+# fleet_scope_args message that ends in a remedy for an agent (the tool's
+# collector_args, an id the tool lists), with the same reason in the
+# install's terms and the remedy that fits it. Parsed with the script's own
+# constants, so a reworded message falls through to the script's text rather
+# than to a wrong reason.
+REFUSAL_REASONS = (
+    (
+        fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR,
+        "the install's declared scope does not list {project}; it lists {projects}",
+        INSTALL_REMEDY_PREFIX + "name the project in spec.scope, " + ROSTER_REMEDY,
+    ),
+    (
+        fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR,
+        "the install's declared scope lists {project} but the install could not read it ({outcome})",
+        INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY,
+    ),
+    (
+        fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR,
+        "the report script could not resolve project number {number} to an id",
+        INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
+    ),
+    (
+        # The sandbox froze KUBEAGENTS_SCOPE_DECLARED when it started and this
+        # pod reads the declaration live, so between a spec.scope block's
+        # removal and the sandbox's restart the two can disagree for a tick.
+        fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR,
+        "the sandbox says the install declares a scope, but this pod reads no declaration",
+        "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
+    ),
 )
+REFUSAL_PROJECTS_FIELD = "projects"
+REFUSAL_FIELDS = ("project", REFUSAL_PROJECTS_FIELD, "outcome", "number")
+REFUSAL_FIELD_PATTERN = "(?P<{field}>.+?)"
 # The remedy rides on the message: every read role the install binds carries
 # resourcemanager.projects.get (cluster_agent_reconcile.py relies on it), and
 # the CRD reference wants spec.harness.projectId to be the id, not the number.
@@ -315,6 +353,7 @@ ATTEMPTS_KEY = "attempts"
 # rewords from one run to the next. The detail rides on the line.
 SIGNATURE_KEY = "signature"
 UNGRADED_KIND_RUN_FAILED = "readiness run failed"
+UNGRADED_KIND_REFUSED = "readiness run refused"
 UNGRADED_KIND_UNRUN = "readiness run not run to completion by the budget"
 UNGRADED_KIND_READS_FAILED = "reads failed"
 REASON_NEW = "new target version"
@@ -392,10 +431,16 @@ DATE_FORMAT = "%Y-%m-%d"
 
 
 class ReportRefused(RuntimeError):
-    """The report script exited with its usage code and wrote no report: it
-    refused to read what it was asked, with the reason on stderr (a project
-    the declared scope does not list, one it lists but the install cannot
-    read, a number it cannot resolve), as against a sandbox that failed."""
+    """The report script exited with its usage code and wrote no report
+    because it refused to read what it was asked: a project the declared
+    scope does not list, one it lists but the install cannot read, a number
+    it cannot resolve, a sandbox still marked as scoped after the declaration
+    went (``refusal_detail`` knows the four), as against a sandbox that
+    failed or a usage error this job does not know, which stay the plain
+    failure. Its text is the reason in the install's terms with the remedy
+    that fits it, composed once (``refusal_detail``) so the partial line, the
+    ungraded line and the tick's failure line all say the same thing and none
+    relays the remedy the script wrote for an agent."""
 
 
 class SandboxTimedOut(RuntimeError):
@@ -644,9 +689,37 @@ def run_report(names: list[str], readiness: bool, *, scope: fleet_scope_targets.
     if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
         detail = f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}"
         if envelope.get(ENVELOPE_EXIT_KEY) == REPORT_USAGE_EXIT:
-            raise ReportRefused(detail)
+            refusal = refusal_detail(completed.stderr or "")
+            if refusal is not None:
+                raise ReportRefused(refusal)
         raise RuntimeError(detail)
     return envelope
+
+
+def refusal_pattern(template: str) -> re.Pattern:
+    """The report script's message as a pattern: its text verbatim, each
+    placeholder a named group."""
+    pattern = re.escape(template)
+    for field in REFUSAL_FIELDS:
+        pattern = pattern.replace(re.escape("{" + field + "}"), REFUSAL_FIELD_PATTERN.format(field=field))
+    return re.compile(pattern)
+
+
+def refusal_detail(stderr: str) -> str | None:
+    """What a refusal by the report script reads as, in the install's terms:
+    the message matched against the script's own constants, re-said with what
+    it named (the scope it lists shortened to a few names) and the remedy that
+    fits it; None for a usage exit this job does not know, which is reported
+    as the script wrote it."""
+    text = " ".join(stderr.split())
+    for template, said, remedy in REFUSAL_REASONS:
+        found = refusal_pattern(template).search(text)
+        if found:
+            fields = found.groupdict()
+            if REFUSAL_PROJECTS_FIELD in fields:
+                fields[REFUSAL_PROJECTS_FIELD] = shown_names(fields[REFUSAL_PROJECTS_FIELD].split(fleet_scope_args.OVERRIDE_PROJECTS_SEPARATOR))
+            return REFUSED_DETAIL.format(reason=said.format(**fields), remedy=remedy)
+    return None
 
 
 # --- project identity ------------------------------------------------------
@@ -1141,7 +1214,7 @@ def readiness_by_project(
     now: datetime,
     ids: dict[str, str],
     scope: fleet_scope_targets.ScopeTargets | None,
-) -> tuple[dict, dict[str, str], dict[str, str]]:
+) -> tuple[dict, dict[str, str], dict[str, str], set[str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
     budget before ``deadline`` (a ``time.monotonic`` instant), merged into one
@@ -1149,7 +1222,12 @@ def readiness_by_project(
     named in the second value; a project the budget did not reach, or cut
     short under a shrunk timeout, is named in the third with the phrase that
     says which, so the caller can tell a failed read from a read that never
-    finished. All are read errors in the envelope, so the report names them.
+    finished; a project the report script refused (``ReportRefused``: on a
+    declared install, one the scope does not list, whose clusters the ledger
+    pended before that) is in the second value with the refusal's text and
+    named again in the fourth, its own kind for the ungraded announcement,
+    so a refusal that stands is posted once and a sandbox that then fails is
+    still news. All are read errors in the envelope, so the report names them.
     ``last_runs`` is stamped for a run that completed or hit its own cap, so
     the least recently run projects go first next time."""
     # Member keys carry the id the report resolved; the run is asked for by the
@@ -1159,6 +1237,7 @@ def readiness_by_project(
     merged = empty_envelope()
     failures: dict[str, str] = {}
     unfinished: dict[str, str] = {}
+    refused: set[str] = set()
     for project in ordered_projects(needed, last_runs):
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
@@ -1176,6 +1255,11 @@ def readiness_by_project(
             last_runs[project] = iso(now)
             failures[project] = str(exc)
             continue
+        except ReportRefused as exc:
+            last_runs[project] = iso(now)
+            failures[project] = str(exc)
+            refused.add(project)
+            continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             last_runs[project] = iso(now)
             failures[project] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
@@ -1183,10 +1267,17 @@ def readiness_by_project(
         last_runs[project] = iso(now)
         merge_envelope(merged, envelope)
     for project, error in failures.items():
-        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_RUN_FAILED_DETAIL.format(project=project, error=error)})
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: run_failure_detail(project, error, refused)})
     for project, detail in unfinished.items():
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: detail})
-    return merged, failures, unfinished
+    return merged, failures, unfinished, refused
+
+
+def run_failure_detail(project: str, error: str, refused: set[str]) -> str:
+    """What a readiness run that returned nothing reads as: refused, with the
+    refusal's own text, or failed, with the error."""
+    template = PROJECT_RUN_REFUSED_DETAIL if project in refused else PROJECT_RUN_FAILED_DETAIL
+    return template.format(project=project, error=error)
 
 
 def shown_names(names: list[str], separator: str = ", ") -> str:
@@ -1214,13 +1305,15 @@ def signature_pairs(kinds: dict[str, str]) -> list[list[str]]:
     return [[project, kinds[project]] for project in sorted(kinds)]
 
 
-def ungraded_signature(projects: set[str], failed: list[str], unrun: list[str]) -> list[list[str]]:
+def ungraded_signature(projects: set[str], failed: list[str], unrun: list[str], refused: list[str]) -> list[list[str]]:
     """What an ungraded version's announcement is keyed on: each of its
     projects with how it went ungraded, as ``[project, kind]`` pairs in project
-    order. A project in neither list ran and graded nothing, so its reads
-    failed; the two budget shapes are one kind, as they are for the table."""
+    order. A project in no list ran and graded nothing, so its reads
+    failed; the two budget shapes are one kind, as they are for the table; a
+    run the report script refused is its own kind, as it is for the table."""
     kinds = {project: UNGRADED_KIND_READS_FAILED for project in projects}
     kinds.update({project: UNGRADED_KIND_RUN_FAILED for project in failed})
+    kinds.update({project: UNGRADED_KIND_REFUSED for project in refused})
     kinds.update({project: UNGRADED_KIND_UNRUN for project in unrun})
     return signature_pairs(kinds)
 
@@ -1376,7 +1469,7 @@ def tick(dry_run: bool = False) -> list[str]:
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     ledger[TABLE_ERRORS_KEY] = read_errors
     if due:
-        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY], scope)
+        readiness, failures, unfinished, refused = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY], scope)
         canonicalise_projects(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:
@@ -1390,6 +1483,7 @@ def tick(dry_run: bool = False) -> list[str]:
             blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
             version_projects = {project_of(k) for k in clusters}
             failed_projects = sorted(version_projects & set(failures))
+            refused_projects = sorted(version_projects & refused)
             unrun_projects = sorted(version_projects & set(unfinished))
             if not blocked and not ready and not unknown and unrun_projects and not failed_projects and len(unrun_projects) == len(version_projects):
                 # Nothing was attempted for this version: not a report, not an
@@ -1403,7 +1497,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 )
                 continue
             failure_text = "; ".join(
-                [PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects]
+                [run_failure_detail(p, failures[p], refused) for p in failed_projects]
                 + [unfinished[p] for p in unrun_projects]
             )
             graded = bool(blocked or ready or unknown)
@@ -1413,7 +1507,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 next_phrase = NEXT_REFRESH_PHRASE.format(date=(now + timedelta(days=days)).strftime(DATE_FORMAT))
             else:
                 detail = failure_text or READS_FAILED_DETAIL
-                condition = ungraded_signature(version_projects, failed_projects, unrun_projects)
+                condition = ungraded_signature(version_projects, failed_projects, unrun_projects, refused_projects)
                 attempts = (previous.get(ATTEMPTS_KEY) or 0) + 1
                 # Once parked, a version stays on the weekly cadence until graded:
                 # the ladder of daily retries runs once, not once a week.

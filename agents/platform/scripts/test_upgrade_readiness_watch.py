@@ -1420,11 +1420,14 @@ class DeclaredScope(Base):
             self.assertEqual(code, 0)
             self.assertIn("the version table was partial (1 read error(s)", out)
             self.assertIn(
-                "p2: version table for p2 refused by the report script: report script exited 2 and wrote no report: "
-                "(declared scope: fleet_scope): the project override names p2, which the install's declared scope does not list (p1, p3)",
+                "p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1, p3; "
+                "the remedy is on the install, not this job: name the project in spec.scope, "
+                "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
                 out,
             )
-            self.assertIn("the remedy is on the install, not this job: name the project in spec.scope", out)
+            # The script's own remedy is for an agent; nothing of it reaches chat.
+            self.assertNotIn("collector_args", out)
+            self.assertNotIn("fleet_scope", out)
             self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a)", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script"])
             code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
@@ -1434,6 +1437,90 @@ class DeclaredScope(Base):
             self.assertIn("the version table was partial (2 read error(s)", out)
             self.assertIn("p1: version table for p1 failed: sandbox exited 255 without a report: ssh: lost connection", out)
             self.assertCountEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script", "table failed"])
+
+    def test_pending_clusters_of_a_refused_project_are_an_ungraded_line_in_the_install_s_terms_posted_once(self) -> None:
+        """A project the scope does not list but whose clusters the ledger
+        pended before (declared later, or dropped from the declaration) keeps
+        them pending; its readiness run is refused every due day, and the
+        ungraded line says why in the install's terms, once."""
+        self.declare_scope(["p1"])
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        versions = envelope([member("a", "current")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn(
+                f"new target version {OLDER_TARGET}, 1 cluster(s) pending (c): none graded (readiness run for p2 refused by the report script: "
+                "the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope",
+                out,
+            )
+            self.assertNotIn("collector_args", out)
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused"]])
+            self.assertEqual(self.ledger()["targets"][OLDER_TARGET]["pending"], ["p2/us-central1-a/c"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+
+    def test_a_refused_readiness_run_that_turns_into_a_failed_one_is_announced_again(self) -> None:
+        self.declare_scope(["p1"])
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        versions = envelope([member("a", "current")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}, failing_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn("none graded (readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection)", out)
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run failed"]])
+
+    def test_a_tick_whose_every_project_is_refused_fails_in_the_install_s_terms(self) -> None:
+        self.declare_scope(["p1"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
+            code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out.strip(),
+            "upgrade readiness watch: the tick failed: ReportRefused: refused by the report script: the install's declared scope does not list p2; "
+            "it lists p1; the remedy is on the install, not this job: name the project in spec.scope, "
+            "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
+        )
+        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+
+    def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_that_fits_it(self) -> None:
+        label = "(declared scope: fleet_scope): "
+        roster = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
+        wide = ", ".join(f"tenant-{i:03d}" for i in range(150))
+        self.assertEqual(
+            watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project="p2", projects=wide) + "\n"),
+            "refused by the report script: the install's declared scope does not list p2; it lists tenant-000, tenant-001, tenant-002, tenant-003, "
+            f"tenant-004, tenant-005, +144 more; the remedy is on the install, not this job: name the project in spec.scope, {roster}",
+        )
+        self.assertEqual(
+            watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project="p2", outcome="denied")),
+            "refused by the report script: the install's declared scope lists p2 but the install could not read it (denied); "
+            f"the remedy is on the install, not this job: give the install read access to the project, {roster}",
+        )
+        self.assertEqual(
+            watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012")),
+            "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
+            "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
+        )
+        # The sandbox froze the marker at its start; this pod reads the declaration live.
+        self.assertEqual(
+            watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR),
+            "refused by the report script: the sandbox says the install declares a scope, but this pod reads no declaration; "
+            "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
+        )
+        for detail in (
+            watch.refusal_detail(label + m) for m in (
+                fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project="p2", projects="p1"),
+                fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project="p2", outcome="denied"),
+                fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="1"),
+                fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR,
+            )
+        ):
+            self.assertNotIn("collector_args", detail)
+            self.assertNotIn("fleet_scope tool", detail)
+        # A usage exit this job does not know is not a refusal: it stays the plain failure, as the script wrote it.
+        self.assertIsNone(watch.refusal_detail("no project: pass --project\n"))
 
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
