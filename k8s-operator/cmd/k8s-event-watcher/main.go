@@ -997,10 +997,12 @@ func realMain(argv []string) error {
 // The two entries are not interchangeable, so which one survives matters. The
 // profile carries the project/location/cluster identity that stamps the payload
 // and labels every metric; the direct entry knows only a name. But the profile
-// also carries a credential that can be refused: it authenticates as the GSA,
-// so a permission set without roles/container.viewer, or master authorized
-// networks that exclude the pod's egress, denies it. The direct entry uses the pod's own service account against
-// kubernetes.default.svc and never leaves the cluster.
+// also carries a credential that can be refused: it authenticates as a GSA
+// (the broker's, through the credential proxy, or the pod's without one), so a
+// permission set without roles/container.viewer, or master authorized networks
+// that exclude that identity's egress, denies it. The direct entry uses the
+// pod's own service account against kubernetes.default.svc and never leaves the
+// cluster.
 //
 // Nothing here would notice the difference. discoverClusterProfiles contacts
 // the GKE API for the control plane's address, but nothing exercises that

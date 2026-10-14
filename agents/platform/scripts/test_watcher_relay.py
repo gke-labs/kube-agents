@@ -182,6 +182,30 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(json.loads(body)["rule"], watcher_policy.RULE_GCP_SUBSCRIPTION)
         self.assertEqual(self.google_requests, [])
 
+    def test_a_content_length_that_is_not_a_number_is_400_not_413(self):
+        path = f"/v1/watcher/gcp/pubsub.googleapis.com/v1/{SUB}:pull"
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.putrequest("POST", path)
+            connection.putheader("Authorization", "Bearer watcher-token")
+            connection.putheader("Content-Length", "abc")
+            connection.endheaders()
+            response = connection.getresponse()
+            status, body = response.status, response.read()
+        finally:
+            connection.close()
+        self.assertEqual(status, 400, body)
+        self.assertEqual(json.loads(body)["error"], "invalid content length")
+        self.assertEqual(self.google_requests, [])
+
+    def test_a_query_outside_the_cloud_relays_shape_or_cap_is_refused(self):
+        base = "/v1/watcher/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a"
+        for query in ("alt=json{", "alt=" + "j" * 9000):
+            with self.subTest(query=query[:20]):
+                status, _ = self._request("GET", f"{base}?{query}")
+                self.assertEqual(status, 400)
+        self.assertEqual(self.google_requests, [])
+
     def test_a_query_key_beyond_alt_and_prettyprint_is_refused(self):
         path = "/v1/watcher/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a?key=x"
         status, _ = self._request("GET", path)
@@ -280,8 +304,6 @@ class ClusterAddressTest(unittest.TestCase):
         self.assertIsNone(address({}))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class WatcherAudienceTest(unittest.TestCase):
@@ -313,3 +335,7 @@ class WatcherAudienceTest(unittest.TestCase):
             CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat", CREDENTIAL_PROXY_WATCHER_AUDIENCE="aud-chat"
         )
         self.assertEqual(authenticator.audience_roles["aud-chat"], credential_proxy.CALLER_ROLE_CHAT)
+
+
+if __name__ == "__main__":
+    unittest.main()

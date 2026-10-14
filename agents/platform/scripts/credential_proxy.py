@@ -9095,16 +9095,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
+            # The two answers /v1/exec and the MCP relay give: 400 for a length
+            # that is not a number, 413 for one out of range.
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                length = -1
+                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+                return
             if length < 0 or length > self.max_request_bytes:
                 LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
                 return
             body = self.rfile.read(length)
-        problem = api_relay_target_problem(host, path, "")
+        # The Cloud API relay's own checks on the query too: its shape and its
+        # length cap, before the key check below narrows it to two keys.
+        problem = api_relay_target_problem(host, path, parts.query)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
             problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")

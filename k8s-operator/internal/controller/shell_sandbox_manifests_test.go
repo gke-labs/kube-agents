@@ -1686,6 +1686,9 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
+		// The watchers' broker token: mounted into the agent container it
+		// would hand the model the broker's watcher role.
+		watcherTokenVolume,
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := federatedTestAgent()

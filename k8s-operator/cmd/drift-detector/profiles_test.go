@@ -699,7 +699,9 @@ func TestDiscoverProfileClustersThroughTheBroker(t *testing.T) {
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/v1/watcher/gcp/container.googleapis.com/") {
-			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1"}`)
+			// Usable addressing, as a real describe carries: discovery checks it,
+			// and the broker's config ignores it.
+			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1","controlPlaneEndpointsConfig":{"dnsEndpointConfig":{"allowExternalTraffic":true,"endpoint":"prod.example.internal"}}}`)
 			return
 		}
 		fmt.Fprint(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
