@@ -624,6 +624,18 @@
     {
       "in": "why\u001dis it slow",
       "kind": "investigate"
+    },
+    {
+      "in": "İs checkout down",
+      "kind": "incident"
+    },
+    {
+      "in": "ıs checkout down",
+      "kind": "incident"
+    },
+    {
+      "in": "ſhould we page",
+      "kind": "incident"
     }
   ]
 }

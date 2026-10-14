@@ -517,6 +517,8 @@ def _plan_key(key: tuple) -> str:
     """The ``update`` key of the thread's next plan: ``plan``, then ``plan-2`` and on."""
     count = _plan_keys.get(key, 0) + 1
     _remember(_plan_keys, key, count, SESSIONS_MAX)
+    # A new plan is a new ask's: its first mark goes out even when it equals the last ask's.
+    _marks_sent.pop(key, None)
     return _chat.PLAN_UPDATE if count == 1 else _chat.PLAN_UPDATE_NEXT.format(number=count)
 
 
@@ -557,10 +559,10 @@ async def _render_chat(adapter: Any, key: tuple, plan: _Plan, title: str | None,
     """:func:`_render` over chat.notify: the plan as a chat message, edited in place by its key."""
     chat_id, thread_ts = key
     chat = _chat.plan_message(title or _alert_title(key) or None, rows)
+    update = plan.ts or _plan_key(key)  # before the mark: a new plan's key starts the thread's mark memory over
     mark = _thread_mark(adapter, key, plan)
     if mark is not None:
         chat["mark"] = mark
-    update = plan.ts or _plan_key(key)
     try:
         result = await adapter.send_chat(
             chat_id, _chat.plan_text(title or _alert_title(key) or None, rows), chat, update,

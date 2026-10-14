@@ -320,6 +320,19 @@ class ChatRoutePlanTest(unittest.TestCase):
         marks = [s["chat"]["mark"] for s in adapter.sent if "mark" in s["chat"]]
         self.assertEqual(marks, [{"ask": "fleet"}, {"settle": "failed"}, {"ask": "fleet"}, {"settle": "done"}])
 
+    def test_a_later_asks_settle_goes_even_when_it_equals_the_last_asks(self):
+        # Ask 2's card's first event is its completion: its plan opens settled,
+        # and its done goes out although ask 1 also ended done.
+        adapter = _ConversationAdapter(ask="fleet")
+
+        async def run():
+            await slack_ux_status.settle_row(adapter, dict(self.SUB), "completed", "fine", "a")
+            await slack_ux_status.settle_row(adapter, dict(self.SUB, task_id="t_b"), "completed", "fine", "b")
+
+        asyncio.run(run())
+        marks = [(s["update"], s["chat"].get("mark")) for s in adapter.sent]
+        self.assertEqual(marks, [("plan", {"settle": "done"}), ("plan-2", {"settle": "done"})])
+
     def test_with_no_recorded_ask_a_lifted_pause_still_goes(self):
         adapter = _ConversationAdapter(ask="")
 

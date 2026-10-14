@@ -485,6 +485,12 @@ func TestAssertion18_ReservedArtifacts(t *testing.T) {
 			{ArtifactID: "p", Name: ArtifactProgress, Parts: append(append([]Part{}, textPart...),
 				Part{Kind: "data", Data: json.RawMessage(`{"schema": "kube-agents.chat/v1", "mark": {"ask": "fleet"}}`)})},
 		}, StateCompleted, false},
+		// A key spelled otherwise is not the schema, as chatmsg reads it.
+		{"progress_with_a_misspelled_schema_key", []Artifact{
+			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
+			{ArtifactID: "p", Name: ArtifactProgress, Parts: append(append([]Part{}, textPart...),
+				Part{Kind: "data", Data: json.RawMessage(`{"Schema": "kube-agents.chat/v1"}`)})},
+		}, StateCompleted, true},
 		{"non_reserved_name_unconstrained", []Artifact{
 			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
 			{ArtifactID: "x", Name: "custom-diagnostics", Parts: dataPart},

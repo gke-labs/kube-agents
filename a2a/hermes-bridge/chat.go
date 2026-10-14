@@ -165,13 +165,16 @@ func asciiWords(text string) string {
 
 // askKind is the mark.ask token for an ask, from its words alone.
 func askKind(text string) string {
-	clean := asciiWords(pyStrip(askMention.ReplaceAllString(text, " ")))
+	stripped := pyStrip(askMention.ReplaceAllString(text, " "))
+	clean := asciiWords(stripped)
 	for _, c := range askClasses {
 		if c.words.MatchString(clean) {
 			return c.kind
 		}
 	}
-	if !askIsQuestion(clean) && incidentWords.MatchString(clean) {
+	// The opener check reads the ask as written: the presenter's FIRST_WORD
+	// is case-sensitive ASCII and never folds, so "İs" opens on "s".
+	if !askIsQuestion(stripped) && incidentWords.MatchString(clean) {
 		return askIncident
 	}
 	if investigateWords.MatchString(clean) || incidentWords.MatchString(clean) {

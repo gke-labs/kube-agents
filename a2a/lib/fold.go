@@ -532,10 +532,12 @@ func chatMessagePart(p Part) bool {
 	if p.Kind != "data" {
 		return false
 	}
-	var head struct {
-		Schema string `json:"schema"`
-	}
-	return json.Unmarshal(p.Data, &head) == nil && strings.HasPrefix(head.Schema, chatSchemaFamily)
+	// Through a map, so the key matches exactly, as chatmsg's reader does;
+	// a struct decode would take "Schema" too.
+	var head map[string]json.RawMessage
+	var schema string
+	return json.Unmarshal(p.Data, &head) == nil && json.Unmarshal(head["schema"], &schema) == nil &&
+		strings.HasPrefix(schema, chatSchemaFamily)
 }
 
 // ValidateArtifacts enforces assertion 18: a completed task carries at least
