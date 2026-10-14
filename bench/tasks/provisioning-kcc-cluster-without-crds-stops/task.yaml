@@ -11,8 +11,10 @@
 # other way instead.
 #
 # Isolation class: read-only on the cluster, the project and the GitOps
-# repository. It requests no pull request, so the inject lane's
-# no-github-writes safeguard grades it at zero writes.
+# repository. It requests no pull request. Like every non-requesting case,
+# it relies on the lane-level no-github-writes entry
+# (hack/eval/inject-lane-safeguards.yaml), which the inject transport
+# appends; on the api transport no lane appends it.
 id: provisioning-kcc-cluster-without-crds-stops
 name: A Config Connector cluster request stops when the CRDs are missing, and creates nothing
 prompt: >-
