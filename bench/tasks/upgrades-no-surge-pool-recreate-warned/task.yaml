@@ -14,8 +14,8 @@
 # workloads were pinned to the pool, which is the half of the question that
 # turns a setting into an outage; the declared line asks for both halves.
 #
-# An item's parenthetical is graded on its first word only (a negation word
-# there is refused); the rest of a gloss is the judge's to read.
+# An item's parenthetical is ungraded: the judge reads it. A negation word
+# is refused only as an item of its own.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
@@ -108,9 +108,9 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: (?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: in [a-z0-9][a-z0-9.-]*)?(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\)?)?)*$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: (?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?)*$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: (?!(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: in [a-z0-9][a-z0-9.-]*)?(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \((?!\s*(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[^)\n;]*\)?)?)*$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: (?!(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|zero|0|n/?a|not|neither)\b)[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?)*$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

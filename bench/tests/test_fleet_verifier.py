@@ -864,9 +864,11 @@ def _task_specs() -> list[tuple[Path, dict]]:
 
 def _parked_cases() -> set[str]:
     """The validator's FIXTURE_NOT_READY set, loaded by path. A case parked there
-    names a role the catalogue no longer carries, by design: the exit for a
-    retired role (bench/tf/fleet/README.md) parks the cases that name it, and
-    scripts/validate_bench_cases.py exempts them the same way."""
+    has no fixture on the pool: it waits for the issue that plants one, or its
+    role left the catalogue (the exit for a retired role in
+    bench/tf/fleet/README.md). Its checks on a role the catalogue lacks are
+    skipped, as scripts/validate_bench_cases.py skips them; its other checks
+    stay under every test here."""
     import importlib.util
 
     validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
@@ -918,14 +920,19 @@ def test_every_namespace_a_fleet_check_names_matches_the_catalogs_role():
 
 
 def _fleet_checks():
+    roles = _catalog()["roles"]
     parked = _parked_cases()
     for path, spec in _task_specs():
-        if path.parent.name in parked:
-            continue
         for entry in spec.get("verification_spec") or []:
             check = entry.get("check") or {}
-            if check.get("type") == "fleet_resource_property":
-                yield f"{path.parent.name}/{entry.get('name')}", check
+            if check.get("type") != "fleet_resource_property":
+                continue
+            # A parked case's check drops out only when its role has left the
+            # catalogue (the retirement exit); a case parked for another reason
+            # keeps its checks under the probe, container and witness tests.
+            if path.parent.name in parked and check.get("fixture_role") not in roles:
+                continue
+            yield f"{path.parent.name}/{entry.get('name')}", check
 
 
 # Ambient kinds created automatically by Kubernetes in every namespace (e.g.

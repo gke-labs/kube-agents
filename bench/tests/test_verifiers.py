@@ -7280,8 +7280,6 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity-x, seeded-debug-x, seeded-deprecation-x, seeded-reliability-x",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: no policies in seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
-            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability (no policy), seeded-debug (no policy), seeded-capacity (no policy), seeded-deprecation (no policy)",
-            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability (0 policies), seeded-debug (0 policies), seeded-capacity (0 policies), seeded-deprecation (0 policies)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation carry none)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation?",
         ],
@@ -7410,7 +7408,6 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none (/etc/cni/net.d is read-only and does not count); coupled to the node image: yes",
-            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d (not mounted); coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /var/run/docker.sock; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
         ],
@@ -7520,7 +7517,6 @@ _GROUP2 = {
         [
             "seeded-b/no-surge-pool: nodes 1; replacement node first: yes; workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: none",
-            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner (not pinned)",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: batch-runner",
             "seeded-b/no-surge-pool: nodes one; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
         ],
@@ -7676,3 +7672,38 @@ def test_group2_and_group4_case_fails_every_objective_without_the_declared_line(
     _, _, missing = {**_GROUP2, **_GROUP4}[case]
     verdicts = _group5_verdicts(case, missing)
     assert verdicts and all(s == "fail" for s in verdicts.values()), verdicts
+
+
+# ------------------------------------------- the list slots, two more shapes
+#
+# An item's parenthetical is ungraded, so seeded-c's `none` carries one the
+# same way a seeded-a name does; and a list joined by ` and ` has one
+# partition, so a long wrong list is refused at once rather than after the
+# night (an item cannot contain ` and `).
+
+
+def test_group3_network_policy_seeded_c_none_admits_an_ungraded_gloss():
+    case = "upgrades-network-policy-enforcement-stated"
+    line_a = _GROUP3[case][0][0]
+    text = "\n".join(
+        [
+            line_a,
+            "seeded-b: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-upgrade",
+            "seeded-c: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (no NetworkPolicy objects)",
+            "seeded-d: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-topology",
+        ]
+    )
+    verdicts = _group3_verdicts(case, text)
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+def test_group3_removed_api_refuses_a_long_and_joined_list_at_once():
+    import time
+
+    case = "upgrades-removed-api-callers-distinguished"
+    items = " and ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
+    line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
+    started = time.monotonic()
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
