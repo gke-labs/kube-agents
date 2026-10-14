@@ -76,7 +76,7 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: [^\n]+$'
 
   - name: the-declared-line-says-all-replicas-share-a-zone
     role: objective
@@ -87,10 +87,10 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?1; all replicas in one zone: yes; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+[^;\n]*; zones in use:? ?1; all replicas in one zone: yes; cause: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?!yes;)[^;\n]+; cause: [^\n]+$'
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?(?!1;)\d+; all replicas in one zone: [^;\n]+; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+; all replicas in one zone: (?!yes;)[^;\n]+; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+[^;\n]*; zones in use:? ?(?!1;)\d+; all replicas in one zone: [^;\n]+; cause: [^\n]+$'
 
   # The cause: the required affinity, the spread that only prefers, or the
   # two named together, which is the reading the fixture's own description
@@ -105,9 +105,9 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?:node ?affinity|(?:topology ?)?spread ?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node ?affinity|(?:topology ?)?spread ?constraints?))?$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$'
       forbidden_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?!(?:node ?affinity|(?:topology ?)?spread ?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node ?affinity|(?:topology ?)?spread ?constraints?))?$)[^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/zone-pinned-api(?:-[a-z0-9]{5,10}){0,2}: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+; all replicas in one zone: (?:yes|no); cause: (?!(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

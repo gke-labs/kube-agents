@@ -88,9 +88,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?kubectl:? ?v?1\.29(?:\.0)?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?(?!kubectl:? ?v?1\.29(?:\.0)?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl:? ?v?1\.29(?:\.0)?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   - name: the-declared-line-says-the-client-is-outside-the-skew
     role: objective

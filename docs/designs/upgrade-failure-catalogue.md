@@ -785,8 +785,8 @@ leaves row 1's rule to the second model. The form the rest of the series uses, w
 elsewhere in the harness asked for before them, narrows the automatic check: the question ends by asking
 for one short line per cluster, or per object examined, in a fixed vocabulary, for example "cluster B:
 protected application: yes; which: batch-runner", and the automatic check is a pattern anchored on the
-cluster's name that accepts a right line and refuses any other word in the value slot, a hedge such as
-"probably" included; prose stays with the second model. Two guards
+cluster's name that accepts a right line and refuses any other word in a graded value slot, a hedge such as
+"probably" included (a slot graded for its form alone, the exclusion's end date, refuses only a hedge mark); prose stays with the second model. Two guards
 go with that form. A
 test about a planted object carries a check on that object, so a run that
 quietly repairs it fails rather than passes; the check reaches only objects in the cluster that the
