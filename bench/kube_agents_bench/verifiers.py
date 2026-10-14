@@ -198,6 +198,11 @@ _PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeho
 # Markdown emphasis is dropped; the typographic apostrophe folds to ASCII
 # so a pattern spells each contraction ("don't") exactly once.
 _MARKDOWN_NOISE = str.maketrans({"*": None, "_": None, "`": None, "’": "'"})
+# A Markdown escape before an emphasis character (`pool\_skew`): the backslash
+# is the renderer's instruction, not content, and is dropped before the noise
+# table deletes the character it protects, so an escaped identifier matches its
+# bare spelling and, under the fold, keeps its inner-underscore boundaries.
+_MARKDOWN_ESCAPE = re.compile(r"\\(?=[_*`])")
 
 
 def _normalize(text: str) -> str:
@@ -211,7 +216,7 @@ def _normalize(text: str) -> str:
     ``" ".join(str.split())`` would drop it and hand back the false positive
     the space was added to prevent.
     """
-    stripped = text.translate(_MARKDOWN_NOISE)
+    stripped = _MARKDOWN_ESCAPE.sub("", text).translate(_MARKDOWN_NOISE)
     collapsed = " ".join(stripped.split())
     if stripped[:1].isspace():
         collapsed = " " + collapsed
@@ -374,7 +379,7 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     # boundary before its cluster name, while `_word_` emphasis, whose
     # underscores sit at a token's edges, is still deleted.
     lines = (
-        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", line)) if fold_decoration else line)
+        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", _MARKDOWN_ESCAPE.sub("", line))) if fold_decoration else line)
         for line in text.splitlines()
     )
     if fold_decoration:

@@ -6785,3 +6785,15 @@ def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text
     v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
     transcript.set(final_message, [], final_message=final_message)
     assert v.verify(1.0).success is matches, final_message
+
+
+def test_a_markdown_escaped_underscore_reads_as_the_bare_identifier():
+    # A model writing for a renderer escapes `pool\_skew\_critical\_minors`; the backslash is
+    # the renderer's instruction, not content. Bare and escaped spellings normalise alike, and
+    # under the fold the escaped key keeps its inner-underscore boundaries.
+    bare = "CRITERIA security-patch-orchestrator pool_skew_critical_minors=4 revision=0"
+    escaped = bare.replace("_", r"\_")
+    assert verifiers._normalize(escaped) == verifiers._normalize(bare)
+    assert verifiers._normalize_lines(escaped, fold_decoration=True) == verifiers._normalize_lines(bare, fold_decoration=True)
+    assert "pool-skew-critical-minors=4 revision=0" in verifiers._normalize_lines(escaped, fold_decoration=True)
+    assert verifiers._normalize(r"a \*b\* \`c\`") == "a b c"
