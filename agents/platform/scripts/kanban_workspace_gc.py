@@ -118,9 +118,11 @@ EXPECTED_HOME_ENTRIES = frozenset({
     "kanban.db", "state.db",
 })
 
-# What `sandbox_mirror.push_skeleton` renames an expected entry to when it
-# finds a file where a directory belongs.  The mirror logs those itself.
+# What `sandbox_mirror.push_skeleton` and the sandbox entrypoint rename an
+# expected entry to when they find a file where a directory belongs: the name,
+# this mark, and a `%Y%m%dT%H%M%S` stamp.  Both log those themselves.
 DISPLACED_MARK = ".displaced-"
+DISPLACED_STAMP = re.compile(r"^\d{8}T\d{6}$")
 
 # Lists a directory's entries as name, mtime, size and type, NUL terminated so
 # a name with a newline or a tab in it can't forge a second row.  By absolute
@@ -337,8 +339,8 @@ def _parse_listing(output: str) -> list[Row]:
 def _is_expected(name: str) -> bool:
     if name in EXPECTED_HOME_ENTRIES:
         return True
-    base, mark, _ = name.partition(DISPLACED_MARK)
-    return bool(mark) and base in EXPECTED_HOME_ENTRIES
+    base, mark, stamp = name.partition(DISPLACED_MARK)
+    return bool(mark) and base in EXPECTED_HOME_ENTRIES and bool(DISPLACED_STAMP.match(stamp))
 
 
 def _list(path: Path, inv: Inventory) -> list[Row] | None:
@@ -362,7 +364,7 @@ def _list(path: Path, inv: Inventory) -> list[Row] | None:
     if result.returncode != 0:
         inv.problems.append(
             f"listing {path} in the sandbox exited {result.returncode}: "
-            f"{(result.stderr or '').strip()[:STDERR_EXCERPT_CHARS]}"
+            f"{' '.join((result.stderr or '').split())[:STDERR_EXCERPT_CHARS]}"
         )
         return None
     return _parse_listing(result.stdout)
@@ -504,8 +506,11 @@ def main() -> int:
             f"{LOG_PREFIX}: removed {len(sweep.local_removed)} on the agent "
             f"pod, {len(sweep.remote_removed)} in the sandbox"
         )
-    if sandbox_exec.sandbox_enabled():
-        lines.extend(_format_inventory(take_inventory(agent_home() / "profiles", sandbox_root())))
+    try:
+        if sandbox_exec.sandbox_enabled():
+            lines.extend(_format_inventory(take_inventory(agent_home() / "profiles", sandbox_root())))
+    except Exception as exc:  # noqa: BLE001 - the inventory never fails the job
+        lines.append(f"{LOG_PREFIX}: inventory skipped: {exc}")
     append_log(lines, agent_home())
     if sweep.warnings:
         print(

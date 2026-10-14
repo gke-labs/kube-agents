@@ -447,6 +447,7 @@ class HomeInventoryTest(unittest.TestCase):
         self.assertTrue(gc._is_expected("scratch.displaced-20261010T000000"))
         self.assertFalse(gc._is_expected("notes.displaced-20261010T000000"))
         self.assertFalse(gc._is_expected(".displaced"))
+        self.assertFalse(gc._is_expected("scratch.displaced-notes.sh"))
 
     def test_skeleton_matches_the_mirror(self):
         # The mirror creates these in every home; if it grows one, the
@@ -484,12 +485,13 @@ class HomeInventoryTest(unittest.TestCase):
         self.assertEqual(len(lines), gc.INVENTORY_LIMIT + 2)
         self.assertIn("and 5 more", lines[-1])
 
-    def run_main(self, fake):
-        """`main()` end to end, with no boards; returns (stdout, log file text)."""
+    def run_main(self, fake, sweep=None):
+        """`main()` end to end; returns (stdout, log file text) and clears the log."""
         import io
         hermes_cli = type(sys)("hermes_cli")
         hermes_cli.kanban_db = type("K", (), {"list_boards": staticmethod(lambda: [])})
         with patch.dict(sys.modules, {"hermes_cli": hermes_cli}), \
+             patch.object(gc, "sweep_boards", return_value=sweep or gc.Sweep()), \
              patch.dict("os.environ", {"PLATFORM_AGENT_HOME": str(self.home)}), \
              patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
              patch.object(sandbox_exec, "_load_terminal_config", return_value={"workspace_root": str(self.remote)}), \
@@ -497,7 +499,38 @@ class HomeInventoryTest(unittest.TestCase):
              patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(gc.main(), 0)
         log = self.home / gc.LOGS_DIR / gc.LOG_FILE_NAME
-        return out.getvalue(), log.read_text(encoding="utf-8") if log.exists() else ""
+        text = log.read_text(encoding="utf-8") if log.exists() else ""
+        log.unlink(missing_ok=True)
+        return out.getvalue(), text
+
+    def test_main_logs_the_sweeps_removals(self):
+        sweep = gc.Sweep()
+        sweep.local_removed = ["t_1", "t_2"]
+        sweep.remote_removed = ["t_1"]
+        out, log = self.run_main(FakeSandbox(self.tree), sweep)
+        self.assertEqual(out, "")
+        self.assertIn("removed 2 on the agent pod, 1 in the sandbox", log)
+
+    def test_a_broken_config_skips_the_inventory_not_the_job(self):
+        import io
+        hermes_cli = type(sys)("hermes_cli")
+        hermes_cli.kanban_db = type("K", (), {"list_boards": staticmethod(lambda: [])})
+        calls = iter([False, sandbox_exec.SandboxMisconfigured("gone")])
+
+        def enabled():
+            value = next(calls)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch.dict(sys.modules, {"hermes_cli": hermes_cli}), \
+             patch.dict("os.environ", {"PLATFORM_AGENT_HOME": str(self.home)}), \
+             patch.object(sandbox_exec, "sandbox_enabled", side_effect=enabled), \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(gc.main(), 0)
+        self.assertEqual(out.getvalue(), "")
+        log = (self.home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn("inventory skipped: gone", log)
 
     def test_main_logs_to_the_file_and_never_to_chat(self):
         out, log = self.run_main(FakeSandbox(self.tree))
