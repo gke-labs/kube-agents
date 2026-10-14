@@ -4984,7 +4984,7 @@ class TestStart(HarnessTestCase):
                 "declarations_path": str(
                     self.tmp_path / "declarations_compliance-audit.json"
                 ),
-                "sop": "governance/compliance_audit_sop.md",
+                "sop": "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
         )
@@ -5361,9 +5361,8 @@ class TestStart(HarnessTestCase):
                 self.assertEqual(
                     list(audit_report.audit_checks(audit_id)), payload["checks"]
                 )
-                self.assertEqual(
-                    f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
-                )
+                self.assertEqual(audit_report.sop_path(audit_id), payload["sop"])
+                self.assertTrue(Path(payload["sop"]).is_absolute())
 
     def test_start_hands_over_the_context_repositories(self):
         """The declared-intent step searches what `start` names, and nothing else.
@@ -25250,6 +25249,24 @@ class TestNoForge(BaseTestCase):
 
         dirs, unreadable = report_status.scan_repo_dirs(str(self.reports_dir), AUDIT)
         self.assertEqual((dirs, unreadable), ([audit_report.NO_FORGE_REPO], []))
+
+
+class TestSopPath(unittest.TestCase):
+    """`start` sends the worker to its SOP by full path (a kanban worker starts outside the profile home)."""
+
+    def test_the_path_is_under_the_agent_home(self):
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": "/srv/agent"}):
+            self.assertEqual(
+                audit_report.sop_path(AUDIT),
+                "/srv/agent/profiles/platform/governance/compliance_audit_sop.md",
+            )
+
+    def test_every_stream_names_a_file_the_profile_ships(self):
+        governance = Path(__file__).resolve().parents[3] / "governance"
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                name = Path(audit_report.sop_path(audit_id)).name
+                self.assertTrue((governance / name).is_file(), name)
 
 
 if __name__ == "__main__":

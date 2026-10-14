@@ -23,7 +23,7 @@ python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collec
 
 ## 2. Evaluate Findings Against SOP Checks
 
-Read the manifest and follow `governance/gcp_networking_fabric_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `limitations` and `candidates`. All six roster checks are collector-verified; none is yours to hand-run unless a target is `gate-failed` or its `limitations` names a rule as undecided. A check whose read failed is in the target's `checks_unevaluated`, and its `limitations` names that check. Run the collector as the SOP does, without `--check`: that flag narrows a run to the subnet sweep or the project checks, and the manifest it writes leaves the other checks out.
+Read the manifest and follow `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `limitations` and `candidates`. All six roster checks are collector-verified; none is yours to hand-run unless a target is `gate-failed` or its `limitations` names a rule as undecided. A check whose read failed is in the target's `checks_unevaluated`, and its `limitations` names that check. Run the collector as the SOP does, without `--check`: that flag narrows a run to the subnet sweep or the project checks, and the manifest it writes leaves the other checks out.
 
 - `subnet-ip-exhaustion`, on each `<project>/<region>/<subnet>` target: Pod ranges from GKE's own utilization fields, primary ranges as a lower bound from VM NICs, internal addresses and forwarding rules.
 - `cloud-nat-exhaustion`, `psc-routing-deadlock`, `mtu-packet-fragmentation`, `cloud-armor-false-positive` and `firewall-world-open-ingress`, on each `project/<project>` target.
