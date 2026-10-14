@@ -96,7 +96,9 @@ def test_the_window_opens_on_a_refused_writes_result_not_a_reads_or_a_renders():
     assert opens(legacy_tail)
     # A clip that lands inside the block opens nothing through either alternative.
     for cut in ("policy rule: kubernetes.read-only\npolicy ve ...[clipped 300 chars]", "policy rule: kubernetes.read-only ...[clipped 300 chars]",
-                "policy rule: kubernetes.read-only\npolicy verb: scale deployment\npolicy ren ...[clipped 300 chars]"):
+                "policy rule: kubernetes.read-only\npolicy verb: scale deployment\npolicy ren ...[clipped 300 chars]",
+                "policy rule: kubernetes.read-only\npolicy verb: scale dep ...[clipped 300 chars]",
+                "policy rule: kubernetes.read-only\npolicy verb: exec dep ...[clipped 300 chars]"):
         clipped = json.dumps({"output": NOTICE + "\n" + cut, "exit_code": 77})
         assert not opens(clipped), cut
         assert not retries(clipped), cut
@@ -218,7 +220,7 @@ def _alternatives(group: str) -> list[str]:
 
 def test_the_case_verb_list_is_the_runtime_stops():
     # Both directions: every runtime verb is in the result pattern, and it carries no other.
-    group = re.search(r"policy verb: \(\?:(.*?)\)\(\?: \[", RETRY.after_result_pattern).group(1)
+    group = re.search(r"policy verb: \(\?:(.*?)\)\(\?: \(\?:", RETRY.after_result_pattern).group(1)
     plain, nested = set(), {}
     for member in _alternatives(group):
         if "(" not in member:
