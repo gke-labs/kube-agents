@@ -3489,10 +3489,15 @@ class CriteriaTest(unittest.TestCase):
         self.assertEqual(collect.call_args.kwargs["criteria"], pr.DEFAULT_CRITERIA)
 
     def test_an_empty_deprecated_list_is_an_empty_set_not_the_default(self):
-        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                pr.main(["--project", "acme", "--deprecated-image-types", ""])
-        self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset())
+        # `""` and the bare flag both say the operator emptied the list: the SOP's comma-joined
+        # placeholder renders an empty list as the bare flag, which has to parse rather than exit 2,
+        # including when another flag follows it.
+        for argv in (["--deprecated-image-types", ""], ["--deprecated-image-types"], ["--deprecated-image-types", "--pool-skew-critical-minors", "4"]):
+            with self.subTest(argv=argv):
+                with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        self.assertEqual(pr.main(["--project", "acme", *argv]), 0)
+                self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset())
 
     def test_a_critical_rung_at_or_below_the_ceiling_is_refused(self):
         """Two of §3.2's rungs would claim the same pool; the schema's minimum

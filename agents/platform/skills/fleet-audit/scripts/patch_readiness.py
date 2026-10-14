@@ -207,8 +207,11 @@ MAX_FREEZE_HORIZON_DAYS = timedelta.max.days
 # also matches before a trailing newline.
 IMAGE_TYPE_TOKEN_PATTERN = r"^[A-Za-z0-9_]+\Z"
 IMAGE_TYPE_TOKEN_RE = re.compile(IMAGE_TYPE_TOKEN_PATTERN)
-# How `--deprecated-image-types` separates its entries.
+# What joins the shipped entries into the flag's default; the flag itself reads commas or
+# whitespace, as `parse_scope_projects` does.
 IMAGE_TYPE_LIST_SEPARATOR = ","
+# What the flag carries when the operator emptied the list: `""`, or the bare flag.
+EMPTY_IMAGE_TYPE_LIST = ""
 # §3.8's escalation: a freeze beside a critical or major version finding.
 # The severities the SOP grades in, as `finish` spells them.
 CRITICAL, MAJOR, MINOR = "critical", "major", "minor"
@@ -2327,7 +2330,7 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     if malformed:
         parser.error(
             f"--deprecated-image-types: {', '.join(malformed)}: an image type is letters, digits and underscores; "
-            f"pass the store's entries comma-separated, not as a JSON array"
+            f"pass the store's entries comma-separated, not as a JSON array, and \"\" for an emptied list"
         )
     return Criteria(
         pool_skew_critical_minors=args.pool_skew_critical_minors,
@@ -2346,7 +2349,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pool-skew-critical-minors", type=int, default=POOL_SKEW_CRITICAL_MINORS, help="§3.2: a pool this many minors or more behind its control plane is critical (criteria.pool_skew_critical_minors)")
     parser.add_argument("--fleet-spread-min-minors", type=int, default=FLEET_SPREAD_MIN_MINORS, help="§3.3: flag the fleet once its control-plane minors span this many (criteria.fleet_spread_min_minors)")
     parser.add_argument("--blocking-exclusion-min-days", type=int, default=LONG_FREEZE_DAYS, help="§3.8: an upgrade-blocking exclusion ending further out than this many days is flagged on its own (criteria.blocking_exclusion_min_days)")
-    parser.add_argument("--deprecated-image-types", default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated as --scope-projects is (criteria.deprecated_image_types)")
+    # nargs="?" with an empty const: an operator who emptied the list has to be able to say so,
+    # and the SOP's comma-joined placeholder renders an empty list as the bare flag, which
+    # argparse would otherwise refuse as a flag missing its argument. Omitting the flag is the
+    # shipped list.
+    parser.add_argument("--deprecated-image-types", nargs="?", const=EMPTY_IMAGE_TYPE_LIST, default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated as --scope-projects is; \"\" or the bare flag is an emptied list, and omitting the flag is the shipped list (criteria.deprecated_image_types)")
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)
     manifest = collect_fleet(args.project, criteria=criteria_from_args(parser, args))
