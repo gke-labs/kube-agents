@@ -680,47 +680,6 @@ class OutputShapeTest(unittest.TestCase):
         self.assertIn(f"read failed for {report.PROJECTS_LIST_ERROR_SCOPE}", stdout.getvalue())
         self.assertIn("PERMISSION_DENIED", stdout.getvalue())
 
-    def test_main_removes_the_previous_output_before_it_reads(self):
-        # A worker is told the --output file is where the answer is. A run that dies before it
-        # writes must leave none there, not the previous question's report.
-        out_path = os.path.join(tempfile.mkdtemp(), "fleet_readiness.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write('{"stale": true}')
-        with patch.object(report, "build_report", side_effect=RuntimeError("killed")), redirect_stderr(io.StringIO()):
-            with self.assertRaises(RuntimeError):
-                report.main(["--project", "p1", "--target-version", self.target, "--output", out_path])
-        self.assertFalse(os.path.exists(out_path))
-
-    def test_a_run_refused_by_a_flag_value_leaves_no_previous_output(self):
-        # The clear runs ahead of every check that can refuse the run, so a --target-version or
-        # --at that does not parse leaves no earlier report where the worker is sent.
-        for argv in (["--target-version", "1.35"], ["--readiness", "--at", "yesterday"], ["--at", self.target]):
-            with self.subTest(argv=argv):
-                out_path = os.path.join(tempfile.mkdtemp(), "fleet_readiness.json")
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write('{"stale": true}')
-                with patch.object(report, "run_cmd", side_effect=AssertionError("nothing is read")), redirect_stderr(io.StringIO()):
-                    rc = report.main(["--project", "p1", *argv, "--output", out_path])
-                self.assertEqual(rc, report.EXIT_USAGE)
-                self.assertFalse(os.path.exists(out_path))
-
-    def test_main_refuses_an_output_it_cannot_clear(self):
-        # The previous file cannot be removed (its directory is read-only): the run refuses
-        # rather than read the fleet and leave that file where the answer is expected.
-        directory = tempfile.mkdtemp()
-        out_path = os.path.join(directory, "fleet_readiness.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write('{"stale": true}')
-        os.chmod(directory, 0o500)
-        self.addCleanup(os.chmod, directory, 0o700)
-        if os.access(out_path, os.W_OK) and os.getuid() == 0:
-            self.skipTest("root removes the file regardless of the directory mode")
-        err = io.StringIO()
-        with patch.object(report, "run_cmd", side_effect=AssertionError("nothing is read")), redirect_stderr(err):
-            rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_path])
-        self.assertEqual(rc, report.EXIT_USAGE)
-        self.assertIn("could not remove the previous", err.getvalue())
-
     def test_write_json_atomically_leaves_the_previous_file_on_failure(self):
         directory = tempfile.mkdtemp()
         path = os.path.join(directory, "out.json")
@@ -742,6 +701,19 @@ class OutputShapeTest(unittest.TestCase):
             report.main(["--project", "p1", "--target-version", self.target, "--readi"])
         self.assertEqual(exc.exception.code, report.EXIT_USAGE)
         self.assertIn("--readi", err.getvalue())
+
+    def test_a_webhook_read_failure_row_is_tagged_and_a_first_read_failure_row_is_not(self):
+        # The readiness watch tells the two apart: a webhook-side row leaves the member graded
+        # `unknown`; a first-read row is a member the server never answered.
+        read_first_failed = {"error": "kubectl get pdb failed", "webhook_error": None, "webhook_skipped": True}
+        read_second_failed = {"error": None, "webhook_error": "kubectl output cut at the cap", "webhook_skipped": False}
+        for read, expect_tag in ((read_first_failed, False), (read_second_failed, True)):
+            with self.subTest(expect_tag=expect_tag):
+                with patch.object(report, "run_cmd", self.fake), patch.object(report, "read_cluster_objects", return_value=read), patch.object(report, "assess_readiness", return_value={"status": "unknown"}):
+                    data = report.build_report(["p1"], self.target, {"at": report.utc_now(), "kubeconfig_dir": tempfile.mkdtemp()})
+                rows = [e for e in data["errors"] if e.get("cluster")]
+                self.assertTrue(rows)
+                self.assertEqual(all(e.get(report.ERROR_READ_KEY) == report.WEBHOOK_READ for e in rows), expect_tag)
 
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()

@@ -995,6 +995,28 @@ class Budget(Base):
         self.assertEqual([c[2] for c in sandbox.calls if c[0] == "readiness"], [watch.READINESS_TIMEOUT_SECONDS])
 
 
+class WebhookReadFailure(unittest.TestCase):
+    """A member whose first read answered and whose other rules were graded is graded, not
+    unread, when only the second, webhook read failed: its `unknown` is a verdict."""
+
+    def _report(self, read_tag):
+        member = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        error = {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap"}
+        if read_tag:
+            error[watch.ERROR_READ_KEY] = read_tag
+        return {watch.MEMBERS_KEY: [member], watch.ERRORS_KEY: [error]}
+
+    def test_a_webhook_read_failure_leaves_the_member_graded_unknown(self) -> None:
+        key = watch.member_key({"project": "p", "location": "us-central1", "cluster": "big"})
+        blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(watch.WEBHOOK_READ_ERROR), [key])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [], [key], []))
+
+    def test_a_first_read_failure_still_leaves_the_member_unread(self) -> None:
+        key = watch.member_key({"project": "p", "location": "us-central1", "cluster": "big"})
+        blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(None), [key])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [], [], [key]))
+
+
 class ProfileHome(unittest.TestCase):
     def test_a_hand_run_from_the_gateway_home_finds_the_profile_s_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as root:

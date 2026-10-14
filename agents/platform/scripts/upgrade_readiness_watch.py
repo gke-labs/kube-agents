@@ -222,6 +222,9 @@ STATUS_KEY = "status"
 TARGET_KEY = "target_version"
 READINESS_KEY = "readiness"
 ERRORS_KEY = "errors"
+# The key and value fleet_upgrade_report.py puts on an `errors` row the webhook read wrote.
+ERROR_READ_KEY = "read"
+WEBHOOK_READ_ERROR = "webhooks"
 MESSAGE_KEY = "message"
 MEMBER_ID_KEYS = ("project", "location", "cluster")
 # The report's lists whose entries name a project under MEMBER_ID_KEYS[0]: the
@@ -881,7 +884,9 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
     definite blocker beats an unknown."""
     wanted = set(clusters)
     errors = report.get(ERRORS_KEY) or []
-    failed_reads = {member_key(error) for error in errors if error.get(MEMBER_ID_KEYS[-1])}
+    # A row the second, webhook read wrote is not a member the server never answered: its PDB,
+    # maintenance and skew rules were graded, and `unknown` is its verdict, not an absence.
+    failed_reads = {member_key(error) for error in errors if error.get(MEMBER_ID_KEYS[-1]) and error.get(ERROR_READ_KEY) != WEBHOOK_READ_ERROR}
     failed_locations = {
         (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
         for error in errors

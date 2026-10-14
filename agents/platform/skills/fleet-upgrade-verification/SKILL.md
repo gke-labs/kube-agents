@@ -70,7 +70,10 @@ directory use the absolute path, `/opt/data/profiles/platform/skills/fleet-upgra
   full run only, the `rollout` block and the per-member `progress` fields described below. A
   `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
   note where the progress section would be.
-  The file is removed as soon as the flags parse (only a run argparse itself refuses, on a mistyped flag, ends before that) and written whole (a temp file, then a rename) when it finishes, so a run that dies or is refused leaves none: a missing file means the run did not finish, and a reader tells an earlier run's report by its `readiness.evaluated_at`. Give each run a name of its own under `/opt/data/scratch`, which every card shares (the Delegation bullet in `AGENTS.md` adds a timestamp).
+  The file is written whole (a temp file, then a rename) when the run finishes and never
+  before, so a reader never meets a partial document and a run that dies leaves the path as it found
+  it. `/opt/data/scratch` is shared by every card, so a run that must tell its own file from an
+  earlier one gives it a name of its own (the Delegation bullet in `AGENTS.md` adds a timestamp).
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 

@@ -178,10 +178,15 @@ STATE_FILE_SUFFIX = ".json"
 # runs against one target at once (a chat turn and a delegated card) cannot truncate
 # each other's half-written file; the last rename wins whole.
 STATE_TMP_PREFIX = ".fleet-upgrade-record-"
-# The `--output` document is written the same way, and removed when a run starts, so a run
-# that dies before it writes leaves none rather than the previous run's report at the path a
-# reader was told to read.
+# The `--output` document is written the same way, whole, so a reader never meets a partial
+# one; a run that dies before it writes leaves the path as it found it, and a caller that must
+# tell its own run's file from an earlier one names the file per run (the persona's bullet).
 OUTPUT_TMP_PREFIX = ".fleet-upgrade-output-"
+# An `errors` row for the second, webhook read carries this key, so a reader of the report (the
+# readiness watch) can tell a member whose first read answered, and whose other rules were
+# graded, from one the API server never answered.
+ERROR_READ_KEY = "read"
+WEBHOOK_READ = "webhooks"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -913,7 +918,10 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 # A credentials failure fills both slots with one message; a skipped second read is not a failure and gets no row.
                 failed = (read["error"], None if read.get("webhook_skipped") else read["webhook_error"])
                 for message in dict.fromkeys(m for m in failed if m):
-                    errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": message})
+                    row = {"project": project, "location": member["location"], "cluster": member["cluster"], "message": message}
+                    if message != read["error"]:
+                        row[ERROR_READ_KEY] = WEBHOOK_READ
+                    errors.append(row)
                 member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"])
             members.append(member)
     errors.extend(cache.errors)
@@ -1161,24 +1169,6 @@ def save_state(path: str, state: dict) -> None:
     write_json_atomically(path, state, STATE_TMP_PREFIX)
 
 
-def clear_output(path: str) -> str | None:
-    """Removes the `--output` file a previous run left at `path`, as soon as the flags parse and
-    before any check that can refuse the run, so a run that dies or is refused leaves no file
-    rather than the previous question's report where a reader was told the answer is; only a
-    run argparse itself refuses (an unknown or mistyped flag) ends before this runs. Returns the error to report when a file is there and
-    cannot be removed; None when there is none or it is gone. A directory at the path is left
-    for the write to report, as before."""
-    if os.path.isdir(path):
-        return None
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        return f"could not remove the previous {path}: {e}"
-    return None
-
-
 def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
     """The member's entry in the record; an ungraded run keeps the last graded status."""
     lowest = member["lowest_node_pool"]
@@ -1355,15 +1345,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)
-
-    # First thing after the flags parse, ahead of every check that can refuse the run, so a
-    # refused or killed run leaves no previous report at the path a reader was sent to. Only
-    # argparse's own exits (an unknown or mistyped flag) come before this.
-    if args.output:
-        clear_error = clear_output(args.output)
-        if clear_error:
-            sys.stderr.write(clear_error + "\n")
-            return EXIT_USAGE
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")
