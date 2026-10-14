@@ -1016,6 +1016,29 @@ class WebhookReadFailure(unittest.TestCase):
         blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(None), [key])
         self.assertEqual((blocked, ready, unknown, unread), ([], [], [], [key]))
 
+    def test_the_markdown_lists_a_webhook_read_row_apart_from_the_unread_ones(self) -> None:
+        # The summary counts the member as graded (unknown); the row is listed under its own
+        # heading, not under the one that says its member is not graded, which the first-read
+        # row of another member still sits under.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        small = {"project": "p", "location": "us-central1", "cluster": "small", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+            {"project": "p", "location": "us-central1", "cluster": "small", "message": "get-credentials failed: 403"},
+        ]
+        keys = [watch.member_key(big), watch.member_key(small)]
+        text = watch.render_markdown(TARGET, "a new version", keys, envelope([big, small], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 unknown (p/us-central1/big; the table says what it could not decide) and 1 not read (p/us-central1/small;", text)
+        unread_at = text.index(watch.FAILED_READS_HEADING)
+        webhook_at = text.index(watch.WEBHOOK_READ_ROWS_HEADING)
+        self.assertLess(unread_at, webhook_at)
+        self.assertIn("- p/us-central1/small: get-credentials failed: 403", text[unread_at:webhook_at])
+        self.assertNotIn("big", text[unread_at:webhook_at])
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", text[webhook_at:])
+        self.assertTrue(watch.webhook_read_row(rows[0]) and not watch.unread_row(rows[0]))
+        self.assertTrue(watch.unread_row(rows[1]) and not watch.webhook_read_row(rows[1]))
+        self.assertFalse(watch.unread_row({"project": "p", "location": "us-central1", "message": "server config failed"}))
+
 
 class ProfileHome(unittest.TestCase):
     def test_a_hand_run_from_the_gateway_home_finds_the_profile_s_ledger(self) -> None:
