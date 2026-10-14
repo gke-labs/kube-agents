@@ -204,6 +204,13 @@ def _validate_name(name: str) -> str:
     return name
 
 
+def _known(root: Path) -> str:
+    """What stands beside an unknown capability: the ones the store holds, or the root it looked in."""
+    if not root.is_dir():
+        return f"no capabilities directory at {root}"
+    return "known: " + (", ".join(list_capabilities(root)) or "none")
+
+
 def load(root: Path, name: str) -> Capability:
     name = _validate_name(name)
     directory = root / name
@@ -217,8 +224,7 @@ def load(root: Path, name: str) -> Capability:
             f"the volume and the next start re-seeds it empty ({CHANGELOG_FILENAME} keeps what was set)"
         ) from exc
     if criteria is None:
-        known = ", ".join(list_capabilities(root)) or "none"
-        raise CapabilityError(f"unknown capability {name!r}; known: {known}")
+        raise CapabilityError(f"unknown capability {name!r}; {_known(root)}")
     if not isinstance(criteria, dict):
         raise CapabilityError(f"{name}/{CRITERIA_FILENAME} must hold a JSON object")
     schema = _read_json(directory / SCHEMA_FILENAME)
@@ -544,8 +550,16 @@ def _last_logged_revision(directory: Path) -> int:
 
 
 def history(root: Path, name: str, limit: int = MAX_HISTORY_ENTRIES) -> list[dict[str, Any]]:
-    cap = load(root, name)
-    path = cap.directory / CHANGELOG_FILENAME
+    """The changelog's last lines, newest last.
+
+    Read on the directory alone, not through `load`: the trail has to stay readable while
+    `criteria.json` is unreadable or removed, which is the state the store's own refusal sends
+    a reader here from.
+    """
+    directory = root / _validate_name(name)
+    if not directory.is_dir():
+        raise CapabilityError(f"unknown capability {name!r}; {_known(root)}")
+    path = directory / CHANGELOG_FILENAME
     if not path.is_file():
         return []
     entries: list[dict[str, Any]] = []

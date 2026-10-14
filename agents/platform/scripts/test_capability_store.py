@@ -119,14 +119,21 @@ class StoreTest(unittest.TestCase):
         # The scaffold holds a volume criteria file it cannot read rather than replacing it, so a
         # restart does not recover this one; the refusal has to say what does.
         seed(self.root)
+        first = cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
         (self.root / "demo" / cs.CRITERIA_FILENAME).write_text("{not json")
         for call in (lambda: cs.load(self.root, "demo"),
-                     lambda: cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")):
+                     lambda: cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="y", confirmed_by="ops@example")):
             with self.assertRaises(cs.CapabilityError) as ctx:
                 call()
             self.assertIn("remove the file", str(ctx.exception))
             self.assertIn(cs.CRITERIA_FILENAME, str(ctx.exception))
-        self.assertFalse((self.root / "demo" / cs.CHANGELOG_FILENAME).exists(), "nothing was written")
+        # The trail the message points at is readable in that state, and after the file is removed.
+        self.assertEqual(cs.history(self.root, "demo"), [first])
+        (self.root / "demo" / cs.CRITERIA_FILENAME).unlink()
+        self.assertEqual(cs.history(self.root, "demo"), [first])
+        self.assertEqual(cs.list_capabilities(self.root), [], "without its criteria file the capability is not listed")
+        with self.assertRaises(cs.CapabilityError):
+            cs.history(self.root, "nope")
 
     def test_a_capability_without_its_learning_policy_is_refused_not_downgraded(self):
         # Without the policy file every key would read as `propose`, and a key the image marks
