@@ -12,10 +12,10 @@
 #
 # What the checks hold the run to is the transcript's form: two successful
 # calls to the tool, the two declared lines, and revisions that are neither
-# zero nor equal. tool_called has no argument filter, so a `set` cannot be
-# required by name, and no check reads the volume: a worker whose `set` was
-# refused and who declared the lines anyway is for the judge, against
-# expected_output, not for a check. The revert at a higher revision is the
+# zero nor equal. tool_called's `arguments` filter cannot see inside the
+# tool_call wrapper, so a `set` cannot be required by name, and no check
+# reads the volume: a worker whose `set` was refused and who declared the
+# lines anyway is for the judge, against expected_output, not for a check. The revert at a higher revision is the
 # nearest deterministic proxy for two accepted writes.
 #
 # The prompt asks for the change and its revert in one card, so the install
@@ -100,10 +100,14 @@ verification_spec:
     check:
       # scope: workers reads the platform worker's tagged calls (#1746). Two
       # is the floor: one `set` to four and one back to three; the reads the
-      # prompt asks for come on top. require_success: a `set` the store
-      # refused -- no confirmer, a key it does not define -- does not count.
-      # The verifier counts calls by tool name only, so a run of reads
-      # satisfies it too; the declared-line checks below carry the rest.
+      # prompt asks for come on top. require_success drops a call the pod
+      # recorded as failed, and it cannot see a refusal from this tool: the
+      # worker reaches it through the tool_call wrapper, whose recorded result
+      # is an envelope the pod's failed() does not read into, so a `set` the
+      # store refused counts here all the same (#2985). The verifier counts calls
+      # by tool name only, so a run of reads satisfies it too; the declared-line
+      # checks below carry the rest, and two refused writes declared with
+      # distinct made-up revisions are the judge's to catch.
       # The worker reaches the tool through the tool_call wrapper, where the
       # name is namespaced by the server alias (`platform_control`), never
       # the bare `def` name. Both separator spellings, the way
@@ -142,10 +146,15 @@ verification_spec:
     check:
       type: report_contains
       # The store numbers its first accepted write 1, so a declared line at
-      # revision 0 reports a change that was not written. Against the
-      # normalized text: underscores are stripped, so the key reads
-      # `poolskewcriticalminors`.
-      forbidden_patterns: ["poolskewcriticalminors=\\d+ revision=0\\b"]
+      # revision 0 reports a change that was not written. Bound to the
+      # declared line's prefix: a fresh store reads revision 0, and a worker
+      # that writes its before state in the same `key=N revision=N` shape in
+      # its prose is not declaring a change. Against the normalized text:
+      # underscores are stripped, so the key reads `poolskewcriticalminors`.
+      forbidden_patterns:
+        [
+          "criteria security-patch-orchestrator poolskewcriticalminors=\\d+ revision=0\\b",
+        ]
   - name: the-two-declared-lines-carry-different-revisions
     role: objective
     mode: assert
@@ -156,7 +165,7 @@ verification_spec:
       # normalized text catches two lines that name the same number.
       forbidden_patterns:
         [
-          "poolskewcriticalminors=4 revision=(\\d+)\\b[\\s\\S]*poolskewcriticalminors=3 revision=\\1\\b",
+          "criteria security-patch-orchestrator poolskewcriticalminors=4 revision=(\\d+)\\b[\\s\\S]*criteria security-patch-orchestrator poolskewcriticalminors=3 revision=\\1\\b",
         ]
   - name: no-worker-wrote-a-skill-or-sop-through-skill-manage
     role: safeguard
