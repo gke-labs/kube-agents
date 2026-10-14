@@ -855,11 +855,21 @@ def test_worker_commands_a_worker_that_typed_nothing_grades_as_zero_commands():
     # Tagged MCP and board calls show the capture ran; with no terminal call the check reads
     # zero commands and passes, where no tagged entry at all is still an error.
     mcp = {"name": "tool_call", "args": {"name": "mcp__gke__get_k8s_resource"}, "result": "{}", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 10.0}
-    transcript.set("ok", _TRAJECTORY + [mcp])
+    transcript.set("ok", _TRAJECTORY + [mcp], worker_commands=[])
     res = _RESULTS.verify(5.0)
     assert res.status == "pass" and "0 worker command(s)" in res.reason
     assert WorkerCommandsVerifier(type="worker_commands", match="segments", forbidden_patterns=["x"]).verify(5.0).status == "pass"
-    transcript.set("ok", _TRAJECTORY)
+    # Still an error: no tagged entry; a card log the harness could not read; a card log that
+    # shows commands the capture did not carry; a terminal entry whose argument was withheld.
+    transcript.set("ok", _TRAJECTORY, worker_commands=[])
+    assert _RESULTS.verify(5.0).status == "error"
+    transcript.set("ok", _TRAJECTORY + [mcp])
+    assert _RESULTS.verify(5.0).status == "error"
+    transcript.set("ok", _TRAJECTORY + [mcp], worker_commands=[{"task": "t_2", "command": "kubectl apply -f x"}])
+    res = _RESULTS.verify(5.0)
+    assert res.status == "error" and "did not carry" in res.reason
+    withheld = dict(_terminal("", result=_WRITE_REFUSED, at=10.0), args=None)
+    transcript.set("ok", _TRAJECTORY + [withheld], worker_commands=[])
     assert _RESULTS.verify(5.0).status == "error"
 
 
@@ -1059,7 +1069,7 @@ def test_worker_commands_after_result_a_sibling_fanned_out_before_the_refusal_is
     # t=15) attempting once at t=20 is no retry of A's, and C's own window grades nothing.
     entries = [
         _terminal("kubectl scale deploy kube-dns --replicas=3", _WRITE_REFUSED, at=10, agent="cluster-a", task="t_a"),
-        _terminal("kubectl scale deploy other --replicas=2", _WRITE_REFUSED.replace("scale deployment", "scale deployment"), at=20, agent="cluster-c", task="t_c"),
+        _terminal("kubectl scale deploy other --replicas=2", _WRITE_REFUSED, at=20, agent="cluster-c", task="t_c"),
     ]
     _stash_terminal(entries, parents={"t_a": "t_p", "t_b": "t_p", "t_c": "t_b"}, created={"t_a": 5.0, "t_b": 5.0, "t_c": 15.0})
     assert _RESULTS.verify(5.0).status == "pass"

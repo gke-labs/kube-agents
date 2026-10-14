@@ -1421,9 +1421,15 @@ _NO_WORKER_COMMANDS_REASON = (
     "predates command capture -- so this check could not be evaluated"
 )
 _NO_WORKER_TERMINAL_CALLS_REASON = (
-    "no delegated worker's calls are in the trajectory: no card was delegated or the "
-    "worker-trajectory capture did not run, so the ordered read has nothing to read (a "
-    "worker that typed no terminal command but made other tagged calls grades as zero commands)"
+    "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
+    "card was delegated, the worker-trajectory capture did not run, the card log could not be "
+    "read, or the pod withheld a call's arguments, so the ordered read cannot observe its "
+    "subject (a worker whose tagged calls are all MCP or board calls, with an empty card log, "
+    "grades as zero commands)"
+)
+_WITHHELD_WORKER_CALLS_REASON = (
+    "the card log shows terminal commands the worker-trajectory capture did not carry, so the "
+    "ordered read cannot observe its subject"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
@@ -1763,18 +1769,28 @@ class WorkerCommandsVerifier(BaseVerifier):
             graded = commands
         else:
             calls = _worker_terminal_calls(snap.trajectory)
-            tagged = any(isinstance(e, dict) and e.get("agent") for e in snap.trajectory)
-            if not calls and (not tagged or snap.worker_commands):
-                # No tagged worker entry at all (nothing delegated, or the capture did not
-                # run), or a card log that shows typed commands the capture did not carry.
-                # A worker whose tagged calls are all MCP or board calls, with no command
-                # in its log either, typed nothing and grades as zero commands.
-                return VerificationResult(
-                    success=False,
-                    status="error",
-                    elapsed_time=time.monotonic() - start,
-                    reason=_NO_WORKER_TERMINAL_CALLS_REASON,
-                )
+            if not calls:
+                # A worker whose tagged calls are all MCP or board calls, with an empty
+                # card log beside them, typed nothing and grades as zero commands. No
+                # tagged entry at all (nothing delegated, or the capture did not run), a
+                # card log the harness could not read, a card log that shows typed commands
+                # the capture did not carry, or a terminal entry whose argument the pod
+                # withheld, is an error: the read cannot observe its subject.
+                tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in snap.trajectory)
+                dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in snap.trajectory)
+                if snap.worker_commands:
+                    reason = _WITHHELD_WORKER_CALLS_REASON
+                elif not tagged or dropped or snap.worker_commands is None:
+                    reason = _NO_WORKER_TERMINAL_CALLS_REASON
+                else:
+                    reason = None
+                if reason is not None:
+                    return VerificationResult(
+                        success=False,
+                        status="error",
+                        elapsed_time=time.monotonic() - start,
+                        reason=reason,
+                    )
             commands = [command for _, _, command, _, _ in calls]
             untimed = [command for _, at, command, _, _ in calls if at is None]
             if untimed and self.after_result_pattern is not None:
