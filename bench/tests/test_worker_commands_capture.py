@@ -284,6 +284,39 @@ def test_archive_stalled_cards_archives_roots_before_descendants_and_reaches_fix
     assert round_count == 3
 
 
+def test_archive_stalled_cards_bounds_fixpoint_loop_rounds_and_warns(monkeypatch, caplog):
+    # Review finding: fixpoint loop in _archive_stalled_cards must have a round bound
+    # so a runaway worker whose archive failed cannot keep the settle phase looping.
+    calls = []
+    read_count = 0
+
+    def fake_shell(script, timeout):
+        nonlocal read_count
+        calls.append(script)
+        if getattr(board, "DESCENDANTS_PRESENT", "__KANBAN_DESCENDANTS__") in script:
+            read_count += 1
+            # Every read produces a new child id (simulating an immortal prolific worker)
+            payload = {"descendants": [f"t_prolific_child_{read_count}"], "error": None}
+            return f"__KANBAN_DESCENDANTS__\n{json.dumps(payload)}\n"
+        if "kanban archive" in script:
+            # Simulate archive failure/refusal for prolific children
+            if "t_prolific_child" in script:
+                return ""
+            tid = script.split("kanban archive")[1].strip().split()[0].strip("'\"")
+            return f"Archived {tid}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_parent"], 5.0)
+
+    assert read_count == harness._MAX_DESCENDANT_ARCHIVE_ROUNDS
+    assert (
+        f"fan-out child archive loop reached round cap ({harness._MAX_DESCENDANT_ARCHIVE_ROUNDS}) for t_parent; some child workers may still hold dispatcher slots"
+        in caplog.text
+    )
+
+
 def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):
     # _agent_shell returns "" for a failed exec exactly as for silence; the
     # log must not read as if the worker was stopped.

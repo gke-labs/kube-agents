@@ -148,9 +148,10 @@ MAX_SESSION_IDS_SCANNED = 1024
 # bound the pinned hermes' own get_compression_chain uses
 # (hermes_state_compression.py); a chain this deep is pathological.
 MAX_CHAIN_STEPS = 100
-# How many unsettled descendant card ids the descendant read collects before
-# truncating. Settle runs one archive exec per card, bounded by the harness's
-# timeout, so this prevents a runaway loop from stalling the settle phase.
+# How many unsettled descendant card ids a single descendant read collects
+# before truncating. Bounds the SQLite payload returned from the agent pod;
+# the harness settle loop applies _MAX_DESCENDANT_ARCHIVE_ROUNDS to bound
+# overall rounds and total cards archived.
 MAX_DESCENDANTS_SCANNED = 64
 
 # Terminal task statuses considered settled by the eval harness.

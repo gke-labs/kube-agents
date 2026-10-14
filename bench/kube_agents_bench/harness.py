@@ -702,6 +702,14 @@ _POLL_PROMPT = (
 # run record on every turn, so an agent looping on kanban_create would inflate
 # both without bound. Far above any real fan-out.
 _MAX_AWAITED_TASKS = 32
+
+# Maximum rounds _archive_stalled_cards spends re-reading the board for
+# newly fanned-out children. Root cards are archived first to terminate
+# top-level workers; each round archives every child discovered and kills its
+# worker, so a finite tree converges in generations. A round cap prevents an
+# immortal worker whose archive failed or was refused from looping the settle
+# phase indefinitely while filing new cards.
+_MAX_DESCENDANT_ARCHIVE_ROUNDS = 5
 # Reads in a row on which the inject wait's board has no row for an awaited
 # card before the card is dropped from the wait. The status-turn wait ends the
 # same case after _MAX_SILENT_TURNS turns that report nothing for it.
@@ -1034,8 +1042,9 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     card that did not archive is warned about by name, with hermes's reason:
     its worker may still hold a slot, and the run log should not say
     otherwise. Stalled root cards are archived first to terminate their
-    workers before walking descendants to a fixpoint, preventing concurrent
-    fan-out from escaping the pass.
+    workers before walking descendants in bounded rounds (capped by
+    :data:`_MAX_DESCENDANT_ARCHIVE_ROUNDS`) to a fixpoint, preventing concurrent
+    fan-out from escaping the pass or looping indefinitely.
     """
     if not stalled:
         return
@@ -1060,7 +1069,7 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
         _archive(tid)
 
     archived = set(stalled)
-    while True:
+    for _ in range(_MAX_DESCENDANT_ARCHIVE_ROUNDS):
         descendants = board.read_descendants(_agent_shell, list(stalled), timeout)
         if descendants is None:
             _log.warning(
@@ -1074,6 +1083,12 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
         for cid in unarchived:
             archived.add(cid)
             _archive(cid)
+    else:
+        _log.warning(
+            "fan-out child archive loop reached round cap (%d) for %s; some child workers may still hold dispatcher slots",
+            _MAX_DESCENDANT_ARCHIVE_ROUNDS,
+            ", ".join(stalled),
+        )
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
