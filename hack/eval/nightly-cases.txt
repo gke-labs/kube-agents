@@ -249,6 +249,13 @@
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
 #
+# 2026-10-08 adds upgrades-audit-reports-upgrade-blocked (rebased past the
+# 2026-10-09 entries above): one case, three units at the 900s hint the full
+# audits take (hack/ci-eval-pr.sh prices and ceilings it with its siblings).
+# Counted over every entry below, this case, the entry after
+# fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
+# (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
+# file's fourteen.
 # 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
@@ -790,6 +797,13 @@
 # it holds the infra lock, and its run is a full drift audit (the 900s audit
 # band of consistency-drift-outlier).
 ./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would be held. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the

@@ -171,6 +171,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
+    "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
 ]
 # Taken back out of the nightly file after registering there, each with a
