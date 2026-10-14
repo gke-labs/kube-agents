@@ -107,7 +107,9 @@ class SpecToolRegistryTest(unittest.TestCase):
             "kanban_comment",
             "kanban_unblock",
         },
-        "*skill_manage_image_owned*": {"skill_manage"},
+        # The image-owned guard gates the native file tools that write content
+        # beside `skill_manage`, and names both in its quoted form.
+        "*skill_manage_image_owned*": {"skill_manage", "write_file", "patch"},
     }
     HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
 
