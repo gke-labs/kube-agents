@@ -3,6 +3,38 @@
 **Status:** requirements. Nothing here is built beyond what the Scope table credits to an existing
 audit or skill.
 
+## High level summary
+
+A GKE minor upgrade replaces the control plane and rebuilds every node. Either event can stop an
+application that assumed it would never happen. kube-agents answers two questions for every cluster:
+will the next upgrade succeed, and what did the last upgrade change. It does this with four pieces,
+each specified in its own document.
+
+The first piece is a catalogue of twenty ways an upgrade fails, each taken from a published
+incident. For every entry it names the signal that predicts the failure before the upgrade and the
+signal that confirms it afterwards. See
+[`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
+
+The second piece is the readiness report, the subject of this document. Every day, and on request in
+chat, the agent reads every cluster and grades it against the next version: blocked, risk or ready.
+For each finding it names the object that breaks and the change that clears it. Once a week the
+audit files a tracked issue for every cluster whose upgrade would not complete.
+
+The third piece is the retrospective, which runs on the first day of an install and every weekend.
+It reports what each upgrade did, what failed, which catalogue entry the failure matches, and the
+mitigation it set up. Each confirmed failure becomes a guard that the next readiness report reads,
+so the fleet learns from every upgrade. See
+[`upgrade-retrospective.md`](upgrade-retrospective.md).
+
+The fourth piece is proof. Every catalogue entry is planted as a live defect on a seeded test fleet,
+and a nightly evaluation shows that the agent detects each one. See
+[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md) for the scripts, the
+fixtures and the evidence.
+
+All of it is read-only. The agent reports and recommends; a person decides and upgrades. The
+outcome for a team is one answer per cluster family: Go, No-Go or Action required. The answer comes
+with its evidence and a record of every upgrade.
+
 ## The problem, in one paragraph
 
 Kubernetes ships a new minor version every few months, and GKE clusters have to follow. Before a
