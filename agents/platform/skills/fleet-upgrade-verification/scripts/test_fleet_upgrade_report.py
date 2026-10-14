@@ -10,12 +10,13 @@ import tempfile
 import unittest
 import subprocess
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
+import credential_proxy_client  # noqa: E402 -- on sys.path through the reporter's SHARED_SCRIPT_DIRS
 
 # Every resolver asks the operator's answer when a run passes neither scope flag:
 # the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
@@ -312,6 +313,160 @@ class RunCmdTest(unittest.TestCase):
 
 
 class ProjectFailureTest(unittest.TestCase):
+    def test_a_cluster_filter_skips_the_other_members(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["b"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["b"])
+        with patch.object(report, "run_cmd", fake):
+            everything = report.build_report(["p"], target)
+        self.assertEqual([m["cluster"] for m in everything["members"]], ["a", "b"])
+
+    def test_a_location_qualified_filter_leaves_a_same_named_twin_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)]), cluster("prod", "europe-west1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["us-central1/prod"])
+        self.assertEqual([(m["location"], m["cluster"]) for m in result["members"]], [("us-central1", "prod")])
+        with patch.object(report, "run_cmd", fake):
+            both = report.build_report(["p"], target, clusters=["prod"])
+        self.assertEqual(len(both["members"]), 2)
+
+    def test_an_unmatched_cluster_spec_is_an_error_and_exit_one_not_an_empty_report(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prd", "europe-west1/prod", "prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(
+            [(e["location"], e["cluster"], e["message"]) for e in result["errors"]],
+            [
+                (None, "prd", "no cluster matched --cluster 'prd' in p"),
+                ("europe-west1", "prod", "no cluster matched --cluster 'europe-west1/prod' in p"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prd", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn("no cluster matched --cluster 'prd' in p", out.getvalue())
+
+    def test_an_unmatched_spec_over_a_failed_listing_says_the_listing_failed_not_no_match(self):
+        """A project the run could not list may hold the cluster: the line says
+        which projects were listed and which were not, never "no match" over
+        a project it never read."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"other": [cluster("a", "us-central1", target, [("p", target)])]}, {}, failing_projects=["acme"])
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["acme", "other"], target, clusters=["us-central1/prod"])
+        messages = [e["message"] for e in result["errors"]]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("permission denied on acme", messages[0])
+        self.assertEqual(messages[1], "no cluster matched --cluster 'us-central1/prod' in other; acme could not be listed, so whether it is there is unknown")
+        with patch.object(report, "run_cmd", fake):
+            alone = report.build_report(["acme"], target, clusters=["us-central1/prod"])
+        self.assertEqual([e["message"] for e in alone["errors"]][1], "--cluster 'us-central1/prod' could not be matched: acme could not be listed")
+        self.assertNotIn("no cluster matched", " ".join(e["message"] for e in alone["errors"]))
+
+    def test_a_qualified_and_a_bare_spec_naming_one_cluster_are_both_matched(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prod", "us-central1/prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(result["errors"], [])
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prod", "--cluster", "us-central1/prod", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertNotIn("no cluster matched", out.getvalue())
+
+    def test_a_cluster_spec_outside_the_gke_name_grammar_is_a_usage_error_before_any_read(self):
+        """Each half is a GKE name, lowercase letters, digits and hyphens, never
+        a hyphen first: an empty half, a second slash, whitespace from a pasted
+        line, an uppercase letter or a leading hyphen can match nothing, and is
+        refused with the spec as typed rather than reported as a miss."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        for spec in ("/prod", "prod/", "", "us-central1/prod/extra", "us-central1/prod ", " prod", "us-central1/Prod", "us central1/prod", "us-central1/-a", "-us-central1/prod", "-prod"):
+            with self.subTest(spec=spec):
+                err = io.StringIO()
+                with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    # One token, `--cluster=<spec>`: argparse reads a separate
+                    # `-prod` as an option and never hands it to the parser.
+                    rc = report.main(["--project", "p", f"--cluster={spec}", "--target-version", target])
+                self.assertEqual(rc, report.EXIT_USAGE)
+                # The line names the spec as typed, slash and all.
+                self.assertIn(f"--cluster {spec!r} is neither", err.getvalue())
+                self.assertEqual(fake.calls, [])
+        # `/prod` is not the bare form: a direct caller is refused too, rather
+        # than handed `prod` in every location.
+        with patch.object(report, "run_cmd", fake), self.assertRaises(ValueError):
+            report.build_report(["p"], target, clusters=["/prod"])
+        self.assertEqual(fake.calls, [])
+
+    def test_the_spec_half_grammar_is_the_brokers_gke_name_component(self):
+        """One GKE name grammar in the tree: the broker's context component,
+        the scoped pool's copy of it, and this file's spec half. Held equal
+        character for character, anchors aside (every use here is
+        `fullmatch`), and driven with the same inputs, so an edit to one fails
+        here rather than admitting a half the broker refuses."""
+        broker = credential_proxy_client._GKE_CONTEXT_COMPONENT
+        self.assertEqual(report.CLUSTER_SPEC_HALF_RE.pattern, broker.pattern.removeprefix("^").removesuffix(r"\Z"))
+        for candidate in ("abc", "a", "a-b-c", "us-east4", "0abc", "abc-", "-abc", "ABC", "a_b", "a.b", "a/b", "", "a b", "abc\n", "\nabc", "abc\r\n"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    bool(broker.fullmatch(candidate)),
+                    bool(report.CLUSTER_SPEC_HALF_RE.fullmatch(candidate)),
+                    f"the broker and the reporter disagree about {candidate!r}",
+                )
+        self.assertIsNone(report.parse_cluster_spec("us-central1/-a"))
+        self.assertIsNone(report.parse_cluster_spec("-prod"))
+        self.assertEqual(report.parse_cluster_spec("us-central1/a-1"), ("us-central1", "a-1"))
+
+    def test_rollout_in_progress_beside_cluster_is_a_usage_error_before_any_read(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        err = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = report.main(["--project", "p", "--cluster", "prod", "--rollout-in-progress", "--target-version", target])
+        self.assertEqual(rc, report.EXIT_USAGE)
+        self.assertIn(report.ROLLOUT_FLAG_NEEDS_FULL_READ, err.getvalue())
+        self.assertEqual(fake.calls, [])
+
+    def test_a_narrowed_run_leaves_the_rollout_record_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            path = report.state_path(state_dir, target)
+            before = open(path, encoding="utf-8").read()
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            self.assertEqual(open(path, encoding="utf-8").read(), before)
+            self.assertIn(report.NARROWED_RUN_NOTE, out.getvalue())
+
+    def test_a_narrowed_run_marks_its_report_and_a_full_run_does_not(self):
+        """A reader of the JSON (the deprecation scan's floor, the collector's
+        join) has to tell a narrowed `members[]` from a full run whose project
+        held one cluster; `narrowed_to` is that mark."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            output = os.path.join(tmp, "r.json")
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--cluster", "b", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                narrowed = json.load(handle)
+            self.assertEqual(narrowed["narrowed_to"], ["b", "us-central1/b"])
+            self.assertEqual([m["cluster"] for m in narrowed["members"]], ["b"])
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                full = json.load(handle)
+            self.assertIsNone(full["narrowed_to"])
+            self.assertEqual([m["cluster"] for m in full["members"]], ["a", "b"])
+
     def test_one_failed_project_does_not_abort_the_others(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud(
@@ -946,6 +1101,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
             self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
         self.assertTrue(any("declared scope does not list" in e for e in errors))
+
+    def test_the_one_project_the_audit_collector_hands_on_is_the_whole_scope_the_override_needs(self):
+        """The upgrade audit's collector runs this reporter per behind cluster
+        as `--project <p> --scope-projects <p> --cluster ...`, the one project
+        and never the sweep or the unread rows, so its recorded command does
+        not grow with the fleet. That is enough here: with `--project` the
+        scope is read only to pass the project through `override_error`, so
+        the run proceeds on a scoped sandbox with no error and no note."""
+        errors: list[str] = []
+        report.declared_scope.set("payments-prod", None)
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+        self.assertEqual(errors, [])
 
     def test_a_project_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
         errors: list[str] = []
