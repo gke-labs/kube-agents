@@ -17,6 +17,9 @@ from credential_proxy_client import authorization_headers
 
 LOGGER = logging.getLogger("teams-relay-patch")
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
+# Bot Framework caps one activity at about 28 KB; the gateway chunks outbound
+# text against the registry entry's limit, so the entry has to carry it.
+TEAMS_MAX_MESSAGE_LENGTH = 28000
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 
 
@@ -354,14 +357,17 @@ def install() -> None:
         async def send(
             self,
             chat_id: str,
-            message: str,
-            *,
+            content: str,
             reply_to: str | None = None,
-            thread_id: str | None = None,
             metadata: dict[str, Any] | None = None,
+            *,
+            thread_id: str | None = None,
             **kwargs: Any,
         ) -> SendResult:
+            # Same parameter order and names as ``BasePlatformAdapter.send``:
+            # the send tool and the base helpers call ``content=`` by keyword.
             del kwargs
+            message = content
             meta = metadata if isinstance(metadata, dict) else {}
             default_service_url = os.getenv(
                 "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
@@ -413,8 +419,14 @@ def install() -> None:
                 raw_response=response,
             )
 
-        async def send_typing(self, chat_id: str, service_url: str) -> None:
-            """Send a typing indicator activity to Teams."""
+        async def send_typing(
+            self, chat_id: str, metadata: dict[str, Any] | None = None
+        ) -> None:
+            """Send a typing indicator activity to Teams (base signature)."""
+            meta = metadata if isinstance(metadata, dict) else {}
+            service_url = meta.get("serviceUrl") or os.getenv(
+                "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
+            )
             if not is_trusted_service_url(service_url):
                 return
             endpoint = f"v3/conversations/{chat_id}/activities"
@@ -432,6 +444,11 @@ def install() -> None:
                 )
             except Exception:
                 LOGGER.debug("Failed to send typing indicator to Teams", exc_info=True)
+
+        async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+            """Teams channel ids end in ``@thread.<suffix>``; the rest are chats."""
+            chat_type = "channel" if "@thread" in str(chat_id) else "dm"
+            return {"name": str(chat_id), "type": chat_type, "chat_id": str(chat_id)}
 
         async def _process_activity(self, activity: dict[str, Any]) -> None:
             if not isinstance(activity, dict):
@@ -530,7 +547,7 @@ def install() -> None:
             text = (raw_text or "").strip()
             activity_id = str(activity.get("id") or "").strip()
 
-            await self.send_typing(conv_id, service_url)
+            await self.send_typing(conv_id, metadata={"serviceUrl": service_url})
 
             metadata = {
                 "serviceUrl": service_url,
@@ -641,8 +658,56 @@ def install() -> None:
         PlatformRegistry.create_adapter = create_adapter
         PlatformRegistry._teams_relay_patched = True
 
+    def patch_teams_entry(entry: Any) -> None:
+        """Point a ``teams`` registry entry at the relay adapter.
+
+        Hermes bundles its own Teams plugin (``plugins/platforms/teams``) whose
+        entry wants ``TEAMS_CLIENT_ID``/``TEAMS_CLIENT_SECRET`` in the gateway,
+        which the operator never renders. Its deferred registration lands in
+        the profile-scoped map that ``get()`` consults first, so a second
+        entry registered here would be shadowed. The Slack relay patch takes
+        the same route: edit the entry the registry serves, whichever module
+        registered it.
+        """
+        entry.adapter_factory = lambda cfg: TeamsRelayAdapter(cfg)
+        entry.check_fn = lambda: True
+        entry.validate_config = None
+        entry.is_connected = lambda _cfg=None: True
+        entry.standalone_sender_fn = _standalone_send
+        entry.max_message_length = TEAMS_MAX_MESSAGE_LENGTH
+
+    if not getattr(PlatformRegistry, "_teams_relay_entry_patched", False):
+        original_registry_register = PlatformRegistry.register
+
+        def register(self: Any, entry: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(entry, "name", None) == "teams":
+                try:
+                    patch_teams_entry(entry)
+                except Exception:
+                    LOGGER.warning("Teams relay entry patch failed", exc_info=True)
+            # Forward blind: the registry's signature has grown a keyword-only
+            # ``scope`` before, and a TypeError here loses every platform.
+            return original_registry_register(self, entry, *args, **kwargs)
+
+        PlatformRegistry.register = register
+        PlatformRegistry._teams_relay_entry_patched = True
+
+    # Registration order is not a contract. Sweep the live maps for an entry
+    # already in place (read directly: ``get()`` would resolve the bundled
+    # plugin's deferred loader and import it), and register one of our own
+    # only when nothing, concrete or deferred, holds the name yet.
     singleton = registry_module.platform_registry
-    if singleton.get("teams") is None:
+    maps = [getattr(singleton, "_entries", None)]
+    maps.extend((getattr(singleton, "_scoped_entries", None) or {}).values())
+    found = False
+    for scope_entries in maps:
+        if isinstance(scope_entries, dict) and scope_entries.get("teams") is not None:
+            patch_teams_entry(scope_entries["teams"])
+            found = True
+    deferred = [getattr(singleton, "_deferred", None)]
+    deferred.extend((getattr(singleton, "_scoped_deferred", None) or {}).values())
+    pending = any(isinstance(d, dict) and "teams" in d for d in deferred)
+    if not found and not pending:
         try:
             singleton.register(
                 registry_module.PlatformEntry(
@@ -652,10 +717,11 @@ def install() -> None:
                     check_fn=lambda: True,
                     is_connected=lambda _cfg=None: True,
                     standalone_sender_fn=_standalone_send,
+                    max_message_length=TEAMS_MAX_MESSAGE_LENGTH,
                 )
             )
         except Exception:
-            # Without the entry, Platform("teams") cannot resolve and no
+            # Without an entry, Platform("teams") cannot resolve and no
             # adapter is built: say so where an operator reads.
             LOGGER.warning(
                 "Teams platform registration failed; the adapter is unavailable",

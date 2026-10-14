@@ -1,3 +1,4 @@
+import abc
 import dataclasses
 import enum
 import json
@@ -31,26 +32,40 @@ def _register_fake_modules():
         label: str = ""
         adapter_factory: object = None
         check_fn: object = None
+        validate_config: object = None
         is_connected: object = None
         standalone_sender_fn: object = None
         source: str = "plugin"
+        max_message_length: int = 0
 
     class PlatformRegistry:
+        """The maps and lookups of the upstream registry: a global map, a
+        per-profile scoped map that ``get()`` consults first, and deferred
+        loaders a plugin's lazy registration leaves behind."""
+
         def __init__(self):
             self._entries = {}
+            self._scoped_entries = {}
+            self._deferred = {}
+            self._scoped_deferred = {}
 
         def create_adapter(self, name, *args, **kwargs):
             return None
 
         def register(self, entry, *, scope=None):
-            del scope
-            self._entries[entry.name] = entry
+            if scope is None:
+                self._entries[entry.name] = entry
+            else:
+                self._scoped_entries.setdefault(scope, {})[entry.name] = entry
 
         def get(self, name):
+            for scoped in self._scoped_entries.values():
+                if name in scoped:
+                    return scoped[name]
             return self._entries.get(name)
 
         def is_registered(self, name):
-            return name in self._entries
+            return self.get(name) is not None
 
     registry_mod.PlatformEntry = PlatformEntry
     registry_mod.PlatformRegistry = PlatformRegistry
@@ -105,11 +120,33 @@ def _register_fake_modules():
         user_name: str | None = None
         thread_id: str | None = None
 
-    class BasePlatformAdapter:
+    class BasePlatformAdapter(abc.ABC):
+        """The abstract set and call signatures of the upstream base, so an
+        adapter that cannot be instantiated there cannot be instantiated here."""
+
         def __init__(self, config, platform):
             self.config = config
             self.platform = platform
             self._message_handler = None
+
+        @abc.abstractmethod
+        async def connect(self, *, is_reconnect=False):
+            ...
+
+        @abc.abstractmethod
+        async def disconnect(self):
+            ...
+
+        @abc.abstractmethod
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            ...
+
+        @abc.abstractmethod
+        async def get_chat_info(self, chat_id):
+            ...
+
+        async def send_typing(self, chat_id, metadata=None):
+            return None
 
         def set_message_handler(self, handler):
             self._message_handler = handler
@@ -407,7 +444,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
             res = await adapter.send(
                 chat_id="conv-123",
-                message="Fleet audit passing",
+                content="Fleet audit passing",
                 thread_id="reply-thread-1",
                 metadata={
                     "title": "Audit Pass",
@@ -419,8 +456,45 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res.raw_response, {"id": "msg-1"})
 
             await adapter.send_typing(
-                "conv-123", "https://smba.trafficmanager.net/teams/"
+                "conv-123", metadata={"serviceUrl": "https://smba.trafficmanager.net/teams/"}
             )
+            self.assertEqual(
+                await adapter.get_chat_info("19:abc@thread.tacv2"),
+                {"name": "19:abc@thread.tacv2", "type": "channel", "chat_id": "19:abc@thread.tacv2"},
+            )
+
+    async def test_bundled_teams_entry_is_taken_over(self):
+        """A ``teams`` entry another module registered first, in the scoped
+        map ``get()`` consults first, ends up pointing at the relay adapter."""
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        foreign = PlatformEntry(
+            name="teams",
+            label="bundled",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: False,
+            is_connected=lambda _cfg=None: False,
+            standalone_sender_fn=None,
+        )
+        platform_registry.register(foreign, scope="profile-a")
+        self.addCleanup(platform_registry._scoped_entries.pop, "profile-a", None)
+
+        teams_relay_patch.install()
+
+        served = platform_registry.get("teams")
+        self.assertIs(served, foreign)
+        self.assertTrue(served.check_fn())
+        self.assertTrue(served.is_connected())
+        self.assertEqual(served.max_message_length, 28000)
+        self.assertIsNotNone(served.standalone_sender_fn)
+        self.assertEqual(served.standalone_sender_fn.__module__, "teams_relay_patch")
+
+        # And an entry registered after install() is patched on the way in.
+        late = PlatformEntry(name="teams", label="late", check_fn=lambda: False)
+        platform_registry.register(late, scope="profile-b")
+        self.addCleanup(platform_registry._scoped_entries.pop, "profile-b", None)
+        self.assertTrue(late.check_fn())
+        self.assertEqual(late.max_message_length, 28000)
 
     async def test_unauthorized_tenant_rejected(self):
         from gateway.platform_registry import PlatformRegistry
