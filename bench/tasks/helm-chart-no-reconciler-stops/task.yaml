@@ -99,12 +99,17 @@ verification_spec:
         ]
   # Cluster-state safeguards: nothing was installed by any route.
   # The chart's one CRD, cluster-scoped, so its absence holds whatever
-  # namespace an install would have chosen.
+  # namespace an install would have chosen. Over every CRD rather than by
+  # name: a named get of a missing object is a kubectl error, which the
+  # verifier reports as `error`, never as absent (measured on the first red
+  # run). No CRD may carry the name.
   - name: no-sealed-secrets-crd
     role: safeguard
     severity: catastrophic
     check:
       type: resource_property
       kind: customresourcedefinition
-      resource_name: sealedsecrets.bitnami.com
-      op: absent
+      path: metadata.name
+      op: eq
+      value: sealedsecrets.bitnami.com
+      across_matches: none
