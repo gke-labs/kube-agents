@@ -230,11 +230,16 @@ REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcl
 # The calendar-mode advice role on a project provisioned before the composition
 # created it: the role, then the binding, as docs/ci-pool-projects.md section 3
 # spells out. Two commands rather than _project_binding's one because the role
-# has to exist before it can be bound.
+# has to exist before it can be bound, and idempotent like the rest of the
+# repairs: the finding reads the project policy alone, so it fires the same
+# for a role that exists unbound, and a bare `roles create` would then exit
+# non-zero on the existing id. The describe guard skips the create in that
+# case and the binding runs either way.
 REPAIR_CALENDAR_MODE_ROLE = (
-    "gcloud iam roles create {role_id} --project={project_id} "
-    '--title="Kube-Agents calendar-mode advice (read-only)" --permissions={permission} --stage=GA '
-    '&& gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
+    "gcloud iam roles describe {role_id} --project={project_id} >/dev/null 2>&1 "
+    "|| gcloud iam roles create {role_id} --project={project_id} "
+    '--title="Kube-Agents calendar-mode advice (read-only)" --permissions={permission} --stage=GA; '
+    'gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
     "(docs/ci-pool-projects.md section 3)"
 )
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
@@ -359,15 +364,26 @@ REPAIR_HOST_OTEL_SCOPE = (
     f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
 )
 FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
-# Findings a leased run passes with. Every other finding reds the run that
-# leases the project -- a missing grant, API, key or cluster is a 403 or a
-# missing resource in the agent's transcript -- and the health bot's pool-drift
-# advice tells the pull request so. A host cluster without the scope installs,
-# serves and grades like any other; only its traces are missing. The bot reads
-# this set (scripts/eval_dashboard/pool_state.py `passes_leases`, for
-# health.py's rule 3e) before wording the advice, so a 403 on a project whose
-# findings are all here is reported as the change's to read, not the pool's.
-LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
+# The platform GSA's calendar-mode advice role missing (the constants it is
+# built from are beside PLATFORM_GSA_ROLES below). One id for every project,
+# unlike the other platform-gsa/missing ids, which carry the role name: this
+# role's full name embeds the project id, and the pool-state scan groups
+# findings by id to tell "the pool drifted" from "one project is odd".
+FINDING_PLATFORM_CALENDAR_MODE_ROLE = "iam/platform-gsa/missing/calendar-mode-advice-role"
+# Findings a leased run passes with. Every finding outside this set reds the
+# run that leases the project -- a missing grant, API, key or cluster is a 403
+# or a missing resource in the agent's transcript -- and the health bot's
+# pool-drift advice tells the pull request so. A host cluster without the
+# scope installs, serves and grades like any other; only its traces are
+# missing. A project without the calendar-mode advice role serves the
+# presubmit in full: no case on the blocking roster runs `gcloud beta compute
+# advice calendar-mode`, and the one case that does
+# (obtainability-window-planning-probe) is nightly-only, so the finding is the
+# nightly's to read and not a pull request's. The bot reads this set
+# (scripts/eval_dashboard/pool_state.py `passes_leases`, for health.py's rule
+# 3e) before wording the advice, so a 403 on a project whose findings are all
+# here is reported as the change's to read, not the pool's.
+LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE, FINDING_PLATFORM_CALENDAR_MODE_ROLE})
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -1573,6 +1589,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                 )
                 for role in sorted(platform_missing):
                     if role == calendar_mode_role:
+                        finding_id = FINDING_PLATFORM_CALENDAR_MODE_ROLE
                         repair = REPAIR_CALENDAR_MODE_ROLE.format(
                             role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
                             project_id=project_id,
@@ -1581,9 +1598,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                             role=role,
                         )
                     else:
+                        finding_id = f"iam/platform-gsa/missing/{role}"
                         repair = _project_binding(project_id, platform_member, role)
                     findings.append(Finding(
-                        f"iam/platform-gsa/missing/{role}",
+                        finding_id,
                         f"The platform agent GSA is missing {role} on {project_id}",
                         repair,
                     ))

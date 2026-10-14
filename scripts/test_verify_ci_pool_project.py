@@ -426,7 +426,21 @@ class GkeAndCmekTest(unittest.TestCase):
         # it says the opposite. Widening the set is a claim about a finding's
         # effect on a run, made here beside the finding that emits it.
         self.assertEqual(checker.FINDING_HOST_OTEL_SCOPE, "gke/host-otel-scope")
-        self.assertEqual(checker.LEASE_SILENT_FINDINGS, frozenset({checker.FINDING_HOST_OTEL_SCOPE}))
+        self.assertEqual(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE, "iam/platform-gsa/missing/calendar-mode-advice-role")
+        self.assertEqual(
+            checker.LEASE_SILENT_FINDINGS,
+            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE}),
+        )
+
+    def test_the_calendar_mode_role_is_not_on_the_presubmit_roster(self):
+        # What makes its finding lease-silent: the presubmit runs the blocking
+        # roster, and no case there runs `advice calendar-mode`. If one ever
+        # does, the finding reds presubmit leases and leaves the silent set.
+        roster = (checker._ROOT / "hack" / "eval" / "blocking-roster.txt").read_text()
+        presubmit = (checker._ROOT / "hack" / "eval" / "presubmit-cases.txt").read_text()
+        for text in (roster, presubmit):
+            entries = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+            self.assertNotIn("obtainability-window-planning-probe", "\n".join(entries))
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
@@ -3703,11 +3717,16 @@ class IamGrantsTest(unittest.TestCase):
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
         role = "projects/kube-agents-evals-3/roles/kubeAgentsCalendarModeAdvice"
-        finding = next(f for f in result.findings if f.id == f"iam/platform-gsa/missing/{role}")
+        # One id for every project: the pool-state scan groups by it.
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertNotIn("kube-agents-evals-3", finding.id)
+        self.assertIn(role, finding.observed)
         member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id="kube-agents-evals-3")
-        self.assertIn("gcloud iam roles create kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3", finding.repair)
+        # Idempotent: an existing role skips the create and the binding still runs.
+        self.assertIn("gcloud iam roles describe kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 >/dev/null 2>&1 || gcloud iam roles create kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3", finding.repair)
         self.assertIn("--permissions=compute.advice.calendarMode", finding.repair)
-        self.assertIn(f'gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
+        self.assertIn(f'; gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
+        self.assertNotIn("&&", finding.repair)
         self.assertNotIn(checker.REPAIR_CONFIRM_PREFIX, finding.repair)
 
     def test_platform_gsa_holding_the_calendar_mode_role_is_not_an_extra(self):
