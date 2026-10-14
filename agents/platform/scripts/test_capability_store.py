@@ -156,6 +156,32 @@ class StoreTest(unittest.TestCase):
         (line,) = cs.history(self.root, "demo")
         self.assertEqual((line["revision"], line["changes"]), (1, {"threshold": {"before": 3, "after": 4}}))
 
+    def test_a_torn_changelog_tail_is_sealed_not_extended(self):
+        # An append that failed part-way (a full disk, a kill mid-flush) leaves the file ending
+        # mid-line. The next line has to start on a line of its own: glued onto the fragment it
+        # is one line `history` cannot parse, and the accepted change vanishes with the garbage.
+        seed(self.root)
+        changelog = self.root / "demo" / cs.CHANGELOG_FILENAME
+        first = cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        fragment = json.dumps(dict(first, revision=2), sort_keys=True)[:60]
+        with changelog.open("a", encoding="utf-8") as fh:
+            fh.write(fragment)
+        second = cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="y", confirmed_by="ops@example")
+        self.assertEqual(second["revision"], 2)
+        self.assertEqual(cs.history(self.root, "demo"), [first, second], "the accepted change is readable")
+        lines = changelog.read_text(encoding="utf-8").split("\n")
+        self.assertEqual(lines[1], fragment, "the fragment stays, on a line of its own")
+        self.assertEqual(json.loads(lines[2]), second)
+        self.assertEqual(lines[3], "", "the file ends in a newline again")
+        # A fragment as the whole file, from a first append that failed: sealed the same way.
+        seed(self.root, "fresh")
+        torn = self.root / "fresh" / cs.CHANGELOG_FILENAME
+        torn.write_text(fragment, encoding="utf-8")
+        only = cs.apply_changes(self.root, "fresh", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        self.assertEqual(only["revision"], 1)
+        self.assertEqual(cs.history(self.root, "fresh"), [only])
+        self.assertEqual(torn.read_text(encoding="utf-8").split("\n")[0], fragment)
+
     def test_a_pattern_on_a_string_is_enforced(self):
         # The flag that carries a list cannot carry an entry with a comma, a space or a quote, so
         # the schema refuses it at the store and `get`, the flag and the manifest agree.

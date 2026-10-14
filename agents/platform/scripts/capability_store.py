@@ -16,7 +16,9 @@ Each capability directory holds:
                         change with and without an operator's confirmation
   changelog.jsonl       one line per change the store set out to write, appended
                         before the value moves, so a line whose value write failed
-                        stays and the next revision counts past it; nothing rewrites it
+                        stays and the next revision counts past it; nothing rewrites
+                        it, and a tail a failed append left torn is sealed with a
+                        newline before the next line
 
 Every write goes through ``apply_changes`` so the policy is enforced in code
 rather than in a prompt. What the code can enforce: a key marked ``never``
@@ -57,6 +59,7 @@ CRITERIA_FILENAME = "criteria.json"
 SCHEMA_FILENAME = "criteria.schema.json"
 LEARNING_FILENAME = "learning.json"
 CHANGELOG_FILENAME = "changelog.jsonl"
+CHANGELOG_LINE_END = b"\n"
 # Held for the whole read -> validate -> write of one change. A cron child and
 # a kanban worker each run their own platform_control process against the same
 # volume, so without it two simultaneous sets would lose one update.
@@ -471,10 +474,29 @@ def _apply_locked(
     # The changelog line lands before the value moves. A failure between the two writes then
     # leaves a changelog line for a value that never took effect, which `history` shows, rather
     # than a value in effect that no line explains.
-    with (cap.directory / CHANGELOG_FILENAME).open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    _append_changelog_line(cap.directory / CHANGELOG_FILENAME, entry)
     write_json_atomic(cap.directory / CRITERIA_FILENAME, stored, sort_keys=True)
     return entry
+
+
+def _append_changelog_line(path: Path, entry: dict[str, Any]) -> None:
+    """Append one line, sealing a torn tail first.
+
+    An append that failed part-way leaves the file ending mid-line with no newline: a full
+    disk persists what fit before ENOSPC, and a kill between the write(2) calls a long entry
+    takes does the same. Appending straight after it would glue this entry onto the fragment,
+    one line `history` cannot parse, and the accepted change would vanish with the garbage. So
+    when the last byte is not a newline, one is written ahead of this line: the fragment becomes
+    a line of its own, which the readers skip, and this entry stays whole.
+    """
+    seal = b""
+    if path.is_file() and path.stat().st_size > 0:
+        with path.open("rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != CHANGELOG_LINE_END:
+                seal = CHANGELOG_LINE_END
+    with path.open("ab") as fh:
+        fh.write(seal + json.dumps(entry, sort_keys=True).encode("utf-8") + CHANGELOG_LINE_END)
 
 
 def _last_logged_revision(directory: Path) -> int:
