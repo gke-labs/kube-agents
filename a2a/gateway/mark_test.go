@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"slices"
 	"testing"
@@ -234,13 +235,52 @@ func TestMarkNotifyKeyFollowsItsAskIntoAContinuingChain(t *testing.T) {
 func TestMarkSessionHoldsUntilEveryChainsCardsSettle(t *testing.T) {
 	g, obs := markRig()
 	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
-		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", NotifyKeys: []string{"plan-1"}, Mark: &MarkState{Ask: "investigate"}},
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", NotifyKeys: []string{"plan-1"}, Mark: &MarkState{Ask: "investigate"}, MarkedAt: time.Now()},
 		{ID: "b", RootTaskID: "b", AskMessageID: "20.0", Mark: &MarkState{Ask: "upgrade"}},
 	}}
 	g.applyTerminalMark(rec, "b", lib.StateCompleted)
 	g.applyNotifyMark(rec, "plan-1", MarkState{})
 	if want := []string{"slack:C1/10.0 investigate/", "slack:C1/10.0 /"}; !slices.Equal(obs.changes, want) {
 		t.Errorf("MarkChanged = %v, want %v", obs.changes, want)
+	}
+}
+
+// An older ask's hold is bounded: one whose mark was last drawn longer ago
+// than markOlderAskHold (a card that died before its settle, or a settle the
+// gateway lost) no longer holds the session.
+func TestMarkSessionHoldOnAnOlderAskExpires(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", NotifyKeys: []string{"plan-1"}, Mark: &MarkState{Ask: "investigate"},
+			MarkedAt: time.Now().Add(-markOlderAskHold - time.Minute)},
+		{ID: "b", RootTaskID: "b", AskMessageID: "20.0", Mark: &MarkState{Ask: "upgrade"}},
+	}}
+	g.applyTerminalMark(rec, "b", lib.StateCompleted)
+	if want := []string{"slack:C1/10.0 /"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v (the stale older ask no longer holds)", obs.changes, want)
+	}
+}
+
+// A key in use stays bound however many keys its chain binds after it, as
+// the notifier keeps a key edited all along: the plan's settle still reaches
+// its ask after sixteen keyed questions and a newer chain.
+func TestMarkNotifyKeyInUseStaysBound(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{{ID: "a", RootTaskID: "a", AskMessageID: "10.0"}}}
+	g.applyNotifyMark(rec, "plan", MarkState{Ask: "investigate"})
+	for n := range notifyUpdateKeysMax - 1 {
+		g.applyNotifyMark(rec, fmt.Sprintf("q-%d", n), MarkState{Ask: "investigate", Settle: "blocked"})
+		g.applyNotifyMark(rec, "plan", MarkState{Ask: "investigate"})
+	}
+	g.applyNotifyMark(rec, "q-last", MarkState{Ask: "investigate", Settle: "blocked"})
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "b", RootTaskID: "b", AskMessageID: "20.0"})
+	rec.ActiveTask = &ActiveTask{TaskID: "b"}
+	if !g.applyNotifyMark(rec, "plan", MarkState{}) {
+		t.Fatal("the plan's settle drew nothing")
+	}
+	want := []string{"slack:C1/10.0 -investigate@10.0", "slack:C1/10.0 -blocked@10.0"}
+	if got := obs.reactionCalls(); !slices.Equal(got[len(got)-len(want):], want) {
+		t.Errorf("reactions = %v, want them to end with %v (the plan's ask settled)", got, want)
 	}
 }
 

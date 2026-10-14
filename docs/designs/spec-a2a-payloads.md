@@ -697,7 +697,7 @@ carry the same chat message:
   only a message the gateway itself posted for that same conversation and key. A key it
   has no message for (another conversation's, one evicted, or one lost to a restart)
   posts a new message and edits nothing. A conversation holds at most 16 live keys, and
-  the oldest is evicted first, so a chatty card can't grow gateway state without bound.
+  the least recently used is evicted first, so a chatty card can't grow gateway state without bound.
 - **`mark`** on a conversation notify marks the message of the chain the card belongs to,
   and counts as that chain's newest writer once every task in it has ended. A notify names
   no task, so its `update` key names the chain: the first notify with a key and a `mark`

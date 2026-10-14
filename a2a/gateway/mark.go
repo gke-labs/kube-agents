@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"slices"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -17,6 +18,12 @@ const (
 	markSettleBlocked = "blocked"
 	// markSettleFailed is what a newest task ending failed with no mark sets.
 	markSettleFailed = "failed"
+	// markOlderAskHold bounds how long an older ask's open mark holds the
+	// Agent Session after it was last drawn (sessionMark). Only a notify
+	// can settle an older ask, so a settle lost to a card that died or to
+	// the gateway would otherwise hold Working… on every later ask. Four
+	// hours is when the emitter drops a plan it set aside for silence.
+	markOlderAskHold = 4 * time.Hour
 )
 
 // MarkState is one message's whole mark: the ask kind and the settle, each
@@ -171,14 +178,22 @@ func (rec *SessionRecord) notifyChainIndex(update string) int {
 	return -1
 }
 
-// bindNotifyKey binds update to the chain root at rec.Tasks[i], keeping the
-// newest notifyUpdateKeysMax keys there.
-func (rec *SessionRecord) bindNotifyKey(i int, update string) {
-	keys := append(rec.Tasks[i].NotifyKeys, update)
+// bindNotifyKey binds update to the chain root at rec.Tasks[i], or marks it
+// the most recently used there, keeping notifyUpdateKeysMax keys, the least
+// recently used dropped first as the notifier drops them (notifyUpdates), so
+// a plan's key edited all along stays bound. It reports whether the keys
+// changed.
+func (rec *SessionRecord) bindNotifyKey(i int, update string) bool {
+	keys := rec.Tasks[i].NotifyKeys
+	if n := len(keys); n > 0 && keys[n-1] == update {
+		return false
+	}
+	keys = append(slices.DeleteFunc(slices.Clone(keys), func(k string) bool { return k == update }), update)
 	if len(keys) > notifyUpdateKeysMax {
 		keys = keys[len(keys)-notifyUpdateKeysMax:]
 	}
 	rec.Tasks[i].NotifyKeys = keys
+	return true
 }
 
 // askIndex is the index of the newest chain root marking askMessageID: the
@@ -218,13 +233,10 @@ func (rec *SessionRecord) runningAsk() string {
 // while a chain runs. It reports whether the record changed.
 func (g *Gateway) applyNotifyMark(rec *SessionRecord, update string, next MarkState) bool {
 	i := rec.notifyChainIndex(update)
-	bound := false
 	if i < 0 && update != "" {
-		if i = rec.latestChainIndex(); i >= 0 {
-			rec.bindNotifyKey(i, update)
-			bound = true
-		}
+		i = rec.latestChainIndex()
 	}
+	bound := i >= 0 && update != "" && rec.bindNotifyKey(i, update)
 	if i < 0 {
 		if rec.ActiveTask != nil {
 			g.log.Info("notify: mark names no chain and a chain runs in the conversation; dropped", "conversation", rec.Key)
@@ -246,10 +258,13 @@ func (g *Gateway) applyNotifyMark(rec *SessionRecord, update string, next MarkSt
 // does (its cards still running, or blocked on the person), in which case
 // the newest such ask's, so the session holds until every chain's cards
 // have settled. An older ask holds it only while a notify key is bound to
-// it: nothing else reaches an older ask, so one no key reaches (a keyless
-// card's, or one marked before keys were bound) would hold Working… for
-// good. Each ask counts once, by the chain holding what is drawn there now.
+// it and for markOlderAskHold after its mark was last drawn: nothing but a
+// notify reaches an older ask, so one no key reaches (a keyless card's, or
+// one marked before keys were bound), or whose settle was lost, would hold
+// Working… for good. Each ask counts once, by the chain holding what is
+// drawn there now.
 func (rec *SessionRecord) sessionMark() MarkState {
+	now := time.Now()
 	open := func(m MarkState) bool { return m.Ask != "" || m.Settle == markSettleBlocked }
 	keyed := map[string]bool{}
 	for _, ref := range rec.Tasks {
@@ -273,7 +288,7 @@ func (rec *SessionRecord) sessionMark() MarkState {
 			latest = m
 		}
 		seen[ref.AskMessageID] = true
-		if open(m) && (first || keyed[ref.AskMessageID]) {
+		if open(m) && (first || keyed[ref.AskMessageID] && now.Sub(ref.MarkedAt) < markOlderAskHold) {
 			return m
 		}
 	}
@@ -311,10 +326,10 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 		}
 	}
 	if next == (MarkState{}) {
-		ref.Mark = nil
+		ref.Mark, ref.MarkedAt = nil, time.Time{}
 	} else {
 		stored := next
-		ref.Mark = &stored
+		ref.Mark, ref.MarkedAt = &stored, time.Now().UTC()
 	}
 	// The observer holds the session mark, so an older chain's late mark (a
 	// stopped task ending after a newer ask) redraws its own message without

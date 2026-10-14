@@ -319,8 +319,11 @@ type TaskRef struct {
 	// the conversation's latest chain the first time a notify carrying it
 	// and a mark arrives, and every later mark with that key marks this
 	// chain's ask, whatever chain has started since (applyNotifyMark). At
-	// most notifyUpdateKeysMax, the oldest dropped first.
-	NotifyKeys []string `json:"notifyKeys,omitempty"`
+	// most notifyUpdateKeysMax, the least recently used dropped first, as
+	// the notifier keeps its keys. MarkedAt is when Mark was last drawn,
+	// what bounds an older ask's hold on the Agent Session (sessionMark).
+	NotifyKeys []string  `json:"notifyKeys,omitempty"`
+	MarkedAt   time.Time `json:"markedAt,omitzero"`
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to

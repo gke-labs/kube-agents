@@ -1666,7 +1666,7 @@ mark still carries its ask (card work still open), `suspended` while its settle 
 and `closed` after. When the latest chain's mark holds no open work and an older ask's still
 does (its cards still running, or blocked), the session follows the newest such ask instead,
 so it holds until every chain's cards have settled. Only an older ask a notify `update` key
-is bound to holds it, since nothing else can settle an older ask. `closed` is sent even for a thread this process never opened, since a restarted gateway
+is bound to holds it, and for at most four hours after its mark was last drawn, since nothing else can settle an older ask and a lost settle would otherwise hold it for good. `closed` is sent even for a thread this process never opened, since a restarted gateway
 otherwise leaves the old process's Working… on it; the thread is renamed once from its first
 verified ask that is not a gateway command, with today's title sanitiser. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
@@ -1785,7 +1785,7 @@ forgotten first, so a plan edited all along outlives the questions filed after i
 `mark` is drawn once its post lands, on the ask of the chain its `update` key is bound to
 (spec-a2a-payloads.md, "Card work after the task ends"): the first keyed `mark` binds the key
 to the conversation's latest chain, recorded on that chain's root history entry beside its
-mark (at most 16 keys a chain), so the binding survives a restart and a later `mark` with the
+mark (at most 16 keys a chain, the least recently used dropped first, as the notifier drops them), so the binding survives a restart and a later `mark` with the
 key reaches that ask while a newer chain runs. A `mark` with no key goes to the latest chain
 once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
 chain runs.
