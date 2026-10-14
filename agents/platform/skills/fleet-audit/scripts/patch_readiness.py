@@ -228,8 +228,6 @@ IMAGE_TYPE_TOKEN_RE = re.compile(IMAGE_TYPE_TOKEN_PATTERN)
 # What joins the shipped entries into the flag's default; the flag itself reads commas or
 # whitespace, as `parse_scope_projects` does.
 IMAGE_TYPE_LIST_SEPARATOR = ","
-# What the flag carries when the operator emptied the list: `""`, or the bare flag.
-EMPTY_IMAGE_TYPE_LIST = ""
 # §3.8's escalation: a freeze beside a critical or major version finding.
 # The severities the SOP grades in, as `finish` spells them.
 CRITICAL, MAJOR, MINOR = "critical", "major", "minor"
@@ -2346,9 +2344,13 @@ def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace
     # Compared case-insensitively, as §3.9 reads image types; an empty flag is
     # an operator who emptied the list, not the default. The list grammar is
     # the one the scope flags on this same command line use, commas or
-    # whitespace with each entry once, so one command line has one grammar.
-    # Each entry is held to the schema's pattern as given, before the upper-casing.
-    entries = fleet_scope_args.parse_scope_projects(args.deprecated_image_types)
+    # whitespace with each entry once, so one command line has one grammar;
+    # the flag takes it quoted as one word or unquoted as several (nargs="*"),
+    # which arrive as a list the separator joins back, while the omitted flag
+    # arrives as the default string. Each entry is held to the schema's
+    # pattern as given, before the upper-casing.
+    raw = args.deprecated_image_types
+    entries = fleet_scope_args.parse_scope_projects(raw if isinstance(raw, str) else IMAGE_TYPE_LIST_SEPARATOR.join(raw))
     malformed = sorted(item for item in entries if not IMAGE_TYPE_TOKEN_RE.match(item))
     if malformed:
         parser.error(
@@ -2412,11 +2414,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pool-skew-critical-minors", type=int, default=POOL_SKEW_CRITICAL_MINORS, help="§3.2: a pool this many minors or more behind its control plane is critical (criteria.pool_skew_critical_minors)")
     parser.add_argument("--fleet-spread-min-minors", type=int, default=FLEET_SPREAD_MIN_MINORS, help="§3.3: flag the fleet once its control-plane minors span this many (criteria.fleet_spread_min_minors)")
     parser.add_argument("--blocking-exclusion-min-days", type=int, default=LONG_FREEZE_DAYS, help="§3.8: an upgrade-blocking exclusion ending further out than this many days is flagged on its own (criteria.blocking_exclusion_min_days)")
-    # nargs="?" with an empty const: an operator who emptied the list has to be able to say so.
-    # The SOP's quoted placeholder renders an empty list as ""; the bare flag is the hand-run
-    # spelling, which argparse would otherwise refuse as a flag missing its argument. Omitting
-    # the flag is the shipped list.
-    parser.add_argument("--deprecated-image-types", nargs="?", const=EMPTY_IMAGE_TYPE_LIST, default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated as --scope-projects is; \"\" or the bare flag is an emptied list, and omitting the flag is the shipped list (criteria.deprecated_image_types)")
+    # nargs="*": the entries may be one comma-separated word (the SOP's quoted placeholder,
+    # which renders an empty list as ""), several unquoted words on a hand run, or nothing at
+    # all, the bare flag, for an emptied list; argparse would otherwise refuse the unquoted
+    # words as unrecognized arguments without naming the flag. Omitting the flag is the
+    # shipped list.
+    parser.add_argument("--deprecated-image-types", nargs="*", default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated, quoted or not, as --scope-projects reads them; \"\" or the bare flag is an emptied list, and omitting the flag is the shipped list (criteria.deprecated_image_types)")
     try:
         args = parser.parse_args(argv)
         criteria = criteria_from_args(parser, args)

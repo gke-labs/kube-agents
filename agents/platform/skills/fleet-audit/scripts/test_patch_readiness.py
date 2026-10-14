@@ -3507,12 +3507,13 @@ class CriteriaTest(unittest.TestCase):
         )
 
     def test_the_deprecated_list_takes_the_scope_flags_grammar(self):
-        # Commas or whitespace, each entry once: the grammar --scope-projects uses on the same line.
-        for value, expected in (("COS UBUNTU", {"COS", "UBUNTU"}), ("cos, ubuntu cos", {"COS", "UBUNTU"})):
-            with self.subTest(value=value):
+        # Commas or whitespace, each entry once: the grammar --scope-projects uses on the same
+        # line, quoted as one word or, on a hand run, unquoted as several.
+        for argv, expected in ((["COS UBUNTU"], {"COS", "UBUNTU"}), (["cos, ubuntu cos"], {"COS", "UBUNTU"}), (["COS", "UBUNTU"], {"COS", "UBUNTU"}), (["COS,UBUNTU", "WINDOWS_SAC"], {"COS", "UBUNTU", "WINDOWS_SAC"})):
+            with self.subTest(argv=argv):
                 with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
                     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                        pr.main(["--project", "acme", "--deprecated-image-types", value])
+                        self.assertEqual(pr.main(["--project", "acme", "--deprecated-image-types", *argv]), 0)
                 self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset(expected))
 
     def refused(self, argv):
