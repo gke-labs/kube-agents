@@ -35,7 +35,7 @@ MIN_FENCED_COMMANDS = 8
 # helm lines it replaced) is checked for a helm command.
 HELM_CHART_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gitops-helm-chart"
 HELM_INVOCATION = re.compile(
-    r"(?im)(?:^|[;&|(`'\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
+    r"(?im)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
 )
 SHIPPED_SKILL_DIRS = sorted(Path(__file__).resolve().parents[2].glob("*/skills/*/"))
 MIN_HELM_CHART_FENCED_COMMANDS = 6
