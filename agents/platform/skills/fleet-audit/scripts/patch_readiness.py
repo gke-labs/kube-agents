@@ -879,9 +879,10 @@ def check_pool_skew(cluster: dict, *, critical_minors: int = POOL_SKEW_CRITICAL_
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane", "severity": CRITICAL})
         elif minor_gap > SKEW_CEILING_MINORS:
             # Only reachable once the criteria raised the critical rung: past
-            # GKE's ceiling, which the excerpt still says, but under the
-            # operator's rung for critical, which it names so the ledger
-            # shows why this week's pool-skew finding is a major one.
+            # GKE's ceiling, which the excerpt says, but under the operator's
+            # rung for critical, which the manifest's `criteria` block records
+            # and the excerpt does not, so an unchanged pool keeps unchanged
+            # evidence when the rung moves and `finish` carries its wording.
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, past GKE's skew ceiling", "severity": MAJOR})
         elif minor_gap == SKEW_CEILING_MINORS:
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, at GKE's skew ceiling", "severity": MAJOR})
