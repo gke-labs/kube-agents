@@ -268,8 +268,12 @@ KUBECTL_TIMEOUT_SECONDS = 60
 # names the class, not an unreachable server, and kubectl's message stays in the error row. In
 # the sandbox the shim prints its own line when it cannot reach the broker (`credential proxy
 # unavailable: ...`), which the second call would print again. Matched without case: the errno
-# text behind the shim's line is capitalised.
+# text behind the shim's line is capitalised. An error the server returned never skips, whatever
+# dial words its body quotes: kubectl prefixes one with `Error from server (<reason>):`, and an
+# InternalError quoting the apiserver's own etcd dial failure is an answer, which the second read
+# may still get.
 FIRST_READ_SKIP_MARKERS = ("unable to connect to the server", "i/o timeout", "connection refused", "no such host", "credential proxy unavailable")
+SERVER_ANSWERED_PREFIX = "error from server"
 WEBHOOK_READ_SKIPPED = "skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable)"
 # The credential-proxy shim keeps the first --max-output-bytes of a command's stdout, drains the
 # rest, exits 0 and writes this line to stderr; a list cut there is unparsable JSON, and the
@@ -745,6 +749,15 @@ def _kubectl_items(resources: str, env: dict) -> tuple[list | None, str | None]:
     return items, None
 
 
+def first_read_failed_before_the_server_answered(error: str) -> bool:
+    """Whether a first read's error is one of FIRST_READ_SKIP_MARKERS' classes and not an answer
+    the API server returned: kubectl prefixes a returned error with `Error from server (...)`, and
+    its body may quote a dial failure of the server's own (an InternalError on the path to etcd),
+    which the second read may still be answered through."""
+    lowered = error.lower()
+    return SERVER_ANSWERED_PREFIX not in lowered and any(marker in lowered for marker in FIRST_READ_SKIP_MARKERS)
+
+
 def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
     """The objects of one member the readiness rules read, via kubectl.
 
@@ -755,7 +768,8 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
     (`directory_error`); a first read that failed before the server answered it (a connection,
     credential-plugin or certificate failure, or the credential proxy unreachable; not the
-    deadline, which in the sandbox measures the credential proxy's queue) skips the second rather
+    deadline, which in the sandbox measures the credential proxy's queue, and not an error the
+    server returned, whatever it quotes) skips the second rather
     than spend a second timeout on it
     (`webhook_skipped`, with `webhook_error` saying so); otherwise
     each read fails alone, grading only its own rule `unknown`, and any
@@ -775,7 +789,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
         result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return result
     result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
-    if result["error"] and any(marker in result["error"].lower() for marker in FIRST_READ_SKIP_MARKERS):
+    if result["error"] and first_read_failed_before_the_server_answered(result["error"]):
         result["webhook_skipped"] = True
         result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
         return result

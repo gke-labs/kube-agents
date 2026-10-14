@@ -1535,6 +1535,30 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
         self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
 
+    def test_a_server_answered_error_quoting_a_dial_failure_does_not_skip_the_webhook_read(self):
+        # kubectl prefixes an error the API server returned with `Error from server (...)`; its
+        # body can quote the server's own dial failure (apiserver to etcd during a control-plane
+        # event), which is an answer, so the second read is made and may be answered.
+        calls = []
+        answered = 'Error from server (InternalError): an error on the server ("rpc error: code = Unavailable desc = dial tcp 10.0.0.2:2379: connect: connection refused") has prevented the request from succeeding'
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 1, "", answered
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("connection refused", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+        self.assertTrue(report.first_read_failed_before_the_server_answered("Unable to connect to the server: dial tcp 10.0.0.1:443: connect: connection refused"))
+        self.assertFalse(report.first_read_failed_before_the_server_answered(answered))
+
     def test_the_shims_broker_down_line_skips_the_webhook_read(self):
         calls = []
 
