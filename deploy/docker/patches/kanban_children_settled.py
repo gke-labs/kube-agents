@@ -1,8 +1,9 @@
-"""Refuse to close a card whose fanned-out children are still running.
+"""Refuse to close a card whose fanned-out children are still running, or to
+re-queue one with nothing to wait on.
 
 Installed into the image at ``/opt/hermes/tools/kanban_children_settled.py``
-and wired into ``tools/kanban_tools.py`` (the ``kanban_create`` and
-``kanban_complete`` handlers) by
+and wired into ``tools/kanban_tools.py`` (the ``kanban_create``,
+``kanban_complete`` and ``kanban_block`` handlers) by
 ``deploy/docker/patches/apply_kanban_children_settled.py``.
 
 Why
@@ -105,8 +106,38 @@ patch), a locked database, a broken connection — anything short of a positive
 "live children exist" lets the completion through, logged. A guard
 bookkeeping failure must never block the one call that delivers a report.
 
-Scope: the check lives in the ``kanban_complete`` tool handler, so the CLI and
-the scheduler (``kb.complete_task`` direct writers) are unaffected — no cron
+A dependency block on a card with nothing to wait on
+----------------------------------------------------
+The other way a worker "waits" for its fan-out is
+``kanban_block(kind="dependency")``, and upstream routes that block to
+``todo`` rather than ``blocked`` (``_route_block`` in
+``hermes_cli/kanban_db.py``) for ``recompute_ready`` to promote once the
+card's parents are done. Fan-out children are not parents, so a card whose
+worker blocks this way has nothing to wait for: the next dispatcher tick
+promotes it and a fresh worker claims it. The block ended the first run but
+not the first session, which keeps its tools; the fresh one starts from the
+card body with no record of what the first did. On 2026-10-08 (#2704, build
+``2108234393209278464``, card ``t_b999714f``) that turned one requested fix
+into two pull requests: the first worker opened #250, was refused here, blocked
+with ``dependency`` against this gate's own instruction to use
+``needs_input``, and six seconds later a new worker claimed the card and opened
+#251. ``agents/platform/SOUL.md`` forbids the same move in prose.
+
+So the ``kanban_block`` handler refuses ``kind="dependency"`` when the card
+has nothing unfinished to wait on: no parent that isn't settled, and no child
+that ``kanban_scheduling``'s repair will turn into a parent inside
+``block_task``. The second test is the repair's own predicate,
+``find_deadlocked_children``, not "any linked child": an edge it won't flip (a
+successor someone planned before this card started, or a child that still
+waits on another card) leaves the card with nothing to wait on, and it would
+re-queue as fast as an unlinked one.
+The refusal is not rationed like the completion gate's, because it can't
+wedge anything: the worker still holds its card and can poll, complete, or
+block with any other kind. Every read fails open.
+
+Scope: the checks live in the ``kanban_complete`` and ``kanban_block`` tool
+handlers, so the CLI and the scheduler (``kb.complete_task`` and
+``kb.block_task`` direct writers) are unaffected — no cron
 run and no human at a shell can be blocked by it. Attribution is written only
 for creates made by a dispatcher-spawned worker, so an orchestrator filing
 cards from a chat session (the Planning Agent's aggregation-card pattern in
@@ -362,3 +393,98 @@ def require_children_settled(task_id, connect, result=None) -> str | None:
 
     _refused_at[key] = time.monotonic()
     return _format_refusal(children)
+
+
+#: Whether a card has a parent that isn't settled: the wait upstream's
+#: ``recompute_ready`` actually honours.
+_UNSETTLED_PARENT_SQL = (
+    "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.parent_id"
+    f" WHERE l.child_id = ? AND t.status NOT IN {SETTLED_STATUSES!r} LIMIT 1"
+)
+
+
+def _children_the_repair_will_flip(conn, task_id: str) -> list:
+    """The children ``kanban_scheduling``'s repair turns into parents of
+    ``task_id`` inside ``block_task``, after this gate runs. Installed as
+    ``hermes_cli/kanban_scheduling.py`` in the image; ``kanban_scheduling``
+    beside this file on a host. Raises if neither imports, which the gate
+    answers by letting the block through."""
+    try:
+        from hermes_cli.kanban_scheduling import find_deadlocked_children
+    except ImportError:
+        from kanban_scheduling import find_deadlocked_children
+    return find_deadlocked_children(conn, task_id)
+
+
+DEPENDENCY_REFUSAL = (
+    "kanban_block refused: kind=\"dependency\" waits for this card's parent "
+    "cards, and it has none left unfinished, so the board would hand this "
+    "card straight back to a NEW worker within seconds. That worker can't see "
+    "what you've already done (a pull request you opened, a change you made) "
+    "and would start the task over. You still hold the card. "
+    "To wait for cards you fanned out{listing}: keep polling each with "
+    "kanban_show(<child id>), run `sleep 60` between polling rounds, and call "
+    "kanban_complete with the synthesized answer once they're settled. "
+    "If a child is blocked or keeps failing, use "
+    "kanban_block(kind=\"needs_input\") naming it, or complete with the "
+    "answer you have and say plainly which part is missing and why. "
+    "A card that lists this one in its `parents` runs only after you "
+    "finish, so don't wait for it: complete this card and it starts."
+)
+
+
+def refuse_idle_dependency_block(task_id, kind, conn, run_id=None) -> str | None:
+    """The block gate. ``None`` when the block may proceed.
+
+    ``conn`` is the board connection the ``kanban_block`` handler already has
+    open; it is read, never written or closed. Only ``kind="dependency"`` is
+    considered, and only a card with nothing unfinished to wait on is refused
+    (see the module docstring). A card that isn't this worker's running card
+    any more (its claim was released or reassigned; ``run_id`` is the
+    worker's dispatcher run, when known) is left to upstream's ``block_task``,
+    which reports that the block didn't land. Fails open on any error.
+    """
+    if kind != "dependency":
+        return None
+    key = str(task_id or "").strip()
+    if not key:
+        return None
+    try:
+        card = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (key,)
+        ).fetchone()
+        if card is None or card[0] != "running":
+            return None
+        if run_id is not None and card[1] is not None and int(card[1]) != int(run_id):
+            return None
+        if conn.execute(_UNSETTLED_PARENT_SQL, (key,)).fetchone():
+            return None
+        if _children_the_repair_will_flip(conn, key):
+            return None
+        try:
+            rows = conn.execute(_LIVE_CHILDREN_SQL, (key,)).fetchall()
+        except Exception:  # noqa: BLE001 — a board without the table
+            rows = []
+    except Exception as exc:  # noqa: BLE001 — advisory gate, never block
+        logger.warning(
+            "kanban_children_settled: could not check what %s's dependency "
+            "block would wait on (allowing the block): %r",
+            key, exc,
+        )
+        return None
+    children = [(str(r[0]), str(r[1])) for r in rows]
+    listing = ""
+    if children:
+        listing = " (" + ", ".join(
+            f"`{cid}` ({status})" for cid, status in children[:MAX_LISTED_CHILDREN]
+        )
+        overflow = len(children) - MAX_LISTED_CHILDREN
+        if overflow > 0:
+            listing += f" and {overflow} more"
+        listing += ")"
+    logger.warning(
+        "kanban_children_settled: refused a dependency block on %s, which "
+        "has nothing unfinished to wait on (%d live fan-out child(ren))",
+        key, len(children),
+    )
+    return DEPENDENCY_REFUSAL.format(listing=listing)

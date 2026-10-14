@@ -142,9 +142,11 @@
 # that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
 # waits out the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
-# chat-fanout-fleet-restarts-rows (the third-last entry below) makes it sixty-three
-# (189) of seventy-seven (231), +3 more: one front-door turn and a four-card
-# fan-out.
+# chat-voice-answer-first (2026-10-05, below) makes it sixty-three
+# (189) of seventy-seven (231), +3 more: one front-door turn plus the card
+# round trip. chat-fanout-fleet-restarts-rows (below) made it sixty-four
+# (192) of seventy-eight (234), +3 more: one front-door turn and a
+# four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -220,11 +222,18 @@
 # before chat-fanout-fleet-restarts-rows below, makes it sixty-one cases (183 units) of a
 # seventy-five-case, 225-unit matrix.
 #
+# 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
+# noop at the 200s default, about 10 serial minutes. It is the entry after
+# upgrades-zonal-control-plane-outage-warned below, and three units more than
+# each count in the paragraphs after this one, which were taken without it.
+# It does not hold the infra lock, so the tofu cases' serial minutes below
+# are unchanged.
+#
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the last entry below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# kubectl execs each). It is the next-to-last entry below: sixty-five cases
+# (195 units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds
+# the infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
 # there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
 # the thirteen come to ~583 serial minutes against the 480m deadline.
 #
@@ -250,6 +259,14 @@
 # the last entry below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
+#
+# 2026-10-08 adds upgrades-audit-reports-upgrade-blocked (rebased past the
+# 2026-10-09 entries above): one case, three units at the 900s hint the full
+# audits take (hack/ci-eval-pr.sh prices and ceilings it with its siblings).
+# Counted over every entry below, this case, the last entry after
+# fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
+# (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
+# file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -735,6 +752,11 @@
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
+# A delegated answer opens on one bold sentence and does not restate it
+# (the report stanza in deploy/docker/patches/kanban_report_format.py).
+# deployer: noop, transcript-only, one front-door turn plus the card round trip.
+./tasks/chat-voice-answer-first/task.yaml
+
 # The agent's own observability: whether the event watcher's metrics are
 # scraped, answered from the PodMonitoring and the Cloud Monitoring series.
 ./tasks/observability-watcher-scrape-state/task.yaml
@@ -768,6 +790,16 @@
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
 
+# A /session crashloop question is answered under the persona's rule for its
+# access (#2858): with the session cluster view on, a GKE skill, kubectl and
+# the session's own answer; with it off, as on the next lane today, the
+# skill check skips and the pod-search safeguard and the relayed answer are
+# graded (the task's VIEW ON OR OFF note says how it tells). Real only on
+# the next lane's inject transport; on the api lane every check passes
+# without testing anything (its TRANSPORT note). deployer: noop; reads the
+# seeded fleet's crashloop-workload role.
+./tasks/session-crashloop-question-loads-a-skill/task.yaml
+
 # The fleet-audit carry: a drift finding whose evidence and severity did not
 # change keeps the words of the previous run. prebuilt/unchanged-finding-wording
 # plants that previous run in the report store, with the collector's own
@@ -775,3 +807,10 @@
 # it holds the infra lock, and its run is a full drift audit (the 900s audit
 # band of consistency-drift-outlier).
 ./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would be held. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml

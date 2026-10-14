@@ -225,8 +225,9 @@ func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
 }
 
 // One broker body yields every counter the broker feeds: the tool invocations
-// summed over the counted statuses and the proposals opened, which is the
-// version-control counter under verb proposal-create and status success alone.
+// summed over the counted statuses, the proposals opened, which is the
+// version-control counter under verb proposal-create and status success alone,
+// and the proposals merged, read whole.
 func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE kubeagents_tool_invocations_total counter",
@@ -237,6 +238,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 		`kubeagents_vcs_requests_total{verb="proposal-create",status="blocked"} 1`,
 		`kubeagents_vcs_requests_total{verb="proposal-list",status="success"} 9`,
 		`kubeagents_vcs_requests_total{verb="issue-create",status="success"} 5`,
+		"# TYPE kubeagents_vcs_proposals_merged_total counter",
+		"kubeagents_vcs_proposals_merged_total 2",
 		"# TYPE process_start_time_seconds gauge",
 		"process_start_time_seconds 1759400000.25",
 		"",
@@ -246,8 +249,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterRemediationsProposed] != 3 {
-		t.Fatalf("samples = %v, want 4 tool executions and 3 proposals", reading.Samples)
+	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 {
+		t.Fatalf("samples = %v, want 4 tool executions, 3 proposals and 2 merged", reading.Samples)
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
 		t.Errorf("start time = %v", reading.StartTime)
