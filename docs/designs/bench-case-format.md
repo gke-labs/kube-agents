@@ -126,7 +126,7 @@ run beside the case's runs and grade their ledger. `oobe-first-run-audits` carri
 starts. devops-bench ignores the key.
 
 The runner pauses most of the Platform Agent's clock-started audits once per lease, before any
-unit (`pause_scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
+unit (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
 four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
 `no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a

@@ -1,9 +1,9 @@
 """Pause the Platform Agent's clock-started audits for an eval run. Runs in the agent container.
 
-Usage: python3 - <home> < ci_pause_scheduled_audits.py
+Usage: python3 - <home> [--resume] < ci_pause_scheduled_audits.py
 
 hack/ci-eval-pr.sh pipes this into the gateway once per lease, before any unit runs
-(pause_scheduled_audits). The governance watchdogs fire on the clock between 06:20 and
+(scheduled_audits pause; the EXIT trap runs scheduled_audits resume). The governance watchdogs fire on the clock between 06:20 and
 09:20 UTC, and a run that writes to the GitOps repository mid-eval is charged to
 whichever cases are running when it lands: `no-github-writes-the-case-did-not-request`
 dates a write, it doesn't attribute it (#2611). The 08:00 networking audit's
@@ -32,8 +32,15 @@ Those four still fire on their clock (06:20, 06:50, Mondays 07:50, 09:20 UTC), a
 their `finish` can open remediation pull requests like any audit's, so a write from
 one of them mid-eval is still possible (#3020 tracks it).
 
-Prints one line naming what it paused and what it left. Exits 1 when a pause it
-asked for didn't take, so the caller can say so.
+Records what it paused in `<home>/.ci-paused-audits.json`, and `--resume` resumes
+exactly those. ci-eval-pr.sh runs the resume from its EXIT trap: a Prow lease's
+teardown sweeps the volume anyway, but a developer's run against an install that
+outlives it would otherwise leave five audits off for good.
+
+Prints one line naming what it did. Exit codes, which the caller's retry reads:
+0 done; 1 worth another try (a pause that timed out, a store it couldn't read
+back); 3 decided, so a retry would only repeat it (its inputs are unreadable, or
+Hermes refused a pause or wrote no markers).
 """
 
 import ast
@@ -43,8 +50,10 @@ import subprocess
 import sys
 
 home = sys.argv[1]
+RESUME = sys.argv[2:] == ["--resume"]
 PROFILE = "platform"
 ROSTER = os.path.join(home, "profiles", PROFILE, "cron", "jobs.json")
+RECORD = os.path.join(home, ".ci-paused-audits.json")
 # The image's copy, not the volume's: the volume is the agent's to write.
 STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
 STAGE_AUDITS = "FIRST_RUN_AUDITS"
@@ -52,8 +61,13 @@ STAGE_AUDITS = "FIRST_RUN_AUDITS"
 SHIPPED_ROSTER = os.environ.get("PLATFORM_ROSTER_SOURCE", "/opt/platform-template/cron/jobs.json")
 # Absolute, as profile_scaffold.py runs it, so PATH order can't change which binary answers.
 HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
-PAUSE_TIMEOUT_SECONDS = 60
+# Per call. Five pauses at this bound stay well inside the caller's
+# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS, so a stalled pause is named here rather than
+# cut off by the caller's timeout before this prints.
+HERMES_TIMEOUT_SECONDS = 30
 PAUSED_STATE = "paused"
+OK, RETRY, DECIDED = 0, 1, 3
+EXCERPT_CHARS = 200
 
 
 def jobs_in(path):
@@ -62,29 +76,67 @@ def jobs_in(path):
     jobs = stored.get("jobs", []) if isinstance(stored, dict) else stored
     if not isinstance(jobs, list):
         raise ValueError(f"{path}: its jobs are not a list")
-    return [job for job in jobs if isinstance(job, dict) and job.get("id")]
+    # Ids as strings, as profile_scaffold.merge_cron_store reads them.
+    return [{**job, "id": str(job["id"])} for job in jobs if isinstance(job, dict) and job.get("id")]
 
 
 def stage_audits():
     tree = ast.parse(open(STAGE_SOURCE, encoding="utf-8").read())
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == STAGE_AUDITS for t in node.targets):
-            return set(ast.literal_eval(node.value))
+            return {str(audit) for audit in ast.literal_eval(node.value)}
     raise ValueError(f"{STAGE_SOURCE} names no {STAGE_AUDITS}")
 
 
 def paused(job):
-    return not job.get("enabled", True) and (job.get("state") == PAUSED_STATE or bool(job.get("paused_at")))
+    """A pause marker alone is a pause, whatever `enabled` says.
+
+    Hermes' `is_job_runnable`, `ci_platform_runs.runnable` and `oobe.py` all read it so:
+    after a restart the merge puts `enabled` back to true and leaves the markers.
+    """
+    return job.get("state") == PAUSED_STATE or bool(job.get("paused_at"))
 
 
-def main():
+def hermes(action, jid):
+    """One `hermes cron <action>`; returns (retryable, failure) or (False, None)."""
+    try:
+        result = subprocess.run(
+            [HERMES_BIN, "-p", PROFILE, "cron", action, jid],
+            capture_output=True, text=True, timeout=HERMES_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return True, f"{jid} (timed out after {HERMES_TIMEOUT_SECONDS}s)"
+    except OSError as exc:
+        return False, f"{jid} ({exc})"
+    if result.returncode != 0:
+        detail = " ".join((result.stderr or result.stdout).split())[:EXCERPT_CHARS]
+        return False, f"{jid} (exit {result.returncode}: {detail})"
+    return False, None
+
+
+def read_record():
+    try:
+        with open(RECORD, encoding="utf-8") as fh:
+            return [str(jid) for jid in json.load(fh)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def write_record(ids):
+    tmp = f"{RECORD}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(sorted(ids), fh)
+    os.replace(tmp, RECORD)
+
+
+def pause():
     try:
         jobs = jobs_in(ROSTER)
         shipped = {job["id"]: job for job in jobs_in(SHIPPED_ROSTER)}
         held_by_stage = stage_audits()
     except (OSError, ValueError, SyntaxError) as exc:
         print(f"nothing paused: {exc}")
-        return 1
+        return DECIDED
     targets, left = [], []
     for job in jobs:
         jid = job["id"]
@@ -102,32 +154,68 @@ def main():
         else:
             targets.append(jid)
 
-    failed = []
+    failed, retryable = [], False
     for jid in targets:
-        try:
-            result = subprocess.run(
-                [HERMES_BIN, "-p", PROFILE, "cron", "pause", jid],
-                capture_output=True, text=True, timeout=PAUSE_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            failed.append(f"{jid} ({exc})")
-            continue
-        if result.returncode != 0:
-            failed.append(f"{jid} (exit {result.returncode}: {' '.join((result.stderr or result.stdout).split())[:200]})")
+        again, failure = hermes("pause", jid)
+        retryable |= again
+        if failure:
+            failed.append(failure)
 
     # Believe the store, not the exit codes.
     try:
         after = {job["id"]: job for job in jobs_in(ROSTER)}
     except (OSError, ValueError) as exc:
-        print(f"paused {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
-        return 1
+        print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
+        return RETRY
     done = [jid for jid in targets if paused(after.get(jid, {}))]
-    failed += [f"{jid} (not paused in the store)" for jid in targets if jid not in done and not any(f.startswith(f"{jid} ") for f in failed)]
+    named = {f.split(" ", 1)[0] for f in failed}
+    failed += [f"{jid} (not paused in the store)" for jid in targets if jid not in done and jid not in named]
+    if done:
+        try:
+            write_record(set(read_record()) | set(done))
+        except OSError as exc:
+            failed.append(f"record ({exc}; --resume will not know these)")
     print(
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")
     )
-    return 1 if failed else 0
+    if not failed:
+        return OK
+    return RETRY if retryable else DECIDED
 
 
-sys.exit(main())
+def resume():
+    ids = read_record()
+    if not ids:
+        print("nothing to resume")
+        return OK
+    try:
+        live = {job["id"]: job for job in jobs_in(ROSTER)}
+    except (OSError, ValueError) as exc:
+        print(f"could not read the roster to resume {', '.join(ids)}: {exc}")
+        return RETRY
+    failed, retryable = [], False
+    targets = [jid for jid in ids if paused(live.get(jid, {}))]
+    for jid in targets:
+        again, failure = hermes("resume", jid)
+        retryable |= again
+        if failure:
+            failed.append(failure)
+    try:
+        after = {job["id"]: job for job in jobs_in(ROSTER)}
+    except (OSError, ValueError) as exc:
+        print(f"asked to resume {', '.join(targets)}, but the roster could not be read back: {exc}")
+        return RETRY
+    still = [jid for jid in targets if paused(after.get(jid, {}))]
+    if not still:
+        os.remove(RECORD)
+    print(
+        f"resumed {', '.join(jid for jid in targets if jid not in still) or 'nothing'}"
+        + (f"; FAILED {', '.join(failed) or ', '.join(still)}" if still else "")
+    )
+    if not still:
+        return OK
+    return RETRY if retryable else DECIDED
+
+
+sys.exit(resume() if RESUME else pause())

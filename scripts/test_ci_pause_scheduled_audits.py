@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""hack/ci_pause_scheduled_audits.py, run as pause_scheduled_audits runs it: `python3 - <home> < script`.
+"""hack/ci_pause_scheduled_audits.py, run as scheduled_audits runs it: `python3 - <home> [--resume] < script`.
 
 Pinned: which jobs it pauses and which it leaves (plumbing, the oobe stage's audits, a job
-already off), that it believes the store over Hermes' exit code, and that ci-eval-pr.sh calls
-it once per lease before any unit.
+already off), that it believes the store over Hermes' exit code, its exit codes, that --resume
+undoes exactly what it paused, and that ci-eval-pr.sh pauses once per lease before any unit and
+resumes from the EXIT trap.
 """
 
 import ast
@@ -46,14 +47,17 @@ FAKE_HERMES = textwrap.dedent('''\
     if mode == "fail":
         print("boom", file=sys.stderr)
         sys.exit(1)
-    assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] == "pause", sys.argv
+    assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
     if mode == "noop":
         sys.exit(0)
     path = os.environ["FAKE_ROSTER"]
     store = json.load(open(path))
     for job in store["jobs"]:
-        if job["id"] == sys.argv[5]:
-            job.update(enabled=False, state="paused", paused_at="2026-10-14T00:00:00+00:00")
+        if str(job["id"]) == sys.argv[5]:
+            if sys.argv[4] == "pause":
+                job.update(enabled=False, state="paused", paused_at="2026-10-14T00:00:00+00:00")
+            else:
+                job.update(enabled=True, state="scheduled", paused_at=None)
     json.dump(store, open(path, "w"))
 ''')
 
@@ -76,7 +80,7 @@ class PauseTest(unittest.TestCase):
         self.roster.write_text(json.dumps({"jobs": jobs}))
         self.shipped.write_text(json.dumps({"jobs": jobs if shipped is None else shipped}))
 
-    def run_script(self, mode="ok", stage=STAGE):
+    def run_script(self, mode="ok", stage=STAGE, resume=False):
         env = {
             **os.environ,
             "HERMES_BIN": str(self.hermes),
@@ -86,7 +90,7 @@ class PauseTest(unittest.TestCase):
             "PLATFORM_ROSTER_SOURCE": str(self.shipped),
         }
         result = subprocess.run(
-            [sys.executable, "-", str(self.home)], input=SCRIPT.read_text(),
+            [sys.executable, "-", str(self.home), *(["--resume"] if resume else [])], input=SCRIPT.read_text(),
             capture_output=True, text=True, env=env, timeout=60,
         )
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -139,8 +143,43 @@ class PauseTest(unittest.TestCase):
         self.write_roster([{"id": "c", "enabled": True}])
         self.shipped.unlink()
         result, store = self.run_script()
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 3)
         self.assertTrue(store["c"]["enabled"])
+
+    def test_a_restarted_pause_reads_as_already_paused(self):
+        # After a gateway restart the merge leaves enabled: true beside the markers. A second
+        # run (a retry, a later lease) must see that as paused, as Hermes does.
+        self.write_roster([{"id": "c", "enabled": True, "state": "paused", "paused_at": "x"}])
+        result, _ = self.run_script(mode="fail")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("c (already paused)", result.stdout)
+
+    def test_a_numeric_id_is_paused_as_a_string(self):
+        self.write_roster([{"id": 5, "enabled": True}])
+        result, store = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(store[5]["state"], "paused")
+
+    def test_resume_undoes_exactly_what_it_paused(self):
+        self.write_roster([{"id": "c", "enabled": True},
+                           {"id": "theirs", "enabled": False, "state": "paused", "paused_at": "x"}])
+        self.run_script()
+        record = self.home / ".ci-paused-audits.json"
+        self.assertEqual(json.loads(record.read_text()), ["c"])
+        result, store = self.run_script(resume=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("resumed c", result.stdout)
+        self.assertTrue(store["c"]["enabled"])
+        # A pause someone else made is not ours to lift.
+        self.assertEqual(store["theirs"]["state"], "paused")
+        self.assertFalse(record.exists())
+
+    def test_resume_with_no_record_does_nothing(self):
+        self.write_roster([{"id": "c", "enabled": False, "state": "paused", "paused_at": "x"}])
+        result, store = self.run_script(resume=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("nothing to resume", result.stdout)
+        self.assertEqual(store["c"]["state"], "paused")
 
     def run_script_with(self, live, shipped):
         self.write_roster(live, shipped)
@@ -149,20 +188,21 @@ class PauseTest(unittest.TestCase):
     def test_the_store_is_believed_over_the_exit_code(self):
         self.write_roster([{"id": "c", "enabled": True}])
         result, _ = self.run_script(mode="noop")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 3)
         self.assertIn("FAILED c (not paused in the store)", result.stdout)
 
     def test_a_failed_pause_is_named(self):
         self.write_roster([{"id": "c", "enabled": True}])
         result, _ = self.run_script(mode="fail")
-        self.assertEqual(result.returncode, 1)
+        # Hermes refused it: a retry would only repeat that, so the verdict is final.
+        self.assertEqual(result.returncode, 3)
         self.assertIn("FAILED c (exit 1: boom)", result.stdout)
 
     def test_an_unreadable_stage_pauses_nothing(self):
         # Without the stage's list it can't tell which audits the stage owns, so it leaves all.
         self.write_roster([{"id": "c", "enabled": True}])
         result, store = self.run_script(stage=self.home / "missing.py")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 3)
         self.assertTrue(store["c"]["enabled"])
         self.assertIn("nothing paused", result.stdout)
 
@@ -199,7 +239,7 @@ class RestartTest(unittest.TestCase):
 class RunnerTest(unittest.TestCase):
     def test_called_once_per_lease_before_any_unit(self):
         text = RUNNER.read_text()
-        calls = [m.start() for m in re.finditer(r'^pause_scheduled_audits "lease"$', text, re.M)]
+        calls = [m.start() for m in re.finditer(r'^scheduled_audits pause "lease"$', text, re.M)]
         self.assertEqual(len(calls), 1)
         lease_reset = text.index('reset_agent_pulls "lease"')
         first_unit = re.search(r'^\s+run_one_unit "\$\{TASKS', text, re.M).start()
@@ -207,11 +247,19 @@ class RunnerTest(unittest.TestCase):
         self.assertLess(calls[0], first_unit)
 
     def test_the_function_pipes_this_script(self):
-        body = RUNNER.read_text().split("pause_scheduled_audits() {", 1)[1].split("\n}\n", 1)[0]
+        body = RUNNER.read_text().split("scheduled_audits() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('< "${SCRIPT_DIR}/ci_pause_scheduled_audits.py"', body)
         self.assertIn('"gke_${PROJECT_ID}_"*', body)
         self.assertIn("EVAL_PAUSE_AUDITS_ATTEMPTS", body)
         self.assertIn("return 0", body)
+        # The script's DECIDED exit ends the retries.
+        self.assertIn('"${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break', body)
+        decided = re.search(r"^readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=(\d+)$", RUNNER.read_text(), re.M).group(1)
+        self.assertIn(f"OK, RETRY, DECIDED = 0, 1, {decided}", SCRIPT.read_text())
+
+    def test_the_exit_trap_resumes(self):
+        trap = RUNNER.read_text().split("profile_and_dump_on_exit() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"', trap)
 
 
 if __name__ == "__main__":
