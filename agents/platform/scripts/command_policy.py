@@ -110,6 +110,8 @@ _LOCAL_RENDER_FLAGS = frozenset({"--local", "--list"})
 # end on the client (a render, or an error before any request).
 _DRY_RUN_WRITE_VALUES = frozenset({"none", "server", "false", "f", "0"})
 _HELP_FLAGS = frozenset({"-h", "--help"})
+# pflag's true spellings for a boolean flag given a value (``--local=true``), and the bare flag.
+_BOOLEAN_TRUE_SPELLINGS = frozenset({"", "true", "t", "1"})
 _LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
@@ -1153,10 +1155,8 @@ def local_render(argv: list[str]) -> bool:
     if dry_runs and dry_runs[-1].partition("=")[2].lower() not in _DRY_RUN_WRITE_VALUES:
         return True
     for t in own:
-        if t in _LOCAL_RENDER_FLAGS:
-            return True
         flag, _, value = t.partition("=")
-        if flag in _HELP_FLAGS and value.lower() in ("", "true", "t", "1"):
+        if flag in _LOCAL_RENDER_FLAGS | _HELP_FLAGS and value.lower() in _BOOLEAN_TRUE_SPELLINGS:
             return True
     verb, _ = _kubectl_verb_and_flag(argv)
     return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)

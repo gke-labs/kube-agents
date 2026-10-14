@@ -121,7 +121,7 @@ _WHICH_RE = re.compile(r"^(?:which|command\s+-v|type\s+-p)\s+(\S+)(?:\s+\d*[<>].
 _WORD_QUOTING_RE = re.compile(r'\\(.)|[\'"]')
 # ``<<`` or ``<<-``, then a tag: quoted, backslashed, or bare; a bare tag is a
 # shell word, and only a bare tag's body is expanded.
-_HEREDOC_RE = re.compile(r"<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|(\\)?([^\s;&|<>()'\"\\]+))")
+_HEREDOC_RE = re.compile(r"<<(-?)\s*((?:\$?'[^']*'|\"[^\"]*\"|\\[^\s]|[^\s;&|<>()'\"\\])+)")
 _REDIRECT_TARGET_RE = re.compile(r"(?:^|[\s'\"])>{1,2}\s*(\S+)")
 _ATTACHED_REDIRECT_RE = re.compile(r"^('[^']*'|\"[^\"]*\")>")
 _DD_TARGET_RE = re.compile(r"(?:^|\s)of=(\S+)")
@@ -633,13 +633,12 @@ def _scan(text: str) -> tuple[list[str], list[str], list[tuple[list[str], str, b
         elif c == "<" and text.startswith("<<", i):
             m = _HEREDOC_RE.match(text, i)
             if m:
-                if m.group(2) is not None:
-                    tag, expands = m.group(2), False
-                elif m.group(3) is not None:
-                    tag, expands = m.group(3), False
-                else:
-                    tag, expands = m.group(5), m.group(4) is None
-                pending.append((tag, m.group(1) == "-", expands))
+                # The delimiter is the tag with the shell's quoting removed, in
+                # whole or in part (``EOF``, ``'EOF'``, ``E'O'F``, ``\EOF``,
+                # ``$'EOF'``); only a tag with no quoting at all expands.
+                raw = m.group(2)
+                tag = _WORD_QUOTING_RE.sub(lambda q: q.group(1) or "", raw[1:] if raw.startswith("$'") else raw)
+                pending.append((tag, m.group(1) == "-", tag == raw))
                 buf.append(text[i : m.end()])
                 i = m.end()
             else:

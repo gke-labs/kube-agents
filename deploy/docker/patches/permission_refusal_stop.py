@@ -340,6 +340,8 @@ def observe_refusal(controller, tool_name, args, result, signature, *, stock, fa
             "halt", HALT_CODE, tool_name, count, signature,
             message=HALT_MESSAGE,
         )
+    if getattr(stock, "action", "allow") not in ("allow", "warn"):
+        return None  # tallied; a stock block or halt on the same call stands
     return decision_cls(
         action="warn", code=WARN_CODE, message=WARN_MESSAGE,
         tool_name=tool_name, count=count, signature=signature,

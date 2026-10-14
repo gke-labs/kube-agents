@@ -309,8 +309,12 @@ class ObserveTests(unittest.TestCase):
         stock_halt = Decision("halt", "same_tool_failure_halt", "", "terminal", 8, None)
         self.assertIsNone(observe(controller, K8S_403, stock=stock_halt))
         self.assertIsNone(observe(controller, refusal("kubectl", "config", "view"), args={"command": "kubectl config view"}, stock=stock_halt))
-        # A definitive refusal still decides for itself.
+        # A definitive refusal still decides for itself at the threshold; under it the
+        # refusal is tallied and the stock halt stands.
         self.assertEqual(observe(controller, REFUSAL, stock=stock_halt).action, "halt")
+        raised = FakeController(halt_after=2)
+        self.assertIsNone(observe(raised, REFUSAL, stock=stock_halt))
+        self.assertEqual(observe(raised, REFUSAL).action, "halt")  # the first was counted
 
     def test_the_turn_token_is_the_container_itself_not_its_address(self):
         controller = FakeController(halt_after=2)

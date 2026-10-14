@@ -369,6 +369,16 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     )
 
 
+def test_a_partly_quoted_heredoc_tag_is_the_delimiter_bash_reads():
+    for tag in ("E'O'F", 'E"O"F', "$'EOF'", "\\EOF", "'EOF'"):
+        command = "cat <<" + tag + " > notes.txt\nkubectl scale deploy x --replicas=3 is refused\nEOF\ncurl -k https://10.0.0.1/api/v1"
+        assert "curl -k https://10.0.0.1/api/v1" in segments(command), tag
+        assert not any("refused" in s for s in segments(command)), tag
+    # A bare tag still expands its body's substitutions; a quoted one does not.
+    assert "kubectl get x" in segments("cat <<EOF\n$(kubectl get x)\nEOF")
+    assert "kubectl get x" not in segments("cat <<'EOF'\n$(kubectl get x)\nEOF")
+
+
 def test_kubectl_boolean_global_flags_are_the_policys():
     import importlib.util
     from pathlib import Path

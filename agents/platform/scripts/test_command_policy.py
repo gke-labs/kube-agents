@@ -1964,6 +1964,8 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run="],
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=Client"],
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--help=true"],
+            ["kubectl", "patch", "--local=true", "-f", "m.yaml", "-p", "{}", "-o", "yaml"],
+            ["kubectl", "label", "pod", "x", "--list=1"],
             ["kubectl", "scale", "--help"],
             ["kubectl", "-n", "kube-system", "patch", "-h"],
         ):
