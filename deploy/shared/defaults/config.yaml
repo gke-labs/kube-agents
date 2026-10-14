@@ -145,6 +145,46 @@ mcp_servers:
     lazy: true
     connect_timeout: 30
     timeout: 60
+    # Read tools only: the 15 of the server's 23 that it annotates
+    # readOnlyHint, the same set the credential proxy's relay enforces
+    # (agents/platform/scripts/mcp_policy.py GKE_READ_TOOLS, which B1 holds this
+    # list to). The relay refuses every other tool; this list keeps them out of
+    # the model's offer, so a refused call is not attempted. This is the
+    # canonical note; agents/platform/config.yaml and agents/cluster/config.yaml
+    # carry the same list and point back here.
+    #
+    #   - `include` is an allowlist (hermes tools/mcp_tool_registration.py
+    #     `_make_tool_filter`), so a tool the server adds later stays hidden
+    #     until it is named here. `exclude` would offer it the day it ships.
+    #   - Exact names, no globs: `get_*` matches whatever the server names next.
+    #   - It is the offer, not the enforcement: the relay is what refuses a
+    #     call. The B1 conformance test reads the config each profile actually
+    #     runs with and fails on any tool that is not a read.
+    #   - deploy/docker/merge_configs.py unions this list with the platform
+    #     overlay's, so a write tool added to either copy reaches the Platform
+    #     Agent.
+    #   - A cluster profile already on the volume gets this key at the next pod
+    #     start if it has none (the entrypoint's fill-only back-fill), but keeps
+    #     the list it holds when a later image changes it, the way it keeps
+    #     `args`. Narrowing the list needs an in-place repair like the
+    #     User-Agent one in deploy/shared/docker-entrypoint.sh.
+    tools:
+      include:
+        - check_k8s_auth
+        - describe_k8s_resource
+        - get_cluster
+        - get_k8s_cluster_info
+        - get_k8s_logs
+        - get_k8s_resource
+        - get_k8s_rollout_status
+        - get_k8s_version
+        - get_node_pool
+        - get_operation
+        - list_clusters
+        - list_k8s_api_resources
+        - list_k8s_events
+        - list_node_pools
+        - list_operations
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys
