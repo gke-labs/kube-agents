@@ -184,7 +184,7 @@ WILDCARD = "*"
 # `storage.k8s.io/v1beta1`) matches nothing. Each rule of a dead off-path webhook is then classed
 # by what the server serves it (`_rule_served_class`), on the resources it names and not on its
 # operations or scope, since the served version is the resource's: live when its `apiVersions`
-# carry `*` or `v1`, so its requests fail now; pinned when every resource it names is graded and
+# carry `*` or `v1`, so every request the server sends it fails now; pinned when every resource it names is graded and
 # the version is one the server does not serve, so the server sends it nothing; unknown when the
 # version is unserved on a resource, group or wildcard off the graded lists, whose served
 # versions this reader does not know. The outage cell says each of the three for the rules it
@@ -327,12 +327,13 @@ WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
 # The off-path cell: one clause per class of rule the webhook carries (`_rule_served_class`),
-# what fails now (the live rules), what the server sends nothing (the pinned rules) and what
-# the reader cannot place (the unknown rules, at an unserved version on a resource off its
-# lists), so a failure now is asserted for the live rules alone.
+# what fails now (the live rules: every request the server sends them, which claims nothing
+# about whether the server serves an off-list resource at all), what the server sends nothing
+# (the pinned rules) and what the reader cannot place (the unknown rules, at an unserved
+# version on a resource off its lists), so a failure now is asserted for the live rules alone.
 WEBHOOK_OFF_PATH_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); {verdicts}; reported, not graded"
-RULES_LIVE_ALL = "it fails its own requests now"
-RULES_LIVE_SOME = "it fails now the requests matched by {live}"
+RULES_LIVE_ALL = "it fails now every request the server sends it"
+RULES_LIVE_SOME = "it fails now every request the server sends it that matches {live}"
 RULES_PINNED_SOME = "the server serves {pinned} at {served} alone, so it sends the rule {pinned_rules} nothing"
 RULES_UNKNOWN_ALL = "its requests fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
 RULES_UNKNOWN_SOME = "the requests matched by {unknown} fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
@@ -1070,8 +1071,10 @@ def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
 
 def _rule_served_class(rule: dict, targets: tuple) -> str:
     """What the server serves this rule, read from its `apiVersions` against the graded lists.
-    `RULE_LIVE`: it carries `*` or `VERSION_V1`, so the server sends its requests and a dead
-    backend fails them now. `RULE_PINNED`: every resource it names is graded and the version is
+    `RULE_LIVE`: it carries `*` or `VERSION_V1`, so a dead backend fails now every request the
+    server sends it; whether the server serves an off-list resource at all (a CRD removed with
+    its controller, `policy/v1 podsecuritypolicies`) is not this reader's to say, and the cell
+    claims no more than that. `RULE_PINNED`: every resource it names is graded and the version is
     one the server does not serve (`_rule_version_pinned`), so the server sends it nothing.
     `RULE_UNKNOWN`: an unserved version on a resource, group or wildcard off the lists, whose
     served versions this reader does not know, so the cell asserts no failure for it. A rule

@@ -502,13 +502,13 @@ class WebhookBackendTest(unittest.TestCase):
         graded = grade([hook("psp.example.com", [rule], policy="Fail")])
         self.assertEqual(graded["blocking"], [])
         cell = r.describe_webhook_finding(graded["outage"][0])
-        self.assertNotIn("fails its own requests now", cell)
+        self.assertNotIn("fails now every request the server sends it", cell)
         self.assertIn("if the server still serves those versions", cell)
         # The same resource at a served version, or unversioned, keeps the live-failure sentence.
         for versions in (["v1"], ["*"]):
             with self.subTest(versions=versions):
                 live = grade([hook("x.example.com", [dict(rule, apiVersions=versions)], policy="Fail")])
-                self.assertIn("fails its own requests now", r.describe_webhook_finding(live["outage"][0]))
+                self.assertIn("fails now every request the server sends it", r.describe_webhook_finding(live["outage"][0]))
 
     def test_a_selector_exempting_kube_system_by_a_label_it_carries_keeps_the_gate_an_outage(self):
         # The policy engine's exemption idiom: `DoesNotExist` or `NotIn` on a label the installer
@@ -685,7 +685,7 @@ class KubeSystemReachTest(unittest.TestCase):
                 gate = hook("old.example.com", [rule(["pods"], operations=operations, versions=("v1beta1",))], policy="Fail")
                 blocking, outage = self._one([gate])
                 self.assertEqual(blocking, [])
-                self.assertNotIn("fails its own requests now", r.describe_webhook_finding(outage[0]))
+                self.assertNotIn("fails now every request the server sends it", r.describe_webhook_finding(outage[0]))
         # The parent of a graded subresource is a graded resource: the pre-1.25 PDB-policy gate,
         # bare or with every subresource, is sent nothing at policy/v1beta1. The bare spelling
         # reaches no row and is labelled at the resource; `/*` reaches the status row.
@@ -969,11 +969,11 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual([f["version_pinned"] for f in graded["outage"]], [["CREATE certificatesigningrequests"]])
         cell = r.describe_webhook_finding(graded["outage"][0])
         self.assertIn("matches no request the server sends at a served version (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends this webhook none of them); it is reported, not graded", cell)
-        self.assertNotIn("fails its own requests now", cell)
+        self.assertNotIn("fails now every request the server sends it", cell)
         # A dead gate on a resource off the list does fail the requests it matches now.
         graded = grade([hook("cm.example.com", [rule(["configmaps"])], policy="Fail")])
         self.assertEqual([f["version_pinned"] for f in graded["outage"]], [[]])
-        self.assertIn("it fails its own requests now", r.describe_webhook_finding(graded["outage"][0]))
+        self.assertIn("it fails now every request the server sends it", r.describe_webhook_finding(graded["outage"][0]))
         # A pinned rule beside a served one is a blocker, with nothing pinned.
         graded = grade([hook("mixed.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",)), rule(["pods"])], policy="Fail")])
         self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [[]])
@@ -998,9 +998,9 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(finding["pinned_rules"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"])
         self.assertEqual(finding["live_rules"], ["CREATE configmaps at v1"])
         cell = r.describe_webhook_finding(finding)
-        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1, CREATE configmaps at v1); it fails now the requests matched by CREATE configmaps at v1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; reported, not graded", cell)
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1, CREATE configmaps at v1); it fails now every request the server sends it that matches CREATE configmaps at v1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; reported, not graded", cell)
         self.assertNotIn("sends this webhook none of them", cell)
-        self.assertNotIn("fails its own requests now", cell)
+        self.assertNotIn("sends it; reported", cell)  # the whole-webhook live clause
         # The order of the rules does not change which is named as failing.
         graded = grade([hook("mixed.example.com", [rule(["configmaps"]), pinned], policy="Fail")])
         self.assertEqual((graded["outage"][0]["live_rules"], graded["outage"][0]["pinned_rules"]), (["CREATE configmaps"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]))
@@ -1019,8 +1019,8 @@ class WebhookScopeTest(unittest.TestCase):
                 self.assertEqual((finding["version_pinned"], finding["pinned_rules"], finding["live_rules"]), ([], [], []))
                 self.assertEqual(finding["unknown_rules"], finding["rules"])
                 cell = r.describe_webhook_finding(finding)
-                self.assertNotIn("fails its own requests now", cell)
-                self.assertNotIn("fails now the requests matched by", cell)
+                self.assertNotIn("fails now every request the server sends it", cell)
+                self.assertNotIn("that matches", cell)
                 self.assertIn("its requests fail now if the server still serves those versions", cell)
 
     def test_each_rule_of_an_outage_is_classed_on_its_own_and_the_cell_says_each(self):
@@ -1047,16 +1047,22 @@ class WebhookScopeTest(unittest.TestCase):
                 self.assertEqual((finding["live_rules"], finding["pinned_rules"]), ([], []))
                 self.assertEqual(finding["unknown_rules"], finding["rules"])
                 cell = r.describe_webhook_finding(finding)
-                self.assertNotIn("fails its own requests now", cell)
+                self.assertNotIn("fails now every request the server sends it", cell)
                 self.assertIn("its requests fail now if the server still serves those versions", cell)
         # A live rule beside an unknown one: the live rule fails now, the unknown one is hedged.
         finding = grade([hook("cm.example.com", [rule(["configmaps"]), psp], policy="Fail")])["outage"][0]
-        self.assertIn("; it fails now the requests matched by CREATE configmaps; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions, which this reader does not know for a resource off its lists; reported, not graded", r.describe_webhook_finding(finding))
+        self.assertIn("; it fails now every request the server sends it that matches CREATE configmaps; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions, which this reader does not know for a resource off its lists; reported, not graded", r.describe_webhook_finding(finding))
         # All three classes in one webhook: one clause each, live, pinned, unknown, in that order.
         finding = grade([hook("all.example.com", [psp, rule(["configmaps"]), csr_pinned], policy="Fail")])["outage"][0]
         cell = r.describe_webhook_finding(finding)
-        self.assertIn("; it fails now the requests matched by CREATE configmaps; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions", cell)
+        self.assertIn("; it fails now every request the server sends it that matches CREATE configmaps; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions", cell)
         self.assertEqual(cell.count("fail now if"), 1)
+        # A live rule on a resource the server may not serve at all (a CRD removed with its
+        # controller): the cell claims a failure for every request the server sends, no more.
+        finding = grade([hook("cm.example.com", [rule(["certificates"], operations=("CREATE", "UPDATE"), groups=("cert-manager.io",), versions=("v1",))], policy="Fail")])["outage"][0]
+        cell = r.describe_webhook_finding(finding)
+        self.assertIn("; it fails now every request the server sends it; reported, not graded", cell)
+        self.assertNotIn("its own requests", cell)
         # The class is read from the versions: `*` or `v1` is live whatever the resource.
         for versions in (("*",), ("v1",), ("v1beta1", "v1")):
             with self.subTest(versions=versions):
