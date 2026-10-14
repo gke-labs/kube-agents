@@ -21,7 +21,8 @@
 # The minAvailable slot is read, not graded: the planted budget has none, and
 # the spellings of an absent field (none, N/A, not set) are the judge's to read.
 #
-# A parenthetical after a graded value is ungraded: the judge reads it.
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #

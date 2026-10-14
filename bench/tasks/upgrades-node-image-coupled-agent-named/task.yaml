@@ -17,7 +17,8 @@
 # An item's parenthetical is ungraded: the judge reads it. A negation word
 # is refused only as an item of its own.
 #
-# A parenthetical after a graded value is ungraded: the judge reads it.
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #

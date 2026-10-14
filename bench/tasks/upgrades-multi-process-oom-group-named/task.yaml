@@ -17,7 +17,8 @@
 # number, so a count that includes or omits the supervisor is not a wrong
 # line.
 #
-# A parenthetical after a graded value is ungraded: the judge reads it.
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
