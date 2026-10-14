@@ -288,3 +288,10 @@ func TestSlackChatMultibyteFoldAtTheCapFits(t *testing.T) {
 		}
 	}
 }
+
+// Slack's answer that a message cannot be edited is ErrMessageGone.
+func TestSlackLayoutErrorClassifiesAGoneMessage(t *testing.T) {
+	if err := slackLayoutError(slack.SlackErrorResponse{Err: "message_not_found"}); !errors.Is(err, ErrMessageGone) || errors.Is(err, ErrLayoutRefused) {
+		t.Fatalf("message_not_found: %v, want ErrMessageGone alone", err)
+	}
+}

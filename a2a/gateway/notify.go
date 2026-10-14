@@ -574,7 +574,12 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	}
 	text := OutMessage{Text: truncateRunes(m.Text, discordChunk)}
 	if message, ok := n.updates.get(conversation, key); ok {
-		if n.editKeyed(conversation, message, m, text) {
+		edited, err := n.editKeyed(conversation, message, m, text)
+		if err != nil {
+			n.reply(job, lib.NotifyReply{Error: "edit failed: " + err.Error()})
+			return true
+		}
+		if edited {
 			n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
 			n.log.Info("notify edited", "conversation", conversation, "message", message, "update", key)
 			return true
@@ -603,13 +608,26 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 
 // editKeyed edits a keyed message to m, laid out when the adapter lays it
 // out and as text otherwise, and reports whether an edit landed.
-func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) bool {
+func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) (bool, error) {
 	var layoutErr error
 	if m.Chat != nil {
 		layoutErr = n.conv.EditMessage(conversation, message, m)
+		if isTransientEdit(layoutErr) {
+			// Neither a refusal nor a gone message: a rate limit or an
+			// outage. A text edit now would strip the card's layout and
+			// close an open question's buttons, so the layout is tried
+			// once more and, failing again, the message is left as it is
+			// and the request answered with the error; the key stays, so
+			// the sender's next request edits it.
+			layoutErr = n.conv.EditMessage(conversation, message, m)
+			if isTransientEdit(layoutErr) {
+				n.log.Warn("notify: the keyed edit failed twice; the message is left as it was", "conversation", conversation, "err", layoutErr)
+				return false, layoutErr
+			}
+		}
 		if layoutErr == nil || errors.Is(layoutErr, ErrTextOnly) {
 			if n.chatOutcome(conversation, layoutErr) {
-				return true
+				return true, nil
 			}
 		}
 	}
@@ -618,13 +636,19 @@ func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) b
 		// the layout was not what failed, so nothing is counted refused,
 		// and the request posts anew.
 		n.log.Warn("notify: editing the keyed message failed; posting a new one", "conversation", conversation, "err", err)
-		return false
+		return false, nil
 	}
 	if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
 		// The text edit landed where the layout did not.
 		n.chatOutcome(conversation, layoutErr)
 	}
-	return true
+	return true, nil
+}
+
+// isTransientEdit reports an edit error that says nothing about the layout
+// or the message: not a refusal, not a gone message, not text-only.
+func isTransientEdit(err error) bool {
+	return err != nil && !errors.Is(err, ErrTextOnly) && !errors.Is(err, ErrLayoutRefused) && !errors.Is(err, ErrMessageGone)
 }
 
 // chatOutcome is Gateway.chatOutcome for the route: it counts what became

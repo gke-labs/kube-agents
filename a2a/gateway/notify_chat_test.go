@@ -191,3 +191,33 @@ func TestNotifyKeyedEditOfAGoneMessageCountsNoRefusal(t *testing.T) {
 		t.Fatalf("rendered = %v, posts = %d; want the second request posted anew, laid out", got, len(conv.posts))
 	}
 }
+
+// A transient failure of a laid-out keyed edit keeps the layout: the edit is
+// tried again, laid out, and no text edit strips the card or its buttons.
+func TestNotifyKeyedEditRetriesATransientFailureLaidOut(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	q := chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "prod-eu"}}}
+	serveJSON(t, n, lib.NotifyRequest{Text: "q", Chat: notifyChat(t, q), Update: "q-1", Conversation: testConversation, ContextID: testContext})
+	conv.transientEdits = 1
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "q, again", Chat: notifyChat(t, q), Update: "q-1", Conversation: testConversation, ContextID: testContext})
+	if got.Error != "" || len(conv.edits) != 1 || conv.chats[len(conv.chats)-1] == nil {
+		t.Fatalf("reply %+v, edits %+v; want one edit, laid out", got, conv.edits)
+	}
+}
+
+// Failing twice, the message is left as it was and the request answered with
+// the error: no text edit, no second card; the key stays for the next request.
+func TestNotifyKeyedEditLeavesTheMessageOnRepeatedTransientFailure(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	q := chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "prod-eu"}}}
+	first := serveJSON(t, n, lib.NotifyRequest{Text: "q", Chat: notifyChat(t, q), Update: "q-1", Conversation: testConversation, ContextID: testContext})
+	conv.transientEdits = 2
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "q, again", Chat: notifyChat(t, q), Update: "q-1", Conversation: testConversation, ContextID: testContext})
+	if got.Error == "" || len(conv.edits) != 0 || len(conv.posts) != 1 {
+		t.Fatalf("reply %+v, edits %d, posts %d; want an error and the message untouched", got, len(conv.edits), len(conv.posts))
+	}
+	serveJSON(t, n, lib.NotifyRequest{Text: "q, later", Chat: notifyChat(t, q), Update: "q-1", Conversation: testConversation, ContextID: testContext})
+	if len(conv.edits) != 1 || conv.edits[0].thread != first.MessageID {
+		t.Fatalf("edits = %+v, want the key still on the first message", conv.edits)
+	}
+}
