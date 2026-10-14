@@ -1,0 +1,120 @@
+# Upgrade-failure catalogue entry 19 (in-tree volumes lose their CSI path),
+# in the shape the seeded fleet plants it: intree-pd-volume on seeded-a, a
+# PersistentVolume (intree-pd) written against the in-tree gcePersistentDisk
+# plugin over the fleet's own disk, bound by the intree-pd claim in
+# seeded-shapes and mounted by intree-pd-reader. The in-tree plugin code
+# left Kubernetes at 1.28, so the attach goes through CSI migration to the PD
+# CSI driver on every supported minor; a cluster whose driver is off leaves
+# it unattachable.
+#
+# The prompt names no volume; the source vocabulary (in-tree
+# gcePersistentDisk, csi, other) is the prompt's, so the source objective is
+# a choice from that menu. It asks which PersistentVolumes on the seeded
+# clusters still use an in-tree volume source, and for the
+# answer to end in one declared line per such volume, in a fixed form; the
+# deterministic objectives read the planted volume's line and nothing else.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the volume source. A CSI volume in its place is the
+# heal that passes every objective and empties the fixture.
+id: upgrades-intree-volume-named
+name: The PersistentVolume on an in-tree plugin is named before the upgrade that would strand it
+
+prompt: >-
+  Before the seeded clusters in this project are upgraded, tell me which
+  PersistentVolumes still use an in-tree volume source rather than a CSI
+  driver, what claims they serve, and what keeps them attachable today. Read
+  only; change nothing. End your answer with one line per such volume in
+  exactly this form, no other words on the line: "<cluster>/<volume>: source
+  <in-tree gcePersistentDisk|csi|other>; bound by <namespace/claim or none>;
+  attaches through csi migration: <yes|no>".
+
+expected_output: >-
+  It reads the PersistentVolumes on the seeded clusters and names intree-pd
+  on seeded-a: an in-tree gcePersistentDisk source over the disk
+  seeded-a-intree-pd, bound by seeded-shapes/intree-pd and mounted by
+  intree-pd-reader, attached today only because CSI migration hands it to
+  the PD CSI driver (the in-tree plugin code is gone upstream since 1.28). It
+  says what would strand it (the PD CSI driver disabled, or a cluster or
+  version where migration is not available) and recommends recreating the
+  volume on the CSI driver before then, without performing it. It cites no CVE identifiers and ends with the
+  declared line for each such volume, the planted one reading "source
+  in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches
+  through csi migration: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+fixtures:
+  - intree-pd-volume
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases. The
+  # volume is cluster-scoped, so the line names the cluster and the volume.
+  - name: the-planted-volume-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source [^;\n]+; bound by [^;\n]+; attaches through csi migration: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-source-is-in-tree
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source in-tree gcepersistentdisk; bound by [^;\n]+; attaches through csi migration: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source (?!in-tree gcepersistentdisk;)[^;\n]+; bound by [^;\n]+; attaches through csi migration: (?:yes|no)$'
+
+  - name: the-declared-line-names-the-claim-and-the-migration
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source [^;\n]+; bound by seeded-shapes/intree-pd; attaches through csi migration: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd: source [^;\n]+; bound by (?!seeded-shapes/intree-pd; attaches through csi migration: yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The volume still has its in-tree source (the disk name carries the
+  # install's cluster prefix, so the field's presence is what is pinned).
+  - name: the-planted-volume-source-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: intree-pd-volume
+      kind: persistentvolume
+      resource_name: intree-pd
+      # Cluster-scoped; the role's namespace is given for the catalogue check,
+      # and kubectl ignores it for this kind.
+      namespace: seeded-shapes
+      path: spec.gcePersistentDisk
+      op: exists

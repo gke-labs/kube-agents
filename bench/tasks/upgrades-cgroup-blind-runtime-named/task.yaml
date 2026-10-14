@@ -1,0 +1,138 @@
+# Upgrade-failure catalogue entry 14 (cgroup v2 under a runtime that cannot
+# read it), in the shape the seeded fleet plants it: cgroup-blind-runtime on
+# seeded-a, a Deployment (cgroup-blind-jvm, in seeded-shapes) running
+# eclipse-temurin 8u302, a JDK 8 from before cgroup v2 support arrived in
+# 8u372, under a 192Mi memory limit. On a cgroup v1 node the JVM sizes its
+# heap from the limit; on a cgroup v2 node it reads the machine's memory
+# instead and is OOM-killed at the limit once the heap grows. GKE migrates a
+# cgroup v1 pool to v2 at 1.33 and drops v1 at 1.35, so for such a pool the
+# flip arrives with the minor. The JVM here only sleeps, so the pod runs on
+# either cgroup mode; the image tag is the before-signal.
+#
+# The prompt names no workload, no runtime and no version. It asks which
+# workloads run a Java or .NET runtime from before cgroup v2 support under a
+# memory limit, and for the answer to end in one declared line per such
+# workload, in a fixed form; the deterministic objectives read the planted
+# Deployment's line and nothing else.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the image. A runtime at 8u372 or later in its place is
+# the heal that passes every objective and empties the fixture.
+id: upgrades-cgroup-blind-runtime-named
+name: The JVM that cannot read cgroup v2 is named before the node pool that moves to it
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project move to
+  cgroup v2, through the minor that migrates them or a node image change,
+  tell me which workloads run a Java or .NET runtime from before those
+  runtimes learned to read cgroup v2 memory limits, whether each runs under
+  a memory limit, and what happens to them on a cgroup v2 node. Read only;
+  change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such workload in exactly
+  this form, no other words on the line: "<cluster>/<namespace>/<workload>:
+  runtime <image reference>; reads cgroup v2 limits: <yes|no>; memory limit
+  <value or none>".
+
+expected_output: >-
+  It reads the container images on the seeded clusters for the runtime
+  version each ships and names cgroup-blind-jvm in seeded-shapes on seeded-a:
+  docker.io/library/eclipse-temurin:8u302-b08-jre, a JDK 8 older than 8u372
+  (the release that reads cgroup v2; 11.0.16 for JDK 11), under a 192Mi
+  limit, so on a cgroup v2 node it sizes its heap from the node's memory and
+  is OOM-killed at 192Mi once the heap grows, with no code change and only
+  on the migrated nodes. It recommends a runtime at 8u372 or later, or
+  explicit heap flags, before the pool moves, and performs no change. It
+  cites no CVE identifiers and ends with the declared line for each such
+  workload, the planted one reading "runtime
+  docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits:
+  no; memory limit 192Mi".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+fixtures:
+  - cgroup-blind-runtime
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-workload-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cgroup-blind-runtime
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime [^;\n]+; reads cgroup v2 limits: (?:yes|no); memory limit [^\n]+$'
+
+  # The image reference as the manifest spells it, with or without the
+  # docker.io/library/ prefix kubectl shows.
+  - name: the-declared-line-names-the-pre-cgroup-v2-runtime
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cgroup-blind-runtime
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime (?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: (?:yes|no); memory limit [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime (?!(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre;)[^;\n]+; reads cgroup v2 limits: (?:yes|no); memory limit [^\n]+$'
+
+  - name: the-declared-line-says-the-runtime-is-blind-to-cgroup-v2
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cgroup-blind-runtime
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime [^;\n]+; reads cgroup v2 limits: no; memory limit [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime [^;\n]+; reads cgroup v2 limits: (?!no;)[^;\n]+; memory limit [^\n]+$'
+
+  # The limit is what the misread heap is killed at; the fold lowercases the
+  # quantity, and a space or a MiB spelling is the same number.
+  - name: the-declared-line-names-the-memory-limit
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cgroup-blind-runtime
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime [^;\n]+; reads cgroup v2 limits: (?:yes|no); memory limit 192 ?mib?$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}: runtime [^;\n]+; reads cgroup v2 limits: (?:yes|no); memory limit (?!192 ?mib?$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The Deployment still runs the pre-8u372 JDK.
+  - name: the-planted-runtime-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: cgroup-blind-runtime
+      kind: deployment
+      resource_name: cgroup-blind-jvm
+      namespace: seeded-shapes
+      path: spec.template.spec.containers[0].image
+      op: eq
+      value: docker.io/library/eclipse-temurin:8u302-b08-jre
