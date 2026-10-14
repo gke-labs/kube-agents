@@ -5493,8 +5493,9 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 			},
 			// The GitOps reconcilers' sync objects: which repository and directory
 			// syncs a cluster is often recorded only here, applied once by hand or
-			// by an installer, and the gitops-helm-chart skill reads it to decide
-			// how to declare a chart. Only the kinds that name a sync's source and
+			// by an installer. The gitops-helm-chart skill reads it to decide how to
+			// declare a chart; this grant merges after that skill, so the reader is in
+			// the tree before the read is. Only the kinds that name a sync's source and
 			// destination; HelmReleases, ApplicationSets, AppProjects and
 			// HelmRepositories are not needed for that and stay out, as do Argo
 			// CD's cluster and repository Secrets. An Application can still carry
