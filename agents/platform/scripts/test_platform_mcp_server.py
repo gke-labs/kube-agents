@@ -962,8 +962,8 @@ class TestReportToChat(unittest.TestCase):
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
     @patch("urllib.request.urlopen")
     def test_the_wait_outlasts_the_relay_it_is_waiting_on(self, mock_urlopen):
-        """The route relays synchronously — it runs a whole Chat Agent turn, with
-        its own 300s ceiling, before it answers.
+        """The route relays synchronously — it posts to every enabled platform
+        before it answers, inside the relay plugin's 360s.
 
         Timing out first is not a harmless retry: nothing cancels the server, so
         the report is posted anyway while this tool returns an ERROR the job
@@ -974,7 +974,7 @@ class TestReportToChat(unittest.TestCase):
         """
         mock_urlopen.return_value = self._urlopen()
         report_to_chat("finding", job_id="j1")
-        self.assertGreater(platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS, 300.0)
+        self.assertGreaterEqual(platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS, 360.0)
         self.assertEqual(
             mock_urlopen.call_args.kwargs.get("timeout"),
             platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS,

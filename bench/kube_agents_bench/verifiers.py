@@ -67,6 +67,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
@@ -100,6 +101,7 @@ from kube_agents_bench.fleet import (
 )
 
 __all__ = [
+    "AnswerFirstVerifier",
     "BootstrapDeliveredVerifier",
     "BootstrapFanoutVerifier",
     "BootstrapFindingsVerifier",
@@ -683,6 +685,209 @@ class ReportContainsVerifier(BaseVerifier):
         )
 
 
+# The header ``_append_delivered`` opens each card's result with in the final
+# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
+# delivered result runs from its header to the next header of either kind.
+_DELIVERED_HEADER = re.compile(
+    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    re.MULTILINE,
+)
+_RESULT_HEADER_PREFIX = "Result of delegated task "
+# A bold span opening the text, closed on its own line.
+_BOLD_LEAD = re.compile(r"\A\*\*([^\n]+?)\*\*")
+_ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
+# A fenced block, dropped before the heading check: a "# comment" in a snippet is no heading
+# (kanban_report_format.py's ``_FENCE``).
+_FENCE = re.compile(r"```.*?```", re.DOTALL)
+# Where the fold ends a sentence: terminal punctuation, an emphasis closer after it allowed,
+# then whitespace and anything but a lowercase letter. Copied from slack_presenter.py's
+# ``SENTENCE_END``; keep the two the same.
+_SENTENCE_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][*_])|(?<=[.!?]\*\*)|(?<=[.!?]__))\s+(?=[^\sa-z])")
+# A line break ends a sentence too, so each bullet counts.
+_SENTENCE_BREAK = re.compile(_SENTENCE_END.pattern + r"|\n+")
+_INNER_SENTENCE_BREAK = _SENTENCE_END
+# A line break inside a soft-wrapped sentence: after a line that has not ended (a stop, with or
+# without an emphasis closer, or a colon), before a line that is not blank, a list item or a
+# heading. It joins, as slack_presenter.split_lead does.
+_SOFT_WRAP = re.compile(
+    r"(?<=\S)(?<![.!?:])(?<![.!?][*_])(?<![.!?]\*\*)(?<![.!?]__)"
+    r"[ \t]*\n(?=[ \t]*\S)(?![ \t]*(?:[-*+]|\d+[.)]|#{1,6})\s)"
+)
+# Abbreviations whose dots end no sentence; their dots are dropped before counting. The
+# fold's own tables, copied from slack_presenter.py's ``ABBREVIATION_END`` and
+# ``NUMBER_ABBREVIATION_END`` (no/max/min abbreviate only before a number), plus a.m./p.m.
+_ABBREVIATION = re.compile(
+    r"(?:(?<=^)|(?<=[\s(\[]))(?:e\.g|i\.e|a\.m|p\.m|vs|approx|incl|cf|etc|esp|ex|fig|rev|ver|cont|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NUMBER_ABBREVIATION = re.compile(r"(?:(?<=^)|(?<=[\s(\[#]))(?:no|max|min)\.(?=\s+\d)", re.IGNORECASE | re.MULTILINE)
+# What trails a bold lead whose terminal punctuation sits outside the bold.
+_LEAD_TRAIL = ".!? \t"
+_TERMINAL = ".!?"
+# What may follow a one-word bold answer that leaves its punctuation to the detail:
+# "**No**: ...", "**Yes** \u2014 ...". A longer span before a colon is a label ("**Memory check**:").
+_LEAD_CLAUSE = (":", "\u2014", "\u2013")
+_WHITESPACE = re.compile(r"\s")
+_HEADING_MARK = "#"
+# A later bold span closed without a stop and followed by a colon, a dash or the line's end:
+# a section label. After an unpunctuated lead, it makes the lead one label of several.
+_BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|$)", re.MULTILINE)
+# A markdown link; chat shows its text, not its target. Named apart from report_contains'
+# _MARKDOWN_LINK above, whose fold keeps its own rule (non-empty text, one line).
+_ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
+# Bold and code markers, which chat renders rather than shows.
+_UNSHOWN_MARKUP = re.compile(r"\*\*|`")
+
+
+def _delivered_results(final_message: str) -> list[str]:
+    """Each delivered card result in ``final_message``, artifacts excluded."""
+    headers = list(_DELIVERED_HEADER.finditer(final_message))
+    results = []
+    for i, header in enumerate(headers):
+        if not header.group(0).startswith(_RESULT_HEADER_PREFIX):
+            continue
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
+        results.append(final_message[header.end() : end].strip())
+    return results
+
+
+def _unabbreviate(text: str) -> str:
+    def undot(match: re.Match) -> str:
+        return match.group(0).replace(".", "")
+
+    return _NUMBER_ABBREVIATION.sub(undot, _ABBREVIATION.sub(undot, text))
+
+
+def _sentences(text: str) -> list[str]:
+    joined = _SOFT_WRAP.sub(" ", text)
+    return [s.strip() for s in _SENTENCE_BREAK.split(_unabbreviate(joined)) if s.strip()]
+
+
+@VERIFIERS.register("answer_first")
+class AnswerFirstVerifier(BaseVerifier):
+    """Whether each delivered card result opens on its answer and stops.
+
+    The shape a chat answer owes the person who asked: one bold sentence that
+    answers the ask, a sentence or two of the evidence that settles it, an
+    offer if there is a next step, and nothing said twice. It reads the raw
+    result rather than ``report_contains``'s normalized text, because that
+    normalization drops the ``**`` this check is partly about.
+
+    Every delivered result must pass: the lead is a bold span opening the
+    result and holding one whole sentence; no ATX heading anywhere; at most
+    ``max_chars`` characters as chat shows them, a markdown link counting as
+    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
+    soft-wrapped sentence as one; and no sentence
+    after the lead matching any of ``recap_patterns``, regexes searched in each
+    later sentence's normalized text, which name the ways a restated verdict
+    reads ("the cluster is healthy", "in summary"). Restatement in other words
+    is the judge's to notice; this is the part an exact check can hold. Each
+    of ``lead_terms`` must appear in at least one result's lead (matched like
+    ``report_contains`` phrases, so ``memory`` finds ``MemoryPressure``), so an
+    ask the front door split across two cards can be answered in two leads.
+
+    A run that delivered no result fails rather than erroring: the transcript
+    was read, and an answer that never arrived does not have the shape.
+    """
+
+    type: Literal["answer_first"]
+    lead_terms: list[str] = Field(default_factory=list)
+    max_chars: int = Field(default=600, gt=0)
+    max_sentences: int = Field(default=4, gt=0)
+    recap_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("recap_patterns")
+    @classmethod
+    def _recap_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as err:
+                raise ValueError(f"recap pattern {pattern!r} does not compile: {err}") from err
+        return patterns
+
+    def _defects(self, result: str) -> tuple[list[str], str]:
+        """The result's defects, and its lead's normalized text (``""`` without one)."""
+        defects = []
+        lead_text = ""
+        lead = _BOLD_LEAD.match(result)
+        if lead is None:
+            defects.append("does not open with a bold sentence")
+            rest = result
+        else:
+            inner = lead.group(1).strip()
+            after = result[lead.end() :]
+            if _INNER_SENTENCE_BREAK.search(_unabbreviate(inner)):
+                defects.append(f"the bold lead is more than one sentence: {inner!r}")
+            elif not (inner.endswith(tuple(_TERMINAL)) or after[:1] in tuple(_TERMINAL)):
+                # A span alone on its line is a sentence missing its stop only when it reads as
+                # one: a single word ("**Memory**") or a heading mark is a label.
+                own_line = not after.split("\n", 1)[0].strip()
+                if not (
+                    (after.lstrip(" ").startswith(_LEAD_CLAUSE) and not _WHITESPACE.search(inner))
+                    or (own_line and _WHITESPACE.search(inner) and not inner.startswith(_HEADING_MARK))
+                ):
+                    defects.append(f"the bold span is not a whole sentence: {inner!r}")
+                elif _BOLD_SECTION.search(after):
+                    defects.append(f"the bold lead is one of several bold labels: {inner!r}")
+            lead_text = _normalize(_ANSWER_LINK.sub(r"\1", inner))
+            rest = after.lstrip(_LEAD_TRAIL)
+        if _ATX_HEADING.search(_FENCE.sub("", result)):
+            defects.append("carries a section heading")
+        shown = len(_UNSHOWN_MARKUP.sub("", _ANSWER_LINK.sub(r"\1", result)))
+        if shown > self.max_chars:
+            defects.append(f"{shown} characters, over {self.max_chars}")
+        later = _sentences(rest)
+        count = len(later) + (lead is not None)
+        if count > self.max_sentences:
+            defects.append(f"{count} sentences, over {self.max_sentences}")
+        recaps = [
+            s for s in later if any(re.search(p, _normalize(s)) for p in self.recap_patterns)
+        ]
+        if recaps:
+            defects.append(f"restates its verdict: {recaps}")
+        return defects, lead_text
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        results = _delivered_results(snap.final_message)
+        if not results:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason="no delegated card result was delivered, so there is no answer to read",
+            )
+        failures, leads = [], []
+        for i, result in enumerate(results):
+            defects, lead_text = self._defects(result)
+            leads.append(lead_text)
+            if defects:
+                failures.append(f"result {i + 1}: " + "; ".join(defects))
+        missing = [t for t in self.lead_terms if not any(_normalize(t) in lead for lead in leads)]
+        if missing:
+            failures.append(f"no bold lead mentions {missing}")
+        if failures:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=" | ".join(failures),
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"{len(results)} delivered result(s) open on a bold one-sentence answer and stop",
+        )
+
+
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = "tool_call"
@@ -1073,6 +1278,12 @@ _PR_COMMITS_MAX_PAGES = 3
 # `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
 _PR_FILES_PAGE_SIZE = 100
 _PR_FILES_MAX_PAGES = 30
+# git's blob id for an empty file.
+_EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+# `/pulls/{n}/files` statuses whose file is not at the head any more.
+_PR_FILE_GONE_STATUSES = frozenset({"removed"})
+# Offending documents a failed content assertion names before counting the rest.
+_PR_CONTENT_MAX_NAMED = 5
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -2239,6 +2450,345 @@ def _stream_started() -> datetime | None:
         return None
 
 
+class PullRequestContentCheck(BaseModel):
+    """One assertion over the files a pull request adds.
+
+    ``paths`` are ``fnmatch`` globs over the files the pull request lists. A
+    removed file is skipped; a file it adds is read; any other file a glob
+    names (modified, renamed) makes the check unevaluable (see
+    ``_head_files``). Each matching file is parsed as multi-document YAML
+    with scalars kept as the text the file holds (``true`` is ``"true"``,
+    ``1.30`` is ``"1.30"``) and aliases refused; a file that does not parse is
+    one text document with no kind, which is how a Terraform file is read, and
+    a root list's mappings are documents of their own, and any other scalar or
+    list is a text document with no kind. Merge keys (``<<``) are refused like
+    aliases. ``kind`` keeps the documents
+    of that ``kind`` ("" for every document). ``field`` is a dotted path into
+    each kept document, stepping through lists element by element, so
+    ``spec.nodeConfig.machineType`` or ``spec.enableK8sBetaApis.enabledApis``
+    resolve to the values found there; a key holding dots is bracketed,
+    ``spec.nodeConfig.labels["ate.dev/substrate-version"]``. A map or list
+    value compares as one-line-per-entry YAML. "" is the document itself, as
+    text: the raw file for a document with no kind, else the document
+    re-serialised as YAML.
+
+    ``op`` is what each kept document must show:
+
+    - ``exists``: the key is there (even with an empty or null value);
+    - ``contains``: one resolved value equals ``value`` exactly (for
+      ``field: ""``, ``value`` occurs in the text);
+    - ``matches``: one resolved value matches the regular expression
+      ``value`` (``re.search``);
+    - ``not_matches``: the field resolves, and none of its values matches
+      (a node pool that leaves its machine type out gets GKE's default, which
+      may be the series the check forbids);
+    - ``absent``: across every matching file, no kept document has the field
+      (with ``field: ""``, no document of that ``kind`` at all). A matching
+      file that does not parse fails it when ``kind`` or ``field`` is set,
+      since the object may be in it.
+
+    Every op but ``absent`` needs at least one kept document, so a pull request
+    that never wrote the object fails rather than passing vacuously, and
+    ``quantifier`` says whether ``all`` kept documents (the default) or ``any``
+    one must satisfy it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1)
+    kind: str = ""
+    field: str = ""
+    op: Literal["exists", "contains", "matches", "not_matches", "absent"]
+    value: str = ""
+    quantifier: Literal["all", "any"] = "all"
+
+    @model_validator(mode="after")
+    def _value_fits_op(self):
+        if self.op in ("contains", "matches", "not_matches") and not self.value:
+            raise ValueError(f"`{self.op}` needs a `value`")
+        if self.op in ("exists", "absent") and self.value:
+            raise ValueError(f"`{self.op}` compares nothing, so a `value` on it would never be read")
+        if self.op == "absent" and self.quantifier != "all":
+            raise ValueError("`absent` is decided over every document, so a `quantifier` on it would never be read")
+        if self.field:
+            _field_keys(self.field)
+        if self.op in ("matches", "not_matches"):
+            try:
+                re.compile(self.value)
+            except re.error as exc:
+                raise ValueError(f"`value` is not a regular expression: {exc}") from exc
+        return self
+
+    def label(self) -> str:
+        what = self.kind or "document"
+        at = f".{self.field}" if self.field else ""
+        tail = f" {self.value!r}" if self.value else ""
+        return f"{what}{at} {self.op}{tail} in {', '.join(self.paths)}"
+
+
+class _ContentLoader(yaml.BaseLoader):
+    """Reads a document's scalars as the text the file holds, never coerced
+    (``true`` stays ``"true"``, ``1.30`` stays ``"1.30"``), and refuses aliases,
+    which a document written to grade could nest into an expansion the grader
+    cannot afford."""
+
+    def compose_node(self, parent, index):  # noqa: D102 - yaml's own hook
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("aliases are not read in graded content")
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node, deep=False):  # noqa: D102 - yaml's own hook
+        # A merge key would splice fields in that this loader does not
+        # resolve, so an object could carry a field no assertion sees.
+        seen: set[str] = set()
+        for key_node, _ in node.value:
+            if getattr(key_node, "tag", "") == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+                raise yaml.YAMLError("merge keys are not read in graded content")
+            # A repeated key keeps only its last spelling, so an earlier one
+            # (an E2 machine type before a C3 one) would never be seen.
+            if isinstance(key_node.value, str):
+                if key_node.value in seen:
+                    raise yaml.YAMLError(f"duplicate key {key_node.value!r} in graded content")
+                seen.add(key_node.value)
+        return super().construct_mapping(node, deep=deep)
+
+
+# The spellings of null a text-only loader keeps as text: a field holding one
+# is set to nothing, and GKE fills it with its default, so `not_matches`
+# cannot show it avoids anything.
+_YAML_NULL_SPELLINGS = frozenset({"", "~", "null", "Null", "NULL"})
+
+# A field segment: a bare key, or a bracketed quoted key that may hold dots
+# (`labels["ate.dev/substrate-version"]`).
+_FIELD_PATH = re.compile(r'(?:[^.\["\]]+|\["[^"]+"\])(?:\.[^.\["\]]+|\["[^"]+"\])*')
+_FIELD_SEGMENT = re.compile(r'\.?(?:\["([^"]+)"\]|([^.\["\]]+))')
+
+
+def _field_keys(dotted: str) -> list[str]:
+    """The keys of a dotted path, refusing anything outside its grammar
+    (a quote or bracket outside a bracketed key, text glued to a bracket),
+    which would otherwise name keys no document has."""
+    if not _FIELD_PATH.fullmatch(dotted):
+        raise ValueError(
+            f"`field` {dotted!r} is not a dotted path; a key holding dots is bracketed, "
+            'as labels["ate.dev/substrate-version"]'
+        )
+    # findall gives "" for the alternative that did not match.
+    return [bracketed or bare for bracketed, bare in _FIELD_SEGMENT.findall(dotted)]
+
+
+class _AsWrittenDumper(yaml.SafeDumper):
+    """Resolves no implicit types, so a string that reads like ``false`` or
+    ``1.30`` needs no quotes and is written plain."""
+
+    yaml_implicit_resolvers: dict = {}
+
+
+def _dump_as_written(value: Any) -> str:
+    """YAML for a tree the text-only loader built, with every scalar written
+    as the file had it (``false``, not ``'false'``)."""
+    return yaml.dump(value, Dumper=_AsWrittenDumper, sort_keys=False, width=float("inf"),
+                     allow_unicode=True, default_flow_style=False)
+
+
+def _scalar_text(value: Any) -> str:
+    """A resolved value as text: a scalar as the file wrote it, a map or list
+    as one-line-per-entry YAML."""
+    if isinstance(value, (dict, list)):
+        return _dump_as_written(value).strip()
+    return str(value)
+
+
+def _resolve_field(node: Any, dotted: str) -> list[Any]:
+    """Every value at ``dotted`` under ``node``, stepping into lists."""
+    values = [node]
+    for key in _field_keys(dotted):
+        nxt: list[Any] = []
+        for value in values:
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, dict) and key in item:
+                    nxt.append(item[key])
+        values = nxt
+    flat: list[Any] = []
+    for value in values:
+        # An empty list still says the key is there; it stands in as "".
+        flat += (value or [""]) if isinstance(value, list) else [value]
+    # Kept even when null or empty: the key is there, which is what
+    # `exists` and `absent` ask; the comparing ops skip empty values.
+    return flat
+
+
+def _is_kubernetes_list(node: Any) -> bool:
+    """Whether a mapping node is a ``kind: List`` with a sequence of ``items``."""
+    keys = {k.value: v for k, v in node.value if isinstance(k, yaml.ScalarNode)}
+    kind, items = keys.get("kind"), keys.get("items")
+    # `List` and the typed lists (`PodList`, `ConfigMapList`) kubectl reads
+    # the same way.
+    return (
+        isinstance(kind, yaml.ScalarNode) and kind.value.endswith("List")
+        and isinstance(items, yaml.SequenceNode)
+    )
+
+
+def _list_members(node: Any, label: str, loader: Any) -> list[tuple[str, Any]] | None:
+    """The objects a list-shaped node carries, recursively, or None when the
+    node is not one. A wrapper mapping is constructed first, so a repeated
+    or merged key in it is refused before its ``items`` are trusted."""
+    if isinstance(node, yaml.SequenceNode):
+        members = [(f"{label}.{j}", child) for j, child in enumerate(node.value)]
+    elif isinstance(node, yaml.MappingNode) and _is_kubernetes_list(node):
+        loader.construct_document(node)
+        items = next(v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == "items")
+        members = [(f"{label}.items.{j}", child) for j, child in enumerate(items.value)]
+    else:
+        return None
+    flat: list[tuple[str, Any]] = []
+    for member_label, member in members:
+        nested = _list_members(member, member_label, loader)
+        flat += nested if nested is not None else [(member_label, member)]
+    return flat
+
+
+def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
+    """``(documents, parsed)`` for one file: ``(label, mapping or None, text)``
+    per document, and whether the file parsed.
+
+    A document's text is the slice of the file it was read from, so a text
+    check sees the file as written, quoting and all. Only a parse error (or an
+    alias or merge key, refused as one) leaves a file unparsed; it is then one
+    text document with no kind. Empty documents (a trailing or doubled
+    ``---``) are nothing. A file whose only document is a scalar is not YAML in
+    any useful sense (a Terraform file reads as one long plain scalar), so it
+    is one raw text document with no kind, and counts as not parsed. A root
+    list's mappings, and the ``items`` of a Kubernetes ``kind: List``, are
+    documents of their own, each sliced from the file; any other scalar is a
+    text document with no kind. A repeated key is refused like an alias."""
+    docs: list[tuple[str, Any, str]] = []
+    pieces: list[tuple[str, Any, str]] = []
+    top_level: list[Any] = []
+    loader = _ContentLoader(text)
+    try:
+        index = 0
+        while loader.check_node():
+            node = loader.get_node()
+            label = f"{path}#{index}"
+            # A root list, and a Kubernetes `kind: List`, hold their objects
+            # one level down; each is a document of its own, sliced from the
+            # file, so a kind-scoped check sees what the wrapper carries.
+            children = _list_members(node, label, loader)
+            if children is None:
+                doc = loader.construct_document(node)
+                if doc is None or doc == "":
+                    continue
+                top_level.append(doc)
+                pieces.append((label, doc, text[node.start_mark.index:node.end_mark.index]))
+            else:
+                top_level.append([])
+                for child_label, child in children:
+                    doc = loader.construct_document(child)
+                    pieces.append((child_label, doc, text[child.start_mark.index:child.end_mark.index]))
+            index += 1
+    except (yaml.YAMLError, RecursionError):
+        # RecursionError: PyYAML composes recursively, and a few hundred nested
+        # brackets in an added file would otherwise crash the verifier.
+        return [(path, None, text)], False
+    finally:
+        loader.dispose()
+    if len(top_level) == 1 and not isinstance(top_level[0], (dict, list)):
+        return [(path, None, text)], False
+    for label, doc, raw in pieces:
+        docs.append((label, doc if isinstance(doc, dict) else None, raw))
+    return docs, True
+
+
+def _added_file_text(entry: dict) -> str | None:
+    """The whole text of a file the pull request adds, rebuilt from its patch,
+    or None when the listing cannot carry it (not an added file, or GitHub left
+    the patch out because the file is too large)."""
+    patch = entry.get("patch")
+    if entry.get("status") != "added":
+        return None
+    if patch is None and entry.get("sha") == _EMPTY_BLOB_SHA:
+        # An empty file: git emits no hunk for it, so there is no patch to read.
+        # Known by its blob, not by its zero line counts, which a binary file
+        # shares.
+        return ""
+    if not isinstance(patch, str):
+        return None
+    lines = []
+    raw = patch.split("\n")
+    if raw and raw[-1] == "":
+        raw.pop()
+    for line in raw:
+        if line.startswith("@@") or line.startswith("\\"):
+            continue
+        if not line.startswith("+"):
+            return None
+        lines.append(line[1:])
+    return "\n".join(lines) + "\n"
+
+
+def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) -> str | None:
+    """Why ``files`` (path -> text at the head) fail ``check``, or None."""
+    matched = {p: t for p, t in files.items() if any(fnmatch.fnmatchcase(p, g) for g in check.paths)}
+    kept = []
+    unparsed = []
+    for path, text in sorted(matched.items()):
+        docs, parsed = _documents(path, text)
+        if not parsed:
+            unparsed.append(path)
+        for label, doc, doc_text in docs:
+            if check.kind and (not isinstance(doc, dict) or doc.get("kind") != check.kind):
+                continue
+            if check.field:
+                values = _resolve_field(doc, check.field) if isinstance(doc, dict) else []
+            else:
+                values = [doc_text]
+            kept.append((label, values))
+    # A file that could not be read structurally may hold the very object a
+    # kind- or field-scoped check is about (an E2 pool behind an alias, say),
+    # so no such check is shown over it, whatever the op.
+    if unparsed and (check.kind or check.field):
+        return f"{check.label()}: could not parse {', '.join(unparsed)} as YAML, so this is not shown"
+    if check.op == "absent":
+        present = [label for label, values in kept if values]
+        if present:
+            named = ", ".join(present[:_PR_CONTENT_MAX_NAMED])
+            more = len(present) - _PR_CONTENT_MAX_NAMED
+            return f"{check.label()}: found in {named}" + (f" and {more} more" if more > 0 else "")
+        return None
+    if not kept:
+        return f"{check.label()}: the pull request adds no such document"
+
+    def holds(values: list[Any]) -> bool:
+        if check.op == "exists":
+            return bool(values)
+        texts = [_scalar_text(v) for v in values if v is not None]
+        filled = [t for t in texts if t.strip() not in _YAML_NULL_SPELLINGS]
+        if check.op == "contains":
+            if not check.field:
+                return any(check.value in t for t in texts)
+            return any(t == check.value for t in texts)
+        hit = any(re.search(check.value, t, re.MULTILINE) for t in texts)
+        # not_matches needs the field to be there: a pool that leaves its
+        # machine type out gets GKE's default, which may be the very series
+        # the check forbids.
+        return hit if check.op == "matches" else (bool(filled) and not hit)
+
+    failing = [label for label, values in kept if not holds(values)]
+    if check.quantifier == "any" and len(failing) < len(kept):
+        return None
+    if check.quantifier == "all" and not failing:
+        return None
+    named = ", ".join(failing[:_PR_CONTENT_MAX_NAMED])
+    more = len(failing) - _PR_CONTENT_MAX_NAMED
+    return (
+        f"{check.label()} ({check.quantifier}): not so in {named}"
+        + (f" and {more} more" if more > 0 else "")
+    )
+
+
 @VERIFIERS.register("pull_request_opened")
 class PullRequestOpenedVerifier(BaseVerifier):
     """A remediation pull request THIS run opened (or, with
@@ -2347,6 +2897,65 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Assertions over what the pull request writes (see PullRequestContentCheck):
+    # the object a provisioning case expects, with the fields it must carry,
+    # rather than only that some file changed. Read from `/pulls/{n}/files`,
+    # whose patch carries a file the pull request adds whole, so the credential
+    # needs only `pull_requests: read`. A glob that names any other file is an
+    # error (see _head_files).
+    content: list[PullRequestContentCheck] = Field(default_factory=list)
+
+    def _head_files(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[dict[str, str], str | None]:
+        """``(path -> text, unevaluable reason)`` for every file the pull request
+        adds that a :attr:`content` glob names, rebuilt from the listing's patch.
+
+        Only added files are read. Any other file a glob names (modified,
+        renamed, copied), or an added one GitHub left no patch for (large or
+        binary), would have to come from ``/contents``, which needs
+        ``contents: read``; the grading mint (hack/ci-eval-pr.sh) does not ask
+        for it, so such a match is unevaluable rather than graded on half the
+        pull request.
+        """
+        globs = [g for check in self.content for g in check.paths]
+        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        texts: dict[str, str] = {}
+        unread: list[str] = []
+        for page in range(1, _PR_FILES_MAX_PAGES + 1):
+            status, files = _http_get_json(
+                f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
+            )
+            if status != 200 or not isinstance(files, list):
+                return {}, (
+                    f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
+                    "the token needs `pull_requests: read` to read what the pull request "
+                    "writes, so the content checks could not be evaluated"
+                )
+            for entry in files:
+                if not isinstance(entry, dict) or entry.get("status") in _PR_FILE_GONE_STATUSES:
+                    continue
+                path = str(entry.get("filename") or "")
+                if not path or not any(fnmatch.fnmatchcase(path, g) for g in globs):
+                    continue
+                added = _added_file_text(entry)
+                if added is None:
+                    unread.append(f"{path} ({entry.get('status') or 'unknown'})")
+                else:
+                    texts[path] = added
+            if len(files) < _PR_FILES_PAGE_SIZE:
+                break
+        if unread:
+            named = ", ".join(unread[:_PR_CONTENT_MAX_NAMED])
+            more = len(unread) - _PR_CONTENT_MAX_NAMED
+            return {}, (
+                f"{owner}/{repo}#{number}: the content globs name {named}"
+                + (f" and {more} more" if more > 0 else "")
+                + ", which the files listing does not carry whole; `content` reads only files "
+                "the pull request adds, and reading any other needs `contents: read`, which "
+                "the grading mint does not grant, so the content checks could not be evaluated"
+            )
+        return texts, None
 
     def _changed_paths(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -3042,6 +3651,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitLab API for {full}!{number}: {exc}")
                     continue
+                if verdict == "pass" and self.content:
+                    # The content assertions read GitHub's file listing; a merge
+                    # request graded on every other clause is not graded on what
+                    # it writes, so it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: the `content` assertions read GitHub's pull request "
+                        "files and are not implemented for GitLab, so this check could not be evaluated"
+                    )
+                    continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)
                 (rejected if verdict == "reject" else unresolved).append(reason)
@@ -3183,6 +3801,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "requires the fix to leave unchanged (`unchanged_paths`) -- a "
                         "remediation written over the workload's own declaration"
                     )
+                    continue
+            if self.content:
+                try:
+                    texts, unevaluable = self._head_files(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                failures = [r for r in (_content_rejection(c, texts) for c in self.content) if r]
+                if failures:
+                    rejected.append(f"{slug}: " + "; ".join(failures))
                     continue
             # Within the skew allowance a pull request a hair older than the
             # run is still this run's; "an earlier repetition" only when the

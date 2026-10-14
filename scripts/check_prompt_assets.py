@@ -250,7 +250,7 @@ CRON_PROMPT_PATH = re.compile(
 #
 # `chat` is this repository's own platform, not a synonym for Google Chat:
 # `deploy/docker/plugins/chat/` relays the report to the Session KV server,
-# which runs one Chat Agent turn over it and posts the result. It is enabled
+# which posts it as written. It is enabled
 # only inside a cron child, because `profile_cron_tick.py` is the sole setter of
 # its `CHAT_HOME_CHANNEL`, so probing for it anywhere else -- a `kubectl exec`,
 # the gateway process -- finds it unset and reads like a dead value. It is not.

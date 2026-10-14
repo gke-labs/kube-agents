@@ -51,9 +51,9 @@ CAPABILITY_ACTIONS = ("list", "get", "set", "history")
 CAPABILITY_ACTOR = "platform-agent"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
-# synchronously — it creates the session, runs a whole Chat Agent turn (its own
-# 300s ceiling) and blocks on `hermes send` before answering — so this has to
-# outlast the work, not just a connect stall. Deliberately the same 360s the
+# synchronously — it blocks on `hermes send` to every enabled platform, and on a
+# Slack audit headline's ledger read, before answering — so this has to outlast
+# the work, not just a connect stall. Deliberately the same 360s the
 # delivery plugin uses (`RELAY_TIMEOUT_SECONDS`,
 # deploy/docker/plugins/chat/adapter.py), for the same reason and with the same
 # ordering: the server's verdict must be what the caller records.
@@ -1015,12 +1015,13 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     Send a report from a SCHEDULED (cron) job to the user's chat channel mid-run.
 
     You usually do NOT need this. A job created with deliver='chat' has its final
-    response relayed to the Chat Agent automatically, with nothing to call and
-    nothing to remember. Use this tool only when that is not enough: to report
+    response relayed to chat automatically, with nothing to call and nothing to
+    remember. Use this tool only when that is not enough: to report
     partway through a long run, or to send something other than your final answer.
 
     Having called it, return exactly `[SILENT]` so the same finding is not also
-    delivered as the run's result. The Chat Agent presents what you pass, so write
+    delivered as the run's result. What you pass is posted as written (on Slack a
+    fleet-audit report is shown as a headline linking its ledger issue), so write
     `report` as the finished message for a human reader, not as notes to yourself.
 
     Prefer this over send_notification for scheduled work: send_notification posts
@@ -1068,15 +1069,15 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # fan-out that reached some platforms and not others, and says which in
     # `relay` and `undelivered`. Reading both here is the difference between the
     # agent knowing what actually happened to its report and it believing the
-    # Chat Agent framed it for everyone. The relay adapter — the other caller of
+    # report reached everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
     #
     # `relay_detail` is the route's own wording for the degradation, so this
-    # end stops hard-coding it: `degraded` has one cause today (the Chat Agent
-    # turn did not compose the report; a leg that never landed keeps `relay:
-    # ok` and shows up in `undelivered` instead). Older routes do not send it;
-    # the sentence they used to get is the fallback.
+    # end does not hard-code it. A current route never sends `degraded`; an
+    # older one did when its Chat Agent turn over the report failed, and its
+    # sentence is the fallback for a route too old to send a detail. A leg that
+    # never landed keeps `relay: ok` and shows up in `undelivered` instead.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":
@@ -1110,7 +1111,7 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
         )
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {session}). "
-        "The Chat Agent posts it; do not also call send_notification for this report."
+        "It is posted to chat; do not also call send_notification for this report."
     )
 
 

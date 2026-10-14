@@ -64,7 +64,7 @@ The manual install covers only the agent workspace. To reach parity with an auto
 - **Cluster access**: a Kubernetes context the agent can call. The shipping config expects the [GKE MCP server](https://container.googleapis.com/mcp) proxied via `mcp-remote`; for other clusters, substitute your own Kubernetes MCP server or add `kubectl` to the toolset.
 - **Chat ingress**: Google Chat Pub/Sub or Slack Socket Mode. See [ChatOps](/kube-agents/concepts/chatops/).
 - **Inference gateway**: any Completions-API-compatible endpoint (LiteLLM is the default recommendation). See [Inference gateway](/kube-agents/concepts/inference-gateway/).
-- **GitHub token minter**: for the `submit-suggestion` and `github-issue-resolver` skills. See [Deploy → Token minter](/kube-agents/deploy/token-minter/).
+- **GitHub token minter**: for the `submit-suggestion` and `github-issue-resolver` skills. See [Deploy → Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on GitLab needs no minter: the credential broker holds a GitLab access token. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
 
 ## Verify
 
