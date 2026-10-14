@@ -1234,7 +1234,18 @@ _SHELL_ESCAPE_CHAR = "\\"
 _SHELL_LINE_END = "\n"
 # A `#` opens a comment only where a word opens: at the start of the line, after whitespace or
 # after an operator character. Bash then drops the rest of the line, operators included.
-_SHELL_WORD_OPENERS = frozenset(" \t\n\r\f\v") | _SHELL_OPERATOR_CHARS
+_SHELL_WORD_OPENERS = frozenset(" \t\n\r\f\v<>") | _SHELL_OPERATOR_CHARS
+# Bash's reserved words: a command word stands behind them (`if python3 ...`, `do python3 ...`).
+_SHELL_RESERVED_WORDS = frozenset(("if", "then", "else", "elif", "while", "until", "do", "{", "!"))
+# A redirect with nothing after it (`>#log`, once the comment is off) is a line bash refuses.
+_SHELL_REDIRECT_RE = re.compile(r"^\d*[<>]{1,2}&?$")
+# A substitution opens a span inside a word that the shell runs for its text, not a subshell:
+# `$(`...`)`, `$((`...`))`, `<(`...`)` and `>(`...`)`. Outside single quotes each is folded into
+# its enclosing word before the line is tokenised, so `r_$(date +%s).json` stays one word while
+# a bare `(` keeps opening a subshell.
+_SHELL_SUBSTITUTION_OPENERS = ("$((", "$(", "<(", ">(")
+_SUBSTITUTION_MARK = "\x00S{index}\x00"
+_SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
 _USAGE_FLAGS = ("-h", "--help")
 
 
@@ -1305,6 +1316,64 @@ def _strip_shell_comments(command: str) -> str:
     return "".join(kept)
 
 
+def _fold_substitutions(command: str) -> tuple[str, list[str]]:
+    """The command line with every unquoted substitution span replaced by a marker, and the
+    spans in order, so the tokeniser reads each as part of its word; a span left open at the
+    line's end is kept as it stands."""
+    spans: list[str] = []
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    while i < len(command):
+        char = command[i]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            out.append(char)
+            i += 1
+            continue
+        if char == _SHELL_ESCAPE_CHAR and i + 1 < len(command):
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        if char == _SHELL_SINGLE_QUOTE:
+            quote = char
+            out.append(char)
+            i += 1
+            continue
+        opener = next((o for o in _SHELL_SUBSTITUTION_OPENERS if command.startswith(o, i)), None)
+        if opener is None:
+            out.append(char)
+            i += 1
+            continue
+        depth = opener.count("(")
+        j = i + len(opener)
+        inner_quote: str | None = None
+        while j < len(command) and depth > 0:
+            c = command[j]
+            if inner_quote is not None:
+                if c == inner_quote:
+                    inner_quote = None
+            elif c in _SHELL_QUOTE_CHARS:
+                inner_quote = c
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            j += 1
+        if depth > 0:
+            out.append(command[i:])
+            break
+        spans.append(command[i:j])
+        out.append(_SUBSTITUTION_MARK.format(index=len(spans) - 1))
+        i = j
+    return "".join(out), spans
+
+
+def _unfold_substitutions(word: str, spans: list[str]) -> str:
+    return _SUBSTITUTION_MARK_RE.sub(lambda m: spans[int(m.group(1))], word)
+
+
 def _shell_words(command: str) -> list[str]:
     """The command line as the shell's words, quotes honoured and removed, operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``) as words of their own; a line whose
@@ -1313,14 +1382,20 @@ def _shell_words(command: str) -> list[str]:
     (:func:`_strip_shell_comments`), so the lexer's own ``#`` commenter is off, as in
     ``shlex.split``: it would cut a word at a ``#`` inside it (``readiness-#2.json``), which
     bash does not."""
-    command = _strip_shell_comments(command)
+    command, spans = _fold_substitutions(_strip_shell_comments(command))
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
-        return list(lexer)
+        words = [_unfold_substitutions(word, spans) for word in lexer]
     except ValueError:
         return []
+    # A redirect that ends a segment with no target (`>#log` once its comment is off) is a line
+    # bash refuses, so nothing on it runs.
+    for index, word in enumerate(words):
+        if _SHELL_REDIRECT_RE.match(word) and (index + 1 == len(words) or set(words[index + 1]) <= _SHELL_OPERATOR_CHARS):
+            return []
+    return words
 
 
 def _shell_argvs(command: str) -> list[list[str]]:
@@ -1363,7 +1438,7 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
         base = os.path.basename(word)
         if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
             return index
-        if _SHELL_ASSIGNMENT_RE.match(word):
+        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
             continue
         if base in _SHELL_EXEC_WRAPPERS:
             after_wrapper = True
@@ -1432,7 +1507,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     expansion is resolved, so a run spelled through a variable that holds the
     whole path (``python3 "$SCRIPT" ...``), a backtick capture or a quoted
     ``$(...)`` is not read as one -- the dictated command spells the path in
-    full. Fails closed
+    full; an unquoted ``$(...)``, ``$((...))``, ``<(...)`` or ``>(...)`` is kept
+    inside its word, as the shell keeps it, and a reserved word (``if``, ``do``,
+    ``!``) stands ahead of the command word. Fails closed
     like its siblings -- a run with no captured worker commands is
     ``status="error"``, not a pass.
     """

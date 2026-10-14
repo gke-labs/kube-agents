@@ -7023,6 +7023,13 @@ def _run_objective(command: str) -> str:
         # a shell word behind `echo` or `printf` is printed, and the string after its `-c` never runs
         (f'echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
         (f"printf '%s' sh -c 'python3 {_SCRIPT_PATH} --readiness'", False),
+        # the dictated per-run name is one word, whatever order the flags come in; a reserved word stands ahead
+        (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness_$(date +%s).json", True),
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p", True),
+        (f"for p in a b; do python3 {_SCRIPT_PATH} --readiness --project $p; done", True),
+        (f"if python3 {_SCRIPT_PATH} --readiness; then echo ok; fi", True),
+        # a redirect whose target is a comment is a line bash refuses
+        (f"python3 {_SCRIPT_PATH} --readiness >#log", False),
         # a wrapper's flag may take a word: everything after a wrapper is its own until the shell or interpreter
         (f'timeout -s KILL 600 bash -c "python3 {_SCRIPT_PATH} --readiness"', True),
         (f"env -u KUBECONFIG sh -c 'python3 {_SCRIPT_PATH} --readiness'", True),
@@ -7069,6 +7076,12 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs('echo bash -c "python3 /x/f.py --readiness"') == [["echo", "bash", "-c", "python3 /x/f.py --readiness"]]
     assert _shell_argvs('nice -n 10 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('timeout -s KILL 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    # a substitution stays inside its word; a bare `(` still opens a subshell; a quoted one is text
+    assert _shell_argvs("python3 f.py --output r_$(date +%s).json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"]]
+    assert _shell_argvs("echo $((1+2)) && python3 f.py --readiness") == [["echo", "$((1+2))"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("diff <(echo a) <(echo b)") == [["diff", "<(echo a)", "<(echo b)"]]
+    assert _shell_argvs("echo '$(not run)'") == [["echo", "$(not run)"]]
+    assert _shell_argvs("python3 f.py --readiness >#log") == []
     # a wrapped shell is unwrapped behind the wrappers that hand their argv on
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]
