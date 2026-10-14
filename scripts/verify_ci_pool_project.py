@@ -370,6 +370,22 @@ FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
 # role's full name embeds the project id, and the pool-state scan groups
 # findings by id to tell "the pool drifted" from "one project is odd".
 FINDING_PLATFORM_CALENDAR_MODE_ROLE = "iam/platform-gsa/missing/calendar-mode-advice-role"
+# The same role held but carrying other permissions than the one it exists
+# for. A predefined role's contents are fixed; a project custom role's are
+# whatever iam.roles.update last made them, and on a registered pool project
+# the role is outside Terraform state, so this read is the only thing that
+# would notice. Not lease-silent: a widened role is the agent under test
+# grading with authority the closed set exists to exclude, like an extra
+# predefined role.
+FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS = "iam/platform-gsa/calendar-mode-advice-role/permissions"
+REPAIR_CALENDAR_MODE_ROLE_PERMISSIONS = (
+    "gcloud iam roles update {role_id} --project={project_id} --permissions={permission} "
+    "# docs/ci-pool-projects.md section 3"
+)
+REPAIR_CALENDAR_MODE_ROLE_UNDELETE = (
+    "gcloud iam roles undelete {role_id} --project={project_id} "
+    "# docs/ci-pool-projects.md section 3"
+)
 # Findings a leased run passes with. Every finding outside this set reds the
 # run that leases the project -- a missing grant, API, key or cluster is a 403
 # or a missing resource in the agent's transcript -- and the health bot's
@@ -1487,6 +1503,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # organization with no folder between), and a binding whose member is a group
     # holding the GSA. Both make the extra-role check below a floor rather than
     # the closed set it reads as.
+    # Named before the read so the role's own read below can ask whether the
+    # policy held it when the policy read itself failed.
+    calendar_mode_role = PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE.format(project_id=project_id)
+    platform_held = set()
     rc, out, err = run_cmd(["gcloud", "projects", "get-iam-policy", project_id, "--format=json"])
     if rc != 0:
         if not _record_unreadable(
@@ -1575,18 +1595,29 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         _project_binding(project_id, FLEET_RECONCILER_MEMBER, role),
                     ))
 
-            calendar_mode_role = PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE.format(project_id=project_id)
             platform_expected = PLATFORM_GSA_ROLES | {calendar_mode_role}
             platform_missing = platform_expected - platform_held
             platform_extra = platform_held - platform_expected
             if platform_missing and not platform_absent:
                 passed = False
-                details.append(
-                    f"The platform agent GSA is missing {len(platform_missing)} role(s) on "
-                    f"{project_id}: {', '.join(sorted(platform_missing))}. The agent under test "
-                    "authenticates as this account, so eval cases on this project fail on a "
-                    "credential the agent lacks rather than on the agent's reasoning"
-                )
+                predefined_missing = platform_missing - {calendar_mode_role}
+                if predefined_missing:
+                    details.append(
+                        f"The platform agent GSA is missing {len(predefined_missing)} role(s) on "
+                        f"{project_id}: {', '.join(sorted(predefined_missing))}. The agent under test "
+                        "authenticates as this account, so eval cases on this project fail on a "
+                        "credential the agent lacks rather than on the agent's reasoning"
+                    )
+                if calendar_mode_role in platform_missing:
+                    # Its own sentence: the role reds one nightly case and no
+                    # presubmit lease (LEASE_SILENT_FINDINGS), so the sentence
+                    # above, written for roles whose absence reds every lease,
+                    # would misattribute it.
+                    details.append(
+                        f"The platform agent GSA is missing {calendar_mode_role} on {project_id}. "
+                        "No presubmit case needs it; the nightly's obtainability-window-planning-probe "
+                        "fails on this project for want of it rather than on the agent's reasoning"
+                    )
                 for role in sorted(platform_missing):
                     if role == calendar_mode_role:
                         finding_id = FINDING_PLATFORM_CALENDAR_MODE_ROLE
@@ -1742,6 +1773,61 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
+
+    # The calendar-mode advice role is admitted to the closed set by name, and
+    # a custom role's name says nothing about its contents: read them. Only
+    # when the policy holds it -- absent, the missing finding above already
+    # carries the repair, and a role that does not exist has no permissions to
+    # read.
+    if roles_checked and calendar_mode_role in platform_held:
+        rc, out, err = run_cmd([
+            "gcloud", "iam", "roles", "describe", PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+            f"--project={project_id}", "--format=json",
+        ])
+        if rc != 0:
+            unread = _unread_reason(err)
+            if unread:
+                warnings.append(Unread(unread))
+            else:
+                passed = False
+                details.append(f"Could not read {calendar_mode_role} on {project_id}: {err.strip()}")
+        else:
+            try:
+                role_doc = _load_json(out)
+                granted = set(role_doc.get("includedPermissions") or [])
+                expected_permissions = {PLATFORM_GSA_CALENDAR_MODE_PERMISSION}
+                if role_doc.get("deleted"):
+                    passed = False
+                    details.append(
+                        f"{calendar_mode_role} on {project_id} is soft-deleted, so the binding grants nothing. "
+                        "The nightly's obtainability-window-planning-probe fails on this project for want of it"
+                    )
+                    findings.append(Finding(
+                        FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+                        f"{calendar_mode_role} on {project_id} is soft-deleted",
+                        REPAIR_CALENDAR_MODE_ROLE_UNDELETE.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID, project_id=project_id
+                        ),
+                    ))
+                elif granted != expected_permissions:
+                    passed = False
+                    details.append(
+                        f"{calendar_mode_role} on {project_id} carries {', '.join(sorted(granted)) or 'no permissions'} "
+                        f"instead of {PLATFORM_GSA_CALENDAR_MODE_PERMISSION} alone. The agent under test holds "
+                        "whatever the role carries, and the set is closed for the same reason the predefined roles are"
+                    )
+                    findings.append(Finding(
+                        FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS,
+                        f"{calendar_mode_role} on {project_id} carries {', '.join(sorted(granted)) or 'no permissions'}",
+                        REPAIR_CALENDAR_MODE_ROLE_PERMISSIONS.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                        ),
+                    ))
+            except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+                passed = False
+                details.append(f"Failed parsing {calendar_mode_role} on {project_id}: {exc}")
 
     # The summary must not assert an item a warning above retracts.
     partial = _partial_summary(

@@ -165,4 +165,17 @@ resource "google_project_iam_member" "calendar_mode_advice" {
   project = var.project_id
   role    = google_project_iam_custom_role.calendar_mode_advice[0].id
   member  = "serviceAccount:${google_service_account.agent.email}"
+
+  # The same (project, role, member) binding listed in project_roles as well
+  # would be two state entries for one grant: removing the list entry later
+  # destroys its member, and the provider's member delete removes the grant
+  # whatever the second entry says, so the agent loses the permission until a
+  # further apply recreates it. Refused at plan time instead; the message
+  # names the gap-free path.
+  lifecycle {
+    precondition {
+      condition     = !contains(var.project_roles, "projects/${var.project_id}/roles/${local.calendar_mode_advice_role_id}")
+      error_message = "project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) lists projects/${var.project_id}/roles/${local.calendar_mode_advice_role_id} while calendar_mode_advice_enabled (ENABLE_CALENDAR_MODE_ADVICE) also binds it, which would manage one grant from two places and revoke it for one apply when the list entry goes. Keep one: drop the role from the list (the switch's binding carries it; a drop-then-apply alone revokes it for one apply, so run the apply twice or `terraform state rm` the list's member first), or leave the switch off."
+    }
+  }
 }

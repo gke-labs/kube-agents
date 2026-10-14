@@ -47,3 +47,20 @@ run "on_plans_the_one_permission_role_bound_in_the_management_project" {
     error_message = "the switch must not change project_roles"
   }
 }
+
+# The same role in project_roles beside the switch is one grant managed from
+# two places, and is refused at plan time rather than revoked for an apply.
+run "the_role_listed_in_project_roles_beside_the_switch_is_refused" {
+  command = plan
+
+  variables {
+    calendar_mode_advice_enabled = true
+    project_roles = [
+      "roles/container.clusterViewer",
+      "roles/container.viewer",
+      "projects/mgmt-project-1/roles/kubeAgentsCalendarModeAdvice",
+    ]
+  }
+
+  expect_failures = [google_project_iam_member.calendar_mode_advice]
+}
