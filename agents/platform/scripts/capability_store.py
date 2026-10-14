@@ -24,7 +24,7 @@ cannot be changed here at all, and a key marked ``propose`` is refused unless
 the call names who confirmed it. What it cannot: that the named person actually
 saw the before/after — that round-trip is the agent's instruction
 (agents/platform/AGENTS.md), and the changelog records the name so a reader can
-ask. The validator is a deliberately small subset of JSON Schema (type, enum,
+ask. The validator is a deliberately small subset of JSON Schema (type, enum, pattern,
 minimum, maximum, maxLength, items, maxItems, required, additionalProperties) so
 this module stays on the standard library like the scaffolder that seeds it.
 """
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import re
 import os
 import sys
 import time
@@ -267,6 +268,9 @@ def _validate_value(spec: dict[str, Any], value: Any) -> list[str]:
     enum = spec.get("enum")
     if isinstance(enum, list) and value not in enum:
         errors.append(f"must be one of {enum}")
+    pattern = spec.get("pattern")
+    if isinstance(pattern, str) and isinstance(value, str) and re.search(pattern, value) is None:
+        errors.append(f"must match {pattern}")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if isinstance(spec.get("minimum"), (int, float)) and value < spec["minimum"]:
             errors.append(f"must be >= {spec['minimum']}")

@@ -29,11 +29,12 @@
       "type": "array",
       "items": {
         "type": "string",
-        "maxLength": 64
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_]+$"
       },
       "maxItems": 32,
       "default": ["COS", "UBUNTU", "WINDOWS_SAC"],
-      "description": "Check 3.9: node image types flagged as deprecated regardless of whether the location still offers them. Compared case-insensitively."
+      "description": "Check 3.9: node image types flagged as deprecated regardless of whether the location still offers them. Compared case-insensitively, as a set; an entry is letters, digits and underscores, the spelling the collector's flag carries."
     }
   }
 }

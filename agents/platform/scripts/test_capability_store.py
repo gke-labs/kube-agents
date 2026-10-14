@@ -156,6 +156,17 @@ class StoreTest(unittest.TestCase):
         (line,) = cs.history(self.root, "demo")
         self.assertEqual((line["revision"], line["changes"]), (1, {"threshold": {"before": 3, "after": 4}}))
 
+    def test_a_pattern_on_a_string_is_enforced(self):
+        # The flag that carries a list cannot carry an entry with a comma, a space or a quote, so
+        # the schema refuses it at the store and `get`, the flag and the manifest agree.
+        schema = {"type": "object", "additionalProperties": False, "properties": {"names": {"type": "array", "items": {"type": "string", "pattern": "^[A-Z0-9_]+$"}, "default": []}}}
+        seed(self.root, criteria={}, schema=schema)
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"names": ["COS CONTAINERD"]}, reason="x", confirmed_by="ops@example")
+        self.assertIn("must match", str(ctx.exception))
+        cs.apply_changes(self.root, "demo", {"names": ["COS_CONTAINERD"]}, reason="x", confirmed_by="ops@example")
+        self.assertEqual(cs.load(self.root, "demo").criteria["names"], ["COS_CONTAINERD"])
+
     def test_schema_violations_are_named_and_nothing_is_written(self):
         seed(self.root)
         cases = {
