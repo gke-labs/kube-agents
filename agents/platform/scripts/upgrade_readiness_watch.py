@@ -238,39 +238,45 @@ PROJECT_RUN_REFUSED_DETAIL = "readiness run for {project} {error}"
 REFUSED_DETAIL = "refused by the report script: {reason}; {remedy}"
 INSTALL_REMEDY_PREFIX = "the remedy is on the install, not this job: "
 ROSTER_REMEDY = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
+# The remedies, chosen below on what the refusal captured and on the scope's
+# state rather than on which message it was: one message covers a project
+# the install cannot read, one merely over the cap and one an hour from
+# being resolved, and the remedies differ.
+REMEDY_DECLARE = INSTALL_REMEDY_PREFIX + "name the project in spec.scope, " + ROSTER_REMEDY
+REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
+REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
+REMEDY_UNRESOLVED = "the reconcile has not resolved the declaration yet; the next tick after it does reads the project, and nothing is to do until then"
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)"
+REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
+# A declared project the install could not read, by the outcome the reconcile
+# recorded; any other outcome (denied, unreachable, unknown) is read access.
+UNREAD_REMEDIES = {fleet_scope_targets.OUTCOME_OVER_CAP: REMEDY_CAP, fleet_scope_targets.OUTCOME_UNRESOLVED: REMEDY_UNRESOLVED}
 # The refusals the report script can answer this job with, each a
 # fleet_scope_args message that ends in a remedy for an agent (the tool's
 # collector_args, an id the tool lists), with the same reason in the
-# install's terms and the remedy that fits it. Parsed with the script's own
-# constants, so a reworded message falls through to the script's text rather
-# than to a wrong reason.
+# install's terms and the kind the remedy is chosen by. Parsed with the
+# script's own constants, so a reworded message falls through to the
+# script's text rather than to a wrong reason.
+REFUSAL_OUTSIDE = "outside"
+REFUSAL_UNREAD = "unread"
+REFUSAL_NUMBER = "number"
+REFUSAL_SANDBOX = "sandbox"
 REFUSAL_REASONS = (
-    (
-        fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR,
-        "the install's declared scope does not list {project}; it lists {projects}",
-        INSTALL_REMEDY_PREFIX + "name the project in spec.scope, " + ROSTER_REMEDY,
-    ),
-    (
-        fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR,
-        "the install's declared scope lists {project} but the install could not read it ({outcome})",
-        INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY,
-    ),
-    (
-        fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR,
-        "the report script could not resolve project number {number} to an id",
-        INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
-    ),
-    (
-        # The sandbox froze KUBEAGENTS_SCOPE_DECLARED when it started and this
-        # pod reads the declaration live, so between a spec.scope block's
-        # removal and the sandbox's restart the two can disagree for a tick.
-        fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR,
-        "the sandbox says the install declares a scope, but this pod reads no declaration",
-        "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
-    ),
+    (fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR, "the install's declared scope does not list {project}; it lists {projects}", REFUSAL_OUTSIDE),
+    (fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR, "the install's declared scope lists {project} but the install could not read it ({outcome})", REFUSAL_UNREAD),
+    (fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR, "the report script could not resolve project number {number} to an id", REFUSAL_NUMBER),
+    # The sandbox froze KUBEAGENTS_SCOPE_DECLARED when it started and this
+    # pod reads the declaration live, so between a spec.scope block's
+    # removal and the sandbox's restart the two can disagree for a tick.
+    (fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, "the sandbox says the install declares a scope, but this pod reads no declaration", REFUSAL_SANDBOX),
 )
+# With an empty resolved set the script's message lists "none readable"; the
+# pod knows the set is empty from the scope itself and says that instead.
+EMPTY_SCOPE_REASON = "the declared scope resolved to no readable project this tick, so it does not list {project}"
+REFUSAL_PROJECT_FIELD = "project"
 REFUSAL_PROJECTS_FIELD = "projects"
-REFUSAL_FIELDS = ("project", REFUSAL_PROJECTS_FIELD, "outcome", "number")
+REFUSAL_OUTCOME_FIELD = "outcome"
+REFUSAL_FIELDS = (REFUSAL_PROJECT_FIELD, REFUSAL_PROJECTS_FIELD, REFUSAL_OUTCOME_FIELD, "number")
 REFUSAL_FIELD_PATTERN = "(?P<{field}>.+?)"
 # The remedy rides on the message: every read role the install binds carries
 # resourcemanager.projects.get (cluster_agent_reconcile.py relies on it), and
@@ -689,7 +695,7 @@ def run_report(names: list[str], readiness: bool, *, scope: fleet_scope_targets.
     if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
         detail = f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}"
         if envelope.get(ENVELOPE_EXIT_KEY) == REPORT_USAGE_EXIT:
-            refusal = refusal_detail(completed.stderr or "")
+            refusal = refusal_detail(completed.stderr or "", scope)
             if refusal is not None:
                 raise ReportRefused(refusal)
         raise RuntimeError(detail)
@@ -705,20 +711,56 @@ def refusal_pattern(template: str) -> re.Pattern:
     return re.compile(pattern)
 
 
-def refusal_detail(stderr: str) -> str | None:
+def unresolved_note(scope: fleet_scope_targets.ScopeTargets | None) -> str | None:
+    """Why the declared scope is not resolved, when it is not: the render's
+    note while no snapshot answers, else the fixed unresolved row's (a carried
+    tick, a failed container or selector lookup); None for a resolved scope."""
+    if scope is None:
+        return None
+    if scope.note:
+        return scope.note
+    if any(project == fleet_scope_args.UNRESOLVED_SCOPE_ROW for project, _ in scope.unread):
+        return fleet_scope_args.UNRESOLVED_SCOPE_NOTE
+    return None
+
+
+def refusal_remedy(kind: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None) -> str:
+    """The remedy for a refusal, by its cause: a project outside a scope the
+    reconcile has resolved is declared or dropped from the roster, but outside
+    one it has not resolved it waits for the tick; a project the install
+    could not read is read access, or the cap, or that same wait, by the
+    outcome the reconcile recorded."""
+    if kind == REFUSAL_OUTSIDE:
+        return REMEDY_UNRESOLVED if unresolved_note(scope) else REMEDY_DECLARE
+    if kind == REFUSAL_UNREAD:
+        return UNREAD_REMEDIES.get(fields[REFUSAL_OUTCOME_FIELD], REMEDY_READ_ACCESS)
+    if kind == REFUSAL_NUMBER:
+        return REMEDY_ID
+    return REMEDY_SANDBOX_RESTART
+
+
+def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None) -> str | None:
     """What a refusal by the report script reads as, in the install's terms:
     the message matched against the script's own constants, re-said with what
-    it named (the scope it lists shortened to a few names) and the remedy that
-    fits it; None for a usage exit this job does not know, which is reported
-    as the script wrote it."""
+    it named (the scope it lists shortened to a few names; an empty resolved
+    set said as such, and an unresolved scope with the scope's own note) and
+    the remedy for its cause (``refusal_remedy``); None for a usage exit this
+    job does not know, which is reported as the script wrote it."""
     text = " ".join(stderr.split())
-    for template, said, remedy in REFUSAL_REASONS:
+    for template, said, kind in REFUSAL_REASONS:
         found = refusal_pattern(template).search(text)
-        if found:
-            fields = found.groupdict()
-            if REFUSAL_PROJECTS_FIELD in fields:
-                fields[REFUSAL_PROJECTS_FIELD] = shown_names(fields[REFUSAL_PROJECTS_FIELD].split(fleet_scope_args.OVERRIDE_PROJECTS_SEPARATOR))
-            return REFUSED_DETAIL.format(reason=said.format(**fields), remedy=remedy)
+        if not found:
+            continue
+        fields = found.groupdict()
+        if REFUSAL_PROJECTS_FIELD in fields:
+            fields[REFUSAL_PROJECTS_FIELD] = shown_names(fields[REFUSAL_PROJECTS_FIELD].split(fleet_scope_args.OVERRIDE_PROJECTS_SEPARATOR))
+        reason = said.format(**fields)
+        if kind == REFUSAL_OUTSIDE and scope is not None and not scope.projects:
+            reason = EMPTY_SCOPE_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
+        note = unresolved_note(scope)
+        if note and (kind == REFUSAL_OUTSIDE or fields.get(REFUSAL_OUTCOME_FIELD) == fleet_scope_targets.OUTCOME_UNRESOLVED):
+            reason = f"{reason}; {note}"
+        return REFUSED_DETAIL.format(reason=reason, remedy=refusal_remedy(kind, fields, scope))
     return None
 
 
@@ -1226,8 +1268,11 @@ def readiness_by_project(
     declared install, one the scope does not list, whose clusters the ledger
     pended before that) is in the second value with the refusal's text and
     named again in the fourth, its own kind for the ungraded announcement,
-    so a refusal that stands is posted once and a sandbox that then fails is
-    still news. All are read errors in the envelope, so the report names them.
+    so a refusal that stands is posted once, then on the weekly cadence an
+    unreachable cluster earns (``UNGRADED_ATTEMPTS_BEFORE_WEEKLY``: the
+    condition needs the operator, and the weekly line carries the remedy),
+    and a sandbox that then fails is still news. All are read errors in the
+    envelope, so the report names them.
     ``last_runs`` is stamped for a run that completed or hit its own cap, so
     the least recently run projects go first next time."""
     # Member keys carry the id the report resolved; the run is asked for by the
