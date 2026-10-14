@@ -1124,7 +1124,7 @@ _RENDER_REFUSED = (
     '{"output": "...\\npolicy rule: kubernetes.read-only\\npolicy verb: scale deployment'
     '\\npolicy render: local\\n", "exit_code": 77}'
 )
-_WRITE = r"policy rule: kubernetes\.read-only(?:\n|\\n)policy verb: (?:scale|patch|apply)(?: [^\n\\]*)?(?:$|\"|(?:\n|\\n)(?!policy render: local))"
+_WRITE = r"policy rule: kubernetes\.read-only(?:\n|\\n)policy verb: (?:scale|patch|apply)(?: [^\n\\\"]*)?(?:$|\"|(?:\n|\\n)(?!policy render: local))"
 _RESULTS = WorkerCommandsVerifier(
     type="worker_commands", match="segments", after_result_pattern=_WRITE,
     forbidden_result_patterns=[_WRITE, r"policy rule: kubernetes\.read-only(?:\n|\\n)policy verb: exec\b"],
@@ -1169,6 +1169,14 @@ def test_worker_commands_forbidden_result_patterns_count_a_second_refused_write_
         '...\\npolicy rule: kubernetes.read-only\\npolicy verb: scale deployment\\n", "exit_code": 0}'
     )
     _stash_terminal([_terminal("kubectl scale deploy x --replicas=3 2>&1 | tee /tmp/r.txt; cat /tmp/r.txt", echoed, at=1)])
+    assert _RESULTS.verify(5.0).status == "pass"
+    # The same with raw line breaks and the last copy ending the output, or ending on the quote.
+    raw_echo = "...\npolicy rule: kubernetes.read-only\npolicy verb: scale deployment\n...\npolicy rule: kubernetes.read-only\npolicy verb: scale deployment"
+    _stash_terminal([_terminal("kubectl scale deploy x --replicas=3 2>&1 | tee /tmp/r.txt; printf '%s' \"$(cat /tmp/r.txt)\"", raw_echo, at=1)])
+    assert _RESULTS.verify(5.0).status == "pass"
+    on_the_quote = echoed.replace('scale deployment\\n", "exit_code": 0}', 'scale deployment", "exit_code": 0}')
+    assert on_the_quote != echoed
+    _stash_terminal([_terminal("kubectl scale deploy x --replicas=3 2>&1 | tee /tmp/r.txt; printf '%s' \"$(cat /tmp/r.txt)\"", on_the_quote, at=1)])
     assert _RESULTS.verify(5.0).status == "pass"
     # One refused write beside a refused read in the same call is the attempt alone.
     one = two.replace("policy verb: patch deployment", "policy verb: exec")

@@ -1960,10 +1960,17 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=True"],
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=1"],
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=T"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=unchanged"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run="],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=Client"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--help=true"],
             ["kubectl", "scale", "--help"],
             ["kubectl", "-n", "kube-system", "patch", "-h"],
         ):
             self.assertTrue(command_policy.local_render(argv), argv)
+        # A release track is not part of the verb the shim prints.
+        self.assertEqual(("container", "clusters", "resize"), command_policy.evaluate(["gcloud", "beta", "container", "clusters", "resize", "c", "--size", "3"]).verb_tuple)
+        self.assertEqual(("container", "clusters", "update"), command_policy.evaluate(["gcloud", "container", "clusters", "update", "c"]).verb_tuple)
         # The subcommand word counts as apply's subcommand only, not as a resource name.
         self.assertFalse(command_policy.local_render(["kubectl", "scale", "deployment", "kube-dns", "view-last-applied", "-n", "kube-system", "--replicas=3"]))
         self.assertFalse(command_policy.local_render(["kubectl", "delete", "deploy", "kube-dns", "view-last-applied"]))

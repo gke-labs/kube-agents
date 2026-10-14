@@ -103,10 +103,12 @@ _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # attempted against the cluster, so the agent's runtime does not count it as a
 # refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
 # a help flag is (the verb's usage text, nothing attempted).
-_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list", "--dry-run", "-h", "--help"})
-# kubectl parses ``--dry-run``'s value with ParseBool before the strategy switch,
-# so every true spelling is a client render; ``server``/``none`` are writes.
-_LOCAL_DRY_RUN_VALUES = frozenset({"client", "true", "t", "1"})
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list", "-h", "--help"})
+# kubectl's ``--dry-run`` strategy reaches the server for these two values only;
+# ``client``, the bare flag's ``unchanged``, the ParseBool true spellings, an empty
+# or unknown value all end on the client (a render, or an error before any request).
+_DRY_RUN_WRITE_VALUES = frozenset({"none", "server"})
+_HELP_FLAGS = frozenset({"-h", "--help"})
 _LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
@@ -716,6 +718,8 @@ _GCLOUD_HELP_FLAGS = frozenset({"--help", "-h"})
 #: not cover, so the prefix defeated the exclusion precisely where it was the
 #: only gate.
 _GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+# The one rule whose refusal carries a render flag (``local_render``).
+KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 
 
 def _gcloud_has_flags_file(argv: list[str]) -> str | None:
@@ -1127,13 +1131,15 @@ def local_render(argv: list[str]) -> bool:
     guidance instead of halting.
     """
     own = argv[: argv.index("--")] if "--" in argv else argv
-    dry_runs = [t for t in own if t.startswith("--dry-run")]
-    if dry_runs:
-        last = dry_runs[-1]
-        if last == "--dry-run" or (last.startswith("--dry-run=") and last.split("=", 1)[1].lower() in _LOCAL_DRY_RUN_VALUES):
-            return True
-    if any(t in _LOCAL_RENDER_FLAGS and not t.startswith("--dry-run") for t in own):
+    dry_runs = [t for t in own if t == "--dry-run" or t.startswith("--dry-run=")]
+    if dry_runs and dry_runs[-1].partition("=")[2].lower() not in _DRY_RUN_WRITE_VALUES:
         return True
+    for t in own:
+        if t in _LOCAL_RENDER_FLAGS:
+            return True
+        flag, _, value = t.partition("=")
+        if flag in _HELP_FLAGS and value.lower() in ("", "true", "t", "1"):
+            return True
     verb, _ = _kubectl_verb_and_flag(argv)
     return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
 
@@ -1220,7 +1226,7 @@ def evaluate(argv: list[str]) -> Decision:
         if verb in KUBECTL_REFUSED_SUBCOMMANDS:
             return Decision(
                 allowed=False,
-                rule_id="kubernetes.read-only",
+                rule_id=KUBERNETES_READ_ONLY_RULE,
                 message=(
                     "Agents hold read-only access to Kubernetes. Propose this change "
                     "as a pull request instead. "
@@ -1232,7 +1238,7 @@ def evaluate(argv: list[str]) -> Decision:
             return _ALLOWED
         return Decision(
             allowed=False,
-            rule_id="kubernetes.read-only",
+            rule_id=KUBERNETES_READ_ONLY_RULE,
             message=(
                 "Agents hold read-only access to Kubernetes. Propose this change "
                 "as a pull request instead. "
@@ -1345,7 +1351,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "rather than working around it. "
                     + _ACTION_BOUNDARY_NOTICE
                 ),
-                verb_tuple=tuple(words[:3]),  # Cap at 3 words to exclude positionals
+                verb_tuple=tuple((words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else words)[:3]),  # past a release track; 3 words, no positionals
             )
         return _ALLOWED
 

@@ -334,6 +334,8 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
         "env -S 'kubectl scale deploy x --replicas=3'",
         "env -S 'sh -c \"kubectl get deploy x; kubectl scale deploy x --replicas=3\"'",
         "env -S'kubectl scale deploy x --replicas=3'",
+        "sudo env -S 'sh -c \"kubectl get deploy x; kubectl scale deploy x --replicas=3\"'",
+        "timeout 30 env -u HTTPS_PROXY -S 'kubectl scale deploy x --replicas=3'",
         "cat <<'EOF' | sudo tee /tmp/fix.sh >/dev/null\nkubectl scale deploy x --replicas=3\nEOF\nsudo bash /tmp/fix.sh",
         "echo 'kubectl scale deploy x --replicas=3' | tee /tmp/fix.sh >/dev/null && bash /tmp/fix.sh",
         '"$(which kubectl)" scale deploy x --replicas=3',

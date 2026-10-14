@@ -7253,7 +7253,7 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
             "rule": decision.rule_id,
             "message": decision.message,
             "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in decision.verb_tuple] if decision.verb_tuple else None,
-            "local_render": command_policy.local_render(argv),
+            "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
         },
         log_hint,
     )

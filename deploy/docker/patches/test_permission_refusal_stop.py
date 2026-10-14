@@ -205,6 +205,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop.classify_refusal("kubectl auth can-i scale deployments -n kube-system; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
         self.assertEqual(stop.classify_refusal("kubectl -n kube-system --context prod auth can-i scale deployments; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
         self.assertEqual(stop.classify_refusal("kubectl scale deploy/kube-dns -n kube-system --replicas=3 || true; kubectl auth can-i scale deployments", _result(lines, 0), failed=False), "policy")
+        self.assertEqual(stop.classify_refusal("kubectl scale deploy/kube-dns -n kube-system --replicas=3\nkubectl auth can-i get deploy -n kube-system\nkubectl get deploy kube-dns -n kube-system", _result(lines, 0), failed=False), "policy")
         self.assertEqual(stop.classify_refusal("kubectl auth can-i scale deployments -n kube-system; kubectl scale deploy/kube-dns -n kube-system --replicas=3 || true", _result(lines, 0), failed=False), "policy")
         # A shell prologue's ``set`` is before the kubectl word, so it is not the verb.
         self.assertEqual(stop.classify_refusal("set -euo pipefail; kubectl get deploy kube-dns -n kube-system -o yaml > /tmp/c.yaml; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")

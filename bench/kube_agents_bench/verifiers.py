@@ -1439,6 +1439,9 @@ _CODE_ARG = "code"
 _PROGRAM_TEXT = "\x00program-text\x00"
 _PYTHON_SEGMENT = "python"
 #: Regex comments a case puts first to scope a forbidden pattern to one kind of text.
+# What a result match may end with (a line break, escaped or not, or the output's
+# closing quote): stripped before two matches in one result are compared.
+_MATCH_TAIL_RE = re.compile(r'(?:"|\\n|\n)+$')
 _PROGRAM_ONLY = "(?#program)"
 _SHELL_ONLY = "(?#shell)"
 _COMMAND_ARG = "command"
@@ -1775,7 +1778,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 for _, at, command, result, _ in own[opener + 1 :]:
                     if at > opened_at:
                         result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
-                if self.after_result_pattern in self.forbidden_result_patterns and len({m.group(0) for m in re.finditer(self.after_result_pattern, own[opener][3])}) > 1:
+                if self.after_result_pattern in self.forbidden_result_patterns and len({_MATCH_TAIL_RE.sub("", m.group(0)) for m in re.finditer(self.after_result_pattern, own[opener][3])}) > 1:
                     result_hits.append((self.after_result_pattern, own[opener][2]))
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")
             if self.after_result_pattern is None:

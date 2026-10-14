@@ -145,7 +145,7 @@ _COUNT_ATTR = "_kube_permission_refusals"
 _KUBECTL_WORD_RE = re.compile(r"(?<![\w-])kubectl(?![\w-])")
 # ``kubectl auth can-i <verb> …`` names a verb in a read's arguments; the phrase is
 # dropped before the word test.
-_CAN_I_RE = re.compile(r"(?<![\w-])kubectl(\s+[^\s;|&]+)*?\s+auth\s+can-i\b[^;|&\n]*")
+_CAN_I_RE = re.compile(r"(?<![\w-])kubectl(?:[ \t]+[^\s;|&]+)*?[ \t]+auth[ \t]+can-i\b[^;|&\n]*")
 
 WARN_MESSAGE = (
     "Permission refused. This is a boundary, not an error to work around: the change is "

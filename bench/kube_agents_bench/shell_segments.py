@@ -329,19 +329,24 @@ def _value_options(base: str) -> frozenset[str]:
 def _env_split_string(piece: str) -> str | None:
     """What GNU ``env -S '<string>'`` splits and runs, or ``None``. ``env`` is a wrapper
     word, so this is read from the raw tokens before the wrapper walk drops it."""
-    words = [t for _, _, t in _tokens(piece)]
-    while words and _ASSIGNMENT_RE.match(words[0]) and not words[0].startswith(("'", '"')):
-        words.pop(0)
-    if not words or _unquote(words[0]).rsplit("/", 1)[-1] != "env":
+    tokens = _tokens(piece)
+    index = _command_index(tokens, keep=frozenset({"env"}))
+    if index is None or _unquote(tokens[index][2]).rsplit("/", 1)[-1] != "env":
         return None
-    words = words[1:]
-    for k, token in enumerate(words):
+    words = [t for _, _, t in tokens[index + 1 :]]
+    k = 0
+    while k < len(words):
+        token = words[k]
         if token in ("-S", "--split-string") and k + 1 < len(words):
             return _unquote(words[k + 1])
         if token.startswith("-S") and len(token) > 2:
             return _unquote(token[2:])
+        if token in _WRAPPER_VALUE_OPTIONS["env"]:
+            k += 2
+            continue
         if not token.startswith("-"):
             return None
+        k += 1
     return None
 
 
@@ -391,7 +396,9 @@ def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
     return None
 
 
-def _command_index(tokens: list[tuple[int, int, str]]) -> int | None:
+def _command_index(tokens: list[tuple[int, int, str]], keep: frozenset[str] = frozenset()) -> int | None:
+    """The index of the command word: assignments and wrapper words (with their options) are
+    skipped, a wrapper named in ``keep`` is returned as the command word instead."""
     i = 0
     while i < len(tokens):
         raw = tokens[i][2]
@@ -399,7 +406,7 @@ def _command_index(tokens: list[tuple[int, int, str]]) -> int | None:
         if _ASSIGNMENT_RE.match(raw) and not raw.startswith(("'", '"')):
             i += 1
             continue
-        if word.rsplit("/", 1)[-1] in _WRAPPERS:
+        if word.rsplit("/", 1)[-1] in _WRAPPERS and word.rsplit("/", 1)[-1] not in keep:
             name = word.rsplit("/", 1)[-1]
             i += 1
             if name == "taskset" and i < len(tokens) and _TASKSET_MASK_RE.match(tokens[i][2]):
