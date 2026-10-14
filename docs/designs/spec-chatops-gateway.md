@@ -1726,8 +1726,8 @@ That is the exception to the notify route's refusal of interactive blocks below:
 request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat
 message's buttons are the gateway's own, built from validated choices whose click text the
 gateway will read as an ordinary message once it answers clicks. The fold's text goes through
-`toMrkdwn`, the translation the text path uses, so markdown the text path leaves raw (a heading,
-a bullet) shows raw there too. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
+`toMrkdwn`, the translation the text path uses, so a heading there shows as a bold line and a
+bullet as `•`, as they do in a text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
 message the shared cases in `tests/conformance/chat/` expect, checked on every run.
 
 A conversation notify request (below) reads its `chat` field and `update` key the same way.

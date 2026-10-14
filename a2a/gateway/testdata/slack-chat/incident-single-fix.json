@@ -24,7 +24,7 @@
         "child_blocks": [
           {
             "text": {
-              "text": "## What's wrong\n\nThe quota for n2 CPUs in us-central1 is exhausted.\n\n## Why\n\n- Scale-up fails with QUOTA_EXCEEDED.\n\n## What to do\n\n- *Proposed fix (Lower the node pool max):* Set max nodes to 4 in the GitOps repo.\n- *To authorize:* reply *'apply'* to open a GitOps Pull Request with this fix.",
+              "text": "*What's wrong*\n\nThe quota for n2 CPUs in us-central1 is exhausted.\n\n*Why*\n\n• Scale-up fails with QUOTA_EXCEEDED.\n\n*What to do*\n\n• *Proposed fix (Lower the node pool max):* Set max nodes to 4 in the GitOps repo.\n• *To authorize:* reply *'apply'* to open a GitOps Pull Request with this fix.",
               "type": "mrkdwn",
               "verbatim": true
             },
