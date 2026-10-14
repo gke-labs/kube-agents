@@ -38,6 +38,18 @@ It cannot name a path into the delete set. That also keeps the sweep away from
 the task-shaped directories other code paths leave outside the kanban roots:
 a live sandbox has ``/opt/data/tmp/t_384aaaba`` and ``/opt/data/gitops/
 t_dc3f1647``, and a ``find -name 't_*'`` would have eaten both.
+
+The job also takes an inventory of each sandbox profile home, and only an
+inventory (#2989).  Hermes cron runs start in the profile home, so a worker's
+loose files land beside the skills and config, on a volume that outlives
+restarts, upgrades and ``helm uninstall``.  A later session lists the home and
+can't tell an invented ``dummy-gitops-state`` from something the product put
+there.  Every top-level entry not expected for that kind of home is logged with
+its mtime and size, as is any sandbox profile home the agent pod no longer has
+a profile for.  Nothing is moved or deleted, and nothing goes to chat:
+an allowlist mover would eventually displace a file someone put there on
+purpose, so whether to move anything is a later decision with the inventory
+behind it.
 """
 
 from __future__ import annotations
@@ -46,7 +58,9 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -86,6 +100,72 @@ RM_TIMEOUT_SECONDS = 120
 # few paths it could not unlink; the rest is the same message repeated once per
 # workspace, and the sweep's summary is read in a chat message.
 STDERR_EXCERPT_CHARS = 400
+
+
+# What a sandbox profile home holds when nothing but the product has written
+# to it, by kind of home, as name -> find's `%y` type.  Every home gets the
+# mirror's skeleton (`sandbox_mirror.SKELETON_DIRS`, pinned by a test).  The
+# platform home also gets the image-staged trees (`sandbox_mirror.IMAGE_OWNED`,
+# staged for `shellSandboxImageTreeHomes`), the entrypoint's `kanban.db` and
+# `state.db` placeholder directories (`AGENT_POD_DATABASES`, planted for
+# `SANDBOX_HOME_ROOTS`), and the credential proxy client's `.kubeconfigs`.  A
+# cluster profile's home gets its `USER.md` from the mirror and the
+# `kubeconfig.yaml` `cluster_agent_profile` writes.  Anything else, or one of
+# these in the wrong kind of home or of the wrong type, was put there by
+# someone, which is what the inventory is for.
+SKELETON_ENTRIES = {
+    name: "d" for name in ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
+}
+PLATFORM_HOME_ENTRIES = {
+    **SKELETON_ENTRIES,
+    "skills": "d", "governance": "d", "scripts": "d",
+    "kanban.db": "d", "state.db": "d",
+    ".kubeconfigs": "d",
+}
+CLUSTER_HOME_ENTRIES = {
+    **SKELETON_ENTRIES,
+    "USER.md": "f", "kubeconfig.yaml": "f",
+}
+PLATFORM_PROFILE = "platform"
+CLUSTER_PROFILE_PREFIX = "cluster-"
+
+
+def expected_entries(profile: str) -> dict[str, str]:
+    """The expected top-level entries for one profile's home."""
+    if profile == PLATFORM_PROFILE:
+        return PLATFORM_HOME_ENTRIES
+    if profile.startswith(CLUSTER_PROFILE_PREFIX):
+        return CLUSTER_HOME_ENTRIES
+    return SKELETON_ENTRIES
+
+
+# What `sandbox_mirror.push_skeleton` renames a skeleton directory to when it
+# finds a file where the directory belongs: the name, this mark, and a
+# `%Y%m%dT%H%M%S` stamp.  It logs those itself.  No other product writer
+# displaces an entry inside a home, so only skeleton names are exempt.
+DISPLACED_MARK = ".displaced-"
+DISPLACED_STAMP = re.compile(r"\d{8}T\d{6}")
+
+# Lists a directory's entries as name, mtime, size and type, NUL terminated so
+# a name with a newline or a tab in it can't forge a second row.  By absolute
+# path for the same reason as `REMOTE_LS`.  The escapes are find's own: an
+# argv can't carry a NUL byte, so `-printf` gets the backslash sequences as
+# text and expands them in the sandbox.
+REMOTE_FIND = "/usr/bin/find"
+FIND_FORMAT = r"%f\t%T@\t%s\t%y\0"
+
+# Cap on how many entries one home reports.  The log line is for a person,
+# and the install this was written against had about 150 probe scripts in one
+# home.
+INVENTORY_LIMIT = 40
+
+# Where the job's own record goes: `<agent home>/logs/`, which the gateway
+# pod's fluent-bit sidecar tails and ships to Cloud Logging.  Not stderr: the
+# scheduler keeps a zero-exit script's stderr nowhere.  Not stdout either,
+# which is the chat delivery channel.
+LOGS_DIR = "logs"
+LOG_FILE_NAME = "kanban_workspace_gc.log"
+LOG_PREFIX = "kanban_workspace_gc"
 
 
 class Sweep:
@@ -221,6 +301,188 @@ def _remove_local(path: Path, sweep: Sweep) -> None:
     sweep.local_removed.append(path.name)
 
 
+def agent_home() -> Path:
+    """The agent pod's data root, as `gitops_workspace.agent_home` reads it.
+
+    Not ``HERMES_HOME``, which names the platform profile's home.
+    """
+    return Path(os.environ.get("PLATFORM_AGENT_HOME") or "/opt/data")
+
+
+def sandbox_root() -> Path:
+    """The sandbox's data root, the directory `sandbox_exec` logs in to.
+
+    Not `agent_home()`.  ``spec.harness.hermes.agentHome`` moves the agent
+    pod's root and leaves the sandbox's where it was, so the two only share a
+    path by default.
+    """
+    published = sandbox_exec._load_terminal_config().get("workspace_root")
+    return Path(str(published) if published else sandbox_exec.DEFAULT_SANDBOX_CWD)
+
+
+Row = tuple[str, float, int, str]
+
+
+class Inventory:
+    """What the profile-home inventory found.  Logged, never delivered."""
+
+    def __init__(self) -> None:
+        # sandbox home -> unexpected top-level entries.
+        self.unexpected: dict[str, list[Row]] = {}
+        # Sandbox profile homes the agent pod has no profile for: a cluster
+        # dropped from scope, or a profile deleted, keeps its home and its
+        # kubeconfig here because the volume has no owner.
+        self.stale_homes: list[Row] = []
+        self.problems: list[str] = []
+
+
+class _SandboxGone(Exception):
+    """Stop the inventory: every further listing would fail the same way."""
+
+
+def _parse_listing(output: str) -> list[Row]:
+    """Every well-formed `FIND_FORMAT` record, the name possibly holding tabs."""
+    rows = []
+    for record in output.split("\0"):
+        parts = record.split("\t")
+        if len(parts) < 4:
+            continue
+        name = "\t".join(parts[:-3])
+        mtime, size, kind = parts[-3:]
+        if not name or "/" in name:
+            continue
+        try:
+            rows.append((name, float(mtime), int(size), kind))
+        except ValueError:
+            continue
+    return sorted(rows)
+
+
+def _is_expected(row: Row, expected: dict[str, str]) -> bool:
+    name, _, _, kind = row
+    if expected.get(name) == kind:
+        return True
+    base, mark, stamp = name.partition(DISPLACED_MARK)
+    return bool(mark) and base in SKELETON_ENTRIES and bool(DISPLACED_STAMP.fullmatch(stamp))
+
+
+def _list(path: Path, inv: Inventory) -> list[Row] | None:
+    """One directory's entries in the sandbox; None when it couldn't be read.
+
+    Runs as the default sandbox principal: the listing is believed, and only
+    the model's own login sources a ``.bashrc`` it could have written.
+    """
+    try:
+        result = sandbox_exec.run(
+            [REMOTE_FIND, str(path), "-mindepth", "1", "-maxdepth", "1",
+             "-printf", FIND_FORMAT],
+            timeout=LS_TIMEOUT_SECONDS,
+            errors="surrogateescape",
+        )
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
+        inv.problems.append(f"inventory stopped, the shell sandbox did not answer: {exc}")
+        raise _SandboxGone from exc
+    except Exception as exc:  # noqa: BLE001
+        inv.problems.append(f"could not list {path} in the sandbox: {exc}")
+        return None
+    if result.returncode != 0:
+        inv.problems.append(
+            f"listing {path} in the sandbox exited {result.returncode}: "
+            f"{' '.join((result.stderr or '').split())[:STDERR_EXCERPT_CHARS]}"
+        )
+        return None
+    return _parse_listing(result.stdout)
+
+
+def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
+    """List each sandbox profile home's unexpected entries, and stale homes.
+
+    The profile list comes from the agent pod, as the mirror's does.  The
+    sandbox's ``profiles/`` listing adds stale homes, and flags a live home
+    that isn't a directory there (a symlink lists as empty under find's
+    default ``-P``, which would read as clean).  Nothing is moved or deleted.
+    """
+    inv = Inventory()
+    try:
+        names = sorted(
+            e.name for e in agent_profiles.iterdir()
+            if e.is_dir() and not e.name.startswith(".")
+        )
+    except OSError as exc:
+        inv.problems.append(f"could not read {agent_profiles}: {exc}")
+        return inv
+    remote_profiles = remote_root / "profiles"
+    try:
+        present = _list(remote_profiles, inv)
+        if present is not None:
+            inv.stale_homes = [
+                row for row in present
+                if row[3] == "d" and not row[0].startswith(".") and row[0] not in names
+            ]
+            kinds = {row[0]: row[3] for row in present}
+            for name in names:
+                if kinds.get(name, "d") != "d":
+                    inv.problems.append(
+                        f"{remote_profiles / name} is type {kinds[name]!r} in the "
+                        "sandbox, not a directory; its inventory can't be trusted"
+                    )
+        for name in names:
+            rows = _list(remote_profiles / name, inv)
+            expected = expected_entries(name)
+            unexpected = [row for row in rows or [] if not _is_expected(row, expected)]
+            if unexpected:
+                inv.unexpected[str(remote_profiles / name)] = unexpected
+    except _SandboxGone:
+        pass
+    return inv
+
+
+def _stamp(mtime: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
+
+
+def _format_inventory(inv: Inventory) -> list[str]:
+    lines = []
+    for name, mtime, _, _ in inv.stale_homes:
+        lines.append(
+            f"{LOG_PREFIX}: sandbox profile home {name!r} has no profile on the "
+            f"agent pod (mtime={_stamp(mtime)}, not removed)"
+        )
+    for home, rows in sorted(inv.unexpected.items()):
+        lines.append(
+            f"{LOG_PREFIX}: {len(rows)} unexpected top-level "
+            f"entr{'y' if len(rows) == 1 else 'ies'} in {home} (not moved)"
+        )
+        for name, mtime, size, kind in rows[:INVENTORY_LIMIT]:
+            lines.append(f"  {name!r} type={kind} size={size} mtime={_stamp(mtime)}")
+        if len(rows) > INVENTORY_LIMIT:
+            lines.append(f"  ... and {len(rows) - INVENTORY_LIMIT} more")
+    lines.extend(f"{LOG_PREFIX}: {problem}" for problem in inv.problems)
+    return lines
+
+
+def append_log(lines: list[str], home: Path) -> None:
+    """Append *lines*, timestamped, to the file fluent-bit ships.
+
+    A log that can't be written is dropped quietly.  The only other channel
+    is chat, and housekeeping that can't keep a log is not worth a daily post.
+    """
+    if not lines:
+        return
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    path = home / LOGS_DIR / LOG_FILE_NAME
+    # One physical line per entry: fluent-bit's tail has no multiline parser,
+    # so a continuation line would ship with no timestamp or prefix.  An
+    # exception's text (ssh's stderr, say) can carry newlines.
+    records = (" ".join(line.splitlines()) for line in lines)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", errors="backslashreplace") as handle:
+            handle.write("".join(f"{now} {record}\n" for record in records))
+    except OSError:
+        pass
+
+
 def sweep_boards(kanban) -> Sweep:  # noqa: ANN001 - the hermes_cli module
     """Run the reconciliation across every board on disk."""
     sweep = Sweep()
@@ -272,14 +534,21 @@ def main() -> int:
     sweep = sweep_boards(kanban_db)
 
     # Stdout is the delivery channel, so a clean sweep says nothing at all. What
-    # it removed goes to stderr, which the scheduler logs and does not deliver:
-    # a job that announced its own housekeeping every night would train the room
+    # it removed, and the profile-home inventory, go to the job's log file: a
+    # job that announced its own housekeeping every night would train the room
     # to ignore it, and the failure it must not hide is the one below.
+    lines = []
     if sweep.local_removed or sweep.remote_removed:
-        sys.stderr.write(
-            f"kanban_workspace_gc: removed {len(sweep.local_removed)} on the agent "
-            f"pod, {len(sweep.remote_removed)} in the sandbox\n"
+        lines.append(
+            f"{LOG_PREFIX}: removed {len(sweep.local_removed)} on the agent "
+            f"pod, {len(sweep.remote_removed)} in the sandbox"
         )
+    try:
+        if sandbox_exec.sandbox_enabled():
+            lines.extend(_format_inventory(take_inventory(agent_home() / "profiles", sandbox_root())))
+    except Exception as exc:  # noqa: BLE001 - the inventory never fails the job
+        lines.append(f"{LOG_PREFIX}: inventory skipped: {exc}")
+    append_log(lines, agent_home())
     if sweep.warnings:
         print(
             "⚠️ **Kanban workspace GC could not finish:**\n"

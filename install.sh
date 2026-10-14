@@ -437,8 +437,9 @@ PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
 # A self-managed GitLab behind a private CA: a FILE the CA is read from, and
-# the ConfigMap it goes into, which install.env records. The file's path is
-# never recorded.
+# the Secret it goes into, which install.env records. The file's path is
+# never recorded. GITOPS_CA_FILE in the environment counts as an interview
+# answer, not as the flag (see PARAM_GITOPS_CA_FILE_FROM_FLAG).
 PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
 PARAM_GITOPS_CA_SECRET="${GITOPS_CA_SECRET:-}"
 # Whether the CA file came from --gitops-ca-file rather than the interview: a
@@ -663,9 +664,10 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org for GitOps repo
-  --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
-                                currently gke-fleet-iac)
+  --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
+  --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
+                                DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
+                                project's full path (required, no default)
   --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
                                 For gitlab, --gitops-repo is the project's full path
                                 (group/subgroup/project) and --gitops-org is not used
@@ -794,10 +796,12 @@ Flags for AI Agents & Automation:
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
   --slack-bot-token=TOKENS      Comma-separated Slack bot tokens (xoxb-...), one per
                                 workspace the agent serves. The relay keys each one by
-                                the team it authenticates as
+                                the team it authenticates as. Under --mode=next the
+                                A2A gateway serves one workspace: pass one token
   --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
-  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
-                                agent. Empty allows all users
+  --slack-allowed-users=USERS   Comma-separated Slack member IDs (e.g. U0123ABCD; not
+                                emails) allowed to talk to the agent. Empty allows
+                                every workspace member
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
@@ -4579,7 +4583,7 @@ validate_gitops_forge_flags() {
       [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
       return 1
     fi
-    # A regular file is checked now, before the apply records the ConfigMap's
+    # A regular file is checked now, before the apply records the Secret's
     # name in install.env, the tfvars and the CR. /dev/stdin and a process
     # substitution can be read only once, so they are checked when they are
     # read, after the apply.
@@ -5918,7 +5922,7 @@ main() {
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
-    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+    prompt_read "Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
@@ -6006,7 +6010,7 @@ main() {
     # toggle.
     echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
-    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<member IDs, e.g. U0123ABCD>, re-run with --slack-bot-token and --slack-app-token"
     echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
@@ -6022,6 +6026,7 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
+      print_info "With --mode=next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -7243,8 +7248,10 @@ main() {
     exit 1
   fi
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
-    create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    # The CA first: an empty token source stops the run here, and the CA
+    # Secret must exist by then.
     create_gitlab_ca_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do

@@ -50,6 +50,23 @@ mcp_servers:
     lazy: true
     connect_timeout: 30
     timeout: 60
+    tools:
+      include:
+        - check_k8s_auth
+        - describe_k8s_resource
+        - get_cluster
+        - get_k8s_cluster_info
+        - get_k8s_logs
+        - get_k8s_resource
+        - get_k8s_rollout_status
+        - get_k8s_version
+        - get_node_pool
+        - get_operation
+        - list_clusters
+        - list_k8s_api_resources
+        - list_k8s_events
+        - list_node_pools
+        - list_operations
 
 platform_toolsets:
   cli:
@@ -109,7 +126,7 @@ MCP servers Hermes exposes to the agent. `developer_knowledge` is not listed her
 Every server is `lazy: true`, so none of them is started at boot. Hermes registers a server's tools from the profile's `cache/mcp_schema_cache.json` and spawns the child process on the first call to one of its tools. The agent sees an identical tool list either way; what changes is who pays the connect. It matters because most Platform Agent turns run in a throwaway kanban worker, and connecting every server eagerly cost each of those workers roughly three seconds before the agent could say anything — a cost the long-lived gateway pays once at boot and a worker re-paid every task. The trade is that a server which cannot start now fails on its first tool call rather than at startup.
 
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Planning Agent). The `env:` block is an allowlist rather than a pass-through: Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed. Currently the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the project ids, the Google Chat and Slack home channels, the API server key, the Session KV bearer token and database path, and the data root (`PLATFORM_AGENT_HOME`) the Cluster Agent roster tools read the profiles tree from. A home channel is what `send_notification` falls back to when a notification has no thread to reply into — every alert-driven investigation — and it needs `spec.integration.googleChat.homeChannel` set to carry a value; the bearer token is what lets it read `chat_id` and `thread_id` back in the first place, so an absent one costs the thread and the incident report both. See the comments on those keys in the source file.
-- **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
+- **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. `tools.include` registers only the server's read tools, the ones it annotates `readOnlyHint`, so its cluster, node-pool and manifest writes are never offered to the model. It is an allowlist: a tool the server adds later stays hidden until it is named here. The server runs on the pod's own credential rather than through the credential proxy, so this list is what keeps those writes out of reach, not a permission boundary — see [Security and IAM](/kube-agents/reference/security-and-iam/). A cluster profile already on the volume gets the list at the next pod start if it has none, but like `args` it keeps the list it holds when a later image changes it.
 
 The two servers reached through `mcp-remote` — `gke` here, and `developer_knowledge` from the shared defaults — each pass `--header User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)`. Without it the request reaches Google as undici's default `node` and the API team serving the endpoint cannot separate kube-agents traffic from anything else running on Node. Hermes resolves `${KUBE_AGENTS_VERSION}` in `args` from the agent process environment, where the image build put it — the commit the image was built from, or `dev` for a build that passed no version. `(daemon)` is the execution mode, carried in the RFC 9110 comment after the product token because that is where the API team's telemetry parser reads it from; every kube-agents profile is a background controller, so the value is the same for all of them. The string is the same everywhere it appears, including in the Cluster Agent template; it names the product, the build and the mode, and nothing else. A profile already on the volume when an image changes the string takes the new one at the next pod start: the entrypoint rewrites that one value in place in each cluster profile's `config.yaml`, and in the platform profile's when it is the front door, since the fill-only back-fill those two files get does not reach a value inside a list — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile).
 

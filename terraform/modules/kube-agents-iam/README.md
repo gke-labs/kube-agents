@@ -33,7 +33,7 @@ for the agent bound on each member as a resource (never at project level). A con
 are the [`kube-agents-scope-resolver`](../kube-agents-scope-resolver/README.md) module's
 `container_members` output: listed at plan time with the reconcile's own Cloud Asset Inventory
 search while the pool is armed, and not read while it is off. A member gets a pool account on that
-apply and nothing else -- no per-project binding, because the container's grant is inherited, and
+apply and nothing else from this module, and no drift audit-log sink from the composition (which projects get one is the drift-pubsub README's "Exporting the scope's other projects") -- no per-project binding, because the container's grant is inherited, and
 no place in the `scope.max_projects` count -- so pool membership under a container lags where the
 grant and discovery do not: a project created beneath a declared folder since the last apply is
 refused by the broker until the next apply lists it. With the pool armed, every declared container
@@ -98,7 +98,7 @@ credentials before it can match the entry, and without the grant the member is r
 as unnamed and holds the scope prune on every tick. Removing an entry revokes its bindings on the next apply, and
 `terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,
 `scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_bound_projects`, `scope_lookup_only_hosts`,
-`scope_roles` and `scope_container_roles` outputs surface what was bound. An organisation binding
+`scope_roles` and `scope_container_roles` outputs surface what was bound; `scope_discovered_projects` is the projects beyond the host the plan lists in the scope, the pool's set less the host; `scope_export_projects` is the same without a container's Asset-Inventory members, which the composition feeds to the drift-pubsub module's `source_projects` (the output's description says why the two differ). An organisation binding
 is wide; the design is
 [`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
 §10 step 3.

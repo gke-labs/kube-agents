@@ -839,6 +839,21 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assertEqual(set(credential_proxy.vcs_broker.route_table(mock.Mock())), set(credential_proxy.vcs_broker.VCS_VERBS))
 
 
+class MergedProposalMetricTest(_BrokerFixture):
+    def test_merged_proposals_render_as_one_unlabelled_counter(self):
+        CredentialProxyHandler.metrics.record_merged(2)
+        CredentialProxyHandler.metrics.record_merged(1)
+        families = self.families()
+        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_merged_total"))
+        self.assertIn("# TYPE kubeagents_vcs_proposals_merged_total counter", CredentialProxyHandler.metrics.render())
+
+    def test_the_broker_built_for_the_handler_reports_merges_into_its_metrics(self):
+        broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
+        broker.merge_observer(2)
+        self.assertEqual(2, _series(self.families(), "kubeagents_vcs_proposals_merged_total"))
+        self.assertEqual(credential_proxy.PROCESS_START_TIME_SECONDS, broker.started_at)
+
+
 class MetricsListenerTest(unittest.TestCase):
     def setUp(self):
         previous = CredentialProxyHandler.__dict__.get("metrics")
