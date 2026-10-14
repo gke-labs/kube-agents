@@ -7020,6 +7020,9 @@ def _run_objective(command: str) -> str:
         # a quoted or escaped `#` is part of the word, as bash reads it
         (f"python3 {_SCRIPT_PATH} --readiness --output '/opt/data/scratch/#1.json'", True),
         (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/readiness\\ #1.json --readiness", True),
+        # a shell word behind `echo` or `printf` is printed, and the string after its `-c` never runs
+        (f'echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
+        (f"printf '%s' sh -c 'python3 {_SCRIPT_PATH} --readiness'", False),
         # a line whose quotes do not balance is one bash refuses: nothing on it ran
         ('echo "run fleet_upgrade_report.py --readiness', False),
         (f"python3 {_SCRIPT_PATH} --readiness --output 'unbalanced", False),
@@ -7053,7 +7056,10 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs("echo a\\#b $#") == [["echo", "a#b", "$#"]]
     assert _shell_argvs('bash -c "python3 /x/f.py --readiness # x"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs("(cd /x && python3 f.py --readiness)") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
-    # a wrapped shell is unwrapped wherever it stands
+    # a shell word behind a command that prints is text, not a shell to unwrap
+    assert _shell_argvs('echo bash -c "python3 /x/f.py --readiness"') == [["echo", "bash", "-c", "python3 /x/f.py --readiness"]]
+    assert _shell_argvs('nice -n 10 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    # a wrapped shell is unwrapped behind the wrappers that hand their argv on
     assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
     assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]
     # a line bash refuses (an unclosed quote) yields no words at all

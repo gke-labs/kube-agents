@@ -1218,6 +1218,13 @@ _MAX_NAMED_COMMANDS = 5
 # starts a new command on. A token made of these characters alone is such an operator.
 _SHELL_OPERATOR_CHARS = frozenset("&|;()")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
+# A shell program is unwrapped only where the shell would run it: as the segment's command word,
+# or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
+# their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
+# `printf` is text the command prints, and the string after its `-c` is not run.
+_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command"))
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_WRAPPER_VALUE_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _SHELL_COMMENT_CHAR = "#"
 _SHELL_QUOTE_CHARS = frozenset("'\"")
 _SHELL_SINGLE_QUOTE = "'"
@@ -1330,16 +1337,30 @@ def _shell_argvs(command: str) -> list[list[str]]:
             continue
         argv.append(word)
     for argv in list(argvs):
-        for index, word in enumerate(argv):
-            if os.path.basename(word) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-                continue
-            for flag_index in range(index + 1, len(argv) - 1):
-                flag = argv[flag_index]
-                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                    argvs.extend(_shell_argvs(argv[flag_index + 1]))
-                    break
-            break
+        index = _shell_program_index(argv)
+        if index is None:
+            continue
+        for flag_index in range(index + 1, len(argv) - 1):
+            flag = argv[flag_index]
+            if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                argvs.extend(_shell_argvs(argv[flag_index + 1]))
+                break
     return argvs
+
+
+def _shell_program_index(argv: list[str]) -> int | None:
+    """The index of the shell program this argv runs, or None: the first word that is not an
+    assignment, an exec wrapper, a wrapper's flag or its value must be the shell, else the
+    segment runs something else (`echo bash -c "..."` prints) and no string inside it runs."""
+    for index, word in enumerate(argv):
+        if os.path.basename(word) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+            return index
+        if _SHELL_ASSIGNMENT_RE.match(word) or os.path.basename(word) in _SHELL_EXEC_WRAPPERS:
+            continue
+        if word.startswith("-") or _SHELL_WRAPPER_VALUE_RE.match(word):
+            continue
+        return None
+    return None
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
