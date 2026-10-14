@@ -1199,7 +1199,7 @@ platform_is_front_door() {
 # monitoring policy mints monitoring.install_id — so a force-sync discards both on
 # every restart. It comes off the list and step 2.6b back-fills the file instead, the
 # way step 2d does for the default profile. cron/ and capabilities/ are written at
-# runtime too, and the scaffolder merges both rather than replacing them (step 2.5's
+# runtime too, and the scaffolder merges both rather than replacing them (step 2.6's
 # comment says which way each merge goes); the config.yaml entry is derived rather
 # than a second list so the two answers cannot drift apart.
 platform_sync_items() {
