@@ -73,7 +73,7 @@ directory use the absolute path, `/opt/data/profiles/platform/skills/fleet-upgra
   The file is written whole (a temp file, then a rename) when the run finishes and never
   before, so a reader never meets a partial document and a run that dies leaves the path as it found
   it. `/opt/data/scratch` is shared by every card, so a run that must tell its own file from an
-  earlier one gives it a name of its own (the Delegation bullet in `AGENTS.md` adds a timestamp).
+  earlier one gives it a name of its own (the Delegation bullet in `AGENTS.md` adds a timestamp and the shell's PID, since a timestamp alone is second-resolution).
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
