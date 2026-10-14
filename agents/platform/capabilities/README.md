@@ -35,7 +35,8 @@ declares it gone.
 `learning.json` gives each key one of three policies. `propose` means the agent must show the
 operator the before/after and record who agreed before the store accepts the write; `autonomous`
 means a reason is enough; `never` means the key changes only through a reviewed change to this
-template. It is image-owned so that a release can tighten a policy and know every install got it;
+template, and a stored value is returned to that reviewed default with `null` under a named
+confirmation. It is image-owned so that a release can tighten a policy and know every install got it;
 ship everything as `propose` until a capability has earned otherwise.
 
 This tree is not under `skills/` on purpose: the entrypoint replaces `skills/` wholesale on every

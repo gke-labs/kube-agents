@@ -455,11 +455,14 @@ def _apply_locked(
             refused.append(f"{key}: maintained by the store, not settable")
             continue
         policy = cap.policy_for(key)
-        if policy == POLICY_NEVER:
+        # A `null` on a `never` key is a return to the reviewed default, which is what `never`
+        # asks for; it goes through under the `propose` rule, since it changes what the next run
+        # flags. A value on a `never` key is still review's.
+        if policy == POLICY_NEVER and changes[key] is not None:
             refused.append(f"{key}: policy is never — this key changes through review, not here")
-        elif policy == POLICY_PROPOSE and not confirmed_by:
+        elif policy in (POLICY_PROPOSE, POLICY_NEVER) and not confirmed_by:
             refused.append(
-                f"{key}: policy is propose — show the operator the before/after and call again "
+                f"{key}: policy is {policy} — show the operator the before/after and call again "
                 f"with confirmed_by naming who agreed"
             )
         elif policy not in POLICIES:

@@ -87,10 +87,18 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(cs.load(self.root, "demo").criteria["names"], ["a"])
 
     def test_a_never_key_is_refused_even_when_confirmed(self):
-        seed(self.root, learning={"keys": {"threshold": "never"}})
+        seed(self.root, criteria={"threshold": 6}, learning={"keys": {"threshold": "never"}})
         with self.assertRaises(cs.CapabilityError) as ctx:
             cs.apply_changes(self.root, "demo", {"threshold": 9}, reason="x", confirmed_by="ops")
         self.assertIn("never", str(ctx.exception))
+        # A `null` on it is a return to the reviewed default, under the propose rule: a release
+        # that marks a tuned key `never` has to leave a way back to the value review chose.
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": None}, reason="back")
+        self.assertIn("confirmed_by", str(ctx.exception))
+        entry = cs.apply_changes(self.root, "demo", {"threshold": None}, reason="back", confirmed_by="ops")
+        self.assertEqual(entry["unset"], {"threshold": {"before": 6, "after": 3}})
+        self.assertNotIn("threshold", cs.load(self.root, "demo").criteria)
 
     def test_the_whole_call_is_refused_if_any_key_is(self):
         seed(self.root, learning={"keys": {"names": "autonomous", "threshold": "never"}})

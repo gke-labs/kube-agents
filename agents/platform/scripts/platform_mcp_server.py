@@ -1394,8 +1394,10 @@ def capability_criteria(
                                     refused unless `confirmed_by` names the
                                     operator who agreed — show them the
                                     before/after first, then call again with
-                                    their name. A "never" key is refused
-                                    outright: it changes through review.
+                                    their name. A "never" key takes no value
+                                    (it changes through review); null on it
+                                    returns the key to the reviewed default
+                                    under the same named confirmation.
       history  capability        -> the changelog's last lines, newest last: each
                                     change the store set out to write (a line whose
                                     value write failed stays, at a revision no later
