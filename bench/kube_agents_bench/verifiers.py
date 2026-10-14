@@ -1539,8 +1539,9 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
     replaced by a marker inside its word, and every bare operator token replaced by a marker of
     its own; the spans and the operators in order. One pass over the raw line, with one quote
     model: a ``'`` or ``"`` outside quotes opens a quoted string that the other character does
-    not close (``"don't"`` is one quoted word), and an escaped character is kept with its escape
-    and never opens a word. A ``#`` outside quotes that opens a word (at the start of the line,
+    not close (``"don't"`` is one quoted word), an escaped character is kept with its escape
+    and never opens a word, and a ``\\``-newline pair, a line continuation, is removed as bash
+    removes it. A ``#`` outside quotes that opens a word (at the start of the line,
     after whitespace or after an operator character) comments out the rest of its line,
     operators included, so nothing after it runs; a ``#`` inside a word (``readiness-#2.json``,
     ``$#``), inside quotes (``'#1.json'``) or escaped is part of the word. A substitution
@@ -1568,6 +1569,11 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
             i = end
             continue
         if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 < len(command):
+            if command[i + 1] == _SHELL_LINE_END:
+                # A line continuation: bash removes the pair before it reads a word, so a
+                # command typed across continued lines is the same line.
+                i += 2
+                continue
             out.append(command[i:i + 2])
             previous = _SHELL_ESCAPE_CHAR
             i += 2

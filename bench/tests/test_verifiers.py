@@ -7514,6 +7514,9 @@ def _run_objective(command: str) -> str:
         (f"sudo -E -u hermes python3 {_SCRIPT_PATH} --readiness", True),
         (f"env -i -u KUBECONFIG python3 {_SCRIPT_PATH} --readiness", True),
         (f"sudo -n -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        # a line continuation is removed as bash removes it, with or without an indent on the next line
+        (f"cd {_SCRIPTS_DIR} && \\\n  python3 fleet_upgrade_report.py --readiness --output /opt/data/scratch/r.json", True),
+        (f"timeout 600 \\\npython3 {_SCRIPT_PATH} --readiness", True),
         # an expansion the reader never resolves, a GNU duration word, or a redirect with its target may stand there too
         (f"timeout $T python3 {_SCRIPT_PATH} --readiness", True),
         (f'timeout "${{TIMEOUT:-600}}" python3 {_SCRIPT_PATH} --readiness', True),
@@ -7573,6 +7576,9 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs("cd /x\npython3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
     assert _shell_argvs("python3 -V\nls fleet_upgrade_report.py --readiness") == [["python3", "-V"], ["ls", "fleet_upgrade_report.py", "--readiness"]]
     assert _shell_argvs('echo "a\nb" && python3 f.py --readiness') == [["echo", "a\nb"], ["python3", "f.py", "--readiness"]]
+    # a backslash-newline pair is a continuation, gone before the words are read
+    assert _shell_argvs("python3 \\\n  f.py \\\n--readiness") == [["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("cd /x && \\\n  python3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
     # a `#` inside quotes, escaped, or inside a word is part of the word
     assert _shell_argvs("python3 f.py --readiness --output '#1.json'") == [["python3", "f.py", "--readiness", "--output", "#1.json"]]
     assert _shell_argvs('python3 f.py --output "#1.json" --readiness') == [["python3", "f.py", "--output", "#1.json", "--readiness"]]
