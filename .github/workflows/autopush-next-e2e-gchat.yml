@@ -1,0 +1,133 @@
+name: "Autopush-Next: Google Chat E2E"
+
+# Runs tests/e2e/gchat_agent_test.py ("what is 2 + 3?") against the long-lived
+# autopush-next environment, which runs spec.mode next, so its Chat ingress is
+# the A2A gateway's Google Chat adapter rather than the Hermes platform. The
+# same forged MESSAGE event the release gate uses reaches the gateway through
+# the install's one subscription; the reply is read back from Chat.
+#
+# Its own file rather than a schedule on e2e-gchat-test.yml: that workflow is
+# dispatch-only, targets autopush through repository-scoped secrets, and is
+# named as unguarded-by-design in .agents/rules/github_actions.md.
+#
+# Until autopush-next carries the three variables below, the `ready` job posts
+# a notice naming the missing ones and the E2E job is skipped, so the run shows
+# a skipped test rather than a passing one. tests/e2e/README.md ("Running in
+# GitHub Actions") lists what provisions them. Drop the `ready` job once the
+# environment is provisioned, so an environment that later loses a variable
+# reds the run instead of skipping it, as autopush-next-deploy.yml says of its
+# own skip.
+#
+# Every variable comes from the autopush-next environment, and two settings have
+# a repository-scoped namesake that an environment-bound job still inherits
+# when the environment does not override it:
+#   - E2E_CHAT_SPACE_ID is read as a variable, not the repository secret of
+#     that name, which names autopush's space. The repository has no variable of
+#     that name, so an unset one here is unset, and the skip below sees it.
+#   - The three E2E_CHAT_* OTA secrets do fall through to the repository's
+#     when autopush-next sets none. That is right for a space the repository's
+#     OTA account belongs to; a DM needs the DM member's own token, set on the
+#     environment so it overrides.
+
+on:
+  schedule:
+    - cron: "41 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Its own group, never `autopush-next-environment`: the deploy's jobs hold that
+# one, and a pending run of this workflow would cancel a pending deploy there.
+concurrency:
+  group: autopush-next-e2e-gchat
+  cancel-in-progress: false
+
+jobs:
+  ready:
+    name: Check the E2E prerequisites (autopush-next)
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    environment: autopush-next
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.ready.outputs.ready }}
+    steps:
+      - name: Check the E2E prerequisites are configured
+        id: ready
+        env:
+          SPACE_ID: ${{ vars.E2E_CHAT_SPACE_ID }}
+          SERVICE_ACCOUNT: ${{ vars.E2E_GCP_SERVICE_ACCOUNT }}
+          WIF_PROVIDER: ${{ vars.E2E_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${SPACE_ID}" ] || missing+=("E2E_CHAT_SPACE_ID")
+          [ -n "${SERVICE_ACCOUNT}" ] || missing+=("E2E_GCP_SERVICE_ACCOUNT")
+          [ -n "${WIF_PROVIDER}" ] || missing+=("E2E_GCP_WORKLOAD_IDENTITY_PROVIDER")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice title=Skipped: autopush-next E2E is not provisioned::The autopush-next environment has no ${missing[*]}. tests/e2e/README.md (Running in GitHub Actions) lists what to provision; the run skips until then."
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "ready=true" >> "${GITHUB_OUTPUT}"
+
+  e2e-gchat:
+    name: Google Chat E2E (autopush-next)
+    needs: ready
+    if: github.repository == 'gke-labs/kube-agents' && needs.ready.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    environment: autopush-next
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # A variable is not masked the way a secret is, and the test prints the
+      # space; a DM's id names one person's conversation with the app.
+      - name: Mask the space id
+        env:
+          SPACE_ID: ${{ vars.E2E_CHAT_SPACE_ID }}
+        run: echo "::add-mask::${SPACE_ID}"
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.E2E_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.E2E_GCP_SERVICE_ACCOUNT }}
+
+      # No kubectl credentials, so the test's gateway rollout pre-flight
+      # returns at once; a run that lands mid-deploy can time out.
+      # TEST_USER_EMAIL is the forged sender, which the gateway's allowlist
+      # admits only if listed in ALLOWED_USERS, or while that is unset and
+      # GOOGLE_CHAT_ALLOW_ALL_USERS is true. 300s
+      # rather than the release gate's 120 covers a cold first turn.
+      - name: Execute E2E Test
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          CHAT_SPACE_ID: ${{ vars.E2E_CHAT_SPACE_ID }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME || 'platform-agent-chat-events' }}
+          TEST_USER_EMAIL: ${{ vars.E2E_TEST_USER_EMAIL || vars.E2E_GCP_SERVICE_ACCOUNT }}
+          TEST_TIMEOUT_SEC: "300"
+          E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
+          E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
+          E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
+        run: pytest tests/e2e/gchat_agent_test.py -v -s

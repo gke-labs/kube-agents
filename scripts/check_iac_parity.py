@@ -117,6 +117,7 @@ STATIC_NETWORK_POLICIES: tuple[str, ...] = (
     "examples/vllm-gemma/networkpolicy.yaml",
     "k8s-operator/config/integrations/github/deployment.yaml.template",
     "k8s-operator/config/integrations/litellm/base/networkpolicy.yaml",
+    "hack/slack-live-check/manifests/setup.yaml.template",
 )
 
 # Manifests containing kind: NetworkPolicy that are deliberately excluded from the

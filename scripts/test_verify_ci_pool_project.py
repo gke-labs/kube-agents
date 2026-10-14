@@ -3994,7 +3994,9 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # neither demands a role nor keeps one accounted for.
     _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
     _READ_BLOCKS = {"resource", "data"}
-    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals"}
+    # moved renames a state address and declares no resource: the type it
+    # names is read from the resource block it points at.
+    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals", "moved"}
 
     @staticmethod
     def _tokenizer():

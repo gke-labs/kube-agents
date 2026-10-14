@@ -9,6 +9,8 @@ This skill provides workflows and best practices for securing GKE workloads. It
 covers security auditing, Identity and Access Management (Workload Identity),
 Network Security (Network Policies), and Node Security.
 
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
+
 ## Workflows
 
 ### 1. Security Audit
@@ -38,37 +40,36 @@ access Google Cloud APIs.
 
 **Steps:**
 
-1. **Create Namespace and KSA:**
+Each step is a change you propose.
 
-   ```bash
-   kubectl create namespace workload-identity-test-ns
-   kubectl create serviceaccount <ksa-name> \
-       --namespace workload-identity-test-ns
+1. **Namespace and KSA:** propose the Namespace and the KSA:
+
+   ```yaml
+   apiVersion: v1
+   kind: Namespace
+   metadata:
+     name: workload-identity-test-ns
+   ---
+   apiVersion: v1
+   kind: ServiceAccount
+   metadata:
+     name: <ksa-name>
+     namespace: workload-identity-test-ns
+     annotations:
+       iam.gke.io/gcp-service-account: <gsa-name>@<project-id>.iam.gserviceaccount.com
    ```
 
-2. **Bind KSA to GSA:**
+2. **Bind KSA to GSA:** propose granting `roles/iam.workloadIdentityUser` on
+   the GSA `<gsa-name>@<project-id>.iam.gserviceaccount.com` to the member
+   `serviceAccount:<project-id>.svc.id.goog[workload-identity-test-ns/<ksa-name>]`.
 
-   ```bash
-   gcloud iam service-accounts add-iam-policy-binding <gsa-name>@<project-id>.iam.gserviceaccount.com \
-       --role roles/iam.workloadIdentityUser \
-       --member "serviceAccount:<project-id>.svc.id.goog[workload-identity-test-ns/<ksa-name>]"
-   ```
+3. **Annotate KSA:** the `iam.gke.io/gcp-service-account` annotation in the
+   manifest above links the KSA to the GSA.
 
-3. **Annotate KSA:**
-
-   ```bash
-   kubectl annotate serviceaccount <ksa-name> \
-       --namespace workload-identity-test-ns \
-       iam.gke.io/gcp-service-account=<gsa-name>@<project-id>.iam.gserviceaccount.com
-   ```
-
-4. **Verify Example Pod:**
-   Use existing asset `assets/workload-identity-pod.yaml` to test the
-   configuration. Update the `<ksa-name>` in the file first.
-
-   ```bash
-   kubectl apply -f ./assets/workload-identity-pod.yaml -n workload-identity-test-ns
-   ```
+4. **Example Pod:** propose a test Pod in `workload-identity-test-ns` with
+   `serviceAccountName: <ksa-name>` and the node selector
+   `iam.gke.io/gke-metadata-server-enabled: "true"`. A complete example is in
+   `assets/workload-identity-pod.yaml`.
 
 ### 3. Implement Network Policies
 
@@ -90,61 +91,55 @@ gcloud container clusters describe <cluster-name> \
   enforcement is built-in natively via eBPF/Cilium from cluster creation. Calico
   addons cannot be enabled and are not needed.
 - If `networkPolicy.enabled` is `True`, Calico enforcement is already enabled on nodes.
-- If neither is active, enable Calico network policy enforcement using the two-step
-  sequence below.
+- If neither is active, propose enabling Calico network policy enforcement in
+  the two steps below.
 
-**Enable Network Policy Enforcement (non-DPv2 clusters):**
+**Network Policy Enforcement (non-DPv2 clusters):**
 
-Enabling network policy enforcement on clusters without Dataplane V2 requires
-two sequential commands in this order: first enable the Calico addon on the
-control plane, then enable network policy enforcement on the nodes. GKE rejects
-`--enable-network-policy` with HTTP 400 until the addon is enabled, and `gcloud`
-rejects both flags in a single invocation.
+On clusters without Dataplane V2 this is two sequential changes, in this order:
+first enable the NetworkPolicy addon on the control plane (Config Connector
+`ContainerCluster` field `spec.addonsConfig.networkPolicyConfig.disabled: false`,
+with `spec.networkPolicy.enabled: false` alongside it, since the addon setting
+does nothing without a `networkPolicy` block), then enable network policy
+enforcement on the nodes (`spec.networkPolicy.enabled: true`, `provider: CALICO`).
+GKE rejects node enforcement with HTTP 400 until the addon is enabled, and
+node pools may be recreated, which can take several minutes. Propose both, with
+that order stated.
 
-```bash
-# Step 1: Enable the NetworkPolicy addon on the control plane
-gcloud container clusters update <cluster-name> \
-    --update-addons=NetworkPolicy=ENABLED \
-    --region <region>
-
-# Step 2: Enable NetworkPolicy enforcement on the nodes (node pools may be recreated; this can take several minutes)
-gcloud container clusters update <cluster-name> \
-    --enable-network-policy \
-    --region <region>
-```
-
-**Apply Default Deny Policy:**
+**Default Deny Policy:**
 Isolate namespaces by denying all ingress and egress traffic by default.
 
-**Replace <target-namespace> with the namespace you want to isolate.**
+Propose this manifest, with `<target-namespace>` set to the namespace to
+isolate. [assets/default-deny-netpol.yaml](assets/default-deny-netpol.yaml)
+holds the same policy without the `metadata.namespace` line.
 
-```bash
-kubectl apply -f ./assets/default-deny-netpol.yaml -n <target-namespace>
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: <target-namespace>
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
 ```
 
 ### 4. Enable Shielded Nodes
 
 Ensure nodes are running with verifiable integrity.
 
-**Command:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --enable-shielded-nodes \
-    --region <region>
-```
+Propose enabling Shielded Nodes (Config Connector `ContainerCluster` field
+`spec.enableShieldedNodes: true`).
 
 ### 5. GKE Sandbox (gVisor)
 
 Run untrusted workloads in a sandbox for extra isolation.
 
-**Enable GKE Sandbox:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --enable-gke-sandbox \
-    --region <region>
-```
+**GKE Sandbox:**
+Propose a node pool with GKE Sandbox enabled (Config Connector
+`ContainerNodePool` field `spec.nodeConfig.sandboxConfig.sandboxType: gvisor`).
 
 **Run a Sandboxed Pod:**
 Add `runtimeClassName: gvisor` to your Pod spec.
@@ -154,11 +149,16 @@ Add `runtimeClassName: gvisor` to your Pod spec.
 Enforce security policies on namespaces using labels.
 
 **Enforce Restricted Profile:**
+Propose these labels on the namespace:
 
-```bash
-kubectl label --overwrite ns <namespace> \
-    pod-security.kubernetes.io/enforce=restricted \
-    pod-security.kubernetes.io/enforce-version=latest
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: <namespace>
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
 ```
 
 > [!NOTE]
@@ -210,7 +210,7 @@ If using GKE Dataplane V2, you can log allowed and denied connections.
 
 **Steps:**
 
-1. Configure the `NetworkLogging` custom resource.
+1. Propose the `NetworkLogging` custom resource.
 
 **Example NetworkLogging Manifest:**
 

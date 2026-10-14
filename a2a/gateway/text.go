@@ -94,8 +94,14 @@ func joinTextParts(parts []lib.Part) string {
 // both repeated that content at the head of every continuation and left
 // the budget nothing to cut with. A continuation chunk therefore loses the
 // language tag on Discord; the text between the inserted fences is the
-// original, byte for byte. Text with no fence open at the cut is split
-// exactly as before.
+// original, byte for byte.
+//
+// A cut inside a pipe table carries the table's header and delimiter rows to
+// the head of the next chunk, for the same reason: each chunk is rendered
+// alone, and the rows after the cut would otherwise be raw `| … |` lines with
+// no header (Slack renders a table only from a header and a delimiter row).
+// A header longer than a quarter of the chunk is not carried. Text with no
+// fence open and no table running across the cut is split exactly as before.
 func chatChunks(text string, size int) []string {
 	if text == "" {
 		return nil
@@ -103,9 +109,10 @@ func chatChunks(text string, size int) []string {
 	var chunks []string
 	reopen := "" // after a cut inside a block: mdFence, with a line break where the cut left none
 	for {
-		// reopen is at most mdFence+"\n" (4 bytes), so the budget is at
-		// least size-4 and the recut below is given at least size-8: with
-		// size the Discord cap, chunkCut always has room to make progress.
+		// reopen is a reopened fence (at most mdFence+"\n", 4 bytes) or a
+		// carried table head (at most size/tableHeadShareMax plus a line
+		// break), so the budget stays above half of size and chunkCut always
+		// has room to make progress.
 		budget := size - len(reopen)
 		if len(text) <= budget {
 			return append(chunks, reopen+text)
@@ -124,6 +131,11 @@ func chatChunks(text string, size int) []string {
 			if !strings.HasPrefix(text[cut:], "\n") {
 				reopen += "\n"
 			}
+		} else if head := tableHeadAtCut(chunk, text[cut:]); head != "" && len(head) <= size/tableHeadShareMax {
+			reopen = head
+			if !strings.HasPrefix(text[cut:], "\n") {
+				reopen += "\n"
+			}
 		}
 		chunks = append(chunks, chunk)
 		text = text[cut:]
@@ -133,6 +145,34 @@ func chatChunks(text string, size int) []string {
 // fenceClose ends a chunk that was cut inside a fenced block; the next
 // chunk reopens the block with a bare mdFence.
 const fenceClose = "\n```"
+
+// tableHeadShareMax bounds a carried table head to 1/tableHeadShareMax of
+// the chunk size, so a very wide header cannot leave the budget no room.
+const tableHeadShareMax = 4
+
+// tableHeadAtCut returns the header and delimiter rows of the pipe table that
+// chunk ends inside, joined by a line break, when rest goes on with more of
+// its rows; otherwise "". The table is the trailing run of non-blank lines
+// that carry a pipe, holding a header followed by a delimiter row with the
+// same cell count (tableEnd's test), and no fence line.
+func tableHeadAtCut(chunk, rest string) string {
+	next := strings.TrimPrefix(rest, "\n")
+	if line, _, _ := strings.Cut(next, "\n"); !strings.Contains(line, slackTablePipe) || strings.TrimSpace(line) == "" {
+		return ""
+	}
+	lines := strings.Split(chunk, "\n")
+	start := len(lines)
+	for start > 0 && strings.Contains(lines[start-1], slackTablePipe) && strings.TrimSpace(lines[start-1]) != "" &&
+		!strings.HasPrefix(strings.TrimSpace(lines[start-1]), mdFence) {
+		start--
+	}
+	for i := start; i+1 < len(lines); i++ {
+		if slackTableSepRE.MatchString(lines[i+1]) && len(tableCells(lines[i])) == len(tableCells(lines[i+1])) {
+			return lines[i] + "\n" + lines[i+1]
+		}
+	}
+	return ""
+}
 
 // fenceOpenAtEnd reports whether chunk ends inside a fenced block, read as
 // the adapters read a chunk: the last span mdCodeSpanRE finds is a fence

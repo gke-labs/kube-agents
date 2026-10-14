@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -32,12 +32,31 @@ from admin_console.telemetry import redact_evidence
 _K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _KANBAN_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 GATEWAY_PYTHON = "/opt/hermes/.venv/bin/python3"
+# Must match FRAME_TAG in _READ_SCRIPT.
+_READ_FRAME_TAG = "KA-READ-1"
+_READ_CUT_SHORT_GUIDANCE = (
+    "Retry the read. Large reads from agent pods on GKE Sandbox (gVisor) can "
+    "lose their end in transit; the console checks the length of every read "
+    "so the loss shows here instead of as invalid data."
+)
 _READ_SCRIPT = r'''
 import json
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
+
+# The console compares this header's length with what arrived, so a read that
+# loses its end fails clearly instead of as invalid JSON.
+FRAME_TAG = "KA-READ-1"
+# kubectl exec into a gVisor pod can drop all but the first 64 KiB of one large
+# write. scripts/exec_tunnel.py writes at most this much per call, and its relay
+# arrived intact on gVisor.
+WRITE_CHUNK_BYTES = 65536
+# kubectl tears down the stdout stream when this process exits; give the final
+# frames a moment to ship, as scripts/exec_tunnel.py does.
+EXIT_HOLD_SECONDS = 0.25
 
 
 def profiles():
@@ -51,6 +70,15 @@ def profiles():
             except OSError:
                 pass
     return {name: path for name, path in found.items() if path.is_file()}
+
+
+def emit(payload):
+    # ASCII keeps byte and character counts equal for the console's check.
+    data = json.dumps(payload, ensure_ascii=True).encode("ascii")
+    out = memoryview(f"{FRAME_TAG} {len(data)}\n".encode("ascii") + data)
+    while out:
+        out = out[os.write(1, out[:WRITE_CHUNK_BYTES]):]
+    time.sleep(EXIT_HOLD_SECONDS)
 
 
 def connect(path):
@@ -508,8 +536,20 @@ elif action == "cron":
     payload = cron_snapshot(int(sys.argv[2]), int(sys.argv[3]))
 else:
     raise ValueError("Unsupported action")
-print(json.dumps(payload, ensure_ascii=False))
+emit(payload)
 '''
+
+
+def _unframe(stdout: str) -> tuple[int, str] | None:
+    """Split the read script's length header from its body, if present."""
+    header, separator, body = stdout.partition("\n")
+    tag, _, length = header.partition(" ")
+    if not separator or tag != _READ_FRAME_TAG:
+        return None
+    try:
+        return int(length), body
+    except ValueError:
+        return None
 
 
 class KubeRunner(Protocol):
@@ -919,6 +959,17 @@ class AgentRuntimeProvider:
             ],
             timeout=timeout,
         )
+        framed = _unframe(result.stdout)
+        if framed is not None:
+            expected, body = framed
+            if len(body) < expected:
+                raise AgentRuntimeError(
+                    "Agent runtime read was cut short: "
+                    f"received {len(body)} of {expected} bytes.",
+                    _READ_CUT_SHORT_GUIDANCE,
+                )
+            if len(body) == expected:
+                result = replace(result, stdout=body)
         return self._json(result, "Agent runtime read")
 
     def check_connection(self, agent: str) -> tuple[int, int]:

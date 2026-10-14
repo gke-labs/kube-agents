@@ -503,8 +503,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `ssh.github.com`), and a repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
-  alias, not both. The alias is still what `install.sh` and the
-  `full-install` Terraform composition write. One GitHub forge with no
+  alias, not both. For a GitHub GitOps repository, the alias is still what
+  `install.sh` and the `full-install` Terraform composition write. For a
+  GitLab GitOps repository, they write the `forges` and `repositories` lists. One GitHub forge with no
   `credentialsRef` and at most one repository, the gitops one, with no
   namespace of its own, renders as `github`, whichever key set it, because
   `helm upgrade` does not update CRDs — provided the forge declares a

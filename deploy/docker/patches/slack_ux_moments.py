@@ -15,7 +15,10 @@ or its report, so the link sits on a plan row or inside the report, where it
 reads like any other step. With the flag on, :func:`pr_opened` also posts it
 as its own message with "Open PR" and "Files changed" buttons, once per PR per
 thread for the life of the process (a restart forgets), since a note and the
-report often both carry it.
+report often both carry it. A GitLab merge request gets the same message, with
+"Open MR" for its first button, when it is on gitlab.com or on the host of a
+GitLab entry in the mounted ``managed_repos`` file (the GitOps repository and
+the managed ones), which is read only for a text holding a merge request url.
 
 **A question the work waits on.** A card blocked with ``kind: needs_input``
 reaches the thread as "⏸ <head> blocked: <reason>", clipped to 160
@@ -102,6 +105,18 @@ try:
     import chat_message as _chat
 except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
     _chat = None
+
+try:
+    import gitops_workspace as _gitops
+    import repo_ref as _repo_ref
+except ImportError:  # not staged for the image-build check: gitlab.com only
+    _gitops = None
+    _repo_ref = None
+
+#: The ``type`` of a ``managed_repos`` entry on GitLab, as in
+#: ``gitops_workspace.FORGE_PROPOSAL_NOUNS``. The host of each such entry is one
+#: whose merge requests may be announced besides gitlab.com.
+GITLAB_REPO_TYPE = "gitlab"
 
 #: The flag, read here only to word the warning when the renderer is missing.
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -266,12 +281,25 @@ async def _send_chat(adapter: Any, sub: dict, text: str, chat: dict, update: str
         logger.warning("slack_ux_moments: chat.notify refused the post in %s: %s", chat_id, getattr(result, "error", None))
         return False
     return True
+def _managed_gitlab_hosts() -> frozenset[str]:
+    """The hosts of the install's managed GitLab repositories, read from the
+    mounted state file each time (kubelet keeps it current); none without it."""
+    if _gitops is None:
+        return frozenset()
+    refs = (
+        _repo_ref.try_parse(entry.get("url"))
+        for entry in _gitops.mounted_repo_entries(_gitops.MANAGED_REPOS_KEY)
+        if entry.get("type") == GITLAB_REPO_TYPE
+    )
+    return frozenset(ref.host for ref in refs if ref and ref.host)
 
 
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
     """Post each PR ``text`` says was opened, once per thread; True when any posted."""
     posted = False
-    for url, repo, number, line in _moments.opened_prs(text):
+    # The managed list is read only for a text that can hold a merge request.
+    hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in str(text or "") else frozenset()
+    for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts):
         key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
         if key in _announced:
             continue

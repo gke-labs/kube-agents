@@ -277,9 +277,18 @@ path that works. `docs/designs/agent-shell-sandboxing.md` has the account.
 
 It reports nothing on a clean run and only on a run it could not finish, which
 is the same contract `github-repo-watcher` keeps. What it removed goes to
-stderr, where the scheduler logs it: a job announcing its own housekeeping every
+`logs/kanban_workspace_gc.log` in the agent home, which fluent-bit ships to
+Cloud Logging, and not to chat: a job announcing its own housekeeping every
 night is a job the room learns to skip, and the message that must not be skipped
-is the failure.
+is the failure. (Not stderr, which the scheduler keeps nowhere for a zero-exit
+script; see `feedback-prompt` below.)
+
+The same log gets an inventory of the sandbox's profile homes, so that loose
+files a worker leaves there can be seen without exec'ing into the sandbox: each
+home's top-level entries that the product doesn't create, and any home the agent
+pod no longer has a profile for, such as a cluster dropped from scope. That's an
+inventory only: nothing is moved or deleted, and a failure to take it is logged
+there too rather than posted.
 
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
