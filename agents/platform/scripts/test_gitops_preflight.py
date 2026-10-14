@@ -98,6 +98,32 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(0, gitops_preflight.EXIT_REGISTERED)
 
 
+class ListingShowsBothRegistries(unittest.TestCase):
+    """`--list` is what SOUL.md reads for managed versus context repositories."""
+
+    def test_nothing_registered_lists_none_twice_and_exits_zero(self):
+        with _StateDir(entries=None):
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
+        self.assertEqual("MANAGED: none\nCONTEXT: none", text)
+
+    def test_managed_and_context_are_listed_apart(self):
+        context = [{"type": "github", "url": "https://github.com/acme/tf-live", "ref": "prod"}]
+        with _StateDir(entries=ENTRY) as state_file:
+            (state_file.parent / "context_repos").write_text(json.dumps(context), encoding="utf-8")
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
+        self.assertEqual(f"MANAGED: {REPO}\nCONTEXT: github.com/acme/tf-live@prod", text)
+
+    def test_an_unreadable_registry_is_state_unreadable(self):
+        with patch.object(
+            gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=RuntimeError("boom")
+        ):
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_STATE_UNREADABLE, code)
+        self.assertTrue(text.startswith("STATE_UNREADABLE: "), text)
+
+
 class PreflightRunsAsAPlainCommand(unittest.TestCase):
     """Workers run it as `python3 <path>`, never `python3 -c`, which the
     sandbox's command scanner refuses. The process prints one line and exits

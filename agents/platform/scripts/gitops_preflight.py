@@ -17,6 +17,13 @@ prints exactly one line:
     REPO_UNREACHABLE: <repo>: stop now. ...          exit 4  (with --repo)
     STATE_UNREADABLE: stop now. ...                  exit 5
 
+With --list it prints both registries instead, for reading rather than
+gating: `managed_repos` (swept, audited, sent pull requests) and
+`context_repos` (read for declared intent only, never written):
+
+    MANAGED: <repo> ... | MANAGED: none
+    CONTEXT: <repo>[@<ref>] ... | CONTEXT: none      exit 0, or 5 if unreadable
+
 With --repo, the named repository must be registered and answer the
 broker's capabilities call; a repository not in the list is reported as
 NO_REGISTERED_REPO for that name. Every non-zero line tells the reader to
@@ -40,6 +47,7 @@ EXIT_STATE_UNREADABLE = 5
 REACH_TIMEOUT_SECONDS = 60
 VCS_SCRIPT_RELATIVE = Path("skills") / "version-control" / "scripts" / "vcs.py"
 DEFAULT_HERMES_HOME = "/opt/data"
+NONE = "none"
 
 REGISTRATION_STEPS = (
     "Register the repository in the PlatformAgent's spec.integration.repositories "
@@ -74,6 +82,30 @@ def _reachable(repo: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _context_names(entries: list[dict[str, str]]) -> list[str]:
+    """`host/path`, with `@ref` when the entry pins one, for each context entry."""
+    names = []
+    for entry in entries:
+        name = entry["url"].split("://", 1)[-1].rstrip("/")
+        ref = entry.get(gitops_workspace.CONTEXT_REF_KEY)
+        names.append(f"{name}@{ref}" if ref else name)
+    return names
+
+
+def listing() -> tuple[int, str]:
+    """Both registries, two lines."""
+    try:
+        managed = gitops_workspace.get_managed_repos()
+        context = _context_names(gitops_workspace.get_context_repo_entries())
+    except Exception as exc:  # noqa: BLE001 - any failure to read is the same answer
+        return EXIT_STATE_UNREADABLE, (
+            f"STATE_UNREADABLE: the registry could not be read ({exc}); {STOP}"
+        )
+    return EXIT_REGISTERED, (
+        f"MANAGED: {' '.join(managed) or NONE}\nCONTEXT: {' '.join(context) or NONE}"
+    )
+
+
 def preflight(repo: str | None = None) -> tuple[int, str]:
     """The exit code and the one line to print."""
     try:
@@ -105,9 +137,11 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--repo", help="also require this repository to be registered and reachable")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--repo", help="also require this repository to be registered and reachable")
+    mode.add_argument("--list", action="store_true", help="print both registries instead of gating")
     args = parser.parse_args(argv)
-    code, line = preflight(args.repo)
+    code, line = listing() if args.list else preflight(args.repo)
     print(line)
     return code
 
