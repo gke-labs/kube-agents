@@ -1210,7 +1210,9 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime, 
     escalation_judged = has_version_finding or (pool_skew_judged and master_behind_judged(cluster, baseline))
     # A blocking exclusion whose window does not parse is skipped by the
     # check, so it keeps the slug out for the same reason.
-    frozen = check_blocking_exclusion(cluster, now=now, has_version_finding=True, long_freeze=criteria.long_freeze) is not None
+    # Probed with a version finding, where the horizon does not matter: the escalation flags
+    # any in-effect blocking exclusion.
+    frozen = check_blocking_exclusion(cluster, now=now, has_version_finding=True) is not None
     if not blocking_exclusions_readable(cluster) or (not escalation_judged and frozen):
         slugs.remove("blocking-exclusion")
 
@@ -2388,10 +2390,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pool-skew-critical-minors", type=int, default=POOL_SKEW_CRITICAL_MINORS, help="§3.2: a pool this many minors or more behind its control plane is critical (criteria.pool_skew_critical_minors)")
     parser.add_argument("--fleet-spread-min-minors", type=int, default=FLEET_SPREAD_MIN_MINORS, help="§3.3: flag the fleet once its control-plane minors span this many (criteria.fleet_spread_min_minors)")
     parser.add_argument("--blocking-exclusion-min-days", type=int, default=LONG_FREEZE_DAYS, help="§3.8: an upgrade-blocking exclusion ending further out than this many days is flagged on its own (criteria.blocking_exclusion_min_days)")
-    # nargs="?" with an empty const: an operator who emptied the list has to be able to say so,
-    # and the SOP's comma-joined placeholder renders an empty list as the bare flag, which
-    # argparse would otherwise refuse as a flag missing its argument. Omitting the flag is the
-    # shipped list.
+    # nargs="?" with an empty const: an operator who emptied the list has to be able to say so.
+    # The SOP's quoted placeholder renders an empty list as ""; the bare flag is the hand-run
+    # spelling, which argparse would otherwise refuse as a flag missing its argument. Omitting
+    # the flag is the shipped list.
     parser.add_argument("--deprecated-image-types", nargs="?", const=EMPTY_IMAGE_TYPE_LIST, default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: node image types flagged whether or not the location still offers them, comma- or whitespace-separated as --scope-projects is; \"\" or the bare flag is an emptied list, and omitting the flag is the shipped list (criteria.deprecated_image_types)")
     try:
         args = parser.parse_args(argv)
@@ -2405,7 +2407,7 @@ def main(argv: list[str] | None = None) -> int:
         return USAGE_EXIT_CODE
     declared_scope.set(args.scope_projects, args.scope_unread)
     manifest = collect_fleet(args.project, criteria=criteria)
-    print(json.dumps(manifest, indent=2))
+    print(json.dumps(manifest, indent=JSON_INDENT))
     if manifest.get("error"):
         log(f"WARNING: {manifest['error']}")
         return 1

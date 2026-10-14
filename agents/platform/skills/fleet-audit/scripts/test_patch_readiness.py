@@ -3445,6 +3445,10 @@ class CriteriaTest(unittest.TestCase):
                 return run_of(0, json.dumps([behind, older, frozen]))
             if "get-server-config" in argv:
                 return run_of(0, json.dumps(server_config(default="1.33.0-gke.1", valid_versions=["1.33.0-gke.1", "1.31.0-gke.1"])))
+            if any(REPORTER_NEEDLE in str(a) for a in argv):
+                # 3.11's reporter run for the behind clusters: a stubbed refusal, not an
+                # assertion the collector's crash fallback would swallow.
+                return NO_REPORTER
             raise AssertionError(f"unexpected discovery call: {argv}")
 
         def severities(manifest, name, check):
