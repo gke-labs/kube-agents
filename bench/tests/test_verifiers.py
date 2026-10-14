@@ -338,8 +338,9 @@ def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | Non
     (root / "clusters").mkdir(exist_ok=True)
     roles = _catalog_roles()
     lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
-    # A role the catalogue lacks (a retired role, bench/tf/fleet/README.md) gets
-    # no slot credential, as the runner writes none for a role it cannot place.
+    # A role the catalogue lacks gets no slot credential; a case that names only
+    # such a role is parked and its table rows are skipped (`_live`), so this is
+    # reached by a hand-built call alone.
     for slot in sorted({roles[role]["cluster_slot"] for role in reached if role in roles}):
         name = (names or {}).get(slot, f"seeded-{slot}")
         lines += [f"cluster.{slot}={name}", f"location.{slot}={location}"]
@@ -348,6 +349,31 @@ def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | Non
         if role not in roles:
             continue
         (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+
+
+def _parked_cases() -> set[str]:
+    """The validator's FIXTURE_NOT_READY set, loaded by path. A parked case's table
+    rows, dedicated tests and construction test drop out with its roster line:
+    the fleet README's exit for a retired role parks the cases that name it, and
+    their fleet directory could record no slot for a role the catalogue lacks."""
+    import importlib.util
+
+    validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
+    spec = importlib.util.spec_from_file_location("validate_bench_cases_for_verifier_tests", validator)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.FIXTURE_NOT_READY)
+
+
+def _live(table: dict) -> dict:
+    """A group table less the cases the validator parks."""
+    parked = _parked_cases()
+    return {case: rows for case, rows in table.items() if case not in parked}
+
+
+def _skip_if_parked(case: str) -> None:
+    if case in _parked_cases():
+        pytest.skip(f"{case} is parked in FIXTURE_NOT_READY")
 
 
 def _zonal_case_verdict(objective: str, text: str, reached: list[str] | None = None, names: dict[str, str] | None = None):
@@ -7247,6 +7273,9 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: core/v1 endpoints api",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: policy/v1beta1 podsecuritypolicy, v1 endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints and flowcontrol.apiserver.k8s.io/v1beta3 flowschemas",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, policy/v1beta1/podsecuritypolicies",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowschemas.flowcontrol.apiserver.k8s.io",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: /apis/flowcontrol.apiserver.k8s.io/v1beta3/flowschemas, v1 endpoints",
             "seeded-a: next minor v1.36; removed apis still called: none; deprecated but still served: core/v1 Endpoint",
             "seeded-a: next minor 1.36.4-gke.1391000; removed apis still called: none; deprecated but still served: endpoints (core/v1)",
             "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
@@ -7264,6 +7293,7 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, and not actually called by anything",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, which is not actually called by anything",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, never called",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1 none",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: neither, endpoints is only kube-system's",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
         ],
@@ -7319,13 +7349,13 @@ def _group3_verdicts(case: str, text: str) -> dict[str, str]:
     return out
 
 
-@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _GROUP3.items() for l in ok])
+@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _live(_GROUP3).items() for l in ok])
 def test_group3_case_accepts_the_declared_lines_as_rendered(case, line):
     verdicts = _group3_verdicts(case, _group3_report(case, line))
     assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
 
 
-@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _GROUP3.items() for l in bad])
+@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _live(_GROUP3).items() for l in bad])
 def test_group3_case_refuses_a_wrong_or_hedged_seeded_a_line(case, line):
     verdicts = _group3_verdicts(case, _group3_report(case, line))
     assert any(s != "pass" for s in verdicts.values()), verdicts
@@ -7471,19 +7501,19 @@ def _group5_verdicts(case: str, text: str) -> dict[str, str]:
     return out
 
 
-@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _GROUP5.items() for l in ok])
+@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _live(_GROUP5).items() for l in ok])
 def test_group5_case_accepts_the_declared_line_as_rendered(case, line):
     verdicts = _group5_verdicts(case, _group5_report(line))
     assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
 
 
-@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _GROUP5.items() for l in bad])
+@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _live(_GROUP5).items() for l in bad])
 def test_group5_case_refuses_a_wrong_or_hedged_value(case, line):
     verdicts = _group5_verdicts(case, _group5_report(line))
     assert any(s != "pass" for s in verdicts.values()), verdicts
 
 
-@pytest.mark.parametrize("case", list(_GROUP5))
+@pytest.mark.parametrize("case", list(_live(_GROUP5)))
 def test_group5_case_fails_every_objective_without_the_declared_line(case):
     _, _, missing = _GROUP5[case]
     verdicts = _group5_verdicts(case, missing)
@@ -7665,7 +7695,7 @@ _GROUP4 = {
 
 @pytest.mark.parametrize(
     "case,line",
-    [(c, l) for table in (_GROUP2, _GROUP4) for c, (ok, _, _) in table.items() for l in ok],
+    [(c, l) for table in (_GROUP2, _GROUP4) for c, (ok, _, _) in _live(table).items() for l in ok],
 )
 def test_group2_and_group4_case_accepts_the_declared_line_as_rendered(case, line):
     verdicts = _group5_verdicts(case, _group5_report(line))
@@ -7674,14 +7704,14 @@ def test_group2_and_group4_case_accepts_the_declared_line_as_rendered(case, line
 
 @pytest.mark.parametrize(
     "case,line",
-    [(c, l) for table in (_GROUP2, _GROUP4) for c, (_, bad, _) in table.items() for l in bad],
+    [(c, l) for table in (_GROUP2, _GROUP4) for c, (_, bad, _) in _live(table).items() for l in bad],
 )
 def test_group2_and_group4_case_refuses_a_wrong_or_hedged_value(case, line):
     verdicts = _group5_verdicts(case, _group5_report(line))
     assert any(s != "pass" for s in verdicts.values()), verdicts
 
 
-@pytest.mark.parametrize("case", list(_GROUP2) + list(_GROUP4))
+@pytest.mark.parametrize("case", list(_live(_GROUP2)) + list(_live(_GROUP4)))
 def test_group2_and_group4_case_fails_every_objective_without_the_declared_line(case):
     _, _, missing = {**_GROUP2, **_GROUP4}[case]
     verdicts = _group5_verdicts(case, missing)
@@ -7698,6 +7728,7 @@ def test_group2_and_group4_case_fails_every_objective_without_the_declared_line(
 
 def test_group3_network_policy_seeded_c_none_admits_an_ungraded_gloss():
     case = "upgrades-network-policy-enforcement-stated"
+    _skip_if_parked(case)
     line_a = _GROUP3[case][0][0]
     text = "\n".join(
         [
@@ -7715,6 +7746,7 @@ def test_group3_removed_api_refuses_a_long_and_joined_list_at_once():
     import time
 
     case = "upgrades-removed-api-callers-distinguished"
+    _skip_if_parked(case)
     items = " and ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
     line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
     started = time.monotonic()
@@ -7727,6 +7759,7 @@ def test_group3_removed_api_refuses_a_long_comma_joined_list_at_once():
     import time
 
     case = "upgrades-removed-api-callers-distinguished"
+    _skip_if_parked(case)
     items = ", ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
     line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
     started = time.monotonic()
@@ -7739,6 +7772,7 @@ def test_group2_no_surge_refuses_nested_unclosed_parentheticals_at_once():
     import time
 
     case = "upgrades-no-surge-pool-recreate-warned"
+    _skip_if_parked(case)
     items = " and ".join(f"worker{i} (note{i}" for i in range(20))
     line = f"seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: {items}"
     started = time.monotonic()
@@ -7751,6 +7785,7 @@ def test_group3_removed_api_refuses_a_long_oxford_joined_list_at_once():
     import time
 
     case = "upgrades-removed-api-callers-distinguished"
+    _skip_if_parked(case)
     items = ", and ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
     line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
     started = time.monotonic()
@@ -7759,7 +7794,7 @@ def test_group3_removed_api_refuses_a_long_oxford_joined_list_at_once():
     assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
 
 
-@pytest.mark.parametrize("case", list(_GROUP2) + list(_GROUP3) + list(_GROUP4) + list(_GROUP5))
+@pytest.mark.parametrize("case", [c for t in (_GROUP2, _GROUP3, _GROUP4, _GROUP5) for c in _live(t)])
 def test_every_check_of_a_catalogue_case_constructs(case):
     """Every entry of the seventeen files, the fleet safeguards included, builds
     through the registry, so a typo in a check is a red test here and not a
@@ -7770,3 +7805,17 @@ def test_every_check_of_a_catalogue_case_constructs(case):
         with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
             built = [parse_node(dict(entry["check"])) for entry in spec["verification_spec"]]
     assert len(built) == len(spec["verification_spec"]) >= 3
+
+
+def test_a_parked_case_drops_out_of_the_tables():
+    """The fleet README's exit for a retired role parks the case that names it;
+    its rows leave the four tables with its roster line, so the suite stays
+    green with the role gone from the catalogue."""
+    import sys
+
+    case = "upgrades-retired-registry-image-named"
+    assert case in _GROUP4
+    with mock.patch.object(sys.modules[__name__], "_parked_cases", return_value={case}):
+        assert case not in _live(_GROUP4)
+        assert len(_live(_GROUP4)) == len(_GROUP4) - 1
+        assert set(_live(_GROUP3)) == set(_GROUP3)
