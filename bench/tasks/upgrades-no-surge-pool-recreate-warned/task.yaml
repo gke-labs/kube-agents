@@ -76,7 +76,7 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?:yes|no); workloads pinned to this pool: [^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: [^\n]+$'
 
   - name: the-declared-line-says-no-replacement-comes-first
     role: objective
@@ -87,9 +87,9 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: no; workloads pinned to this pool: [^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: no; workloads pinned to this pool: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?!no;)[^;\n]+; workloads pinned to this pool: [^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?!no;)[^;\n]+; workloads pinned to this pool: [^\n]+$'
 
   # The pinned-workload slot admits the name as the agent has it in hand:
   # bare, namespaced, with a kind word in front, as a pod name with its
@@ -105,9 +105,9 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?:yes|no); workloads pinned to this pool: (?:(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?)*$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: (?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?)*$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+; replacement node first: (?:yes|no); workloads pinned to this pool: (?!(?:(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: \([^)\n;]*\)?)?)*$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no); workloads pinned to this pool: (?!(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:-[a-z0-9]{5,10})?(?:-[a-z0-9]{5})?(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?[a-z0-9][a-z0-9./_-]*(?: in [a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*\)?)?)*$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
