@@ -333,7 +333,7 @@ offered for as long as `validMasterVersions` or any channel's roster carries it,
 (a) does not fire and `seeded-b` carries the intended branch (b) at major. A held pin is not
 re-drawn: each reconcile returns the running version until REGULAR ships a patch above it, so
 if every roster drops that version meanwhile, branch (a) fires on every project, and correctly,
-until REGULAR catches up or the cluster is replaced.
+until REGULAR catches up or the cluster is destroyed and re-created.
 
 A case touching `version-laggard` may assert that branch (a) is absent, and
 `upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it

@@ -51,8 +51,9 @@ entries in `oss-test-infra` run `main` only: a postsubmit on every merge that ch
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
-never from a laptop while a run holds the project. The two recovery replaces below (`seeded_b`'s
-cluster, `inventory_api`) are the exception: the script passes no `-replace`, so they run by hand
+never from a laptop while a run holds the project. The two hand recoveries below (`seeded_b`'s
+cluster, a targeted destroy; `inventory_api`, a replace) are the exception: the script passes neither
+`-target` nor `-replace`, so they run by hand
 from a `main` checkout, under a lease on the project. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
@@ -92,7 +93,7 @@ rule), so a master the hold left two minors behind reaches the target over two a
 While a hold lasts the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
 `version-laggard` as drifted until REGULAR ships a patch above the running one, and if
 REGULAR drops the minor first no pin can recover, so the cluster is upgraded by hand off
-the channel or replaced. `seeded-b`'s node pool is
+the channel or destroyed and re-created (the recovery below). `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
 moves with the master; freezing it would leave the pool a minor (or, between minor
 rolls, a patch) behind the control plane, which is upgrade SOP 3.2 `pool-skew` and a
@@ -126,9 +127,11 @@ two ways — reconciles lapse for longer than the window, or the minor reaches E
 either way GKE upgrades the master, the defect self-heals, and the upgrade scenario
 going red is the detection. The pin cannot pull it back — the provider upgrades only
 when the recorded master is below the configured value, and a control plane cannot be
-downgraded — so the recovery is the same in both cases: replace the cluster and let the
-derived pin re-lag it against the then-current default:
-`tofu apply -replace=google_container_cluster.seeded_b`. That replacement costs the
+downgraded — so the recovery is the same in both cases: destroy the cluster under a lease
+(`tofu destroy -target=google_container_cluster.seeded_b`) and let the next apply, the
+daily's or your own, re-create it at the lag target. Not a `-replace` in one apply:
+`seeded_b_pin.py` reads the running cluster at plan time, so a replace plans the new
+cluster at the version the old one is on and re-lags nothing. That re-creation costs the
 drift scenario a day — see the cluster-replacement note under Activation timeline below.
 The other standing hazard is a cleanup sweep — one `orphan-pd-` deletion breaks the cost
 scenario, and recreating a deleted fixture restarts its age gate (below).

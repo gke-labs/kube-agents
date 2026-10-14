@@ -217,14 +217,19 @@ resource "google_project_iam_member" "pool_state_readers" {
 # the minor bump from an on-channel patch. As of 2026-10-14 REGULAR's newest
 # 1.34 is below seeded-b's 1.34.12-gke.1011000, so the hold lasts until
 # REGULAR ships a 1.34 patch above it; if REGULAR drops 1.34 first, no pin
-# can recover and the cluster is upgraded by hand or replaced.
+# can recover and the cluster is upgraded by hand or destroyed and
+# re-created (the recovery below).
 #
 # The provider only ever upgrades (cur < des) and a control plane cannot be
 # downgraded, so the pin is one-way: if the master ever gets AHEAD of it --
 # reconciles lapse past the exclusion window, or the minor reaches EOL and
-# GKE auto-upgrades -- the lag is gone for good and the fix is replacing
-# the cluster (`tofu apply -replace=google_container_cluster.seeded_b`).
-# That replacement is not free: the drift SOP drops a cluster under 24h old
+# GKE auto-upgrades -- the lag is gone for good and the fix is destroying
+# the cluster and letting the next apply re-create it at the lag target:
+# `tofu destroy -target=google_container_cluster.seeded_b` under a lease,
+# then the daily or a `tofu apply`. Not `-replace` in one apply: the pin
+# script reads the running cluster at plan time, so a replace would plan
+# the new cluster at the version the old one is on and re-lag nothing.
+# That re-creation is not free: the drift SOP drops a cluster under 24h old
 # from every cohort, which takes the comparable cohort from four to three,
 # still at its 3-cluster floor, so seeded-c stays outvoted 2/3. On a project
 # whose fleet predates seeded-d it takes the cohort from three to two, under
@@ -483,9 +488,9 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 #    past EOL (observed live on 1.34: capped at 2027-01-25), the exclusion
 #    dies for good, and the same self-heal follows.
 # A control plane cannot be downgraded, so recovery either way is
-# replacing the cluster -- the derived pin then re-lags against the
-# then-current default:
-# `tofu apply -replace=google_container_cluster.seeded_b`.
+# destroying the cluster under a lease and letting the next apply re-create
+# it at the lag target (the block above the data source says why not
+# `-replace`): `tofu destroy -target=google_container_cluster.seeded_b`.
 resource "google_container_cluster" "seeded_b" {
   name     = "${var.cluster_prefix}-b"
   location = var.zone
