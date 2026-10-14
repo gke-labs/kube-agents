@@ -418,7 +418,7 @@ module "gke_cluster" {
   #
   # one(), not [0]: the ingress is count-gated and this has to resolve to null
   # when it is off.
-  create_after = one(module.drift_pubsub[*].topic_name)
+  create_after = try(module.drift_pubsub[0].teardown_gate, null)
 
   depends_on = [google_project_service.required]
 }

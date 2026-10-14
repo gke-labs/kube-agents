@@ -191,6 +191,10 @@ INGRESS_MODULE = "drift_pubsub"
 CLUSTER_MODULE = "gke_cluster"
 IAM_MODULE = "kube_agents_iam"
 IAM_MODULE_REFERENCE = f"{_MODULE}.{IAM_MODULE}"
+#: The ingress output the cluster is ordered behind. Named rather than any
+#: output, because it is the one that reaches the drain, the grant and the
+#: topic -- see its description in the module's outputs.tf.
+TEARDOWN_GATE = "teardown_gate"
 
 # The detector's own access, which moved out of the module to break the
 # dependency above and so is no longer guaranteed by instantiating it. Both
@@ -529,14 +533,19 @@ class DriftPubsubOrdering(unittest.TestCase):
     def test_the_cluster_is_destroyed_before_the_ingress(self) -> None:
         body = _module_body(self.composition, CLUSTER_MODULE)
         self.assertIn(
-            f"{_MODULE}.{INGRESS_MODULE}",
+            TEARDOWN_GATE,
             _reference_text(body),
-            f'module "{CLUSTER_MODULE}" must take a value from {_MODULE}.{INGRESS_MODULE}. '
-            f"Terraform destroys dependents before dependencies, so this edge is the only "
-            f"thing keeping the topic alive until the control plane has stopped emitting; "
-            f"without it the topic goes minutes early and every audit record that lands "
-            f"after it mails the project's owners (#2426). The edge is for the destroy "
-            f"order, so no apply and no plan will show it missing",
+            f'module "{CLUSTER_MODULE}" must take {TEARDOWN_GATE} from '
+            f"{_MODULE}.{INGRESS_MODULE}. Terraform destroys dependents before "
+            f"dependencies, so this edge is the only thing keeping the ingress alive "
+            f"until the control plane has stopped emitting; without it the topic goes "
+            f"minutes early and every audit record that lands after it mails the "
+            f"project's owners (#2426). The edge is for the destroy order, so no apply "
+            f"and no plan will show it missing. It has to be this output and not, say, "
+            f"topic_name: the gate names the drain, the grant and the topic, and "
+            f"ordering the topic alone leaves the grant free to be revoked while a "
+            f"control plane is still emitting, which is the same mail under "
+            f"topic_permission_denied",
         )
 
     def test_the_cluster_is_ordered_by_a_value_and_not_by_depends_on(self) -> None:
@@ -585,51 +594,35 @@ class DriftPubsubOrdering(unittest.TestCase):
                     f"the detector starts, is denied on every pull, and the pod stays Ready",
                 )
 
-    def test_the_ingress_references_no_other_module(self) -> None:
-        """The class, not one member of it.
+    def test_the_ordering_edge_is_indexed_and_not_a_splat(self) -> None:
+        """`module.drift_pubsub[*].x` closes a dependency cycle; `[0]` does not.
 
-        kube_agents_iam is how the dependency got in and is the one to expect
-        back, but any module whose own graph reaches the cluster does the same
-        damage, and most of them do -- the composition hangs nearly everything
-        off gke_cluster. Asserting the ingress call reaches no module at all is
-        both the real invariant and the cheaper thing to keep true: its
-        arguments are all `var.` today.
+        A splat over a module reaches the module's close node, so the edge
+        depends on every resource in the ingress -- `source_projects` among
+        them, which in this composition comes from kube-agents-iam, which
+        depends on the cluster. The cluster then depends on itself and
+        `terraform validate` fails with `Error: Cycle`. The indexed form
+        depends on the one output it names, which is why teardown_gate names
+        the three resources the ordering has to cover rather than relying on
+        the splat to cover them for it.
 
-        What the walk does not follow: a reference parked in a `resource` or
-        `data` block, including the one this call already names in its
-        `depends_on`. That is the same class and it is left out on purpose --
-        following it means parsing arbitrary blocks, which is more parser to
-        get wrong, and the hole is contained: a laundered reference that
-        actually reaches the cluster is a dependency cycle, and CI runs
-        `terraform validate` over `terraform/examples/*`, which refuses it.
-        What is lost there is this test's explanation, not the protection.
-
-        "Reaches" is three things, because Terraform's graph is not lexical
-        and a guard that reads only bare code text misses two of them. A
-        reference can be bare (module.x.y), interpolated inside a string
-        ("serviceAccount:${module.x.y}", which the tokenizer hands over as one
-        opaque string token and which is this composition's own idiom for
-        principals), or laundered through a local -- the shape this very
-        assertion used to recommend as the safe alternative. All three are
-        followed, locals transitively.
+        This replaces an earlier guard asserting the ingress call reached no
+        other module at all. #2862 made that false on purpose -- the source
+        sinks need the scope's project list -- so the invariant moved from
+        "the ingress reaches nothing" to "the edge into the cluster reaches
+        only what cannot cycle".
         """
-        body = _module_body(self.composition, INGRESS_MODULE)
-        definitions = _locals_definitions(self.composition)
-        referenced = sorted(
-            _modules_reached(body, definitions) - {INGRESS_MODULE}
+        body = _module_body(self.composition, CLUSTER_MODULE)
+        self.assertNotIn(
+            f"{_MODULE}.{INGRESS_MODULE}[*]",
+            _reference_text(body).replace(" ", ""),
+            f'module "{CLUSTER_MODULE}" reaches {_MODULE}.{INGRESS_MODULE} through a '
+            f"splat. That depends on the whole module, including source_projects, "
+            f"which comes from {IAM_MODULE} and so from the cluster: a cycle. Index "
+            f"the single output instead",
         )
-        self.assertEqual(
-            [],
-            referenced,
-            f'module "{INGRESS_MODULE}" now references {", ".join(referenced)}. Any module '
-            f"reference risks reaching module.{CLUSTER_MODULE} -- {IAM_MODULE} is the one "
-            f"that used to, through the detector's GSA -- which makes the ingress a "
-            f"dependent of the cluster, inverts the destroy order the test above pins, and, "
-            f"since the cluster now depends on the ingress, is a dependency cycle besides. "
-            f"Pass a variable, or move whatever needs the reference out of the module "
-            f"the way the detector's subscription grants were. A local is not a way "
-            f"round this: locals are followed, including through a chain of them",
-        )
+
+
 
 
 class ReachabilityHelpers(unittest.TestCase):

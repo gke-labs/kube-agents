@@ -788,8 +788,8 @@ enabled APIs.
 `roles/pubsub.subscriber` and `roles/pubsub.viewer` on the subscription for the
 agent's GSA are granted here rather than inside the module, next to the module
 call. That is what keeps the module clear of `kube-agents-iam`, and so clear of
-the cluster: `gke_cluster` takes the ingress's topic name as its `create_after`
-input, which makes Terraform destroy the cluster first and delete the topic
+the cluster: `gke_cluster` takes the ingress's `teardown_gate` output as its
+`create_after` input, which makes Terraform destroy the cluster first and delete the topic
 last. Without that ordering the topic goes while the control plane is still
 emitting matching audit records, and each one mails every project owner. An
 input rather than a `depends_on` on the module call, because a module-level
