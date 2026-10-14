@@ -31,7 +31,8 @@ and the next readiness report shows the guard, so the fleet learns from every up
 [`upgrade-retrospective.md`](upgrade-retrospective.md).
 
 The fourth piece is the test fleet. It carries the before-state of each catalogue entry that a
-standing fixture can hold. A nightly evaluation case per entry grades whether the agent names it. See
+standing fixture can hold. The catalogue plans one nightly evaluation case per entry, each grading
+whether the agent names it, and its status table says which cases are registered. See
 [`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md) for the scripts, the
 fixtures and the evidence.
 
