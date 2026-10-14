@@ -14,7 +14,9 @@ Each capability directory holds:
   criteria.schema.json  image-owned; what keys exist, their types and defaults
   learning.json         image-owned; per-key policy for what the agent may
                         change with and without an operator's confirmation
-  changelog.jsonl       one line per accepted change; nothing rewrites it
+  changelog.jsonl       one line per change the store set out to write, appended
+                        before the value moves, so a line whose value write failed
+                        stays and the next revision counts past it; nothing rewrites it
 
 Every write goes through ``apply_changes`` so the policy is enforced in code
 rather than in a prompt. What the code can enforce: a key marked ``never``
@@ -212,12 +214,20 @@ def load(root: Path, name: str) -> Capability:
             f"write a capability without its schema; a pod restart restores the image's copy"
         )
     learning = _read_json(directory / LEARNING_FILENAME)
+    if not isinstance(learning, dict):
+        # The same torn-scaffold and hand-made routes reach a missing policy file, and an empty
+        # policy would read every key as `propose`: a key the image marks `never` would take a
+        # confirmed write. Refused the way the schema is; the next pod start copies it back.
+        raise CapabilityError(
+            f"{name}/{LEARNING_FILENAME} is missing or not a JSON object: the store refuses to read or "
+            f"write a capability without its learning policy; a pod restart restores the image's copy"
+        )
     return Capability(
         name=name,
         root=root,
         criteria=criteria,
         schema=schema,
-        learning=learning if isinstance(learning, dict) else {},
+        learning=learning,
     )
 
 
@@ -432,8 +442,11 @@ def _apply_locked(
     if errors:
         raise CapabilityError("invalid: " + "; ".join(errors))
 
-    revision = cap.criteria.get(REVISION_KEY)
-    revision = revision + 1 if isinstance(revision, int) and not isinstance(revision, bool) else 1
+    stored_revision = cap.criteria.get(REVISION_KEY)
+    stored_revision = stored_revision if isinstance(stored_revision, int) and not isinstance(stored_revision, bool) else 0
+    # Past the last changelog line as well as the stored value: a line whose value write failed
+    # keeps its number, so no two lines share one.
+    revision = max(stored_revision, _last_logged_revision(cap.directory)) + 1
     now = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     stored = dict(candidate)
     stored[REVISION_KEY] = revision
@@ -458,6 +471,23 @@ def _apply_locked(
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
     write_json_atomic(cap.directory / CRITERIA_FILENAME, stored, sort_keys=True)
     return entry
+
+
+def _last_logged_revision(directory: Path) -> int:
+    """The revision the changelog's last well-formed line carries, 0 when there is none."""
+    path = directory / CHANGELOG_FILENAME
+    if not path.is_file():
+        return 0
+    last = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        revision = entry.get("revision") if isinstance(entry, dict) else None
+        if isinstance(revision, int) and not isinstance(revision, bool):
+            last = max(last, revision)
+    return last
 
 
 def history(root: Path, name: str, limit: int = MAX_HISTORY_ENTRIES) -> list[dict[str, Any]]:

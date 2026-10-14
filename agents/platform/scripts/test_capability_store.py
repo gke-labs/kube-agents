@@ -35,8 +35,8 @@ def seed(root: Path, name: str = "demo", criteria=None, learning=None, schema=SC
     d.mkdir(parents=True)
     (d / cs.CRITERIA_FILENAME).write_text(json.dumps(criteria if criteria is not None else {"threshold": 3}))
     (d / cs.SCHEMA_FILENAME).write_text(json.dumps(schema))
-    if learning is not None:
-        (d / cs.LEARNING_FILENAME).write_text(json.dumps(learning))
+    # The policy file is always there, as the template ships it; a capability without one is refused.
+    (d / cs.LEARNING_FILENAME).write_text(json.dumps(learning if learning is not None else {}))
     return d
 
 
@@ -114,6 +114,31 @@ class StoreTest(unittest.TestCase):
         (d / cs.SCHEMA_FILENAME).write_text("[]")
         with self.assertRaises(cs.CapabilityError):
             cs.load(self.root, "torn")
+
+    def test_a_capability_without_its_learning_policy_is_refused_not_downgraded(self):
+        # Without the policy file every key would read as `propose`, and a key the image marks
+        # `never` would take a confirmed write. Refused like the schema, naming the file.
+        seed(self.root)
+        (self.root / "demo" / cs.LEARNING_FILENAME).unlink()
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        self.assertIn(cs.LEARNING_FILENAME, str(ctx.exception))
+        self.assertEqual(json.loads((self.root / "demo" / cs.CRITERIA_FILENAME).read_text()), {"threshold": 3})
+        (self.root / "demo" / cs.LEARNING_FILENAME).write_text("[]")
+        with self.assertRaises(cs.CapabilityError):
+            cs.load(self.root, "demo")
+
+    def test_the_next_revision_counts_past_an_orphan_changelog_line(self):
+        # A line whose value write failed keeps its number; the next accepted write takes the one
+        # after it, so history never shows two changes at one revision.
+        seed(self.root)
+        with patch.object(cs, "write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="x", confirmed_by="ops@example")
+        entry = cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="y", confirmed_by="ops@example")
+        self.assertEqual(entry["revision"], 2)
+        self.assertEqual(cs.load(self.root, "demo").criteria[cs.REVISION_KEY], 2)
+        self.assertEqual([e["revision"] for e in cs.history(self.root, "demo")], [1, 2])
 
     def test_the_changelog_line_lands_before_the_value_moves(self):
         # A changelog the store cannot append to leaves the value where it was; a value the

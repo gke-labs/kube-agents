@@ -1392,7 +1392,10 @@ def capability_criteria(
                                     — show them the before/after first, then
                                     call again with their name. A "never" key is
                                     refused outright: it changes through review.
-      history  capability        -> the last accepted changes, newest last.
+      history  capability        -> the changelog's last lines, newest last: each
+                                    change the store set out to write (a line whose
+                                    value write failed stays, at a revision no later
+                                    write reuses).
 
     Every accepted change is appended to the capability's changelog with who
     confirmed it and why, and bumps its revision. State the revision you ran
