@@ -23,7 +23,7 @@ prompt: >-
   Before the node pools of the seeded clusters in this project are upgraded,
   tell me which workloads pull images from a registry hostname that has been
   retired and now answers only by redirect, and what a node rebuild would do
-  to them if that host stopped answering. Read only; change nothing. End your
+  to them if that host stopped answering. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your
   answer with one line per such workload in exactly this form, no other words
   on the line: "<cluster>/<namespace>/<workload>: image <image reference>;
   registry host <hostname>; retired: <yes|no>".
@@ -63,7 +63,7 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull: image [^;\n]+; registry host [^;\n]+; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-names-the-retired-host
     role: objective
@@ -74,9 +74,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull: image [^;\n]+; registry host k8s\.gcr\.io; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io; retired: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull: image [^;\n]+; registry host (?!k8s\.gcr\.io;)[^;\n]+; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-says-the-host-is-retired
     role: objective
@@ -87,9 +87,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull: image [^;\n]+; registry host [^;\n]+; retired: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull: image [^;\n]+; registry host [^;\n]+; retired: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

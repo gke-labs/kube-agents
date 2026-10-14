@@ -75,7 +75,7 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client [^;\n]+; server [^;\n]+; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   # The client is kubectl at 1.29: the image tag, with or without its `v`
   # and its patch.
@@ -88,9 +88,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client kubectl v?1\.29(?:\.0)?; server [^;\n]+; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?kubectl v?1\.29(?:\.0)?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client (?!kubectl v?1\.29(?:\.0)?;)[^;\n]+; server [^;\n]+; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?(?!kubectl v?1\.29(?:\.0)?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   - name: the-declared-line-says-the-client-is-outside-the-skew
     role: objective
@@ -101,9 +101,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client [^;\n]+; server [^;\n]+; within supported skew: no$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client [^;\n]+; server [^;\n]+; within supported skew: (?!no$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}: client:? ?[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?!no$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

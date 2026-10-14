@@ -7236,6 +7236,8 @@ _GROUP3 = {
     "upgrades-removed-api-callers-distinguished": (
         [
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36 (REGULAR channel); removed apis still called: none; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor: 1.36; removed apis still called: none; deprecated but still served: endpoints v1",
             "seeded-a: next minor v1.36; removed apis still called: none; deprecated but still served: core/v1 Endpoint",
             "seeded-a: next minor 1.36.4-gke.1391000; removed apis still called: none; deprecated but still served: endpoints (core/v1)",
             "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
@@ -7243,6 +7245,7 @@ _GROUP3 = {
         [
             "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none (Endpoints is written only by kube-system's controller)",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
         ],
         "seeded-{s}: next minor 1.36; removed apis still called: none; deprecated but still served: none",
@@ -7250,8 +7253,9 @@ _GROUP3 = {
     "upgrades-network-policy-enforcement-stated": (
         [
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
-            "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-intent, seeded-stall and seeded-reliability",
-            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 6 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-intent, seeded-stall)",
+            "seeded-a: dataplane: legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom and seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
         ],
         [
             "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
@@ -7313,6 +7317,7 @@ _GROUP5 = {
     "upgrades-pod-security-latest-pinned-named": (
         [
             "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce: baseline; enforce-version: latest; rule set changes at the next minor: yes",
             "- `seeded-a/seeded-defaults`: enforce baseline; enforce-version `latest`; rule set changes at the next minor: yes.",
             "**seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes**",
             "1. seeded-a (us-central1-a)/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
@@ -7328,6 +7333,7 @@ _GROUP5 = {
     "upgrades-stale-client-skew-named": (
         [
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client-29384756-abcde: client: kubectl v1.29.0; server: v1.34.1-gke.1234000; within supported skew: no",
             "- `seeded-a/seeded-shapes/stale-kubectl-client`: client kubectl 1.29; server 1.34; within supported skew: no.",
             "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
         ],
@@ -7342,6 +7348,7 @@ _GROUP5 = {
     "upgrades-cgroup-blind-runtime-named": (
         [
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit: 192Mi",
             "- `seeded-a/seeded-shapes/cgroup-blind-jvm`: runtime `eclipse-temurin:8u302-b08-jre`; reads cgroup v2 limits: no; memory limit 192Mi.",
             "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
         ],
@@ -7356,6 +7363,7 @@ _GROUP5 = {
     "upgrades-multi-process-oom-group-named": (
         [
             "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container: several; memory limit: 32Mi; oom kills the whole container: yes",
             "- `seeded-a/seeded-shapes/multi-process-worker`: processes per container several; memory limit `32Mi`; oom kills the whole container: yes.",
             "**seeded-a/seeded-shapes/multi-process-worker**: processes per container several; memory limit 32 MiB; OOM kills the whole container: yes",
         ],
@@ -7370,6 +7378,7 @@ _GROUP5 = {
     "upgrades-node-image-coupled-agent-named": (
         [
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths: /etc/cni/net.d; coupled to the node image: yes",
             "- `seeded-a/seeded-shapes/cni-shaped-agent`: host network: yes; host paths `/etc/cni/net.d` (read-only, mounted at /host/etc/cni/net.d); coupled to the node image: yes.",
             "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
         ],
@@ -7384,6 +7393,7 @@ _GROUP5 = {
     "upgrades-cuda-pinned-gpu-job-named": (
         [
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator: nvidia-l4; cuda: 12.2; suspended: yes",
             "- `seeded-a/seeded-shapes/cuda-pinned-trainer`: accelerator `nvidia-l4`; CUDA 12.2.0; suspended: yes.",
             "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
         ],
@@ -7489,6 +7499,7 @@ _GROUP2 = {
     "upgrades-zonal-skew-replicas-warned": (
         [
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api-5f6d7c8b9-x1y2z: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
             "- `seeded-d/seeded-topology/zone-pinned-api`: replicas: 2; zones in use: 1; all replicas in one zone: yes; cause: spread constraint.",
             "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
             "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
@@ -7504,6 +7515,8 @@ _GROUP2 = {
     "upgrades-exclusion-end-date-named": (
         [
             "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21T04:00:00.000Z; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-20 21:00 PDT; holds the automatic minor upgrade: yes",
             "- `seeded-b`: exclusion: hold-the-minor-lag; scope: no-minor-upgrades; ends: 2026-10-21T00:00:00Z; holds the automatic minor upgrade: yes.",
             "**seeded-b**: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21 (seven days from now); holds the automatic minor upgrade: yes",
             "1. seeded-b (us-central1-a): exclusion hold-the-minor-lag; scope NO MINOR UPGRADES; ends 2026-10-21 00:00 UTC; holds the automatic minor upgrade: yes",
@@ -7522,6 +7535,7 @@ _GROUP4 = {
     "upgrades-node-local-state-named": (
         [
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir-7c9d4b5f6-k2x8q: node-local volumes: queue; survives a node rebuild: no",
             "- `seeded-a/seeded-shapes/cache-on-emptydir`: node-local volumes `queue` (emptyDir); survives a node rebuild: no.",
             "**seeded-a/seeded-shapes/cache-on-emptydir**: node-local volumes queue (emptyDir at /var/lib/queue); survives a node rebuild: no",
             "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
@@ -7537,6 +7551,7 @@ _GROUP4 = {
     "upgrades-deprecated-node-label-selector-named": (
         [
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker-7d9f8b6c4-abcde: label: beta.kubernetes.io/arch; deprecated: yes; replacement: kubernetes.io/arch",
             "- `seeded-a/seeded-shapes/arch-pinned-worker`: label `beta.kubernetes.io/arch`; deprecated: yes; replacement `kubernetes.io/arch`.",
             "**seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch**",
             "1. seeded-a (us-central1-a)/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
@@ -7552,6 +7567,7 @@ _GROUP4 = {
     "upgrades-containerd-socket-agent-named": (
         [
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe-x7k2q: runtime socket mounted: yes; path: /run/containerd/containerd.sock",
             "- `seeded-a/seeded-shapes/node-runtime-probe`: runtime socket mounted: yes; path `/run/containerd/containerd.sock`.",
             "**seeded-a/seeded-shapes/node-runtime-probe**: runtime socket mounted: yes; path /run/containerd/containerd.sock",
             "1. seeded-a (us-central1-a)/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
@@ -7567,6 +7583,7 @@ _GROUP4 = {
     "upgrades-intree-volume-named": (
         [
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source: in-tree gcePersistentDisk; bound by: seeded-shapes/intree-pd; attaches through csi migration: yes",
             "- `seeded-a/intree-pd`: source in-tree gcePersistentDisk; bound by `seeded-shapes/intree-pd`; attaches through CSI migration: yes.",
             "**seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes**",
             "1. seeded-a (us-central1-a)/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
@@ -7582,6 +7599,7 @@ _GROUP4 = {
     "upgrades-retired-registry-image-named": (
         [
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull-6b7c8d9e5-abcde: image: k8s.gcr.io/pause:3.9; registry host: k8s.gcr.io; retired: yes",
             "- `seeded-a/seeded-shapes/legacy-registry-pull`: image `k8s.gcr.io/pause:3.9`; registry host `k8s.gcr.io`; retired: yes.",
             "**seeded-a/seeded-shapes/legacy-registry-pull**: image k8s.gcr.io/pause:3.9 (imagePullPolicy Always); registry host k8s.gcr.io; retired: yes",
             "1. seeded-a (us-central1-a)/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",

@@ -27,7 +27,7 @@ prompt: >-
   newer node image, tell me which workloads outside kube-system talk to the
   container runtime directly, through its socket or its configuration on the
   host, and what a change of containerd's major version or its CRI API would
-  do to them. Read only; change nothing. End your answer with one line per
+  do to them. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per
   such workload in exactly this form, no other words on the line:
   "<cluster>/<namespace>/<workload>: runtime socket mounted: <yes|no>; path
   <host path or none>".
@@ -67,7 +67,7 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe: runtime socket mounted: (?:yes|no); path [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?:yes|no); path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-socket-is-mounted
     role: objective
@@ -78,9 +78,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: yes; path:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe: runtime socket mounted: (?!yes;)[^;\n]+; path [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?!yes;)[^;\n]+; path:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-containerd-socket-path
     role: objective
@@ -91,9 +91,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe: runtime socket mounted: (?:yes|no); path /run/containerd/containerd\.sock$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?:yes|no); path:? ?/run/containerd/containerd\.sock$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe: runtime socket mounted: (?:yes|no); path (?!/run/containerd/containerd\.sock$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/node-runtime-probe(?:-[a-z0-9]{5,10}){0,2}: runtime socket mounted: (?:yes|no); path:? ?(?!/run/containerd/containerd\.sock$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

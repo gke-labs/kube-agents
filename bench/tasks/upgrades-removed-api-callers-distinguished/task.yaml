@@ -16,8 +16,7 @@
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
-# Mutation safeguard: the writer's suspend flag, as in
-# upgrades-deprecated-api-caller-named.
+# Mutation safeguard: the writer's suspend flag.
 id: upgrades-removed-api-callers-distinguished
 name: Removed APIs still called are told apart from deprecated APIs still served before the next minor
 
@@ -81,7 +80,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^^{cluster:a}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:b}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:c}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:d}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)'
+        - '(?ms)\A(?=.*^^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:b}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:c}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:d}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)'
 
   # The fleet plants no caller of a removed API. The Endpoints writer
   # filed here is the misclassification the case exists for.
@@ -97,9 +96,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: none; deprecated but still served: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: none; deprecated but still served: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: (?!none;)[^;\n]+; deprecated but still served: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: (?!none;)[^;\n]+; deprecated but still served: [^\n]+$'
 
   - name: seeded-a-keeps-the-endpoints-writer-under-deprecated
     role: objective
@@ -113,9 +112,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: [^;\n]+; deprecated but still served: [^\n?!]*\bendpoints?\b(?!slice)[^\n?!]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!none\b)[^\n?!]*\bendpoints?\b(?!slice)[^\n?!]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor (?:v?\d+\.\d+(?:[.-][^;\n]*)?|none); removed apis still called: [^;\n]+; deprecated but still served: (?![^\n?!]*\bendpoints?\b(?!slice)[^\n?!]*$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!(?!none\b)[^\n?!]*\bendpoints?\b(?!slice)[^\n?!]*$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
