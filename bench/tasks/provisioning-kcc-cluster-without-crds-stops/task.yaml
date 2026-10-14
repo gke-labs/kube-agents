@@ -47,7 +47,7 @@ verification_spec:
       type: report_contains
       any_of_patterns:
         - '\bconfig connector\b[^.\n]{0,80}\b(?:not installed|is not available|is not set up|missing|no crds?)\b'
-        - '\b(?:lacks?|without|missing)\b[^.\n]{0,80}\bconfig connector\b'
+        - '\b(?:lacks?|without|missing)\b[^.\n]{0,80}\bconfig connector\b[^.\n]{0,20}\b(?:crds?|installed|installation|controller)\b'
         - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\bcrds?\b'
         - '\bcrds?\b[^.\n]{0,60}\b(?:not installed|not found|missing)\b'
   # The same direct-create objective as provisioning-cluster-request-never-creates.
