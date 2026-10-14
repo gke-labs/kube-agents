@@ -170,9 +170,12 @@ class ClassifyTests(unittest.TestCase):
             "cat <<'EOF'\n" + lines + "\nEOF",
         ):
             self.assertIsNone(stop.classify_refusal(command, _result(lines, 0), failed=False), command)
-        # A comment quoting an earlier rule line beside a fresh write is the retry, not an echo.
-        retry = "# direct scale was refused (policy rule: kubernetes.read-only); patch the autoscaler instead\nkubectl patch configmap kube-dns-autoscaler -n kube-system -p '{}'"
-        self.assertEqual(stop.classify_refusal(retry, refusal("kubectl", "patch", "configmap", "kube-dns-autoscaler", "-n", "kube-system", "-p", "{}")), "policy")
+        # A comment quoting an earlier rule line beside a fresh write is the retry, not an
+        # echo: on the exit-0 path, where the echo test is consulted, the result's own verb
+        # line is what the test looks for, and the comment does not carry it.
+        retry = "# direct scale was refused (policy rule: kubernetes.read-only); patch the autoscaler instead\nkubectl patch configmap kube-dns-autoscaler -n kube-system -p '{}' || true"
+        patch = refusal("kubectl", "patch", "configmap", "kube-dns-autoscaler", "-n", "kube-system", "-p", "{}", exit_code=0)
+        self.assertEqual(stop.classify_refusal(retry, patch, failed=False), "policy")
 
     def test_a_failed_retry_that_pastes_the_earlier_refusal_block_still_counts(self):
         lines = shim_lines(SCALE)
@@ -188,7 +191,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop.classify_refusal("kubectl create deployment x --image=y --dry-run=client -o yaml | kubectl apply -f -", render_then_apply), "policy")
         read_then_scale = _result(shim_lines(["kubectl", "exec", "pod", "--", "cat", "/x"]) + "\n" + shim_lines(SCALE))
         self.assertEqual(stop.classify_refusal("kubectl exec pod -- cat /x; kubectl scale deploy/kube-dns -n kube-system --replicas=3", read_then_scale), "policy")
-        flag_then_scale = _result(FLAG_REFUSAL and (command_policy._FLAG_BOUNDARY_NOTICE + "\npolicy rule: identity.caller-supplied-impersonation\n" + shim_lines(SCALE)))
+        flag_then_scale = _result(command_policy._FLAG_BOUNDARY_NOTICE + "\npolicy rule: identity.caller-supplied-impersonation\n" + shim_lines(SCALE))
         self.assertEqual(stop.classify_refusal("kubectl --as admin scale deploy/x --replicas=3; kubectl scale deploy/kube-dns -n kube-system --replicas=3", flag_then_scale), "policy")
         self.assertEqual(len(stop.refusal_blocks(json.loads(render_then_apply)["output"])), 2)
 
@@ -198,6 +201,8 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop.classify_refusal("echo '$ kubectl scale deploy kube-dns --replicas=3'; cat /tmp/refusal.txt | tee /tmp/pr-body.md", _result(lines, 0), failed=False), "policy")
         # Not counted, by design: a write that reached kubectl through a script or a variable and exited 0.
         self.assertEqual(stop.classify_refusal("bash /tmp/retry.sh; echo done", _result(lines, 0), failed=False), "advisory")
+        # A shell prologue's ``set`` is before the kubectl word, so it is not the verb.
+        self.assertEqual(stop.classify_refusal("set -euo pipefail; kubectl get deploy kube-dns -n kube-system -o yaml > /tmp/c.yaml; cat /tmp/refusal.txt", _result(lines, 0), failed=False), "advisory")
 
     def test_a_flag_refusal_is_not_a_refusal_of_the_change(self):
         self.assertIsNone(stop.classify_refusal("kubectl --as x get pods", FLAG_REFUSAL))

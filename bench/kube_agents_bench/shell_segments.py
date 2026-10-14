@@ -45,7 +45,8 @@ nothing at all.
 
 What is not understood, stated so a case is not written against it: a command
 behind a shell variable (``$K scale``), text piped into an interpreter
-(``echo ... | sh``), a here-string's content, a ``printf`` format whose
+(``echo ... | sh``) or handed as an argument to one other than a shell or
+Python (``perl -e``, ``awk 'BEGIN{system(...)}'``), a here-string's content, a ``printf`` format whose
 directives are filled from later arguments, aliases and functions, a script
 written in one call and run in a later one, and anything after a quote that
 never closes. A content heredoc whose opener line also carries an interpreter
@@ -62,7 +63,7 @@ import re
 # duration after its options.
 _WRAPPERS = frozenset(
     {"env", "sudo", "doas", "setsid", "busybox", "chroot", "time", "nohup", "nice", "ionice", "stdbuf",
-     "watch", "timeout", "xargs", "command", "builtin", "exec",
+     "taskset", "watch", "timeout", "xargs", "command", "builtin", "exec",
      "if", "!", "while", "until", "then", "else", "elif", "do", "{"}
 )
 # ``find … -exec <command> {} \;`` runs its argument for every match.
@@ -72,6 +73,8 @@ _FIND_EXEC_END = frozenset({";", "\;", "+"})
 _ESCAPES = (("\\n", "\n"), ("\\t", "\t"), ("\\r", "\r"))
 _WRAPPER_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-T", "-U", "--user", "--group"},
+    "doas": {"-u", "-C"},
+    "taskset": {"-c", "-p", "--cpu-list"},
     "nice": {"-n", "--adjustment"},
     "ionice": {"-c", "-n", "-p"},
     "stdbuf": {"-i", "-o", "-e"},
@@ -80,7 +83,7 @@ _WRAPPER_VALUE_OPTIONS = {
     "env": {"-u", "-C", "-S"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
 }
-_WRAPPER_POSITIONAL = {"timeout": 1}
+_WRAPPER_POSITIONAL = {"timeout": 1, "chroot": 1}
 # Words that end a block; never a command.
 _BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "}", ")"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "su"})
@@ -88,7 +91,11 @@ _PYTHONS = re.compile(r"^python[\d.]*$")
 _SHELL_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "source", "."})
 # Short options of an interpreter that take a value token, read before a ``-c``;
 # the value may also be attached (``-Werror``, ``-Xdev``).
-_INTERPRETER_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "-W", "-X", "-m"})
+# per interpreter: a shell's ``-O shopt`` and ``-m`` (monitor) are not Python's
+# ``-O`` (optimise, no value) and ``-m module``.
+_SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O"})
+_SU_VALUE_OPTIONS = _SHELL_VALUE_OPTIONS | {"-s", "-g", "-G"}
+_PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "-m"})
 _INTERPRETER_LONG_VALUE_OPTIONS = frozenset({"--rcfile", "--init-file"})
 # ``echo``/``printf`` options that precede the text they print.
 _WRITER_OPTIONS = frozenset({"-e", "-E", "-n", "-v", "-ne", "-en"})
@@ -136,22 +143,6 @@ def _typed(seg: str) -> tuple[str, str]:
     return _KIND_SHELL, seg
 
 
-def ordered_segments(command: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """``(line, elsewhere)``, typed as ``typed_segments``: the call's own pieces in the order
-    the shell runs them, and every other segment (substitutions, written scripts, heredoc
-    bodies, ``find -exec``), whose place in that order the walk does not keep."""
-    everything: list[str] = []
-    _walk(command, everything, depth=0)
-    line: list[str] = []
-    for piece in _scan(command)[0]:
-        _emit(piece, line, 0)
-    elsewhere = list(everything)
-    for seg in line:
-        if seg in elsewhere:
-            elsewhere.remove(seg)
-    return [_typed(seg) for seg in line], [_typed(seg) for seg in elsewhere]
-
-
 def _walk(text: str, out: list[str], depth: int) -> None:
     if depth > _MAX_DEPTH or not text:
         return
@@ -167,8 +158,8 @@ def _walk(text: str, out: list[str], depth: int) -> None:
         # A script written by ``echo``/``printf`` (``>`` or ``tee``) and run
         # in the same call: the writer's quoted arguments are the script, or
         # the piece piped into ``tee``.
-        target = _heredoc_target([piece])
-        kind = executed.get(target) or executed.get("./" + target) if target else None
+        target = _writer_target(piece)
+        kind = _executed_kind(executed, target) if target else None
         if kind is None:
             continue
         found = _command_word(piece)
@@ -211,7 +202,7 @@ def _emit(piece: str, out: list[str], depth: int) -> None:
         return
     _, end, word = tokens[index]
     unquoted = _unquote(word)
-    inner = _substituted_command(word)
+    inner = _substituted_command(unquoted)
     if inner is not None:
         which = _WHICH_RE.match(inner.strip())
         if not which:
@@ -324,6 +315,15 @@ def _find_exec_argv(piece: str) -> str | None:
     return None
 
 
+def _value_options(base: str) -> frozenset[str]:
+    """The short options of ``base`` that take a value token."""
+    if base == "su":
+        return _SU_VALUE_OPTIONS
+    if _PYTHONS.match(base):
+        return _PYTHON_VALUE_OPTIONS
+    return _SHELL_VALUE_OPTIONS
+
+
 def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
     """The string a shell or python runs with ``-c``, or everything after ``eval``.
 
@@ -331,9 +331,11 @@ def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
     ``-c`` the next token is the script; before one there is no script), long
     options that take a value consume it, a short value option consumes the
     next token or carries it attached, and only then does a cluster holding
-    ``c`` name the script."""
+    ``c`` name the script. ``su`` may name a user (and ``-``) before ``-c``."""
     if base == "eval":
         return " ".join(_unquote(t) for _, _, t in rest) if rest else None
+    values = _value_options(base)
+    user_seen = False
     i = 0
     while i < len(rest):
         token = rest[i][2]
@@ -343,10 +345,10 @@ def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
             i += 2 if token in _INTERPRETER_LONG_VALUE_OPTIONS else 1
             continue
         if token.startswith(("-", "+")) and len(token) > 1:
-            if token in _INTERPRETER_VALUE_OPTIONS:
+            if token in values:
                 i += 2
                 continue
-            if token[:2] in _INTERPRETER_VALUE_OPTIONS and len(token) > 2:
+            if token[:2] in values and len(token) > 2:
                 i += 1
                 continue
             if "c" in token[1:] and token[0] == "-":
@@ -355,9 +357,13 @@ def _dash_c_script(base: str, rest: list[tuple[int, int, str]]) -> str | None:
                     k += 1
                 return _unquote(rest[k][2]) if k < len(rest) else None
             # A cluster ending in a value letter (``-eo x``).
-            if ("-" + token[-1]) in _INTERPRETER_VALUE_OPTIONS:
+            if ("-" + token[-1]) in values:
                 i += 2
                 continue
+            i += 1
+            continue
+        if base == "su" and (token == "-" or not user_seen):
+            user_seen = user_seen or token != "-"
             i += 1
             continue
         return None
@@ -660,7 +666,7 @@ def _executed_paths(pieces: list[str]) -> dict[str, str]:
             continue
         word, args = found
         base = word.rsplit("/", 1)[-1]
-        positional = _interpreter_operands(args)
+        positional = _interpreter_operands(args, base)
         if word == "chmod":
             positional = [a for a in args if not a.startswith("-")]  # the mode is the first operand
         if base in _SHELL_RUNNERS and positional:
@@ -676,21 +682,44 @@ def _executed_paths(pieces: list[str]) -> dict[str, str]:
     return paths
 
 
-def _interpreter_operands(args: list[str]) -> list[str]:
+def _interpreter_operands(args: list[str], base: str) -> list[str]:
     """An interpreter's operands: option words and their values (``-o pipefail``, ``--rcfile f``,
     ``-W ignore``, attached ``-Werror``) are neither."""
+    values = _value_options(base)
     out: list[str] = []
     i = 0
     while i < len(args):
         token = args[i]
-        if token in _INTERPRETER_VALUE_OPTIONS or token in _INTERPRETER_LONG_VALUE_OPTIONS:
+        if token in values or token in _INTERPRETER_LONG_VALUE_OPTIONS:
             i += 2
         elif token.startswith(("-", "+")) and len(token) > 1:
-            i += 2 if ("-" + token[-1]) in _INTERPRETER_VALUE_OPTIONS and token[:2] not in _INTERPRETER_VALUE_OPTIONS else 1
+            i += 2 if ("-" + token[-1]) in values and token[:2] not in values else 1
         else:
             out.append(token)
             i += 1
     return out
+
+
+def _writer_target(piece: str) -> str:
+    """The file a writer piece's own redirect, ``tee`` or ``dd of=`` names, read token by token
+    so a ``>`` inside the quoted text is not taken for it."""
+    tokens = [t for _, _, t in _tokens(piece)]
+    for i, token in enumerate(tokens):
+        attached = _ATTACHED_REDIRECT_RE.match(token)
+        if attached:
+            rest = token[attached.end():].lstrip(">")
+            return _unquote(rest) if rest else (_unquote(tokens[i + 1]) if i + 1 < len(tokens) else "")
+        if token in (">", ">>", "1>", "1>>", "&>"):
+            return _unquote(tokens[i + 1]) if i + 1 < len(tokens) else ""
+        if token.startswith((">", "1>", "&>")) and not token.startswith(">("):
+            return _unquote(token.lstrip("1&>"))
+    return _heredoc_target([piece])
+
+
+def _executed_kind(executed: dict[str, str], target: str) -> str | None:
+    """How ``target`` runs, with ``./`` read the same on both sides."""
+    plain = target[2:] if target.startswith("./") else target
+    return executed.get(plain) or executed.get("./" + plain)
 
 
 def _heredoc_target(opener_pieces: list[str]) -> str:
@@ -728,4 +757,4 @@ def _heredoc_kind(opener_pieces: list[str], executed: dict[str, str]) -> str | N
         return _KIND_PYTHON
     if target.endswith(_SHELL_SUFFIXES):
         return _KIND_SHELL
-    return executed.get(target) or executed.get("./" + target)
+    return _executed_kind(executed, target)

@@ -1961,6 +1961,9 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "-n", "kube-system", "patch", "-h"],
         ):
             self.assertTrue(command_policy.local_render(argv), argv)
+        # The subcommand word counts as apply's subcommand only, not as a resource name.
+        self.assertFalse(command_policy.local_render(["kubectl", "scale", "deployment", "kube-dns", "view-last-applied", "-n", "kube-system", "--replicas=3"]))
+        self.assertFalse(command_policy.local_render(["kubectl", "delete", "deploy", "kube-dns", "view-last-applied"]))
 
     def test_server_dry_runs_real_writes_and_passthroughs_are_not(self):
         for argv in (

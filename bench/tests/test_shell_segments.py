@@ -321,6 +321,21 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     assert segments("setsid kubectl scale deploy x --replicas=3") == ["kubectl scale deploy x --replicas=3"]
     assert segments("busybox sh -c 'kubectl scale deploy x --replicas=3'")[-1] == "kubectl scale deploy x --replicas=3"
     assert "kubectl scale deploy x --replicas=3" in segments("su -c 'kubectl scale deploy x --replicas=3'")
+    for command in (
+        "su root -c 'kubectl scale deploy x --replicas=3'",
+        "su - root -c 'kubectl scale deploy x --replicas=3'",
+        "su -s /bin/sh -c 'kubectl scale deploy x --replicas=3'",
+        "doas -u root kubectl scale deploy x --replicas=3",
+        "chroot /mnt/root kubectl scale deploy x --replicas=3",
+        "taskset -c 0 kubectl scale deploy x --replicas=3",
+        '"$(which kubectl)" scale deploy x --replicas=3',
+    ):
+        assert "kubectl scale deploy x --replicas=3" in segments(command), command
+    # A ``>`` inside the written text is not the writer's redirect; ``./run`` and ``run`` are one path.
+    assert "kubectl scale deploy x --replicas=3" in segments(
+        "echo 'kubectl get deploy x -o yaml > /tmp/d.yaml; kubectl scale deploy x --replicas=3' > /tmp/s.sh && bash /tmp/s.sh"
+    )
+    assert segments("cat > ./run <<'EOF'\nkubectl scale deploy x --replicas=3\nEOF\nbash run")[0] == "kubectl scale deploy x --replicas=3"
     assert segments("printf 'kubectl get deploy x\\nkubectl scale deploy x --replicas=3\\n' > /tmp/s.sh && bash /tmp/s.sh")[:2] == [
         "kubectl get deploy x",
         "kubectl scale deploy x --replicas=3",
@@ -339,18 +354,23 @@ def test_bare_writer_arguments_process_substitution_and_interpreter_options_are_
     )
 
 
-def test_ordered_segments_splits_the_line_from_the_bodies_it_carries():
-    from kube_agents_bench.shell_segments import ordered_segments, typed_segments
+def test_typed_segments_type_python_text_wherever_it_ran():
+    from kube_agents_bench.shell_segments import typed_segments
 
     command = (
         "kubectl scale deploy/x --replicas=3 || python3 - <<'EOF'\nimport subprocess\n"
         "subprocess.run(['kubectl', 'patch', 'deploy/x'])\nEOF"
     )
-    line, elsewhere = ordered_segments(command)
-    assert line[0] == ("shell", "kubectl scale deploy/x --replicas=3")
-    assert elsewhere == [("python", "import subprocess\nsubprocess.run(['kubectl', 'patch', 'deploy/x'])")]
+    assert typed_segments(command) == [
+        ("python", "import subprocess\nsubprocess.run(['kubectl', 'patch', 'deploy/x'])"),
+        ("shell", "kubectl scale deploy/x --replicas=3"),
+        ("shell", "python3 - <<'EOF'"),
+    ]
     # Python text is typed wherever it ran: a heredoc, a ``-c`` string, a written script.
-    assert typed_segments(command)[0][0] == "python"
+    # The value-option table is the interpreter's own: python's ``-O`` takes none, bash's ``-m`` takes none.
+    assert ("python", "print(1)") in typed_segments("python3 -O -c 'print(1)'")
+    assert ("python", "print(1)") in typed_segments("echo 'print(1)' > r.py && python3 -O r.py")
+    assert "kubectl scale deploy/x --replicas=3" in segments("bash -m -c 'kubectl scale deploy/x --replicas=3'")
     assert typed_segments("python3 -c 'print(1)'") == [("shell", "python3 -c 'print(1)'"), ("python", "print(1)")]
     assert ("python", "print(1)") in typed_segments("echo 'print(1)' > s.py && python3 s.py")
     assert all(kind == "shell" for kind, _ in typed_segments("bash -c 'kubectl get x; kubectl scale deploy/x --replicas=3'"))

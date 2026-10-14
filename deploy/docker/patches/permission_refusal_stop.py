@@ -189,11 +189,15 @@ def verb_is_mutating(verb_words: list[str]) -> bool:
 
 
 def names_a_write(command) -> bool:
-    """Whether the call's own text names kubectl and a mutating verb (a word test, used only
-    to tell a refused write chained before an exit-0 read from a read that echoed a refusal)."""
-    if not isinstance(command, str) or not _KUBECTL_WORD_RE.search(command):
+    """Whether the call's own text names kubectl and, after its first ``kubectl`` word, a
+    mutating verb (a word test, used only to tell a refused write chained before an exit-0
+    read from a read that echoed a refusal; a ``set -e`` prologue is before the word)."""
+    if not isinstance(command, str):
         return False
-    words = set(re.split(r"[\s\"'`;|&()\[\],]+", command))
+    first = _KUBECTL_WORD_RE.search(command)
+    if first is None:
+        return False
+    words = set(re.split(r"[\s\"'`;|&()\[\],]+", command[first.end():]))
     return bool(words & MUTATING_VERBS) or any(
         head in words and words & subs for head, subs in MUTATING_SUBVERBS.items()
     )

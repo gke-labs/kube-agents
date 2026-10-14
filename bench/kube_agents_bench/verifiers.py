@@ -89,7 +89,6 @@ from kube_agents_bench import (
     onboarding,
     transcript,
 )
-from kube_agents_bench.shell_segments import ordered_segments as _ordered_segments
 from kube_agents_bench.shell_segments import typed_segments as _typed_segments
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
@@ -1234,7 +1233,7 @@ _CODE_ARG = "code"
 #: Marks a command string that is program text (an ``execute_code`` body): the
 #: patterns see it whole, never through the shell segmenter.
 _PROGRAM_TEXT = "\x00program-text\x00"
-# Prefix on a shell segment the walk already cut (the opener call's later
+# Prefix on a shell segment the walk already cut (the opener call's other
 # pieces): read whole, so a heredoc body is not re-cut as shell.
 _SEGMENT_TEXT = "\x00segment-text\x00"
 _PYTHON_SEGMENT = "python"
@@ -1530,17 +1529,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                 opened_at = own[opener][1]
                 after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
                 if self.match == "segments" and self.after_command_pattern is not None and not own[opener][2].startswith(_PROGRAM_TEXT):
-                    # The opener call's own commands behind the one that opened the
-                    # window are after it too (``kubectl scale … || kubectl patch …``),
-                    # in the order the shell ran them; what the call ran elsewhere
-                    # (a substitution, a written script, a heredoc body) is graded
-                    # with them, since the walk keeps no place for it.
-                    line, elsewhere = _ordered_segments(own[opener][2])
-                    k = next((n for n, (kind, t) in enumerate(line) if kind != _PYTHON_SEGMENT and re.search(self.after_command_pattern, t)), None)
+                    # Every other segment of the opener call is graded with the later
+                    # calls (``kubectl scale … || kubectl patch …``, a fallback in a
+                    # heredoc body, a written script or a ``$(…)``): the walk keeps no
+                    # order between the line and what ran elsewhere, and a second
+                    # write in the call that met the refusal is a retry wherever it
+                    # sits. The opener is the first shell segment the write pattern
+                    # matches, in walk order.
+                    segs = _typed_segments(own[opener][2])
+                    k = next((n for n, (kind, t) in enumerate(segs) if kind != _PYTHON_SEGMENT and re.search(self.after_command_pattern, t)), None)
                     if k is not None:
                         after = [
                             (_PROGRAM_TEXT if kind == _PYTHON_SEGMENT else _SEGMENT_TEXT) + t
-                            for kind, t in line[k + 1 :] + elsewhere
+                            for n, (kind, t) in enumerate(segs) if n != k
                         ] + after
                 graded.extend(after)
                 opened.append(f"{len(after)} in the lineage of card {root} after {own[opener][2].replace(_PROGRAM_TEXT, '')[:_SHOWN_COMMAND_CHARS]!r}")

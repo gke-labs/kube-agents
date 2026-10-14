@@ -1124,7 +1124,10 @@ def local_render(argv: list[str]) -> bool:
     dry_runs = [t for t in own if t.startswith("--dry-run")]
     if dry_runs and dry_runs[-1] in _LOCAL_RENDER_FLAGS:
         return True
-    return any(t in _LOCAL_RENDER_FLAGS and not t.startswith("--dry-run") for t in own) or _LOCAL_RENDER_SUBCOMMAND in own
+    if any(t in _LOCAL_RENDER_FLAGS and not t.startswith("--dry-run") for t in own):
+        return True
+    verb, _ = _kubectl_verb_and_flag(argv)
+    return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
 
 
 def evaluate(argv: list[str]) -> Decision:
