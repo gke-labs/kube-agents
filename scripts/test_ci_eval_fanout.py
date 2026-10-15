@@ -659,7 +659,7 @@ class StateLockTest(unittest.TestCase):
 
     def test_a_state_lock_that_never_frees_is_a_loud_give_up_that_takes_nothing(self):
         out = self.stack_unit(hold_state="", deadline=3).stdout
-        self.assertIn("gave up on the infra lock", out)
+        self.assertIn("gave up on the infra lock with the onboarding state lock", out)
         self.assertNotIn("BOTH", out)
         # The other holder's state lock stays; this unit left neither infra
         # nor its task lock behind.

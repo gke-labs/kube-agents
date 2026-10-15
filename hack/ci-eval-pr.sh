@@ -3291,7 +3291,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     if [ -z "${infra_held}" ]; then
       release_streams "${streams}"
       lock_release "${STATE_DIR}/lock-task-${name}"
-      echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+      echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock${state_lock:+ with the ${state_lock} state lock}" >&2
       return 0
     fi
   fi
