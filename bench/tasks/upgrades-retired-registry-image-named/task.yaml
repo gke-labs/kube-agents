@@ -23,6 +23,8 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
+# The registry host may carry its scheme (`https://k8s.gcr.io`).
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the image reference. Repointing it at registry.k8s.io
@@ -85,9 +87,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io(?: \([^)\n;]*\))?; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?:https?://)?k8s\.gcr\.io(?: \([^)\n;]*\))?; retired: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!(?:https?://)?k8s\.gcr\.io(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-says-the-host-is-retired
     role: objective

@@ -7918,7 +7918,8 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/stale-kubectl-client: client image registry.k8s.io/kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "- `seeded-a/seeded-shapes/stale-kubectl-client`: client kubectl 1.29; server 1.34; within supported skew: no.",
             "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
-        ],
+                    "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+],
         [
             "seeded-a/seeded-shapes/stale-kubectl-client-apiserver-egress: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.30.0 (was v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
@@ -8242,7 +8243,8 @@ _GROUP4 = {
             "**seeded-a/seeded-shapes/legacy-registry-pull**: image k8s.gcr.io/pause:3.9 (imagePullPolicy Always); registry host k8s.gcr.io; retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io (frozen 2023); retired: yes",
             "1. seeded-a (us-central1-a)/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
-        ],
+                    "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host https://k8s.gcr.io; retired: yes",
+],
         [
             "seeded-a/seeded-shapes/legacy-registry-pull-mirror: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
             "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host registry.k8s.io (formerly k8s.gcr.io); retired: yes",
