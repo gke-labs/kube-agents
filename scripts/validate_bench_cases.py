@@ -56,6 +56,8 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
+YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
@@ -507,19 +509,23 @@ class CaseError(Exception):
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """SafeLoader that refuses a mapping key it has already seen.
+    """SafeLoader that refuses a key written twice in one mapping.
 
-    PyYAML keeps the last of two equal keys without a word, but devops-bench
-    loads a task with ruamel's safe loader, which raises on the second. A
-    task.yaml with a repeated key passes this validator and then cannot be
-    loaded by the runner at all, so the case is evaluated nowhere.
+    devops-bench loads a task with ruamel's safe loader, which raises on a
+    repeated key, while yaml.safe_load keeps the last value. With safe_load
+    here, a task.yaml the runner cannot load at all would pass this validator.
+    A key that overrides one brought in by a merge key (`<<: *anchor`) is not a
+    repeat; both loaders accept it.
     """
 
 
 def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> Any:
-    loader.flatten_mapping(node)
+    # The mapping's own keys only, before construct_mapping flattens merged
+    # pairs into node.value, where an override would look like a repeat.
     seen: set[Any] = set()
     for key_node, _ in node.value:
+        if key_node.tag == YAML_MERGE_TAG:
+            continue
         key = loader.construct_object(key_node, deep=deep)
         try:
             repeated = key in seen

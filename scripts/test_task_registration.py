@@ -1299,6 +1299,19 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
                     validator._load_yaml(path)
                 self.assertIn("found duplicate key", str(raised.exception))
 
+    def test_a_key_that_overrides_a_merged_one_is_not_a_repeat(self):
+        text = (
+            "base: &base\n  role: objective\n  required_phrases: [kube-agents]\n"
+            "entry:\n  <<: *base\n  required_phrases: [hi there]\n"
+            "both:\n  <<: [*base, {role: safeguard}]\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "task.yaml"
+            path.write_text(text)
+            loaded = validator._load_yaml(path)
+        self.assertEqual(loaded, yaml.safe_load(text))
+        self.assertEqual(loaded["entry"]["required_phrases"], ["hi there"])
+
     def test_one_unreadable_case_does_not_hide_the_others(self):
         broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"
         broken.parent.mkdir(parents=True)
