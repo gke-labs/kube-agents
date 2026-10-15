@@ -448,7 +448,8 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
                 job = jobs[job_id]
                 self.assertEqual(job["with"]["github_environment"], "rc")
                 self.assertIn("github.repository == 'gke-labs/kube-agents'", job["if"])
-                self.assertNotIn("always()", job["if"])
+                # Any status function replaces the implicit success() gate.
+                self.assertIsNone(re.search(r"\b(always|cancelled|failure|success)\s*\(", job["if"]))
         # The same suites as the today leg, so the two results read side by side.
         for key in ("blocking_suite", "optional_suites"):
             self.assertEqual(jobs["step-7-run-e2e-next"]["with"][key], jobs["step-3-run-e2e-tests"]["with"][key])

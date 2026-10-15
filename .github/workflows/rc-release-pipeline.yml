@@ -163,6 +163,8 @@ jobs:
   # validated and nothing depends on these jobs, so a next-only failure reds
   # this run without holding back a release. The run's own conclusion is
   # therefore the worse of the two legs; the `Next mode` job names say which.
+  # The leg does delay the next candidate: the workflow-level concurrency
+  # group holds a newer dispatch until step 8 ends, roughly doubling a run.
   # At the flip the legs swap: steps 2 and 3 take `mode: next` and gate, and
   # this leg installs today as the coverage until today is rollback-only.
   #

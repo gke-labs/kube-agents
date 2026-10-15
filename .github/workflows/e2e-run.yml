@@ -168,6 +168,10 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           E2E_SUITE: ${{ inputs.blocking_suite }}
+          # gchat_agent_test.py's wait for the reply. `next` gets 300s, as
+          # autopush-next-e2e-gchat.yml does, because its readiness gate does
+          # not cover the first turn's cold start; '' keeps the test's default.
+          TEST_TIMEOUT_SEC: ${{ steps.mode.outputs.next == 'true' && '300' || '' }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
           CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
           E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
@@ -194,6 +198,7 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           OPTIONAL_SUITES: ${{ inputs.optional_suites }}
+          TEST_TIMEOUT_SEC: ${{ steps.mode.outputs.next == 'true' && '300' || '' }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
           CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
           E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
