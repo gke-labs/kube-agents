@@ -414,6 +414,9 @@ TABLE_ERRORS_KEY = "table_errors"
 # project is read or refused under another cause, and kept through anything
 # else; it holds only while the declaration names no container it did not,
 # since a container just gained carries no members when its lookup fails.
+# Saved even when the table fails the tick (``keep_standing``), the one path
+# on which nothing else of the ledger is: the failure line is keyed on the
+# refusal's text, and the hold is what keeps that text the same.
 STANDING_OUTSIDE_KEY = "standing_outside"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
@@ -428,8 +431,9 @@ REPORT_PROJECTS_KEY = "projects"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
-# A failed tick writes nothing to the ledger; the failure it announced is kept
-# in this file beside it, so the same failure is posted once and its recovery once.
+# A failed tick writes nothing to the ledger but the standing-outside record
+# (``keep_standing``); the failure it announced is kept in this file beside
+# it, so the same failure is posted once and its recovery once.
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 RECOVERED_LINE = "{prefix} watch: the tick runs again"
 DETAIL_KEY = "detail"
@@ -1344,7 +1348,8 @@ def versions_by_project(
     the ledger. ``standing`` is the ledger's standing-outside record
     (``STANDING_OUTSIDE_KEY``), read for the hold under the spelling or the key
     a project was recorded by and kept current by this run's verdicts
-    (``file_refusal``)."""
+    (``file_refusal``), which the caller saves even when this run fails the
+    tick (``keep_standing``)."""
     last_runs = ledger[TABLE_RUNS_KEY]
     ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
@@ -1606,6 +1611,29 @@ def file_refusal(standing: dict[str, list[str]], project: str, cause: str, scope
         standing.pop(project, None)
 
 
+def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, list[str]]) -> None:
+    """Save the standing-outside record (``STANDING_OUTSIDE_KEY``) of a tick
+    the version table failed. Such a tick writes nothing else to the ledger
+    (``main`` announces its failure through the marker, keyed on the failure's
+    text), but the refusals its runs filed are the scope's verdicts on those
+    projects, and the hold the next tick reads lives in the record: a roster
+    of nothing but outside projects would otherwise see its failure line
+    change cause, and post again, on each lookup that fails for a tick.
+    Written under that key alone into the ledger as it is on disk, and only
+    when the record moved from ``loaded``, the one the tick read, so a failed
+    tick that filed nothing still leaves no ledger and a standing failure
+    rewrites nothing; a record that cannot be written is the hold not
+    carried, which the next refusal re-files."""
+    if standing == loaded:
+        return
+    try:
+        ledger = load_ledger(path)
+        ledger[STANDING_OUTSIDE_KEY] = standing
+        save_ledger(path, ledger)
+    except OSError:
+        pass
+
+
 def tables_without_the_output_line(tables: str) -> str:
     """The skill's tables as printed, minus the line naming the loader's
     temporary output path, which is gone by the time anyone reads this."""
@@ -1728,10 +1756,19 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
     standing = ledger[STANDING_OUTSIDE_KEY]
+    loaded_standing = {project: list(containers) for project, containers in standing.items()}
     scope = declared_scope()
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
+    try:
+        versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
+    except Exception:
+        # A table that read nothing fails the tick, which writes no ledger;
+        # the standing-outside record its runs filed is kept all the same,
+        # since the next tick's hold reads it. A dry run changes nothing.
+        if not dry_run:
+            keep_standing(ledger_path, standing, loaded_standing)
+        raise
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
@@ -1863,9 +1900,10 @@ def tick(dry_run: bool = False) -> list[str]:
 
 def announce_failure_once(detail: str) -> bool:
     """A failure that persists is posted once per distinct detail and the next
-    clean tick posts a recovery line. The marker lives beside the ledger, which
-    a failed tick never writes; a marker that cannot be read or written leaves
-    the line posted every time, since nothing can remember it."""
+    clean tick posts a recovery line. The marker lives beside the ledger, to
+    which a failed tick writes nothing but the standing-outside record; a
+    marker that cannot be read or written leaves the line posted every time,
+    since nothing can remember it."""
     try:
         marker = watch_home() / FAILURE_MARKER_FILE_NAME
         if marker.exists() and marker.read_text(encoding="utf-8") == detail:
