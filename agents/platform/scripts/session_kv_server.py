@@ -2997,6 +2997,8 @@ def _post_audit_blocks(
 ) -> AuditPost | None:
     """Post the audit report as Block Kit (headline, findings, choice and link
     buttons, or the clean card); where it landed, or None to post text instead.
+    Under ``spec.mode: next`` the same card goes to the gateway as a chat
+    message instead (:func:`_post_audit_chat_via_gateway`).
 
     None, before anything is posted, when there are no blocks to build (no
     issue, an issue that does not parse), no Slack relay in the
@@ -3016,7 +3018,10 @@ def _post_audit_blocks(
     if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     threaded = bool(chat_id and thread_id)
-    built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
+    if routed:
+        built = slack_audit_report.chat_from_issue(headline.issue, headline.ref, message)
+    else:
+        built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
     if built is None:
         return None
     blocks, text = built
@@ -3025,7 +3030,7 @@ def _post_audit_blocks(
         logger.warning(f"Relay for {profile}/{job_id}: no time left for the report blocks, posting text")
         return None
     if routed:
-        return _post_audit_blocks_via_gateway(
+        return _post_audit_chat_via_gateway(
             profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
         )
     try:
@@ -3048,63 +3053,33 @@ def _post_audit_blocks(
     return AuditPost(thread_id if threaded else ts)
 
 
-# The A2A gateway answers no Slack interaction (it acks only Events API
-# envelopes), so a button posted through it is one a user clicks into a
-# timeout. Interactive elements are taken off the card on that path; a URL
-# button becomes a plain mrkdwn link so the ledger link survives.
-GATEWAY_INTERACTIVE_BLOCK = "actions"
-GATEWAY_BUTTON = "button"
 # How much sooner the CLI gives up than the subprocess bound, so the CLI's
 # own outcome-unknown exit is what a slow post ends in.
-GATEWAY_BLOCKS_TIMEOUT_MARGIN_S = 3
+GATEWAY_POST_TIMEOUT_MARGIN_S = 3
 
 
-def _without_interaction(blocks: list[dict]) -> list[dict]:
-    """The card without anything a user could click: no actions blocks and no
-    interactive accessories. The URLs of any link buttons come back as one
-    context block of mrkdwn links, so the card keeps where it points."""
-    kept: list[dict] = []
-    links: list[str] = []
-
-    def collect(element: dict) -> None:
-        if element.get("type") == GATEWAY_BUTTON and element.get("url"):
-            label = ((element.get("text") or {}).get("text") or element["url"]).replace("|", " ")
-            links.append(f"<{element['url']}|{label}>")
-
-    for block in blocks:
-        if block.get("type") == GATEWAY_INTERACTIVE_BLOCK:
-            for element in block.get("elements") or []:
-                collect(element)
-            continue
-        accessory = block.get("accessory")
-        if isinstance(accessory, dict) and accessory.get("type") not in ("image", None):
-            collect(accessory)
-            block = {key: value for key, value in block.items() if key != "accessory"}
-        kept.append(block)
-    if links:
-        kept.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(links)}]})
-    return kept
-
-
-def _post_audit_blocks_via_gateway(
-    profile: str, job_id: str, blocks: list[dict], text: str, thread_id: str, timeout: float
+def _post_audit_chat_via_gateway(
+    profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
 ) -> AuditPost | None:
-    """Post the audit report's blocks through the gateway's Slack chat.notify route.
+    """Post the audit report's card through the gateway's Slack chat.notify route.
 
     The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
-    the broker's Slack relay is gone and the gateway holds Slack, so the blocks
-    go as ``a2a notify --blocks-file`` into the home channel (chat_notify.py).
-    Same outcomes as the relay path: None, to post text instead, after a
-    refusal, a failure to send, or a post that may have landed.
+    the broker's Slack relay is gone and the gateway holds Slack, so the card
+    goes as a ``kube-agents.chat/v1`` message (``a2a notify --chat-file``,
+    chat_notify.py) into the home channel, and the gateway lays it out, its
+    buttons included. ``text`` is the message's fallback, which the gateway
+    posts itself when it does not lay the message out. Same outcomes as the
+    relay path: None, to post text instead, after a refusal, a failure to
+    send, or a post that may have landed.
     """
     path = ""
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump(_without_interaction(blocks), handle)
+            json.dump(chat, handle)
             path = handle.name
         res = subprocess.run(
-            chat_notify.blocks_command(
-                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_BLOCKS_TIMEOUT_MARGIN_S, 1)
+            chat_notify.chat_command(
+                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
             ),
             capture_output=True,
             text=True,
@@ -3113,7 +3088,7 @@ def _post_audit_blocks_via_gateway(
             timeout=timeout,
         )
     except Exception as exc:
-        logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
+        logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {exc!r}")
         return None
     finally:
         if path:
@@ -3123,9 +3098,9 @@ def _post_audit_blocks_via_gateway(
                 pass
     if res.returncode != 0:
         if chat_notify.outcome_unknown(res.returncode):
-            logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {res.stderr.strip()}")
+            logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {res.stderr.strip()}")
         else:
-            logger.warning(f"Relay for {profile}/{job_id}: report blocks not posted, posting text: {res.stderr.strip()}")
+            logger.warning(f"Relay for {profile}/{job_id}: report card not posted, posting text: {res.stderr.strip()}")
         return None
     try:
         resp = json.loads(res.stdout) or {}
@@ -3134,6 +3109,48 @@ def _post_audit_blocks_via_gateway(
     if thread_id:
         return AuditPost(thread_id)
     return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
+
+
+def _post_failed_audit_via_gateway(
+    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Under ``spec.mode: next``, post a failed fleet-audit report as its one line with the report folded under it.
+
+    A reply in the thread reaches the gateway there, which cannot replay the
+    report as ``incident_context`` does under today, so the report rides in
+    the message's fold (:func:`slack_audit_report.failed_chat`). None, and the
+    caller posts the line as text, when the message cannot be built, too
+    little of `deadline` is left, or the gateway did not post it.
+    """
+    built = slack_audit_report.failed_chat(report)
+    left = deadline - time.monotonic()
+    if built is None or left < AUDIT_BLOCKS_MIN_POST_S:
+        return None
+    chat, text = built
+    thread = thread_id if chat_id and thread_id else ""
+    return _post_audit_chat_via_gateway(profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
+
+
+def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
+    """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the report ends with no ledger link and opens a "What's wrong"
+    section (:func:`slack_audit_report.failed_line`), and the job runs the
+    fleet-audit skill. The line is that section's first sentence, the agent's
+    own words for what failed; the incident row the caller stores keeps the
+    whole report for a reply in the thread, and under ``spec.mode: next`` the
+    report folds under the line instead (:func:`_post_failed_audit_via_gateway`).
+    """
+    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    line = slack_audit_report.failed_line(report)
+    if line is None or not _is_fleet_audit_job(profile, job_id):
+        return None
+    return line
 
 
 def relay_cron_report(
@@ -3272,15 +3289,33 @@ def relay_cron_report(
             logger.warning(f"Relay for {profile}/{job_id}: audit headline skipped: {exc!r}")
             headline = None
         posted = None
-        # A truncated report keeps its notice, which the blocks have no place for.
+        failed = None
+        # A truncated report keeps its notice, which the blocks have no place for,
+        # and the rest of it.
         if headline and not truncation_notice:
             posted = _post_audit_blocks(
                 profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
+        elif not truncation_notice:
+            try:
+                failed = _failed_audit_line(platform, report, leg_chat_id, profile, job_id)
+            except Exception as exc:
+                logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
+            if failed and chat_notify.routes(platform):
+                posted = _post_failed_audit_via_gateway(
+                    profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                )
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            leg_message = truncation_notice + headline.text if headline else message
+            # Under next a reply cannot bring the report back, so a failed audit
+            # whose folded card did not post goes out whole.
+            if headline:
+                leg_message = truncation_notice + headline.text
+            elif failed and not chat_notify.routes(platform):
+                leg_message = failed
+            else:
+                leg_message = message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
             if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Posted (or may have): delivered, with no thread to register.

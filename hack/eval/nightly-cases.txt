@@ -942,3 +942,9 @@
 # (agents/platform/SOUL.md §0 step 3). deployer: noop, one front-door turn and
 # the card round trip; reads the seeded fleet's crashloop-workload role.
 ./tasks/chat-question-asked-to-choose-pauses/task.yaml
+
+# manage-cluster skill probe: excluding a cluster on an installer-managed
+# install goes through SCOPE_EXCLUDE_CLUSTERS in install.env and a full
+# upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
+# transcript-only, one delegation round trip.
+./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml

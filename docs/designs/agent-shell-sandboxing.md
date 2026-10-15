@@ -2073,10 +2073,11 @@ the PVC from the moment the card is filed, so the report files it also checks ad
 nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
 which is wrong about the pod and right about the path the worker must write.
 
-The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
-picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
-as though the scan were still running. The report still arrives on the next delivery
-tick.
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin, which
+picks its first greeting by whether `INVENTORY.md` is written. It reads the report across with
+`sandbox_exec.read_bytes`, as delivery does, and greets as though the scan were still running
+when the report is not there yet, or when that read fails or takes longer than
+`REPORT_CHECK_TIMEOUT_SECONDS`. The report still arrives on the next delivery tick either way.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
