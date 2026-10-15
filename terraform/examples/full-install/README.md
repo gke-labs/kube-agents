@@ -785,6 +785,19 @@ the sink's writer identity, and `roles/pubsub.subscriber` plus
 `roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
 `pubsub.googleapis.com` to the enabled APIs.
 
+The module creates the sink after its publish grant, and `gke_cluster` takes
+the ingress's `teardown_gate` output as its `create_after` input, which makes
+Terraform destroy the cluster before the drain, the publish grant and the
+topic. Without that ordering the topic goes while the control plane is still
+emitting matching audit records, and each one mails every project owner. An
+input rather than a `depends_on` on the module call, because a module-level
+`depends_on` would also defer `gke-cluster`'s data sources — including the one
+a `create_cluster = false` install reads the endpoint from, which the Helm
+provider needs at plan time; and an indexed output rather than a splat, which
+would reach `source_projects` and close a cycle. The module README's
+[ordering section](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+is canonical.
+
 `drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
 on the topic to each member it lists, on top of the sink's writer identity.
 Leave it empty unless a test harness has to inject synthetic audit records: the
@@ -882,7 +895,8 @@ wait already paid — the wait is keyed on this value, so a change re-creates it
 and pays the new, lower figure once — it only shortens any later one.
 
 [The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical for all three orderings.
+is canonical for all four orderings — the three inside the module, and the
+cluster-before-ingress edge this composition adds on top of them.
 
 Four outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, `drift_pubsub_subscription_id`, the
