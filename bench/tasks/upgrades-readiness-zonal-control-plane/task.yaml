@@ -184,12 +184,12 @@ verification_spec:
   # and `report.json` carries it bare (`readiness.risks[].text`); an agent that
   # reads the JSON copies the bare text, so the prefix is optional here, the
   # rule slot having named the rule already. A report whose rule is missing
-  # prints no such cell, and one whose rule blocks prints it under `other
-  # blockers` with a grade the grade slot refuses, so the slot reads `none` or
-  # something else and the line fails here, whatever the other slots say. The
-  # cell carries a `;`,
-  # which keeps the verifier's value-wrap fold from removing a quote or angle
-  # bracket the agent kept around it, so both patterns admit one opener before
+  # prints no such cell, so the slot reads `none` or something else and the
+  # line fails here, whatever the other slots say; one whose rule blocks prints
+  # the cell under `other blockers`, and that line passes here and fails the
+  # grade slot. The cell carries a `;`, which keeps the verifier's value-wrap
+  # fold from removing a quote or angle bracket the agent kept around it, so
+  # both patterns admit one opener before
   # the text.
   - name: the-declared-lines-quote-the-reports-cell
     role: objective

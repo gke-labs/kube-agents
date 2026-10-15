@@ -1230,10 +1230,10 @@ class VerdictTest(unittest.TestCase):
         # An unknown of another shape counts, the conservative reading.
         self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": ["why"]}), r.READINESS_UNKNOWN)
         self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": [{"rule": "a"}]}), r.READINESS_UNKNOWN)
-        # Blocked beats an unknown from either kind of rule; the three rules' own unknown still holds.
+        # Blocked beats an unknown from either kind of rule; the four built-in rules' own unknown still holds.
         self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "blocking": [{"rule": "x"}], "unknown": [{"rule": "y", "can_block": False}]}), r.READINESS_BLOCKED)
         self.assertEqual(r.readiness_status(None, None, self.CLEAR, self.NO_SKEW, True, clean), r.READINESS_UNKNOWN)
-        # None means the per-entry rules did not run; the three rules decide alone.
+        # None means the per-entry rules did not run; the four built-in rules decide alone.
         self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, None), r.READINESS_READY)
 
 
