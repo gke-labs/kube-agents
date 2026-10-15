@@ -1396,6 +1396,55 @@ tf_state_prefix() {
   echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
 }
 
+# ─── Cloud KMS ─────────────────────────────────────────────────────────────────
+# Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
+# used in project <n> before or it is disabled" for a few minutes after a
+# project's FIRST enablement -- which is the enablement install.sh performs
+# seconds before creating the key ring and key. An ERE, for grep -E: the API
+# has been named "Google Cloud KMS API" and "Cloud Key Management Service (KMS)
+# API" in this message, and both end the same way. Matching lifecycle.sh.
+readonly KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
+KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
+
+# Retries a Cloud KMS command on Cloud KMS's first-enablement 403
+# (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
+# for a few minutes after being enabled. Output of the command is preserved and
+# echoed on completion; retry warnings are printed to stderr.
+retry_kms_create() {
+  local attempt=1 status=0 output=""
+  while :; do
+    output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+      if [ "$attempt" -ge "$KMS_API_PROPAGATION_ATTEMPTS" ]; then
+        if type print_warning >/dev/null 2>&1; then
+          print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        else
+          echo -e "  ⚠ Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        fi
+        [ -n "$output" ] && printf '%s\n' "$output"
+        return "$status"
+      fi
+      attempt=$((attempt + 1))
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        print_warning "Waiting ${KMS_API_PROPAGATION_WAIT_SECONDS}s, then retrying (attempt $attempt of $KMS_API_PROPAGATION_ATTEMPTS)..." >&2
+      else
+        echo -e "  ⚠ Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        echo -e "  ⚠ Waiting ${KMS_API_PROPAGATION_WAIT_SECONDS}s, then retrying (attempt $attempt of $KMS_API_PROPAGATION_ATTEMPTS)..." >&2
+      fi
+      sleep "$KMS_API_PROPAGATION_WAIT_SECONDS"
+      continue
+    fi
+    [ -n "$output" ] && printf '%s\n' "$output"
+    return "$status"
+  done
+}
+
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.
 # The token minter cannot pass readiness without one, so the generator,
 # install.sh and upgrade.sh all ask before enabling it; one pipeline here so

@@ -3756,9 +3756,9 @@ ensure_existing_cluster_cmek() {
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" 2>/dev/null || true
+  retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" >/dev/null || true
+  retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+    --purpose="encryption" --project="$project_id" >/dev/null || true
   local project_number service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
   service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
@@ -5154,17 +5154,17 @@ import_github_pem() {
   # "already exists" is the expected answer — would print two fatal-looking
   # abort banners and leave a FAILED install report behind mid-run.
   local kms_ring_err="" kms_key_err=""
-  kms_ring_err="$(trap - ERR; gcloud kms keyrings create "$keyring" --location="$kms_location" \
-    --project="$project_id" 2>&1)" || true
+  kms_ring_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" \
+    --project="$project_id")" || true
 
   # --skip-initial-version-creation is required, not optional: KMS answers
   # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
   # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
   # which is where the key normally comes from.
-  kms_key_err="$(trap - ERR; gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+  kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
     --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
     --import-only --skip-initial-version-creation \
-    --protection-level=software --project="$project_id" 2>&1)" || true
+    --protection-level=software --project="$project_id")" || true
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
   # wrong above, the import cannot work without this key, and saying so here names
