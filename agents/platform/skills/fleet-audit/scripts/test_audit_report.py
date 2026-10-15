@@ -837,6 +837,8 @@ class BaseTestCase(unittest.TestCase):
             {
                 "CREDENTIAL_PROXY_URL": "",
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
+                # `sop_path` reads it; an export must not move the SOP path `start` prints.
+                "PLATFORM_AGENT_HOME": "",
             },
         )
         env.start()

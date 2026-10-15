@@ -343,11 +343,15 @@ def _is_placeholder(ref: str) -> bool:
     if "..." in ref or "YYYY" in ref:
         return True
     if ref.startswith(PLATFORM_PROFILE_HOME):
-        # The items the image gives that home are checked; anything else under
-        # it (SETTINGS.md, memories/) is runtime state, as the rest of
+        # The items the image gives that home are checked, and so is a path the
+        # checkout has under agents/platform but does not ship (docs/); anything
+        # else under it (SETTINGS.md, memories/) is runtime state, as the rest of
         # /opt/data is.
-        head = ref[len(PLATFORM_PROFILE_HOME) :].split("/", 1)[0]
-        return head not in PROFILE_HOME_ITEMS["platform"]
+        rest = ref[len(PLATFORM_PROFILE_HOME) :]
+        head = rest.split("/", 1)[0]
+        if head in PROFILE_HOME_ITEMS["platform"]:
+            return False
+        return not (REPO / PLATFORM_HOME_ANCHOR).parent.joinpath(rest).exists()
     if ref.startswith("/opt/data/"):
         return True
     # Absolute paths that are neither image layout nor repository content:
