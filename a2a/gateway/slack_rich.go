@@ -285,8 +285,50 @@ func slackRichLen(v any) int {
 	return n
 }
 
+// slackRichPreLines cuts a preformatted block's text into chunks of at most
+// budget runes between its lines, a line past budget cut by runes. The text
+// is code already, so unlike chatChunks nothing in it is read as markdown:
+// a ``` line or a table row inside it is content, not a fence to balance or
+// a header to repeat.
+func slackRichPreLines(text string, budget int) []string {
+	var out []string
+	var chunk strings.Builder
+	size, open := 0, false
+	flush := func() {
+		out = append(out, chunk.String())
+		chunk.Reset()
+		size, open = 0, false
+	}
+	for _, line := range strings.Split(text, slackRichLineBreak) {
+		rs := []rune(line)
+		for len(rs) > budget {
+			if open {
+				flush()
+			}
+			chunk.WriteString(string(rs[:budget]))
+			flush()
+			rs = rs[budget:]
+		}
+		n := len(rs)
+		if open && size+len(slackRichLineBreak)+n > budget {
+			flush()
+		}
+		if open {
+			chunk.WriteString(slackRichLineBreak)
+			size += len(slackRichLineBreak)
+		}
+		chunk.WriteString(string(rs))
+		size += n
+		open = true
+	}
+	if open {
+		flush()
+	}
+	return out
+}
+
 // slackRichPreChunks cuts an element past budget runes into several: a
-// preformatted one between its lines (chatChunks), a section or a quote
+// preformatted one between its lines (slackRichPreLines), a section or a quote
 // between its spans, a text span past budget cut by runes, a list between
 // its items (a numbered list's numbering kept by offset). A single item
 // past budget stands alone.
@@ -298,7 +340,7 @@ func slackRichPreChunks(e map[string]any, budget int) []map[string]any {
 	switch e["type"] {
 	case "rich_text_preformatted":
 		text, _ := e["elements"].([]map[string]any)[0]["text"].(string)
-		for _, chunk := range chatChunks(text, budget) {
+		for _, chunk := range slackRichPreLines(text, budget) {
 			out = append(out, slackRichPre(chunk))
 		}
 	case "rich_text_list":

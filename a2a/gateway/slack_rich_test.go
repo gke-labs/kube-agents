@@ -144,6 +144,44 @@ func TestSlackRichLongListIsCut(t *testing.T) {
 	}
 }
 
+// A long preformatted block is cut between its lines with nothing added: a
+// ``` line or a pipe table inside it is code, so no fence is balanced and
+// no table header repeated across the cut, and the parts rejoin to the
+// block as written.
+func TestSlackRichLongPreformattedIsCutAsWritten(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("```yaml\n| a | b |\n|---|---|\n")
+	for i := 0; i < 120; i++ {
+		body.WriteString("| key" + strconv.Itoa(i) + " | " + strings.Repeat("v", 30) + " |\n")
+	}
+	body.WriteString("```\n" + strings.Repeat("x", 3000))
+	text := body.String()
+	chunks := slackRichPreChunks(slackRichPre(text), slackChatFoldChunk)
+	if len(chunks) < 2 {
+		t.Fatalf("chunks = %d, want the block cut", len(chunks))
+	}
+	var parts []string
+	for _, c := range chunks {
+		if c["type"] != "rich_text_preformatted" {
+			t.Fatalf("a part is %v, want preformatted", c["type"])
+		}
+		if n := slackRichLen(c); n > slackChatFoldChunk {
+			t.Errorf("a part of %d runes, over the share", n)
+		}
+		parts = append(parts, c["elements"].([]map[string]any)[0]["text"].(string))
+	}
+	joined := strings.Join(parts, "")
+	if strings.Count(joined, "```") != strings.Count(text, "```") || strings.Count(joined, "|---|") != 1 {
+		t.Fatalf("the cut added a fence or a table header: %d fences, %d headers",
+			strings.Count(joined, "```"), strings.Count(joined, "|---|"))
+	}
+	// A cut drops the line break it falls on, or falls inside a line too
+	// long for one part.
+	if strings.ReplaceAll(joined, "\n", "") != strings.ReplaceAll(text, "\n", "") {
+		t.Fatalf("the parts do not rejoin to the block")
+	}
+}
+
 // A one-line ```cmd``` is a code span in prose, not a fence opener that
 // would swallow what follows it.
 func TestSlackRichDocumentOneLineTripleBacktickIsCode(t *testing.T) {
