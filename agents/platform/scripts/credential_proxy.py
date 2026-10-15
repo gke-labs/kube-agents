@@ -2893,11 +2893,17 @@ class SlackRelay:
 TEAMS_EVENT_QUEUE_MAXSIZE = 500
 TEAMS_MAX_DELIVERY_ATTEMPTS = 3
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
-# Send Activity and Reply to Activity only. ``activities/history`` is Send
-# Conversation History, a transcript upload, so that id is excluded.
+# Send Activity and Reply to Activity only. The optional segment is an
+# activity id, so it is allowlisted by shape: no percent-encoding, no dots,
+# a bounded length. ``activities/history`` (Send Conversation History, a
+# transcript upload) is refused in any letter case: the connector routes
+# case-insensitively.
 TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
-    r"^v3/conversations/[^/?#]+/activities(?:/(?!history$)[^/?#]+)?$"
+    r"^v3/conversations/[^/?#]+/activities(?:/(?!(?i:history)$)[0-9A-Za-z:_\-]{1,128})?$"
 )
+# How much of a Microsoft error body the broker reads for its log line and the
+# ``teams`` field it answers with: enough for ``error.code`` and ``error.message``.
+TEAMS_UPSTREAM_BODY_MAX_BYTES = 4096
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -2962,9 +2968,41 @@ def validate_teams_activity(activity: dict[str, Any]) -> None:
 
 
 class TeamsUpstreamError(RuntimeError):
-    """Microsoft's side misbehaved: a redirect, a non-JSON identity response, a
-    token without a usable expiry. Not a ``ValueError``, so the route answers
-    502 and logs the reason instead of a silent 400 the gateway cannot read."""
+    """Microsoft's side refused or misbehaved: a 4xx/5xx with its error code, a
+    redirect, a non-JSON identity response, a token without a usable expiry.
+    Not a ``ValueError``, so the route answers 502 and logs the reason instead
+    of a silent 400 the gateway cannot read. ``fields`` carries what the body
+    said about itself (status, code, message) for the log and the response."""
+
+    def __init__(self, message: str, fields: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.fields = fields or {}
+
+
+def _teams_upstream_error(exc: urllib.error.HTTPError) -> TeamsUpstreamError:
+    """Read the bounded error body Bot Framework or Entra answered with.
+
+    Bot Framework puts the cause in ``error.code`` / ``error.message``
+    (``BotNotInConversationRoster``, ``ConversationNotFound``,
+    ``MessageSizeTooBig``); the identity provider in ``error`` /
+    ``error_description`` (``invalid_client``). Without them an operator cannot
+    tell a wrong conversation id from a wrong secret from an oversize card.
+    """
+    fields: dict[str, Any] = {"status": exc.code}
+    try:
+        raw = exc.read(TEAMS_UPSTREAM_BODY_MAX_BYTES)
+        body = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+    except Exception:
+        body = {}
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        fields["code"] = str(err.get("code", ""))[:128]
+        fields["message"] = str(err.get("message", ""))[:256]
+    elif isinstance(err, str):
+        fields["code"] = err[:128]
+        fields["message"] = str(body.get("error_description", ""))[:256]
+    detail = " ".join(str(fields[k]) for k in ("code", "message") if fields.get(k))
+    return TeamsUpstreamError(f"HTTP {exc.code}: {detail or exc.reason}", fields)
 
 
 class _TeamsNoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -3068,7 +3106,10 @@ class TeamsRelay:
 
     @staticmethod
     def _open_url(req: urllib.request.Request, *, timeout: float) -> Any:
-        return _TEAMS_OPENER.open(req, timeout=timeout)
+        try:
+            return _TEAMS_OPENER.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raise _teams_upstream_error(exc) from exc
 
     def enqueue_event(self, event: dict[str, Any]) -> bool:
         validate_teams_activity(event)
@@ -9966,10 +10007,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
                 _sanitize_for_logging(safe_detail, max_length=256),
             )
-            self._json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": "Teams operation failed", "detail": safe_detail},
-            )
+            answer: dict[str, Any] = {"error": "Teams operation failed", "detail": safe_detail}
+            if getattr(exc, "fields", None):
+                answer["teams"] = exc.fields
+            self._json(HTTPStatus.BAD_GATEWAY, answer)
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         # send_response calls this for every response this listener writes --

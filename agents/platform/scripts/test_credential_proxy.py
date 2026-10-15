@@ -13728,6 +13728,9 @@ class TeamsRelayTest(unittest.TestCase):
             "v3/conversations/123/../admin",
             "v3/attachments/123",
             "v3/conversations/123/activities/history",
+            "v3/conversations/123/activities/History",
+            "v3/conversations/123/activities/%68istory",
+            "v3/conversations/123/activities/a.b",
         ):
             with self.assertRaises(ValueError, msg=bad_path):
                 relay.api_call(
@@ -13756,6 +13759,19 @@ class TeamsRelayTest(unittest.TestCase):
                 payload={"text": "hello"},
             )
             self.assertEqual(res, {"id": "act-resp-1"})
+
+    def test_teams_relay_upstream_rejection_carries_the_error_code(self):
+        import io
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token, relay._token_expires_at = "cached", 9999999999.0
+        body = json.dumps({"error": {"code": "BotNotInConversationRoster", "message": "The bot is not part of the conversation roster."}}).encode()
+        err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/v3/x", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", side_effect=err):
+            with self.assertRaises(credential_proxy.TeamsUpstreamError) as caught:
+                relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path="v3/conversations/123/activities", payload={"text": "hi"})
+        self.assertEqual(caught.exception.fields["status"], 403)
+        self.assertEqual(caught.exception.fields["code"], "BotNotInConversationRoster")
+        self.assertIn("BotNotInConversationRoster", str(caught.exception))
 
     def test_teams_relay_redirect_handler_refuses_redirects(self):
         # api_call goes through the module's one opener, and that opener

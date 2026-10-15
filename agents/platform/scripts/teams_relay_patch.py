@@ -27,6 +27,9 @@ DEFAULT_RELAY_READY_TIMEOUT = 120.0
 TEAMS_MAX_MESSAGE_LENGTH = 16000
 TEAMS_MAX_ACTIVITY_BYTES = 28 * 1024
 TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
+# Each pass cuts at least the overshoot in raw bytes, and a raw byte is at least
+# one serialized byte, so two passes are the norm; the bound is a safety stop.
+TEAMS_FIT_ATTEMPTS = 8
 # Where the bot posts when an activity did not say: the public Bot Framework
 # endpoint. A regional tenant sets TEAMS_DEFAULT_SERVICE_URL.
 DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
@@ -224,31 +227,48 @@ def fit_activity_to_cap(
     use_adaptive_cards: bool,
     title: str | None,
     actions: list[dict[str, Any]] | None,
+    extra: dict[str, Any] | None = None,
     cap: int = TEAMS_MAX_ACTIVITY_BYTES,
 ) -> dict[str, Any]:
     """Build the outbound activity and keep it under ``cap`` bytes.
 
     Order: the card as asked; plain text of the same message (a card adds a
     TextBlock per line, so short lines inflate it several times); then plain
-    text cut to fit, ending in ``TEAMS_TRUNCATION_MARKER``. Measured on the
-    serialized form rather than on characters, so non-Latin text is bounded
-    the same way as ASCII.
+    text cut to fit, ending in ``TEAMS_TRUNCATION_MARKER``. Every candidate
+    carries ``extra`` (``replyToId`` and the like) and is measured in its
+    serialized form, the one the broker puts on the wire, so a newline or a
+    quote costs what it costs there and the result is what gets measured.
     """
-    payload = format_teams_activity_payload(
-        message, use_adaptive_cards=use_adaptive_cards, title=title, actions=actions
-    )
+    fields = dict(extra or {})
+
+    def build(text: str, cards: bool, with_title: bool) -> dict[str, Any]:
+        payload = format_teams_activity_payload(
+            text,
+            use_adaptive_cards=cards,
+            title=title if with_title else None,
+            actions=actions if with_title else None,
+        )
+        payload.update(fields)
+        return payload
+
+    payload = build(message, use_adaptive_cards, True)
     if activity_size_bytes(payload) <= cap:
         return payload
     if use_adaptive_cards:
         LOGGER.info("Teams card over the activity size cap; sending plain text")
-        payload = format_teams_activity_payload(message, use_adaptive_cards=False)
+        payload = build(message, False, False)
         if activity_size_bytes(payload) <= cap:
             return payload
-    overhead = activity_size_bytes(format_teams_activity_payload("", use_adaptive_cards=False))
-    room = cap - overhead - len(TEAMS_TRUNCATION_MARKER.encode("utf-8"))
-    cut = message.encode("utf-8")[: max(room, 0)].decode("utf-8", errors="ignore")
     LOGGER.warning("Teams message over the activity size cap; truncated to fit")
-    return format_teams_activity_payload(cut + TEAMS_TRUNCATION_MARKER, use_adaptive_cards=False)
+    cut = message
+    for _ in range(TEAMS_FIT_ATTEMPTS):
+        payload = build(cut + TEAMS_TRUNCATION_MARKER, False, False)
+        over = activity_size_bytes(payload) - cap
+        if over <= 0:
+            return payload
+        raw = cut.encode("utf-8")
+        cut = raw[: max(len(raw) - over, 0)].decode("utf-8", errors="ignore")
+    return build(TEAMS_TRUNCATION_MARKER.strip(), False, False)
 
 
 def format_teams_activity_payload(
@@ -429,12 +449,6 @@ def install() -> None:
             )
             conversation_id = str(chat_id or "").strip()
 
-            payload = fit_activity_to_cap(
-                message,
-                use_adaptive_cards=self.adaptive_cards,
-                title=meta.get("title"),
-                actions=meta.get("actions"),
-            )
             effective_thread = (
                 thread_id
                 or reply_to
@@ -444,8 +458,13 @@ def install() -> None:
                     else None
                 )
             )
-            if effective_thread:
-                payload["replyToId"] = effective_thread
+            payload = fit_activity_to_cap(
+                message,
+                use_adaptive_cards=self.adaptive_cards,
+                title=meta.get("title"),
+                actions=meta.get("actions"),
+                extra={"replyToId": effective_thread} if effective_thread else None,
+            )
 
             endpoint = f"v3/conversations/{conversation_id}/activities"
             raw = await asyncio.to_thread(

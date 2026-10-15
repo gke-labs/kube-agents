@@ -32,7 +32,7 @@ carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server h
 an unbound principal that IAM grants nothing.
 
 The **credential broker Pod**, `<agent>-credential-proxy`, runs Envoy, the real CLIs,
-and the Slack and Google Chat relays, and is reached over a ClusterIP Service on port
+and the Slack, Google Chat and Microsoft Teams relays, and is reached over a ClusterIP Service on port
 8765 rather than loopback. Nothing in it executes anything the model wrote. The broker
 is always its own Deployment; there is no configuration that puts it back in the gateway
 Pod or in the sandbox Pod, and none that turns the sandbox off.
@@ -63,7 +63,7 @@ that point.
 
 A shim in the sandbox sends a structured argument vector to Envoy at
 `CREDENTIAL_PROXY_URL`. Envoy forwards it over a private Unix socket to the credential
-runtime in the same Pod. Slack and Google Chat use the same relay.
+runtime in the same Pod. Slack, Google Chat and Microsoft Teams use the same relay.
 
 Only trusted containers receive projected Kubernetes ServiceAccount (KSA) tokens. The
 credential runtime receives secret environment variables, credential state, and its
@@ -173,7 +173,7 @@ and the route table it feeds
 - CLI forwarding for `gcloud` and `kubectl`.
 - Read-only Google Cloud REST relay for the reads no CLI exposes
   ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
-- Slack and Google Chat credentialed relays.
+- Slack, Google Chat and Microsoft Teams credentialed relays.
 - PlatformAgent API bearer-key termination in the `agent-api-auth` sidecar.
 - GitHub installation tokens minted through Minty.
 - Broker health, lifecycle, rollout, and migration from the former in-Pod sidecar.
@@ -924,7 +924,7 @@ a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull reque
 
 ### Chat
 
-Slack and Google Chat adapters send credential-free request payloads to Envoy.
+Slack, Google Chat and Microsoft Teams adapters send credential-free request payloads to Envoy.
 The credential runtime owns platform tokens and performs the external API call.
 Allowlisted users, payload size limits, and file size limits are enforced by the
 relay.

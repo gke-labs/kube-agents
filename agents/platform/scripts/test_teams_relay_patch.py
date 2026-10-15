@@ -548,16 +548,20 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.__enter__.return_value = resp
             return resp
 
-        cjk = "集群状态报告。" * 2300  # 16,100 characters, 3 bytes each
+        # Newlines and quotes cost two bytes each once serialized, and the
+        # reply id rides along: the cap is measured on exactly what is posted.
+        cjk = "\n".join(['集群"状态"报告。' * 5 for _ in range(460)])  # 16,100+ characters
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            await adapter.send("conv-1", cjk)
+            await adapter.send("conv-1", cjk, reply_to="1697000000000")
         payload = sent[0]["payload"]
         self.assertNotIn("attachments", payload)
+        self.assertEqual(payload["replyToId"], "1697000000000")
         self.assertTrue(payload["text"].endswith(teams_relay_patch.TEAMS_TRUNCATION_MARKER))
         self.assertTrue(cjk.startswith(payload["text"][: -len(teams_relay_patch.TEAMS_TRUNCATION_MARKER)]))
         self.assertLessEqual(
             len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 28 * 1024
         )
+        self.assertGreater(len(payload["text"]), 9000)  # cut to fit, not emptied
 
     async def test_unauthorized_tenant_rejected(self):
         from gateway.platform_registry import PlatformRegistry

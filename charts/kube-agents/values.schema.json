@@ -987,6 +987,10 @@
                 "homeChannel": {
                   "type": "string"
                 },
+                "serviceUrl": {
+                  "type": "string",
+                  "description": "Retired: nothing reads it. Accepted so values files written against earlier charts still validate under additionalProperties: false."
+                },
                 "adaptiveCards": {
                   "type": "boolean"
                 }
