@@ -484,7 +484,8 @@
           "type": "boolean"
         },
         "name": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 35
         },
         "mode": {
           "enum": [null, "", "today", "next"]
@@ -498,8 +499,23 @@
         "serviceMonitor": {
           "type": ["boolean", "null"]
         },
+        "serviceMonitorLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "vmPodScrape": {
           "type": ["boolean", "null"]
+        },
+        "vmPodScrapeLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "monitoringScraperNamespace": {
+          "type": "string"
         },
         "harness": {
           "type": "object",

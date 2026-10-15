@@ -141,6 +141,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -175,6 +178,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -209,6 +215,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -242,6 +251,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -264,6 +276,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -280,6 +295,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -297,6 +315,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -314,6 +335,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -322,4 +346,81 @@ spec:
     - port: a2a-metrics
       path: /metrics
       interval: 30s
+{{- end }}
+
+{{- if and .Values.platformAgent.enabled (or (include "kube-agents.platformAgentServiceMonitor" .) (include "kube-agents.platformAgentVMPodScrape" .)) .Values.platformAgent.monitoringScraperNamespace }}
+---
+{{- /*
+NetworkPolicy admitting metrics scrapes from the configured monitoring scraper namespace.
+The operator's own policies admit metrics ports only from gke-gmp-system.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-metrics-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace }}
+      ports:
+        - protocol: TCP
+          port: 9095
+        - protocol: TCP
+          port: 9097
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-metrics-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace }}
+      ports:
+        - protocol: TCP
+          port: 8766
+{{- if eq (default "today" .Values.platformAgent.mode) "next" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.platformAgent.name }}-a2a-gateway-metrics-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-a2a-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace }}
+      ports:
+        - protocol: TCP
+          port: 9096
+{{- end }}
 {{- end }}

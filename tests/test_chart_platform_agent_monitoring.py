@@ -407,6 +407,62 @@ class MonitoringRenderTest(unittest.TestCase):
     def test_vm_pod_scrape_no_agent_renders_nothing(self):
         self.assertEqual(self._vm_pod_scrapes(*_ON_VICTORIAMETRICS, "--set", "platformAgent.enabled=false"), {})
 
+    def test_service_monitor_and_vmpodscrape_labels(self):
+        sm_rendered = self._service_monitors(
+            *_ON_PROMETHEUS,
+            "--set", "platformAgent.serviceMonitorLabels.release=kube-prometheus-stack",
+            "--set", "platformAgent.serviceMonitorLabels.custom=test-label",
+        )
+        for sm in sm_rendered.values():
+            self.assertEqual(sm["metadata"]["labels"]["release"], "kube-prometheus-stack")
+            self.assertEqual(sm["metadata"]["labels"]["custom"], "test-label")
+
+        vm_rendered = self._vm_pod_scrapes(
+            *_ON_VICTORIAMETRICS,
+            "--set", "platformAgent.vmPodScrapeLabels.release=victoria-metrics",
+        )
+        for vm in vm_rendered.values():
+            self.assertEqual(vm["metadata"]["labels"]["release"], "victoria-metrics")
+
+    def test_monitoring_scraper_namespace_renders_network_policy(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED, *_ON_PROMETHEUS,
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = {
+            doc["metadata"]["name"]: doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "metrics-netpol" in doc["metadata"]["name"]
+        }
+        self.assertIn(f"{_AGENT}-gateway-metrics-netpol", netpols)
+        self.assertIn(f"{_AGENT}-credential-proxy-metrics-netpol", netpols)
+        gw_np = netpols[f"{_AGENT}-gateway-metrics-netpol"]
+        self.assertEqual(gw_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-gateway")
+        self.assertEqual(
+            gw_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "monitoring",
+        )
+        ports = [p["port"] for p in gw_np["spec"]["ingress"][0]["ports"]]
+        self.assertIn(9095, ports)
+        self.assertIn(9097, ports)
+
+    def test_name_longer_than_35_chars_rejected_by_schema(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED,
+                "--set", "platformAgent.name=this-platform-agent-name-is-far-too-long-for-schema",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("maxLength: got 51, want 35", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -632,12 +632,20 @@ platformAgent:
   # monitoring.coreos.com/v1/ServiceMonitor; true renders them unconditionally; false
   # disables. Pass --api-versions monitoring.coreos.com/v1/ServiceMonitor to helm template.
   serviceMonitor: null
+  # Additional labels to merge into rendered ServiceMonitor metadata.labels (e.g. release: kube-prometheus-stack).
+  serviceMonitorLabels: {}
   # VictoriaMetrics Operator VMPodScrapes for the agent's pods. Tri-state: null
   # (default) renders them when the cluster serves
   # operator.victoriametrics.com/v1beta1/VMPodScrape; true renders them unconditionally;
   # false disables. Pass --api-versions operator.victoriametrics.com/v1beta1/VMPodScrape
   # to helm template.
   vmPodScrape: null
+  # Additional labels to merge into rendered VMPodScrape metadata.labels.
+  vmPodScrapeLabels: {}
+  # Namespace where Prometheus Operator or VictoriaMetrics scrapers run.
+  # When set, the chart renders a NetworkPolicy admitting ingress on the agent's
+  # metrics ports (9095, 9097, 8766, 9096) from this namespace.
+  monitoringScraperNamespace: ""
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
