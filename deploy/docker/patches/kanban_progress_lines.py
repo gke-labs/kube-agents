@@ -781,13 +781,15 @@ async def _pr_event(notification: Any, ev: Any) -> None:
     Its evidence line is the worker's first line naming the PR later in the
     batch, else the PR's title. A later note or report that also says it
     opened the PR posts nothing more: ``slack_ux_moments`` keeps one record of
-    each thread's PRs for both paths. Not for one replayed (:func:`_replayed`);
+    each thread's PRs for both paths. Not for a wake-only subscription, which
+    is sent nothing, nor for an event replayed (:func:`_replayed`);
     one a later event settles past still posts, since the PR was opened. Only
     with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it runs
     inside the send loop.
     """
     try:
-        if _replayed(notification, ev):
+        # A wake-only subscription is sent no messages; upstream runs this hook before that check.
+        if _replayed(notification, ev) or getattr(notification, "send_passive", True) is False:
             return
         sub = notification.sub
         adapter = getattr(notification, "adapter", None)

@@ -17,8 +17,9 @@ message with "Open PR" and "Files changed" buttons, once per PR per thread for
 the life of the process (a restart forgets). It posts from the card's
 ``pr_opened`` event (:func:`pr_event`): the ``pr_opened`` plugin
 (``agents/platform/plugins/pr_opened``) records one on the worker's card
-whenever the broker's ``proposal-create`` answers with a new proposal, so the
-worker's wording decides nothing. :func:`pr_opened` reads a note or report
+whenever the broker's ``proposal-create`` answers with a new proposal and the
+forge confirms the agent's own credential authored it, so the worker's
+wording decides nothing. :func:`pr_opened` reads a note or report
 saying a PR was opened, as the fallback for one opened any other way; the two
 share one record of what each thread was shown, so a PR posts once whichever
 path reaches it first. A GitLab merge request gets the same message, with

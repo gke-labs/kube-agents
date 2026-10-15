@@ -1212,7 +1212,7 @@ var frontDoorToolsets = []string{
 }
 
 // frontDoorPlugins are the plugins the profile receiving chat ingress has to run, on
-// top of the three agents/platform/config.yaml already enables.
+// top of the ones agents/platform/config.yaml already enables.
 //
 // They are agents/chat/config.yaml's list, less two. legacy_slash_commands unwraps a typed
 // "/hermes sethome" before the gateway dispatcher sees it, and session_store and

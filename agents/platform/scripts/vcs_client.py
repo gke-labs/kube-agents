@@ -136,9 +136,10 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 #: submit-suggestion, the fleet audit -- reaches the broker through `call()`, so
 #: this is the one place that knows a proposal was opened, with the forge's own
 #: url. The agent pod's `pr_opened` plugin (agents/platform/plugins/pr_opened)
-#: takes the line out of the terminal output and records it on the worker's
-#: card, which is how the thread's PR message is posted without reading the
-#: worker's words. A JSON value rather than a prefixed line, so a pipeline that
+#: checks the proposal with the forge, records it on the worker's card and takes
+#: the line out of the terminal output, which is how the thread's PR message is
+#: posted without reading the worker's words. The line proves nothing alone --
+#: any text in the output can take its shape -- which is why the plugin checks. A JSON value rather than a prefixed line, so a pipeline that
 #: merges stderr into `jq` reads one more document instead of failing. The
 #: plugin holds the same three names; its test reads these to keep them equal.
 PROPOSAL_CREATE_VERB = "proposal-create"

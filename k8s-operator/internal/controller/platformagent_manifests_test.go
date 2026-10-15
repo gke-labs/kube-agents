@@ -6585,7 +6585,7 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
 // The list is derived, not chosen: every ingress plugin the chat profile enables, less the
-// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// two named below, less the ones agents/platform/config.yaml already enables. Adding an
 // ingress plugin to the chat profile and not here is the drift that matters — it hooks a
 // message the front door is the one receiving, so the behaviour is simply lost, with
 // nothing logged.

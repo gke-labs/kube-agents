@@ -1640,6 +1640,13 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         await silent_event(notification, events[0])
         self.assertEqual(self.recorded, [])
 
+    async def test_a_wake_only_subscription_gets_no_pr_message(self):
+        # Upstream calls the silent hook before it checks send_passive.
+        notification, events = self._pr_batch()
+        notification.send_passive = False
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [])
+
     async def test_a_pr_opened_event_posts_nothing_with_the_flag_off_or_off_slack(self):
         notification, events = self._pr_batch(SUB)
         await silent_event(notification, events[0])

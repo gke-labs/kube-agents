@@ -9,24 +9,41 @@ answers with a new proposal, ``call`` writes one JSON line to stderr naming it
 of its terminal output, in the process whose ``HERMES_KANBAN_TASK`` names the
 card it is working.
 
-This hook sees that output before the model does. It takes each such line out,
-so the model's view of the command is what it was before the record existed,
-and appends a ``pr_opened`` event (the forge's ``url``, ``number`` and
-``title``) to the card. The gateway's notifier claims the kind and, with
-``KAGE_SLACK_UX`` on, posts the PR as its own message in the thread the card
-reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``),
+This hook sees that output before the model does. A line that has the record's
+shape is not proof by itself: terminal output also carries text nobody here
+wrote (a commit message, a file, a pod's log), and such text could hold a line
+naming someone else's pull request on the install's own repository. So each
+record is checked with the forge first (:func:`ours`): the broker must serve
+the pull request at that url on a repository this install manages, and its
+author must be the account the broker's credential authenticates as, the
+identity every pull request the agent opens carries. Only then is a
+``pr_opened`` event (the forge's ``url``, ``number`` and ``title``) appended to
+the card and the line taken out of the output, so the model's view of the
+command is what it was before the record existed. A line that fails the check
+is left where it was, for the model to read as the text it is. The gateway's
+notifier claims the kind and, with ``KAGE_SLACK_UX`` on, posts the PR as its
+own message in the thread the card reports to
+(``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``),
 whatever the worker goes on to say about it.
 
-Outside a kanban worker there is no card, so the line is taken out and nothing
-is recorded. A record that cannot be written is logged and dropped: the PR is
-open either way, and the thread falls back to reading the worker's own note.
-Background processes are not covered, since this hook runs on foreground
-output only.
+The check is two broker reads through the sandbox (``forge.call``), made in the
+terminal call that opened the pull request, so that call returns a few seconds
+later; it happens once per pull request. It is made in line rather than on a
+thread because a worker leaves through ``os._exit``, which would drop a thread
+still waiting on the broker.
+
+Outside a kanban worker there is no card, so nothing is checked, recorded or
+taken out. A check or a record that fails is logged and the line left in: the
+PR is open either way, and the thread falls back to reading the worker's own
+note. Background processes are not covered, since this hook runs on
+foreground output only.
 """
 
 import json
 import logging
 import os
+import re
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +65,17 @@ TITLE_MAX = 300
 
 #: What a record line starts with once stripped.
 JSON_OBJECT_START = "{"
+
+#: Where the agent pod's shared scripts (``forge.py`` and what it imports) are
+#: staged, as ``vcs_client`` finds its siblings there.
+SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+
+#: A pull request url on any forge (``…/pull/<n>``) or a merge request url
+#: (``…/-/merge_requests/<n>``): the repository url before it, and the number.
+PROPOSAL_URL = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+
+#: The verb that reads one proposal back from the broker.
+PROPOSAL_VIEW_VERB = "proposal-view"
 
 
 def register(ctx):
@@ -73,6 +101,38 @@ def opened(line):
     return found
 
 
+def _forge():
+    """The agent pod's ``forge`` module, which reaches the broker through the sandbox."""
+    for directory in SCRIPTS_DIRS:
+        if directory not in sys.path:
+            sys.path.append(directory)
+    import forge
+
+    return forge
+
+
+def ours(proposal):
+    """Whether the forge says the agent opened the pull request ``proposal`` names.
+
+    The broker must answer ``proposal-view`` for that number on the repository
+    in its url (a repository this install does not manage is refused there),
+    the answer must carry the same url, and its author must be the account the
+    broker's credential authenticates as on that forge.
+    """
+    match = PROPOSAL_URL.match(proposal["url"])
+    if match is None:
+        return False
+    repository, number = match.group(1), int(match.group(2))
+    forge = _forge()
+    viewer = forge.BrokerProvider().viewer_login(repository)
+    view = forge.call(PROPOSAL_VIEW_VERB, {"number": number}, repository, retry_transient=True).get("proposal") or {}
+    return (
+        bool(viewer)
+        and view.get("url") == proposal["url"]
+        and forge.normalise_login(view.get("author")) == forge.normalise_login(viewer)
+    )
+
+
 def record(task_id, proposal):
     """Append a ``pr_opened`` event for ``proposal`` to card ``task_id``, in its current run."""
     from hermes_cli import kanban_db as kb
@@ -82,26 +142,34 @@ def record(task_id, proposal):
         kb._append_event(conn, task_id, PR_OPENED_KIND, proposal, run_id=kb._current_run_id(conn, task_id))
 
 
-def on_terminal_output(command="", output="", **_):
-    """Take each proposal-opened record out of ``output`` and record it on the worker's card.
+def _recorded(task_id, proposal):
+    """Check ``proposal`` with the forge and record it on the card; True when it was recorded."""
+    try:
+        if not ours(proposal):
+            logger.warning("pr_opened: %s is not a pull request this agent opened; not recorded", proposal["url"])
+            return False
+        record(task_id, proposal)
+        return True
+    except Exception as exc:  # noqa: BLE001 — the PR is open; the thread falls back to the note
+        logger.warning("pr_opened: recording %s on %s failed: %s", proposal.get("url"), task_id, exc)
+        return False
 
-    Returns the output without those lines, or None (unchanged) when it holds none.
+
+def on_terminal_output(command="", output="", **_):
+    """Record each proposal the agent opened on the worker's card, and take its line out of ``output``.
+
+    Returns the output without the recorded lines, or None (unchanged) when none was recorded.
     """
     if not isinstance(output, str) or PROPOSAL_OPENED_KEY not in output:
         return None
-    kept, found = [], []
+    task_id = os.environ.get(TASK_ENV, "").strip()
+    if not task_id:
+        return None
+    kept, changed = [], False
     for line in output.splitlines(keepends=True):
         proposal = opened(line)
-        if proposal is None:
-            kept.append(line)
+        if proposal is not None and _recorded(task_id, proposal):
+            changed = True
         else:
-            found.append(proposal)
-    if not found:
-        return None
-    task_id = os.environ.get(TASK_ENV, "").strip()
-    for proposal in found if task_id else ():
-        try:
-            record(task_id, proposal)
-        except Exception as exc:  # noqa: BLE001 — the PR is open; the thread falls back to the note
-            logger.warning("pr_opened: recording %s on %s failed: %s", proposal.get("url"), task_id, exc)
-    return "".join(kept)
+            kept.append(line)
+    return "".join(kept) if changed else None
