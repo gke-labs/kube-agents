@@ -301,7 +301,9 @@ func optionOf(item listItem) (answerOption, bool) {
 	if label == "" || (lead == nil && runeLen(label) > buttonTextMax) {
 		return answerOption{}, false
 	}
-	label = clipRunes(label, buttonTextMax)
+	clipped := clipRunes(label, buttonTextMax)
+	wholeLabel := clipped == label
+	label = clipped
 	if said == "" {
 		var prose []string
 		for _, line := range item.more {
@@ -320,7 +322,7 @@ func optionOf(item listItem) (answerOption, bool) {
 	if summary != "" {
 		shown = fmt.Sprintf(shownSummary, fmt.Sprintf(shownOption, item.marker, label), summary)
 	}
-	whole := summary == pyStrip(said)
+	whole := wholeLabel && summary == pyStrip(said)
 	for _, line := range item.more {
 		if pyStrip(line) != "" {
 			whole = false

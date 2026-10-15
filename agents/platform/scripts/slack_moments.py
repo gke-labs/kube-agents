@@ -685,7 +685,8 @@ def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, b
     label = " ".join(OPTION_NUMBER.sub("", RECOMMENDED.sub("", label)).split()).rstrip(":").strip()
     if not label or (not lead and len(label) > _presenter.BUTTON_TEXT_MAX):
         return None
-    label = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX)
+    clipped = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX)
+    whole_label, label = clipped == label, clipped
     if not said:
         prose = []
         for line in continuation:
@@ -696,7 +697,7 @@ def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, b
     held, spans = _presenter._hold_code(said)
     summary = _presenter._restore_code(_presenter._first_sentence(held)[0], spans).strip()
     shown = SHOWN_SUMMARY.format(line=SHOWN_OPTION.format(marker=marker, label=label), summary=summary)
-    whole = not any(line.strip() for line in continuation) and summary == said.strip()
+    whole = whole_label and not any(line.strip() for line in continuation) and summary == said.strip()
     return label, primary, shown if summary else "", whole
 
 

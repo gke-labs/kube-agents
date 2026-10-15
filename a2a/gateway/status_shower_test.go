@@ -72,6 +72,28 @@ func TestTheMuxAnswersStatusShowingForTheOwningBackend(t *testing.T) {
 	var _ StatusShower = mux
 }
 
+// stubDoor is a door that is never called: ShowsTaskStatus answers for a
+// door's conversation without asking it.
+type stubDoor struct{ SideDoor }
+
+// The side door answers for the primary's conversations and keeps the line
+// for its own: an A2A or inject caller reads the line's edits as data.
+func TestTheSideDoorKeepsTheLineForItsDoors(t *testing.T) {
+	s := &sideDoorAdapter{
+		primary: statusShowingAdapter{newFakeAdapter()},
+		doors:   []DoorSpec{{Name: "inject", Prefix: "inject:", Door: stubDoor{}}},
+	}
+	if !s.ShowsTaskStatus("slack:C1/1.0") {
+		t.Error("the primary's conversation: want the status shown, no rolling line")
+	}
+	if s.ShowsTaskStatus("inject:case-1") {
+		t.Error("a door's conversation: want the rolling line kept")
+	}
+	if (&sideDoorAdapter{primary: newFakeAdapter()}).ShowsTaskStatus("discord:g/1") {
+		t.Error("a primary that shows no status: want the rolling line kept")
+	}
+}
+
 // The Slack adapter shows the status once Agent Sessions is wired, and keeps
 // the line without it.
 func TestSlackShowsTaskStatusWithAgentSessions(t *testing.T) {

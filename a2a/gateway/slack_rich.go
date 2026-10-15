@@ -367,8 +367,8 @@ func slackRichSpanChunks(span map[string]any, budget int) []map[string]any {
 }
 
 // slackRichBlocks is md as rich_text blocks of at most budget runes each,
-// cut between elements; a fenced block past it is cut between its lines,
-// and any other element past it is a block alone.
+// cut between elements, an element past budget cut as slackRichPreChunks
+// cuts it; only a single list item past budget is a block alone.
 func slackRichBlocks(md string, budget int) []map[string]any {
 	var blocks []map[string]any
 	var group []map[string]any

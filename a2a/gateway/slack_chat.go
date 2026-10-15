@@ -430,9 +430,10 @@ func slackRichText(text string, style map[string]any) map[string]any {
 	return e
 }
 
-// slackRichMarkdown is one field of markdown as rich_text elements, the
-// presenter's _rich_elements: code spans, bold, italic, strike and links
-// kept, the rest text. rich_text text is literal -- Slack parses no mrkdwn
+// slackRichMarkdown is one field of markdown as rich_text elements, after
+// the presenter's _rich_elements: code spans, bold, italic, strike and links
+// kept, the rest text, and, past the presenter, a bold run's own spans
+// drawn inside it, each kept bold. rich_text text is literal -- Slack parses no mrkdwn
 // and no mention in it -- so nothing here escapes. A link renders as one
 // only when its url passes the links rule, the label check included
 // (chatmsg.SafeURL, chattext.LinkLabelMisnamesHost); any other shows its

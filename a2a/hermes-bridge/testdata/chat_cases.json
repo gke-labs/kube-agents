@@ -954,6 +954,26 @@
           }
         ]
       }
+    },
+    {
+      "in": "Two ways.\n\n- **word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **\n- **short**\n\nWhich one?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two ways.",
+        "detail": "Which one?",
+        "fold": {
+          "title": "why",
+          "text": "- **word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **\n- **short**"
+        },
+        "choices": [
+          {
+            "text": "word word word word word word word word word word word word word word…"
+          },
+          {
+            "text": "short"
+          }
+        ]
+      }
     }
   ]
 }
