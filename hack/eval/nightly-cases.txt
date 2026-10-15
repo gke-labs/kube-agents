@@ -264,7 +264,11 @@
 # and `oobe` job. Its unit_cost_hint goes to 3000s, the top of the queue, so its
 # three repetitions (~150 lane-minutes at 2530-3144s each) start first, in one
 # of the eight lanes, beside the chain rather than on it. Its four audit-stream
-# locks still hold the audit cases on those streams back while it runs. #2699
+# locks still hold the audit cases on those streams back while it runs: the
+# compliance-audit stream already carries nine other units, so that stream's
+# chain grows by the same ~150 minutes plus the audits each repetition leaves
+# running. The bootstrap cases take the state lock only while they hold the
+# infra lock, in one try, so a busy one costs the chain nothing. #2699
 # made it gradable: tool_calls_optional lets its no-tool reply pass the liveness
 # rung that graded the first night blocked. The first night with it measures
 # whether the main part still fits; if it does not, it is parked again. Counted

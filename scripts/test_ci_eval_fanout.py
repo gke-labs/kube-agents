@@ -531,9 +531,9 @@ class RunDirRecoveryTest(unittest.TestCase):
 
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 TF_ROOT = REPO_ROOT / "bench" / "tf"
-# What a stack rewrites that the onboarding state lock guards: the scan marker
-# and the Planning Agent's `oobe` job.
-ONBOARDING_STATE = re.compile(r"bootstrap_scan_filed|\.bootstrap_handoff_filed")
+# The onboarding markers a stack under the onboarding state lock rewrites. The
+# stacks that touch the Planning Agent's `oobe` job all write one of them too.
+ONBOARDING_STATE = re.compile(r"bootstrap_scan_filed|bootstrap_handoff_filed|oobe_audits_fired")
 
 
 def task_stack(case: str) -> str:
@@ -603,21 +603,67 @@ class StateLockTest(unittest.TestCase):
                 self.assertLess(own, main.index("get-credentials"))
                 self.assertLess(own, main.index("kubectl"))
 
-    def test_the_state_lock_sits_between_the_task_lock_and_the_streams(self):
-        # Taken after the task lock and before the stream and infra locks, so a
-        # waiter holds neither of those while another case's stack has the state.
+    def test_the_state_lock_is_taken_before_the_streams_or_with_the_infra_lock(self):
+        # Off the infra lock, a unit takes it after the task lock and before its
+        # streams. A stack-bearing unit takes it only while it holds the infra
+        # lock, so it never holds the state lock while queued for infra.
         unit = lifted("run_one_unit")
         task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
-        state_lock = unit.index('lock_acquire "${STATE_DIR}/lock-state-${state_lock}"')
+        blocking = unit.index('lock_acquire "${STATE_DIR}/lock-state-${state_lock}"')
         stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
         infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
-        self.assertLess(task_lock, state_lock)
-        self.assertLess(state_lock, stream_lock)
+        one_try = unit.index('mkdir "${STATE_DIR}/lock-state-${state_lock}"')
+        self.assertIn('if [ -n "${state_lock}" ] && [ -z "${has_stack}" ]; then', unit[task_lock:blocking])
+        self.assertLess(task_lock, blocking)
+        self.assertLess(blocking, stream_lock)
         self.assertLess(stream_lock, infra_lock)
-        # Given back on the stream and infra give-up paths, after the run, and
-        # in skip_unit; the task lock's own give-up path never took it.
-        self.assertEqual(unit.count('release_state_lock "${name}"'), 3)
+        self.assertLess(infra_lock, one_try)
+        # Given back after the run and in skip_unit, and on the stream give-up
+        # path only when held: a stack-bearing unit has not taken it there.
+        self.assertIn('[ -n "${state_held}" ] && release_state_lock "${name}"', unit)
+        self.assertEqual(unit.count('release_state_lock "${name}"'), 2)
         self.assertIn('release_state_lock "${name}"', lifted("skip_unit"))
+
+    def stack_unit(self, hold_state: str, deadline: int) -> subprocess.CompletedProcess:
+        body = "\n".join(
+            [
+                lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_TIMING_FILE"),
+                lifted("unit_task_path"),
+                lifted("finished_rep_count"),
+                lifted("skip_unit"),
+                lifted("run_one_unit"),
+                PerCaseGradingTest.UNIT_STUBS,
+                lifted("release_state_lock"),
+                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'lock_acquire() { echo "$(basename "$1")" >> "${ACQ_LOG}"; mkdir "$1" 2>/dev/null; }',
+                "unit_state_lock() { echo onboarding; }",
+                "state_lock_deadline() { echo 0; }",
+                f"INFRA_LOCK_DEADLINE={deadline}; STATE_LOCK_RETRY_SECONDS=1",
+                'mkdir "${STATE_DIR}/lock-state-onboarding"',
+                f'( sleep {hold_state}; rmdir "${{STATE_DIR}}/lock-state-onboarding" ) &' if hold_state else ":",
+                'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && [ -d "${STATE_DIR}/lock-infra" ] && echo "BOTH"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
+                'run_one_unit ./tasks/x/task.yaml case-x 1 "" true 1 2>&1 | tail -1',
+                "cat /tmp/eval_case-x_rep1.log 2>/dev/null",
+                'echo "INFRA_TRIES=$(grep -c lock-infra "${ACQ_LOG}")"',
+                'ls "${STATE_DIR}" | grep "^lock-" | tr "\\n" " "; echo',
+            ]
+        )
+        return run_bash(body)
+
+    def test_a_busy_state_lock_sends_the_infra_lock_back_to_the_queue(self):
+        out = self.stack_unit(hold_state="2.5", deadline=60).stdout
+        self.assertIn("BOTH", out)
+        self.assertGreaterEqual(int(re.search(r"INFRA_TRIES=(\d+)", out).group(1)), 2)
+        self.assertNotIn("lock-", out.splitlines()[-1])
+
+    def test_a_state_lock_that_never_frees_is_a_loud_give_up_that_takes_nothing(self):
+        out = self.stack_unit(hold_state="", deadline=3).stdout
+        self.assertIn("gave up on the infra lock", out)
+        self.assertNotIn("BOTH", out)
+        # The other holder's state lock stays; this unit left neither infra
+        # nor its task lock behind.
+        self.assertEqual(out.splitlines()[-1].split(), ["lock-state-onboarding"])
 
     def test_the_lock_is_held_and_given_back_by_a_real_unit(self):
         body = "\n".join(
