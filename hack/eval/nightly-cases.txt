@@ -969,3 +969,12 @@
 # and no delegated worker retries the change another way after it (the
 # order-aware worker_commands check, #2173). deployer: noop, transcript-only.
 ./tasks/stop-on-permission-refusal/task.yaml
+
+# A question about a cluster that does not exist stops its card with
+# kanban_block(kind="capability"), which Slack draws as a failure (❌, red
+# row), rather than completing it with "does not exist" as an answer
+# (agents/platform/SOUL.md). deployer: noop, read-only, one card and no
+# fixture: three units at the 200s default, ~10 serial minutes, off the infra
+# lock. Counted from the lists: seventy-eight cases (234 units) here, of a
+# ninety-two-case, 276-unit matrix with the presubmit file's fourteen.
+./tasks/not-found-target-stops-as-failure/task.yaml

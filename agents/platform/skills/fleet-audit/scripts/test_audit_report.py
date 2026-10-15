@@ -837,6 +837,8 @@ class BaseTestCase(unittest.TestCase):
             {
                 "CREDENTIAL_PROXY_URL": "",
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
+                # `sop_path` reads it; an export must not move the SOP path `start` prints.
+                "PLATFORM_AGENT_HOME": "",
             },
         )
         env.start()
@@ -2732,9 +2734,11 @@ class TestAuditCatalogue(unittest.TestCase):
                 # The script, not the first word: the documented invocation
                 # names an interpreter first, and the prompt cites the
                 # collector rather than a runnable command line.
+                # The SOP names it by full path for a kanban worker; a cron
+                # prompt runs in the profile home and may name it from there.
                 script_token = next(
                     token for token in invocation_line.split() if token.endswith(".py")
-                ).lstrip("./")
+                ).removeprefix("/opt/data/profiles/platform/").lstrip("./")
                 self.assertIn(
                     script_token,
                     prompt,
@@ -5015,7 +5019,7 @@ class TestStart(HarnessTestCase):
                 "declarations_path": str(
                     self.tmp_path / "declarations_compliance-audit.json"
                 ),
-                "sop": "governance/compliance_audit_sop.md",
+                "sop": "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
         )
@@ -5392,9 +5396,8 @@ class TestStart(HarnessTestCase):
                 self.assertEqual(
                     list(audit_report.audit_checks(audit_id)), payload["checks"]
                 )
-                self.assertEqual(
-                    f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
-                )
+                self.assertEqual(audit_report.sop_path(audit_id), payload["sop"])
+                self.assertTrue(Path(payload["sop"]).is_absolute())
 
     def test_start_hands_over_the_context_repositories(self):
         """The declared-intent step searches what `start` names, and nothing else.
@@ -5779,7 +5782,8 @@ class TestDeclaredIntent(BaseTestCase):
                 doc = declaring_doc()
                 doc["declared"] = [make_declared(check=fault)]
                 exc = self.rejects(
-                    doc, "declared[0].check", repr(fault), "fault, not a posture"
+                    doc, "declared[0].check", repr(fault), "fault, not a posture",
+                    audit_report.sop_path(DECLARING_AUDIT),
                 )
                 for slug in audit_report.audit_declarable_checks(DECLARING_AUDIT):
                     self.assertNotIn(slug, str(exc))
@@ -25734,6 +25738,58 @@ class TestNoForge(BaseTestCase):
 
         dirs, unreadable = report_status.scan_repo_dirs(str(self.reports_dir), AUDIT)
         self.assertEqual((dirs, unreadable), ([audit_report.NO_FORGE_REPO], []))
+
+
+class TestSopPath(unittest.TestCase):
+    """`start` sends the worker to its SOP by full path (a kanban worker starts outside the profile home)."""
+
+    def test_the_path_is_under_the_agent_home(self):
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": "/srv/agent"}):
+            self.assertEqual(
+                audit_report.sop_path(AUDIT),
+                "/srv/agent/profiles/platform/governance/compliance_audit_sop.md",
+            )
+
+    # A skill file (script, SKILL.md, reference page) or an SOP named relative to
+    # the profile home, with or without a leading `./` or `../`.
+    RELATIVE = re.compile(r"(?<![\w/.-])(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)")
+
+    def test_audit_documents_name_skill_files_and_sops_by_full_path(self):
+        """A kanban worker starts in its card's workspace, where `./skills/...`
+        and `governance/...` name nothing; the SOPs and the audit skills must
+        not send it there."""
+        platform = Path(__file__).resolve().parents[3]
+        documents = sorted((platform / "governance").glob("*_sop.md")) + [
+            platform / "skills" / name / "SKILL.md"
+            for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
+        ]
+        for document in documents:
+            with self.subTest(document=document.name):
+                self.assertEqual(
+                    [], self.RELATIVE.findall(document.read_text(encoding="utf-8"))
+                )
+
+    def test_the_relative_form_is_caught_in_every_spelling(self):
+        for relative in (
+            "./skills/fleet-audit/scripts/collect.py",
+            "../skills/fleet-audit/scripts/collect.py",
+            "`skills/fleet-audit/SKILL.md`",
+            "(../skills/fleet-audit/reference.md)",
+            "`skills/gke-compute-classes/references/ccc.md`",
+            "`governance/compliance_audit_sop.md`",
+        ):
+            with self.subTest(relative=relative):
+                self.assertRegex(relative, self.RELATIVE)
+        for full in (
+            "/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py",
+            '"$HERMES_HOME"/skills/fleet-audit/scripts/collect.py',
+            "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
+        ):
+            with self.subTest(full=full):
+                self.assertNotRegex(full, self.RELATIVE)
+
+    def test_a_rejection_points_at_the_sop_by_full_path(self):
+        self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))
 
 
 if __name__ == "__main__":

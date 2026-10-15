@@ -85,6 +85,29 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Non-pod resource names should not be modified
         self.assertEqual(clean_workload_name("service", "billing-processor-service"), "billing-processor-service")
 
+    def test_clean_workload_name_gives_the_workloads_the_recap_counts(self):
+        """The recap counts withheld alerts per cleaned workload name.
+
+        The design doc says which names fold into one workload. If the
+        cleaner changes, change these cases and the doc together. SOP: "What
+        this recap does not report".
+        """
+        # Pods from two runs of one CronJob fold into one workload.
+        self.assertEqual(clean_workload_name("Pod", "backup-29340180-x7k2p"), "backup")
+        self.assertEqual(clean_workload_name("Pod", "backup-29340240-q9zzm"), "backup")
+        # Each Job keeps the run minute, so it is not the same workload as its pod.
+        self.assertEqual(clean_workload_name("Job", "backup-29340180"), "backup-29340180")
+        # Each StatefulSet pod keeps its ordinal.
+        self.assertEqual(clean_workload_name("Pod", "db-0"), "db-0")
+        self.assertEqual(clean_workload_name("Pod", "db-1"), "db-1")
+        # A Pod name that ends in five lowercase letters or digits loses that
+        # segment. DaemonSet pods fold, and so does a word of five letters.
+        self.assertEqual(clean_workload_name("Pod", "fluentd-x7k2p"), "fluentd")
+        self.assertEqual(clean_workload_name("Pod", "ingest-batch"), "ingest")
+        self.assertEqual(clean_workload_name("Pod", "ingest-queue"), "ingest")
+        # Only Pod names change.
+        self.assertEqual(clean_workload_name("Deployment", "ingest-batch"), "ingest-batch")
+
     def test_clean_reason_label_camel_case(self):
         self.assertEqual(clean_reason_label("FailedToDrainNode"), "Failed to drain node")
         self.assertEqual(clean_reason_label("PodEviction"), "Pod eviction")

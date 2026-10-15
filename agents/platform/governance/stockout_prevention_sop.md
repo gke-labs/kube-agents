@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-python3 ./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention [--repo "<owner>/<repo>"]
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention [--repo "<owner>/<repo>"]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
@@ -105,7 +105,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 **Run the collector before evaluating a covered check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/fleet_stockout.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_stockout-prevention.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/fleet_stockout.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_stockout-prevention.json
 ```
 
 It reads every cluster in every project in the install's scope — the `projects` the platform_control `fleet_scope` tool reports when the install declares a scope (its `collector_args` passed to the collector), else the active `gcloud` project plus every project `gcloud projects list` returns, or only the one `--project` names — and runs for minutes, not seconds: give the terminal call `timeout: 600`, the foreground maximum, because a shorter one kills it partway and leaves no manifest. This covers all twelve checks below — the ten built on a `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute reservations list`, or `gcloud compute regions describe --format=json(quotas)`, plus `spot-scarcity-risk` (3.8) off `gcloud beta compute advice capacity-history` and `autoscaler-out-of-resources` (3.11) off `gcloud logging read`. The `Node` dump exists only so 3.9's "`>= 90%` of the pool's _effective_ ceiling" test can count each pool's _live_ nodes — `initialNodeCount` is creation-time and the autoscaler never updates it. It applies the standard exclusions S1–S5 and the non-production rule below itself, so a candidate has already passed them. Some sub-conditions it does not reach — listed below — stay yours to check by hand. Read the manifest before doing anything else:
@@ -143,7 +143,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count). A priority's zones are its own `location.zones`, its specific reservations' zones, or else the class-level `priorityDefaults.location.zones`. Zone varies when priorities name different zones, when one priority lists two or more, or when a priority names no zone on a cluster whose node locations, auto-provisioning locations or node pools span more than one zone (Autopilot counts as multi-zone). A `podFamily`, `nodepools` or accelerator-only priority in a chain that also names machines leaves its family and size to GKE or the pools, so they are unknown. When the dimensions left unknown — those, an unread span, an unparsed machine size — could bring a chain to 2, it is listed in `checks_unevaluated` rather than filed.
 - **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2` — every priority on the same zones, or on none in a multi-zone cluster — or Spot fallback to On-Demand across zones); ComputeClasses whose every priority names a `podFamily` rather than a `machineFamily`/`machineType`, which pins no machine family at all and leaves the shape to GKE's capacity broker — this is what the built-in Autopilot classes (`autopilot`, `autopilot-arm`, `autopilot-spot`) do, and they are GKE-managed besides, so a finding against one has no manifest to remediate; standard exclusions.
@@ -153,17 +153,17 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.2 Spot-only ComputeClass without on-demand safety floor (`ccc-no-ondemand-floor`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`, `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end, or a latency-sensitive inference workload (per the discriminator under **Severity**) selects a class whose first priority is Spot, even with an On-Demand fallback after it.
 - **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`, unless an inference workload selects one that tries Spot first; the built-in Autopilot class `autopilot-spot`, whose every priority names a `podFamily` and which GKE manages, so the `kind: manifest` remediation below has no manifest to append to — the same exclusion and the same reason as §3.1, and the reason it is scoped to `podFamily`-only chains rather than to the name; workloads the §3 "Non-production" rule covers (name, namespace or environment label, or the S4 opt-out), which also do not escalate a class they select. The one exception is an `autopilot-spot` an inference workload actually selects: the `critical` escalation below describes a real and immediate risk, so it is reported even though its remediation has to be `kind: manual`.
-- **Severity:** `major`, escalated to `critical` when a workload referencing an all-Spot ComputeClass is an inference workload per the serving half of the AI Workload Security audit's discriminator (`governance/ai_security_audit_sop.md` §2: a container image naming a known inference or serving runtime, or a container requesting an accelerator; its third prong, a model-provider credential, marks a workload that calls a model rather than one that serves it) — a Spot preemption there breaches a user-facing latency SLA immediately rather than delaying a batch job.
+- **Severity:** `major`, escalated to `critical` when a workload referencing an all-Spot ComputeClass is an inference workload per the serving half of the AI Workload Security audit's discriminator (`/opt/data/profiles/platform/governance/ai_security_audit_sop.md` §2: a container image naming a known inference or serving runtime, or a container requesting an accelerator; its third prong, a model-provider credential, marks a workload that calls a model rather than one that serves it) — a Spot preemption there breaches a user-facing latency SLA immediately rather than delaying a batch job.
 - **Impact:** "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state."
 - **Remediation:** `kind: manifest`. Append an On-Demand priority rule at the lowest priority in the ComputeClass manifest to act as a guaranteed capacity floor; for a Spot-first class an inference workload selects, move the On-Demand rule ahead of the Spot ones or give the workload its own On-Demand-first class.
 
 #### 3.3 Large VM shape scarcity (>32 vCPU) without multi-family fallbacks (`ccc-large-vm-scarcity`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `kubectl --context <ctx> get deployments,statefulsets,computeclasses -n <ns> <name> -o yaml`
 - **Flag when:** A workload or ComputeClass requests very large VM sizes (>32 vCPUs, such as `m1-ultramem-160`, `c3-highcpu-88`, `a2-highgpu-8g`) from thin capacity pools without secondary fallback families or horizontal replica spreading.
 - **Do NOT flag:** Workloads requesting standard/horizontal shapes (<=32 vCPUs); stateful monolithic databases that explicitly declare multi-region failover.
@@ -173,7 +173,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.4 Excessive priority rules causing autoscaler backoff loops (`ccc-priority-starvation`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`, `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A `ComputeClass` contains more than 10 total priority rules (granular `machineType` rules or family entries), exceeding Flex Advisor combinations and triggering Cluster Autoscaler cooldown/backoff reset loops.
 - **Do NOT flag:** ComputeClasses using <= 5 broad `machineFamily` level definitions (e.g. `n4`, `c3`, `n2`).
@@ -183,7 +183,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.5 Mixed disk generations on PV-attached ComputeClasses (`ccc-mixed-disk-generations`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,statefulsets -n <ns> <name> -o yaml`
 - **Flag when:** A stateful workload using PersistentVolumes references a ComputeClass whose `priorities[]` mixes Gen 2 VMs (`n2`, `n2d`, `c2`) and Gen 4/Hyperdisk VMs (`c4`, `n4`, `c3`), causing PV attachment deadlocks upon failover.
 - **Do NOT flag:** Stateless workloads; ComputeClasses whose priorities are purely Gen 2 or purely Gen 4/Hyperdisk-compatible; clusters running GKE 1.35.3+ using the `dynamic-rwo` StorageClass.
@@ -193,7 +193,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.6 Incompatible machine families for Hyperdisk workloads (`ccc-hyperdisk-incompatible`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `kubectl --context <ctx> get storageclasses,computeclasses,deployments -n <ns> -o yaml`
 - **Flag when:** A workload using Hyperdisk storage (`hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`) uses a ComputeClass that falls back to older generation machine families (`c2`, `n2`, `e2`) that do not support Hyperdisk CSI drivers.
 - **Do NOT flag:** Workloads using standard Persistent Disk (`pd-standard`, `pd-ssd`); ComputeClasses falling back only to Hyperdisk-capable families (`c3`, `c4`, `n4`, `c3d`).
@@ -203,7 +203,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.7 Regional quota exhaustion risk across fleet (`quota-exhaustion-risk`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `gcloud compute regions describe <region> --project=<project> --format="json(quotas)"`
 - **Flag when:** a GPU, TPU or CPU quota's `usage` in a project's region reaches >=90% of its `limit` (e.g. 22 of 24 L4 GPUs in use). One finding per region and metric, object `Quota/<region>:<metric>`.
 - **Do NOT flag:** a quota whose `usage` is under 90% of its `limit`, however much demand the fleet's workloads could add to it; a `COMMITTED_*` metric at any usage, because it limits how much capacity committed-use discounts can buy, not how many nodes the autoscaler can run.
@@ -213,7 +213,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** run by the §3 collector — `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --project=<project> --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
 - **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks. The collector reads the **mean** of the daily `preemptionRate` values, over at least seven of them — one bad afternoon inside a calm month is a zonal incident that already resolved, and a shape with less history than that is reported as unmeasured rather than clean.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
@@ -223,7 +223,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.9 Single-zone node pool, or one at its autoscaling ceiling (`single-zone-nodepool`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --project=<project> --format=json`
 - **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) and no untainted zonal pool's fallback — an untainted multi-zone node pool of the same machine type (a tainted zonal pool is flagged regardless; the excerpt says which test failed), or a node pool's live node count is `>= 90%` of its **effective** ceiling — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call. Effective, because `autoscaling.maxNodeCount` is a _per-location_ limit ("maximum number of nodes for one location in the NodePool", in the API's words) while the live count is a pool total summed over every zone: the pool-wide ceiling is `maxNodeCount` times the zones the pool spans, unless the pool sets the mutually-exclusive `totalMaxNodeCount`, which is already pool-wide. The collector computes this and names the basis in the excerpt.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); an untainted single-zone pool beside an untainted multi-zone pool of the same machine type on the same cluster; a tainted multi-zone pool is no fallback, since the zonal pool's pods do not tolerate its taints.
@@ -240,7 +240,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.10 Reservation bypass, unreachable zones, or unallocated capacity mismatch (`reservation-mismatch-risk`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `gcloud compute reservations list --project=<project> --format=json`
 - **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) `inUseCount / count <= 0.5` **and** `count - inUseCount >= 4` — at most half the reservation is in use, and at least four whole instances of headroom sit idle, while production workloads in the same region run unreserved. Both conditions together, not either alone: the ratio catches a large reservation nobody uses, the absolute floor keeps a tiny reservation's normal one-or-two-instance headroom from reading as a leak. (Note: CUDs are financial commitments, not physical capacity reservations).
 - **Do NOT flag:** ComputeClasses with valid targeted reservation bindings; non-production workloads.
@@ -250,7 +250,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.11 Autoscaler out-of-resources leading indicators (`autoscaler-out-of-resources`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** run by the §3 collector — `gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND resource.labels.location="<location>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format=json`. JSON rather than the `value(...)` projection: a stockout is written under **two** schemas, and that projection reads only one of them. `jsonPayload.resultInfo.results[].errorMsg` is a scale-up that was attempted and failed, carrying the affected instance group in `parameters[0]`; `jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[].napFailureReasons[]` is the node-auto-provisioning side, which never gets as far as an attempt.
 - **Flag when:** Cluster autoscaler visibility logs emit `scale.up.error.out.of.resources`, `scale.up.error.quota.exceeded`, or `scale.up.error.ip.space.exhausted` within the past 24 hours, indicating that scale-up attempts failed before fallback recovery. One finding per distinct message id, not per log entry: a wedged cluster emits the same id every autoscaler tick and the remediation below branches on the id.
 - **Do NOT flag:** Clusters with clean autoscaler visibility logs over 24h.
@@ -263,7 +263,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 
 #### 3.12 Dangling, unlabelled, or invalid ComputeClass configurations (`dangling-compute-class`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-crd-fields.md`, `/opt/data/profiles/platform/skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml`
 - **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; or (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations.
 - **Do NOT flag:** Workloads referencing valid, reconciled ComputeClasses with matching node pool labels and tolerations; workloads selecting a GKE built-in compute class by its exact case, which GKE provides without a `ComputeClass` object in the dump — on Autopilot any of `Balanced`, `Scale-Out`, `Performance`, `Accelerator`, `autopilot`, `autopilot-spot`, `autopilot-arm`; on Standard only `autopilot` and `autopilot-spot`.
@@ -295,7 +295,7 @@ Write the schema exactly as the helper validates it to the `findings_path` retur
 ### 6. Close the audit run
 
 ```bash
-python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
   --findings-file /opt/data/scratch/findings_stockout-prevention.json \
   --manifest-file /opt/data/scratch/manifest_stockout-prevention.json \
   [--repo "<owner>/<repo>"]
@@ -303,7 +303,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-pre
 
 Always pass `--manifest-file`: nothing else checks the document against what the collector actually ran. On a run where §3's collector never produced one — it crashed, or the fleet was unreachable, and every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether.
 
-One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`skills/fleet-audit/SKILL.md`, step 3). Exit 1 is fatal. Exit 0 means it published.
+One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`, step 3). Exit 1 is fatal. Exit 0 means it published.
 
 `partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload or ComputeClass you never queried is not one that got resolved: `resolved` comes back `0` and no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out. A run that audited no cluster is partial too unless every `project/<id>` target carries `clusters_listed: 0`: a project target without it may hold clusters nobody read.
 
@@ -311,7 +311,7 @@ One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `pr
 
 - On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full, except a `NO_FORGE` run, which has none (below).
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`).
 
 What to report in each case:
 
