@@ -6638,7 +6638,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped. Scheduled fleet audits still run and report to chat, but write no ledger issue or pull request without one."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits still run, keep their reports on the agent's volume and post to chat when something changed, but write no ledger issue or pull request without one."
       fi
     fi
   else

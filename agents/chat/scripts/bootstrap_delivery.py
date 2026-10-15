@@ -598,6 +598,20 @@ def _presented(content: str) -> str:
         return content
 
 
+def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
+    """Whether oobe recorded its skip after the sweep the report comes from was filed.
+
+    A sweep filed after the skip (onboarding repeated with the stage's marker kept) ran on a later
+    build, whose scan leaves the workload checks to the audits whatever the old skip said.
+    """
+    filed = bootstrap_handoff.read_scan_marker(data_dir / oobe.SCAN_FILED_MARKER)
+    try:
+        skipped_at = float(state.get(oobe.STATE_AT))
+    except (TypeError, ValueError):
+        return False
+    return filed is not None and skipped_at >= filed[1]
+
+
 def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     """The note on the first-run audits the delivery closes with, from oobe's marker.
 
@@ -609,7 +623,7 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
         reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
         if no_coverage:
             coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
-        elif reason == LEGACY_NO_REPOSITORY_REASON:
+        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
             coverage = AUDITS_COVERED_NOTE
         else:
             coverage = AUDITS_NOT_COVERED_NOTE
