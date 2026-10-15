@@ -19,6 +19,10 @@
 # minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
 # alphabet. A sibling's name (`-canary`) is another object and is refused.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the image reference. Repointing it at registry.k8s.io
@@ -70,7 +74,7 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-names-the-retired-host
     role: objective
@@ -81,9 +85,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io(?: \([^)\n;]*\))?; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?k8s\.gcr\.io(?: \([^)\n;]*\))?; retired: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!k8s\.gcr\.io(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
 
   - name: the-declared-line-says-the-host-is-retired
     role: objective
@@ -94,9 +98,9 @@ verification_spec:
       fixture_roles:
         - retired-registry-image
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

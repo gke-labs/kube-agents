@@ -26,6 +26,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the pin that makes the pool's recreate an outage. An
@@ -88,7 +92,7 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no)(?: \([^)\n;]*\))?; workloads pinned to this pool: [^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/(?:(?:node-?pools?|pools?)/)?no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no)(?: \([^)\n;]*\))?; workloads pinned to this pool: [^\n]+$'
 
   - name: the-declared-line-says-no-replacement-comes-first
     role: objective
@@ -99,13 +103,14 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: no(?: \([^)\n;]*\))?; workloads pinned to this pool: [^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/(?:(?:node-?pools?|pools?)/)?no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: no(?: \([^)\n;]*\))?; workloads pinned to this pool: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?!no(?: \([^)\n;]*\))?;)[^;\n]+; workloads pinned to this pool: [^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/(?:(?:node-?pools?|pools?)/)?no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?!no(?: \([^)\n;]*\))?;)[^;\n]+; workloads pinned to this pool: [^\n]+$'
 
   # The pinned-workload slot admits the name as the agent has it in hand:
-  # bare, namespaced (`in <namespace>`, `in namespace <namespace>` or `in ns
-  # <namespace>`, before or after a parenthetical), with a kind word in front, as a pod name with its
+  # bare, namespaced (`in <namespace>`, `in namespace <namespace>`, `in ns
+  # <namespace>`, `in the <namespace> namespace`, `from` or `of` for `in`, before
+  # or after a parenthetical), with a kind word in front, as a pod name with its
   # ReplicaSet and pod suffixes, or with a parenthetical after it, alone or
   # in a comma- or "and"-joined list; the fold may take a line-final closing
   # parenthesis, so that one is optional.
@@ -118,9 +123,9 @@ verification_spec:
       fixture_roles:
         - readiness-pinned-workload
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no)(?: \([^)\n;]*\))?; workloads pinned to this pool: (?:(?:[1-9]\d*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?: (?:workloads?|pods?|deployments?|total))?(?: \(|: | [-\u2014\u2013] ))?(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*(?:\)|$))?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*(?:\)|$))?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*(?:\)|$))?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?)*\)?$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/(?:(?:node-?pools?|pools?)/)?no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no)(?: \([^)\n;]*\))?; workloads pinned to this pool: (?:(?:[1-9]\d*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?: (?:workloads?|pods?|deployments?|total))?(?: \(|: | [-\u2014\u2013] ))?(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?: \([^)\n;]*(?:\)|$))?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?: \([^)\n;]*(?:\)|$))?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?: \([^)\n;]*(?:\)|$))?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?)*\)?$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no)(?: \([^)\n;]*\))?; workloads pinned to this pool: (?!(?:(?:[1-9]\d*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?: (?:workloads?|pods?|deployments?|total))?(?: \(|: | [-\u2014\u2013] ))?(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*(?:\)|$))?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*(?:\)|$))?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?(?: \([^)\n;]*(?:\)|$))?(?: in (?:(?:the )?namespaces? |ns )?[a-z0-9][a-z0-9.-]*)?)*\)?$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/(?:(?:node-?pools?|pools?)/)?no-surge-pool(?:\s*\([^)\n]*\))?: nodes:? ?\d+[^;\n]*; replacement node first: (?:yes|no)(?: \([^)\n;]*\))?; workloads pinned to this pool: (?!(?:(?:[1-9]\d*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?: (?:workloads?|pods?|deployments?|total))?(?: \(|: | [-\u2014\u2013] ))?(?:(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?: \([^)\n;]*(?:\)|$))?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?:, ?|,? and ))*(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?:[a-z0-9][a-z0-9./_-]*/)?pinned-batch-runner(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?: \([^)\n;]*(?:\)|$))?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?:(?:, ?|,? and )(?:(?:deployment|deploy|daemonset|statefulset|replicaset|cronjob|job|workload|pod)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9./_-]*(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?(?: \([^)\n;]*(?:\)|$))?(?: (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?[a-z0-9][a-z0-9.-]*(?: namespace)?)?)*\)?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

@@ -7802,6 +7802,7 @@ _GROUP3 = {
     ),
     "upgrades-network-policy-enforcement-stated": (
         [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/default-deny, seeded-debug/default-deny, seeded-capacity/default-deny, seeded-deprecation/apiserver-egress-only",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: namespace/seeded-reliability, namespace/seeded-debug, namespace/seeded-capacity, namespace/seeded-deprecation",
             "seeded-a: dataplane LEGACY_DATAPATH; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero-trust",
@@ -7908,6 +7909,7 @@ _GROUP5 = {
     ),
     "upgrades-stale-client-skew-named": (
         [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl/v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client (CronJob): client kubectl v1.29.0 (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client-29384756-tqbn7: client: kubectl v1.29.0; server: v1.34.1-gke.1234000; within supported skew: no",
@@ -7935,8 +7937,11 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit: 192Mi",
             "- `seeded-a/seeded-shapes/cgroup-blind-jvm`: runtime `eclipse-temurin:8u302-b08-jre`; reads cgroup v2 limits: no; memory limit 192Mi.",
             "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
-        ],
+        
+            "seeded-a/seeded-shapes/deployment.apps/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre@sha256:a1b2cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",],
         [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",
             # A gloss may not carry the line's own separator: the slots are read by `;`.
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre (jdk 8; cgroup v2 support came in 8u372); reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes (since 8u372); memory limit 192Mi",
@@ -7985,12 +7990,14 @@ _GROUP5 = {
     ),
     "upgrades-cuda-pinned-gpu-job-named": (
         [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: true",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator: nvidia-l4; cuda: 12.2; suspended: yes",
             "- `seeded-a/seeded-shapes/cuda-pinned-trainer`: accelerator `nvidia-l4`; CUDA 12.2.0; suspended: yes.",
             "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
         ],
         [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: false",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-tesla-t4; cuda 12.2; suspended: yes",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4; suspended: yes",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
@@ -8065,7 +8072,8 @@ _GROUP2 = {
             "- `seeded-b/seeded-upgrade/pinned-batch-runner`: maxUnavailable: 0; minAvailable: none; disruptionsAllowed: 0; blocks a drain: yes.",
             "**seeded-b/seeded-upgrade/pinned-batch-runner**: maxUnavailable 0%; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
             "1. seeded-b (us-central1-a)/seeded-upgrade/pinned-batch-runner: maxUnavailable 0 (0); minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
-        ],
+        
+            "seeded-b/seeded-upgrade/pdb/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",],
         [
             "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 1; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
             "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 1; blocks a drain: yes",
@@ -8076,6 +8084,8 @@ _GROUP2 = {
     ),
     "upgrades-no-surge-pool-recreate-warned": (
         [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in the seeded-upgrade namespace",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner from seeded-upgrade",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in namespace seeded-upgrade",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner (Deployment) in seeded-upgrade",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, no-surge-canary",
@@ -8214,7 +8224,8 @@ _GROUP4 = {
             "- `seeded-a/intree-pd`: source in-tree gcePersistentDisk; bound by `seeded-shapes/intree-pd`; attaches through CSI migration: yes.",
             "**seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes**",
             "1. seeded-a (us-central1-a)/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
-        ],
+        
+            "seeded-a/pv/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",],
         [
             "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by none; attaches through csi migration: yes",
@@ -8456,3 +8467,35 @@ def test_a_sibling_name_after_the_object_is_refused(case):
     bare = _bare_line(case)
     verdicts = _group5_verdicts(case, _group5_report(bare.replace(": ", "-canary: ", 1)))
     assert verdicts and any(s != "pass" for s in verdicts.values()), verdicts
+
+
+# The kind word a `kubectl get` listing prints before each framed object.
+_OBJECT_KINDS = {
+    "upgrades-drain-blocking-budget-named": "pdb",
+    "upgrades-no-surge-pool-recreate-warned": "nodepool",
+    "upgrades-zonal-skew-replicas-warned": "deployment",
+    "upgrades-node-local-state-named": "deployment",
+    "upgrades-deprecated-node-label-selector-named": "deployment",
+    "upgrades-containerd-socket-agent-named": "daemonset",
+    "upgrades-intree-volume-named": "pv",
+    "upgrades-retired-registry-image-named": "deployment",
+    "upgrades-pod-security-latest-pinned-named": "namespace",
+    "upgrades-stale-client-skew-named": "cronjob",
+    "upgrades-cgroup-blind-runtime-named": "deployment",
+    "upgrades-multi-process-oom-group-named": "deployment",
+    "upgrades-node-image-coupled-agent-named": "daemonset",
+    "upgrades-cuda-pinned-gpu-job-named": "cronjob",
+}
+
+
+@pytest.mark.parametrize("case", _FRAMED_CASES)
+def test_a_kind_segment_before_the_object_is_admitted(case):
+    """`seeded-a/seeded-shapes/deployment/cgroup-blind-jvm` names the object as
+    `kubectl get` prints it; the kind word is ungraded."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    head, rest = bare.split(": ", 1)
+    parts = head.split("/")
+    parts.insert(len(parts) - 1, _OBJECT_KINDS[case])
+    verdicts = _group5_verdicts(case, _group5_report("/".join(parts) + ": " + rest))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts

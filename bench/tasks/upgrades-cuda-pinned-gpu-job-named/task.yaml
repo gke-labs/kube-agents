@@ -24,6 +24,13 @@
 # minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
 # alphabet. A sibling's name (`-canary`) is another object and is refused.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# The `suspended` slot is the field `spec.suspend` itself, so it takes the
+# field's boolean (`true`, `false`) beside `yes` and `no`.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguards: the image and the suspend flag. An image built for
@@ -83,7 +90,7 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
 
   - name: the-declared-line-names-the-accelerator
     role: objective
@@ -94,9 +101,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?nvidia-l4(?: \([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?nvidia-l4(?: \([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?!nvidia-l4(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?!nvidia-l4(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
 
   # The CUDA pin, with or without its patch.
   - name: the-declared-line-names-the-cuda-pin
@@ -108,9 +115,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?(?: \([^)\n;]*\))?; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?(?: \([^)\n;]*\))?; suspended: (?:yes|true|no|false)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; suspended: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
 
   # The job is suspended: an inventory that saw it saw that, and one that
   # skipped suspended workloads has no line at all.
@@ -123,9 +130,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?!(?:yes|true)$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

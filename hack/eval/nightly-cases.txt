@@ -1042,7 +1042,8 @@
 # fleet holds it: every seeded cluster runs the legacy dataplane with the
 # NetworkPolicy add-on off, and three carry policies nothing enforces.
 # Read-only chat prompt graded on a declared line per seeded cluster (the
-# dataplane, whether policy is enforced today, the namespaces with policies).
+# dataplane and whether policy is enforced today on every cluster; the
+# namespaces with policies on seeded-a and seeded-c).
 # No deterministic mutation safeguard, documented in the case: no catalogue
 # role probes the policies, and the dataplane is cluster configuration.
 # deployer: noop, no lock; one declared line per cluster from a read of every

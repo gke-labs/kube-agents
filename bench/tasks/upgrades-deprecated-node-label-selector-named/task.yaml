@@ -19,6 +19,10 @@
 # minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
 # alphabet. A sibling's name (`-canary`) is another object and is refused.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the selector. Replacing the key with kubernetes.io/arch
@@ -70,7 +74,7 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-beta-arch-label
     role: objective
@@ -81,9 +85,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?: \([^)\n;]*\))?; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?: \([^)\n;]*\))?; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-it-is-deprecated-and-names-the-replacement
     role: objective
@@ -94,9 +98,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
