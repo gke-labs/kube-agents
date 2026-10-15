@@ -773,8 +773,10 @@ def failed_line(report: str) -> str | None:
     ledger, and posts as written. One with no issue URL that opens a "What's
     wrong" section is a run that could not write its ledger (no GitOps
     repository registered, say): the line is that section's first sentence, as
-    the agent wrote it, markdown and all. None for a report with no such
-    section, which posts as written.
+    the agent wrote it, markdown and all; the headline cut past ``HEADLINE_MAX``
+    does not apply, since the line is the whole notification and its "because"
+    clause is why the audit failed. None for a report with no such section,
+    which posts as written.
     """
     if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
         return None
@@ -792,7 +794,7 @@ def failed_line(report: str) -> str | None:
             if not line.strip() or SECTION_BREAK.match(line):
                 break
             paragraph.append(line.strip())
-    sentence, _rest = split_lead(" ".join(paragraph))
+    sentence, _rest = split_lead(" ".join(paragraph), cut=False)
     return sentence.strip() or None
 
 
