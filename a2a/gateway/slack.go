@@ -1050,7 +1050,10 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 // @mention), and the next reply asks again. With no lookup wired (an
 // embedder that offers none) a miss is a false; there is nothing to ask.
 //
-// Nothing is derived from the root message, and that is deliberate. The
+// Nothing about a session thread is derived from the root message, and that
+// is deliberate. (A reply under the bot's own post is a separate rule,
+// decided in inboundEvent from the root's author, and it makes no session
+// thread either.) The
 // root can say that someone mentioned the bot; it cannot say that the
 // gateway verified them and started a task, and only the latter makes a
 // session thread. So a channel ask's own thread becomes a session thread
@@ -1390,6 +1393,7 @@ func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageE
 	return InboundMessage{
 		Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 		Kind:         "group",
+		Unaddressed:  botRooted && !mentioned,
 		AuthorID:     m.User,
 		MessageID:    m.TimeStamp,
 		// Decoded last, after the mention match and strip above: both key on

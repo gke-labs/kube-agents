@@ -2952,6 +2952,13 @@ func TestSlackReplyUnderTheBotsOwnPostIsAddressed(t *testing.T) {
 	if len(reg.asked) != 0 {
 		t.Errorf("the registry was asked %v; the root's author is the answer", reg.asked)
 	}
+	if !got.Unaddressed {
+		t.Error("an unmentioned reply under the bot's post is not marked Unaddressed")
+	}
+	mentioned := slackMsg("channel", "C1", "U1", "<@UBOT> why?", "1792100300.000200", "1792100240.299609")
+	if got, ok := a.inboundEvent(context.Background(), mentioned, "UBOT"); !ok || got.Unaddressed {
+		t.Errorf("a mentioned reply there: delivered=%v unaddressed=%v, want delivered and addressed", ok, got.Unaddressed)
+	}
 }
 
 func TestSlackReplyUnderSomeoneElsesPostStillNeedsAMention(t *testing.T) {

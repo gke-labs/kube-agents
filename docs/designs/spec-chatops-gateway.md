@@ -537,7 +537,7 @@ still works; on an install whose default is already the session route the bare f
 with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <text>` while a task is still running turns the route on and holds the text, unless the running task is the session's own, in which case the text steers it as a plain message would. On Slack a leading slash belongs to the Slack client, which
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
-mention too: the adapter forwards an unmentioned reply only once a task has started there, and
+mention too: the adapter forwards an unmentioned reply only once a task has started there (or under the bot's own post), and
 the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
 adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,

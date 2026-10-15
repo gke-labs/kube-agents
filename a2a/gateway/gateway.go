@@ -732,14 +732,22 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// an asserted address that varies in case is one person. Bounded the
 		// way the adapters bound their own maps: wholesale eviction at the
 		// cap, which at worst repeats a notice.
-		key := droppedNoticeKey(backend, msg.AuthorID)
-		g.mu.Lock()
-		if len(g.droppedNotices) >= droppedNoticesCap {
-			g.droppedNotices = map[string]bool{}
+		//
+		// Not for a message that addressed nobody (Unaddressed): a member off
+		// the list talking to a colleague under an alert would otherwise get
+		// a public refusal in a thread the channel is reading. Nor is it
+		// counted as notified, so their first real ask still gets the notice.
+		notified := msg.Unaddressed
+		if !notified {
+			key := droppedNoticeKey(backend, msg.AuthorID)
+			g.mu.Lock()
+			if len(g.droppedNotices) >= droppedNoticesCap {
+				g.droppedNotices = map[string]bool{}
+			}
+			notified = g.droppedNotices[key]
+			g.droppedNotices[key] = true
+			g.mu.Unlock()
 		}
-		notified := g.droppedNotices[key]
-		g.droppedNotices[key] = true
-		g.mu.Unlock()
 		if !notified {
 			g.post(msg.Conversation, "⛔ I can't verify who you are on "+backend+
 				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
