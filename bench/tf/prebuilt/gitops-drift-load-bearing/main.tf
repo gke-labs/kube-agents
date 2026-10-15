@@ -234,8 +234,14 @@ resource "null_resource" "load_bearing_change" {
       # only unconditional namespace delete in the stack and it runs against
       # the shared cluster the Platform Agent install lives on.
       if kubectl get namespace "${local.ns}" >/dev/null 2>&1; then
+        # Not swallowed: the enclosing `if` has already proved the namespace
+        # exists, so a failing read here is a transport or RBAC failure and
+        # not an absent label. Swallowed, it becomes an empty value that the
+        # branch below reports as "this stack did not create it" -- a refusal
+        # with the wrong reason, and indistinguishable from a namespace that
+        # genuinely carries no label.
         leftover_owner="$(kubectl get namespace "${local.ns}" \
-          -o jsonpath='{.metadata.labels.managed-by}' 2>/dev/null || true)"
+          -o jsonpath='{.metadata.labels.managed-by}')"
         if [ "$leftover_owner" != "${local.ci_labels["managed-by"]}" ]; then
           echo "ERROR: ${local.ns} already exists on ${var.host_cluster_name} but is not labelled managed-by=${local.ci_labels["managed-by"]} (found '$leftover_owner'). This stack did not create it, so it will not delete it. Remove it by hand if it is stale." >&2
           exit 1
@@ -272,7 +278,19 @@ resource "null_resource" "load_bearing_change" {
 
       # jq runs inside the pod rather than on the runner: the agent image
       # installs it, and the Prow runner has no jq in any of hack/'s scripts.
-      kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}" || true)"
+      # `curl -fsS` and the body captured before jq sees it. Without -f, curl
+      # prints an error body and exits 0 on a 404; and inside `sh -c 'curl |
+      # jq'` the pipeline's status is JQ's, which is 0 on empty input -- so a
+      # connection refused, a wrong daemon_url or a timeout all produced an
+      # empty `kinds` with a zero status, and the branch below blamed the
+      # install's age for a daemon that was simply down. Measured: that
+      # pipeline exits 0 with curl failing.
+      kinds_rc=0
+      kinds="$("$${exec_in_pod[@]}" sh -c 'body="$(curl -fsS --max-time 10 "$1/healthz")" || exit $?; printf "%s" "$body" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}")" || kinds_rc=$?
+      if [ "$kinds_rc" -ne 0 ]; then
+        echo "ERROR: could not read ${var.daemon_url}/healthz in ${var.agent_container} (exit $kinds_rc); kubectl's or curl's own error is above. This says nothing about which inject kinds the daemon advertises -- it is an exec, RBAC, connection or HTTP failure, and the install may be perfectly current." >&2
+        exit 1
+      fi
       if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then
         echo "ERROR: the Session KV daemon at ${var.daemon_url} does not advertise the 'gitops-drift' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
         exit 1

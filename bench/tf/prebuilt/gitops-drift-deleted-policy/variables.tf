@@ -147,8 +147,8 @@ variable "drift_principal" {
   description = "Authenticated identity the audit entry recorded as making the deletion"
   default     = "eval-operator@example.com"
   validation {
-    condition     = !can(regex("[\"$\\\\`]", var.drift_principal))
-    error_message = "drift_principal must not contain a double quote, dollar sign, backslash or backtick: it is spliced into the unquoted PAYLOAD heredoc, which is JSON built by the shell. A quote makes the inner payload unparseable and the daemon's 400 is then reported as 'the request did not reach the drift route'; a $name is expanded by bash at run time."
+    condition     = !can(regex("[\"$\\\\`[:cntrl:]]", var.drift_principal))
+    error_message = "drift_principal must not contain a double quote, dollar sign, backslash, backtick or a control character (a newline or tab included): it is spliced into the unquoted PAYLOAD heredoc, which is JSON built by the shell. A quote makes the inner payload unparseable and the daemon's 400 is then reported as 'the request did not reach the drift route'; a $name is expanded by bash at run time."
   }
 }
 

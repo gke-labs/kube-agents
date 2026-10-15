@@ -278,9 +278,9 @@ resource "null_resource" "deleted_policy" {
       # that, then let the exit trap delete the namespace it just built,
       # before reporting a condition knowable in ten seconds.
       #
-      # `|| true` stays, and the exit status is tested separately below: an
-      # exec that failed is a different diagnosis from a daemon that answered
-      # and advertised the wrong kinds.
+      # The exec's status and curl's are both tested below, separately from
+      # the advertised list: a call that failed is a different diagnosis from
+      # a daemon that answered and advertised the wrong kinds.
       pod="deployment/${var.agent_deployment}"
       exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
       exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
@@ -289,10 +289,18 @@ resource "null_resource" "deleted_policy" {
       # below. The agent image installs it; the Prow runner has no jq in any of
       # hack/'s scripts, so assuming one would be a dependency nothing else in
       # bench/tf takes.
+      #
+      # `curl -fsS`, and the body captured before jq sees it. Without -f, curl
+      # prints an error body and exits 0 on a 404; and inside `sh -c 'curl |
+      # jq'` the pipeline's status is jq's, which is 0 on empty input -- so a
+      # connection refused, a wrong daemon_url or a timeout produced an empty
+      # `kinds` with a zero status, and the branch below blamed the install's
+      # age for a daemon that was simply down. Measured: that pipeline exits 0
+      # with curl failing.
       kinds_rc=0
-      kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}")" || kinds_rc=$?
+      kinds="$("$${exec_in_pod[@]}" sh -c 'body="$(curl -fsS --max-time 10 "$1/healthz")" || exit $?; printf "%s" "$body" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}")" || kinds_rc=$?
       if [ "$kinds_rc" -ne 0 ]; then
-        echo "ERROR: could not read ${var.daemon_url}/healthz in ${var.agent_container} (exit $kinds_rc); kubectl's or curl's own error is above. This says nothing about which inject kinds the daemon advertises -- it is an exec, RBAC, or connection failure, and the install may be perfectly current." >&2
+        echo "ERROR: could not read ${var.daemon_url}/healthz in ${var.agent_container} (exit $kinds_rc); kubectl's or curl's own error is above. This says nothing about which inject kinds the daemon advertises -- it is an exec, RBAC, connection or HTTP failure, and the install may be perfectly current." >&2
         exit 1
       fi
       if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then

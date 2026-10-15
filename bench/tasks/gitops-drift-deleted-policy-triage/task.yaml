@@ -346,7 +346,21 @@ verification_spec:
       # stem would cover more and would also let the card's own `delete` verb
       # satisfy the check, which is the one thing this objective is written to
       # exclude.
-      any_of_phrases: ["deleted", "deletion", "removed", "removal"]
+      # Patterns rather than a longer phrase list, because the inflections
+      # that were missing are the participles -- "deleting the policy",
+      # "removing the default-deny" -- and enumerating every form is what
+      # produced two rounds of this finding. The stems carry a suffix
+      # requirement and a word boundary, which keeps the exclusion the phrase
+      # list was protecting: the card's own bare `delete` and
+      # `networkpolicies.delete` match neither, so this still grades the
+      # agent's prose rather than a transcription. any_of_patterns and
+      # any_of_phrases are one pool, so either satisfies the check.
+      any_of_patterns:
+        [
+          "\\bdelet(?:ed|ion|ing)\\b",
+          "\\bremov(?:ed|al|ing)\\b",
+          "\\bno longer exists\\b",
+        ]
 
   - name: triage-delivers-an-actionable-report
     role: objective
