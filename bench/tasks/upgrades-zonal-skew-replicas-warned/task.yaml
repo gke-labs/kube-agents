@@ -24,6 +24,10 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
+# A cause component may carry its qualifier before it (`required`,
+# `preferred`, `ScheduleAnyway`, `DoNotSchedule`), and `plus` joins two
+# components as `and` does.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the spread's whenUnsatisfiable. Flipping it to
@@ -118,9 +122,9 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: \([^)\n;]*\))?(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: \([^)\n;]*\))?(?:(?:,| and| \+|/| with| under| plus) ?(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$'
       forbidden_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?!(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: \([^)\n;]*\))?(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$)[^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?!(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: \([^)\n;]*\))?(?:(?:,| and| \+|/| with| under| plus) ?(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
