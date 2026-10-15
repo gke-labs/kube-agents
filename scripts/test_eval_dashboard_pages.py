@@ -1729,6 +1729,11 @@ class CasesAndGridPagesTest(unittest.TestCase):
         # files, in the nightly one, dated on the roster page. It is a
         # held-out row with the demoted pill, not a "nightly only" one.
         data["cases"].append({"name": "demoted-nightly-case", "domain": "cost", "active": False, "nightly_active": True})
+        # A blocking case whose task.yaml names no domain: the slug "unknown".
+        # Its one pass in the live window gives it a Grid row.
+        data["cases"].append({"name": "no-domain-case", "domain": "unknown", "active": True})
+        max((r for r in data["runs"] if r["tasks"] and r["started"] < NOW), key=lambda r: r["started"])["tasks"].append(
+            {"name": "no-domain-case", "result": "pass", "reps": [{"n": 1, "result": "pass"}]})
         history = history_lines(
             dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
             dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
@@ -1736,7 +1741,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
             dict(health_doc(), tick="2026-09-08T09:00:00+00:00"),
             dict(health_doc(), tick=NOW),
         )
-        admitted = frozenset(CRASHLOOP_TRIO[:2])
+        admitted = frozenset([*CRASHLOOP_TRIO[:2], "no-domain-case"])
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=admitted), \
                 unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02", "demoted-nightly-case": "2026-09-02"}), \
                 unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
@@ -1793,6 +1798,11 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment=CASES_ROW_ANCHOR, budget_ms=CASES_TWO_POLLS_BUDGET_MS)).group(1), "1")
         clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
         self.assertIn('id="case-retired-probe"', clicked)
+
+    def test_the_no_domain_group_rows_carry_the_label_and_tooltip(self):
+        tip = 'title="cases with no domain on record"'
+        self.assertIn(f'<tr class="grp"><td colspan="8" {tip}>no domain</td></tr>', dom_text(self.cases_page))
+        self.assertIn(f'<div class="grp" {tip}>no domain · blocking</div>', dom_text(self.grid_page))
 
     def test_grid_live_window_columns_markers_and_folding(self):
         app = dom_text(self.grid_page)

@@ -7,9 +7,11 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // InboundMessage is one chat message, normalized across backends. AuthorID is
@@ -62,6 +64,19 @@ type InboundMessage struct {
 	// where to send it instead of being read as an ask. False is every
 	// other message, and every other backend's case.
 	TopLevel bool
+	// Click marks a message that is a click on a choice button rather than a
+	// message of its own: MessageID then names the click (the audit chain's
+	// join), not a message anything can be drawn on. A chain a click starts
+	// carries its mark on the conversation's previous ask instead (mark.go).
+	// False for a typed message, and for every backend but Slack.
+	Click bool
+	// Answer marks a typed message that answers a question the conversation
+	// has open (one the adapter laid out with choices). Like a click, it
+	// continues that ask's work rather than starting an ask of its own, so
+	// its chain marks the previous ask: otherwise the card that asked
+	// settles on the answer, and the ask keeps ⏸️. False on every backend
+	// but Slack.
+	Answer bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
@@ -84,13 +99,30 @@ type Adapter interface {
 	Run(ctx context.Context, handler func(InboundMessage)) error
 
 	// Post writes text to a conversation and returns the backend message id,
-	// used by the rolling progress line's Edit.
+	// used by the rolling progress line's Edit. It is PostMessage for a
+	// message that is text alone.
 	Post(conversation, text string) (messageID string, err error)
 
 	// Edit replaces the text of a previously posted message — the rolling
 	// progress line edits one message as progress artifacts arrive, at zero
 	// model cost.
 	Edit(conversation, messageID, text string) error
+
+	// PostMessage writes one message value. With m.Chat set, a backend that
+	// renders chat messages posts it laid out, as one message, with m.Text
+	// as its fallback; a backend that renders none returns ErrTextOnly, and
+	// a backend that cannot hold this one, or whose API refuses it, returns
+	// the reason. Either way nothing was posted, and the gateway posts
+	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
+	// With m.Chat nil it is Post(conversation, m.Text).
+	PostMessage(conversation string, m OutMessage) (messageID string, err error)
+
+	// EditMessage replaces a posted message with m, laid out or not, under
+	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
+	// message, which the gateway answers with Edit. With m.Chat nil a
+	// backend that laid the message out before replaces the layout with the
+	// text; any other backend makes it Edit.
+	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
 	// as AuthorID (so a member who is also the requester matches), and
@@ -103,6 +135,108 @@ type Adapter interface {
 	// that decides to use it comes later. Until then everything posts to the
 	// room it came from.
 	OpenDirect(userID string) (conversation string, err error)
+
+	// React puts the reaction for a mark token on a message the conversation
+	// received, and RemoveReaction takes it off: the `mark` of a chat
+	// message (spec-a2a-payloads.md, "mark"), an ask kind (question,
+	// investigate, ...) or a settle (blocked, failed). The gateway decides
+	// which tokens a message carries; the adapter only owns which emoji, if
+	// any, a token shows, and a token it has none for is a nil no-op.
+	//
+	// Both are best effort, and the rule is the adapter's own: the gateway
+	// holds the bot token, so no credential-proxy rule applies here. An
+	// adapter removes only a reaction the bot itself put on, never anyone
+	// else's, and a backend that cannot react returns nil from both, as
+	// does a reaction that is already there or already gone. A failure is
+	// returned for the caller to log; it never holds up the answer.
+	React(conversation, messageID, token string) error
+	RemoveReaction(conversation, messageID, token string) error
+}
+
+// MarkObserver is the optional extension an Adapter implements to learn a
+// conversation's session mark whenever it changes: the latest ask's whole
+// mark state, or the newest older ask's while that one still has open card
+// work (SessionRecord.sessionMark), beside the React and RemoveReaction calls that draw it. The
+// Slack adapter uses it to hold the thread's Agent Sessions status: an ask
+// whose chain has ended but still carries its kind is card work still open,
+// and a blocked settle is work waiting on the user. Called where the mark is
+// applied, on the conversation's worker under its session lock: record and
+// return.
+type MarkObserver interface {
+	MarkChanged(conversation string, ask, settle string)
+}
+
+// VerifiedObserver is the optional extension an Adapter implements to learn
+// whether a message it handed over passed sender verification (verified:
+// it goes on as a turn) or was dropped. A backend that has to act on the
+// message itself -- the Slack adapter rewriting a clicked question to say
+// who answered, or titling the thread -- must not act for a sender the
+// gateway drops, and only the gateway holds the principal map. Called once
+// per message, on the conversation's inbox worker before the session lock
+// is taken: record and return.
+type VerifiedObserver interface {
+	InboundVerified(conversation, messageID string, verified bool)
+}
+
+// StatusShower is the optional extension an Adapter implements when its
+// backend shows a task's status itself, so the relay's rolling line ("⏳
+// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// adapter does, with Agent Sessions' Working… status, the ask's reaction and
+// the plan rows, as the today path shows no receipt either. With it true the
+// gateway posts no placeholder for a task, so the relay has no line to edit
+// and every line edit is skipped; the notices that stand on their own (the
+// queue notice, a publish failure, a failed or canceled task) still post.
+// Asked per conversation, so a wrapper (the mux, the side door) answers for
+// the backend that owns it.
+type StatusShower interface {
+	ShowsTaskStatus(conversation string) bool
+}
+
+// OutMessage is one post or edit as a value: the text, and the chat message
+// that lays the same content out (spec-a2a-payloads.md, "Chat messages").
+type OutMessage struct {
+	// Text is the message as text, and the whole of it: what a backend that
+	// renders no chat message posts, and the fallback (the notification,
+	// what a read-back sees) on one that does.
+	Text string
+	// Chat, when set, is a kube-agents.chat/v1 message the gateway has
+	// already read and validated for its carrier (chatmsg.Read); an adapter
+	// renders it or declines it, and never repairs one.
+	Chat *chatmsg.Message
+}
+
+// ErrTextOnly is a backend's answer to a message value with a chat message
+// when it renders none: Discord, Google Chat, the inject door, the console
+// and the A2A door. The gateway posts the text instead, so every one of them
+// posts exactly what it posted before chat messages existed.
+var ErrTextOnly = errors.New("this backend posts text only")
+
+// ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
+// more than one message holds, or the API's own refusal of the blocks. It
+// is told apart from any other failure (a rate limit, an outage, a message
+// that is gone), which says nothing about the layout and is retried as
+// such rather than counted or remembered as a refusal.
+var ErrLayoutRefused = errors.New("the backend refused this layout")
+
+// ErrMessageGone wraps a backend's answer that the message an edit names
+// cannot be edited at all (deleted, or past the backend's edit window), as
+// distinct from a failure a retry may clear.
+var ErrMessageGone = errors.New("the message can no longer be edited")
+
+// postTextOnly is PostMessage for a backend that renders no chat message.
+func postTextOnly(post func(conversation, text string) (string, error), conversation string, m OutMessage) (string, error) {
+	if m.Chat != nil {
+		return "", ErrTextOnly
+	}
+	return post(conversation, m.Text)
+}
+
+// editTextOnly is EditMessage for a backend that renders no chat message.
+func editTextOnly(edit func(conversation, messageID, text string) error, conversation, messageID string, m OutMessage) error {
+	if m.Chat != nil {
+		return ErrTextOnly
+	}
+	return edit(conversation, messageID, m.Text)
 }
 
 // TaskObserver is the optional extension an Adapter implements when it has to

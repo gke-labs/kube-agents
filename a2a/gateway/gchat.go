@@ -200,27 +200,30 @@ func unverifiedRemedyFor(backend string) string {
 }
 
 // gchatLinkRe matches markdown links for rewriteLinks to turn into Chat's
-// <url|text> form. The URL class excludes `<`, `>` and `|` so a crafted
-// markdown link cannot close the generated sequence early and pick its own
-// display text; none of the three is legal in a URL unencoded, so refusing
-// them costs nothing real. It admits one level of balanced parentheses, as
-// slackLinkRE does and for the same reason: a `.../wiki/Foo_(bar)`
-// destination otherwise ends at the first `)`.
-var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://(?:[^()\s<>|]|\([^()\s<>|]*\))+)\)`)
+// <url|text> form. The URL class (chatLinkURLPattern, which the executor's
+// own <url|text> links are read with too) excludes `<`, `>` and `|` so a
+// crafted markdown link cannot close the generated sequence early and pick
+// its own display text; none of the three is legal in a URL unencoded, so
+// refusing them costs nothing real. It admits one level of balanced
+// parentheses, as slackLinkRE does and for the same reason: a
+// `.../wiki/Foo_(bar)` destination otherwise ends at the first `)`.
+var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((` + chatLinkURLPattern + `)\)`)
 
 // gchatPipeRe matches Chat's other in-text control sequence, the <url|text>
-// link, closed or not. The segment before the pipe must be non-empty and
-// space-free, which is the shape Chat linkifies; prose like `a < b | c >` is
-// left alone. An opener the executor never closed counts too: the adapter
+// link, closed or not, for the defang. A closed one that the adapter would
+// have made from a markdown link never reaches it (toGchatText); every other
+// one does, and is defanged. The segment before the pipe must be non-empty
+// and space-free, which is the shape Chat linkifies; prose like `a < b | c >`
+// is left alone. An opener the executor never closed counts too: the adapter
 // writes its own <url|text> for every markdown link that follows, and that
 // link's `>` would close the executor's opener around it, making one link to
 // the executor's host with the adapter's link inside its text. The text
 // before the `>` admits no `<` either, so an opener nested inside another's
-// text is a sequence of its own and is defanged as one, rather than read
-// over as the outer sequence's text. Where the two readings are ambiguous
-// this errs towards defanging: the cost of that error is one visible space,
-// and the cost of the other is a link whose visible text names a host it
-// does not open.
+// text is a sequence of its own and is defanged as one, rather than read over
+// as the outer sequence's text. Where the two readings are ambiguous this
+// errs towards defanging: the cost of that error is one visible space, and
+// the cost of the other is a link whose visible text names a host it does not
+// open.
 var gchatPipeRe = regexp.MustCompile(`<[^\s<>|]+\|(?:[^<>]*>)?`)
 
 // gchatSpace, gchatSender and gchatMessage are the Chat resources both event
@@ -506,6 +509,16 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 	return a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
 }
 
+// PostMessage and EditMessage post text only: a chat message falls back to
+// its text (ErrTextOnly) until this adapter renders cards.
+func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
 // Roster returns one page of the space's membership (Adapter.Roster):
 // emails where the backend surfaced one — they resolve straight to
 // principals — the immutable users/ id where it did not, never the app
@@ -554,6 +567,12 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 	}
 	return ids, out.NextPageToken == "", nil
 }
+
+// React and RemoveReaction draw no mark on Google Chat: its relay holds app
+// credentials, and Chat's reaction API takes user credentials only, so a nil
+// no-op (Adapter).
+func (a *GoogleChatAdapter) React(string, string, string) error          { return nil }
+func (a *GoogleChatAdapter) RemoveReaction(string, string, string) error { return nil }
 
 // OpenDirect returns the DM conversation for a user (Adapter.OpenDirect).
 // userID is the Google-asserted email; the Chat API accepts the email alias
@@ -877,35 +896,47 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // the one it opens. The defusing is a visible space, not an invisible
 // character.
 //
-// The defang runs first, the way the Slack adapter escapes first: every
-// <users/…> anywhere in the text, and every <url|text the executor opened
-// outside a closed code span, whether or not the executor closed it, is
-// defused before the markdown rules see it, and the markdown link's
-// destination class excludes `<`, so the <url|text> rewriteLinks generates
-// afterwards is the adapter's own — which is the distinction the <users/…>
-// defang already drew, applied to the sequence next to it. The markdown
-// rules (bold pairs, code spans, links, the label-host refusal) are the
-// ones markdown.go holds for both chat surfaces.
+// One <url|text> the executor wrote is not defanged: a closed one, in prose,
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
+// text does not name another host (keepChatLinks). That is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground, so the visible text still cannot name a host the link
+// does not open, and a model that writes Chat's form instead of markdown gets
+// a link instead of a broken one. It is passed through as written, and the
+// markdown rules read it as the link it is (rewriteMarkdown).
+//
+// Around those, the defang runs first, the way the Slack adapter escapes
+// first: every <users/…> anywhere in the text, and every other <url|text the
+// executor opened outside a closed code span, whether or not the executor
+// closed it, is defused before the markdown rules see it, and the markdown
+// link's destination class excludes `<`, so the <url|text> rewriteLinks
+// generates afterwards is the adapter's own — which is the distinction the
+// <users/…> defang already drew, applied to the sequence next to it. The kept
+// link's text admits no `<`, so no mention rides out in it. The markdown
+// rules (bold pairs, code spans, links, the label-host refusal) are the ones
+// markdown.go holds for both chat surfaces.
 func toGchatText(s string) string {
-	return rewriteMarkdown(defangGchatControls(s), gchatLinkRe)
+	return rewriteMarkdown(keepChatLinks(s, defangGchatControls, func(dest, label string) string {
+		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
+	}), gchatLinkRe)
 }
 
 // defangGchatControls neutralizes Chat's in-text control sequences in a span
-// the adapter did not author, so the text renders as itself. The mention pass
-// runs first and over the whole text, code included: a ping-all that Chat
-// honoured from inside a code span would be loud, and the cost of defusing
-// one that it would not is a space in a code span that was quoting a
-// mention's resource name. Running it first also splits any angle pair that
-// wraps a mention so the link pass sees both. The link pass reads only
-// outside code spans and fenced blocks (rewriteOutsideCode): its shape is a
-// shell's as well -- `cat <(gen)|wc -l`, `sort <f|uniq` -- and a space in
-// a quoted command is an altered answer, where the opener it is defending
-// against is one the next markdown link's `>` would close, and that link is
-// made in prose. An opener in prose keeps being defanged when a code span
-// cuts its text short, since the opener alone is the match, and an opener
-// after a fence that never closes is defanged too: this adapter posts a
-// result in chunks, so the fence is as likely the closing one of a block
-// the chunker cut as an opener (rewriteOutsideCode).
+// the adapter did not author and did not keep as a link (toGchatText), so the
+// text renders as itself. The mention pass runs first and over the whole
+// text, code included: a ping-all that Chat honoured from inside a code span
+// would be loud, and the cost of defusing one that it would not is a space in
+// a code span that was quoting a mention's resource name. Running it first
+// also splits any angle pair that wraps a mention so the link pass sees both.
+// The link pass reads only outside code spans and fenced blocks
+// (rewriteOutsideCode): its shape is a shell's as well -- `cat <(gen)|wc -l`,
+// `sort <f|uniq` -- and a space in a quoted command is an altered answer,
+// where the opener it is defending against is one the next markdown link's
+// `>` would close, and that link is made in prose. An opener in prose keeps
+// being defanged when a code span cuts its text short, since the opener alone
+// is the match, and an opener after a fence that never closes is defanged
+// too: this adapter posts a result in chunks, so the fence is as likely the
+// closing one of a block the chunker cut as an opener (rewriteOutsideCode).
 func defangGchatControls(s string) string {
 	s = strings.ReplaceAll(s, "<users/", "< users/")
 	return rewriteOutsideCode(s, func(prose string) string {

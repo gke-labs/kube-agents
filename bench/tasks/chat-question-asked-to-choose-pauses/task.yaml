@@ -1,0 +1,131 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. A user who asks for options and to pick one
+# themselves is asking a question back, and the card has to stop and ask it:
+# kanban_block(kind="needs_input") with a reason that ends on the options. On
+# Slack that block is the needs-you message, ⏸️ on the ask, a yellow side-bar
+# and a button per option (deploy/docker/patches/slack_ux_moments.py,
+# needs_you, reading the options with agents/platform/scripts/slack_moments.py
+# _trailing_options). A card that completes with the options as text instead
+# posts an answer the user cannot click, and nothing waits on their pick.
+# agents/chat/SOUL.md §2 step 3 carries the choice into the card body;
+# agents/platform/SOUL.md §0 step 3 and agents/cluster/SOUL.md §6 step 4 say
+# whoever owns the user's card blocks with the question.
+#
+# The objectives read the platform worker's kanban_block call (scope: workers, agent: platform), since
+# the front door never blocks a card itself. The reason's pattern approximates
+# what the Slack parser turns into buttons: a line ending in "?" and right
+# below it two to five option lines, each at most 75 characters
+# (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It differs from
+# the parser at the edges, none of which the SOULs' "Which one?" shape
+# reaches: it counts an option's markup against the 75, rejects a question in
+# single-asterisk italics and CRLF line ends, and accepts a list after a
+# "Shall I proceed?" that the parser leaves as text. A worker's
+# arguments are clipped at 2,000 characters in the pod
+# (worker_trajectory.MAX_ARGS_CHARS), and a reason past that loses its tail
+# to the clip and fails here; the SOULs ask for a short reason for the same
+# reason the message reads well, so a long one is a real miss, not noise.
+#
+# What it does not grade: the click, or the work after the answer. The block
+# ends the run (blocked is terminal to the harness's wait), so the case grades
+# the pause and the question, not what the agent does with the pick.
+#
+# The prompt names no cluster: fixtures.json is the only thing allowed to
+# address a seeded cluster (cluster-agent-crashloop-debug's header).
+#
+# Planted defect required: crashloop-workload, the payments-api Deployment in
+# seeded-debug on slot a, OOMKilled on every start. Isolation class: read-only.
+id: chat-question-asked-to-choose-pauses
+name: Asked for options to choose from, the card pauses with the question and its options
+prompt: >-
+  payments-api in the seeded-debug namespace keeps restarting somewhere in the
+  fleet. Look into why, then give me two or three ways to fix it and ask me
+  which one to go with.
+expected_output: >-
+  The front door files one card and acks it. The worker that owns the
+  user's card finds payments-api OOMKilled on every start against its 64Mi
+  memory limit, then stops with kanban_block(kind="needs_input"): the reason
+  opens with the question, gives the finding in a few lines, and ends with
+  "Which one?" and two or three short options such as raising the limit,
+  setting a request to match, or reducing the app's memory use. It does not
+  complete with the options as an answer, and nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the conversation around a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  # The pause itself, on the user's card. agent: platform because the prompt
+  # names no cluster, so the front door's card is platform's, and a Cluster
+  # Agent blocking a child card while platform completes the user's card with
+  # the options as text is the regression this case exists to catch (the pin
+  # chat-fanout-fleet-restarts-rows uses for the same reason).
+  # require_success: a refused block left the card open.
+  - name: platform-paused-the-card-on-a-question
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_block"]
+      scope: workers
+      agent: platform
+      arguments:
+        kind: "needs_input"
+      require_success: true
+  # One call carries both: the question grounded in what the fleet plants,
+  # and options the Slack parser makes buttons of. The grounding wants the
+  # OOM's evidence (OOMKilled, an OOM kill, exit code 137, the 64Mi limit or
+  # "out of memory"), not "memory", which "Increase the memory limit" in the
+  # option list would supply on its own. The options: a line ending in "?"
+  # that is not itself an option line (else a question-styled option could
+  # anchor a list of six), then two to five option lines (`-`, `*`, `•`,
+  # `1.`, `1)`, `a.` or `a)`), blank lines allowed between them, and nothing
+  # after.
+  - name: the-question-names-the-oom-and-ends-on-two-to-five-options
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_block"]
+      scope: workers
+      agent: platform
+      arguments:
+        kind: "needs_input"
+        reason: '(?is)(?=.*payments-api)(?=.*(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))(?:.*\n)?(?![ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t])[^\n]*\?(?:\*\*|__)?[ \t]*\n(?:[ \t]*\n)*(?:[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\n(?:[ \t]*\n)*){1,4}[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\s*'
+      require_success: true
+  # Diagnosed and asked, not fixed: the limit the fixture plants is unchanged.
+  - name: the-crashloop-was-not-fixed-before-asking
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: crashloop-workload
+      kind: deployment
+      resource_name: payments-api
+      namespace: seeded-debug
+      path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
+      op: eq
+      value: 64Mi
+  # The front door files the card and never works or blocks it. No
+  # require_success: an attempted worker-verb call is the violation.
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

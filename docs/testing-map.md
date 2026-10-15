@@ -87,7 +87,9 @@ gated on `A2A_LIVE_NATS_URL`; nothing automatic runs it.
 **`tests/e2e/` is not manual-only.** `rc-scheduler.yml` runs on `cron: "17 */3 * * *"` and
 dispatches `rc-release-pipeline.yml` whenever a new candidate exists, and
 `step-4-tag-validated` depends on the suite. Breaking a test there is not free — it reds the
-release-candidate pipeline within three hours and stops the tag. Both it and `staging-promotion-pipeline.yml`
+release-candidate pipeline within three hours and stops the tag. The pipeline then runs the
+suite again on a `spec.mode: next` install, where a failure reds the run but gates no tag
+([`tests/e2e/README.md`](../tests/e2e/README.md#-running-in-github-actions-ci)). Both `rc-release-pipeline.yml` and `staging-promotion-pipeline.yml`
 reach the suite through the same reusable `e2e-run.yml`; `e2e-gchat-test.yml` and
 `e2e-manual-runner.yml` are the by-hand callers. `autopush-next-e2e-gchat.yml` runs `gchat_agent_test.py` every three hours against the
 long-lived `autopush-next` environment, outside any gate, and skips until that environment is

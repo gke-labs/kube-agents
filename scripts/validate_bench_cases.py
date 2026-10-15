@@ -246,6 +246,11 @@ FIXTURE_NOT_READY = {
         "project's id at the case's two sites: the command check's first forbidden "
         "pattern and the ledger check's forbidden phrase"
     ),
+    "fleet-audit-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
         "service account can read, declared in the install's spec.scope.projects (or an "
@@ -390,6 +395,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
+    # No field: "this run's report is in the store" is the assertion, and
+    # `status` and `required_finding_phrases` only narrow it.
+    "audit_report_stored": (),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
@@ -399,7 +407,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),
-    "worker_commands": ("required_patterns", "forbidden_patterns"),
+    "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
@@ -953,6 +961,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"'expected_fail:' {spec['expected_fail']!r} is not a YAML boolean; "
             "write a bare true or false. A quoted value is a string, which "
             "bench-gate refuses at spec-load time, after the lease"
+        )
+    if "tool_calls_optional" in spec and not isinstance(spec["tool_calls_optional"], bool):
+        problems.append(
+            f"'tool_calls_optional:' {spec['tool_calls_optional']!r} is not a YAML "
+            "boolean; write a bare true or false. bench-gate refuses a quoted "
+            "value at spec-load time, after the lease"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster

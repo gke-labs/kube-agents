@@ -797,6 +797,17 @@ func (a *InjectAdapter) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+// PostMessage and EditMessage record text only: a chat message falls back
+// to its text (ErrTextOnly), so a transcript reads as it did before chat
+// messages existed.
+func (a *InjectAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *InjectAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
 // Roster is the requester alone, complete. A synthetic conversation has
 // exactly one participant -- the author who injected into it -- and
 // reporting it complete is the truth rather than a degradation: there is no
@@ -814,6 +825,11 @@ func (a *InjectAdapter) Roster(conversation string) ([]string, bool, error) {
 	}
 	return []string{conv.requester}, true, nil
 }
+
+// React and RemoveReaction: a program reads no reactions, so the door draws
+// no mark (Adapter).
+func (a *InjectAdapter) React(string, string, string) error          { return nil }
+func (a *InjectAdapter) RemoveReaction(string, string, string) error { return nil }
 
 // OpenDirect is the DM-switch primitive, and on this door it returns the
 // conversation the user is already in. Every synthetic conversation has one

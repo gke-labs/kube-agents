@@ -3480,6 +3480,87 @@ class RefusedProjectIdTest(unittest.TestCase):
             with self.subTest(stderr=stderr):
                 self.assertEqual(fs.refusal_owner("acme-prod", stderr, run=run), (True, ""))
 
+class CredentialsNoteTest(unittest.TestCase):
+    def test_a_refused_directory_is_the_failed_credentials_and_gcloud_is_not_run(self):
+        # `prepare_kubeconfig`'s note is the `get-credentials` result: gcloud is not run through a
+        # directory this run may not write (a root run would otherwise write a kubeconfig wherever a
+        # planted symlink points), and the entry built from the result names the owner or the link.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            owner = kc.parent.stat().st_uid
+            other = owner + 1
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(fs, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = fs.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls), (fs.KUBECONFIG_REFUSED_RC, []))
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            # A symlink planted at the directory's name: refused the same way, nothing run through it,
+            # the target left empty.
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            linked = Path(tmp) / "linked" / "kubeconfig_p_c_l.yaml"
+            linked.parent.symlink_to(elsewhere)
+            with patch.object(fs, "KUBECONFIG_DIR", linked.parent):
+                _, result = fs.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, sorted(p.name for p in elsewhere.iterdir())), (fs.KUBECONFIG_REFUSED_RC, [], []))
+            self.assertIn("is a symbolic link", result.stderr)
+            # With the directory usable, gcloud runs and its result is returned as is.
+            with patch.object(fs, "KUBECONFIG_DIR", kc.parent):
+                _, ok = fs.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
+
+def owned_by(path, uid):
+    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if self == path:
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return patch.object(Path, "stat", fake)
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    def test_fetch_credentials_prepares_the_shared_directory(self):
+        # The shared `.kubeconfigs` is prepared by `collect.prepare_kubeconfig`, the one rule for the
+        # fleet-audit collectors, before gcloud runs: this uid's and closed to other uids (0755) whatever
+        # the umask, a directory this uid made at another mode brought to it, a stale kubeconfig this uid
+        # cannot write removed.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            # The keep follows `os.access`, true for a 0400 file to root alone, not the runner's uid.
+            kept = os.access(kc, os.W_OK)
+            mask = os.umask(0o077)
+            try:
+                with patch.object(fs, "KUBECONFIG_DIR", kc.parent):
+                    path, _ = fs.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            finally:
+                os.umask(mask)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o755, kept))
+
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # The tick's directory, then a root hand run: from root's side it is another uid's, and root
+        # keeps it rather than moving it aside, and replaces the tick's stale file rather than writing
+        # through it. Mocked root shows both branches.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            with patch.object(fs, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1), owned_by(kc, 1):
+                path, _ = fs.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

@@ -260,6 +260,32 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	}
 }
 
+// The gateway's chat listener serves one family, summed over its platform
+// label, and no cluster gauge: the chat body is the platform-agent container's,
+// not the watcher's.
+func TestPodUsageSource_SumsTheChatListenerOverPlatforms(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_chat_messages_inbound_total counter",
+		`kubeagents_chat_messages_inbound_total{platform="googlechat"} 4`,
+		`kubeagents_chat_messages_inbound_total{platform="slack"} 2`,
+		`kubeagents_chat_messages_inbound_total{platform="other"} 1`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 7 {
+		t.Fatalf("samples = %v, want 7 inbound messages", reading.Samples)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("the chat body yielded a cluster reading: %+v", reading.Clusters)
+	}
+}
+
 // Each scrape that produces no body to count: a connection that failed, a
 // 3xx answer (not followed), a line past its bound, a wanted line expfmt
 // cannot parse, a sample that is negative or not finite.

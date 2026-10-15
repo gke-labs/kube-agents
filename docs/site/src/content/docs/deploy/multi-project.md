@@ -21,7 +21,12 @@ with the management project appended, that exports the project's GKE admin-activ
 audit records into the management project's drift topic, so a change made by hand
 on a cluster there is reported like one on the management cluster; besides setting IAM
 policy there, the identity running the apply needs to read the project, mint its Logging
-service agent and create a sink (`roles/owner` carries all of them).
+service agent and create a sink (`roles/owner` carries all of them). Before an apply the
+installer asks each listed project the sink would cover whether that identity can create a sink
+there, and refuses the apply naming the project when it cannot, unless the install's Terraform
+state already holds that project's sink, when it warns and goes ahead; the routes that only plan
+or hand the apply off (`upgrade.sh --plan`, `install.sh --generate-only`) warn instead, and
+`install.sh --dry-run` runs no preflight.
 `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS` bind the roles on a folder or
 organisation, whose bindings every project beneath it inherits; its members get
 no drift sink: their clusters are discovered at runtime and their changes are
@@ -286,7 +291,11 @@ On an install you manage with Helm or `kubectl` directly:
    JSON patch `remove` operation on its index (keeping `spec.scope: {projects: []}`
    if it was the last additional project) so the reconciler retires its Cluster
    Agent profiles over two clean runs.
-2. If you onboarded clusters in chat, add each one to
+2. If you onboarded clusters in chat, exclude each one: on a Helm release, set
+   the chart value `platformAgent.scope.exclude.clusters` and run
+   `helm upgrade`, because the chart renders the field and a hand edit of the
+   CR is overwritten at the next upgrade; on a hand-applied `PlatformAgent`,
+   add it to
    [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope)
    (`projectId`, `location`, `clusterName`). A profile the scope never
    produced is kept (listed under `unmanaged` in `fleet_scope.json`), so

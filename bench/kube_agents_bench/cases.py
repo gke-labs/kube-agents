@@ -56,7 +56,8 @@ NOOP_DEPLOYER = "noop"
 
 # The check types that read the run's own tool calls or worker logs rather
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
-# ``worker_commands`` the delegated cards' worker logs, ``worker_agents`` the
+# ``worker_commands`` the delegated cards' worker logs (or, with
+# ``after_result_pattern``, the workers' trajectory entries), ``worker_agents`` the
 # ``agent`` tags the harness puts on the workers' trajectory entries. On the
 # inject transport they are blind in two different ways, and the scorer
 # sets each aside under its own condition (``scoring.py``, the inject lane).
@@ -169,6 +170,14 @@ class CaseSpec:
     compound mixing such a leaf with a router-scope ``tool_called`` lands
     here, not in ``trace_blind_checks``: its worker leaf would still error
     with the trace shown, and grading the compound would block on it."""
+
+    tool_calls_optional: bool = False
+    """``tool_calls_optional:``, for a case a correct agent can answer without
+    calling a tool -- a first-turn greeting, a reply that names a command.
+    Rung 3 otherwise reads an empty trajectory as no agent having run; for a
+    case that sets it, a non-empty reply stands in for the trajectory as the
+    run evidence, beside the billed tokens and latency every case needs.
+    Absent means False."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -333,6 +342,9 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
 
     expected_fail_raw = doc.get("expected_fail", False)
     expected_fail = _coerce_bool(expected_fail_raw, field="expected_fail", path=path)
+    tool_calls_optional = _coerce_bool(
+        doc.get("tool_calls_optional", False), field="tool_calls_optional", path=path
+    )
 
     domain_raw = doc.get("domain")
     domain = str(domain_raw).strip() if domain_raw is not None else None
@@ -354,4 +366,5 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         trace_blind_checks=trace_blind,
         negated_trace_blind_checks=negated_trace_blind,
         worker_blind_checks=worker_blind,
+        tool_calls_optional=tool_calls_optional,
     )

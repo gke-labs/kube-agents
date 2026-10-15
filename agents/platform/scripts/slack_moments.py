@@ -6,7 +6,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 * A pull request the work opened (:func:`pr_opened`), or a GitLab merge
   request: a bold headline naming it, the worker's own line below it as evidence, and "Open PR"
   ("Open MR" for a merge request; the primary button) and "Files changed" url buttons, beside a green side bar
-  (:data:`PR_SIDE_BAR`). :func:`opened_pr` finds it in a progress note or a report, and
+  (:data:`PR_SIDE_BAR`). :func:`proposal_ref` reads one from the url the forge
+  answered with when the work opened it, which no wording decides, and
+  :func:`evidence_line` finds the worker's line naming it. As the fallback for a
+  PR opened any other way, :func:`opened_pr` finds it in a progress note or a report, and
   only where the line says it opened that PR, the verb in front of the url
   with the worker as its subject by the one rule in :func:`_ours`, so a note
   citing someone else's PR ("… pull/300, opened by bob", "Dependabot opened
@@ -24,6 +27,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   side bar (:data:`NEEDS_YOU_SIDE_BAR`), which stays once it is settled while
   anything is left below the headline.
 
+A finished answer that ends by asking which of its options to take gets the same
+option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` under today
+and ``chat_message.answer_message`` under next.
+
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
 into the headline and the attachment that carries the bar when it is posted.
 """
@@ -39,9 +46,10 @@ import slack_presenter as _presenter
 #: trailing path (``/files``, ``#discussion``) left out of the match. Any other
 #: host is left to the ordinary line: the headline vouches for the url in the
 #: bot's voice and the evidence line hides its host, so a note echoing someone
-#: else's link must not become a button. GitHub alone, as in
-#: ``repo_ref.GITHUB_HOSTS``, which names no enterprise host.
-PR_URL = re.compile(r"https://github\.com/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)")
+#: else's link must not become a button. github.com, and the install's GitHub
+#: Enterprise Server host when it has one (``_pr_url``), and no other host.
+PR_URL_TEMPLATE = r"https://(?:{hosts})/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)"
+PR_URL = re.compile(PR_URL_TEMPLATE.format(hosts=r"github\.com"))
 #: A GitLab merge request url over https: host, the project (the last segment
 #: of its path, groups and subgroups before it) and number, as groups 1 to 3,
 #: so the project and number sit where :data:`PR_URL` has repo and number. A
@@ -54,6 +62,21 @@ MR_URL = re.compile(r"https://([^\s/<>|:@]+)(?::\d+)?/(?:[^\s/<>|]+/)+([^\s/<>|]
 #: ``repo_ref.GITLAB_CANONICAL_HOST``, spelt out: this module imports nothing but
 #: ``slack_presenter``, and the image-build check stages no ``repo_ref`` beside it.
 GITLAB_HOST = "gitlab.com"
+
+
+_PR_URLS: dict[str, re.Pattern] = {}
+
+
+def _pr_url(github_host: str) -> re.Pattern:
+    """:data:`PR_URL` for an install whose GitHub host is ``github_host``."""
+    host = github_host.strip().lower()
+    if not host or host == "github.com":
+        return PR_URL
+    if host not in _PR_URLS:
+        _PR_URLS[host] = re.compile(PR_URL_TEMPLATE.format(hosts=r"github\.com|" + re.escape(host)))
+    return _PR_URLS[host]
+
+
 #: What must sit right before the url for a line to announce the PR as ours:
 #: the verb, then optionally "a"/"the", "new", "PR"/"pull request" with its
 #: number, a colon, dash or "(", and the opening of a ``[label](`` or ``<`` link.
@@ -173,7 +196,12 @@ PR_REF = "PR #{number}"
 #: #412". A Slack ``<url|label>``, markdown ``[label](url)`` or ``(url)``
 #: around it goes too, and so does a tail after the number (``/files``).
 PR_URL_TAIL = r"(?:[/?#][^\s<>|()\[\]]*)?"
-PR_REF_URL = r"(?:<{url}{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}{tail}\)|{url}{tail})"
+#: ``(?!\d)`` ends the url at its number, so PR 9's url does not match inside PR 91's.
+URL_NUMBER_END = r"(?!\d)"
+PR_REF_URL = (
+    r"(?:<{url}" + URL_NUMBER_END + r"{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}" + URL_NUMBER_END
+    + r"{tail}\)|{url}" + URL_NUMBER_END + r"{tail})"
+)
 PR_REF_SPAN = (
     r"(?:\b{lead}\s*[:—–-]?(?P<mark>[*_`]*)\s*)?(?P<open>[*_`]*)"
     r"(?:\(\s*{ref}\s*\)|{ref})(?P<close>[*_`]*)"
@@ -197,6 +225,10 @@ A_BEFORE_MR = re.compile(r"\b([Aa])(?=\s+[*_`]*MR !)")
 PR_LAYOUT = (PR_HEADLINE, PR_REF, PR_LEAD, OPEN_PR, FILES_PATH)
 MR_LAYOUT = (MR_HEADLINE, MR_REF, MR_LEAD, OPEN_MR, DIFFS_PATH)
 PR_ACTION_PREFIX = "kage_pr"
+#: A line naming a PR or merge request by its number alone ("PR #99", "MR !12"), as
+#: :func:`evidence_line` finds the worker's line about one it opened.
+PR_NUMBER_REF = r"(?<![\w#!])#{number}\b"
+MR_NUMBER_REF = r"(?<![\w#!])!{number}\b"
 
 #: An option line in a block reason: a bullet, a numbered item or a lettered one ("a)", "B.").
 OPTION_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+(.+?)\s*$")
@@ -234,22 +266,58 @@ NEEDS_YOU_ACTION_PREFIX = "kage_needs"
 WAITING = "⏸ waiting on you"
 NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
 
+#: A finished answer's options (:func:`answer_choices`): a list item, its indent, marker and text;
+#: the bold lead a label is taken from; the "(Recommended)" that makes an option the primary one
+#: and leaves its label; and an "Option 2:" numbering, which a button does not need.
+ITEM_LINE = re.compile(r"^( {0,3})([-*+•]|\d+[.)]|[A-Za-z][.)])\s+(\S.*?)\s*$")
+BOLD_LEAD = re.compile(r"^\*\*(.+?)\*\*|^__(.+?)__")
+RECOMMENDED = re.compile(r"\s*\(\s*recommended\s*\)", re.IGNORECASE)
+OPTION_NUMBER = re.compile(r"^option\s+(?:\d+|[a-z])\b\s*[:.)\-–—]?\s*", re.IGNORECASE)
+#: A yes/no question's opening word ("Want me to scale it?", "Should I apply it?"): under a finished
+#: answer's list it offers the list as the plan, not as options, unless it also says "which" or "or".
+YES_NO_OPENER = re.compile(
+    r"^(?:shall|should|can|could|may|might|will|would|do|does|did|is|are|am|was|were|want|have|has|ok|okay"
+    r"|sounds?|looks?)\b",
+    re.IGNORECASE,
+)
+#: Words that ask to choose among a list, for a closing question with no "which" or "or":
+#: "How would you like to proceed?", "Do you have a preference?" is a yes/no opener and not one.
+CHOICE_HINT = re.compile(r"\b(?:prefer|preference|options?|choose|pick)\b|^how\s+would\s+you\s+like\b", re.IGNORECASE)
+#: How many item lines :func:`_list_start` reads up from an answer's end before it gives up, nested
+#: items included: well past five options with sub-bullets, and it keeps the scan linear.
+LIST_SCAN_MAX = 50
+#: What may sit between a bold lead and the rest of its line ("**Fix it**: …", "**Fix it** — …").
+LEAD_JOINER = " :-–—"
+#: An option shown under the answer: its marker, its label in bold, and the first sentence
+#: of what the answer said about it.
+SHOWN_OPTION = "{marker} **{label}**"
+SHOWN_SUMMARY = "{line} — {summary}"
+#: A line that is not prose: a quote or a table row, beside the presenter's headings, items and fences.
+NOT_PROSE = re.compile(r"^\s*[>|]")
 
-def opened_pr(text: str, gitlab_hosts: Collection[str] = frozenset()) -> tuple[str, str, str, str] | None:
+
+def opened_pr(
+    text: str, gitlab_hosts: Collection[str] = frozenset(), github_host: str | None = None
+) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
-    return next(opened_prs(text, gitlab_hosts), None)
+    return next(opened_prs(text, gitlab_hosts, github_host), None)
 
 
-def opened_prs(text: str, gitlab_hosts: Collection[str] = frozenset()) -> Iterator[tuple[str, str, str, str]]:
+def opened_prs(
+    text: str, gitlab_hosts: Collection[str] = frozenset(), github_host: str | None = None
+) -> Iterator[tuple[str, str, str, str]]:
     """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order.
 
     A GitLab merge request counts too, on :data:`GITLAB_HOST` or one of
     ``gitlab_hosts``, the self-managed hosts the caller vouches for; its
     ``repo`` is the project. :func:`pr_opened` tells the two apart by the url.
+    ``github_host`` is the install's GitHub host, which the caller reads; None
+    is github.com. This module reads nothing but its arguments.
     """
     hosts = {GITLAB_HOST, *(host.lower() for host in gitlab_hosts)}
+    pr_url = _pr_url(github_host or "github.com")
     for line in str(text or "").splitlines():
-        for match, (before_url, then, labels) in _proposals(line, hosts):
+        for match, (before_url, then, labels) in _proposals(line, hosts, pr_url):
             verb = before_url.search(line[: match.start()]) or _opened_pr_then(
                 line[: match.start()], match.group(3), then
             )
@@ -261,9 +329,42 @@ def opened_prs(text: str, gitlab_hosts: Collection[str] = frozenset()) -> Iterat
             yield match.group(0), match.group(2), match.group(3), line.strip()
 
 
-def _proposals(line: str, gitlab_hosts: Collection[str]) -> list[tuple[re.Match, tuple]]:
-    """Each PR url and merge request url on ``gitlab_hosts`` in ``line``, in order, with its rules."""
-    found = [(match, PR_RULES) for match in PR_URL.finditer(line)]
+def proposal_ref(
+    url: str, gitlab_hosts: Collection[str] = frozenset(), github_host: str | None = None
+) -> tuple[str, str, str] | None:
+    """``(url, repo, number)`` for the PR or merge request at ``url``, else None.
+
+    For a url a forge answered with when the work opened it, so no wording is
+    read: a PR on github.com or ``github_host``, or a merge request on
+    :data:`GITLAB_HOST` or one of ``gitlab_hosts``, the hosts :func:`opened_prs`
+    would announce, with any tail left out as it leaves it out.
+    """
+    text = str(url or "").strip()
+    match = _pr_url(github_host or "github.com").match(text)
+    if match is None:
+        match = MR_URL.match(text)
+        hosts = {GITLAB_HOST, *(host.lower() for host in gitlab_hosts)}
+        if match is None or match.group(1).lower() not in hosts:
+            return None
+    return match.group(0), match.group(2), match.group(3)
+
+
+def evidence_line(text: str, url: str, number: str) -> str:
+    """The first line of ``text`` naming the PR at ``url``, by its url or its number, else ""."""
+    ref = re.compile((MR_NUMBER_REF if MR_URL.match(url) else PR_NUMBER_REF).format(number=re.escape(number)))
+    named = re.compile(re.escape(url) + URL_NUMBER_END)
+    for line in str(text or "").splitlines():
+        if named.search(line) or ref.search(line):
+            return line.strip()
+    return ""
+
+
+def _proposals(
+    line: str, gitlab_hosts: Collection[str], pr_url: re.Pattern = PR_URL
+) -> list[tuple[re.Match, tuple]]:
+    """Each PR url (on the hosts ``pr_url`` matches) and merge request url on
+    ``gitlab_hosts`` in ``line``, in order, with its rules."""
+    found = [(match, PR_RULES) for match in pr_url.finditer(line)]
     found += [(match, MR_RULES) for match in MR_URL.finditer(line) if match.group(1).lower() in gitlab_hosts]
     return sorted(found, key=lambda item: item[0].start())
 
@@ -561,3 +662,180 @@ def needs_you_settled(blocks: Sequence[dict], note: str = "") -> list[dict]:
     if note:
         out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
     return out
+
+
+# --- a finished answer's options --------------------------------------------
+
+
+def _not_prose(line: str) -> bool:
+    """Whether ``line`` is a heading, a list item, a fence, a quote or a table row."""
+    return bool(
+        _presenter.HEADING.match(line) or _presenter.LIST_MARKER.match(line) or ITEM_LINE.match(line)
+        or _presenter._opens_fence(line) or NOT_PROSE.match(line)
+    )
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _marker_kind(marker: str) -> tuple[bool, bool]:
+    """A numbered, lettered or bulleted marker; one list keeps to one kind."""
+    return marker[0].isdigit(), marker[0].isalpha()
+
+
+def _items(lines: Sequence[str]) -> list[tuple[str, str, list[str]]] | None:
+    """``lines`` as one list's items, each ``(marker, text, continuation lines)``, or None when they are not one.
+
+    The first line is an item. Every later line is blank, an item of the same kind at the same
+    indent, or indented deeper, which continues the item above it (a nested list, a fence).
+    """
+    first = ITEM_LINE.match(lines[0]) if lines else None
+    if not first:
+        return None
+    indent, kind = len(first.group(1)), _marker_kind(first.group(2))
+    items: list[tuple[str, str, list[str]]] = []
+    for line in lines:
+        item = ITEM_LINE.match(line)
+        if item and len(item.group(1)) == indent and _marker_kind(item.group(2)) == kind:
+            items.append((item.group(2), item.group(3), []))
+        elif not line.strip() or _indent(line) > indent:
+            items[-1][2].append(line)
+        else:
+            return None
+    return items
+
+
+def _list_start(lines: Sequence[str]) -> int | None:
+    """Where the longest list that ends ``lines`` starts, or None when they do not end in one or
+    it runs past :data:`LIST_SCAN_MAX` item lines, far more than an offer of options holds."""
+    found, seen = None, 0
+    for start in range(len(lines) - 1, -1, -1):
+        line = lines[start]
+        if ITEM_LINE.match(line):
+            seen += 1
+            if seen > LIST_SCAN_MAX:
+                return None
+            if _items(lines[start:]) is not None:
+                found = start
+        elif line.strip() and not _indent(line):
+            break
+    return found
+
+
+def _asks_choice(question: str) -> bool:
+    """Whether ``question`` asks for one of the options: it ends in a question mark, and its
+    last sentence says "which" or "or", or asks to choose (:data:`CHOICE_HINT`) without being
+    a yes/no ask to go on (:func:`_trailing_options`) or any other yes/no question
+    (:data:`YES_NO_OPENER`). "Anything else?" under a list of findings asks for no choice."""
+    text = _presenter._plain(question)
+    if not text.endswith(QUESTION_END):
+        return False
+    asked = SENTENCE_START.split(text)[-1]
+    if CHOICE_WORD.search(asked):
+        return True
+    return not (PROCEED_QUESTION.search(asked) or YES_NO_OPENER.match(asked)) and bool(CHOICE_HINT.search(asked))
+
+
+def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, bool, str, bool] | None:
+    """``(label, primary, shown line, whole)`` for one option, or None when it cannot be a button.
+
+    The label is the item's bold lead, else its whole first line, which must then fit a
+    button; "(Recommended)" makes it primary and an "Option 2:" numbering is dropped. The
+    shown line is the label in bold and the first sentence the item says after it, or empty
+    when it says nothing more than its label. ``whole`` is whether the label and the shown
+    line carry all the item says.
+    """
+    lead = BOLD_LEAD.match(text)
+    said = text[lead.end():] if lead else ""
+    # "**Fix it** (Recommended): …" marks the option outside its bold as well.
+    marked = RECOMMENDED.match(said)
+    said = said[marked.end():].lstrip(LEAD_JOINER) if marked else said.lstrip(LEAD_JOINER)
+    label = _presenter._plain(lead.group(1) or lead.group(2) if lead else text)
+    primary = bool(marked or RECOMMENDED.search(label))
+    label = " ".join(OPTION_NUMBER.sub("", RECOMMENDED.sub("", label)).split()).rstrip(":").strip()
+    if not label or (not lead and len(label) > _presenter.BUTTON_TEXT_MAX):
+        return None
+    clipped = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX)
+    whole_label, label = clipped == label, clipped
+    if not said:
+        prose = []
+        for line in continuation:
+            if not line.strip() or _not_prose(line.strip()):
+                break
+            prose.append(line.strip())
+        said = " ".join(prose)
+    held, spans = _presenter._hold_code(said)
+    summary = _presenter._restore_code(_presenter._first_sentence(held)[0], spans).strip()
+    shown = SHOWN_SUMMARY.format(line=SHOWN_OPTION.format(marker=marker, label=label), summary=summary)
+    whole = whole_label and not any(line.strip() for line in continuation) and summary == said.strip()
+    return label, primary, shown if summary else "", whole
+
+
+def answer_choices(rest: str, buttons: bool = True) -> tuple[str, str, str, list[tuple[str, bool]]] | None:
+    """A finished answer's options as choices: ``(shown, folded, question, options)``, or None.
+
+    ``rest`` is the answer after its headline, as markdown. It offers choices when it ends with
+    a question over two to five options, as a needs-you reason does (:func:`_question`): the
+    options end it right under the question, or the question is its last paragraph right
+    under them. The question asks for one (:func:`_asks_choice`), and every option makes a
+    label (:func:`_option`), none twice. ``options`` are ``(label, primary)``, the first
+    recommended one primary. ``shown`` is a prose paragraph that opens ``rest``, then each
+    option's shown line when every option has one; ``folded`` is everything else before the options, then the options
+    as written when any says more than its first line, for a fold; ``question`` is the question.
+    With ``buttons`` False, as outside a thread, nothing carries the labels, so ``shown`` holds
+    the options as written and ``folded`` only what came before them.
+    """
+    lines = (rest or "").strip("\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    para = len(lines)
+    while para and lines[para - 1].strip():
+        para -= 1
+    closing = lines[para:]
+    question = " ".join(line.strip() for line in closing)
+    if closing and not any(_not_prose(line) for line in closing) and _asks_choice(question):
+        before = lines[:para]
+        while before and not before[-1].strip():
+            before.pop()
+        start = _list_start(before)
+        region, head = (before[start:], before[:start]) if start is not None else ([], [])
+    else:
+        start = _list_start(lines)
+        asked = (start or 0) - 1
+        while asked >= 0 and not lines[asked].strip():
+            asked -= 1
+        if start is None or asked < 0 or _not_prose(lines[asked]) or not _asks_choice(lines[asked]):
+            return None
+        question, region, head = lines[asked].strip(), lines[start:], lines[:asked]
+    items = _items(region)
+    if not items or not OPTIONS_MIN <= len(items) <= OPTIONS_MAX:
+        return None
+    options = [_option(*item) for item in items]
+    if any(option is None for option in options):
+        return None
+    labels = [label.casefold() for label, _primary, _shown, _whole in options]
+    if len(set(labels)) != len(labels):
+        return None
+    first = next((i for i, (_label, primary, _shown, _whole) in enumerate(options) if primary), None)
+    head = list(head)
+    while head and not head[-1].strip():
+        head.pop()
+    lead_end = next((i for i, line in enumerate(head) if not line.strip()), len(head))
+    lead = head[:lead_end] if head and not _not_prose(head[0]) else []
+    folded = head[len(lead):]
+    if not buttons:
+        shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(region).strip()) if part)
+        return shown, "\n".join(folded).strip(), question, [
+            (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
+        ]
+    # The options' lines show only when each says more than its button does.
+    lines = [line for _label, _primary, line, _whole in options]
+    shown_all = all(lines)
+    # The options fold as written whenever what is in sight does not carry all they say.
+    if any(not whole or (line and not shown_all) for _label, _primary, line, whole in options):
+        folded = [*folded, "", *region]
+    shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(lines) if shown_all else "") if part)
+    return shown, "\n".join(folded).strip(), question, [
+        (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
+    ]

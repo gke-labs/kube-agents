@@ -3,6 +3,85 @@
 **Status:** requirements. Nothing here is built beyond what the Scope table credits to an existing
 audit or skill.
 
+## High level summary
+
+A GKE minor upgrade replaces the control plane and rebuilds every node. Either event can stop an
+application that did not expect it. The upgrade work gives kube-agents two questions to answer for
+every cluster: will the next upgrade succeed, and what did the last upgrade change. Some pieces are
+on main today. The Scope table below and each linked document's status line say which. This document
+and the retrospective design specify the rest. The agent only reads and reports. A person decides
+and upgrades.
+
+**Before the upgrade: the readiness report.** A daily job grades each cluster for which GKE offers a
+new version, and the agent grades any cluster on request in chat. Today each cluster's grade is
+blocked, unknown or ready, and each finding names the object and the setting that blocks. This
+document specifies a verdict per cluster family: Go, No-Go or Action required. The Scope table below
+says which parts exist on main.
+
+**After the upgrade: the retrospective.** The retrospective design specifies a job that runs once at
+install, at the end of each weekend and soon after each upgrade. Its report says what each upgrade
+did, what failed, which catalogue entry the failure matches, and the fix to make before the next
+upgrade. It records each failure, and each risk it finds on a cluster, as a guard. The next
+readiness report shows the guard. Nothing of it is on main yet. See
+[`upgrade-retrospective.md`](upgrade-retrospective.md).
+
+**What both rest on: the catalogue and the test fleet.** The catalogue lists twenty ways an upgrade
+fails, each from a public incident, provider documentation or a test-fleet fixture. For each it
+names the signal before the upgrade and the signal after it. The test fleet carries the before-state
+of each entry that a standing fixture can carry. The catalogue plans one evaluation case per entry,
+each grading whether the agent names it, and its status table names the registered cases. See
+[`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md) and
+[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md).
+
+### The twenty scenarios, as the agent reports them
+
+Each of the twenty cases is to ask the agent one question about the test fleet and grade a
+fixed-form answer line. The line names the cluster, the object and the finding, so a check reads it
+without a model as judge. The catalogue's status table names the registered cases; the rest are
+planned. Entry 5's fixture is a maintenance exclusion that holds the minor upgrade. One answer the
+agent gave for it on the test fleet, from a case not yet registered, quoted from the run's record:
+
+```
+seeded-a: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
+seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2027-01-05; holds the automatic minor upgrade: yes
+seeded-c: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
+seeded-d: exclusion none; scope none; ends none; holds the automatic minor upgrade: no
+```
+
+That case's check graded five objectives on that reply and passed all five. The five objectives: a
+line exists, it states the scope and end date, it says the exclusion holds the upgrade, and it
+invents no CVE.
+
+### The retrospective, as it reports
+
+The retrospective design specifies a collector. It reads GKE's upgrade operations for the window,
+the versions before and after, and the objects that failed after each one. It matches each failure
+to a catalogue entry, or marks it unclassified. It writes one block per incident: what happened,
+what failed, how to detect and mitigate it next time, and the guard it recorded. One block from a
+report the collector produced on a development project that contains the test fleet. The quote
+leaves out the version and operation tables and replaces the project name:
+
+```
+### 2 — <project>/us-central1-a/seeded-a — `seeded-capacity/Deployment/inference-server`
+
+**What happened.** new (first seen); channel REGULAR; cluster status RUNNING.
+
+**What failed.**
+
+| Symptom | Since | Catalogue entry | Confidence | Evidence |
+| --- | --- | --- | --- | --- |
+| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |
+
+**Detect and mitigate next time.**
+- **2. No spare capacity for the displaced pods** — For seeded-capacity/Deployment/inference-server: A pool whose upgrade settings let a node go before its replacement exists, with requests near allocatable, the autoscaler at its ceiling or quota exhausted. Read today: the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; `maxSurge` and headroom against allocatable are unread. Mitigate before: Keep the pool on maxSurge at least 1 and maxUnavailable 0, with one node of headroom and quota for the extra node. Mitigate after: Add a node or raise the ceiling and the Pending pods schedule.
+
+**Mitigation set up.**
+- guard `<project>/us-central1-a/seeded-a#failure#2#seeded-capacity/Deployment/inference-server` failure entry 2 (high), first seen 2026-10-14T19:49:58Z, 1 review(s)
+```
+
+That run reviewed the project's seven clusters in 20 seconds and filed 6 errors and 8 warnings. It
+recorded 61 guards: 15 for failures and 46 for risks.
+
 ## The problem, in one paragraph
 
 Kubernetes ships a new minor version every few months, and GKE clusters have to follow. Before a
@@ -142,13 +221,13 @@ Some of this already runs. The table says what, so nobody builds it twice. The S
 is the real definition of what that check does and at what threshold; this document does not
 repeat it. **The third column is the work.**
 
-| Area                                   | Already on `main`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | New in this document                                                                                                                                                                                                   |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Version posture                        | `security-patch-orchestrator` (`agents/platform/governance/security_patch_orchestrator_sop.md`): control plane behind its channel, node-pool skew, fleet spread, no channel, auto-upgrade and auto-repair off, no maintenance window, blocking exclusions, stale image types, notifications not configured, and whether a behind cluster's upgrade would go through cleanly (`upgrade-blocked`, from the readiness grade below). The `fleet-upgrade-verification` skill grades every cluster against one `--target-version` on request.                                                                                                                                                                                  | A target version and date **per family**, and days remaining against that date. GKE's API exposes no end-of-support date (the SOP records why calendar EOL was dropped), so the release calendar is an operator input. |
-| GKE deprecation insights               | Nothing scheduled. The `gke-upgrades` skill's checklist template tells a human to look at the insights dashboard or grep the API server's deprecated-request metric; no job reads the Recommender API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Everything in the section.                                                                                                                                                                                             |
-| Workload compatibility                 | The `fleet-upgrade-verification` skill's `api_deprecation_scan.py` scans every managed GitOps repository's manifests for `apiVersion`s the target version removes, reporting each hit with its replacement at the commit it read; it runs on request, not on a schedule.                                                                                                                                                                                                                                                                                                                                                                                                                                                 | The add-on compatibility matrix, admission-webhook posture, and image assumptions (cgroup v1, dockershim-era mounts) — and putting the existing manifest scan on the schedule.                                         |
-| Drain safety and disruption            | `obtainability-audit` (`agents/platform/governance/obtainability_audit_sop.md`): multi-replica workloads with no PodDisruptionBudget, drain-blocking budgets, single-replica Service-backed Deployments, rigid scheduling, missing spread. Weekly, the upgrade audit's `upgrade-blocked` check runs `fleet-upgrade-verification --readiness --cluster` once per behind cluster, and files the join; daily, the `upgrade-readiness-watch` cron job runs the same grade when a cluster is below a version its channel offers; on request, the same grade reports drain-blocking PDBs, upgrade-covering maintenance exclusions and node-pool skew per member against a chosen target, emitting `blocked`/`unknown`/`ready`. | Surge and blue/green capacity per pool, workloads pinned to a pool being retired, whether anything consumes the cluster's upgrade notifications.                                                                       |
-| Rollout orchestration and verification | The `fleet-upgrade-verification` skill reports, run over run, which clusters started, completed or stalled against one target version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Canary sequencing per family with each family's blocking findings, and the post-upgrade diff.                                                                                                                          |
+| Area                                   | Already on `main`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | New in this document                                                                                                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Version posture                        | `security-patch-orchestrator` (`agents/platform/governance/security_patch_orchestrator_sop.md`): control plane behind its channel, node-pool skew, fleet spread, no channel, auto-upgrade and auto-repair off, no maintenance window, blocking exclusions, stale image types, notifications not configured, and whether a behind cluster's upgrade would go through cleanly (`upgrade-blocked`, from the readiness grade below). The `fleet-upgrade-verification` skill grades every cluster against one `--target-version` on request.                                                                                                                                                                                                                                                                                                                      | A target version and date **per family**, and days remaining against that date. GKE's API exposes no end-of-support date (the SOP records why calendar EOL was dropped), so the release calendar is an operator input. |
+| GKE deprecation insights               | Nothing scheduled. The `gke-upgrades` skill's checklist template tells a human to look at the insights dashboard or grep the API server's deprecated-request metric; no job reads the Recommender API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Everything in the section.                                                                                                                                                                                             |
+| Workload compatibility                 | The `fleet-upgrade-verification` skill's `api_deprecation_scan.py` scans every managed GitOps repository's manifests for `apiVersion`s the target version removes, reporting each hit with its replacement at the commit it read; it runs on request, not on a schedule.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | The add-on compatibility matrix, admission-webhook posture, and image assumptions (cgroup v1, dockershim-era mounts) — and putting the existing manifest scan on the schedule.                                         |
+| Drain safety and disruption            | `obtainability-audit` (`agents/platform/governance/obtainability_audit_sop.md`): multi-replica workloads with no PodDisruptionBudget, drain-blocking budgets, single-replica Service-backed Deployments, rigid scheduling, missing spread. Weekly, the upgrade audit's `upgrade-blocked` check runs `fleet-upgrade-verification --readiness --cluster` once per behind cluster, and files the join; daily, the `upgrade-readiness-watch` cron job runs the same grade when a cluster is below a version its channel offers; on request, the same grade reports drain-blocking PDBs, fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes, upgrade-covering maintenance exclusions and node-pool skew per member against a chosen target, emitting `blocked`/`unknown`/`ready`. | Surge and blue/green capacity per pool, workloads pinned to a pool being retired, whether anything consumes the cluster's upgrade notifications.                                                                       |
+| Rollout orchestration and verification | The `fleet-upgrade-verification` skill reports, run over run, which clusters started, completed or stalled against one target version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Canary sequencing per family with each family's blocking findings, and the post-upgrade diff.                                                                                                                          |
 
 ## What a run produces: a verdict, not a list
 
@@ -167,10 +246,14 @@ Every check below carries a tier, and the tiers are what produce the verdict:
 The findings are the evidence behind the verdict; the verdict is the deliverable.
 
 Closest thing on `main`: `fleet-upgrade-verification --readiness` already emits
-`blocked`/`unknown`/`ready` per cluster from drain-blocking PDBs, maintenance exclusions and skew.
-Two things are missing — the verdict is per cluster, not per family, and it reads three inputs
-rather than every check here. It is on the schedule for the clusters that are behind: the
-upgrade audit's `upgrade-blocked` check runs it weekly and files the join.
+`blocked`/`unknown`/`ready` per cluster from drain-blocking PDBs, fail-closed webhooks with an
+unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC
+writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in `kube-system` and
+`kube-public`), maintenance exclusions and skew.
+Two things are missing — the verdict is per cluster, not per family, and it reads four inputs rather
+than every check here. It is on the schedule for the clusters that are behind: the upgrade audit's
+`upgrade-blocked` check runs it weekly and files the join, and the daily `upgrade-readiness-watch`
+cron job runs it for a cluster below a version its release channel offers.
 
 ## Version posture
 
@@ -228,7 +311,17 @@ Four ways a workload breaks on a new version:
   runs on is drained. Report the scope as well as the policy: a webhook whose rules or namespace
   selector can match `kube-system` or a cluster-scoped object can block the control plane's own
   writes during an upgrade, not just the pods being moved. Report the backend too — one replica with
-  no liveness probe is what turns a slow webhook into a stuck one.
+  no liveness probe is what turns a slow webhook into a stuck one. `--readiness` already grades the
+  case where the backend is unreachable now, on the webhook's rules (the writes a node drain and a
+  node join make, listed with their sources as `UPGRADE_PATH_TARGETS` in
+  `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`) and on its
+  bootstrap-RBAC reach (a dead webhook whose rules match the ClusterRoles and ClusterRoleBindings a
+  new master's `rbac/bootstrap-roles` hook reconciles, which no namespace selector exempts, or the
+  Roles and RoleBindings it reconciles in `kube-system` and `kube-public` when the selector admits
+  that namespace, `CONTROL_PLANE_CLUSTER_WRITES` and `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
+  Jetstack outage deadlocked on left the start-up path in Kubernetes 1.17, and the leader-election
+  Leases are already on the node path's list); the object selector, match conditions and the
+  would-fail-once-drained backend are still unread.
 - **Manifests in Git, and release state, not just live clusters.** Stored Helm release manifests
   carry removed kinds even when nothing in the cluster runs them, and the next `helm upgrade` of that
   release fails on reading its own stored state. Nothing breaks until someone deploys, which is why

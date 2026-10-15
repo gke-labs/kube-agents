@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -115,6 +115,13 @@ defaults to `false`, a case for your own change never carries it, and it must be
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
 
+`tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
+first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
+trajectory as no agent having run; with the key set, a non-empty reply on a record with no error
+stands in for the trajectory, and the token, latency and status signals still apply
+([`eval-scorer.md`](eval-scorer.md)). It does not forbid tool calls. It defaults to `false`, must be
+a bare YAML boolean, and devops-bench ignores it.
+
 `audit_streams` is for a case whose stack starts real audit runs without grading their
 ledger: a list of the Platform Agent job ids it starts
 (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
@@ -124,6 +131,14 @@ releases them when devops-bench returns. A run that outlasts the unit is covered
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
+
+The runner pauses most of the Platform Agent's clock-started audits once per lease, before any
+unit (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
+repository in the middle of an eval and be charged to whichever cases are running. It leaves the
+four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
+`no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
+write from one of them mid-eval is still possible. An audit case starts its own run from its
+prompt, which a paused schedule doesn't affect.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -230,14 +245,16 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it), `worker_agents` (regular expressions every one of which must match the
+purges it, or with `required_runs` a script by its basename and the flags that must
+follow it on the same shell segment, read from the command's argv as the shell splits
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), and `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule).
 
-Nine read the install under test, eight of them from that file. `bootstrap_fanout` compares the
+Eleven read the install under test, nine of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -248,7 +265,10 @@ card for anything else).
 `INVENTORY.raw.md` there, and every cluster the writer's own `finding_lines` lists from the
 completed cluster cards has a block line) or `ranking_card_filed` (the newest unarchived card keyed
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
-not `blocked`, `triage`, `failed` or `cancelled`).
+not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
+same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
+stage runs after the scan; an error on an install the gate recorded as having no GitOps repository,
+where the scan runs those checks on purpose).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
 `INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py
@@ -268,7 +288,10 @@ staged skills, scripts and governance against the copies the sandbox runs, so a 
 grade an edit to them by its effect. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
-case's plant is missing. `oobe_audits_started`, in its own module
+case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
+sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
+the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
+finding in its `document` whose id contains it. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
@@ -443,8 +466,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
-boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
