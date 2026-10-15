@@ -14,12 +14,14 @@
 # whoever owns the user's card blocks with the question.
 #
 # The objectives read the workers' kanban_block call (scope: workers), since
-# the front door never blocks a card itself. The reason's shape is what the
-# Slack parser turns into buttons: a line ending in "?" and right below it two
-# to five option lines, each at most 75 characters (slack_presenter
-# BUTTON_TEXT_MAX), and nothing after them. The option-length bound in the
-# pattern counts the marker's text as written, markup included, so it is a
-# little stricter than the parser, which strips the markup first. A worker's
+# the front door never blocks a card itself. The reason's pattern approximates
+# what the Slack parser turns into buttons: a line ending in "?" and right
+# below it two to five option lines, each at most 75 characters
+# (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It differs from
+# the parser at the edges, none of which the SOULs' "Which one?" shape
+# reaches: it counts an option's markup against the 75, rejects a question in
+# single-asterisk italics and CRLF line ends, and accepts a list after a
+# "Shall I proceed?" that the parser leaves as text. A worker's
 # arguments are clipped at 2,000 characters in the pod
 # (worker_trajectory.MAX_ARGS_CHARS), and a reason past that loses its tail
 # to the clip and fails here; the SOULs ask for a short reason for the same
