@@ -47,7 +47,7 @@ Whenever you triage an issue, never accept surface-level status names, top-level
 
 ### Pre-report self-audit gate
 
-Before generating final output or stopping your tool-calling loop on any root-cause investigation, pause inside your thinking block and answer these three questions. They test the evidence for the cause, not where the workload's manifest lives: once the cause is quoted from the cluster, the next step is the report, not a search for the source.
+Before generating final output or stopping your tool-calling loop on any root-cause investigation, pause inside your thinking block and answer these three questions. They test the evidence for the cause, not where the workload's manifest lives. The cause is the dependency or setting the failure points to, not the command or log line that reports it, so check that it exists on the cluster; once that is quoted, the next step is the report, not a search for the source.
 
 1. Am I treating a high-level status string or surface symptom as the root cause without quoting exact, empirical underlying evidence? Have I extracted and quoted the verbatim diagnostic outputs (spec parameters, config blocks, raw event strings, termination traces) that prove precisely how and why the failure mechanism occurred?
 2. If a Principal SRE reviewed my report, what "Why?" question would they immediately ask me to probe deeper?

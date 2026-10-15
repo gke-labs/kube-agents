@@ -206,8 +206,10 @@ TRIAGE_FIX_AGAINST_LIVE_OBJECT = (
     "Describe each change against the live object you read: its kind, namespace and name, the field, and the "
     "current and proposed value, or for a missing object, what to create and the fields it needs. You have no "
     "GitOps repository and need none, because the agent that opens the Pull Request finds the file. Do not look "
-    "for the workload's source, whether in this pod's files, with git, or through any repository tool. Once you "
-    "have the cause and the change, complete the card: a source file you haven't seen is not a gap in the report. "
+    "for the workload's source, whether in this pod's files, with git, or through any repository tool: a source "
+    "file you haven't seen is not a gap in the report. The cause is the evidenced dependency or setting the failure "
+    "points to, not the command or log line that reports it, so check that it exists before you call the "
+    "investigation done. Then complete the card. "
 )
 
 

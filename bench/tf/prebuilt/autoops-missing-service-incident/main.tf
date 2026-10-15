@@ -49,9 +49,13 @@ locals {
   }
 }
 
-# The workload: busybox that prints it cannot reach the missing Service and
-# exits 1, so the Service name (the planted evidence noun) is in the container
-# log and in the pod spec's command, and nowhere in any event. Exits fast, so BackOff accumulates
+# The workload: busybox that looks its database Service up before it starts
+# and exits 1 when the lookup fails, as a service with a hard dependency does.
+# The Service never exists, so it crash-loops; with the Service present it
+# would run. The command is therefore not the bug: a triage that blames it
+# instead of the missing Service read the surface. (The first version simply
+# echoed the error and exited, which read as a fake failure and graded whether
+# the model saw through it rather than the triage.) Exits fast, so BackOff accumulates
 # quickly; the watcher gate accepts the crash-loop half of the BackOff family
 # (k8s-operator/cmd/k8s-event-watcher/filter_test.go — the image-pull half is
 # deliberately left alone, which is why this plant crashes at runtime rather
@@ -178,7 +182,7 @@ resource "null_resource" "incident" {
             containers:
               - name: app
                 image: busybox:1.36
-                command: ["sh", "-c", "echo \"FATAL: cannot reach database at ${var.missing_service_name}.${local.ns}.svc:5432\" >&2; exit 1"]
+                command: ["sh", "-c", "nslookup ${var.missing_service_name}.${local.ns}.svc.cluster.local >/dev/null 2>&1 || { echo \"FATAL: cannot reach database at ${var.missing_service_name}.${local.ns}.svc:5432\" >&2; exit 1; }; exec sleep 3600"]
                 resources:
                   requests:
                     cpu: 10m

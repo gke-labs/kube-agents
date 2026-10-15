@@ -3,8 +3,9 @@
 #
 # WHAT THIS GRADES: what a Cluster Agent triage worker does once it has the
 # cause. The plant (prebuilt/autoops-missing-service-incident) is a container
-# that prints it cannot reach a database Service and exits; no such Service
-# exists. The cause is visible in the first minute, from the pod spec's
+# that looks up its database Service before it starts and exits when the
+# lookup fails; no such Service exists, so the cause is the missing Service,
+# not the command. The cause is visible in the first minute, from the pod spec's
 # command, the container log and `kubectl get svc`. On the 10-14 rehearsal a
 # worker had exactly this cause at minute one, then spent 21 minutes hunting
 # for the workload's GitOps source (git status in its workspace, the
