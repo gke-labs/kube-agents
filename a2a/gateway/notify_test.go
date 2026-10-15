@@ -536,8 +536,26 @@ type fakeConversations struct {
 	rendersChat    bool
 	failEdits      bool
 	transientEdits int
-	edits          []notifyPost
-	chats          []*chatmsg.Message
+	// failPosts fails every Post (and so every PostMessage).
+	failPosts bool
+	edits     []notifyPost
+	chats     []*chatmsg.Message
+	// marks records MarkConversation calls as "conversation ask/settle",
+	// then "@update" for a keyed request, with postsAtMark the number of
+	// posts made by then.
+	marks       []string
+	postsAtMark []int
+}
+
+func (f *fakeConversations) MarkConversation(conversation, update string, mark MarkState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entry := conversation + " " + mark.Ask + "/" + mark.Settle
+	if update != "" {
+		entry += "@" + update
+	}
+	f.marks = append(f.marks, entry)
+	f.postsAtMark = append(f.postsAtMark, len(f.posts))
 }
 
 func (f *fakeConversations) ConversationContext(_ context.Context, key string) (string, error) {
@@ -547,6 +565,9 @@ func (f *fakeConversations) ConversationContext(_ context.Context, key string) (
 func (f *fakeConversations) Post(conversation, text string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failPosts {
+		return "", errors.New("fake post failure")
+	}
 	f.posts = append(f.posts, notifyPost{thread: conversation, text: text})
 	return conversation + "/messages/c" + string(rune('0'+len(f.posts))), nil
 }
@@ -859,5 +880,3 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 		t.Fatalf("conv.posts = %v, want 0 posts after Stop", conv.posts)
 	}
 }
-
-

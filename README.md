@@ -102,6 +102,49 @@ For three scenarios from trigger to pull request (a scheduled audit, a crash loo
 
 ---
 
+## 🧰 Capabilities
+
+The Platform Agent runs these audits on a schedule and posts each report to chat. Each skill is a procedure that the Platform Agent or a Cluster Agent loads when a request or an audit needs it. The [skill catalog](https://gke-labs.github.io/kube-agents/skills/) describes each skill, and the [cron job reference](https://gke-labs.github.io/kube-agents/reference/cron-jobs/) lists every scheduled job.
+
+<!-- BEGIN GENERATED: capabilities -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
+### Scheduled governance audits
+
+| Audit | Schedule (UTC) | Procedure |
+| ----- | -------------- | --------- |
+| Security & RBAC Posture Audit | Daily 06:20 | [`compliance_audit_sop.md`](agents/platform/governance/compliance_audit_sop.md) |
+| Workload Reliability Audit | Daily 06:50 | [`obtainability_audit_sop.md`](agents/platform/governance/obtainability_audit_sop.md) |
+| GCE Compute Engine and MIG Fleet Audit | Daily 07:45 | [`gce_compute_fleet_sop.md`](agents/platform/governance/gce_compute_fleet_sop.md) |
+| GCP Networking Fabric & VPC IPAM Audit | Daily 08:00 | [`gcp_networking_fabric_sop.md`](agents/platform/governance/gcp_networking_fabric_sop.md) |
+| AI Workload Security Audit | Daily 08:50 | [`ai_security_audit_sop.md`](agents/platform/governance/ai_security_audit_sop.md) |
+| Fleet Stockout Prevention & Capacity Audit | Daily 09:20 | [`stockout_prevention_sop.md`](agents/platform/governance/stockout_prevention_sop.md) |
+| Upgrade & Patch Readiness Audit | Weekly, Monday 07:20 | [`security_patch_orchestrator_sop.md`](agents/platform/governance/security_patch_orchestrator_sop.md) |
+| Fleet Waste Audit | Weekly, Monday 07:50 | [`fleet_wide_cost_analysis_sop.md`](agents/platform/governance/fleet_wide_cost_analysis_sop.md) |
+| Fleet Consistency Drift Audit | Weekly, Monday 08:20 | [`fleet_consistency_drift_sop.md`](agents/platform/governance/fleet_consistency_drift_sop.md) |
+
+### Skills by area
+
+| Area | Skills |
+| ---- | ------ |
+| Cluster lifecycle | `cluster-agent-lifecycle`, `gke-cluster-creation`, `gke-multitenancy`, `manage-cluster` |
+| Workloads | `gke-app-onboarding`, `gke-batch-hpc`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `workload-rebalancing` |
+| Cost and capacity | `capacity-obtainability`, `gce-compute-fleet-audit`, `gke-cluster-autoscaler`, `gke-compute-classes`, `gke-cost-analysis`, `gke-cost-optimization`, `gke-productionize` |
+| Security and compliance | `gke-backup-dr`, `gke-platform-security`, `gke-workload-identity` |
+| Networking and storage | `gcp-networking-fabric-audit`, `gke-networking`, `gke-service-networking`, `gke-storage` |
+| AI and inference | `gke-ai-troubleshooting-handle-disruption-gpu-tpu`, `gke-ai-troubleshooting-jobset-interruption`, `gke-ai-troubleshooting-tpu-vbar-oom`, `gke-golden-path`, `gke-inference`, `gke-tpu-dynamic-slices-monitoring`, `gke-tpu-metrics-monitoring` |
+| Observability | `gke-basics`, `gke-observability`, `kube-agents-observability` |
+| Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades` |
+| Manifests and remediation | `gcp-config-connector`, `gke-manifest-generation`, `submit-suggestion` |
+| Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `pr-conversation`, `version-control` |
+| Cluster Agent (per-cluster runtime) | `gke-observability`, `gke-reliability`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting` |
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: capabilities -->
+
+---
+
 ## 🛡️ Governance & isolation
 
 `kube-agents` is designed for enterprise fleets where agents must be powerful _and_ provably contained:

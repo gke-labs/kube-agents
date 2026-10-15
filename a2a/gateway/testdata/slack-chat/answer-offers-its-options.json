@@ -1,0 +1,603 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "The payments-api workload is CrashLooping.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "Due to an OOMKill (exit code 137) caused by the container running ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "tail /dev/zero",
+                "type": "text"
+              },
+              {
+                "text": ", which rapidly exhausts its ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "64Mi",
+                "type": "text"
+              },
+              {
+                "text": " memory limit. The ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "payments-api",
+                "type": "text"
+              },
+              {
+                "text": " workload in the ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "seeded-debug",
+                "type": "text"
+              },
+              {
+                "text": " namespace is failing to start and is stuck in ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "CrashLoopBackOff",
+                "type": "text"
+              },
+              {
+                "text": " due to being ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "OOMKilled",
+                "type": "text"
+              },
+              {
+                "text": " (exit code 137).",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Fix the command",
+                    "type": "text"
+                  },
+                  {
+                    "text": " — If the container's purpose is simply to stay alive for debugging (which is common for ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "busybox",
+                    "type": "text"
+                  },
+                  {
+                    "text": " images), the command should be changed to one that does not consume memory.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Increase the memory limit",
+                    "type": "text"
+                  },
+                  {
+                    "text": " — If reading from ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "/dev/zero",
+                    "type": "text"
+                  },
+                  {
+                    "text": " is a legitimate requirement for this workload, the memory limit of ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "64Mi",
+                    "type": "text"
+                  },
+                  {
+                    "text": " needs to be significantly increased to accommodate the data being buffered.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Change the workload image and logic",
+                    "type": "text"
+                  },
+                  {
+                    "text": " — If this is supposed to be the actual ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "payments-api",
+                    "type": "text"
+                  },
+                  {
+                    "text": " service, the image is currently set to ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "busybox:1.36",
+                    "type": "text"
+                  },
+                  {
+                    "text": " and running a shell command.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "indent": 0,
+            "style": "ordered",
+            "type": "rich_text_list"
+          },
+          {
+            "elements": [
+              {
+                "text": "Which of these options would you like to proceed with?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Root Cause",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "The container is executing a command that consumes infinite memory unbounded until it hits its limit. Specifically, the deployment runs:",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "      containers:\n      - command:\n        - sh\n        - -c\n        - tail /dev/zero",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_preformatted"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "Running ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "tail",
+                    "type": "text"
+                  },
+                  {
+                    "text": " on ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "/dev/zero",
+                    "type": "text"
+                  },
+                  {
+                    "text": " continually reads null bytes into memory. The container is configured with a strict memory limit of ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "64Mi",
+                    "type": "text"
+                  },
+                  {
+                    "text": ", which is exhausted almost immediately upon startup, leading the node to kill the process.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Evidence",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "text": "The pod is in ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "CrashLoopBackOff",
+                        "type": "text"
+                      },
+                      {
+                        "text": " state.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "text": "Inspecting the previous container termination state:",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "{\"exitCode\":137,\"finishedAt\":\"2026-10-14T16:58:24Z\",\"reason\":\"OOMKilled\"}",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_preformatted"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "text": "The deployment manifest defines the memory limit at ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "64Mi",
+                        "type": "text"
+                      },
+                      {
+                        "text": ".",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Remediation Options",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "To fix the restarts, we need to address the root cause of the memory exhaustion.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Option 1 (Recommended): Fix the command",
+                        "type": "text"
+                      },
+                      {
+                        "text": "\n",
+                        "type": "text"
+                      },
+                      {
+                        "text": "If the container's purpose is simply to stay alive for debugging (which is common for ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "busybox",
+                        "type": "text"
+                      },
+                      {
+                        "text": " images), the command should be changed to one that does not consume memory.",
+                        "type": "text"
+                      },
+                      {
+                        "text": "\n",
+                        "type": "text"
+                      },
+                      {
+                        "text": "Change the command in the deployment manifest to ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "tail -f /dev/null",
+                        "type": "text"
+                      },
+                      {
+                        "text": " or ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "sleep infinity",
+                        "type": "text"
+                      },
+                      {
+                        "text": ".",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Option 2: Increase the memory limit",
+                        "type": "text"
+                      },
+                      {
+                        "text": "\n",
+                        "type": "text"
+                      },
+                      {
+                        "text": "If reading from ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "/dev/zero",
+                        "type": "text"
+                      },
+                      {
+                        "text": " is a legitimate requirement for this workload, the memory limit of ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "64Mi",
+                        "type": "text"
+                      },
+                      {
+                        "text": " needs to be significantly increased to accommodate the data being buffered.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Option 3: Change the workload image and logic",
+                        "type": "text"
+                      },
+                      {
+                        "text": "\n",
+                        "type": "text"
+                      },
+                      {
+                        "text": "If this is supposed to be the actual ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "payments-api",
+                        "type": "text"
+                      },
+                      {
+                        "text": " service, the image is currently set to ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "busybox:1.36",
+                        "type": "text"
+                      },
+                      {
+                        "text": " and running a shell command. The manifest should be updated to use the correct application image and start command.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "ordered",
+                "type": "rich_text_list"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Fix the command",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Fix the command"
+          },
+          {
+            "action_id": "kage.choice.1",
+            "text": {
+              "emoji": true,
+              "text": "Increase the memory limit",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Increase the memory limit"
+          },
+          {
+            "action_id": "kage.choice.2",
+            "text": {
+              "emoji": true,
+              "text": "Change the workload image and logic",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Change the workload image and logic"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]
