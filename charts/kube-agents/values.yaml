@@ -644,10 +644,10 @@ platformAgent:
   vmPodScrapeLabels: {}
   # Namespace where Prometheus Operator or VictoriaMetrics scrapers run.
   # When set, the chart renders NetworkPolicies admitting ingress on the agent's
-  # metrics ports (9095, 9097, 8766, 9096) from this namespace. Note that the
-  # gateway admitting policy (ports 9095, 9097) is omitted when operator network
-  # policies are disabled via platformAgent.networkPolicy.enabled: false; see
-  # README.md for details.
+  # metrics ports (9095, 9097, 8766, 9096) from this namespace. The gateway
+  # admitting policy also carries baseline rules for the agent API (8642/8643) and
+  # operator poller (9095/9097), ensuring inbound traffic is not isolated when
+  # operator network policies are disabled.
   monitoringScraperNamespace: ""
   harness:
     # Required — the install fails fast when these are left empty.

@@ -349,26 +349,14 @@ spec:
 {{- end }}
 
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.monitoringScraperNamespace }}
-{{- $operatorNetpolEnabled := true -}}
-{{- if hasKey (.Values.platformAgent.networkPolicy | default dict) "enabled" -}}
-  {{- $operatorNetpolEnabled = .Values.platformAgent.networkPolicy.enabled -}}
-{{- else if not .Release.IsInstall -}}
-  {{- $cr := lookup "kubeagents.x-k8s.io/v1alpha1" "PlatformAgent" .Release.Namespace .Values.platformAgent.name -}}
-  {{- if and $cr $cr.spec $cr.spec.networkPolicy (hasKey $cr.spec.networkPolicy "enabled") -}}
-    {{- $operatorNetpolEnabled = $cr.spec.networkPolicy.enabled -}}
-  {{- end -}}
-{{- end -}}
-{{- if $operatorNetpolEnabled }}
 ---
 {{/*
 NetworkPolicy admitting metrics scrapes from the configured monitoring scraper namespace.
 The operator's own policies admit metrics ports only from gke-gmp-system.
-When operator policies are disabled (via platformAgent.networkPolicy.enabled: false or on the CR),
-the chart omits this gateway policy: without the operator's Ingress policy, rendering an
-Ingress policy here would isolate the gateway pod and default-deny inbound traffic to the
-agent API (8642/8643). The gateway pod remains open only if no other policy selects it.
-Under a namespace default-deny, the operator must admit the scraper namespace on 9095/9097 in
-their own policy.
+To ensure the gateway pod's inbound agent API (8642/8643) and operator poller metrics
+(9095/9097) are never isolated regardless of whether operator-managed NetworkPolicies
+are active or disabled (spec.networkPolicy.enabled: false), this policy includes the
+same-namespace agent API ingress rule and operator metrics ingress rule as a superset.
 */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -393,7 +381,25 @@ spec:
           port: 9095
         - protocol: TCP
           port: 9097
-{{- end }}
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8642
+        - protocol: TCP
+          port: 8643
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - protocol: TCP
+          port: 9095
+        - protocol: TCP
+          port: 9097
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -449,6 +449,7 @@ class MonitoringRenderTest(unittest.TestCase):
 
         gw_np = netpols[f"{_AGENT}-gw-mon-netpol"]
         self.assertEqual(gw_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-gateway")
+        self.assertEqual(len(gw_np["spec"]["ingress"]), 3)
         self.assertEqual(
             gw_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
             "monitoring",
@@ -456,6 +457,25 @@ class MonitoringRenderTest(unittest.TestCase):
         ports = [p["port"] for p in gw_np["spec"]["ingress"][0]["ports"]]
         self.assertIn(9095, ports)
         self.assertIn(9097, ports)
+
+        # Ingress rule 1: same-namespace agent API (8642/8643)
+        self.assertEqual(gw_np["spec"]["ingress"][1]["from"][0]["podSelector"], {})
+        ports_api = [p["port"] for p in gw_np["spec"]["ingress"][1]["ports"]]
+        self.assertIn(8642, ports_api)
+        self.assertIn(8643, ports_api)
+
+        # Ingress rule 2: operator poller on 9095/9097
+        self.assertEqual(
+            gw_np["spec"]["ingress"][2]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "default",
+        )
+        self.assertEqual(
+            gw_np["spec"]["ingress"][2]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            "kube-agents-operator",
+        )
+        ports_op = [p["port"] for p in gw_np["spec"]["ingress"][2]["ports"]]
+        self.assertIn(9095, ports_op)
+        self.assertIn(9097, ports_op)
 
         cp_np = netpols[f"{_AGENT}-cred-mon-netpol"]
         self.assertEqual(cp_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-credential-proxy")
@@ -530,7 +550,7 @@ class MonitoringRenderTest(unittest.TestCase):
                     self.assertIsInstance(val, str)
                     self.assertEqual(val, ns)
 
-    def test_gateway_netpol_omitted_when_operator_network_policy_disabled(self):
+    def test_gateway_netpol_renders_superset_rules_even_when_operator_network_policy_disabled(self):
         proc = subprocess.run(
             [
                 "helm", "template", "test-release", str(_CHART),
@@ -546,11 +566,40 @@ class MonitoringRenderTest(unittest.TestCase):
             for doc in yaml.safe_load_all(proc.stdout)
             if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
         }
-        # Gateway policy must NOT render so the unisolated gateway pod is not accidentally default-denied on 8642/8643.
-        self.assertNotIn(f"{_AGENT}-gw-mon-netpol", netpols)
-        # Credential proxy and A2A gateway policies still render because operator guardrails remain active.
+        # Gateway policy renders as a superset including agent API and operator metrics ingress rules
+        self.assertIn(f"{_AGENT}-gw-mon-netpol", netpols)
         self.assertIn(f"{_AGENT}-cred-mon-netpol", netpols)
         self.assertIn(f"{_AGENT}-a2a-mon-netpol", netpols)
+        gw_np = netpols[f"{_AGENT}-gw-mon-netpol"]
+        self.assertEqual(len(gw_np["spec"]["ingress"]), 3)
+
+    def test_monitoring_scraper_namespace_pattern_validation(self):
+        # Valid DNS-1123 labels succeed
+        for ns in ["monitoring", "openshift-user-workload-monitoring", "vm", "123", "on", "yes", "true"]:
+            with self.subTest(ns=ns, valid=True):
+                proc = subprocess.run(
+                    [
+                        "helm", "template", "test-release", str(_CHART),
+                        *_REQUIRED,
+                        "--set-string", f"platformAgent.monitoringScraperNamespace={ns}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        # Invalid namespace strings fail values schema validation
+        for ns in ["Monitoring", "monitoring.svc", "monitoring_ns", "has space", "-starts-hyphen", "ends-hyphen-"]:
+            with self.subTest(ns=ns, valid=False):
+                proc = subprocess.run(
+                    [
+                        "helm", "template", "test-release", str(_CHART),
+                        *_REQUIRED,
+                        "--set-string", f"platformAgent.monitoringScraperNamespace={ns}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("/platformAgent/monitoringScraperNamespace", proc.stderr)
 
     def test_max_supported_agent_name_length_succeeds_under_service_monitor(self):
         # 46 chars is the operator's longest 63-character slot bound (63 - len("-credential-proxy")).
