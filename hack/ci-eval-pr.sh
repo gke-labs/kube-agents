@@ -2050,6 +2050,12 @@ fi
 # (eval_gitops_repo; EVAL_GITOPS_REPO is a local deploy's own answer), and
 # refuses to start the run without one: a run whose safeguard cannot name
 # its repository would grade every repetition as an errored check.
+# It refuses as well, on GitHub, when the run has no read credential for
+# the check: with no EVAL_LEDGER_APP_KEY_FILE to mint one from (Prow sets
+# it; a hand-driven run usually does not), the token has to be in the
+# shell already as BENCH_GITHUB_TOKEN or GITHUB_TOKEN
+# (forges.token_env_vars), or every repetition's safeguard errors the same
+# way. Under gitlab read_gitlab_tokens has already set BENCH_GITLAB_TOKEN.
 # bench/kube_agents_bench/lane.py refuses a lane entry whose name
 # a case already declares -- devops-bench would refuse the duplicate as a
 # parse error on every repetition of that case, after the lease -- and
@@ -2068,6 +2074,11 @@ if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
 fi
 if [ -z "${INJECT_LANE_REPO}" ]; then
   echo "ERROR: no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the run does not start." >&2
+  exit 1
+fi
+if [ "${EVAL_FORGE:-github}" = "github" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
+    && [ -z "${BENCH_GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "ERROR: no GitHub read credential: EVAL_LEDGER_APP_KEY_FILE is unset and neither BENCH_GITHUB_TOKEN nor GITHUB_TOKEN is set; the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot read the repository, so the run does not start. Export a token that can read ${INJECT_LANE_REPO} as BENCH_GITHUB_TOKEN." >&2
   exit 1
 fi
 export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"

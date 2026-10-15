@@ -31,6 +31,11 @@ HACK_DIR = REPO_ROOT / "hack"
 BENCH_DIR = REPO_ROOT / "bench"
 LANE_FILE = HACK_DIR / "eval" / "inject-lane-safeguards.yaml"
 LANE_ENTRY = "no-github-writes-the-case-did-not-request"
+# The read credential the step requires on GitHub without a ledger key;
+# every run gets it unless the test says otherwise.
+READ_CREDENTIAL = {"BENCH_GITHUB_TOKEN": "test-read-token"}
+# What the shell running the tests may export that the step reads.
+STEP_INPUTS = ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "EVAL_FORGE", "EVAL_LEDGER_APP_KEY_FILE", "BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # `uv run python -m ...` answered by python3 with bench/ on the path: the
 # real lane module, without the virtualenv the presubmit has. Anything else
@@ -90,7 +95,12 @@ def requesting_among(tasks: list[str]) -> str:
     return ",".join(n for n in (pathlib.Path(t).parent.name for t in tasks) if n in INJECT_LANE_REQUESTING)
 
 
-def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file: pathlib.Path = LANE_FILE) -> subprocess.CompletedProcess:
+def run_step(
+    env: dict | None = None,
+    tasks: list[str] | None = None,
+    lane_file: pathlib.Path = LANE_FILE,
+    credential: dict | None = None,
+) -> subprocess.CompletedProcess:
     tasks = presubmit_tasks() if tasks is None else tasks
     tasks_array = "TASKS=(" + " ".join(f'"{t}"' for t in tasks) + ")"
     step = safeguards_step().replace(
@@ -114,16 +124,18 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
         ]
     )
     # "Not set by the test" has to mean unset, not whatever the shell running
-    # the tests exports: the transport switch and the two repository
-    # variables, which a developer who drove the lane by hand has in theirs.
+    # the tests exports: the transport switch, the two repository variables
+    # and the forge and its read credential, which a developer who drove the
+    # lane by hand has in theirs.
     # The step's `mktemp -d` lands under TMPDIR, which is a directory of the
     # test's own so nothing is left behind.
-    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO")}
+    clean = {k: v for k, v in os.environ.items() if k not in STEP_INPUTS}
+    credential = READ_CREDENTIAL if credential is None else credential
     # Kept on the result, not in a `with`: the tests read the copies the step
     # wrote, so the directory lives until the result is dropped.
     scratch = tempfile.TemporaryDirectory()
     result = subprocess.run(
-        ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch.name, **(env or {})}
+        ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch.name, **credential, **(env or {})}
     )
     result.scratch = scratch  # type: ignore[attr-defined]
     return result
@@ -231,6 +243,36 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertIn("no GitOps repository is known for PROJECT_ID=kube-agents-evals-21", result.stderr)
                 self.assertIn("inject-lane-safeguards.yaml", result.stderr)
                 self.assertNotIn("REPO=", result.stdout)
+
+    def test_no_github_read_credential_stops_the_lane_before_anything_runs(self):
+        """GitHubWritesVerifier errors without BENCH_GITHUB_TOKEN or
+        GITHUB_TOKEN, so on GitHub with no ledger key to mint one from the
+        step refuses, as it does without a repository."""
+        repo = {"EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}
+        for forge in ({}, {"EVAL_FORGE": "github"}):
+            with self.subTest(forge=forge):
+                result = run_step(self.lane(**repo, **forge), credential={})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("no GitHub read credential", result.stderr)
+                self.assertIn("neither BENCH_GITHUB_TOKEN nor GITHUB_TOKEN is set", result.stderr)
+                self.assertIn("cannot read the repository, so the run does not start", result.stderr)
+                self.assertNotIn("REPO=", result.stdout)
+
+    def test_any_read_credential_or_a_ledger_key_lets_the_lane_start(self):
+        """Prow mounts BENCH_GITHUB_TOKEN or sets EVAL_LEDGER_APP_KEY_FILE
+        (the preflight mints from it); under gitlab read_gitlab_tokens has
+        unset both GitHub names and set the GitLab token instead."""
+        repo = {"EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}
+        for credential in (
+            {"BENCH_GITHUB_TOKEN": "t"},
+            {"GITHUB_TOKEN": "t"},
+            {"EVAL_LEDGER_APP_KEY_FILE": "/etc/ledger-app-key/key.pem"},
+            {"EVAL_FORGE": "gitlab"},
+        ):
+            with self.subTest(credential=credential):
+                result = run_step(self.lane(**repo), credential=credential)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
 
     def test_a_lane_entry_a_case_already_names_stops_the_lane(self):
         with tempfile.TemporaryDirectory() as scratch:
