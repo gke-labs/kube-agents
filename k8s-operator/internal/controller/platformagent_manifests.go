@@ -1234,13 +1234,24 @@ var frontDoorToolsets = []string{
 // own README states the rule ("Do not relocate any part of this flow"), and the CRD page
 // carries the cost as a known limit.
 //
-// hermes_otel, tool_call_audit, incident_context and pr_opened are the four the image's own copy
+// hermes_otel, tool_call_audit and incident_context are ones the image's own copy
 // already enables; the overlay unions lists, so naming them again would be inert rather
 // than wrong, and leaving them out keeps the list to what the flag actually adds.
 var frontDoorPlugins = []string{
 	"session_store",
 	"session_otel_bridge",
 	"legacy_slash_commands",
+}
+
+// frontDoorBackfillPlugins are plugins agents/platform/config.yaml enables that an existing
+// front-door volume does not pick up from the image. With the flag on, the platform
+// profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
+// back-fill never extends a list the live file already holds, so a plugin the image
+// enabled after that volume was first written stays off there. The front-door overlay
+// unions these in so the flag cannot hide one. pr_opened records each pull request a
+// worker opens on its card, which is what posts the thread's PR message.
+var frontDoorBackfillPlugins = []string{
+	"pr_opened",
 }
 
 // kanbanDispatchIntervalSeconds and kanbanWakeOnEvents mirror the `kanban` block
@@ -1346,7 +1357,7 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 
 	return map[string]any{
 		"platform_toolsets": platformToolsets,
-		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
+		"plugins":           map[string]any{"enabled": slices.Concat(frontDoorPlugins, frontDoorBackfillPlugins)},
 		"kanban":            frontDoorKanban(),
 	}
 }
