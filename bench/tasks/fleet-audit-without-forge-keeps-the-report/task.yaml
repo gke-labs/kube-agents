@@ -80,17 +80,21 @@ verification_spec:
         - script: audit_report.py
           flags: [start]
           word_patterns: ["^--audit(?:=|$)"]
-  # No worker command ran a skill script by a path relative to the profile
-  # home, and none joined `governance/` to a script directory. From a
+  # No worker command named a skill file or an SOP by a path relative to the
+  # profile home, and none joined `governance/` to a skill directory. From a
   # card's workspace both name nothing, and the worker spends its turns
-  # recovering.
+  # recovering. The relative path has to start a word, so a search string
+  # (`grep "skills/fleet-audit/scripts/"`) is not read as a use of one.
   - name: the-worker-used-full-paths
     role: objective
     mode: assert
     check:
       type: worker_commands
       forbidden_patterns:
-        ['(?<![\w/.-])(?:\.\.?/)*skills/[\w-]+/scripts/', "scripts/governance/"]
+        [
+          '(?<!\S)(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)',
+          'skills/[\w-]+/(?:scripts/)?governance/',
+        ]
   # The answer is the only report an operator on such an install receives, so
   # it names the planted binding and says why no ledger was written.
   - name: the-answer-names-the-binding
