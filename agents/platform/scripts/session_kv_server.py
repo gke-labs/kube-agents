@@ -195,6 +195,21 @@ MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
 )
 
+# How a Cluster Agent describes a fix on an event or stall triage card. (The
+# drift card is left alone: its report compares the live object with what git
+# declares.) A Cluster Agent has no GitOps repository: the Platform
+# Agent finds the file when it opens the Pull Request. Without this, "precisely
+# enough that someone can open the Pull Request from your report alone" sent a
+# worker that had its cause in the first minute on a 21-minute hunt for the
+# workload's source, and it never answered (gke-labs#3078).
+TRIAGE_FIX_AGAINST_LIVE_OBJECT = (
+    "Describe each change against the live object you read: its kind, namespace and name, the field, and the "
+    "current and proposed value, or for a missing object, what to create and the fields it needs. You have no "
+    "GitOps repository and need none, because the agent that opens the Pull Request finds the file. Do not look "
+    "for the workload's source, whether in this pod's files, with git, or through any repository tool. Once you "
+    "have the cause and the change, complete the card: a source file you haven't seen is not a gap in the report. "
+)
+
 
 def _dotenv_value(path: str, name: str) -> str:
     """Return `name`'s value from a dotenv file, or "" if it does not carry one.
@@ -1753,7 +1768,8 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**Who acts on this:**\n"
         f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-        f"Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+        f"Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+        f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
         f"Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
         f"(no `kubectl scale`, `patch`, or `apply`)."
     )
@@ -2314,8 +2330,9 @@ def _stall_task_body(payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**Who acts on this:**\n"
         f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not "
-        f"you, and not from this card. Name the manifest change each option needs precisely enough that someone can "
-        f"open the Pull Request from your report alone: the object, the field, and the value. Two things are true "
+        f"you, and not from this card. Name the change each option needs precisely enough that someone can "
+        f"open the Pull Request from your report alone. {TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        f"Two things are true "
         f"whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written "
         f"to the live cluster directly (no `kubectl create`, `patch`, or `apply`)."
     )
