@@ -107,6 +107,7 @@ hand-written. Never edit inside the markers — edit the source and regenerate.
 | `docs/site/src/content/docs/concepts/autonomous-watchdogs.md`, `docs/site/src/content/docs/concepts/skills.md`, `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-job-example -->` | The `compliance-audit` entry of `agents/platform/cron/jobs.json`, rendered as fenced JSON |
 | `docs/site/src/content/docs/skills/index.mdx` | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
 | `docs/site/src/content/docs/deploy/docker-images.md` | `<!-- BEGIN GENERATED: container-images -->` | `images.json` |
+| `README.md` | `<!-- BEGIN GENERATED: capabilities -->` | The enabled entries of `agents/platform/cron/jobs.json` that carry the `fleet-audit` skill, with the SOP each prompt names, and the skill directories under `agents/platform/skills/` and `agents/cluster/skills/` |
 | `agents/platform/cron/jobs.json` — the SOP length and checks-section line range each governance prompt cites | none: `scripts/generate_sop_geography.py` rewrites the digits in place (`make docs-generate` runs it first) | The `agents/platform/governance/*_sop.md` each prompt names |
 
 CI enforcement: `make docs-check` runs the same checks as

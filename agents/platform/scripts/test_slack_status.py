@@ -171,7 +171,7 @@ class RowTitleTest(unittest.TestCase):
             _row("t_b", "seeded-b", status=s.TASK_PENDING),
             _row("t_c", "seeded-c", lines=["reading version"]),
         ]
-        tasks = s.plan_blocks(None, rows)[0]["tasks"]
+        tasks = s.plan_blocks(None, rows)
         self.assertEqual(
             [t["title"] for t in tasks],
             ["seeded-a · 1.33.4 = default", "seeded-b · waiting on you", "seeded-c · reading version"],
@@ -202,17 +202,24 @@ class RowTitleTest(unittest.TestCase):
         self.assertTrue(title.startswith("check payments · word"))
 
     def test_the_details_still_carry_the_trail(self):
-        task = s.plan_blocks(None, [_row(lines=["a", "b"])])[0]["tasks"][0]
+        task = s.plan_blocks(None, [_row(lines=["a", "b"])])[0]
         items = task["details"]["elements"][0]["elements"]
         self.assertEqual([i["elements"][0]["text"] for i in items], ["✓ a", "◌ b"])
 
 
 class PlanTest(unittest.TestCase):
-    def test_the_plan_is_one_block_with_no_stop(self):
+    def test_the_plan_is_a_task_card_per_row_with_no_stop(self):
         # Stop is deferred: /stop would end the turn and leave the cards running.
         for status in (s.TASK_RUNNING, s.TASK_PENDING):
-            blocks = s.plan_blocks(None, [_row(status=status)])
-            self.assertEqual([b["type"] for b in blocks], ["plan"])
+            blocks = s.plan_blocks(None, [_row(status=status), _row("t_b")])
+            self.assertEqual([b["type"] for b in blocks], ["task_card", "task_card"])
+
+    def test_no_plan_block_folds_the_rows_under_a_title(self):
+        # Slack draws a plan block as its title alone, folded: a fan-out read as "N cards",
+        # and one card as the thread's ask rather than the card's step.
+        blocks = s.plan_blocks("is checkout-gateway restarting?", [_row(lines=["a", "reading pod state"])])
+        self.assertNotIn("plan", [b["type"] for b in blocks])
+        self.assertEqual([b["title"] for b in blocks], ["reading pod state · step 2 ▸"])
 
     def test_title(self):
         self.assertEqual(s.plan_title("is it up?", [_row(), _row("t_b")]), "is it up?")
@@ -221,7 +228,7 @@ class PlanTest(unittest.TestCase):
 
     def test_rows_are_capped_oldest_first(self):
         rows = [_row(f"t_{i}") for i in range(s.ROWS_MAX + 5)]
-        tasks = s.plan_blocks(None, rows)[0]["tasks"]
+        tasks = s.plan_blocks(None, rows)
         self.assertEqual(len(tasks), s.ROWS_MAX)
         self.assertEqual(tasks[-1]["task_id"], rows[-1].task_id)
 
@@ -237,7 +244,9 @@ class PlanTest(unittest.TestCase):
             "R&amp;D: roll back\n◌ see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
         )
         blocks = s.plan_blocks(None, rows)
-        self.assertEqual(blocks[0]["title"], "R&D: roll back", "blocks carry rich text, which Slack does not parse")
+        self.assertEqual(
+            blocks[0]["title"], "see <!here> <https://evil.example|docs>", "blocks carry plain text, which Slack does not parse",
+        )
 
 
 class SessionTest(unittest.TestCase):
@@ -249,6 +258,40 @@ class SessionTest(unittest.TestCase):
     def test_title(self):
         self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
+
+    def test_the_title_is_the_ask_up_to_its_first_question(self):
+        cases = {
+            "is checkout-gateway restarting in prod? someone in #oncall said it's crashlooping": (
+                "is checkout-gateway restarting in prod?"
+            ),
+            "which clusters have pods restarting right now?": "which clusters have pods restarting right now?",
+            "is 1.33.4 the default? asking for seeded-b": "is 1.33.4 the default?",
+            "wait... is it up? yes": "wait... is it up?",
+            "hold on\u2026 is it up? yes": "hold on... is it up?",
+            "Hi! Is checkout-gateway crashlooping in prod? It was earlier": "Hi! Is checkout-gateway crashlooping in prod?",
+            "Hi team,\nis checkout-gateway restarting in prod? It was": "Hi team, is checkout-gateway restarting in prod?",
+            # No question: the whole ask, clipped as before. "." and line breaks end nothing.
+            "seeded-b is behind. Ask me before doing anything.": "seeded-b is behind. Ask me before doing anything.",
+            "Check e.g. seeded-a. Then seeded-b": "Check e.g. seeded-a. Then seeded-b",
+            "1. check seeded-a pods\n2. then seeded-b": "1. check seeded-a pods 2. then seeded-b",
+            "<@U1> hi. there": "hi. there",
+            # One word before the question: not a title on its own.
+            "\n\nup? ok": "up? ok",
+            # Punctuation a stripped mention or link leaves behind closes no word.
+            "hi <@UBOT>? which clusters are behind? thanks": "hi ? which clusters are behind?",
+            "see <https://runbook.example/x>? is prod ok? thanks": "see ? is prod ok?",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
+    def test_the_question_cut_stays_linear(self):
+        # It runs on the gateway's event loop, like the markup patterns below. A "?" that closes
+        # no word never ends the question, so the cut walks the whole ask.
+        ask = "a ? " * (SLACK_MESSAGE_MAX // len("a ? "))
+        start = time.monotonic()
+        s.session_title(ask)
+        self.assertLess(time.monotonic() - start, LINEAR_BUDGET_SECONDS)
 
     def test_a_long_word_after_a_short_one_is_cut_not_dropped(self):
         self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 69 + s.TITLE_ELLIPSIS)

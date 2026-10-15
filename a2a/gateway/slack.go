@@ -225,6 +225,9 @@ type SlackAdapter struct {
 	sessionStates map[string]*slackSession
 	sessionOrder  []string
 	syncSessions  bool
+	// sessionErrorsSeen is the setStatus error texts already logged at Warn
+	// (firstSessionError), under s.mu.
+	sessionErrorsSeen map[string]bool
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
@@ -322,6 +325,7 @@ var (
 	_ TaskObserver      = (*SlackAdapter)(nil)
 	_ SessionLookupSink = (*SlackAdapter)(nil)
 	_ MarkObserver      = (*SlackAdapter)(nil)
+	_ StatusShower      = (*SlackAdapter)(nil)
 	_ VerifiedObserver  = (*SlackAdapter)(nil)
 )
 
@@ -414,6 +418,17 @@ func (s *SlackAdapter) expireMark(key string) {
 	if s.sessionThreads[key] {
 		s.sessionExpiresAt[key] = s.now()
 	}
+}
+
+// ShowsTaskStatus is the StatusShower answer: with Agent Sessions wired the
+// thread's Working… status, the ask's reaction and the plan rows are the
+// task's status, so the relay posts no rolling line. An adapter built
+// without them (a test that fakes no sessions API) keeps the line, and so
+// does a conversation with no thread (a legacy top-level DM key), which
+// gets no Agent Session.
+func (s *SlackAdapter) ShowsTaskStatus(conversation string) bool {
+	_, thread, ok := slackChannelThread(conversation)
+	return s.sessionsAPI != nil && ok && thread != ""
 }
 
 func (s *SlackAdapter) TaskAccepted(conversation, _ string) {

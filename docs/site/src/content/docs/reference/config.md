@@ -110,6 +110,7 @@ context_file_max_chars: 100000
 tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
+  permission_refusal_halt_after: 1
 
 memory:
   memory_enabled: false
@@ -182,6 +183,8 @@ The character cap Hermes puts on each context file — `SOUL.md`, `AGENTS.md` �
 Raised to 200 for this profile only, for the same reason as `max_turns` above: both dispatch paths read the profile's `config.yaml`, so the Planning Agent and the Cluster Agents keep the stock 50, which nothing has approached. 200 is a ceiling rather than a target — a card that reaches it is misbehaving and should be stopped, so do not set `0` (unlimited).
 
 The cap was never the whole defect. What made hitting it expensive was the exit taken when it fired: the halt broke out of the agent loop without showing the model the block result, so a worker with 173 successful searches in hand was never told, never got another turn, and exited without closing its card. That path is repaired in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py), whose module docstring carries the analysis. Raising the cap alone would only have moved when the failure happened.
+
+`permission_refusal_halt_after` is a kube-agents addition, read by [`deploy/docker/patches/permission_refusal_stop.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/permission_refusal_stop.py): the number of definitive command-policy refusals in one run before the runtime halts it. The command policy's `kubernetes.read-only` rule refuses a kubectl write with a notice that the change is refused however it is attempted, and the credential proxy's client in the sandbox prints the verb it resolved beside the rule (`policy verb:`), which is what the runtime reads instead of parsing the command's shell text (the text is read only to tell a write chained before a successful read from a read that echoed a refusal); a refused write whose output the call discarded is not seen at all. The stock loop guardrails never see a workaround hunt, because they count identical retries and reset on any success. At the default of 1 the first refusal ends the run through the same kanban-aware exit, so a worker ends its card (blocked, or completed when the card asked for a pull request) with the refusal instead of running to its step budget, and a chat turn replies with the refusal. A higher value makes the refusals below it append guidance to the tool result instead; in live runs the model read that guidance and went on investigating, which is why the default is the first. An API 403 only warns and is never counted, so a fleet audit continues past a project it may not read; so do a `gcp.read-only` refusal and a `kubernetes.read-only` refusal of a read spelling such as `config view`, since both rules are allowlists that refuse an unlisted read with the same notice. There is no unlimited setting.
 
 ### `memory`
 

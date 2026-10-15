@@ -43,17 +43,14 @@ const (
 	// leading blocks stay above the side bar, so the headline is the
 	// message's own and the bar holds the rest.
 	slackChatSideBarFrom = 1
-	// slackChatSectionMax is Slack's cap on a section's text; a fold's text
-	// is cut into sections under it, and a fold that cannot be is a message
-	// Slack cannot hold, which posts as its fallback.
+	// slackChatSectionMax is Slack's cap on a section's text.
 	slackChatSectionMax = 3000
-	// slackChatFoldChunk is the raw-text share of one fold section, under
-	// slackChatSectionMax with room for the escaping toMrkdwn adds.
+	// slackChatFoldChunk is the text one of a fold's rich_text blocks holds
+	// at most, under slackChatSectionMax (slackRichBlocks), but for a single
+	// list item past it, which stands alone; a fold past
+	// slackChatContainerChildMax blocks is a message Slack cannot hold, which
+	// posts as its fallback.
 	slackChatFoldChunk = 2500
-	// slackChatFoldChunkMin is the smallest share slackFoldSections cuts a
-	// chunk to before it calls the fold too large: 600 bytes escape to at
-	// most 3,000 runes even if every one is an ampersand.
-	slackChatFoldChunkMin = 600
 	// slackChatContainerChildMax is Slack's cap on a container's children.
 	slackChatContainerChildMax = 10
 	// slackChatBlocksMax is Slack's cap on the blocks in one message, the
@@ -69,15 +66,12 @@ const (
 	// running row is the open one.
 	slackChatStepDone = "✓"
 	slackChatStepOpen = "◌"
-	// slackChatPlanCountTitle is slack_status.py's CARDS_TITLE, the plan's
-	// title when the message names none and it has more than one item.
-	slackChatPlanCountTitle = "%d cards"
 	// slackChatRawTextCell is the Slack table cell type that shows its text
 	// as written.
 	slackChatRawTextCell = "raw_text"
-	// slackChatMrkdwn is the text object type Slack parses as mrkdwn; the
-	// renderer sends it verbatim, so Slack links and mentions nothing the
-	// text does not spell out as <url|label>.
+	// slackChatMrkdwn is the text object type Slack parses as mrkdwn, which
+	// the renderer no longer writes; refuseSlackChat still reads every one
+	// for a mention (slackMrkdwnTexts).
 	slackChatMrkdwn = "mrkdwn"
 	// slackChatActionsBlock is the block the renderer writes its buttons
 	// into, the one block refuseSlackChat lets carry interactive elements.
@@ -93,7 +87,7 @@ var slackChatColors = map[string]string{
 }
 
 // errSlackChatTooLarge is a valid chat message that is more than one Slack
-// message holds: the fold's text past its sections, the blocks past Slack's
+// message holds: the fold's text past its container's blocks, the blocks past Slack's
 // count, the fallback past the text cap. The caller posts the fallback.
 var errSlackChatTooLarge = errors.New("the chat message is more than one Slack message holds")
 
@@ -120,7 +114,7 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 		blocks = append(blocks, detail)
 	}
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
-		blocks = append(blocks, slackChatPlan(m.Plan))
+		blocks = append(blocks, slackChatPlan(m.Plan)...)
 	} else if rows := slackChatRows(m.Rows); rows != nil {
 		blocks = append(blocks, slackChatDivider(), rows, slackChatDivider())
 	}
@@ -169,8 +163,8 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 // refuseSlackChat is the last check before a rendered message is sent. The
 // only text Slack parses for mentions is a mrkdwn text object (rich_text
 // text, plain_text and a task card's title are shown as written, so a field
-// carrying <!here> there is inert text), and the renderer writes mrkdwn only
-// for a fold's text, escaped (toMrkdwn) and verbatim. blocksMention, the
+// carrying <!here> there is inert text), and the renderer writes no mrkdwn
+// of its own (a fold's text is rich text too, slackRichBlocks). blocksMention, the
 // notify route's own check, reads every mrkdwn text object, so the two Block
 // Kit paths hold one bound; and blocksInteractive finds no interactive
 // element outside the actions blocks the renderer wrote itself from the
@@ -239,12 +233,14 @@ func slackChatHead(m *chatmsg.Message) map[string]any {
 
 // slackChatDetail is the detail, a block of its own under the head, so a
 // message with a tone carries it inside the side bar, as the presenter's
-// subline under a question or an opened PR is.
+// subline under a question or an opened PR is. Its markdown's headings,
+// fenced blocks, lists and paragraphs are drawn as rich text
+// (slackRichDocument).
 func slackChatDetail(detail string) map[string]any {
 	if strings.TrimSpace(detail) == "" {
 		return nil
 	}
-	return slackRichBlock([]map[string]any{slackRichSection(slackRichMarkdown(detail))})
+	return slackRichBlock(slackRichDocument(detail))
 }
 
 // slackChatRows is the rows, one section each: the severity as inline code
@@ -287,26 +283,15 @@ func slackChatAfter(after []string) map[string]any {
 }
 
 // slackChatFold is the fold as Slack's collapsible container, collapsed:
-// its text as mrkdwn sections (toMrkdwn, the text path's escaping and
-// translation), then its table as a native table block whose first row is
-// the column names.
+// its text as rich_text blocks (slackRichBlocks: headings, fences, lists and
+// paragraphs drawn as Slack draws them), then its table as a native table
+// block whose first row is the column names.
 func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 	var children []map[string]any
 	if strings.TrimSpace(f.Text) != "" {
-		// chatChunks measures bytes and Slack's cap is characters, so the
-		// budget scales by the text's bytes per character: multibyte text
-		// gets as many characters a section as ASCII does.
-		budget := slackChatFoldChunk * len(f.Text) / max(1, utf8.RuneCountInString(f.Text))
-		texts, err := slackFoldSections(f.Text, budget)
-		if err != nil {
-			return nil, err
-		}
-		for _, text := range texts {
-			children = append(children, map[string]any{
-				"type": "section",
-				"text": map[string]any{"type": slackChatMrkdwn, "text": text, "verbatim": true},
-			})
-		}
+		// Rich text, as the detail is, cut into blocks between its
+		// elements so no one block grows past a section's share.
+		children = append(children, slackRichBlocks(f.Text, slackChatFoldChunk)...)
 	}
 	if f.Table != nil && len(f.Table.Columns) > 0 {
 		rows := [][]map[string]any{slackChatTableRow(f.Table.Columns)}
@@ -336,33 +321,6 @@ func slackChatFoldEmpty(f *chatmsg.Fold) bool {
 	return strings.TrimSpace(f.Text) == "" && (f.Table == nil || len(f.Table.Columns) == 0)
 }
 
-// slackFoldSections cuts text into chunks of at most size bytes and renders
-// each as mrkdwn, cutting a chunk smaller again when its escaping (&amp;,
-// &lt;, &gt;) takes it past a section's cap, so text dense with those
-// characters still fits; past slackChatContainerChildMax sections it is too
-// large.
-func slackFoldSections(text string, size int) ([]string, error) {
-	var out []string
-	for _, chunk := range chatChunks(text, size) {
-		rendered := toMrkdwn(chunk)
-		if utf8.RuneCountInString(rendered) <= slackChatSectionMax {
-			out = append(out, rendered)
-		} else if size <= slackChatFoldChunkMin {
-			return nil, errSlackChatTooLarge
-		} else {
-			smaller, err := slackFoldSections(chunk, size/2)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, smaller...)
-		}
-		if len(out) > slackChatContainerChildMax {
-			return nil, errSlackChatTooLarge
-		}
-	}
-	return out, nil
-}
-
 func slackChatTableRow(cells []string) []map[string]any {
 	row := make([]map[string]any, 0, len(cells))
 	for _, c := range cells {
@@ -371,11 +329,13 @@ func slackChatTableRow(cells []string) []map[string]any {
 	return row
 }
 
-// slackChatPlan is the plan as Slack's plan block of task cards, as
+// slackChatPlan is the plan as one top-level task card per item, as
 // slack_status.plan_blocks lays it out: a row's title arrives composed, and
 // its steps are listed under it, each marked done but the last of a running
-// row, which is the open one.
-func slackChatPlan(p *chatmsg.Plan) map[string]any {
+// row, which is the open one. Not Slack's plan block: Slack draws that as its
+// title alone, folded, so a fan-out read as one "N cards" line, and allows one
+// per message. The plan's title is the fallback text's, and draws nothing.
+func slackChatPlan(p *chatmsg.Plan) []map[string]any {
 	tasks := make([]map[string]any, 0, len(p.Items))
 	for _, item := range p.Items {
 		card := map[string]any{
@@ -401,15 +361,7 @@ func slackChatPlan(p *chatmsg.Plan) map[string]any {
 		}
 		tasks = append(tasks, card)
 	}
-	title := p.Title
-	switch {
-	case title != "":
-	case len(p.Items) == 1:
-		title = p.Items[0].Title
-	default:
-		title = fmt.Sprintf(slackChatPlanCountTitle, len(p.Items))
-	}
-	return map[string]any{"type": "plan", "title": title, "tasks": tasks}
+	return tasks
 }
 
 // slackChatActions is the buttons, choices before links, five to a row. A
@@ -470,9 +422,10 @@ func slackRichText(text string, style map[string]any) map[string]any {
 	return e
 }
 
-// slackRichMarkdown is one field of markdown as rich_text elements, the
-// presenter's _rich_elements: code spans, bold, italic, strike and links
-// kept, the rest text. rich_text text is literal -- Slack parses no mrkdwn
+// slackRichMarkdown is one field of markdown as rich_text elements, after
+// the presenter's _rich_elements: code spans, bold, italic, strike and links
+// kept, the rest text, and, past the presenter, a bold run's own spans
+// drawn inside it, each kept bold. rich_text text is literal -- Slack parses no mrkdwn
 // and no mention in it -- so nothing here escapes. A link renders as one
 // only when its url passes the links rule, the label check included
 // (chatmsg.SafeURL, chattext.LinkLabelMisnamesHost); any other shows its
@@ -489,7 +442,13 @@ func slackRichMarkdown(md string) []map[string]any {
 	for i := 0; i < len(md); {
 		if span, n, ok := slackRichSpan(md, i); ok {
 			flush()
-			out = append(out, span)
+			if bold, _ := span["style"].(map[string]any); bold["bold"] == true && span["type"] == "text" {
+				// A bold run's own spans (a code span, a link, an italic)
+				// draw as they would outside it, each kept bold.
+				out = append(out, slackRichBold(slackRichMarkdown(span["text"].(string)))...)
+			} else {
+				out = append(out, span)
+			}
 			i += n
 			continue
 		}
@@ -517,6 +476,15 @@ func slackRichSpan(md string, i int) (span map[string]any, n int, ok bool) {
 		if m := mdBoldRE.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 && m[2] == m[3] && m[6] == m[7] &&
 			!slackWordBefore(md, i) {
 			return slackRichText(rest[m[4]:m[5]], map[string]any{"bold": true}), m[1], true
+		}
+	case strings.HasPrefix(rest, "<"):
+		// A <url|text> link the executor wrote, as keepChatLinks keeps it on
+		// the text path; one that fails the checks stays text.
+		if m := chatNativeLinkRE.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 {
+			dest, label := rest[m[2]:m[3]], rest[m[4]:m[5]]
+			if chatmsg.SafeURL(dest) == nil && !chattext.LinkLabelMisnamesHost(label, dest) {
+				return map[string]any{"type": "link", "url": dest, "text": label}, m[1], true
+			}
 		}
 	case strings.HasPrefix(rest, "["):
 		if m := slackLinkRE.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 {

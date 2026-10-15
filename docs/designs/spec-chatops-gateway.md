@@ -181,7 +181,8 @@ during a `working` task is a steer, per the 8/24 decision above.
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
-edits), the status card, the steer acknowledgement, the release line for a task that
+edits; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
+Agent Sessions, where a submission that never reached the bus is posted instead), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
 below), the notice the reap scan posts once when that grace passes with no turn to
 carry the release line, and failure notices (a submission or steer that never reached the bus). All
@@ -230,7 +231,8 @@ record's active task; a new turn in that conversation replaces it. At or above
 `A2A_BUSY_NOTICE_AT` the gateway edits the turn's "⏳ submitted…" placeholder, the message
 the relay's rolling-line edits target, to a queued state: "⏳ **queued** — 3 requests are
 ahead of yours; I'll start on it as soon as there's room" ("1 request is" for one). It posts
-nothing of its own. The relay's first edit past submitted (working, or the terminal)
+nothing of its own, except on a backend that keeps no rolling line (`StatusShower`, Slack with
+Agent Sessions), where the notice is a post of its own that no later edit replaces. The relay's first edit past submitted (working, or the terminal)
 replaces the queued text as it would the placeholder, so the notice is never left under a
 "completed" header, where a separate post read as the output of some earlier command; the
 executor's own submitted event (the bridge publishes one on accept, before it has a worker)
@@ -397,8 +399,9 @@ refused here, with the same target-only notice and an audit line, and nothing re
 
 **The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
 parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
-incarnation that asked. The conversation's rolling line for it is the same "working on" line any
-task gets, suffixed `(delegated to platform)`; the parent's own line is left in place on the
+incarnation that asked. The conversation's rolling line for it, on a backend that keeps one (not
+Slack, a `StatusShower`), is the same "working on" line any task gets, suffixed
+`(delegated to platform)`; the parent's own line is left in place on the
 parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
 the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
 reports it. A heal releases the child from the conversation's active-task slot, and retires its
@@ -1382,7 +1385,9 @@ only after its children with the synthesis, so the child's `completed` is held w
 works and until the parent's own answer has been delivered on that thread, then dropped with its
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
 or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
-the parent's answer has posted opens with "Late result from <card title>:". Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+the parent's answer has posted opens with "Late result from <card title>:". On Slack with
+`KAGE_SLACK_UX` on, a child whose parent still works is not held: its `completed` delivers, and
+`kanban_progress_lines` settles its plan row and posts nothing, as under `today`. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
 the subscription's failure budget. Once, when routed delivery first goes live on an install,
@@ -1687,7 +1692,8 @@ does (its cards still running, or blocked), the session follows the newest such 
 so it holds until every chain's cards have settled. Only an older ask a notify `update` key
 is bound to holds it, and for at most four hours after its mark was last drawn or a keyed notify last repeated it (the latest across every chain that marked the ask, so a click or typed answer continuing it keeps the clock), since nothing else can settle an older ask and a lost settle would otherwise hold it for good. A terminal that draws nothing still tells Slack when that bound alone has moved the session. `closed` is sent even for a thread this process never opened, since a restarted gateway
 otherwise leaves the old process's Working… on it; the thread is renamed once from its first
-verified ask that is not a gateway command, with today's title sanitiser. That state is process
+verified ask that is not a gateway command, with today's title rules: the ask up to its first
+question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
 three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
 
@@ -1764,26 +1770,34 @@ The Slack adapter lays a chat message out as Block Kit, in the spec's fixed orde
 notification and a thread read-back carry it): the headline bold with the note after it on the
 same line, as one `rich_text` block; the detail under it; the rows between two dividers, each led
 by its severity as inline code; the `after` lines; the fold as a collapsible `container`,
-collapsed (a fold with neither text nor a table is omitted), its text as escaped mrkdwn sections
-sent `verbatim`, cut smaller where escaping would take one past Slack's cap, and its table as a native `table`
+collapsed (a fold with neither text nor a table is omitted), its text as `rich_text` blocks of
+at most 2,500 characters each, cut between elements (a long fenced block between its lines, a
+long list between its items, its numbering kept; one item past that stands alone), and its table as a native `table`
 block whose first row is the column names; then the buttons, choices before links, five to an
 `actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
 are the presenter's `kage.choice.<n>` and `kage.link.<n>`. A progress message's `plan` is
-Slack's `plan` block of `task_card`s, each row's steps listed under it and marked `✓`, the last
-step of an `in_progress` row `◌`. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
+one top-level `task_card` per item, each row's steps listed under it and marked `✓`, the last
+step of an `in_progress` row `◌`; not Slack's `plan` block, which Slack draws as its title alone,
+folded, and allows once per message, so the plan's `title` is the fallback text's only. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
 red `#E01E5A`) holding every block under the headline. Slack refuses a `container` inside the
 attachment a side bar is, and an attachment draws after every top-level block, so a message with
 a fold keeps the fold and everything above it top-level and the bar holds only the buttons; with
-no buttons it has no bar, and its tone shows nowhere (the text states the fact either way). Markdown in the detail, rows and `after`
-keeps code spans, bold, italic, strike and links whose url passes the links rule, the label check
-included; anything else shows as written. Every field but the fold's text goes out as
-`rich_text` or `plain_text`, which Slack shows as written, so a `<!here>` in one is inert text;
-the fold's mrkdwn is escaped, and a bare broadcast word in it (`@here`), which escaping cannot
-reach, makes the message one the adapter will not send (`blocksMention`, the notify route's
-check). The blocks go on the wire as the renderer wrote them, not through slack-go's types.
-The live message shows the newest progress chat message under every display mode, and keeps it
-when the task ends, its text turning to the terminal line; a progress artifact without one turns
+no buttons it has no bar, and its tone shows nowhere (the text states the fact either way). Markdown
+in the detail and the fold's text is drawn as rich text (`slackRichDocument`): a heading as a bold
+line, a fenced block as `rich_text_preformatted` (one inside a list item loses the item's indent),
+bullet and numbered lists as `rich_text_list` with their nesting as its `indent` and a numbered
+list's first number less one as its `offset`, a quote as `rich_text_quote`, a table as a preformatted block
+with its columns lined up, a rule dropped, and paragraphs a blank line apart. Inline, it and the
+rows and `after` keep code spans, bold, italic, strike and links whose url passes the links rule,
+the label check included; anything else shows as written. Every field goes out as `rich_text` or
+`plain_text`, which Slack shows as written, so a `<!here>` or a bare `@here` in one is inert text;
+`refuseSlackChat` still refuses a layout carrying a mention in a mrkdwn text object
+(`blocksMention`, the notify route's check), which the renderer no longer writes. The blocks go on
+the wire as the renderer wrote them, not through slack-go's types.
+With Agent Sessions wired (every Slack adapter the gateway builds) there is no live message in a
+Slack thread, since the adapter is a `StatusShower` for any conversation with a thread; where a backend keeps one, the live message shows
+the newest progress chat message under every display mode, and keeps it when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress
 chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
 so a live message laid out before a gateway restart does not keep a stale plan. A post or edit
@@ -1794,9 +1808,9 @@ clicks and Agent Sessions, above); a link button opens its url and its click is 
 That is the exception to the notify route's refusal of interactive blocks: a raw `blocks`
 request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat
 message's buttons are the gateway's own, built from validated choices whose click text the
-gateway reads as an ordinary message. The fold's text goes through
-`toMrkdwn`, the translation the text path uses, so a heading there shows as a bold line and a
-bullet as `•`, as they do in a text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
+gateway reads as an ordinary message. The fold's text is drawn as rich text as the detail is,
+so a heading there shows as a bold line and a list as a list, as `toMrkdwn` renders them in a
+text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
 message the shared cases in `tests/conformance/chat/` expect, checked on every run.
 
 A conversation notify request (below) reads its `chat` field and `update` key the same way.

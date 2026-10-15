@@ -228,9 +228,10 @@
 #
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the next-to-last entry below: sixty-five cases
-# (195 units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds
-# the infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# kubectl execs each). It is the entry before upgrades-freeze-runbook-probe
+# below: sixty-five cases (195
+# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
+# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
 # there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
 # the thirteen come to ~583 serial minutes against the 480m deadline.
 #
@@ -253,14 +254,14 @@
 # 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
 # units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
 # plants a previous run in the report store and removes it on destroy). It is
-# the last entry below: sixty-six cases (198 units) here, of an eighty-case,
+# the entry after session-crashloop-question-loads-a-skill below: sixty-six cases (198 units) here, of an eighty-case,
 # 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
 # case after oobe-first-run-audits was parked.
 #
 # 2026-10-08 adds upgrades-audit-reports-upgrade-blocked (rebased past the
 # 2026-10-09 entries above): one case, three units at the 900s hint the full
 # audits take (hack/ci-eval-pr.sh prices and ceilings it with its siblings).
-# Counted over every entry below, this case, the last entry after
+# Counted over every entry below, this case, the entry after
 # fleet-audit-unchanged-finding-keeps-wording, makes this file sixty-nine cases
 # (207 units) of an eighty-three-case, 249-unit matrix with the presubmit
 # file's fourteen.
@@ -351,6 +352,13 @@
 # Counted from the lists on 2026-10-14, after the merges of main to 1f9b84ba:
 # seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit matrix
 # with the presubmit file's fourteen.
+#
+# 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
+# 1200s hint (one front-door turn and one delegated card; noop, no infra
+# lock; 13-28 minutes a repetition on the dev install while main runs the
+# worker to its retries). It is the last entry below. Counted from the
+# lists: seventy-six cases (228 units) here, of a ninety-case, 270-unit
+# matrix, the paragraphs above included.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -936,9 +944,20 @@
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
 
+# Asked for options to choose from, the card pauses on the question:
+# kanban_block(kind="needs_input") with a reason ending on two to five
+# options, which Slack posts as the needs-you message with a button per option
+# (agents/platform/SOUL.md §0 step 3). deployer: noop, one front-door turn and
+# the card round trip; reads the seeded fleet's crashloop-workload role.
+./tasks/chat-question-asked-to-choose-pauses/task.yaml
 
 # manage-cluster skill probe: excluding a cluster on an installer-managed
 # install goes through SCOPE_EXCLUDE_CLUSTERS in install.env and a full
 # upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
 # transcript-only, one delegation round trip.
 ./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
+
+# A kubectl scale the command policy refuses: the report names the refusal
+# and no delegated worker retries the change another way after it (the
+# order-aware worker_commands check, #2173). deployer: noop, transcript-only.
+./tasks/stop-on-permission-refusal/task.yaml
