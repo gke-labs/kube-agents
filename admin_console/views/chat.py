@@ -164,7 +164,7 @@ def render_task_cards(
             if task.status == "done" and task.run_count > 1:
                 st.caption(f"Completed after {task.run_count} runs")
             st.page_link(
-                "pages/kanban.py",
+                "views/kanban.py",
                 label=task.task_id,
                 icon=":material/open_in_new:",
                 help="Open this task in Task Kanban",
@@ -663,7 +663,7 @@ with thread:
                 st.caption(f"Root run: {last_run.root_run_id}")
             for diagnostic in last_run.diagnostics:
                 st.caption(diagnostic)
-            st.page_link("pages/activity.py", label="Open Activity Explorer")
+            st.page_link("views/activity.py", label="Open Activity Explorer")
 
     prompt = st.chat_input(
         "Message the agent",

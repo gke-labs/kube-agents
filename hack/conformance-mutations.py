@@ -1085,14 +1085,6 @@ Mutation(
         "log the hint raw, which is the state the sanitiser was added to fix",
     ),
     Mutation(
-        "D1-gateway-role-reaches-secrets",
-        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-        ('Resources: []string{"pods"},', 'Resources: []string{"pods", "secrets"},'),
-        "test_D1_no_product_role_can_write_the_identity_table",
-        "let the gateway's spawner Role read and write Secrets beside pods, "
-        "which is the shortcut that puts its own identity table in its hands",
-    ),
-    Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
@@ -1562,7 +1554,7 @@ Mutation(
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
         ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: gke-gmp-system\n",
          "        - namespaceSelector: {}\n"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
         "drop the matchLabels from the inject fence's collector peer, the edit "
         "that reads as \"admit Prometheus wherever it runs\" and admits every "
         "pod in every namespace to the gateway's metrics port",
@@ -1571,7 +1563,7 @@ Mutation(
         "C1-a2a-gateway-collector-to-a-door-port",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
         ("      ports:\n        - port: 9096\n", "      ports:\n        - port: 8099\n"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
         "point the inject fence's collector rule at the inject door's port, so "
         "the collector's namespace reaches a task-submission endpoint guarded "
         "by its bearer token alone",
@@ -1582,17 +1574,29 @@ Mutation(
         ("      ports:\n        - port: 9096\n          protocol: TCP\n  podSelector:",
          "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
          "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
-        "add a second rule beside the collector's, admitting every pod in the "
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
+        "add a rule beside the collector's and the operator's, admitting every pod in the "
         "namespace to the A2A door's port: the 'an in-cluster caller needs the "
         "door' edit made without the decision the fence's comment asks for",
+    ),
+    Mutation(
+        "C1-a2a-gateway-operator-peer-without-its-pod-selector",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kubeagents-system\n"
+         "          podSelector:\n            matchLabels:\n              app.kubernetes.io/name: kube-agents-operator\n",
+         "        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kubeagents-system\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
+        "drop the podSelector from the inject fence's operator peer, the edit "
+        "that reads as \"the operator's namespace is ours anyway\" and admits "
+        "every pod in it, the agent's own sandbox included on a single-namespace "
+        "install, to the gateway's metrics port",
     ),
     Mutation(
         "C1-a2a-gateway-fence-selects-a-label-the-pod-lacks",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
         ("  podSelector:\n    matchLabels:\n      app: test-agent-a2a-gateway\n",
          "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: test-agent-a2a-gateway\n"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
         "move the inject fence's selector to an app.kubernetes.io/name key the "
         "gateway pod carries with another value, the half-done label migration: "
         "the fence still names the Deployment, selects no pod, and the API "

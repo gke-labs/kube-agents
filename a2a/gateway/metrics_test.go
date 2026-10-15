@@ -295,6 +295,75 @@ func TestTaskTerminalLabelsAreClosed(t *testing.T) {
 	none.gchatPull(gchatPullEvents)
 }
 
+// metricsInboundCount reads one inbound-messages series.
+func metricsInboundCount(t *testing.T, m *Metrics, platform string) float64 {
+	t.Helper()
+	return counterValue(t, m.messagesInbound.WithLabelValues(platform))
+}
+
+// Every message a chat backend hands the gateway is counted under its
+// platform, before the sender is verified: the rig's backend is discord, and
+// a sender the principal map does not know counts too.
+func TestInboundMessagesAreCountedByPlatform(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/count-1", Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "one"}
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/count-1", Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "two"}
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/count-2", Kind: "group", AuthorID: "9999", MessageID: "c-3", Text: "from nobody the map knows"}
+	waitFor(t, "three discord messages counted", func() bool { return metricsInboundCount(t, m, platformDiscord) == 3 })
+	for _, platform := range []string{platformGoogleChat, platformSlack, platformConsole, metricsLabelOther} {
+		if got := metricsInboundCount(t, m, platform); got != 0 {
+			t.Errorf("%s = %v, want 0", platform, got)
+		}
+	}
+	if got := seriesCount(t, m, "kubeagents_a2a_gateway_messages_inbound_total"); got != len(metricsPlatforms)+1 {
+		t.Errorf("the inbound counter carries %d series, want %d: every platform and other, pre-seeded", got, len(metricsPlatforms)+1)
+	}
+}
+
+// The body carries the process start time the operator's poller reads to tell
+// an in-place restart from a counter that fell: one series, the process's own
+// clock at construction, never re-derived.
+func TestTheBodyCarriesTheProcessStartTime(t *testing.T) {
+	before := float64(time.Now().UnixNano()) / float64(time.Second)
+	m := NewMetrics()
+	after := float64(time.Now().UnixNano()) / float64(time.Second)
+	var out dto.Metric
+	if err := m.processStart.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.GetGauge().GetValue()
+	if got < before || got > after {
+		t.Fatalf("process_start_time_seconds = %v, want within [%v, %v]", got, before, after)
+	}
+	if n := seriesCount(t, m, "process_start_time_seconds"); n != 1 {
+		t.Fatalf("the registry serves %d process_start_time_seconds series, want 1", n)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := m.processStart.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.GetGauge().GetValue() != got {
+		t.Fatal("the start time moved under an unchanged process")
+	}
+}
+
+// The platform label is a closed list: each chat backend maps to its name,
+// the doors are not counted at all, and an unknown backend lands under other.
+func TestInboundPlatformLabelsAreClosed(t *testing.T) {
+	for backend, want := range map[string]string{gchatBackend: platformGoogleChat, slackBackend: platformSlack, discordBackend: platformDiscord, consoleBackend: platformConsole, "telegram": metricsLabelOther} {
+		got, ok := metricsPlatformLabel(backend)
+		if !ok || got != want {
+			t.Errorf("%s -> %q,%v; want %q,true", backend, got, ok, want)
+		}
+	}
+	for _, door := range []string{injectBackend, a2aBackend, a2aGoogleBackend} {
+		if _, ok := metricsPlatformLabel(door); ok {
+			t.Errorf("the %s door's turns are counted as chat", door)
+		}
+	}
+}
+
 // TestGchatPullsAreCountedByOutcome: events, then empty pulls, then refused
 // ones, each read off the counter where the summary line counts them.
 func TestGchatPullsAreCountedByOutcome(t *testing.T) {

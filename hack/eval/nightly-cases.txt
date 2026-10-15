@@ -228,12 +228,12 @@
 #
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the entry before upgrades-freeze-runbook-probe
-# below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
-# there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
-# the thirteen come to ~583 serial minutes against the 480m deadline.
+# kubectl execs each). It is the entry after
+# backup-dr-cmek-selected-namespaces-probe below: sixty-five cases (195 units)
+# here, of a seventy-nine-case, 237-unit matrix. Its stack holds the infra
+# lock, so it is the thirteenth tofu case: ~10 more serial minutes there. With
+# oobe-first-run-audits, the twelfth (~120 at its 2400s hint), the thirteen
+# come to ~583 serial minutes against the 480m deadline.
 #
 # 2026-10-09 parks oobe-first-run-audits: it is in no roster file, and its
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py says what brings
@@ -250,6 +250,37 @@
 # key is the open fix for that half). Counted from the lists,
 # this file is now sixty-five cases (195 units) of a seventy-nine-case,
 # 237-unit matrix.
+#
+# 2026-10-15 readmits oobe-first-run-audits (#2806), off the infra-lock chain.
+# The chain had no room for it: the four nights after the park ran it 303-340
+# minutes inside builds of 395-422, and 10-13 ran 485m to the deadline. The
+# writers part had none either: 99-219 minutes against its 240m budget, and a
+# case that requests no pull request runs there before the writers do. So the
+# case takes no infra lock (hack/ci-eval-pr.sh, infra_lock_exempt): its stack
+# touches no task cluster and reaches the install through a kubeconfig of its
+# own, and its unit runs devops-bench on a private copy of the shared one. The
+# onboarding state lock keeps it apart from bootstrap-discovery-fanout and
+# bootstrap-inventory-ranking-delivery, whose stacks rewrite the same markers
+# and `oobe` job. Its unit_cost_hint goes to 3000s, the top of the queue, so
+# each repetition launches first in its repetition round: repetition 1 at the
+# start of the night, 2 and 3 once every unit of the round before has
+# launched, each then waiting on its stream locks and the previous
+# repetition's audits (wait_platform_runs). That is ~150 lane-minutes at
+# 2530-3144s a repetition, beside the chain rather than on it, but spread
+# across the night, so the later repetitions can extend the night's tail. Its
+# four audit-stream locks still hold the audit cases on those streams back
+# while it runs: the compliance-audit stream already carries nine other units,
+# so that stream's chain grows by the same ~150 minutes plus the audits each
+# repetition leaves running. It takes the state lock only once its stream
+# waits are over, and the bootstrap cases take it only while they hold the
+# infra lock, in one try. A bootstrap unit that finds it busy gives the infra
+# lock back and keeps its lane for up to one oobe run (~50 minutes), which
+# costs the chain nothing unless the chain has nothing else left to run. #2699
+# made it gradable: tool_calls_optional lets its no-tool reply pass the liveness
+# rung that graded the first night blocked. The first night with it measures
+# whether the main part still fits; if it does not, it is parked again. Counted
+# from the lists, this file is seventy-nine cases (237 units) of a
+# ninety-three-case, 279-unit matrix with the presubmit file's fourteen.
 #
 # 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
 # units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
@@ -345,7 +376,7 @@
 # in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
 #
 # 2026-10-06 adds upgrades-fleet-readiness-failclosed-webhook (its paragraph
-# is last because its count is the newest): one case, three units, a
+# sits after the 2026-10-09 one because it was counted later): one case, three units, a
 # read-only chat turn that runs the readiness script over every cluster in
 # the project (one red repetition on a dev install with thirty-odd clusters
 # took 29 minutes of agent time; the pool projects hold the seeded fleet and
@@ -354,12 +385,23 @@
 # seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit matrix
 # with the presubmit file's fourteen.
 #
+# 2026-10-13 adds upgrades-readiness-zonal-control-plane (rebased past the
+# gitops-drift-noise-filtered-triage and upgrades-fleet-readiness-failclosed-webhook
+# entries above): one case, three units at
+# the 200s default (a read-only chat turn that runs the readiness report; the
+# report alone measured 62s on the dev install). It is the entry after
+# manage-cluster-exclusion-installer-route-probe below. Counted over every
+# entry below on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine
+# cases (237 units) here, of a ninety-three-case, 279-unit matrix with the
+# presubmit file's fourteen.
+# No stack, so the infra lock is untouched.
 # 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
-# lists: seventy-six cases (228 units) here, of a ninety-case, 270-unit
-# matrix, the paragraphs above included.
+# lists on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine cases
+# (237 units) here, of a ninety-three-case, 279-unit matrix, the paragraphs
+# above included.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -846,6 +888,16 @@
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
+# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
+# onboarding scan settles, four fleet audits start instead of waiting for their
+# schedules, one after another. The stack arms the stage with two archived
+# stand-in cards, the scan marker and the hand-off's record, and puts back the
+# oobe job the image ships;
+# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
+# because each repetition runs four real audits back to back. Off the infra
+# lock (the 2026-10-15 paragraph above).
+./tasks/oobe-first-run-audits/task.yaml
+
 # A delegated answer opens on one bold sentence and does not restate it
 # (the report stanza in deploy/docker/patches/kanban_report_format.py).
 # deployer: noop, transcript-only, one front-door turn plus the card round trip.
@@ -964,6 +1016,11 @@
 # upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
 # transcript-only, one delegation round trip.
 ./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
+# Upgrade-failure catalogue entry 11 through the readiness report's
+# zonal-control-plane rule: every seeded cluster's zonal control plane is a
+# risk, never a block, on the report. Read-only; no planted fixture. Nightly
+# from its first merge.
+./tasks/upgrades-readiness-zonal-control-plane/task.yaml
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the
@@ -978,3 +1035,9 @@
 # lock. Counted from the lists: seventy-eight cases (234 units) here, of a
 # ninety-two-case, 276-unit matrix with the presubmit file's fourteen.
 ./tasks/not-found-target-stops-as-failure/task.yaml
+
+# gke-alert-configuration skill probe: a Terraform memory-saturation alert
+# for a GKE workload uses condition_prometheus_query_language, the cAdvisor
+# memory limit and the skill's created-with-google-skill label. deployer:
+# noop, transcript-only, one delegation round trip.
+./tasks/alert-config-terraform-promql-probe/task.yaml

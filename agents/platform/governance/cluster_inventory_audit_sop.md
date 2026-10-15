@@ -123,67 +123,6 @@ Google Cloud and GKE best practices where it helps.
 
 ---
 
-## Without a GitOps repository
-
-**Run this section only when your card says to.** It does when the install has no GitOps repository
-for the four first-run audits (cost, security, reliability and capacity) to publish to: those audits
-then do not run after the scan, and this card is all that checks the workloads on day one. When your card says to skip it, skip
-it; the audits run these checks and report them with their own evidence.
-
-Add these to Steps 3 and 4, across all namespaces on this cluster:
-
-1. **NetworkPolicy:** In the multi-tenancy check, also verify whether NetworkPolicies are configured.
-2. **Probes:** Verify that every workload has `livenessProbe` and `readinessProbe` configured.
-3. **Resource Management:** Verify that containers define explicit `requests` and `limits` (record
-   the Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
-4. **Scaling:** Audit Horizontal Pod Autoscaler settings (`minReplicas`, `maxReplicas`, metrics
-   targets).
-5. **Security Context:** Verify whether workloads run as non-root (`runAsNonRoot: true`). Check
-   `privileged`, `hostPID`, `hostNetwork`, `hostIPC`, and an added `SYS_ADMIN` capability in the
-   same pass, and record any workload that sets one as a **high** severity finding naming that
-   workload, for the same reason Step 3 gives for added capabilities: those five grant escape from
-   the container to the node.
-6. **Hardening:** On Standard clusters, evaluate Pod Security Admission and whether Workload
-   Identity is enabled on the cluster.
-
-Record them in the Step 5 `metadata` as these fields, beside the ones Step 5 already shows:
-
-```json
-{
-  "workloads": [
-    {
-      "probes": { "liveness": false, "readiness": false, "startup": false },
-      "resources": { "requests": false, "limits": false, "qos": "BestEffort" },
-      "hpa": false,
-      "security_context": {
-        "run_as_non_root": false,
-        "read_only_root_fs": false,
-        "privileged": false,
-        "host_pid": false,
-        "host_network": false,
-        "added_capabilities": []
-      }
-    }
-  ],
-  "namespace_governance": [{ "network_policy": false }]
-}
-```
-
-Report their findings under these slugs, alongside the Step 5 table:
-
-| what you found                   | check slug                            |
-| -------------------------------- | ------------------------------------- |
-| liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
-| requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
-| HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
-| NetworkPolicy                    | `netpol-missing`                      |
-| Workload Identity on the cluster | `workload-identity-off`               |
-| `runAsNonRoot` security context  | `podsecurity-gaps`                    |
-| privileged or `SYS_ADMIN`        | `privileged-container`                |
-| host namespaces                  | `host-namespace`                      |
-
----
-
 ## Step 5: Report on your card
 
 Complete the card with `kanban_complete`, supplying **both** a human-readable `result` and a
@@ -266,7 +205,7 @@ Checks the first-run audits own (cost, security, reliability and capacity: liven
 probes, requests and limits, HPA, NetworkPolicy, the cluster's Workload Identity setting
 (`workload-identity-off`; a pod's static keys are `static-sa-key` above), pod security, privileged
 and host-namespace workloads, and an added `SYS_ADMIN` among them) are not reported here, under any
-slug, unless your card has you run "Without a GitOps repository" above. Those audits report them with their own evidence,
+slug. Those audits report them with their own evidence,
 and a second copy from this card reaches the user as a separate problem.
 
 For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it

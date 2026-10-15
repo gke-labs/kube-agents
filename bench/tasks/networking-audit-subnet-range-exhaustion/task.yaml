@@ -2,8 +2,7 @@
 # in no roster file under hack/eval/, until the preconditions #2755 lists
 # land: Compute network permission for the CI runners (confirmed or
 # granted), a scheduled sweep of what a killed run leaves behind, and room on
-# the main part's infra-lock chain (measured with oobe-first-run-audits in
-# it if that parked case returns first, or stack cases moved to a second
+# the main part's infra-lock chain (or stack cases moved to a second
 # project). It has its eval record
 # (#2468: red on main 83194e93, three greens on the fix, 2026-10-06). Until
 # then it runs by hand against a dev install:

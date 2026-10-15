@@ -178,6 +178,13 @@ readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
+# The longest a unit holding a state lock (unit_state_lock) keeps its stack
+# applied: oobe-first-run-audits' own_wait plus its chain_wait
+# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
+readonly STATE_LOCK_HOLD_SECONDS=7200
+# How long a stack-bearing unit that found its state lock busy waits, with the
+# infra lock given back, before it queues for the infra lock again.
+readonly STATE_LOCK_RETRY_SECONDS=30
 
 # ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
@@ -2649,11 +2656,13 @@ unit_cost_hint() {
     # and the agent turn is a board read. Unmeasured; priced below the band
     # above because one card's worker is the whole of the wait.
     bootstrap-inventory-ranking-delivery) echo 600 ;;
-    # Tofu too: the unit waits for the previous repetition's audits to finish
-    # (wait_platform_runs), then the stack waits for the stage to run the four
-    # one after another (1-15 min each, #985; up to its chain_wait, 3600s).
-    # Unmeasured on CI.
-    oobe-first-run-audits) echo 2400 ;;
+    # A stack, but off the infra lock (infra_lock_exempt): the unit waits for
+    # the previous repetition's audits to finish (wait_platform_runs), then the
+    # stack waits for the stage to run the four one after another (1-15 min
+    # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
+    # nightly of 2026-10-09; the top of the list, so it launches first in each
+    # repetition round.
+    oobe-first-run-audits) echo 3000 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2793,6 +2802,28 @@ unit_delegation_timeout() {
 # of every task's `audit_streams:`; a file that will not read stops the run,
 # since a unit that held none of its declared locks would run beside the
 # audit cases they keep out.
+#
+# A stack-bearing case listed in infra_lock_exempt runs beside the other tofu
+# units: its stack reaches the agent install through a kubeconfig of its own
+# and touches no task cluster, and run_one_unit gives the unit a private copy
+# of the shared kubeconfig, so the get-credentials devops-bench runs for the
+# stack's cluster_name output cannot move another unit's current-context.
+infra_lock_exempt() { # <task-name>
+  case "$1" in
+    oobe-first-run-audits) return 0 ;;
+  esac
+  return 1
+}
+# The agent-install state a case's stack rewrites that another case's stack
+# rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
+# markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
+# Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
+# from the others, so this lock does.
+unit_state_lock() { # <task-name>
+  case "$1" in
+    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
+  esac
+}
 TASK_NAMES=()
 TASK_REUSE=()
 TASK_HAS_STACK=()
@@ -2807,7 +2838,12 @@ for TASK in "${TASKS[@]}"; do
   TASK_STREAMS+=("$(task_streams "$(ledger_audit_id_for_task "${TASK}" 2>/dev/null)" \
     "$(printf '%s\n' "${DECLARED_STREAMS}" | awk -v c="${TASK_NAME}" '$1 == c { $1 = ""; print; exit }')")")
   TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
-  if [ -n "${TASK_STACK}" ]; then TASK_HAS_STACK+=("true"); else TASK_HAS_STACK+=(""); fi
+  # "true" means the unit takes the infra lock, so an exempt stack is left out.
+  if [ -n "${TASK_STACK}" ] && ! infra_lock_exempt "${TASK_NAME}"; then
+    TASK_HAS_STACK+=("true")
+  else
+    TASK_HAS_STACK+=("")
+  fi
   if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
     && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
     TASK_REUSE+=("true")
@@ -2845,7 +2881,7 @@ STATE_DIR="$(mktemp -d)"
 # otherwise strand every contender in a silent spin that `wait` can never
 # collect past, so acquisition carries a deadline: a unit that gives up fails
 # loudly and grades as MISSING, which is a diagnosis the gate already
-# reports. Three locks serialize what genuinely cannot overlap while noop
+# reports. Four locks serialize what genuinely cannot overlap while noop
 # units fill the lanes:
 #   per task   -- repetitions of ONE task never overlap. Concurrent reps of a
 #                 ledger-writing audit rewrite one shared ledger issue and
@@ -2853,6 +2889,13 @@ STATE_DIR="$(mktemp -d)"
 #                 task plant simultaneous incidents with no card attribution;
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
+#   per state  -- cases whose stacks rewrite the same agent-install state
+#                 (unit_state_lock) never overlap. A unit off the infra lock
+#                 takes it after its streams and wait_platform_runs; a
+#                 stack-bearing unit takes it only while it holds the infra
+#                 lock, in one try, giving the infra lock back when it is
+#                 busy. No unit holds it while queued for infra, and no unit
+#                 holds infra while waiting for it.
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label, and
@@ -2874,6 +2917,7 @@ STATE_DIR="$(mktemp -d)"
 #                 per-run isolation (own kubeconfig, gcloud config, tofu data
 #                 dir) is off, and two concurrent tofu units would race the
 #                 shared kubeconfig's current-context and their state locks.
+#                 An infra_lock_exempt case does not take it.
 lock_acquire() { # <dir> [deadline-seconds]
   local waited=0 limit="${2:-1800}"
   until mkdir "$1" 2>/dev/null; do
@@ -2936,6 +2980,23 @@ release_streams() { # <space-separated audit ids>
   local s
   # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
   for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done
+}
+
+# How long a unit waits for a state lock: every case holding it keeps its
+# stack applied for up to STATE_LOCK_HOLD_SECONDS, and a stack-bearing waiter
+# queues for the infra lock between its tries, one INFRA_LOCK_DEADLINE a case.
+state_lock_deadline() { # <lock>
+  local n=0 t
+  for t in "${TASK_NAMES[@]}"; do
+    [ "$(unit_state_lock "${t}")" = "$1" ] && n=$((n + 1))
+  done
+  echo $(( n * (INFRA_LOCK_DEADLINE + STATE_LOCK_HOLD_SECONDS) ))
+}
+
+release_state_lock() { # <task-name>
+  local lock
+  lock="$(unit_state_lock "$1")"
+  if [ -n "${lock}" ]; then lock_release "${STATE_DIR}/lock-state-${lock}"; fi
 }
 
 # ─── Per-case grading and recording, inside the fan-out ─────────────────────
@@ -3111,6 +3172,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
   fi
   release_streams "${streams}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} ${why}" >&2
   if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
@@ -3153,12 +3215,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # INFRA_LOCK_DEADLINE, because its previous rep holds the task lock while
   # queued on lock-infra, and no stream term counts that wait. The infra
   # lock keeps its default: it is taken last, after any stream wait, so it is
-  # held only while this unit's own stack is in use.
-  local audit_id lock_deadline held="" s
+  # held only while this unit's own stack is in use. A case with a state lock
+  # adds that lock's deadline, which its previous rep may wait out first.
+  local audit_id lock_deadline held="" s state_lock
   audit_id="$(ledger_audit_id_for_task "${task}")"
+  state_lock="$(unit_state_lock "${name}")"
   lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"
   if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
     lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
+  fi
+  if [ -n "${state_lock}" ]; then
+    lock_deadline=$(( lock_deadline + $(state_lock_deadline "${state_lock}") ))
   fi
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
@@ -3186,11 +3253,40 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     held="${held} ${s}"
   done
   wait_platform_runs "${name} rep ${rep}" "${streams}"
-  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
+  # A unit without the infra lock waits for its state lock here, once its
+  # stream waits are over, so it holds the state only while its stack is in
+  # use; a stack-bearing one takes it with the infra lock, below.
+  if [ -n "${state_lock}" ] && [ -z "${has_stack}" ] \
+    && ! lock_acquire "${STATE_DIR}/lock-state-${state_lock}" "$(state_lock_deadline "${state_lock}")"; then
     release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${state_lock} state lock" >&2
     return 0
+  fi
+  # A stack-bearing unit with a state lock tries it once while it holds the
+  # infra lock and never waits on it there: a busy one sends the infra lock
+  # back to the queue, so the tofu chain does not stall behind an exempt
+  # case's stack, and no unit holds the state lock while it queues for infra.
+  if [ -n "${has_stack}" ]; then
+    local infra_deadline="${INFRA_LOCK_DEADLINE}" infra_start="${SECONDS}" infra_held=""
+    if [ -n "${state_lock}" ]; then
+      infra_deadline=$(( infra_deadline + $(state_lock_deadline "${state_lock}") ))
+    fi
+    while [ $(( infra_deadline - (SECONDS - infra_start) )) -gt 0 ] \
+      && lock_acquire "${STATE_DIR}/lock-infra" "$(( infra_deadline - (SECONDS - infra_start) ))"; do
+      if [ -z "${state_lock}" ] || mkdir "${STATE_DIR}/lock-state-${state_lock}" 2>/dev/null; then
+        infra_held="true"
+        break
+      fi
+      lock_release "${STATE_DIR}/lock-infra"
+      sleep "${STATE_LOCK_RETRY_SECONDS}"
+    done
+    if [ -z "${infra_held}" ]; then
+      release_streams "${streams}"
+      lock_release "${STATE_DIR}/lock-task-${name}"
+      echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock${state_lock:+ with the ${state_lock} state lock}" >&2
+      return 0
+    fi
   fi
   # This unit's own token, minted rather than inherited, and minted after the
   # waiting rather than before it: reps of one task serialize on the task lock,
@@ -3254,6 +3350,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     unset TF_VAR_reuse_existing_cluster
   fi
   export BENCH_NO_INFRA="false"
+  # An exempt stack runs beside the tofu units, so the context devops-bench
+  # sets for its cluster_name output goes to a copy (infra_lock_exempt).
+  if infra_lock_exempt "${name}"; then
+    local kubeconfig="${STATE_DIR}/kubeconfig-${name}-rep${rep}"
+    if ! kubectl config view --raw > "${kubeconfig}" || [ ! -s "${kubeconfig}" ]; then
+      skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}" "did not run: could not copy the kubeconfig" \
+        "the unit's private kubeconfig could not be written before launch"
+      return 0
+    fi
+    export KUBECONFIG="${kubeconfig}"
+  fi
   # Per unit, inside this subshell, so the audit units' longer ceiling never
   # leaks to a sibling lane; see unit_delegation_timeout.
   AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
@@ -3318,6 +3425,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   finished_reps="$(finished_rep_count "${name}")"
   release_streams "${streams}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   # Copied here, not in the grading pass: a Prow deadline that kills the
   # fan-out must still leave every completed unit's log in the artifacts.
