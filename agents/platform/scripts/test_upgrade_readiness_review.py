@@ -202,10 +202,29 @@ class Registration(unittest.TestCase):
             outcomes, problems = review.register(members, [], findings)
         self.assertEqual(problems, [])
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][1]["scope"], {"project": PROJECT, "cluster": "seeded-b", "complete": True})
+        self.assertEqual(calls[0][1]["scope"], {"project": PROJECT, "cluster": "seeded-b", "complete": True, "check_prefix": review.CHECK_PREFIX})
         self.assertNotIn("scope", calls[1][1])
         self.assertEqual(set(outcomes.values()), {"created"})
         self.assertEqual(len(outcomes), len(findings))
+
+    def test_a_complete_cluster_with_nothing_to_report_sends_an_empty_scoped_batch(self):
+        calls = []
+
+        def fake_request(path, body):
+            calls.append(body)
+            return {"results": []}
+
+        clean = member("seeded-c")
+        with mock.patch.object(review, "kv_request", fake_request):
+            outcomes, problems = review.register([clean], [], [])
+        self.assertEqual((outcomes, problems), ({}, []))
+        self.assertEqual(calls, [{"findings": [], "scope": {"project": PROJECT, "cluster": "seeded-c", "complete": True, "check_prefix": review.CHECK_PREFIX}}])
+        partial = member("seeded-c")
+        partial["readiness"]["read_error"] = "timed out"
+        calls.clear()
+        with mock.patch.object(review, "kv_request", fake_request):
+            review.register([partial], [], [])
+        self.assertEqual(calls, [])
 
     def test_a_failed_batch_is_reported_and_marks_its_rows(self):
         def failing(path, body):
@@ -241,9 +260,13 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(doc["clusters"]["ready"], [f"{PROJECT}/us-central1-a/seeded-c"])
         self.assertEqual(doc["counts"]["critical"], 4)  # seeded-b's budget; gemma's budget, skew and webhook
         self.assertEqual(len(doc["new_ids"]), len(findings))
-        previous = {"findings": [{"id": "upgrade-pool-skew.acme-prod.old-cluster._.default-pool"}, {"id": doc["findings"][0]["id"]}]}
-        doc2, _ = self.summary_for([seeded_b(), gemma()], previous=previous)
-        self.assertEqual(doc2["no_longer_reported_ids"], ["upgrade-pool-skew.acme-prod.old-cluster._.default-pool"])
+        # Last week's rows count as no longer reported only on a cluster this
+        # run read; a cluster not read this week keeps its rows unjudged.
+        gone = {"id": "upgrade-pool-skew.acme-prod.seeded-b._.old-pool", "project": PROJECT, "cluster": "seeded-b"}
+        unread = {"id": "upgrade-pool-skew.acme-prod.old-cluster._.default-pool", "project": PROJECT, "cluster": "old-cluster"}
+        kept = dict(doc["findings"][0])
+        doc2, _ = self.summary_for([seeded_b(), gemma()], previous={"findings": [gone, unread, kept]})
+        self.assertEqual(doc2["no_longer_reported_ids"], [gone["id"]])
 
     def test_the_report_names_every_finding_with_its_id_and_action(self):
         doc, findings = self.summary_for([seeded_b()])
@@ -267,14 +290,35 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(review.load_previous(home)["stamp"], doc["stamp"])
 
     def test_the_sandbox_copy_program_writes_both_files_readable(self):
-        program = review.sandbox_copy_program({"latest.md": "# r\n", "latest.json": "{}"})
+        program = review.sandbox_copy_program({"latest.md": "# r 🎄 exclusion\n", "latest.json": "{}"})
         self.assertIn(review.SANDBOX_COPY_DIR, program)
         self.assertIn("os.chmod", program)
         fake_dir = Path(self.tmp.name) / "sandbox"
         exec_globals = {}
         exec(program.replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir))), exec_globals)  # noqa: S102 - the program under test
         self.assertEqual(sorted(p.name for p in fake_dir.iterdir()), ["latest.json", "latest.md"])
+        self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# r 🎄 exclusion\n")
         self.assertEqual(oct(os.stat(fake_dir / "latest.md").st_mode & 0o777), oct(review.SANDBOX_COPY_MODE))
+
+    def test_the_sop_reads_the_fields_the_summary_writes(self):
+        # Step 1 of the brief SOP lists the summary's keys in backticks; a
+        # renamed key here breaks every install's Saturday brief with no signal,
+        # so the list is held to the dict `summary()` writes.
+        import re
+        doc, _ = self.summary_for([seeded_b()])
+        text = SOP.read_text()
+        step_one = text.split("### 1. Read the review", 1)[1].split("### 2.", 1)[0]
+        named = set(re.findall(r"`([a-z_]+)`", step_one))
+        row_keys = set(doc["findings"][0]) if doc["findings"] else set()
+        self.assertTrue(named, "the SOP names no fields")
+        for key in named - {"generated_at"}:
+            self.assertTrue(key in doc or key in row_keys, f"the SOP names `{key}`, which the summary does not write")
+        for key in ("generated_at", "projects", "clusters", "counts", "findings", "new_ids", "suppressed_ids", "no_longer_reported_ids", "project_failures", "registration_errors", "report_path"):
+            self.assertIn(key, named, f"the SOP does not tell the brief about `{key}`")
+
+    def test_projects_last_week_could_not_read_go_first(self):
+        self.assertEqual(review.ordered_names(["a", "b", "c"], {"project_failures": {"c": "timed out"}}), ["c", "a", "b"])
+        self.assertEqual(review.ordered_names(["a", "b"], None), ["a", "b"])
 
 
 class TheTick(unittest.TestCase):
@@ -321,8 +365,9 @@ class TheTick(unittest.TestCase):
         self.assertEqual((code, out), (0, ""))
         self.assertEqual(self.asked[0], [PROJECT])
         self.assertTrue(self.asked[1])
-        self.assertEqual(len(self.registered), 1)  # seeded-c has nothing to register
+        self.assertEqual(len(self.registered), 2)  # seeded-b's findings, and seeded-c's complete empty batch
         self.assertEqual(self.registered[0]["scope"]["cluster"], "seeded-b")
+        self.assertEqual((self.registered[1]["findings"], self.registered[1]["scope"]["cluster"]), ([], "seeded-c"))
         home = review.weekly_home()
         self.assertTrue((home / review.LATEST_MD_NAME).exists())
         latest = json.loads((home / review.LATEST_JSON_NAME).read_text())
@@ -349,6 +394,28 @@ class TheTick(unittest.TestCase):
         code, out = self.run_main()
         self.assertEqual(out.strip(), review.RECOVERED_LINE.format(prefix=review.LOG_PREFIX))
 
+    def test_a_project_not_read_is_one_line_and_the_rest_is_registered(self):
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            if names[0] == OTHER_PROJECT:
+                raise RuntimeError("the sandbox run timed out after 1500s")
+            return self.envelope
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("1 project(s) not read this week: acme-dev: the sandbox run timed out", out)
+        self.assertEqual(len(self.registered), 2)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "the sandbox run timed out after 1500s"})
+        # Next run, the project that failed goes first.
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
+            calls.clear()
+            self.run_main()
+        self.assertEqual(calls[0], OTHER_PROJECT)
+
     def test_no_project_is_a_failure_line(self):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ""}), mock.patch.object(watch, "projects", return_value=[]):
             code, out = self.run_main()
@@ -362,7 +429,7 @@ class TheRoster(unittest.TestCase):
         review_job = jobs[review.JOB_ID]
         brief = jobs[review.BRIEF_JOB_ID]
         self.assertEqual(review_job["schedule"]["expr"], "0 6 * * 6")
-        self.assertEqual(brief["schedule"]["expr"], "30 6 * * 6")
+        self.assertEqual(brief["schedule"]["expr"], "0 7 * * 6")
         self.assertTrue(review_job["no_agent"])
         self.assertEqual(review_job["script"], Path(review.__file__).name)
         self.assertEqual((review_job["deliver"], brief["deliver"]), ("chat", "chat"))

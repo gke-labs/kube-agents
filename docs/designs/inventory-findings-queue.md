@@ -4,7 +4,12 @@
 > `agents/platform/scripts/findings_queue.py`, `inventory_findings.py` and the Session KV server:
 > the tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
 > rules (§5.2), the endpoints and MCP tools (§6.1), and the inventory sweep's registration
-> path (§5). Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
+> path (§5). A second writer ships beside the sweep: the Saturday `upgrade-readiness-weekly-review` job
+> (`agents/platform/scripts/upgrade_readiness_review.py`) registers the readiness report's blockers
+> and risks as `source: audit` rows under its own `upgrade-` check family rather than the audit
+> streams' slugs, because it reads objects those streams never file (pools, exclusions, webhooks) and
+> one problem must stay one row across weeks, not across streams; its completeness claim is scoped to
+> that family (`scope.check_prefix`), so it lowers no other source's confidence. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
 > ships in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
 > entry in `jobs.json` post a paced version of §7.2's message, hourly: at most two new criticals a
 > UTC day, a few non-criticals in the afternoon, nothing new while a non-critical it named waits for

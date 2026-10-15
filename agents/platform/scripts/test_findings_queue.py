@@ -439,6 +439,31 @@ class TestRegistration(QueueTestCase):
 
         self.assertEqual(fq.get_finding(self.conn, elsewhere_id)["rubric"]["C"], 1.0)
 
+    def test_a_check_prefix_scopes_absence_to_its_own_family(self):
+        # The weekly upgrade readiness review is complete for the `upgrade-`
+        # family on a cluster and for nothing else: an inventory row it never
+        # looked at keeps its confidence, the upgrade row it no longer reports
+        # loses it.
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        self.register(sample(), upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        inventory_id = fq.validate_finding(sample())["id"]
+
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+
+        self.assertEqual(result, {"results": [], "downgraded": 1})
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 0.6)
+        self.assertIsNotNone(fq.get_finding(self.conn, upgrade_id)["absent_since"])
+        self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+        self.assertIsNone(fq.get_finding(self.conn, inventory_id)["absent_since"])
+
+    def test_an_empty_batch_needs_a_complete_scope(self):
+        with self.assertRaises(fq.FindingError):
+            self.register()
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu"})
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True}), {"results": [], "downgraded": 0})
+
     def test_absence_does_not_reach_a_state_the_user_set(self):
         accepted = sample(object="Deployment/ledger")
         self.register(sample(), accepted)

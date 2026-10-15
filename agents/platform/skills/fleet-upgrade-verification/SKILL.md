@@ -291,8 +291,9 @@ error (exit 2).
 
 ## Scheduled runs of the readiness report
 
-Two cron jobs on the Platform Agent's roster run `--readiness` without a request (`cron/README.md`
-in the platform profile says how):
+Besides the Monday upgrade audit, whose `upgrade-blocked` check runs `--readiness` for each cluster
+found behind, two cron jobs on the Platform Agent's roster run the whole report without a request
+(`cron/README.md` in the platform profile says how):
 
 - `upgrade-readiness-watch`, daily: for a cluster below a version its release channel offers; the
   report lands under `upgrade-readiness/reports/<version>/` on the agent's volume with one chat line.

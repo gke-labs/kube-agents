@@ -713,8 +713,17 @@ def _register_one(conn: sqlite3.Connection, finding: dict) -> str:
     return "updated"
 
 
-def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen: set[str]) -> int:
+def _downgrade_absent(
+    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = ""
+) -> int:
     """§5.2's reciprocal case: absence lowers confidence, it does not resolve.
+
+    `check_prefix` narrows the claim to the rows whose `check_slug` starts with
+    it: a recurring sweep that reads one family of checks (the weekly upgrade
+    readiness review, `upgrade-`) is complete for that family alone, and must
+    not lower the confidence of an inventory or event-watcher row on the same
+    cluster that it never looked at. Empty means every row on the cluster, the
+    onboarding sweep's claim.
 
     A sweep that died halfway produces the same silence as a fleet that got
     healthier, so a row the run did not re-report is re-ranked down at the
@@ -732,13 +741,15 @@ def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen
     # row, which says nothing about whether the problem is still there. Exempting
     # it would make the rows the nudge names the only ones absence never reaches.
     rows = conn.execute(
-        "SELECT id, rubric FROM findings WHERE project = ? COLLATE NOCASE "
+        "SELECT id, rubric, check_slug FROM findings WHERE project = ? COLLATE NOCASE "
         "AND cluster = ? COLLATE NOCASE AND state IN ('queued', 'surfaced')",
         (project, cluster),
     ).fetchall()
     downgraded = 0
-    for finding_id, raw in rows:
+    for finding_id, raw, check_slug in rows:
         if finding_id in seen:
+            continue
+        if check_prefix and not str(check_slug or "").startswith(check_prefix):
             continue
         try:
             rubric = validate_rubric(json.loads(raw))
@@ -763,10 +774,16 @@ def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen
 
 
 def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None) -> dict:
-    """Upsert a batch, then apply the absence rule if the run says it was complete."""
+    """Upsert a batch, then apply the absence rule if the run says it was complete.
+
+    An empty batch is a run that found nothing: refused without a complete
+    `scope` (there is nothing to do), accepted with one, where the point is
+    that every row the claim covers was absent (§5.2).
+    """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
-    if not findings:
+    complete = isinstance(scope, dict) and bool(scope.get("complete"))
+    if not findings and not complete:
         raise FindingError("findings is empty")
     if len(findings) > MAX_BATCH:
         raise FindingError(f"batch is {len(findings)} findings, over the {MAX_BATCH} limit")
@@ -781,10 +798,11 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
         seen.add(finding["id"])
 
     downgraded = 0
-    if isinstance(scope, dict) and scope.get("complete"):
+    if complete:
         project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
-        downgraded = _downgrade_absent(conn, project, cluster, seen)
+        check_prefix = _text(scope.get("check_prefix"), "scope.check_prefix", required=False)
+        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix)
 
     return {"results": results, "downgraded": downgraded}
 

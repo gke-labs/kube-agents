@@ -1,8 +1,9 @@
 # SOP: Weekly Upgrade Readiness Brief
 
-**Cron id:** `upgrade-readiness-weekly-brief` — `30 6 * * 6` (Saturdays, 06:30 UTC), thirty minutes
-after `upgrade-readiness-weekly-review` has graded every cluster and registered what it found on the
-findings queue.
+**Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
+`upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
+it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk or its
+failure line is in chat; nothing else sequences the two.
 
 **Purpose:** one message a person reads in a minute, saying what this week's upgrade readiness
 review found, which findings need their decision now, and where the full report is. The review job
@@ -33,9 +34,11 @@ shape; the model chooses the emphasis.
    `counts` by severity, `findings` (one row per finding: `id`, `severity`, `check`, `entry`,
    `cluster`, `namespace`, `object`, `title`, `action`, `outcome`), `new_ids`, `suppressed_ids`,
    `no_longer_reported_ids`, `project_failures`, `registration_errors` and `report_path`.
-2. If the file is missing, or `generated_at` is older than **48 hours**, the review did not run
-   this week. Say so in one line, name the job (`upgrade-readiness-weekly-review`) and the last
-   `generated_at` you found, and stop. Do not run the readiness report yourself from this job: the
+
+2. If the file is missing, or `generated_at` is older than **48 hours**, the review did not
+   finish this week (it did not run, or the hour cut it short before its record). Say so in one
+   line, name the job (`upgrade-readiness-weekly-review`) and the last `generated_at` you found,
+   and stop. Do not run the readiness report yourself from this job: the
    queue would hold nothing for the findings, and a brief that names findings nobody can decide on
    is noise.
 3. Read the full report when a line needs more than the summary row says:
@@ -46,14 +49,16 @@ shape; the model chooses the emphasis.
 
 ### 2. Read the queue
 
-Call the `platform_control` tool `get_ranked_findings` and keep the rows whose `check` starts with
-`upgrade-` (every row the review registers carries that prefix; `source` is `audit`). The queue is
-the authority on **state**: the summary says what was found, the queue says what the user has
-decided.
+Two `platform_control` tools, because the queue's open backlog and its decided rows are read
+differently; keep from both only the rows whose `check` starts with `upgrade-` (every row the
+review registers carries that prefix; `source` is `audit`). The queue is the authority on
+**state**: the summary says what was found, the queue says what the user has decided.
 
-- **Undecided**: `state` is `queued` or `surfaced`. These are the rows that still need the user.
-- **Decided**: `accepted` (being worked on), `snoozed` (back on `snoozed_until`), `dismissed`
-  (won't fix; the review will keep finding it and the queue will keep it silent).
+- `get_ranked_findings` returns the open backlog, worst first: **undecided** rows (`state` is
+  `queued` or `surfaced`), which still need the user, and `accepted` ones (being worked on).
+- `get_findings` with `state=snoozed`, then with `state=dismissed`, returns the other decided rows:
+  snoozed (back on `snoozed_until`) and dismissed (won't fix; the review will keep finding it and
+  the queue will keep it silent). The open backlog never carries them.
 - A row in the summary with outcome `suppressed` is a dismissed finding seen again. Never name it
   as new.
 
@@ -75,6 +80,8 @@ Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r>
 
 **Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there<, or "none yet">.
 
+<when the summary's project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
+
 Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "show me this week's upgrade readiness report" to read it here, or reply with an id and `dismiss`, `snooze until <date>` or `accept` to decide.
 ```
 
@@ -91,7 +98,7 @@ Rules for the judgement:
   pod, so the drain kills it" is the clause; the action is the row's `action`, shortened to the
   verb and the object. Never paste the row's full text.
 - **No critical undecided** → the section reads `**Decide now:** nothing; every critical finding
-  has a decision.` and the brief is shorter.
+has a decision.` and the brief is shorter.
 - **Nothing found at all** → two lines: the headline, then the report line. Never `[SILENT]`: the
   week's brief is owed whether or not there is news.
 - **Majors and minors stay out of Decide now.** They go in **Also this week** as counts by
@@ -99,6 +106,9 @@ Rules for the judgement:
   of the week without a list. The queue names them at its own pace.
 - **Dismissed is silent.** A `suppressed` row is never counted as new and never named; it was the
   user's decision.
+- **A project the review could not read is said, once, in its own line.** The headline's counts
+  cover the clusters that were read; `project_failures` names the rest with the review's reason.
+  Without the line a reader takes "6 clusters reviewed" for the fleet.
 - **Never invent.** Every id comes from the summary or the queue; every count comes from the
   summary. If the queue and the summary disagree on a row's state, the queue wins and you say
   nothing about the disagreement in the brief.
@@ -128,8 +138,9 @@ A user may ask in chat for the brief or the report, at any time.
   report yourself over every project in scope (`fleet-upgrade-verification`, `--readiness`, as
   "Check upgrade readiness" in its `SKILL.md` says), take the blockers and risks it names as the
   findings (a drain-blocking budget over a single replica, a pool past the skew ceiling and a
-  fail-closed webhook in the upgrade's path are critical; a webhook refusing only what it matches
-  today, a pool at the ceiling and a rule's risk are major; an exclusion is minor), read the queue
+  fail-closed webhook in the upgrade's path are critical; a budget over several replicas, a webhook
+  refusing only what it matches today and a pool at the ceiling are major; a covering exclusion is
+  minor; a rule's risk takes the severity the review's rubric gives its catalogue entry), read the queue
   for any decision already recorded, and compose the same shape. Say "live brief, composed now; the
   weekly review has not run" in the headline, use the object's name where the queue would have an
   id, and register nothing: the Saturday review owns the queue.

@@ -71,7 +71,7 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?is)decide now.{0,1200}?pinned-batch-runner'
+        - "(?is)decide now.{0,1200}?pinned-batch-runner"
       required_phrases: ["pinned-batch-runner"]
   - name: the-budget-line-names-the-cluster-and-what-it-costs
     role: objective
@@ -81,16 +81,18 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?is){cluster:b}.{0,400}?pinned-batch-runner.{0,400}?(evict|drain|only pod|single replica|one replica|singleton)'
-        - '(?is)pinned-batch-runner.{0,400}?{cluster:b}.{0,400}?(evict|drain|only pod|single replica|one replica|singleton)'
-        - '(?is){cluster:b}.{0,400}?(evict|drain|only pod|single replica|one replica|singleton).{0,400}?pinned-batch-runner'
+        - "(?is){cluster:b}.{0,400}?pinned-batch-runner.{0,400}?(evict|drain|only pod|single replica|one replica|singleton)"
+        - "(?is)pinned-batch-runner.{0,400}?{cluster:b}.{0,400}?(evict|drain|only pod|single replica|one replica|singleton)"
+        - "(?is){cluster:b}.{0,400}?(evict|drain|only pod|single replica|one replica|singleton).{0,400}?pinned-batch-runner"
   - name: the-webhook-outage-is-not-a-decision
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?is)decide now.{0,1500}?seeded-fail-closed-gate'
+        # The Decide-now block ends where the next labelled section starts, so the
+        # webhook's name under "Also this week" is where the SOP puts it, not a hit.
+        - "(?is)decide now(?:(?!also this week|decided earlier|full report).){0,1500}?seeded-fail-closed-gate"
   - name: the-brief-says-where-the-full-report-is-and-how-to-open-it
     role: objective
     mode: assert

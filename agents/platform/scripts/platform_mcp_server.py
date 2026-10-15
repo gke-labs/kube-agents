@@ -1169,7 +1169,10 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
         scope: Pass {'project': '<id>', 'cluster': '<name>', 'complete': true}
             only when this run covered that cluster in full. It lowers the
             confidence of queued rows the run did not re-report. Omit it for a
-            partial or failed run.
+            partial or failed run. A run that reads one family of checks adds
+            'check_prefix' (for example 'upgrade-'), so the claim reaches only
+            rows whose check starts with it; with it, an empty findings list is
+            a complete run that found nothing.
     """
     return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
 

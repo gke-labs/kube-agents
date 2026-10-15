@@ -4400,7 +4400,9 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     `scope` is how a source says its run was complete for one cluster, which is
     the only condition under which absence may lower a row's confidence. A
     partial run must omit it: a sweep that died halfway looks exactly like a
-    fleet that got healthier.
+    fleet that got healthier. `scope.check_prefix` narrows the claim to one
+    family of checks, and with it an empty `findings` list is accepted as a
+    complete run that found nothing.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
 

@@ -55,8 +55,10 @@ when a user asks for it; the copy is a copy, the record is on this side.
 
 Stdout is the chat message (``deliver: "chat"``) and is empty on success: the
 brief speaks for the week, and the queue speaks for every finding. A run that
-fails prints one line saying so, once per distinct failure, and exits 0; the
-exit is 1 only when the record could not be written. ``--dry-run`` runs the
+read some projects and not others prints one line naming the projects it did
+not read, since the brief's counts cannot show them; a run that fails prints
+one line saying so, once per distinct failure, and exits 0; the exit is 1 only
+when the record could not be written. ``--dry-run`` runs the
 reports and prints the summary without registering or writing anything.
 
 ``UPGRADE_READINESS_PROJECTS``, ``UPGRADE_READINESS_WATCH_HOME``,
@@ -66,6 +68,7 @@ nudge read them.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -133,11 +136,14 @@ SKEW_VERDICT_BLOCKS = "blocks"
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
 
-# The per-run budget: the watch's readiness timeout per project, and a floor
-# under which a project is not started.
+# The per-run budget: the watch's readiness timeout per project, the watch's
+# whole-tick budget for the run (Hermes kills a no_agent script at an hour, as
+# the watch records), and a floor under which a project is not started. Each
+# project is registered as soon as it returns, so a run the hour cuts short
+# keeps what it registered; the record is written at the end.
 PROJECT_TIMEOUT_SECONDS = watch.READINESS_TIMEOUT_SECONDS
 MIN_PROJECT_RUN_SECONDS = 120
-TOTAL_BUDGET_SECONDS = 3 * PROJECT_TIMEOUT_SECONDS
+TOTAL_BUDGET_SECONDS = watch.TICK_BUDGET_SECONDS
 
 # The rubric (findings_queue §4.2: B, L, detect, recover, C percent), by kind.
 # Severity falls out of it: `critical` at 150 and above or at the L>=10, B>=3
@@ -269,7 +275,34 @@ NO_PROJECTS_DETAIL = "no project to review: set UPGRADE_READINESS_PROJECTS or de
 BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
+PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
+PARTIAL_DETAIL_SEPARATOR = "; "
 DRY_RUN_HEADER = "dry run: nothing registered, nothing written"
+
+
+# --- the watch's API, on main and on the declared-scope fix -----------------------
+
+
+def watch_scope():
+    """The declared scope as the watch resolves it, or None on a watch that
+    reads none (the watch before its declared-scope change passes a bare
+    --project, which an undeclared install accepts)."""
+    resolve = getattr(watch, "declared_scope", None)
+    return resolve() if resolve else None
+
+
+def run_watch_report(project: str, scope, timeout: float) -> dict:
+    """One readiness run through the watch's loader, on either shape of
+    `run_report`: the scope-aware one takes the scope and the outside-stands
+    flag, the earlier one only the names."""
+    if hasattr(watch, "declared_scope"):
+        return watch.run_report([project], readiness=True, scope=scope, outside_stands=False, timeout=timeout)
+    return watch.run_report([project], readiness=True, timeout=timeout)
+
+
+WATCH_RUN_ERRORS = tuple(
+    error for error in (getattr(watch, "SandboxTimedOut", None), getattr(watch, "ReportRefused", None), RuntimeError, ValueError) if error
+)
 
 
 # --- time, paths -------------------------------------------------------------
@@ -587,10 +620,19 @@ def payload(item: dict) -> dict:
 # --- running the reports -------------------------------------------------------
 
 
-def run_projects(names: list[str], scope) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str]]:
+def ordered_names(names: list[str], previous: dict | None) -> list[str]:
+    """The projects last week could not read go first, so a budget that ran
+    out does not run out on the same tail twice."""
+    failed = set(((previous or {}).get("project_failures") or {}).keys())
+    return [n for n in names if n in failed] + [n for n in names if n not in failed]
+
+
+def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str]]:
     """One readiness run per project inside the total budget. Returns the
     members, the report errors, the report script's tables per project, and
-    the projects that failed with why."""
+    the projects that failed with why. `on_project(members, errors)` runs as
+    each project returns, which is where registration happens, so a run the
+    hour cuts short keeps what it registered."""
     members: list[dict] = []
     errors: list[dict] = []
     tables: dict[str, str] = {}
@@ -602,16 +644,18 @@ def run_projects(names: list[str], scope) -> tuple[list[dict], list[dict], dict[
             failures[project] = BUDGET_EXHAUSTED_DETAIL
             continue
         try:
-            envelope = watch.run_report(
-                [project], readiness=True, scope=scope, outside_stands=False, timeout=min(PROJECT_TIMEOUT_SECONDS, remaining)
-            )
-        except (watch.SandboxTimedOut, watch.ReportRefused, RuntimeError, ValueError) as exc:
+            envelope = run_watch_report(project, scope, min(PROJECT_TIMEOUT_SECONDS, remaining))
+        except WATCH_RUN_ERRORS as exc:
             failures[project] = str(exc)
             continue
         report = envelope.get(watch.ENVELOPE_REPORT_KEY) or {}
-        members.extend(m for m in report.get(watch.MEMBERS_KEY) or [] if isinstance(m, dict))
-        errors.extend(e for e in report.get(watch.ERRORS_KEY) or [] if isinstance(e, dict))
+        found = [m for m in report.get(watch.MEMBERS_KEY) or [] if isinstance(m, dict)]
+        read_errors = [e for e in report.get(watch.ERRORS_KEY) or [] if isinstance(e, dict)]
+        members.extend(found)
+        errors.extend(read_errors)
         tables[project] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
+        if on_project is not None:
+            on_project(found, read_errors)
     return members, errors, tables, failures
 
 
@@ -620,7 +664,8 @@ def run_projects(names: list[str], scope) -> tuple[list[dict], list[dict], dict[
 
 def register(members: list[dict], errors: list[dict], findings: list[dict]) -> tuple[dict[str, str], list[str]]:
     """Register the findings cluster by cluster, each batch with its scope when
-    the cluster was read in full. Returns the outcome per id and the
+    the cluster was read in full (a complete cluster with nothing to report
+    sends an empty batch with the scope). Returns the outcome per id and the
     registration errors."""
     outcomes: dict[str, str] = {}
     problems: list[str] = []
@@ -631,11 +676,14 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
         project, _location, cluster = cluster_fields(member)
         batch = by_cluster.get((project, cluster), [])
         complete = member_complete(member, errors)
-        if not batch:
+        if not batch and not complete:
             continue
+        # A complete read of a cluster with nothing to report is sent too: it is
+        # what lets the queue lower the confidence of last week's rows there,
+        # and it reaches only this job's own family of checks.
         body = {"findings": [payload(item) for item in batch[:KV_BATCH_LIMIT]]}
         if complete:
-            body["scope"] = {"project": project, "cluster": cluster, "complete": True}
+            body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX}
         try:
             answer = kv_request(KV_FINDINGS_PATH, body)
         except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -701,7 +749,12 @@ def summary(
         )
     counts = {severity: sum(1 for r in rows if r["severity"] == severity) for severity in SEVERITY_ORDER}
     ids = [r["id"] for r in rows]
-    previous_ids = [r.get("id") for r in (previous or {}).get("findings") or [] if r.get("id")]
+    reviewed_pairs = {(str(m.get(watch.MEMBER_ID_KEYS[0]) or ""), str(m.get(watch.MEMBER_ID_KEYS[-1]) or "")) for m in members}
+    previous_ids = [
+        r.get("id")
+        for r in (previous or {}).get("findings") or []
+        if r.get("id") and (str(r.get("project") or ""), str(r.get("cluster") or "")) in reviewed_pairs
+    ]
     return {
         "version": SUMMARY_VERSION,
         "job": JOB_ID,
@@ -823,18 +876,22 @@ def prune(home: Path) -> None:
 
 def sandbox_copy_program(files: dict[str, str]) -> str:
     """The program the terminal login runs to place the copy: the directory
-    made, each file written whole, mode set so the agent can read it."""
+    made, each file written whole, mode set so the agent can read it. The
+    contents travel base64-encoded, because a JSON string literal in Python
+    source turns a character outside the Basic Multilingual Plane into a
+    surrogate pair the file write refuses."""
+    encoded = {name: base64.b64encode(text.encode("utf-8")).decode("ascii") for name, text in files.items()}
     return "\n".join(
         [
-            "import json, os",
+            "import base64, os",
             f"DIR = {json.dumps(SANDBOX_COPY_DIR)}",
-            f"FILES = {json.dumps(files)}",
+            f"FILES = {json.dumps(encoded)}",
             f"MODE = {SANDBOX_COPY_MODE}",
             "os.makedirs(DIR, exist_ok=True)",
             "for name, text in FILES.items():",
             "    path = os.path.join(DIR, name)",
-            "    with open(path, 'w', encoding='utf-8') as handle:",
-            "        handle.write(text)",
+            "    with open(path, 'wb') as handle:",
+            "        handle.write(base64.b64decode(text))",
             "    os.chmod(path, MODE)",
             "print(len(FILES))",
             "",
@@ -891,20 +948,28 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     """Run the review. Returns the lines to print and the exit code."""
     now = now_utc()
     stamp = now.strftime(STAMP_FORMAT)
-    scope = watch.declared_scope()
+    scope = watch_scope()
     names = watch.projects()
     if not names:
         raise RuntimeError(NO_PROJECTS_DETAIL)
-    members, errors, tables, failures = run_projects(names, scope)
-    if not members and failures:
-        raise RuntimeError("; ".join(f"{p}: {d}" for p, d in failures.items()))
-    findings = [item for member in members for item in member_findings(member)]
     home = weekly_home()
     previous = load_previous(home)
+    findings: list[dict] = []
     outcomes: dict[str, str] = {}
     problems: list[str] = []
-    if not dry_run and findings:
-        outcomes, problems = register(members, errors, findings)
+
+    def registered(found: list[dict], read_errors: list[dict]) -> None:
+        items = [item for member in found for item in member_findings(member)]
+        findings.extend(items)
+        if dry_run:
+            return
+        got, bad = register(found, read_errors, items)
+        outcomes.update(got)
+        problems.extend(bad)
+
+    members, errors, tables, failures = run_projects(ordered_names(names, previous), scope, on_project=registered)
+    if not members and failures:
+        raise RuntimeError("; ".join(f"{p}: {d}" for p, d in failures.items()))
     report_path = home / stamp / REPORT_MD_NAME
     summary_doc = summary(
         stamp=stamp, now=now, names=names, members=members, errors=errors, failures=failures,
@@ -929,6 +994,9 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     lines = []
     if clear_failure_marker():
         lines.append(RECOVERED_LINE.format(prefix=LOG_PREFIX))
+    if failures:
+        detail = PARTIAL_DETAIL_SEPARATOR.join(f"{p}: {d}" for p, d in failures.items())
+        lines.append(PARTIAL_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
     return lines, 0
 
 

@@ -289,32 +289,42 @@ version, and ends in one message a person reads.
 
 `upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
 `fleet-upgrade-verification` readiness report in the sandbox through the watch's own loader, one
-run per project, and turns every blocker and risk the report names (a drain-blocking budget, a
-fail-closed webhook, a pool past or at the skew ceiling, a covering exclusion, and each readiness
-rule's rows when the report carries rules) into a finding on the findings queue, through the
-Session KV server's `/v1/findings` route as `findings_nudge.py` reads it. The queue's identity rule
-makes next Saturday's run an update of the same row, its rubric sets the severity (a blocker that
-takes a serving workload down or refuses the control-plane move is critical; a dated risk is major;
-a posture is minor), a row the user dismissed stays dismissed, and the hourly nudge paces what is
-named and reminds daily of undecided criticals. The script writes the technical report under
-`upgrade-readiness/weekly/` beside the watch's ledger, keeps the newest eight runs, and places a
-copy of `latest.md` and `latest.json` in the sandbox at `/opt/data/upgrade-readiness/weekly/` so
-the agent can read it when asked. It prints nothing on success: the brief speaks for the week and
-the queue for each finding. A failure is one line, once per distinct failure, with the recovery line
-on the next clean run.
+run per project inside the watch's 45-minute tick budget (Hermes kills a `no_agent` script at an
+hour), and turns every blocker and risk the report names (a drain-blocking budget, a fail-closed
+webhook, a pool past or at the skew ceiling, a covering exclusion, and each readiness rule's rows
+once the report carries rules) into a finding on the findings queue, through the Session KV
+server's `POST /v1/findings` route, reached at the endpoint and with the key `findings_nudge.py`
+uses. Each project is registered as soon as its run returns, so a run the hour cuts short keeps
+what it registered. The queue's identity rule makes next Saturday's run an update of the same row;
+its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
+webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
+and a webhook refusing only what it matches today are major; a covering exclusion is minor); a row
+the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
+undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's own
+check family (`upgrade-`), an empty batch when nothing was found, so a finding the week no longer
+reports loses confidence and stops being reminded without touching another source's rows on that
+cluster. The script writes the technical report under `upgrade-readiness/weekly/` beside the
+watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
+the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
+nothing on success: the brief speaks for the week and the queue for each finding. A project it could
+not read is one line naming it; a failure is one line, once per distinct failure, with the recovery
+line on the next clean run.
 
-`upgrade-readiness-weekly-brief` (`30 6 * * 6`) is the model turn, and the reason the pair is not
-one job: the review can rank by rubric but cannot tell that two criticals on one cluster are one
-problem, or that an exclusion ending next week outranks one ending in January. Its SOP
-(`governance/upgrade_readiness_brief_sop.md`) has it read the review's summary and the queue's
-ranked rows (`get_ranked_findings`, the rows whose `check` starts with `upgrade-`), and compose a
-brief of at most sixteen lines: the week's headline, the undecided criticals that need a decision
-(at most three, with one clause of why and one action each), the rest of the week as counts, what
-was decided earlier, and where the full report is with the sentence that opens it in chat. It never
-registers, never decides, never runs the report, and is never `[SILENT]`: the brief is owed every
-week, a quiet one in three lines. If the review did not run, the brief says so and stops. The
-`deliver: "chat"` relay posts it as written and stores it against the thread, so a reply with an id
-and `dismiss`, `snooze until <date>` or `accept` reaches the agent with the brief attached.
+`upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
+budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric
+but cannot tell that two criticals on one cluster are one problem, or that an exclusion ending next
+week outranks one ending in January. Its SOP (`governance/upgrade_readiness_brief_sop.md`) has it
+read the review's summary, the queue's open backlog (`get_ranked_findings`, the rows whose `check`
+starts with `upgrade-`) and its snoozed and dismissed rows (`get_findings` by state, which the
+backlog never carries), and compose a brief of at most sixteen lines: the week's headline, the
+undecided criticals that need a decision (at most three, with one clause of why and one action
+each), the rest of the week as counts, what was decided earlier, any project the review could not
+read, and where the full report is with the sentence that opens it in chat. It never registers,
+never decides, never runs the report, and is never `[SILENT]`: the brief is owed every week, a
+quiet one in three lines. If the review's summary is missing or older than two days, the brief
+says so and stops. The `deliver: "chat"` relay posts it as written and stores it against the
+thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
+with the brief attached.
 
 Why the queue and not a weekly chat line per finding: a line is read once; the queue keeps asking
 until a person answers, keeps the answer, and stops. That is the contract the review needs for a
