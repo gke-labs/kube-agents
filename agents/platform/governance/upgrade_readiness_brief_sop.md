@@ -2,8 +2,9 @@
 
 **Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
 `upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
-it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk or its
-failure line is in chat; nothing else sequences the two.
+it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk, its
+failure line is in chat, or (a run the hour cut short before its record) neither, which step 1
+treats as a review that did not finish; nothing else sequences the two.
 
 **Purpose:** one message a person reads in a minute, saying what this week's upgrade readiness
 review found, which findings need their decision now, and where the full report is. The review job
@@ -32,7 +33,7 @@ shape; the model chooses the emphasis.
 
    It carries `generated_at`, `projects`, `clusters` (reviewed, blocked, ready, unknown, unread),
    `counts` by severity, `findings` (one row per finding: `id`, `severity`, `check`, `entry`,
-   `cluster`, `namespace`, `object`, `title`, `action`, `outcome`), `new_ids`, `suppressed_ids`,
+   `project`, `cluster`, `namespace`, `object`, `title`, `action`, `outcome`), `new_ids`, `suppressed_ids`,
    `no_longer_reported_ids`, `project_failures`, `registration_errors` and `report_path`.
 
 2. If the file is missing, or `generated_at` is older than **48 hours**, the review did not

@@ -7,9 +7,10 @@
 > path (§5). A second writer ships beside the sweep: the Saturday `upgrade-readiness-weekly-review` job
 > (`agents/platform/scripts/upgrade_readiness_review.py`) registers the readiness report's blockers
 > and risks as `source: audit` rows under its own `upgrade-` check family rather than the audit
-> streams' slugs, because it reads objects those streams never file (pools, exclusions, webhooks) and
-> one problem must stay one row across weeks, not across streams; its completeness claim is scoped to
-> that family (`scope.check_prefix`), so it lowers no other source's confidence. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
+> streams' slugs (`pool-skew`, `blocking-exclusion`, `blocking-pdb`, which those streams file to their
+> ledgers, not to the queue): one problem must stay one row across weeks here, and the review also
+> reads objects no stream names (fail-closed webhooks, the readiness rules' rows); its completeness
+> claim is scoped to that family (`scope.check_prefix`), so it lowers no other source's confidence. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
 > ships in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
 > entry in `jobs.json` post a paced version of §7.2's message, hourly: at most two new criticals a
 > UTC day, a few non-criticals in the afternoon, nothing new while a non-critical it named waits for
@@ -695,7 +696,7 @@ So absence downgrades confidence rather than deciding anything: on a completed r
 `surfaced` row the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
 from §7.4's verification the next time the row is named in a nudge. Only a run that reports its own scope as
-complete for that cluster may do even this much; a partial run touches nothing.
+complete for that cluster may do even this much; a partial run touches nothing. A run that reads one family of checks narrows the claim with `scope.check_prefix`, so it reaches only rows whose check starts with that prefix; with a complete scope an empty batch is accepted, since a sweep that found nothing is exactly the case the rule is for.
 
 The same run sets `absent_since` on each such row, keeping the first miss, including on a row
 already at 0.6, which is not re-ranked (the register response's `downgraded` counts only the rows
