@@ -37,6 +37,9 @@ def _register_fake_modules():
         standalone_sender_fn: object = None
         source: str = "plugin"
         max_message_length: int = 0
+        cron_deliver_env_var: str = ""
+        allowed_users_env: str = ""
+        allow_all_env: str = ""
 
     class PlatformRegistry:
         """The maps and lookups of the upstream registry: a global map, a
@@ -485,7 +488,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertIs(served, foreign)
         self.assertTrue(served.check_fn())
         self.assertTrue(served.is_connected())
-        self.assertEqual(served.max_message_length, 28000)
+        self.assertEqual(served.max_message_length, 16000)
         self.assertIsNotNone(served.standalone_sender_fn)
         self.assertEqual(served.standalone_sender_fn.__module__, "teams_relay_patch")
 
@@ -494,7 +497,34 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         platform_registry.register(late, scope="profile-b")
         self.addCleanup(platform_registry._scoped_entries.pop, "profile-b", None)
         self.assertTrue(late.check_fn())
-        self.assertEqual(late.max_message_length, 28000)
+        self.assertEqual(late.max_message_length, 16000)
+
+    async def test_send_drops_to_plain_text_when_the_card_is_over_the_byte_cap(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        self.assertEqual(adapter.MAX_MESSAGE_LENGTH, 16000)
+        sent = []
+
+        def fake_urlopen(req, timeout=35):
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        # 16000 characters as 20-character lines: a card several times the text.
+        long_text = "\n".join(["- item %05d x" % i for i in range(1000)])
+        self.assertLessEqual(len(long_text), 16000)
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", long_text)
+            await adapter.send("conv-1", "# short\n- one line")
+        big, small = sent[0]["payload"], sent[1]["payload"]
+        self.assertNotIn("attachments", big)
+        self.assertEqual(big["text"], long_text)
+        self.assertLessEqual(len(json.dumps(big).encode("utf-8")), 28 * 1024)
+        self.assertIn("attachments", small)
 
     async def test_unauthorized_tenant_rejected(self):
         from gateway.platform_registry import PlatformRegistry

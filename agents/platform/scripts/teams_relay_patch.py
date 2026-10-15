@@ -17,9 +17,17 @@ from credential_proxy_client import authorization_headers
 
 LOGGER = logging.getLogger("teams-relay-patch")
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
-# Bot Framework caps one activity at about 28 KB; the gateway chunks outbound
-# text against the registry entry's limit, so the entry has to carry it.
-TEAMS_MAX_MESSAGE_LENGTH = 28000
+# Bot Framework caps one activity at about 28 KB of serialized JSON. The send
+# tool chunks text at the registry entry's ``max_message_length`` and the
+# gateway's reply path at the adapter's ``MAX_MESSAGE_LENGTH``, both character
+# counts; an Adaptive Card adds a TextBlock per line, so the character cap
+# stays well under the byte cap and ``send`` drops to plain text for a card
+# that would still exceed it.
+TEAMS_MAX_MESSAGE_LENGTH = 16000
+TEAMS_MAX_ACTIVITY_BYTES = 28 * 1024
+# Where the bot posts when an activity did not say: the public Bot Framework
+# endpoint. A regional tenant sets TEAMS_DEFAULT_SERVICE_URL.
+DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 
 
@@ -298,6 +306,9 @@ def install() -> None:
     class TeamsRelayAdapter(BasePlatformAdapter):
         """Hermes platform adapter connecting to Microsoft Teams via credential proxy."""
 
+        # The gateway's own reply chunker reads this; the base default is 4096.
+        MAX_MESSAGE_LENGTH = TEAMS_MAX_MESSAGE_LENGTH
+
         def __init__(self, config: Any = None) -> None:
             # ``Platform._missing_`` admits a name the platform registry knows,
             # and install() registers "teams" before anything builds an adapter.
@@ -369,9 +380,7 @@ def install() -> None:
             del kwargs
             message = content
             meta = metadata if isinstance(metadata, dict) else {}
-            default_service_url = os.getenv(
-                "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
-            )
+            default_service_url = os.getenv("TEAMS_DEFAULT_SERVICE_URL", DEFAULT_TEAMS_SERVICE_URL)
             candidate_url = meta.get("serviceUrl") or default_service_url
             service_url = (
                 candidate_url
@@ -386,6 +395,14 @@ def install() -> None:
                 title=meta.get("title"),
                 actions=meta.get("actions"),
             )
+            if (
+                self.adaptive_cards
+                and len(json.dumps(payload).encode("utf-8")) > TEAMS_MAX_ACTIVITY_BYTES
+            ):
+                # Many short lines make a card several times the text's size;
+                # plain text of the same message fits where the card does not.
+                LOGGER.info("Teams card over the activity size cap; sending plain text")
+                payload = format_teams_activity_payload(message, use_adaptive_cards=False)
             effective_thread = (
                 thread_id
                 or reply_to
@@ -424,9 +441,7 @@ def install() -> None:
         ) -> None:
             """Send a typing indicator activity to Teams (base signature)."""
             meta = metadata if isinstance(metadata, dict) else {}
-            service_url = meta.get("serviceUrl") or os.getenv(
-                "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
-            )
+            service_url = meta.get("serviceUrl") or os.getenv("TEAMS_DEFAULT_SERVICE_URL", DEFAULT_TEAMS_SERVICE_URL)
             if not is_trusted_service_url(service_url):
                 return
             endpoint = f"v3/conversations/{chat_id}/activities"
@@ -477,9 +492,7 @@ def install() -> None:
                 return
 
             raw_service_url = activity.get("serviceUrl")
-            default_service_url = os.getenv(
-                "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
-            )
+            default_service_url = os.getenv("TEAMS_DEFAULT_SERVICE_URL", DEFAULT_TEAMS_SERVICE_URL)
             if raw_service_url is not None and not is_trusted_service_url(raw_service_url):
                 LOGGER.warning(
                     "Rejected Teams activity with untrusted serviceUrl: %s",
@@ -718,6 +731,10 @@ def install() -> None:
                     is_connected=lambda _cfg=None: True,
                     standalone_sender_fn=_standalone_send,
                     max_message_length=TEAMS_MAX_MESSAGE_LENGTH,
+                    # What the bundled entry carries, so the two paths match.
+                    cron_deliver_env_var="TEAMS_HOME_CHANNEL",
+                    allowed_users_env="TEAMS_ALLOWED_USERS",
+                    allow_all_env="TEAMS_ALLOW_ALL_USERS",
                 )
             )
         except Exception:
