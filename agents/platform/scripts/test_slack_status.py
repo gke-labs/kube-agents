@@ -259,31 +259,36 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
 
-    def test_the_title_is_the_asks_first_sentence_or_line(self):
+    def test_the_title_is_the_ask_up_to_its_first_question(self):
         cases = {
             "is checkout-gateway restarting in prod? someone in #oncall said it's crashlooping": (
                 "is checkout-gateway restarting in prod?"
             ),
-            "seeded-b is behind. Ask me before doing anything.": "seeded-b is behind.",
-            "check seeded-a\nthen seeded-b": "check seeded-a",
-            "is 1.33.4 the default?": "is 1.33.4 the default?",
-            "wait... is it up? yes": "wait... is it up?",
             "which clusters have pods restarting right now?": "which clusters have pods restarting right now?",
-            "!! x now": "!! x now",
-            "\n\nup? ok": "up? ok",
-            "<@U1> hi. there": "hi. there",
-            "1. check seeded-a pods\n2. then seeded-b": "1. check seeded-a pods",
-            "e.g. restart the pods": "e.g. restart the pods",
+            "is 1.33.4 the default? asking for seeded-b": "is 1.33.4 the default?",
+            "wait... is it up? yes": "wait... is it up?",
+            "hold on\u2026 is it up? yes": "hold on... is it up?",
             "Hi! Is checkout-gateway crashlooping in prod? It was earlier": "Hi! Is checkout-gateway crashlooping in prod?",
-            "Thanks. Now restart payments-api": "Thanks. Now restart payments-api",
+            "Hi team,\nis checkout-gateway restarting in prod? It was": "Hi team, is checkout-gateway restarting in prod?",
+            # No question: the whole ask, clipped as before. "." and line breaks end nothing.
+            "seeded-b is behind. Ask me before doing anything.": "seeded-b is behind. Ask me before doing anything.",
+            "Check e.g. seeded-a. Then seeded-b": "Check e.g. seeded-a. Then seeded-b",
+            "1. check seeded-a pods\n2. then seeded-b": "1. check seeded-a pods 2. then seeded-b",
+            "<@U1> hi. there": "hi. there",
+            # One word before the question: not a title on its own.
+            "\n\nup? ok": "up? ok",
+            # Punctuation a stripped mention or link leaves behind closes no word.
+            "hi <@UBOT>? which clusters are behind? thanks": "hi ? which clusters are behind?",
+            "see <https://runbook.example/x>? is prod ok? thanks": "see ? is prod ok?",
         }
         for ask, title in cases.items():
             with self.subTest(ask=ask):
                 self.assertEqual(s.session_title(ask), title)
 
-    def test_the_clause_cut_stays_linear(self):
-        # It runs on the gateway's event loop, like the markup patterns below.
-        ask = "a. " * (SLACK_MESSAGE_MAX // len("a. "))
+    def test_the_question_cut_stays_linear(self):
+        # It runs on the gateway's event loop, like the markup patterns below. A "?" that closes
+        # no word never ends the question, so the cut walks the whole ask.
+        ask = "a ? " * (SLACK_MESSAGE_MAX // len("a ? "))
         start = time.monotonic()
         s.session_title(ask)
         self.assertLess(time.monotonic() - start, LINEAR_BUDGET_SECONDS)

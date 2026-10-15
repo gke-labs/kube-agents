@@ -26,7 +26,7 @@ parses that field.
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
 ``closed`` and refuses free text with ``invalid_arguments``, which is what
-Hermes's thread status sends it. The title is the ask's first sentence or line, so a
+Hermes's thread status sends it. The title is the ask up to its first question, so a
 long ask leaves a short title. ``agents.sessions.rename`` refuses a whole
 title with ``invalid_name`` when it runs over 80 characters or holds a single
 character outside a narrow set: letters, digits, combining marks, spaces, a
@@ -102,12 +102,13 @@ TITLE_ELLIPSIS = "..."
 ELLIPSIS = "…"
 #: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
-#: The title is the ask's first clause (:func:`_first_clause`): it ends at a run of these
-#: followed by whitespace, or at a line break, once it holds this many words, so a list
-#: number, an abbreviation or a greeting ("1.", "e.g.", "Hi!") does not end it.
-CLAUSE_ENDS = frozenset(".?!")
-CLAUSE_BREAK = "\n"
-CLAUSE_MIN_WORDS = 2
+#: The title is the ask up to its first question (:func:`_first_question`): a run of
+#: :data:`QUESTION_END` that closes a word and is followed by whitespace, once the ask holds
+#: :data:`QUESTION_MIN_WORDS` words. Only ``?``: a ``.`` or ``!`` also closes ``e.g.``,
+#: ``U.S.``, ``1.`` and ``Hi!``, and a line break closes ``Hi team,``, each of which would
+#: leave a title that names nothing, and a thread keeps its first title.
+QUESTION_END = "?"
+QUESTION_MIN_WORDS = 2
 
 #: Slack markup in an ask: a user or channel mention, and a link with or
 #: without its label. Mentions go; a channel keeps its name, a link its label,
@@ -241,38 +242,35 @@ def _title_chars(title: str) -> str:
     return "".join(out)
 
 
-def _first_clause(text: str) -> str:
-    """``text`` up to the end of its first sentence or line, or whole when it has neither.
+def _first_question(text: str) -> str:
+    """``text`` up to the end of its first question, or whole when it asks none.
 
-    A sentence ends at a run of :data:`CLAUSE_ENDS` followed by whitespace, which stays with
-    it, and a line at :data:`CLAUSE_BREAK`; either counts only once the clause holds
-    :data:`CLAUSE_MIN_WORDS` space-separated words and a word character, so "1. check pods",
-    "e.g. restart" or "Hi! Is it up?" is not cut to its first word. ``1.33.4`` and ``...``
-    mid-word do not end one. One pass, counting words as it goes, so a long ask stays linear.
+    A question ends at a run of :data:`QUESTION_END` followed by whitespace, which stays with
+    it, when it closes a word (a run of non-space holding a word character, so punctuation a
+    stripped mention or link left behind does not count) and the text so far holds
+    :data:`QUESTION_MIN_WORDS` such words. One pass, so a long ask stays linear.
     """
-    seen_word = in_word = False
     words = 0
+    worded = False
     for i, char in enumerate(text):
         if char.isspace():
-            in_word = False
-        elif not in_word:
-            in_word = True
-            words += 1
-        seen_word = seen_word or _word_char(char)
-        if not seen_word or words < CLAUSE_MIN_WORDS:
+            worded = False
             continue
-        if char == CLAUSE_BREAK:
-            return text[:i]
-        if char in CLAUSE_ENDS and i + 1 < len(text) and text[i + 1].isspace():
+        if not worded and _word_char(char):
+            worded = True
+            words += 1
+        if (
+            char == QUESTION_END and worded and words >= QUESTION_MIN_WORDS
+            and i + 1 < len(text) and text[i + 1].isspace()
+        ):
             return text[: i + 1]
     return text
-
 
 def session_title(text: Any) -> str:
     """A short title ``agents.sessions.rename`` accepts, from the ask's words, or ``""``.
 
     Mentions and bare links are dropped, a channel keeps its name and a link its label, the
-    ask is cut to its first sentence or line (:func:`_first_clause`), each refused character
+    ask is cut to its first question (:func:`_first_question`), each refused character
     is replaced, and the result is clipped on a word to :data:`TITLE_MAX`, ending on
     :data:`TITLE_ELLIPSIS`. NFKC first, so a compatibility form becomes the plain character
     Slack accepts and an accent typed as a combining mark joins its letter.
@@ -281,7 +279,7 @@ def session_title(text: Any) -> str:
     title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
     title = unicodedata.normalize("NFKC", title)
-    title = _first_clause(title)
+    title = _first_question(title)
     title = _title_chars(title)
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
