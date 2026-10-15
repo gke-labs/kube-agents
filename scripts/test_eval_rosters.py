@@ -177,22 +177,15 @@ ADDED_AFTER_THE_MOVE = [
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
-    "upgrades-drain-blocking-budget-named",  # upgrade-failure catalogue entries 1, 2, 3 and 5, the second scenario group
-    "upgrades-no-surge-pool-recreate-warned",
+    # The upgrade-failure catalogue's scenario cases, entries 1, 3, 5, 12 and
+    # 20: the first batch of five of the seventeen. The other twelve wait in
+    # KNOWN_UNREGISTERED (scripts/validate_bench_cases.py) for their batch,
+    # five at a time, as the nightly's main part has room; each batch's pull
+    # request moves its five here.
+    "upgrades-drain-blocking-budget-named",
     "upgrades-zonal-skew-replicas-warned",
     "upgrades-exclusion-end-date-named",
-    "upgrades-removed-api-callers-distinguished",  # catalogue entries 6 and 16, the third group's two cases on fixtures the fleet carries
-    "upgrades-network-policy-enforcement-stated",
-    "upgrades-node-local-state-named",  # catalogue entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20, the fourth and fifth groups on the seeded-a shapes
-    "upgrades-pod-security-latest-pinned-named",
-    "upgrades-stale-client-skew-named",
     "upgrades-deprecated-node-label-selector-named",
-    "upgrades-containerd-socket-agent-named",
-    "upgrades-cgroup-blind-runtime-named",
-    "upgrades-multi-process-oom-group-named",
-    "upgrades-node-image-coupled-agent-named",
-    "upgrades-cuda-pinned-gpu-job-named",
-    "upgrades-intree-volume-named",
     "upgrades-retired-registry-image-named",
 ]
 # Taken back out of the nightly file after registering there, each with a

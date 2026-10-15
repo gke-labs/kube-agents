@@ -2723,36 +2723,53 @@ unit_cost_hint() {
     # One delegation and one forge list call. Measured on `dev-vcs3-20261001b`:
     # 173-237s a repetition over three runs, 225s the middle one.
     vcs-forge-cli-request-uses-the-verbs) echo 240 ;;
-    # The upgrade-failure catalogue's scenario cases, nightly-only from
-    # 2026-10-14: read-only chat prompts that fan out across the seeded
-    # clusters (entries 1 and 2 to one Cluster Agent card per cluster; entry 3
-    # names the multi-zone cluster without saying which, so the agent reads
-    # each to find it; entries 6 and 16 ask for one declared line per
-    # cluster). Measured on a dev install with one user worker slot, so the
-    # cards ran one at a time: entries 1 and 3 at 541-1081s and entry 2 at
-    # 3163s a repetition (2026-10-07 and 10-08), all three at 475-1092s
-    # (2026-10-13); entries 6 and 16 at
-    # 2041s and 2538-2551s (2026-10-08 and 10-13, the latter two at the 2400s
-    # delegation ceiling). All priced at the 900 band they share.
-    upgrades-drain-blocking-budget-named | upgrades-no-surge-pool-recreate-warned) echo 900 ;;
-    upgrades-zonal-skew-replicas-warned) echo 900 ;;
+    # The upgrade-failure catalogue's scenario cases: read-only chat prompts
+    # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
+    # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
+    # maintenance-policy read per cluster; entry 3 and the eleven on the
+    # seeded-a shapes a read of every cluster for one planted object the
+    # prompt does not place). Five are in the nightly from 2026-10-15, the
+    # first batch; the other twelve wait in scripts/validate_bench_cases.py's
+    # KNOWN_UNREGISTERED for their batch (hack/eval/nightly-cases.txt's
+    # 2026-10-14 paragraph). Each measured case is priced at the median wall
+    # clock of its clean passes on a dev install with one user worker slot
+    # (57 runs, 2026-10-07 to 10-15, re-graded at the head's task files),
+    # rounded up to the next 100s, the way compliance-rbac-overgrant,
+    # capacity-pinned-pool-probe and cluster-agent-delegation-profile-lookup
+    # above are priced at their medians. The clean-pass walls per entry:
+    # entry 1: 514, 782 and 1081s.
+    upgrades-drain-blocking-budget-named) echo 800 ;;
+    # entry 2: 924, 1065 and 3163s, with two more runs lost at the 2400s
+    # delegation ceiling.
+    upgrades-no-surge-pool-recreate-warned) echo 1100 ;;
+    # entry 3: 454, 541, 672 and 983s.
+    upgrades-zonal-skew-replicas-warned) echo 700 ;;
+    # entry 5: 237, 240, 316, 441 and 571s.
+    upgrades-exclusion-end-date-named) echo 400 ;;
+    # entry 4: 1171 and 1280s.
+    upgrades-node-local-state-named) echo 1300 ;;
+    # entry 8: one pass, 750s.
+    upgrades-pod-security-latest-pinned-named) echo 800 ;;
+    # entry 12: 510 and 1161s.
+    upgrades-deprecated-node-label-selector-named) echo 900 ;;
+    # entry 13: one pass, 540s.
+    upgrades-containerd-socket-agent-named) echo 600 ;;
+    # entry 14: one pass, 360s.
+    upgrades-cgroup-blind-runtime-named) echo 400 ;;
+    # entry 17: one pass, 2180s: the agent answered at 264s and the harness
+    # was still waiting on the delegated cards when the sequence stopped it.
+    upgrades-node-image-coupled-agent-named) echo 2200 ;;
+    # entry 19: 1042 and 1291s.
+    upgrades-intree-volume-named) echo 1200 ;;
+    # entry 20: 390 and 1762s.
+    upgrades-retired-registry-image-named) echo 1100 ;;
+    # Entries 6, 10, 15, 16 and 18 have no clean pass on record, so no
+    # measurement: every run was a loss (682-3943s wall, most at the 2400s
+    # delegation ceiling) or an agent gap. They keep the 900 band of their
+    # shape until a clean pass measures them.
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
-    # Entry 5's follow-up: one maintenance-policy read per seeded cluster, no
-    # card fan-out. 571s wall clock on 2026-10-08, 257-354s on 2026-10-13.
-    upgrades-exclusion-end-date-named) echo 600 ;;
-    # The fourth and fifth groups (entries 4, 8, 10, 12, 13, 14, 15, 17, 18,
-    # 19 and 20), on the seeded-a shapes: each asks across the seeded
-    # clusters for one planted object the prompt does not place, so the
-    # agent reads every cluster to find it, entry 3's shape. Measured one
-    # run each on the same dev install, 2026-10-07 and 10-08: 390-2180s a
-    # repetition where they passed, 1350-2522s where they failed. The same
-    # 900 band.
-    upgrades-node-local-state-named | upgrades-pod-security-latest-pinned-named) echo 900 ;;
-    upgrades-stale-client-skew-named | upgrades-deprecated-node-label-selector-named) echo 900 ;;
-    upgrades-containerd-socket-agent-named | upgrades-cgroup-blind-runtime-named) echo 900 ;;
-    upgrades-multi-process-oom-group-named | upgrades-node-image-coupled-agent-named) echo 900 ;;
-    upgrades-cuda-pinned-gpu-job-named | upgrades-intree-volume-named) echo 900 ;;
-    upgrades-retired-registry-image-named) echo 900 ;;
+    upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
+    upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
     *) echo 200 ;;
   esac
 }

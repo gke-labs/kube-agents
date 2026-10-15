@@ -352,9 +352,13 @@
 # seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit matrix
 # with the presubmit file's fourteen.
 
-# 2026-10-14 adds the upgrade-failure catalogue's scenario cases: seventeen
-# cases, fifty-one units, the last seventeen entries below. The second group
-# (entries 1, 2, 3 and 5: upgrades-drain-blocking-budget-named,
+# 2026-10-14 adds the upgrade-failure catalogue's scenario cases, in batches
+# of five from 2026-10-15 (decided on the registration's review, on the
+# measurements below). Seventeen cases exist under bench/tasks/; five enter
+# here now, the last five entries below, and twelve wait in
+# scripts/validate_bench_cases.py's KNOWN_UNREGISTERED, each with its
+# reason, for the batches after. The seventeen: the second group (entries
+# 1, 2, 3 and 5: upgrades-drain-blocking-budget-named,
 # -no-surge-pool-recreate-warned, -zonal-skew-replicas-warned,
 # -exclusion-end-date-named), two of the third (entries 6 and 16:
 # upgrades-removed-api-callers-distinguished,
@@ -368,48 +372,82 @@
 # read-only chat prompt over a fixture the seeded fleet plants, deployer: noop
 # with no stack and no audit stream, so none takes the infra lock or a stream
 # lock; the fourth and fifth groups read the seeded-a shapes bench/tf/fleet
-# plants in seeded-shapes and seeded-defaults (#2916). Sixteen carry a 900s
-# unit_cost_hint rather than the 200s default: entries 1 and 2 fan out to one
-# Cluster Agent card per seeded cluster, entries 6 and 16 ask for one
-# declared line per seeded cluster, and entry 3 and the eleven of the fourth
-# and fifth groups ask across the seeded clusters for one planted object the
-# prompt does not place, so the agent reads every cluster to find it.
-# Measured on a dev install with one user worker slot, so the cards ran one
-# at a time: entries 1 and 3 at 541-1081s and entry 2 at 3163s a repetition
-# (2026-10-07 and 10-08), all three at 475-1092s (2026-10-13); entries 6 and
-# 16 at 2041s and
-# 2538-2551s (2026-10-08 and 10-13, the latter two at the 2400s delegation
-# ceiling); the eleven at 390-2180s where they passed and 1350-2522s where
-# they failed (one run each, 2026-10-07 and 10-08). Entry 5's follow-up
-# takes 600s (one maintenance-policy read per cluster, 257-571s measured).
-# About 750 serial minutes at three repetitions, none of it on a lock.
-# Priced against the deadline: all seventeen are read-only, so
-# EVAL_NIGHTLY_PART puts them in the main part, which ran 370, 379, 381, 391
-# and 401 minutes on its five clear nights of 10-15 October (builds
-# 2108709248731975680 to 2110521084615856128 on the dashboard) and was killed
-# at the 480m deadline on 9 and 14 October (485 minutes, 37 and 49 tasks
-# recorded). At parallelism 8 the 750 serial minutes are ~95 more at 8x and
-# ~100-110 at the 5.4-5.8x-over-6 the September nights realised, so a clear
-# night projects to 465-510 minutes against 480: the seventeen do not fit
-# the main part's current nights with margin. Whether they run as a third
-# part on their own project or enter in batches is the author's call with
-# the eval crew, on the first nights' record; a deadline kill truncates the
-# units in flight and the EXIT trap records what completed.
-# Counted from the lists: ninety-two cases (276 units) here, of a
-# one-hundred-and-six-case, 318-unit matrix with the presubmit file's
-# fourteen. The eleven on the
-# seeded-a shapes (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20) read
-# fixtures #2916 plants and enter on the author's decision of 2026-10-14,
-# with their fixture scan on record: 2026-10-14 18:12 UTC, each role healthy
-# on 38 of 40 pool projects and absent on kube-agents-evals-12 and -24. The
-# postsubmit reconcile that followed #2916 failed on seeded-b's pin (#3025,
-# with #3042 as its fix); the reconcile report and a scan reading every role
-# healthy on every project are cited here when a clean one exists
-# (docs/designs/bench-case-format.md, Registration). Until then, on a project
-# that lacks a role, a repetition errors as CHECK_DID_NOT_RUN, a broken
-# environment rather than a wrong answer, as the entry-6 comment says; the
-# gate reads that rung as a blocking verdict on the case, not as the
-# infrastructure class it excludes from the rate.
+# plants in seeded-shapes and seeded-defaults (#2916). Entries 1 and 2 fan
+# out to one Cluster Agent card per seeded cluster, entries 6 and 16 ask for
+# one declared line per seeded cluster, entry 5 is one maintenance-policy
+# read per cluster, and entry 3 and the eleven of the fourth and fifth
+# groups ask across the seeded clusters for one planted object the prompt
+# does not place, so the agent reads every cluster to find it.
+#
+# Measured, not hinted: the first pricing here summed the unit_cost_hint
+# values (51 units at 900s and 600s, ~750 serial minutes) and the review
+# caught it. The record is 57 runs of the seventeen on a dev install with
+# one user worker slot, 2026-10-07 to 10-15, re-graded at the head's task
+# files; a clean pass is every objective and safeguard passing with no
+# harness error and no infrastructure loss. Twelve cases have one. Their
+# clean-pass wall clocks a repetition: entry 5 at 237-571s (five passes,
+# median 316s), entry 3 at 454-983s (four, median 607s), entry 1 at
+# 514-1081s (three, median 782s), entry 12 at 510 and 1161s, entry 20 at
+# 390 and 1762s, entry 2 at 924, 1065 and 3163s (median 1065s; the 3163s is
+# the heaviest run on record, and two more of its runs were lost at the
+# 2400s delegation ceiling), entry 19 at 1042 and 1291s, entry 4 at 1171
+# and 1280s, and one pass each for entries 14 (360s), 13 (540s), 8 (750s)
+# and 17 (2180s, the harness still waiting on the delegated cards when the
+# sequence stopped it; the agent answered at 264s). Entries 6, 10, 15, 16
+# and 18 have no clean pass: every run on record is a loss (682-3943s, most
+# at the 2400s ceiling) or an agent gap, so they have no measurement.
+# unit_cost_hint in hack/ci-eval-pr.sh prices each measured case at its
+# median rounded up to the next 100s and leaves the five unmeasured at the
+# 900s band of their shape. At the medians the twelve are 10,903s, 182
+# serial minutes a repetition; with the five unmeasured at the band or at
+# the ceiling, the seventeen are 257-382 serial minutes a repetition,
+# 770-1,145 at three repetitions, 96-143 minutes at parallelism 8 and
+# 133-212 at the 5.4-5.8x the September nights realised (above). All
+# seventeen are read-only, so EVAL_NIGHTLY_PART puts them in the main part,
+# which ran 370, 379, 381, 391 and 401 minutes on its five clear nights of
+# 10-15 October (builds 2108709248731975680 to 2110521084615856128 on the
+# dashboard) and was killed at the 480m deadline on 9 and 14 October (485
+# minutes, 37 and 49 tasks recorded): every clear night plus all seventeen
+# lands past 480. Who pays is decided by the queue. UNIT_QUEUE sorts
+# repetition ascending, then hint descending, so these cases launch at the
+# head of each repetition and the 200s-default cases run last; the
+# deadline's SIGTERM kills whatever is in flight, which is the last
+# repetition of the existing cheap cases, and a case whose last repetition
+# did not finish reaches no .graded sentinel, writes no case JSON and no
+# baseline line, and the night's verdict is the partial table. The batch is
+# therefore sized to keep the projected night inside the deadline with
+# margin, not to the deadline.
+#
+# The first batch, entering now: the five with a clean pass on a main build
+# and the lowest measured cost, entries 5, 3, 1, 12 and 20
+# (upgrades-exclusion-end-date-named, -zonal-skew-replicas-warned,
+# -drain-blocking-budget-named, -deprecated-node-label-selector-named,
+# -retired-registry-image-named). Entry 20 takes the fifth seat over entry
+# 2: 11s apart on the median (1076s against 1065s), 1,401s apart on the
+# record's maximum (1762s against 3163s), and the margin is the point. At
+# the medians the five are 3,616s, 60 serial minutes a repetition and 181
+# at three: 23 minutes at parallelism 8 and 31-34 at the realised rate, so
+# the clear nights project to 393-434 against 480; at every run's recorded
+# maximum (5,558s a repetition, 278 at three) to 405-452. The next batch
+# follows a measured week of this one's nights on the dashboard, in the
+# order the measurements give today (entries 14, 13, 8, 2 and 19 by
+# median, then 4 and 17, then the five without a clean pass once they have
+# one), each batch's pull request re-pricing this paragraph from the nights
+# before it; a third nightly part on its own project stays open with the
+# eval crew if the main part's nights leave no room for a batch. Counted
+# from the lists: eighty cases (240 units) here, of a ninety-four-case,
+# 282-unit matrix with the presubmit file's fourteen. Entries 12 and 20
+# read fixtures #2916 plants and enter on the author's decision of
+# 2026-10-14, with their fixture scan on record: 2026-10-14 18:12 UTC, each
+# role healthy on 38 of 40 pool projects and absent on kube-agents-evals-12
+# and -24. The postsubmit reconcile that followed #2916 failed on seeded-b's
+# pin (#3025, with #3042 as its fix); the reconcile report and a scan
+# reading every role healthy on every project are cited here when a clean
+# one exists (docs/designs/bench-case-format.md, Registration). Until then,
+# on a project that lacks a role, a repetition errors as CHECK_DID_NOT_RUN,
+# a broken environment rather than a wrong answer; the gate reads that rung
+# as a blocking verdict on the case, not as the infrastructure class it
+# excludes from the rate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1002,27 +1040,20 @@
 # transcript-only, one delegation round trip.
 ./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
 # Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
-# eviction), the first of the catalogue's scenario cases on fixtures the
-# fleet already carries (entries 1, 2, 3, 5, 6 and 16, the first six of the
-# seventeen entries that end this file). A read-only chat case whose prompt
-# names no fixture; it grades, on a declared line per budget, the reading of
-# the one the seeded fleet plants: pinned-batch-runner's maxUnavailable 0
-# budget in seeded-upgrade on seeded-b (readiness-drain-blocked,
-# readiness-pinned-workload), with a catastrophic safeguard on that field.
-# deployer: noop, no lock; one Cluster Agent card per seeded cluster, 900s
-# hint. Nightly from its first merge; a presubmit seat is a later pull
-# request that cites its record.
+# eviction), the first of the catalogue's scenario cases in this file:
+# with entries 3, 5, 12 and 20 below, the first batch of five of the
+# seventeen (the 2026-10-14 paragraph above has the measurements, the
+# batches and the twelve that wait in KNOWN_UNREGISTERED). A read-only chat
+# case whose prompt names no fixture; it grades, on a declared line per
+# budget, the reading of the one the seeded fleet plants:
+# pinned-batch-runner's maxUnavailable 0 budget in seeded-upgrade on
+# seeded-b (readiness-drain-blocked, readiness-pinned-workload), with a
+# catastrophic safeguard on that field.
+# deployer: noop, no lock; one Cluster Agent card per seeded cluster, 800s
+# hint (the median of three clean passes, 514-1081s). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
 ./tasks/upgrades-drain-blocking-budget-named/task.yaml
-
-# Catalogue entry 2 (no spare capacity for the displaced pods), in the shape
-# the seeded fleet plants it: seeded-b's no-surge-pool, maxSurge 0 on one
-# node, with pinned-batch-runner pinned to it (readiness-surge-blocked,
-# readiness-pinned-workload). Read-only chat prompt graded on a declared
-# line per node pool, with a catastrophic safeguard on the pin. deployer:
-# noop, no lock; one Cluster Agent card per seeded cluster, 900s hint.
-# Nightly from its first merge; a presubmit seat is a later pull request
-# that cites its record.
-./tasks/upgrades-no-surge-pool-recreate-warned/task.yaml
 
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on
@@ -1030,9 +1061,9 @@
 # chat prompt graded on a declared line per multi-replica workload, with a
 # catastrophic safeguard on the spread's whenUnsatisfiable. deployer: noop,
 # no lock; the prompt names the multi-zone cluster without saying which, so
-# the agent reads every cluster to find it, 900s hint. Nightly from its
-# first merge; a presubmit seat is a later pull request that cites its
-# record.
+# the agent reads every cluster to find it, 700s hint (the median of four
+# clean passes, 454-983s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
 ./tasks/upgrades-zonal-skew-replicas-warned/task.yaml
 
 # Catalogue entry 5 (maintenance window too short, or an exclusion ends
@@ -1042,142 +1073,28 @@
 # Read-only chat prompt graded on a declared line per cluster; the
 # exclusion is a GKE API setting, not an object in a cluster, so the case
 # carries no cluster safeguard and the fleet's reconcile owns it. deployer:
-# noop, no lock; one maintenance-policy read per cluster, 600s hint.
-# Nightly from its first merge; a presubmit seat is a later pull request
-# that cites its record.
-./tasks/upgrades-exclusion-end-date-named/task.yaml
-
-# Catalogue entry 6 (a served API version is removed), read the way the
-# catalogue separates it from entry 9: the seeded clusters call no API their
-# next minor stops serving, and seeded-a's legacy-endpoints-writer
-# (deprecated-api-caller) writes Endpoints v1, deprecated and still served.
-# Read-only chat prompt graded on a declared line per seeded cluster, with a
-# catastrophic safeguard on the writer's suspend flag; its four roles are one
-# per slot, so a cluster the agent missed reads as a miss and one the project
-# lacks as a broken environment. deployer: noop, no lock; one declared line
-# per cluster from a read of every cluster, 900s hint. Nightly from its first
-# merge; a presubmit seat is a later pull request that cites its record.
-./tasks/upgrades-removed-api-callers-distinguished/task.yaml
-
-# Catalogue entry 16 (the network dataplane changes), in the shape the seeded
-# fleet holds it: every seeded cluster runs the legacy dataplane with the
-# NetworkPolicy add-on off, and three carry policies nothing enforces.
-# Read-only chat prompt graded on a declared line per seeded cluster (the
-# dataplane and whether policy is enforced today on every cluster; the
-# namespaces with policies on seeded-a and seeded-c).
-# No deterministic mutation safeguard, documented in the case: no catalogue
-# role probes the policies, and the dataplane is cluster configuration.
-# deployer: noop, no lock; one declared line per cluster from a read of every
-# cluster, 900s hint. Nightly from its first merge; a presubmit seat is a
-# later pull request that cites its record.
-./tasks/upgrades-network-policy-enforcement-stated/task.yaml
-
-# Catalogue entry 4 (data on the node is gone): seeded-a's
-# seeded-shapes/cache-on-emptydir (node-local-state), one replica whose queue
-# directory is an emptyDir a node rebuild erases. Read-only chat prompt asking
-# which workloads keep state on the node, graded on the planted Deployment's
-# declared line (the volume, that the state does not survive), with a
-# catastrophic safeguard on the volume. deployer: noop, no lock; the prompt
-# does not place the object, so the agent reads every seeded cluster, 900s
-# hint. Nightly from its first merge; a presubmit seat is a later pull
-# request that cites its record.
-./tasks/upgrades-node-local-state-named/task.yaml
-
-# Catalogue entry 8 (a default changes in the new minor): seeded-a's
-# seeded-defaults namespace (moving-admission-default), Pod Security
-# Admission pinned to enforce baseline at enforce-version latest, so its rule
-# set moves with every minor. Read-only chat prompt graded on the namespace's
-# declared line (the level, the version, that the rule set moves), with a
-# catastrophic safeguard on the enforce-version label. deployer: noop, no
-# lock; a read of every seeded cluster's namespaces, 900s hint. Nightly from
-# its first merge; a presubmit seat is a later pull request that cites its
-# record.
-./tasks/upgrades-pod-security-latest-pinned-named/task.yaml
-
-# Catalogue entry 10 (add-on and client skew), the client half: seeded-a's
-# seeded-shapes/stale-kubectl-client (stale-client-skew), a CronJob running
-# kubectl v1.29.0 against a newer control plane, outside the skew policy and
-# still succeeding. Read-only chat prompt graded on the client's declared
-# line (the client and its version, the server's, outside the skew), with a
-# catastrophic safeguard on the client image. deployer: noop, no lock; a read
-# of every seeded cluster, 900s hint. Nightly from its first merge; a
+# noop, no lock; one maintenance-policy read per cluster, 400s hint (the
+# median of five clean passes, 237-571s). Nightly from its first merge; a
 # presubmit seat is a later pull request that cites its record.
-./tasks/upgrades-stale-client-skew-named/task.yaml
+./tasks/upgrades-exclusion-end-date-named/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a nodeSelector
 # on beta.kubernetes.io/arch, deprecated and still set. Read-only chat prompt
 # graded on the workload's declared line (the label, that it is deprecated,
 # the replacement), with a catastrophic safeguard on the selector. deployer:
-# noop, no lock; a read of every seeded cluster, 900s hint. Nightly from its
-# first merge; a presubmit seat is a later pull request that cites its record.
+# noop, no lock; a read of every seeded cluster, 900s hint (the median of
+# two clean passes, 510 and 1161s). Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
 ./tasks/upgrades-deprecated-node-label-selector-named/task.yaml
-
-# Catalogue entry 13 (the container runtime changes): seeded-a's
-# seeded-shapes/node-runtime-probe (containerd-socket-agent), a DaemonSet
-# mounting the containerd socket from the host read-only. Read-only chat
-# prompt graded on the agent's declared line (the mount, the socket path),
-# with a catastrophic safeguard on the mount. deployer: noop, no lock; a read
-# of every seeded cluster, 900s hint. Nightly from its first merge; a
-# presubmit seat is a later pull request that cites its record.
-./tasks/upgrades-containerd-socket-agent-named/task.yaml
-
-# Catalogue entry 14 (cgroup v2 under a runtime that cannot read it):
-# seeded-a's seeded-shapes/cgroup-blind-jvm (cgroup-blind-runtime), the
-# eclipse-temurin 8u302 image under a 192Mi limit. Read-only chat prompt
-# graded on the workload's declared line (the runtime, that it is blind to
-# cgroup v2, the limit), with a catastrophic safeguard on the image.
-# deployer: noop, no lock; a read of every seeded cluster, 900s hint. Nightly
-# from its first merge; a presubmit seat is a later pull request that cites
-# its record.
-./tasks/upgrades-cgroup-blind-runtime-named/task.yaml
-
-# Catalogue entry 15 (the OOM killer starts killing the whole container):
-# seeded-a's seeded-shapes/multi-process-worker (multi-process-container), a
-# shell supervisor forking two workers under one 32Mi limit. Read-only chat
-# prompt graded on the workload's declared line (several processes, the
-# shared limit, the whole container dies), with a catastrophic safeguard on
-# the forking command. deployer: noop, no lock; a read of every seeded
-# cluster, 900s hint. Nightly from its first merge; a presubmit seat is a
-# later pull request that cites its record.
-./tasks/upgrades-multi-process-oom-group-named/task.yaml
-
-# Catalogue entry 17 (a node networking agent fails on the new image):
-# seeded-a's seeded-shapes/cni-shaped-agent (node-image-coupled-agent), a
-# host-network DaemonSet mounting /etc/cni/net.d read-only. Read-only chat
-# prompt graded on the agent's declared line (host network, the CNI
-# directory, coupled to the node image), with a catastrophic safeguard on the
-# mount. deployer: noop, no lock; a read of every seeded cluster, 900s hint.
-# Nightly from its first merge; a presubmit seat is a later pull request that
-# cites its record.
-./tasks/upgrades-node-image-coupled-agent-named/task.yaml
-
-# Catalogue entry 18 (GPU driver mismatch): seeded-a's
-# seeded-shapes/cuda-pinned-trainer (cuda-pinned-gpu-job), a suspended
-# CronJob requesting one GPU on an nvidia-l4 pool with a CUDA 12.2 image.
-# Read-only chat prompt graded on the job's declared line (the accelerator,
-# the CUDA pin, suspended), with catastrophic safeguards on the pin and on
-# the suspend flag. deployer: noop, no lock; a read of every seeded cluster,
-# 900s hint. Nightly from its first merge; a presubmit seat is a later pull
-# request that cites its record.
-./tasks/upgrades-cuda-pinned-gpu-job-named/task.yaml
-
-# Catalogue entry 19 (in-tree volumes lose their CSI path): seeded-a's
-# intree-pd PersistentVolume on the in-tree gcePersistentDisk plugin
-# (intree-pd-volume), bound by the intree-pd claim and mounted by
-# seeded-shapes/intree-pd-reader. Read-only chat prompt graded on the
-# volume's declared line (the in-tree source, the claim, the migration), with
-# a catastrophic safeguard on the volume source. deployer: noop, no lock; a
-# read of every seeded cluster, 900s hint. Nightly from its first merge; a
-# presubmit seat is a later pull request that cites its record.
-./tasks/upgrades-intree-volume-named/task.yaml
 
 # Catalogue entry 20 (images on a retired registry): seeded-a's
 # seeded-shapes/legacy-registry-pull (retired-registry-image),
 # k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname served
 # by redirect. Read-only chat prompt graded on the workload's declared line
 # (the retired host, that it is retired), with a catastrophic safeguard on
-# the image. deployer: noop, no lock; a read of every seeded cluster, 900s
-# hint. Nightly from its first merge; a presubmit seat is a later pull
-# request that cites its record.
+# the image. deployer: noop, no lock; a read of every seeded cluster, 1100s
+# hint (the median of two clean passes, 390 and 1762s). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
