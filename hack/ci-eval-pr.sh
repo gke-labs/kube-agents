@@ -175,6 +175,9 @@ readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
+# How long each pause attempt waits for exactly one Ready gateway pod: an
+# autoscaler scale-down at lease time replaced it in about 40s on 2026-10-15.
+readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -1510,12 +1513,23 @@ scheduled_audits() { # <pause|resume> <label>
   # An exec that fails (a pod rolling, an API blip) is tried again, as wait_platform_runs
   # does; the script skips what is already done. Its exit 3 is a verdict a retry would
   # only repeat (unreadable inputs, a pause Hermes refused), so that one is final.
+  # Each attempt first waits for one Ready gateway pod and execs into it by name:
+  # `deployment/...` can pick a pod that is terminating, and a container that is
+  # still starting runs the entrypoint's cron merge, which can rewrite the store
+  # over a pause (eval-next 2110626938950258691, an autoscaler scale-down at
+  # lease time). Readiness means the entrypoint has finished.
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  local attempt
+  local attempt pod
   for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
     rc=0
-    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    pod="$(ready_gateway_pod "${ctx}" "${ns}")" || {
+      rc=1
+      out="no single Ready ${AGENT_SERVICE_NAME}-gateway pod within ${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}s"
+      [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+      continue
+    }
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "${pod}" \
       -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
       "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" ${args[@]+"${args[@]}"} \
       < "${SCRIPT_DIR}/ci_pause_scheduled_audits.py" 2>&1)" || rc=$?
@@ -1526,8 +1540,38 @@ scheduled_audits() { # <pause|resume> <label>
     [ "${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break
     [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
   done
+  if [ "${mode}" = "pause" ]; then
+    # Loud, not a warning: a scheduled audit left on its clock writes to the GitOps
+    # repository mid-run, and the writes safeguard charges them to whichever cases
+    # are running (#3020). Better an infra-red that says so than case-reds that don't.
+    echo "ERROR: Scheduled audits (${label}): pause exited ${rc} on attempt ${attempt}: ${out}" >&2
+    echo "ERROR: a scheduled audit is still on its clock, so its writes would be charged to the cases; stopping the run (infrastructure, not a case result)" >&2
+    exit 1
+  fi
   echo "WARNING: Scheduled audits (${label}): ${mode} exited ${rc} on attempt ${attempt}: ${out}; any audit not named as ${mode}d keeps its state" >&2
   return 0
+}
+
+# The one Ready, non-terminating pod of the gateway Deployment, waited for up to
+# EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS; prints its pod/<name>, or returns 1.
+ready_gateway_pod() { # <context> <namespace>
+  local ctx="$1" ns="$2" selector deadline=$((SECONDS + EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS)) names
+  selector="$(kubectl --context "${ctx}" -n "${ns}" get "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null)" || return 1
+  selector="${selector%,}"
+  [ -n "${selector}" ] || return 1
+  while :; do
+    names="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
+      -o go-template='{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{"pod/"}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" || names=""
+    # Exactly one: two Ready pods mean a rollout is still settling, and the store is
+    # on a volume both can write.
+    if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq 1 ]; then
+      printf '%s\n' "${names}"
+      return 0
+    fi
+    [ "${SECONDS}" -lt "${deadline}" ] || return 1
+    sleep 5
+  done
 }
 
 if [ "${EVAL_FORGE}" = "gitlab" ]; then
@@ -3323,6 +3367,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
 #
+# Again, right before the fan-out: idempotent, and it catches a gateway that
+# restarted between lease setup and here.
+scheduled_audits pause "fan-out"
+
 # Two phases on the inject lane (#2079), and since #2260 on the api lane too.
 # On the inject lane for the GitHub-write safeguard, which dates a write and
 # cannot sign it while every unit of the run writes to one repository; on

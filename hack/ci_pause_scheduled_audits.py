@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 home = sys.argv[1]
 RESUME = sys.argv[2:] == ["--resume"]
@@ -65,6 +66,10 @@ HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 # EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS, so a stalled pause is named here rather than
 # cut off by the caller's timeout before this prints.
 HERMES_TIMEOUT_SECONDS = 30
+# Rounds of pause-then-read-back, and the gap between them, for a job a
+# concurrent writer un-paused (see pause()).
+PAUSE_ROUNDS = 4
+PAUSE_ROUND_SLEEP_SECONDS = 3
 PAUSED_STATE = "paused"
 OK, RETRY, DECIDED = 0, 1, 3
 EXCERPT_CHARS = 200
@@ -164,22 +169,34 @@ def pause():
         except OSError as exc:
             print(f"nothing paused: could not write {RECORD}: {exc}")
             return RETRY
+    # Believe the store, not the exit codes, and pause again what it doesn't show.
+    # Another writer can rewrite the store from a copy read before a pause: the
+    # entrypoint's cron merge in a container that is still starting, or a
+    # scheduler tick. Hermes reports success and the marker is gone
+    # (eval-next 2110626938950258691: gcp-networking-fabric-audit, after an
+    # autoscaler scale-down replaced the gateway mid-pause). A few rounds a few
+    # seconds apart outlast that window.
     failed, failed_ids, retryable = [], set(), False
-    for jid in targets:
-        again, failure = hermes("pause", jid)
-        retryable |= again
-        if failure:
-            failed.append(failure)
-            failed_ids.add(jid)
-
-    # Believe the store, not the exit codes.
-    try:
-        after = {job["id"]: job for job in jobs_in(ROSTER)}
-    except (OSError, ValueError) as exc:
-        print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
-        return RETRY
+    pending = list(targets)
+    for round_no in range(PAUSE_ROUNDS):
+        if round_no:
+            time.sleep(PAUSE_ROUND_SLEEP_SECONDS)
+        for jid in pending:
+            again, failure = hermes("pause", jid)
+            retryable |= again
+            if failure and jid not in failed_ids:
+                failed.append(failure)
+                failed_ids.add(jid)
+        try:
+            after = {job["id"]: job for job in jobs_in(ROSTER)}
+        except (OSError, ValueError) as exc:
+            print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
+            return RETRY
+        pending = [jid for jid in targets if not paused(after.get(jid, {})) and jid not in failed_ids]
+        if not pending:
+            break
     done = [jid for jid in targets if paused(after.get(jid, {}))]
-    failed += [f"{jid} (not paused in the store)" for jid in targets if jid not in done and jid not in failed_ids]
+    failed += [f"{jid} (not paused in the store)" for jid in pending]
     print(
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")

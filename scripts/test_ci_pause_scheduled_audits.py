@@ -50,6 +50,13 @@ FAKE_HERMES = textwrap.dedent('''\
     assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
     if mode == "noop":
         sys.exit(0)
+    if mode.startswith("lose-first:") and sys.argv[5] == mode.split(":", 1)[1]:
+        # A concurrent writer (a starting container's cron merge) rewrites the
+        # store over the first pause of this job: Hermes says yes, no marker lands.
+        flag = os.environ["FAKE_ROSTER"] + ".lost"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            sys.exit(0)
     if mode.startswith("die-at:") and sys.argv[5] == mode.split(":", 1)[1]:
         import signal
         os.kill(os.getppid(), signal.SIGKILL)  # the pod going away mid-loop
@@ -234,6 +241,16 @@ class PauseTest(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertIn("FAILED c (exit 1: boom)", result.stdout)
 
+    def test_a_pause_lost_to_a_concurrent_writer_is_paused_again(self):
+        # eval-next 2110626938950258691: the gateway was replaced mid-pause and the
+        # new container's cron merge dropped one marker. The read-back finds it
+        # and the next round pauses it again.
+        self.write_roster([{"id": "c", "enabled": True}, {"id": "d", "enabled": True}])
+        result, store = self.run_script(mode="lose-first:d")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(store["d"]["state"], "paused")
+        self.assertIn("paused c, d;", result.stdout)
+
     def test_an_unreadable_stage_pauses_nothing(self):
         # Without the stage's list it can't tell which audits the stage owns, so it leaves all.
         self.write_roster([{"id": "c", "enabled": True}])
@@ -278,6 +295,10 @@ class RunnerTest(unittest.TestCase):
         text = RUNNER.read_text()
         calls = [m.start() for m in re.finditer(r'^scheduled_audits pause "lease"$', text, re.M)]
         self.assertEqual(len(calls), 1)
+        # And again right before the fan-out, which catches a restart in between.
+        again = [m.start() for m in re.finditer(r'^scheduled_audits pause "fan-out"$', text, re.M)]
+        self.assertEqual(len(again), 1)
+        self.assertLess(again[0], text.index('# Two phases on the inject lane'))
         lease_reset = text.index('reset_agent_pulls "lease"')
         first_unit = re.search(r'^\s+run_one_unit "\$\{TASKS', text, re.M).start()
         self.assertLess(lease_reset, calls[0])
@@ -289,6 +310,12 @@ class RunnerTest(unittest.TestCase):
         self.assertIn('"gke_${PROJECT_ID}_"*', body)
         self.assertIn("EVAL_PAUSE_AUDITS_ATTEMPTS", body)
         self.assertIn("return 0", body)
+        # A pause that does not take stops the run, loudly; a resume only warns.
+        self.assertIn('if [ "${mode}" = "pause" ]; then', body)
+        self.assertIn("exit 1", body)
+        # It execs into one Ready pod by name, not deployment/<name>.
+        self.assertIn('pod="$(ready_gateway_pod "${ctx}" "${ns}")"', body)
+        self.assertNotIn('exec -i "deployment/', body)
         # The script's DECIDED exit ends the retries.
         self.assertIn('"${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break', body)
         decided = re.search(r"^readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=(\d+)$", RUNNER.read_text(), re.M).group(1)
