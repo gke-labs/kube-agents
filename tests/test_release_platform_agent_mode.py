@@ -406,7 +406,15 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         self.assertGreaterEqual((next_minutes - today_minutes) * 60, budget)
 
     def test_the_pipelines_still_install_and_test_today(self):
-        """No caller passes a mode yet; the input's default is what they run."""
+        """Every gating deploy and E2E job takes the input's default, today.
+
+        The RC pipeline's next-mode leg is the one exception, and it is listed by
+        name so a `mode` added anywhere else still fails here.
+        """
+        next_leg = {
+            ("rc-release-pipeline.yml", "step-6-deploy-next-env"),
+            ("rc-release-pipeline.yml", "step-7-run-e2e-next"),
+        }
         for workflow in ("rc-release-pipeline.yml", "staging-promotion-pipeline.yml"):
             doc = _workflow(workflow)
             for job_id, job in doc["jobs"].items():
@@ -415,7 +423,35 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
                     "./.github/workflows/e2e-run.yml",
                 ):
                     with self.subTest(workflow=workflow, job=job_id):
-                        self.assertNotIn("mode", job.get("with") or {})
+                        if (workflow, job_id) in next_leg:
+                            self.assertEqual((job.get("with") or {}).get("mode"), "next")
+                        else:
+                            self.assertNotIn("mode", job.get("with") or {})
+
+    def test_the_rc_next_leg_gates_nothing_and_follows_the_today_leg(self):
+        """The next leg must not hold back a release, and must not share the cluster.
+
+        Nothing the tag step or the today teardown waits on may belong to the leg,
+        and the leg starts only after the today teardown, whose own success()
+        gate keeps a failed today install standing for diagnosis.
+        """
+        jobs = _workflow("rc-release-pipeline.yml")["jobs"]
+        leg = {"step-6-deploy-next-env", "step-7-run-e2e-next", "step-8-teardown-next-env"}
+        for job_id in ("step-2-deploy-env", "step-3-run-e2e-tests", "step-4-tag-validated", "step-5-teardown-env"):
+            with self.subTest(job=job_id):
+                self.assertFalse(leg & set(jobs[job_id].get("needs") or []))
+        self.assertIn("step-5-teardown-env", jobs["step-6-deploy-next-env"]["needs"])
+        self.assertIn("step-6-deploy-next-env", jobs["step-7-run-e2e-next"]["needs"])
+        self.assertIn("step-7-run-e2e-next", jobs["step-8-teardown-next-env"]["needs"])
+        for job_id in leg:
+            with self.subTest(job=job_id):
+                job = jobs[job_id]
+                self.assertEqual(job["with"]["github_environment"], "rc")
+                self.assertIn("github.repository == 'gke-labs/kube-agents'", job["if"])
+                self.assertNotIn("always()", job["if"])
+        # The same suites as the today leg, so the two results read side by side.
+        for key in ("blocking_suite", "optional_suites"):
+            self.assertEqual(jobs["step-7-run-e2e-next"]["with"][key], jobs["step-3-run-e2e-tests"]["with"][key])
 
 
 if __name__ == "__main__":

@@ -100,6 +100,8 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
 
 The pipeline builds a full GKE cluster per candidate and destroys it twice over: step 2 removes whatever was there before it installs, and step 5 removes what the run itself built. A run that passes therefore leaves nothing behind and nothing billing.
 
+A run whose today leg passes then builds the environment a second time with `spec.mode: next` (steps 6 to 8: deploy, the same E2E suites, teardown), so the cluster bills for both legs back to back. That leg starts only after step 5, so it never rebuilds a today install that failed, and nothing waits on it: step 4 has already tagged the candidate validated, so a failure that only reproduces on `next` reds the run without holding back a release. It follows the same teardown rule, leaving a failed `next` install standing until the next run's step 2. It gates nothing until the default mode flips, when the two legs swap.
+
 A run that fails anywhere does leave its environment standing, deliberately — step 5 hangs off the success of every earlier job (in the staging promotion pipeline, every earlier job but the rollback leg, as its section says), and the E2E failures worth diagnosing are the ones that only reproduce on the cluster that produced them. Two consequences to know about:
 
 - Nothing else removes that environment. The next run's step 2 does, which on the schedule is up to three hours later, so an investigation that needs longer than that wants the schedule paused rather than a race against it.
