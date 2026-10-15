@@ -1284,6 +1284,21 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         self.assertIn("is commented out in", " ".join(results["cluster-provision-kanban"]))
         self.assertIn("That parking state is retired", " ".join(results["cluster-provision-kanban"]))
 
+    def test_a_repeated_key_is_refused_as_the_runner_refuses_it(self):
+        # devops-bench loads tasks with ruamel's safe loader, which raises on a
+        # repeated key that PyYAML would keep silently.
+        texts = {
+            "top level": "id: made-up-case\ntool_calls_optional: true\nname: A case\ntool_calls_optional: true\n",
+            "nested": "id: made-up-case\ninfrastructure:\n  stack: a\n  stack: b\n",
+        }
+        for where, text in texts.items():
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "task.yaml"
+                path.write_text(text)
+                with self.assertRaises(validator.CaseError) as raised:
+                    validator._load_yaml(path)
+                self.assertIn("found duplicate key", str(raised.exception))
+
     def test_one_unreadable_case_does_not_hide_the_others(self):
         broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"
         broken.parent.mkdir(parents=True)
