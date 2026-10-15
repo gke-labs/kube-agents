@@ -467,7 +467,9 @@ case that declares no `fixtures:` at all, a missing, empty or inline `verificati
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
 as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
-does not have, and a case that is registered nowhere. It
+does not have, a case that is registered nowhere, and a file that writes one key twice in
+the same mapping, which PyYAML would load with the last value and devops-bench's loader
+refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
@@ -524,6 +526,10 @@ classes of mistake get through it and fail at spec-load, after a cluster lease i
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
   the validator sees the field, the trap has already been parsed away.
+
+A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal keys
+silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with
+a `SafeLoader` subclass that refuses a key written twice in one mapping.
 
 The gap is deliberate rather than pending. `make bench-case-check` depends on PyYAML alone,
 so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what

@@ -228,12 +228,12 @@
 #
 # 2026-10-07 adds findings-decision-covers-item: one case, three units at the
 # 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the entry before upgrades-freeze-runbook-probe
-# below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
-# there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
-# the thirteen come to ~583 serial minutes against the 480m deadline.
+# kubectl execs each). It is the entry after
+# backup-dr-cmek-selected-namespaces-probe below: sixty-five cases (195 units)
+# here, of a seventy-nine-case, 237-unit matrix. Its stack holds the infra
+# lock, so it is the thirteenth tofu case: ~10 more serial minutes there. With
+# oobe-first-run-audits, the twelfth (~120 at its 2400s hint), the thirteen
+# come to ~583 serial minutes against the 480m deadline.
 #
 # 2026-10-09 parks oobe-first-run-audits: it is in no roster file, and its
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py says what brings
@@ -376,7 +376,7 @@
 # in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
 #
 # 2026-10-06 adds upgrades-fleet-readiness-failclosed-webhook (its paragraph
-# is last because its count is the newest): one case, three units, a
+# sits after the 2026-10-09 one because it was counted later): one case, three units, a
 # read-only chat turn that runs the readiness script over every cluster in
 # the project (one red repetition on a dev install with thirty-odd clusters
 # took 29 minutes of agent time; the pool projects hold the seeded fleet and
@@ -385,12 +385,23 @@
 # seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit matrix
 # with the presubmit file's fourteen.
 #
+# 2026-10-13 adds upgrades-readiness-zonal-control-plane (rebased past the
+# gitops-drift-noise-filtered-triage and upgrades-fleet-readiness-failclosed-webhook
+# entries above): one case, three units at
+# the 200s default (a read-only chat turn that runs the readiness report; the
+# report alone measured 62s on the dev install). It is the entry after
+# manage-cluster-exclusion-installer-route-probe below. Counted over every
+# entry below on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine
+# cases (237 units) here, of a ninety-three-case, 279-unit matrix with the
+# presubmit file's fourteen.
+# No stack, so the infra lock is untouched.
 # 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
-# lists: seventy-six cases (228 units) here, of a ninety-case, 270-unit
-# matrix, the paragraphs above included.
+# lists on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine cases
+# (237 units) here, of a ninety-three-case, 279-unit matrix, the paragraphs
+# above included.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1005,6 +1016,11 @@
 # upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
 # transcript-only, one delegation round trip.
 ./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
+# Upgrade-failure catalogue entry 11 through the readiness report's
+# zonal-control-plane rule: every seeded cluster's zonal control plane is a
+# risk, never a block, on the report. Read-only; no planted fixture. Nightly
+# from its first merge.
+./tasks/upgrades-readiness-zonal-control-plane/task.yaml
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the
