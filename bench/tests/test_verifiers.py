@@ -7751,6 +7751,8 @@ def test_worker_commands_required_run_names_what_did_not_run():
 _GROUP3 = {
     "upgrades-removed-api-callers-distinguished": (
         [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowcontrol.apiserver.k8s.io/v1beta3",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: policy/v1beta1, v1 endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none (audit log clean); deprecated but still served: v1 endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowschemas flowcontrol.apiserver.k8s.io/v1beta3",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints",
@@ -7772,6 +7774,7 @@ _GROUP3 = {
             "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
         ],
         [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1",
             "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none (Endpoints is written only by kube-system's controller)",
@@ -7799,6 +7802,7 @@ _GROUP3 = {
     ),
     "upgrades-network-policy-enforcement-stated": (
         [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: namespace/seeded-reliability, namespace/seeded-debug, namespace/seeded-capacity, namespace/seeded-deprecation",
             "seeded-a: dataplane LEGACY_DATAPATH; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero-trust",
             "seeded-a: dataplane legacy; network policies enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
@@ -7818,6 +7822,7 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
         ],
         [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, namespace/none",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero",
             "seeded-a: dataplane legacy no longer, now dataplane v2 (migrated at 1.33); networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy-free; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
@@ -7924,6 +7929,7 @@ _GROUP5 = {
     ),
     "upgrades-cgroup-blind-runtime-named": (
         [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre (jdk 8u302, pre-8u372); reads cgroup v2 limits: no (cgroup v1 only); memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit: 192Mi",
@@ -8070,6 +8076,8 @@ _GROUP2 = {
     ),
     "upgrades-no-surge-pool-recreate-warned": (
         [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in namespace seeded-upgrade",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner (Deployment) in seeded-upgrade",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, no-surge-canary",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no (maxSurge 0); workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
@@ -8200,6 +8208,7 @@ _GROUP4 = {
     ),
     "upgrades-intree-volume-named": (
         [
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
             "seeded-a/intree-pd: source: in-tree gcePersistentDisk; bound by: seeded-shapes/intree-pd; attaches through csi migration: yes",
             "- `seeded-a/intree-pd`: source in-tree gcePersistentDisk; bound by `seeded-shapes/intree-pd`; attaches through CSI migration: yes.",
