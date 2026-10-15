@@ -98,7 +98,9 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
 
 ## What Happens to the RC Cluster
 
-The pipeline builds a full GKE cluster per candidate and destroys it twice over: step 2 removes whatever was there before it installs, and step 5 removes what the run itself built. A run that passes therefore leaves nothing behind and nothing billing.
+The pipeline builds a full GKE cluster per candidate and destroys it twice over: step 2 removes whatever was there before it installs, and step 5 removes what the run itself built (step 8 for the `next` leg below). A run that passes therefore leaves nothing behind and nothing billing.
+
+A run whose today leg passes then builds the environment a second time with `spec.mode: next` (steps 6 to 8: deploy, the same E2E suites, teardown), so the cluster bills for both legs back to back. That leg starts only after step 5, so it never rebuilds a today install that failed, and nothing waits on it: step 4 has already tagged the candidate validated, so a failure that only reproduces on `next` reds the run without holding back that release. It follows the same teardown rule, step 8 standing in for step 5, so a failed `next` install stays up until the next run's step 2. It does hold back the next candidate: the pipeline runs one at a time, so a dispatch made while the leg runs waits for it, and the leg roughly doubles a run's wall-clock (about 40 to 160 minutes for the today leg alone).
 
 A run that fails anywhere does leave its environment standing, deliberately — step 5 hangs off the success of every earlier job (in the staging promotion pipeline, step 7, of the deploy and the matrix; there a deploy that did not succeed is torn down in the same run, and only a failed matrix keeps the cluster, as its section says), and the E2E failures worth diagnosing are the ones that only reproduce on the cluster that produced them. Two consequences to know about:
 

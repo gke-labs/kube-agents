@@ -75,23 +75,19 @@ from the environment.
 Across all namespaces on this cluster:
 
 1. **Multi-Tenancy & Governance:** List all non-system namespaces (`kubectl get ns`). Verify whether
-   ResourceQuotas, LimitRanges, and NetworkPolicies are configured to enforce boundary defense.
-2. **Workload Health & QoS:**
+   ResourceQuotas and LimitRanges are configured to enforce boundary defense.
+2. **Workloads:**
    - List all Deployments, StatefulSets, DaemonSets, and Jobs
      (`kubectl get deployments,statefulsets,daemonsets,jobs -A`).
-   - **Probes:** Verify that every workload has `livenessProbe`, `readinessProbe`, and
-     `startupProbe` configured.
-   - **Resource Management:** Verify that containers define explicit `requests` and `limits` (record
-     the Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
-   - **Scaling:** Audit Horizontal Pod Autoscaler settings (`minReplicas`, `maxReplicas`, metrics
-     targets).
-   - **Security Context:** Verify whether workloads run as non-root (`runAsNonRoot: true`) and use
-     read-only root filesystems (`readOnlyRootFilesystem: true`). Check `privileged`, `hostPID`,
-     `hostNetwork`, `hostIPC`, and added `capabilities` in the same pass, and record any workload
-     that sets one as a **high** severity finding naming that workload. Those five grant escape from
-     the container to the node, which is a different class of problem from a writable root
-     filesystem; scored alongside missing probes they read as one more hardening gap and the report
-     ranks them out of sight.
+   - **Startup probes:** Verify whether every workload has a `startupProbe` configured.
+   - **Security Context:** Verify whether workloads use read-only root filesystems
+     (`readOnlyRootFilesystem: true`). Check added `capabilities` in the same pass, and record any
+     workload that adds one other than `SYS_ADMIN` as a **high** severity finding naming that
+     workload and the capabilities it adds. An added capability widens what the container can do to
+     the node, which is a different class of problem from a writable root filesystem; scored
+     alongside missing probes it reads as one more hardening gap and the report ranks it out of
+     sight. An added `SYS_ADMIN` is not this check: it counts as a privileged container, which
+     Step 5 leaves to the first-run audits.
 3. **Core Infrastructure Addons:** Check for ingress controllers (GKE Gateway API, NGINX),
    cert-manager, OpenTelemetry collectors (`gke-managed-otel`), and identity integration endpoints
    (`github-token-minter` / `minty`). Record which deployment toolchain manages the cluster —
@@ -99,8 +95,8 @@ Across all namespaces on this cluster:
    the fleet report has a column for it and no other stage can see your cluster.
 
 **A pod list is not this audit.** `kubectl get pods` reports phase, and every gap above sits in a
-workload's spec rather than its phase — a Deployment with no probes, no resource requests, and no
-security context runs perfectly and reports `Running`. Read the specs
+workload's spec rather than its phase — a Deployment with no startup probe and a writable root
+filesystem runs perfectly and reports `Running`. Read the specs
 (`kubectl get deployments -A -o json` and friends), or the audit will report a clean cluster it
 never checked.
 
@@ -123,8 +119,68 @@ Google Cloud and GKE best practices where it helps.
    thresholds.
 3. **Security Hardening:** Verify whether pods reaching Google Cloud APIs use Workload Identity
    (`serviceAccountName` with an `iam.gke.io/gcp-service-account` annotation) rather than static
-   keys. On Standard clusters, evaluate Shielded GKE Nodes, Dataplane V2, node auto-upgrades, and
-   Pod Security Admission.
+   keys. On Standard clusters, evaluate Shielded GKE Nodes, Dataplane V2, and node auto-upgrades.
+
+---
+
+## Without a GitOps repository
+
+**Run this section only when your card says to.** It does when the install has no GitOps repository
+for the four first-run audits (cost, security, reliability and capacity) to publish to: those audits
+then do not run after the scan, and this card is all that checks the workloads on day one. When your card says to skip it, skip
+it; the audits run these checks and report them with their own evidence.
+
+Add these to Steps 3 and 4, across all namespaces on this cluster:
+
+1. **NetworkPolicy:** In the multi-tenancy check, also verify whether NetworkPolicies are configured.
+2. **Probes:** Verify that every workload has `livenessProbe` and `readinessProbe` configured.
+3. **Resource Management:** Verify that containers define explicit `requests` and `limits` (record
+   the Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
+4. **Scaling:** Audit Horizontal Pod Autoscaler settings (`minReplicas`, `maxReplicas`, metrics
+   targets).
+5. **Security Context:** Verify whether workloads run as non-root (`runAsNonRoot: true`). Check
+   `privileged`, `hostPID`, `hostNetwork`, `hostIPC`, and an added `SYS_ADMIN` capability in the
+   same pass, and record any workload that sets one as a **high** severity finding naming that
+   workload, for the same reason Step 3 gives for added capabilities: those five grant escape from
+   the container to the node.
+6. **Hardening:** On Standard clusters, evaluate Pod Security Admission and whether Workload
+   Identity is enabled on the cluster.
+
+Record them in the Step 5 `metadata` as these fields, beside the ones Step 5 already shows:
+
+```json
+{
+  "workloads": [
+    {
+      "probes": { "liveness": false, "readiness": false, "startup": false },
+      "resources": { "requests": false, "limits": false, "qos": "BestEffort" },
+      "hpa": false,
+      "security_context": {
+        "run_as_non_root": false,
+        "read_only_root_fs": false,
+        "privileged": false,
+        "host_pid": false,
+        "host_network": false,
+        "added_capabilities": []
+      }
+    }
+  ],
+  "namespace_governance": [{ "network_policy": false }]
+}
+```
+
+Report their findings under these slugs, alongside the Step 5 table:
+
+| what you found                   | check slug                            |
+| -------------------------------- | ------------------------------------- |
+| liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
+| requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
+| HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
+| NetworkPolicy                    | `netpol-missing`                      |
+| Workload Identity on the cluster | `workload-identity-off`               |
+| `runAsNonRoot` security context  | `podsecurity-gaps`                    |
+| privileged or `SYS_ADMIN`        | `privileged-container`                |
+| host namespaces                  | `host-namespace`                      |
 
 ---
 
@@ -158,16 +214,10 @@ finding the report loses.
       "name": "…",
       "kind": "Deployment",
       "replicas": "1/1",
-      "probes": { "liveness": false, "readiness": false, "startup": false },
-      "resources": { "requests": false, "limits": false, "qos": "BestEffort" },
-      "hpa": false,
+      "probes": { "startup": false },
       "telemetry": "otlp | prometheus-scrape | none",
       "security_context": {
-        "run_as_non_root": false,
         "read_only_root_fs": false,
-        "privileged": false,
-        "host_pid": false,
-        "host_network": false,
         "added_capabilities": []
       }
     }
@@ -176,13 +226,12 @@ finding the report loses.
     {
       "namespace": "…",
       "resource_quota": false,
-      "limit_range": false,
-      "network_policy": false
+      "limit_range": false
     }
   ],
   "findings": [
     {
-      "check": "probes-readiness",
+      "check": "probes-startup",
       "severity": "high|medium|low",
       "area": "security|reliability|observability",
       "namespace": "…",
@@ -197,25 +246,28 @@ finding the report loses.
 
 `check` is a lowercase hyphenated slug naming the condition, stable across sweeps: with the project,
 cluster, namespace and workload it is the finding's identity in the findings queue. These are the
-audit streams' own slugs; use one where it fits. Using them means the same
+audit streams' own slugs where a stream has one (`probes-startup`, `readonly-root-fs`, `no-resourcequota`, `static-sa-key` and `added-capabilities` have none yet); use one where it fits. Using them means the same
 problem carries one identity whichever source found it, and a finding promoted out of the queue
 routes to the stream that owns the check.
 
-| what you found                   | check slug                            |
-| -------------------------------- | ------------------------------------- |
-| liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
-| missing `startupProbe`           | `probes-startup`                      |
-| requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
-| HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
-| NetworkPolicy                    | `netpol-missing`                      |
-| ResourceQuota and LimitRange     | `no-resourcequota`                    |
-| Workload Identity                | `workload-identity-off`               |
-| `runAsNonRoot` security context  | `podsecurity-gaps`                    |
-| missing `readOnlyRootFilesystem` | `readonly-root-fs`                    |
-| Shielded Nodes                   | `shielded-nodes`                      |
-| Dataplane V2                     | `datapath-provider`                   |
-| Managed Service for Prometheus   | `managed-prometheus`                  |
-| node auto-upgrade                | `no-autoupgrade`                      |
+| what you found                   | check slug           |
+| -------------------------------- | -------------------- |
+| missing `startupProbe`           | `probes-startup`     |
+| ResourceQuota and LimitRange     | `no-resourcequota`   |
+| missing `readOnlyRootFilesystem` | `readonly-root-fs`   |
+| Shielded Nodes                   | `shielded-nodes`     |
+| Dataplane V2                     | `datapath-provider`  |
+| Managed Service for Prometheus   | `managed-prometheus` |
+| node auto-upgrade                | `no-autoupgrade`     |
+| pods on static Google Cloud keys | `static-sa-key`      |
+| added capabilities               | `added-capabilities` |
+
+Checks the first-run audits own (cost, security, reliability and capacity: liveness and readiness
+probes, requests and limits, HPA, NetworkPolicy, the cluster's Workload Identity setting
+(`workload-identity-off`; a pod's static keys are `static-sa-key` above), pod security, privileged
+and host-namespace workloads, and an added `SYS_ADMIN` among them) are not reported here, under any
+slug, unless your card has you run "Without a GitOps repository" above. Those audits report them with their own evidence,
+and a second copy from this card reaches the user as a separate problem.
 
 For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it
 is the row's identity across every later sweep.
