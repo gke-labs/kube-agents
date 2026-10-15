@@ -58,8 +58,13 @@ verification_spec:
       type: tool_called
       tool_names: ["kanban_create"]
       require_success: true
+      # tool_called matches each argument with re.fullmatch, so the pattern
+      # spans the whole body. Confirm-first, in any of the wordings a card
+      # takes: "verify if checkout-gateway exists", "verify checkout-gateway's
+      # current status", "confirming the workload ... first". Not "check":
+      # "check logs, events" is ordinary diagnosis.
       arguments:
-        body: '(?is)checkout-gateway.*(?:confirm|verify|check)\w*\b[^.\n]{0,80}\bexist'
+        body: '(?is).*checkout-gateway.*\b(?:confirm|verify)\w*\b[^.\n]{0,80}\b(?:exists?|present|current status|the workload)\b.*'
   # No question back to the user: the report is real, so the rule's ask does
   # not apply. The front door's own text is everything before the first
   # delivered section (harness.py _append_final).
