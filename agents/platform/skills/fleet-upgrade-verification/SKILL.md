@@ -289,6 +289,20 @@ maintenance and skew rules are still graded, and the other members are unaffecte
 value that is not RFC 3339, or `--at` or `--kubeconfig-dir` without `--readiness`, is a usage
 error (exit 2).
 
+## Scheduled runs of the readiness report
+
+Two cron jobs on the Platform Agent's roster run `--readiness` without a request (`cron/README.md`
+in the platform profile says how):
+
+- `upgrade-readiness-watch`, daily: for a cluster below a version its release channel offers; the
+  report lands under `upgrade-readiness/reports/<version>/` on the agent's volume with one chat line.
+- `upgrade-readiness-weekly-review`, Saturdays: every cluster in scope, every blocker and risk
+  registered on the findings queue; the technical report is `upgrade-readiness/weekly/latest.md`
+  on the agent's volume, with a copy at `/opt/data/upgrade-readiness/weekly/latest.md` in the
+  sandbox. `upgrade-readiness-weekly-brief` follows it with the week's brief in chat. A user who
+  asks for "this week's upgrade readiness report" gets that copy printed; one who asks for the brief
+  gets it composed again from the copy and the queue (`governance/upgrade_readiness_brief_sop.md`).
+
 ## Scan the GitOps manifests
 
 ```bash

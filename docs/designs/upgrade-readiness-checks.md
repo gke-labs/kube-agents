@@ -383,3 +383,11 @@ that are not built here: it **ships with the agent**; it **runs on a weekly sche
 **customizable**, held apart from the procedure so an operator can change a threshold by agreeing
 the edit with the agent; and it is **self-learning**, refining those criteria from what the
 operator says, within limits the operator sets.
+
+What ships of that today is the schedule and the chat half, through the Platform Agent's cron roster
+rather than the vehicle: the weekly `upgrade-readiness-weekly-review` job grades every cluster in
+scope on Saturday and registers each blocker and risk on the findings queue, which carries it to a
+decision (dismiss, snooze, accept) and reminds until one is made; the `upgrade-readiness-weekly-brief`
+job that follows composes the week's message from the review and the queue; and the daily
+`upgrade-readiness-watch` grades a cluster the day a new version appears for it. The family
+verdict, the customizable criteria and the self-learning stay specified here and unbuilt.

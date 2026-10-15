@@ -180,6 +180,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    "upgrades-weekly-brief-decisions-named",  # the Saturday brief's on-request route
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

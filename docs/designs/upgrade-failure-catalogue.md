@@ -153,7 +153,10 @@ build. The column and the table were last reconciled on 2026-10-14.
 
 ### Gap to scheduled coverage
 
-The goal is that every entry is caught without a request. Two scheduled readers do that. The daily
+The goal is that every entry is caught without a request. Two scheduled readers do that, and a
+third carries what they find to a decision: the Saturday job `upgrade-readiness-weekly-review` runs
+the readiness report over every cluster in scope and registers each blocker and risk on the findings
+queue, which reminds until the user dismisses, snoozes or accepts it. The daily
 job `upgrade-readiness-watch` (`agents/platform/cron/jobs.json`, 10:10 UTC) runs the readiness report's rules before an
 upgrade, for a cluster below a version its release channel offers. The weekly job `upgrade-retrospective` (its [design](upgrade-retrospective.md) on `main`; collector #2729, in review) runs
 after one; its collector matches symptoms to this list, and it also reads a set of risk shapes on

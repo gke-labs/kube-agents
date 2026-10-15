@@ -1,0 +1,149 @@
+# SOP: Weekly Upgrade Readiness Brief
+
+**Cron id:** `upgrade-readiness-weekly-brief` — `30 6 * * 6` (Saturdays, 06:30 UTC), thirty minutes
+after `upgrade-readiness-weekly-review` has graded every cluster and registered what it found on the
+findings queue.
+
+**Purpose:** one message a person reads in a minute, saying what this week's upgrade readiness
+review found, which findings need their decision now, and where the full report is. The review job
+did the reading and the registering; the findings queue carries every finding to a decision and
+reminds on its own schedule. This brief is the weekly judgement over both: what matters most this
+week, said once, in plain words. It changes nothing: it registers no finding, decides nothing on the
+user's behalf, and upgrades nothing.
+
+**Why a model turn.** The review job can rank by rubric; it cannot tell that two criticals on one
+cluster are one problem, that a major on the cluster the agent itself runs on outranks a critical on
+a scratch cluster, or that an exclusion ending next week matters more than one ending in January.
+That is the judgement this turn makes, inside the rules below. The rules bound the length and the
+shape; the model chooses the emphasis.
+
+---
+
+## Execution Checklist
+
+### 1. Read the review
+
+1. Read the review's summary, the copy the review job placed where you can read it:
+
+   ```bash
+   cat /opt/data/upgrade-readiness/weekly/latest.json
+   ```
+
+   It carries `generated_at`, `projects`, `clusters` (reviewed, blocked, ready, unknown, unread),
+   `counts` by severity, `findings` (one row per finding: `id`, `severity`, `check`, `entry`,
+   `cluster`, `namespace`, `object`, `title`, `action`, `outcome`), `new_ids`, `suppressed_ids`,
+   `no_longer_reported_ids`, `project_failures`, `registration_errors` and `report_path`.
+2. If the file is missing, or `generated_at` is older than **48 hours**, the review did not run
+   this week. Say so in one line, name the job (`upgrade-readiness-weekly-review`) and the last
+   `generated_at` you found, and stop. Do not run the readiness report yourself from this job: the
+   queue would hold nothing for the findings, and a brief that names findings nobody can decide on
+   is noise.
+3. Read the full report when a line needs more than the summary row says:
+
+   ```bash
+   cat /opt/data/upgrade-readiness/weekly/latest.md
+   ```
+
+### 2. Read the queue
+
+Call the `platform_control` tool `get_ranked_findings` and keep the rows whose `check` starts with
+`upgrade-` (every row the review registers carries that prefix; `source` is `audit`). The queue is
+the authority on **state**: the summary says what was found, the queue says what the user has
+decided.
+
+- **Undecided**: `state` is `queued` or `surfaced`. These are the rows that still need the user.
+- **Decided**: `accepted` (being worked on), `snoozed` (back on `snoozed_until`), `dismissed`
+  (won't fix; the review will keep finding it and the queue will keep it silent).
+- A row in the summary with outcome `suppressed` is a dismissed finding seen again. Never name it
+  as new.
+
+### 3. Compose the brief
+
+Write one message, in this shape and order, at most **16 lines**. Plain sentences; no table; no
+heading markup beyond the bold labels shown; the ids verbatim as the queue spells them, in
+backticks, because the user replies with them.
+
+```
+Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r> ready<, u not read>. <new> new findings since last week, <gone> no longer reported.
+
+**Decide now** (critical, nobody has decided yet):
+1. `<id>` — <cluster>: <what blocks and what it costs, one clause>. Do: <the first action>.
+2. ...
+<at most three; then one line: "and <k> more critical findings await a decision, listed in the report.">
+
+**Also this week:** <one or two lines: counts by catalogue entry on which clusters, majors only; minors as one count>.
+
+**Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there<, or "none yet">.
+
+Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "show me this week's upgrade readiness report" to read it here, or reply with an id and `dismiss`, `snooze until <date>` or `accept` to decide.
+```
+
+Rules for the judgement:
+
+- **Lead with what needs a decision.** The three lines under **Decide now** are the undecided
+  criticals, worst first. The queue's rank order is the default. Depart from it when one of these
+  holds, and only then: two or more criticals on one cluster are one problem (merge them into one
+  line and name both objects); a finding on the cluster the agent runs on outranks the same finding
+  elsewhere; a finding whose clock is short (an exclusion or a target that ends within thirty days)
+  outranks one with no date; a `major` whose evidence says a serving workload goes down outranks a
+  `critical` on a cluster the summary lists as `unknown` or whose evidence is inferred.
+- **One clause of why, one action.** "Budget `pinned-batch-runner` refuses eviction of its only
+  pod, so the drain kills it" is the clause; the action is the row's `action`, shortened to the
+  verb and the object. Never paste the row's full text.
+- **No critical undecided** → the section reads `**Decide now:** nothing; every critical finding
+  has a decision.` and the brief is shorter.
+- **Nothing found at all** → two lines: the headline, then the report line. Never `[SILENT]`: the
+  week's brief is owed whether or not there is news.
+- **Majors and minors stay out of Decide now.** They go in **Also this week** as counts by
+  catalogue entry (the row's `entry` and the first part of its `title`), so the user sees the shape
+  of the week without a list. The queue names them at its own pace.
+- **Dismissed is silent.** A `suppressed` row is never counted as new and never named; it was the
+  user's decision.
+- **Never invent.** Every id comes from the summary or the queue; every count comes from the
+  summary. If the queue and the summary disagree on a row's state, the queue wins and you say
+  nothing about the disagreement in the brief.
+- **No CVEs, no version advice.** The review reads budgets, webhooks, pools, exclusions and the
+  readiness rules; it has no vulnerability feed. Name no CVE and recommend no version.
+
+### 4. Deliver
+
+Your final response is the brief and nothing else: no preamble, no restatement of these rules, no
+closing offer. The scheduler posts it to chat as written and stores it against the thread, so a
+reply in that thread reaches the agent with the brief attached.
+
+---
+
+## On request
+
+A user may ask in chat for the brief or the report, at any time.
+
+- **"Show me this week's upgrade readiness report"**, or any ask for the full report → print
+  `/opt/data/upgrade-readiness/weekly/latest.md` as it is. Google Chat splits anything past 4,000
+  characters across messages; that is expected. If the file is missing, say the weekly review has
+  not run yet and offer the on-request readiness report (`fleet-upgrade-verification`, `--readiness`).
+- **"Give me the upgrade readiness brief"**, or any ask for what needs a decision → steps 1 to 3
+  above, and the same shape. If the summary is older than 48 hours, say so in the headline and
+  compose from it anyway: a stale brief with its date is better than none. If there is no summary
+  at all (the review has never run on this install), compose a **live brief**: run the readiness
+  report yourself over every project in scope (`fleet-upgrade-verification`, `--readiness`, as
+  "Check upgrade readiness" in its `SKILL.md` says), take the blockers and risks it names as the
+  findings (a drain-blocking budget over a single replica, a pool past the skew ceiling and a
+  fail-closed webhook in the upgrade's path are critical; a webhook refusing only what it matches
+  today, a pool at the ceiling and a rule's risk are major; an exclusion is minor), read the queue
+  for any decision already recorded, and compose the same shape. Say "live brief, composed now; the
+  weekly review has not run" in the headline, use the object's name where the queue would have an
+  id, and register nothing: the Saturday review owns the queue.
+- **A decision in reply** ("`<id>` dismiss", "snooze until 2026-11-01", "accept") is not this
+  SOP's to apply: the Chat Agent files it as a card and the `update_finding` tool records it. Do
+  not answer a decision with a new brief.
+
+## Red Lines
+
+- **Never register, verify or decide a finding from this job.** The review job registers; the user
+  decides; the queue remembers.
+- **Never run the readiness report from this job.** The on-request route offers it; the scheduled
+  brief reads the review.
+- **Never pad the brief.** Sixteen lines is the ceiling, not the target; a quiet week is three lines.
+- **Never name a dismissed finding.**
+- **Never mutate.** No `gcloud ... upgrade`, no `kubectl apply/patch/delete`, nothing through the
+  `gke` MCP server that writes.

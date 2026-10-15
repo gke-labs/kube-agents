@@ -185,6 +185,8 @@ CRON_CADENCE = {
     "*/10 * * * *": "Every 10 minutes",
     "*/30 * * * *": "Every 30 minutes",
     "0 21 * * 1-5": "Weekdays 21:00",
+    "0 6 * * 6": "Weekly, Saturday 06:00",
+    "30 6 * * 6": "Weekly, Saturday 06:30",
     "0 9 * * 0": "Weekly, Sunday 09:00",
     "0 10 * * 0": "Weekly, Sunday 10:00",
     "20 7 * * 1": "Weekly, Monday 07:20",

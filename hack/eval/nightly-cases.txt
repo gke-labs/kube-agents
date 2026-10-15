@@ -969,3 +969,8 @@
 # and no delegated worker retries the change another way after it (the
 # order-aware worker_commands check, #2173). deployer: noop, transcript-only.
 ./tasks/stop-on-permission-refusal/task.yaml
+
+# The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
+# whose Decide-now lines name slot b's singleton budget and keep the webhook outage
+# under Also-this-week. deployer: noop, read-only, one readiness report.
+./tasks/upgrades-weekly-brief-decisions-named/task.yaml
