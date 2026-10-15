@@ -1521,7 +1521,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # recorded children are neither settled nor gated on it, telling the worker to
 # wait and synthesize instead. kanban_block also refuses kind="dependency" on a
 # card with nothing unfinished to wait on, which upstream re-queues to a fresh
-# worker that can't see the first one's work (#2704's duplicate PR). Must run
+# worker that can't see the first one's work (#2704's duplicate PR). And
+# kanban_complete refuses, every time, a card whose declared `step <key>:` lines
+# (in its body or comments) are not all `done` (#2935, #2939). Must run
 # AFTER apply_kanban_result_required.py
 # (earlier stage): its completion anchor is text that patch introduced,
 # deliberately, because the site it needs only exists in the patched tree. The
@@ -1665,6 +1667,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_children_settled.py /opt/hermes && \
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '_steps_err = _require_steps_settled(' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
     cp /tmp/latency-patches/kanban_wake_guard.py /opt/hermes/tools/kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_guard.py /opt/hermes && \

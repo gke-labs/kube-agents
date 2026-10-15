@@ -1035,3 +1035,9 @@
 # lock. Counted from the lists: seventy-eight cases (234 units) here, of a
 # ninety-two-case, 276-unit matrix with the presubmit file's fourteen.
 ./tasks/not-found-target-stops-as-failure/task.yaml
+
+# gke-alert-configuration skill probe: a Terraform memory-saturation alert
+# for a GKE workload uses condition_prometheus_query_language, the cAdvisor
+# memory limit and the skill's created-with-google-skill label. deployer:
+# noop, transcript-only, one delegation round trip.
+./tasks/alert-config-terraform-promql-probe/task.yaml

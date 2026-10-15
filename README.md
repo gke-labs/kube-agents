@@ -134,7 +134,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Security and compliance | `gke-backup-dr`, `gke-platform-security`, `gke-workload-identity` |
 | Networking and storage | `gcp-networking-fabric-audit`, `gke-networking`, `gke-service-networking`, `gke-storage` |
 | AI and inference | `gke-ai-troubleshooting-handle-disruption-gpu-tpu`, `gke-ai-troubleshooting-jobset-interruption`, `gke-ai-troubleshooting-tpu-vbar-oom`, `gke-golden-path`, `gke-inference`, `gke-tpu-dynamic-slices-monitoring`, `gke-tpu-metrics-monitoring` |
-| Observability | `gke-basics`, `gke-observability`, `kube-agents-observability` |
+| Observability | `gke-alert-configuration`, `gke-basics`, `gke-observability`, `kube-agents-observability` |
 | Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades` |
 | Manifests and remediation | `gcp-config-connector`, `gke-manifest-generation`, `submit-suggestion` |
 | Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `pr-conversation`, `version-control` |
