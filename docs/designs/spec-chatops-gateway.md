@@ -181,7 +181,8 @@ during a `working` task is a steer, per the 8/24 decision above.
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
-edits), the status card, the steer acknowledgement, the release line for a task that
+edits; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
+Agent Sessions, where a submission that never reached the bus is posted instead), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
 below), the notice the reap scan posts once when that grace passes with no turn to
 carry the release line, and failure notices (a submission or steer that never reached the bus). All
@@ -1741,8 +1742,8 @@ The Slack adapter lays a chat message out as Block Kit, in the spec's fixed orde
 notification and a thread read-back carry it): the headline bold with the note after it on the
 same line, as one `rich_text` block; the detail under it; the rows between two dividers, each led
 by its severity as inline code; the `after` lines; the fold as a collapsible `container`,
-collapsed (a fold with neither text nor a table is omitted), its text as escaped mrkdwn sections
-sent `verbatim`, cut smaller where escaping would take one past Slack's cap, and its table as a native `table`
+collapsed (a fold with neither text nor a table is omitted), its text as `rich_text` blocks of
+at most 2,500 characters each, cut between elements (a long fenced block between its lines), and its table as a native `table`
 block whose first row is the column names; then the buttons, choices before links, five to an
 `actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
@@ -1752,13 +1753,18 @@ step of an `in_progress` row `◌`. A `tone` colours a side bar (green `#2EB67D`
 red `#E01E5A`) holding every block under the headline. Slack refuses a `container` inside the
 attachment a side bar is, and an attachment draws after every top-level block, so a message with
 a fold keeps the fold and everything above it top-level and the bar holds only the buttons; with
-no buttons it has no bar, and its tone shows nowhere (the text states the fact either way). Markdown in the detail, rows and `after`
-keeps code spans, bold, italic, strike and links whose url passes the links rule, the label check
-included; anything else shows as written. Every field but the fold's text goes out as
-`rich_text` or `plain_text`, which Slack shows as written, so a `<!here>` in one is inert text;
-the fold's mrkdwn is escaped, and a bare broadcast word in it (`@here`), which escaping cannot
-reach, makes the message one the adapter will not send (`blocksMention`, the notify route's
-check). The blocks go on the wire as the renderer wrote them, not through slack-go's types.
+no buttons it has no bar, and its tone shows nowhere (the text states the fact either way). Markdown
+in the detail and the fold's text is drawn as rich text (`slackRichDocument`): a heading as a bold
+line, a fenced block as `rich_text_preformatted` (one inside a list item loses the item's indent),
+bullet and numbered lists as `rich_text_list` with their nesting as its `indent` and a numbered
+list's first number as its `offset`, a quote as `rich_text_quote`, a table as a preformatted block
+with its columns lined up, a rule dropped, and paragraphs a blank line apart. Inline, it and the
+rows and `after` keep code spans, bold, italic, strike and links whose url passes the links rule,
+the label check included; anything else shows as written. Every field goes out as `rich_text` or
+`plain_text`, which Slack shows as written, so a `<!here>` or a bare `@here` in one is inert text;
+`refuseSlackChat` still refuses a layout carrying a mention in a mrkdwn text object
+(`blocksMention`, the notify route's check), which the renderer no longer writes. The blocks go on
+the wire as the renderer wrote them, not through slack-go's types.
 The live message shows the newest progress chat message under every display mode, and keeps it
 when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress

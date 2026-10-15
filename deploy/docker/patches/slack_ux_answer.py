@@ -25,15 +25,20 @@ The first sentence is ``slack_presenter.split_lead``'s, the sentence
 ``slack_presenter.split_answer`` takes its headline from. A bold headline is
 plain text with its code spans kept as code, so an answer it cannot carry whole
 keeps the upstream post: one whose first line is a heading, a list item, a
-code fence, a quote or a table row, one opening on a bold label, or whose first sentence is longer than ``HEADLINE_MAX``, runs onto
-a second line, or holds a link or a mention. So does one with nothing after
+code fence, a quote or a table row, one opening on a bold label, or whose first sentence is longer than ``HEADLINE_MAX``
+with no clause to cut it at (``slack_presenter.clause_cut``; with one, the headline is the sentence up to the cut and the rest
+of it leads the fold), runs onto a second line, or holds a link or a mention. So does one with nothing after
 that sentence, one whose first line ends in a colon (what it introduces is the
 answer), one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
 :data:`FOLD_CHILD_TYPES` (a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
 logs why; a failed post falls back to the upstream send. A closing question posts after
-the fold, unfolded, so an offer is never hidden. The folded post
+the fold, unfolded, so an offer is never hidden. An answer that ends by asking which of
+two to five options to take (``slack_moments.answer_choices``, the rule next's emitter
+applies too) keeps its opening paragraph and the options' shown lines above the fold, the
+question below it, and the options as choice buttons (``kage_answer.choice.<n>``, value
+the label), which ``slack_ux_clicks`` answers as the clicker's reply. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on

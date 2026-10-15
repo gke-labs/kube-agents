@@ -24,6 +24,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   side bar (:data:`NEEDS_YOU_SIDE_BAR`), which stays once it is settled while
   anything is left below the headline.
 
+A finished answer that ends by asking which of its options to take gets the same
+option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` under today
+and ``chat_message.answer_message`` under next.
+
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
 into the headline and the attachment that carries the bar when it is posted.
 """
