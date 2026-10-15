@@ -23,8 +23,8 @@ refused form therefore fails every time an agent copies it, and nothing short
 of a live run would say so.
 
 This reads every ``bash``, ``sh``, ``shell`` and ``zsh`` fenced block in each
-``SKILL.md`` under the skill trees named on the command line and in its
-``references/*.md``, replaces each
+``SKILL.md`` under the skill trees named on the command line, and in that
+skill's ``references/*.md``, replaces each
 ``<placeholder>`` with its bare name, and passes the block whole to Hermes' own
 ``tools.tirith_security.check_command_security``, the call the approval gate
 makes on a terminal command of any length. The block is not split into
