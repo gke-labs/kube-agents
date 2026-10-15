@@ -565,8 +565,9 @@ class StateLockTest(unittest.TestCase):
     def state_lock(self, case: str) -> str:
         return shell_answer("unit_state_lock", f"unit_state_lock {case}").stdout.strip()
 
-    def test_only_oobe_first_run_audits_is_exempt(self):
+    def test_only_the_oobe_audit_chain_cases_are_exempt(self):
         self.assertTrue(self.exempt("oobe-first-run-audits"))
+        self.assertTrue(self.exempt("oobe-late-first-message"))
         for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe"):
             with self.subTest(case=case):
                 self.assertFalse(self.exempt(case))
@@ -595,13 +596,14 @@ class StateLockTest(unittest.TestCase):
                 rewriters.append(case)
         self.assertIn("oobe-first-run-audits", rewriters)
         self.assertIn("bootstrap-discovery-fanout", rewriters)
+        self.assertIn("oobe-late-first-message", rewriters)
         for case in rewriters:
             with self.subTest(case=case):
                 self.assertEqual(self.state_lock(case), "onboarding")
         self.assertEqual(self.state_lock("capacity-pinned-pool-probe"), "")
 
     def test_an_exempt_stack_reaches_its_cluster_through_its_own_kubeconfig(self):
-        for case in ("oobe-first-run-audits",):
+        for case in ("oobe-first-run-audits", "oobe-late-first-message"):
             with self.subTest(case=case):
                 self.assertTrue(self.exempt(case))
                 main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
@@ -705,13 +707,13 @@ class StateLockTest(unittest.TestCase):
                 lifted("state_lock_deadline"),
                 lifted_constant("STATE_LOCK_HOLD_SECONDS"),
                 "INFRA_LOCK_DEADLINE=100",
-                "TASK_NAMES=(oobe-first-run-audits bootstrap-discovery-fanout capacity-pinned-pool-probe bootstrap-inventory-ranking-delivery)",
+                "TASK_NAMES=(oobe-first-run-audits bootstrap-discovery-fanout capacity-pinned-pool-probe bootstrap-inventory-ranking-delivery oobe-late-first-message)",
                 "state_lock_deadline onboarding",
                 "state_lock_deadline none",
             ]
         )
         hold = int(lifted_constant("STATE_LOCK_HOLD_SECONDS").split("=")[1])
-        self.assertEqual(run_bash(body).stdout.split(), [str(3 * (100 + hold)), "0"])
+        self.assertEqual(run_bash(body).stdout.split(), [str(4 * (100 + hold)), "0"])
 
     def test_the_task_lock_waits_out_a_previous_rep_on_the_state_lock(self):
         unit = lifted("run_one_unit")

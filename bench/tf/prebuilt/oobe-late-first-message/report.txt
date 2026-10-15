@@ -1,0 +1,4 @@
+# Onboarding report (oobe-late-first-message eval)
+
+This stand-in report takes the place of the ranked onboarding report. The case grades the note
+the delivery adds under it, not this text.

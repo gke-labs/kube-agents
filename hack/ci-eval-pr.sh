@@ -179,9 +179,10 @@ readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
-# applied: oobe-first-run-audits' own_wait plus its chain_wait
-# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
-readonly STATE_LOCK_HOLD_SECONDS=7200
+# applied: oobe-late-first-message's own_wait, audits_wait and delivery_wait
+# (bench/tf/prebuilt/oobe-late-first-message/main.tf), the longest of the cases
+# on one.
+readonly STATE_LOCK_HOLD_SECONDS=9600
 # How long a stack-bearing unit that found its state lock busy waits, with the
 # infra lock given back, before it queues for the infra lock again.
 readonly STATE_LOCK_RETRY_SECONDS=30
@@ -2663,6 +2664,9 @@ unit_cost_hint() {
     # nightly of 2026-10-09; the top of the list, so it launches first in each
     # repetition round.
     oobe-first-run-audits) echo 3000 ;;
+    # The same chain, then the delivery of a report on the late first message
+    # (up to its delivery_wait, 600s). Off the infra lock with it. Unmeasured on CI.
+    oobe-late-first-message) echo 3600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2810,7 +2814,7 @@ unit_delegation_timeout() {
 # stack's cluster_name output cannot move another unit's current-context.
 infra_lock_exempt() { # <task-name>
   case "$1" in
-    oobe-first-run-audits) return 0 ;;
+    oobe-first-run-audits | oobe-late-first-message) return 0 ;;
   esac
   return 1
 }
@@ -2821,7 +2825,7 @@ infra_lock_exempt() { # <task-name>
 # from the others, so this lock does.
 unit_state_lock() { # <task-name>
   case "$1" in
-    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
+    oobe-first-run-audits | oobe-late-first-message | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
   esac
 }
 TASK_NAMES=()
