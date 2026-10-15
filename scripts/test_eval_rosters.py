@@ -179,9 +179,20 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    # The upgrade-failure catalogue's scenario cases, entries 1, 3, 5, 12 and
+    # 20: the first batch of five of the seventeen. The other twelve wait in
+    # KNOWN_UNREGISTERED (scripts/validate_bench_cases.py) for their batch,
+    # five at a time, as the nightly's main part has room; each batch's pull
+    # request moves its five here.
+    "upgrades-drain-blocking-budget-named",
+    "upgrades-zonal-skew-replicas-warned",
+    "upgrades-exclusion-end-date-named",
+    "upgrades-deprecated-node-label-selector-named",
+    "upgrades-retired-registry-image-named",
 ]
 # Taken back out of the nightly file after registering there, each with a
-# KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
+# KNOWN_UNREGISTERED or FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# that says why.
 PARKED_AFTER_THE_MOVE = [
     "oobe-first-run-audits",  # 2026-10-09: truncated the main nightly, graded blocked
 ]
