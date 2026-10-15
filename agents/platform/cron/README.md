@@ -271,10 +271,10 @@ tick is announced once, not daily: the ledger keeps what was announced (the
 kinds of read error for a partial table; each project and how it went
 ungraded for a version, never the error text, which an outage rewords from
 one run to the next), a
-failed tick (which writes nothing to the ledger but the projects its table
-refused as outside the declared scope, so the next tick files them under the
-same cause) keeps its line in `last-failure.txt` beside it, and the next line
-is the recovery. A version
+failed tick (which writes nothing to the ledger but its record of the projects
+the hops refused as outside the declared scope, kept at whichever step the tick
+failed, so the next tick files them under the same cause) keeps its line in
+`last-failure.txt` beside it, and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
 project one readiness sweep a week rather than one a day; a `blocked` verdict

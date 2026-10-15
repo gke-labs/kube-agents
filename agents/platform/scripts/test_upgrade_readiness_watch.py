@@ -1681,6 +1681,56 @@ class DeclaredScope(Base):
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertNotIn("the declaration is not fully resolved", out)
 
+    def test_a_tick_that_fails_after_the_table_keeps_the_standing_outside_record(self) -> None:
+        """The table files p2 as outside and reads p1, whose pending cluster
+        is due, so the readiness hop runs; then the tick fails: the hop's
+        sandbox call raises, or the report cannot be written. Nothing of the
+        tick's own reaches the ledger, and the record its table filed is kept
+        all the same (the round-9 wrapper covered the table's failure alone),
+        so the folder lookup failing on the next tick posts the partial line
+        once, with the declaration remedy, the announcement having been lost
+        with the ledger, and the lookup resolving after that posts nothing;
+        without the record the line would carry the lookup's remedy and then
+        the declaration's. A dry run that fails after the table writes
+        nothing."""
+        versions = envelope([member("a", "lagging")])
+        readiness = envelope([member("a", "lagging", readiness="ready")])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        failed = dict(resolved, outcome="unreachable")
+        held = (
+            "p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; "
+            "the remedy is on the install, not this job: name the project in spec.scope"
+        )
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[resolved])
+            with mock.patch.object(watch, "decide", side_effect=RuntimeError("boom")):
+                code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}), ["--dry-run"])
+            self.assertEqual((code, out.strip()), (0, "upgrade readiness watch: the tick failed: RuntimeError: boom"))
+            self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists(), "a dry run changes nothing")
+            for failure in ("the readiness hop raised", "the report could not be written"):
+                with self.subTest(failure):
+                    (self.home / watch.LEDGER_FILE_NAME).unlink(missing_ok=True)
+                    self.marker().unlink(missing_ok=True)
+                    self.declare_scope(["p1"], containers=[resolved])
+                    if failure == "the readiness hop raised":
+                        code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}, readiness_error=OSError("sandbox: cannot fork")))
+                        self.assertEqual((code, out.strip()), (0, "upgrade readiness watch: the tick failed: OSError: sandbox: cannot fork"))
+                    else:
+                        with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")):
+                            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+                        self.assertEqual((code, out.strip()), (watch.WRITE_FAILED_EXIT, "upgrade readiness watch: writing the ledger or the report failed: disk full"))
+                    self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
+                    self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["announced"]), (None, {}, {}), "nothing else of the failed tick is written")
+                    self.declare_scope(["p1"], containers=[failed])
+                    code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+                    self.assertEqual(code, 0)
+                    self.assertIn(held, out)
+                    self.assertNotIn("the declaration is not fully resolved", out)
+                    self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
+                    self.declare_scope(["p1"], containers=[resolved])
+                    code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+                    self.assertEqual((code, out.strip()), (0, ""))
+
     def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_and_cause_it_has(self) -> None:
         label = "(declared scope: fleet_scope): "
         roster = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
@@ -1791,13 +1841,8 @@ class DeclaredScope(Base):
         detail, _ = watch.refusal_detail(label + outside.format(project="p2", projects="p1"), scope_targets("p1", excluded=("legacy-*",)))
         self.assertTrue(detail.endswith(f"not this job: name the project in spec.scope, {roster}"), detail)
         # A project the declaration dropped has a retiring row until the prune: the reconcile has judged it, so the
-        # cause is its own whatever the scope's state and whether an exclude entry took it out, and the remedy is
-        # nothing to do, never the declaration or the roster.
-        for scope in (
-            scope_targets("p1", retiring=("p2",)),
-            scope_targets("p1", unread=(("declared-scope", "unresolved"),), retiring=("p2",)),
-            scope_targets("p1", excluded=("p2",), retiring=("p2",)),
-        ):
+        # cause is its own whatever the scope's state, and the remedy is nothing to do, never the declaration or the roster.
+        for scope in (scope_targets("p1", retiring=("p2",)), scope_targets("p1", unread=(("declared-scope", "unresolved"),), retiring=("p2",))):
             self.assertEqual(
                 watch.refusal_detail(label + outside.format(project="p2", projects="p1"), scope, outside_stands=True),
                 (
@@ -1807,7 +1852,24 @@ class DeclaredScope(Base):
                     "retiring from the declaration",
                 ),
             )
-        self.assertNotIn(roster, watch.REMEDY_RETIRING)
+        # An exclude entry that matches a retiring project is the detail the undo names: the reconcile drops an explicit
+        # project the entry matches and marks its row retiring as it does a removal, so the project may still be under
+        # spec.scope and "put it back" would undo nothing. The cause stays the reconcile's verdict, under a resolved and
+        # a carried scope alike, and the roster is still not named.
+        for scope in (scope_targets("p1", excluded=("p2",), retiring=("p2",)), scope_targets("p1", unread=(("declared-scope", "unresolved"),), excluded=("p*",), retiring=("p2",))):
+            self.assertEqual(
+                watch.refusal_detail(label + outside.format(project="p2", projects="p1"), scope),
+                (
+                    "refused by the report script: the install's declared scope no longer lists p2, and a spec.scope.exclude.projects entry matches it; "
+                    "the reconcile has it retiring; nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile "
+                    "on its next clean run; if the entry was a mistake, drop it, name the project in spec.scope if nothing there holds it, and the next "
+                    "reconcile run that resolves the project puts it back in the sweep",
+                    "retiring from the declaration",
+                ),
+            )
+        for remedy in (watch.REMEDY_RETIRING, watch.REMEDY_RETIRING_EXCLUDED):
+            self.assertNotIn(roster, remedy)
+        self.assertNotIn("put the project back under spec.scope", watch.REMEDY_RETIRING_EXCLUDED)
         # A remedy's closing clause is a promise the signature keeps: a refusal posts once per cause, so neither
         # unread remedy says the line returns while the same outcome stands.
         for remedy in (watch.REMEDY_UNRESOLVED, watch.REMEDY_LISTING_UNFINISHED):
@@ -1933,6 +1995,43 @@ class DeclaredScope(Base):
                 out,
             )
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
+
+    def test_a_retiring_project_an_exclude_entry_matches_is_told_to_drop_the_entry_not_to_declare_it_again(self) -> None:
+        """The operator adds p2 to spec.scope.exclude.projects and leaves it
+        under spec.scope.projects: the reconcile drops it on the explicit
+        route and marks its row retiring on its first clean run, as it does a
+        removal. The project is still under spec.scope, so "put it back under
+        spec.scope" undoes nothing; on both hops the line names the entry as
+        the undo and the declaration after it, under the retiring cause, and
+        the entry dropped reads the project again."""
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        versions = envelope([member("a", "current")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], exclude=["p2"], retiring=["p2"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn(
+                "p2: version table for p2 refused by the report script: the install's declared scope no longer lists p2, and a spec.scope.exclude.projects "
+                "entry matches it; the reconcile has it retiring; nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent "
+                "profile on its next clean run; if the entry was a mistake, drop it, name the project in spec.scope if nothing there holds it, and the next "
+                "reconcile run that resolves the project puts it back in the sweep",
+                out,
+            )
+            self.assertIn(
+                "none graded (readiness run for p2 refused by the report script: the install's declared scope no longer lists p2, and a "
+                "spec.scope.exclude.projects entry matches it; the reconcile has it retiring; nothing to do",
+                out,
+            )
+            self.assertNotIn("put the project back under spec.scope", out)
+            self.assertNotIn("the remedy is on the install", out)
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: retiring from the declaration"])
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: retiring from the declaration"]])
+            self.assertEqual(self.ledger()["standing_outside"], {})
+            # The entry dropped: the reconcile resolves p2 again and the table reads it.
+            self.declare_scope(["p1", "p2"])
+            code, out = self.run_tick(FakeSandbox(versions))
+            self.assertEqual(code, 0)
+            self.assertIn("the version table reads every project again", out)
 
     def test_a_second_refused_project_is_announced_while_the_first_stands(self) -> None:
         versions = envelope([member("a", "current")])
