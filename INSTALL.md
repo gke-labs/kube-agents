@@ -1149,10 +1149,12 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
   env HERMES_HOME=/opt/data/profiles/platform hermes cron list
 ```
 
-Each audit's report is a ledger issue in the GitOps repository, so the audits need a GitOps
-repository, on GitHub or on GitLab: with none configured, every run fails before it audits
-anything. A
-run that changed something since the last one also posts a one-line summary linking the issue to
+Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
+there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
+registered (none at all, rather than one the install cannot use), the audits still run: each keeps
+its findings in the report store on the agent's volume, and a run that changed something posts a
+summary to chat that says no forge is configured. With a repository, a
+run that changed something since the last one posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
 `GOOGLE_CHAT_HOME_CHANNEL` from the install), and an audit can open remediation pull requests in the

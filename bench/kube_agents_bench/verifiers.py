@@ -58,12 +58,14 @@ import http.client
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -139,6 +141,11 @@ _NO_WORKER_CALLS_REASON = (
     "delegated or the worker-trajectory capture did not run, so a check scoped to "
     "the workers cannot observe its subject"
 )
+# The fleet-audit report store (agents/platform/skills/fleet-audit/scripts/
+# audit_report.py, REPORTS_DIR), on whichever pod ran the audit's shell, and the
+# marker the store read prints its listing after.
+REPORT_STORE_ROOT = "/opt/data/fleet-audit/reports"
+_REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
@@ -1160,6 +1167,24 @@ LEDGER_AUDIT_IDS = frozenset(
     }
 )
 
+# The same ids as a type, for a check's `audit` field: a typo fails at
+# spec-load time rather than as an unfindable ledger or store at run time.
+AuditId = Literal[
+    "ai-security-audit",
+    "compliance-audit",
+    "fleet-consistency-drift",
+    "fleet-wide-cost-analysis",
+    "gce-compute-fleet-audit",
+    "gcp-networking-fabric-audit",
+    "obtainability-audit",
+    "security-patch-orchestrator",
+    "stockout-prevention",
+]
+
+# Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
+# a typo fails at spec-load time, as `AuditId` does for the stream.
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
+
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
@@ -2083,17 +2108,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     type: Literal["ledger_issue_contains"]
     # Which stream's ledger. Validated against the registered ids so a typo
     # fails at spec-load time rather than as an unfindable ledger at run time.
-    audit: Literal[
-        "ai-security-audit",
-        "compliance-audit",
-        "fleet-consistency-drift",
-        "fleet-wide-cost-analysis",
-        "gce-compute-fleet-audit",
-        "gcp-networking-fabric-audit",
-        "obtainability-audit",
-        "security-patch-orchestrator",
-        "stockout-prevention",
-    ]
+    audit: AuditId
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
@@ -5219,3 +5234,117 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 raw,
             )
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
+
+
+def report_store_command(audit: str) -> str:
+    """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
+
+    One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
+    the envelope's ``status``, ``repo`` and ``finished_at``, and the ids of the
+    findings in its ``document`` (this run's own, never ids it only carried),
+    or the ``error`` that kept it unread. The rest stays in the pod.
+    """
+    script = f"""
+import glob, json, os
+out = []
+for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*", "*", "latest.json"))):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            envelope = json.load(handle)
+        entry = {{key: envelope.get(key) for key in ("status", "repo", "finished_at")}}
+        findings = (envelope.get("document") or {{}}).get("findings") or []
+        entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
+        out.append(entry)
+    except Exception as exc:
+        out.append({{"path": path, "error": str(exc)}})
+print({_REPORT_STORE_READ!r} + json.dumps(out))
+"""
+    return f"python3 -c {shlex.quote(script)}"
+
+
+def read_report_store(
+    shell: Callable[[str, float], str], audit: str, timeout: float
+) -> list[dict[str, Any]] | None:
+    """The store listing ``report_store_command`` prints, or None when the pod gave none."""
+    reply = shell(report_store_command(audit), timeout)
+    marker = reply.find(_REPORT_STORE_READ)
+    if marker < 0:
+        return None
+    try:
+        listing = json.loads(reply[marker + len(_REPORT_STORE_READ):].strip().splitlines()[0])
+    except (IndexError, json.JSONDecodeError):
+        return None
+    return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
+
+
+@VERIFIERS.register("audit_report_stored")
+class AuditReportStoredVerifier(_OnboardingPollVerifier):
+    """Checks that a fleet audit kept this run's report in the on-pod report store.
+
+    Reads ``latest.json`` under every repository directory of ``audit`` in the
+    store, in the shell sandbox first and then in the agent container: the
+    store is on whichever pod ran the audit's shell. Passes when one envelope
+    finished at or after the run started (``TranscriptSnapshot.started_at``
+    less ``max_clock_skew_sec``), has ``status`` when the check names one, and
+    has, for each ``required_finding_phrases`` entry, a finding in its
+    ``document`` whose id contains it. ``current_ids`` is not read: it also
+    carries ids a run held without finding them.
+
+    No envelope from this run is a fail: the audit published nothing where the
+    store's readers look. A pod that cannot be read, or a run with no start
+    time, is ``status="error"``.
+    """
+
+    type: Literal["audit_report_stored"]
+    audit: AuditId
+    status: AuditStatus | None = None
+    required_finding_phrases: list[str] = Field(default_factory=list)
+    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
+    # the agent pod are two clocks.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        snap = transcript.get()
+        if snap is None:
+            return "error", _NO_TRANSCRIPT_REASON, None
+        if not snap.started_at:
+            return "error", _NO_RUN_CLOCK_REASON, None
+        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
+            seconds=self.max_clock_skew_sec
+        )
+        envelopes: list[dict[str, Any]] = []
+        read_any = False
+        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
+            listing = read_report_store(shell, self.audit, read_timeout)
+            if listing is not None:
+                read_any = True
+                envelopes.extend(listing)
+        if not read_any:
+            return "error", "neither the sandbox nor the agent container could be read", None
+        fresh = []
+        for envelope in envelopes:
+            try:
+                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
+            except ValueError:
+                continue
+            if finished.tzinfo is not None and finished >= since:
+                fresh.append(envelope)
+        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at")} for e in envelopes]}
+        if not fresh:
+            return (
+                "fail",
+                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since the run started "
+                f"({len(envelopes)} older or unreadable)",
+                raw,
+            )
+        failures = []
+        for envelope in fresh:
+            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
+            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            if self.status is not None and envelope.get("status") != self.status:
+                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif missing:
+                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            else:
+                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
+        return "fail", "; ".join(failures), raw

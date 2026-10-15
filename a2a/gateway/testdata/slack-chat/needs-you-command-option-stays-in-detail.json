@@ -1,0 +1,47 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Should I go on with the drain?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "- continue\n- stop",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

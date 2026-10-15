@@ -926,6 +926,59 @@ FAILURE_LINES = {
 }
 
 
+class _MetadataAdapter(_Adapter):
+    """An adapter that records the metadata each post went out with."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.metadata = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.metadata.append(metadata)
+        return await super().send(chat_id, content, metadata)
+
+
+class _ChatNotifyStandIn(_MetadataAdapter):
+    """The chat.notify stand-in as kanban_progress_lines sees it: it has ``send_chat``."""
+
+    async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+        raise AssertionError("the terminal report goes through send, with the chat message in its metadata")
+
+
+class ChatNotifyAnswerTest(SlackQuietTerminalTest):
+    """Under next, a completed card's report through the chat.notify stand-in is laid out as an answer."""
+
+    def setUp(self):
+        super().setUp()
+        notify = SimpleNamespace(
+            chat_route=lambda adapter: callable(getattr(adapter, "send_chat", None)),
+            CHAT_METADATA_KEY="kage_chat",
+        )
+        gateway = sys.modules["gateway"]
+        gateway.kanban_chat_notify = notify
+        patcher = mock.patch.dict(sys.modules, {"gateway.kanban_chat_notify": notify})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_the_report_carries_its_answer(self):
+        adapter = _ChatNotifyStandIn()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.sent[-1][1], "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"],
+                         {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
+
+    async def test_an_actionable_report_and_a_failure_post_their_text_alone(self):
+        adapter = _ChatNotifyStandIn()
+        with mock.patch.object(kanban_notifier, "actionable_report", return_value=True):
+            await self._run(adapter, SLACK_SUB, "completed", "Down. Reply apply.")
+        self.assertNotIn("kage_chat", adapter.metadata[-1] or {})
+
+    async def test_todays_adapter_gets_the_metadata_it_always_got(self):
+        adapter = _MetadataAdapter()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertIsNone(adapter.metadata[-1])
+
+
 class SlackHeadsTest(unittest.IsolatedAsyncioTestCase):
     """KAGE_SLACK_UX on a Slack card: no line carries the board tag or ``Kanban <id>``.
 

@@ -293,6 +293,37 @@ def test_load_run_returns_none_for_missing_and_absent(tmp_path):
     assert load_run(tmp_path / "never-written") is None
 
 
+def test_load_run_reads_the_opening_turn_seconds_from_timing_json(make_run):
+    run = make_run()
+    assert load_run(run).turn1_s is None
+    (run / "timing.json").write_text('{"turn1_s": 4.25}', encoding="utf-8")
+    assert load_run(run).turn1_s == 4.25
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['{"turn1_s": 0}', '{"turn1_s": -1.5}', '{"turn1_s": "4.2"}', '{"turn1_s": true}',
+     '{"turn1_s": null}', '{"turn1_s": NaN}', '{"turn1_s": Infinity}', "{}", "[4.2]", "not json",
+     '{"turn1_s": 1' + "0" * 400 + "}"],
+    ids=["zero", "negative", "string", "bool", "null", "nan", "inf", "no-key", "list", "broken",
+         "int-too-large-for-a-float"],
+)
+def test_load_run_rejects_a_timing_that_is_not_a_finite_positive_number(make_run, body):
+    run = make_run()
+    (run / "timing.json").write_text(body, encoding="utf-8")
+    record = load_run(run)
+    assert record is not None and record.turn1_s is None
+
+
+def test_the_repetition_and_the_case_json_carry_the_opening_turn_seconds(noop_spec, make_run):
+    timed = make_run()
+    (timed / "timing.json").write_text('{"turn1_s": 4.25}', encoding="utf-8")
+    assert classify_rep(noop_spec, timed, 1).turn1_s == 4.25
+
+    reps = grade_case(noop_spec, [timed, make_run()], admitted=True).to_dict()["reps"]
+    assert [r["turn1_s"] for r in reps] == [4.25, None]
+
+
 def test_the_empty_list_record_is_flagged(tmp_path):
     from conftest import read_fixture, write_run
 

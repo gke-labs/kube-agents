@@ -55,6 +55,13 @@ A reply that arrives as edits to a streamed message, rather than through
 ``send_final_ledgered``, is drawn as upstream draws it, and its claim is
 dropped as an unsent one is.
 
+Under ``spec.mode: next`` a wake's reply in an alert's thread is sent by the
+kanban notifier's chat.notify stand-in (``kanban_chat_notify``), which has no
+blocks to hand :func:`maybe_blocks`. It asks :func:`chat_for` instead, under
+the same mark: the reply's first sentence as the headline, the rest as the
+detail, and Try again as a choice when :func:`present` finds the offer
+(``agents/platform/scripts/chat_message.py``).
+
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
 """
@@ -75,6 +82,10 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
 
 SLACK_PLATFORM = "slack"
 
@@ -412,6 +423,23 @@ def _continues(line: str) -> bool:
     return bool(line.strip()) and not (
         _presenter.LIST_MARKER.match(line) or _presenter.HEADING.match(line) or _presenter._opens_fence(line)
     )
+
+
+def chat_for(content: str) -> Optional[dict]:
+    """The ``kube-agents.chat/v1`` layout of a marked failure reply, or None for any other.
+
+    :func:`maybe_blocks` for the chat.notify stand-in: the offer only in a thread,
+    since a click answers in the thread it was clicked in.
+    """
+    thread = _marked.get()
+    if thread is None or _chat is None:
+        return None
+    try:
+        _bolded, offer = present(content)
+        return _chat.failure_message(content, bool(offer and thread))
+    except Exception:
+        logger.warning("slack_ux_failure: laying out the failure reply failed", exc_info=True)
+        return None
 
 
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
