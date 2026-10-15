@@ -35,8 +35,10 @@ cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
 With the flag on, a Slack origin and the credential proxy's Slack relay in the
 environment, the report goes out as Block Kit instead (a headline with the
-total, the top rows, and "Fix the first one" and "See all N" buttons), posted here
-through ``slack_blocks_post`` because the scheduler's delivery takes text only.
+total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
+buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
+takes text only. Under ``spec.mode: next`` the same card goes through the A2A
+gateway as a chat message instead (``_posted_through_gateway``).
 Then nothing is printed; any failure prints the text. A failure after the request was
 sent may have posted, so that path can send the report twice; see
 ``_posted_as_blocks``.

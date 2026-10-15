@@ -3297,7 +3297,14 @@ def relay_cron_report(
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            leg_message = truncation_notice + headline.text if headline else failed or message
+            # Under next a reply cannot bring the report back, so a failed audit
+            # whose folded card did not post goes out whole.
+            if headline:
+                leg_message = truncation_notice + headline.text
+            elif failed and not chat_notify.routes(platform):
+                leg_message = failed
+            else:
+                leg_message = message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
             if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Posted (or may have): delivered, with no thread to register.

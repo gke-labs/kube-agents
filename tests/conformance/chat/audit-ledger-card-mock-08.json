@@ -7,9 +7,7 @@
       "title": "[audit] Security & RBAC Posture Audit — 7 findings (2 critical)",
       "body": "7 findings: 2 critical, 1 major, 4 minor.\n\n### Critical (2)\n\n#### seeded-b and -c admit privileged pods <!-- finding:rbac-1 -->\n\n<!-- finding-new -->\n\n- **Where:** `seeded-a`\n#### default service account is cluster-admin on seeded-c <!-- finding:rbac-2 -->\n\n- **Where:** `seeded-a`\n\n### Major (1)\n\n#### seeded-a: Workload Identity is off on one node pool <!-- finding:wi-1 -->\n\n- **Where:** `seeded-a`\n\n### Minor (4)\n\n#### seeded-a: a namespace has no NetworkPolicy <!-- finding:np-1 -->\n\n- **Where:** `seeded-a`\n",
       "state": "open",
-      "labels": [
-        "agent:audit"
-      ]
+      "labels": ["agent:audit"]
     },
     "relayed": "Security & RBAC posture audit: 2 new, 1 resolved across 3 clusters — https://github.com/acme/fleet-config/issues/231"
   },
@@ -29,9 +27,7 @@
             "severity": "critical"
           }
         ],
-        "after": [
-          "5 more (1 major, 4 minor) are in the ledger issue."
-        ],
+        "after": ["5 more (1 major, 4 minor) are in the ledger issue."],
         "choices": [
           {
             "text": "Look at the first one",

@@ -123,9 +123,11 @@ A fleet-audit report that ends with no ledger link and opens a "What's wrong" se
 (the Platform Agent's three sections, as a `##` heading or a bold label) is a run that
 could not write its ledger, most often because no GitOps repository is registered. With
 the flag on, its Slack leg posts that section's first sentence alone, as the agent wrote
-it (`slack_audit_report.failed_line`), under either `spec.mode`; the incident row still
-stores the whole report for a reply in the thread. A truncated report, or one with no
-such section, posts unchanged.
+it (`slack_audit_report.failed_line`), and the incident row still stores the whole report
+for a reply in the thread. Under `spec.mode: next`, where a reply does not bring the
+report back, the line goes to the gateway as a chat message with the whole report folded
+under it (`slack_audit_report.failed_chat`), and the leg posts the report whole when that
+message did not post. A truncated report, or one with no such section, posts unchanged.
 
 Every other report (Google Chat, one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack

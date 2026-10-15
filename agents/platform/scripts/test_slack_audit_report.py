@@ -1057,7 +1057,7 @@ WALL_HEADING = (
     "Here is the latest scheduled GCP networking fabric and VPC IPAM audit report from the platform agent.\n\n"
     "## What's wrong\n"
     "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project "
-    "`jayantid-gkedemos-3`, but could not publish its findings because no GitOps repository is registered in "
+    "`my-project`, but could not publish its findings because no GitOps repository is registered in "
     "the `platform-agent-gitops-state` ConfigMap.\n\n"
     "## Why\n- **FirewallRule/default-allow-rdp** — `sourceRanges 0.0.0.0/0` allows `tcp:3389`.\n\n"
     "## What to do\n- **Register a GitOps repository** — add one to the ConfigMap.\n"
@@ -1081,7 +1081,7 @@ class FailedLineTest(unittest.TestCase):
         cases = {
             WALL_HEADING: (
                 "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in "
-                "project `jayantid-gkedemos-3`, but could not publish its findings because no GitOps repository "
+                "project `my-project`, but could not publish its findings because no GitOps repository "
                 "is registered in the `platform-agent-gitops-state` ConfigMap."
             ),
             WALL_LABEL: "The daily workload reliability audit could not run because no GitOps repository is registered.",

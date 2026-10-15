@@ -635,7 +635,7 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 }
 
 // postHomeChat answers a home-channel request that carries a chat message
-// (a scheduled report's card, posted by the cron relay) when the backend lays
+// (the cron relay's fleet-audit card, the first inventory's) when the backend lays
 // one out, and reports whether it did. The chat message is read and validated
 // as a conversation request's is; one that breaks a rule is dropped whole,
 // logged and counted, and so is one the backend refuses, and post then sends

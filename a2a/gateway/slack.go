@@ -500,8 +500,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// interactivity on and these envelopes do arrive: clicks on
 				// messages posted under today, and on the buttons a chat
 				// message's layout carries (renderSlackChat), which nothing
-				// answers yet. The notify route's raw blocks still carry none
-				// (the agent sends the audit card with its buttons removed).
+				// answers yet, the home-channel cards the notify route lays out
+				// (the fleet audit's, the first inventory's) among them. The
+				// route's raw blocks still carry none.
 				// Answering interactions means acking them here first: Slack
 				// wants the envelope acked inside three seconds, and an
 				// unacked one redelivers and shows the user a timeout.

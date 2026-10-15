@@ -3665,12 +3665,13 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(chat["fold"], {"title": "why", "text": self.FAILED.strip()})
         self.assertEqual(text, self.FAILED.strip())
 
-    def test_under_next_a_failed_audit_the_gateway_did_not_lay_out_posts_its_line(self):
+    def test_under_next_a_failed_audit_whose_card_did_not_post_goes_out_whole(self):
+        # A reply cannot bring the report back under next, so the line alone would lose it.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
         with patch.object(session_kv_server, "_post_audit_chat_via_gateway", return_value=None):
             _, calls = self._post(composed=self.FAILED, job_id="reliability")
-        self.assertEqual([c.args for c in calls], [("slack", self.FAILED_LINE, "", "")])
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
 
     def test_flag_off_a_failed_audit_posts_the_report(self):
         os.environ["KAGE_SLACK_UX"] = "false"
