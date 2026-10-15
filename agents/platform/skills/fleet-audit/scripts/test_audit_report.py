@@ -15028,6 +15028,17 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
         self.assertIn("directory mode", str(caught.exception))
 
 
+class TestRefreshCredentialsOnAnotherHost(unittest.TestCase):
+    def test_the_log_does_not_call_a_minted_token_stored(self):
+        # A GitHub Enterprise Server repository's token is minted by the broker.
+        logged = []
+        with patch.object(audit_report, "log", side_effect=logged.append), \
+                patch("github_token_refresh.refresh_git_credentials") as refresh:
+            audit_report.refresh_credentials("ghe.example.com/acme/infra")
+        refresh.assert_not_called()
+        self.assertEqual(["No credential refresh for ghe.example.com/acme/infra: the broker presents its forge's token itself."], logged)
+
+
 class TestLedgerStoreForNestedPaths(unittest.TestCase):
     def setUp(self):
         # Only the path is computed; nothing is created under it.
@@ -15047,6 +15058,15 @@ class TestLedgerStoreForNestedPaths(unittest.TestCase):
             audit_report.reports_dir_for("compliance-audit", "acme/fleet"),
             audit_report.reports_dir_for("compliance-audit", "github.com/Acme/fleet"),
         )
+
+    def test_a_github_enterprise_server_repository_keeps_its_hosts_ledger(self):
+        # Named `<host>/owner/name` by the managed list, its ledger sits below
+        # its host and is never the github.com repository of the same name.
+        ghes = audit_report.reports_dir_for("compliance-audit", "GHE.example.com/Acme/fleet")
+        self.assertEqual(Path(self.root, "compliance-audit", "ghe.example.com", "acme%2Ffleet"), ghes)
+        self.assertNotEqual(audit_report.reports_dir_for("compliance-audit", "acme/fleet"), ghes)
+        self.assertEqual("ghe.example.com/acme/fleet", audit_report._ledger_key("GHE.example.com/Acme/fleet"))
+        self.assertNotEqual(audit_report._ledger_key("acme/fleet"), audit_report._ledger_key("ghe.example.com/acme/fleet"))
 
     def test_a_deep_path_without_a_host_or_with_a_climb_is_refused(self):
         for repo in ("acme/platform/infra", "gitlab.com/acme/../infra", "gitlab.com/acme"):
@@ -24996,6 +25016,28 @@ class TestManifestRemediationLinks(HarnessTestCase):
             )
             self.assertIn("no pull request was opened", out["b"])
             self.assertNotIn("refreshed", out["b"])
+
+
+class ProposalOpenedRecordTest(unittest.TestCase):
+    """The remediation pull request reaches the broker through `vcs_client.call`, which records it."""
+
+    def test_a_remediation_pull_request_is_recorded_on_stderr(self):
+        url = "https://github.com/acme/fleet/pull/31"
+
+        def broker(verb, payload):
+            return {"proposal": {"number": 31, "title": payload["title"], "url": url}}
+
+        stderr = io.StringIO()
+        with patch.object(vcs_client, "_call", broker), patch("sys.stderr", stderr):
+            audit_report.forge(
+                "proposal-create", "acme/fleet",
+                {"source": "platform-agent/audit-1", "target": "main", "title": "audit 1", "body": "b"},
+            )
+        records = [json.loads(line) for line in stderr.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(
+            records,
+            [{"kube-agents.event": "proposal-opened", "proposal": {"url": url, "number": 31, "title": "audit 1"}}],
+        )
 
 
 class TestNoForge(BaseTestCase):

@@ -23,7 +23,10 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   [Prerequisites](/kube-agents/install/prerequisites/#gitops-repo--github-token-minter-for-submit-suggestion)
   and [Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on
   GitLab needs an access token instead, and no GitHub App, minter or KMS key:
-  see [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
+  see [GitLab as the GitOps forge](/kube-agents/install/gitlab/). The installer
+  cannot install a GitOps repository on a GitHub Enterprise Server yet; for one,
+  use the Terraform + Helm method in
+  [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
 </Aside>
 
 ## Run the Zero-Friction One-Liner Installer

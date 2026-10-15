@@ -275,3 +275,84 @@ func TestAForgeCABundleIsMountedIntoTheBrokerOnly(t *testing.T) {
 		}
 	}
 }
+
+// ghesAgent is the broker-pod agent with one GitHub forge at a GitHub
+// Enterprise Server host, behind a private CA.
+func ghesAgent() *agentv1alpha1.PlatformAgent {
+	agent := brokerPodAgent()
+	agent.Spec.Integration.Forges = []agentv1alpha1.ForgeSpec{{
+		Name: "github", Provider: "github", Host: "ghe.example.com", Namespace: "acme",
+		CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "ghe-ca"},
+	}}
+	agent.Spec.Integration.Repositories = []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+	}
+	return agent
+}
+
+// A GitHub Enterprise Server install hands the broker a configuration with
+// the GitHub entry at the declared host, mounts the CA bundle into the broker
+// only, and seeds the GitOps repository by its full URL on that host.
+func TestAGitHubEnterpriseServerForgeReachesTheBroker(t *testing.T) {
+	agent := ghesAgent()
+	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	caFile := forgeCADir + "/github/" + agentv1alpha1.ForgeCABundleFileName
+	want := `{"forges":[{"provider":"github","host":"ghe.example.com","caSecret":"ghe-ca","caKey":"ca.crt","caFile":"` + caFile + `"}]}`
+	if raw != want {
+		t.Errorf("forge configuration =\n %s\nexpected\n %s", raw, want)
+	}
+	dep := buildCredentialProxyDeployment(agent, "hash")
+	container := dep.Spec.Template.Spec.Containers[0]
+	if got, _ := brokerEnvValue(container.Env, vcsForgesEnv); got != vcsForgesMountPath {
+		t.Errorf("%s = %q, expected %s", vcsForgesEnv, got, vcsForgesMountPath)
+	}
+	if mountCovering(&container, caFile) == nil {
+		t.Errorf("%s is supplied by no mount in the broker container", caFile)
+	}
+	gateway := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
+	for _, volume := range gateway.Spec.Volumes {
+		if volume.Secret != nil && volume.Secret.SecretName == "ghe-ca" {
+			t.Errorf("the gateway pod mounts the GitHub Enterprise Server CA as %q", volume.Name)
+		}
+	}
+	stateData := buildGitopsStateConfigMap(agent).Data
+	if want := `[{"type":"github","url":"https://ghe.example.com/acme/infra"}]`; stateData[gitopsStateManagedReposKey] != want {
+		t.Errorf("managed_repos = %s, expected %s", stateData[gitopsStateManagedReposKey], want)
+	}
+	if got := stateData[gitopsStateGitHubHostKey]; got != "ghe.example.com" {
+		t.Errorf("github_host = %q, expected ghe.example.com", got)
+	}
+}
+
+// A github.com install renders the same broker, gateway, policy and state
+// whichever way it spells github.com, and none of them carries a forge
+// configuration: what a github.com install rendered before GitHub Enterprise
+// Server.
+func TestAGitHubDotComInstallRendersTheSameWhateverItsSpelling(t *testing.T) {
+	render := func(host string) []any {
+		agent := brokerPodAgent()
+		agent.Spec.Integration.Forges = []agentv1alpha1.ForgeSpec{{Name: "github", Host: host, Namespace: "acme"}}
+		agent.Spec.Integration.Repositories = []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		}
+		return []any{
+			buildCredentialProxyPolicyConfigMap(agent),
+			buildCredentialProxyDeployment(agent, "hash"),
+			buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{}),
+			buildGitopsStateConfigMap(agent),
+			agentv1alpha1.ForgeEgressPatterns(&agent.Spec.Integration.IntegrationSpec),
+		}
+	}
+	base := render("")
+	if _, found := base[0].(*corev1.ConfigMap).Data[vcsForgesKey]; found {
+		t.Fatal("a github.com install carries a forge configuration")
+	}
+	if _, found := base[3].(*corev1.ConfigMap).Data[gitopsStateGitHubHostKey]; found {
+		t.Fatal("a github.com install carries a github_host key")
+	}
+	for _, host := range []string{"github.com", "WWW.GitHub.com", "ssh.github.com"} {
+		if got := render(host); !reflect.DeepEqual(got, base) {
+			t.Errorf("host %q renders differently from no host", host)
+		}
+	}
+}

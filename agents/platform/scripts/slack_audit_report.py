@@ -56,6 +56,7 @@ its target, and a ``<!channel>``-style token loses its brackets.
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import NamedTuple
 
@@ -89,18 +90,54 @@ LINK_JOIN_BROKEN = "] ("
 
 #: Every count is at most nine digits, so ``int()`` never meets a digit run
 #: past its limit; a longer run matches nothing.
-ISSUE_URL = r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d{1,9})"
+#: The issue URL on github.com, and on the install's GitHub Enterprise Server
+#: host when it has one (``_issue_url``): no other host's link is a ledger.
+ISSUE_URL_TEMPLATE = r"https://(?P<host>{hosts})/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d{{1,9}})"
+ISSUE_URL = ISSUE_URL_TEMPLATE.format(hosts=r"github\.com")
 #: The ledger link: the report's last URL, after the SOPs' dash or a "Ledger:"
 #: label, bare, in angle brackets or as a markdown link; or a markdown link
 #: whose own label names the ledger ("[Ledger issue #231](url)"), with nothing
 #: before it. Labels are bounded, and the pattern only searches the report's
 #: last ``LEDGER_TAIL_MAX`` characters, so a long report cannot make it backtrack.
-TRAILING_LEDGER = re.compile(
+TRAILING_LEDGER_PREFIX = (
     r"(?:(?:[—–]|\s-|\bledger(?:\s+issue)?:?)\s*(?:\[[^\]\n]{0,80}\]\()?|\[(?P<label>[^\]\n]{0,80})\]\()<?"
-    + ISSUE_URL
-    + r">?\)?[\s.]*\Z",
-    re.IGNORECASE,
 )
+TRAILING_LEDGER_SUFFIX = r">?\)?[\s.]*\Z"
+TRAILING_LEDGER = re.compile(TRAILING_LEDGER_PREFIX + ISSUE_URL + TRAILING_LEDGER_SUFFIX, re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=8)
+def _trailing_ledger_re(github_host: str) -> re.Pattern:
+    """``TRAILING_LEDGER`` for an install whose GitHub host is ``github_host``.
+
+    github.com alone when that host is github.com; github.com and the GitHub
+    Enterprise Server host otherwise.
+    """
+    host = github_host.strip().lower()
+    if not host or host == "github.com":
+        return TRAILING_LEDGER
+    hosts = r"github\.com|" + re.escape(host)
+    return re.compile(
+        TRAILING_LEDGER_PREFIX + ISSUE_URL_TEMPLATE.format(hosts=hosts) + TRAILING_LEDGER_SUFFIX,
+        re.IGNORECASE,
+    )
+
+
+def _github_host() -> str:
+    """The install's GitHub host, from the mounted repository lists; github.com without them.
+
+    The one input here that is not the text: a ledger on a GitHub Enterprise
+    Server is an issue URL on that host, and nothing in the report says which
+    host is the install's.
+    """
+    try:
+        from gitops_workspace import github_host
+    except ImportError:
+        return "github.com"
+    try:
+        return github_host()
+    except Exception:  # noqa: BLE001 - github.com, as before
+        return "github.com"
 LEDGER_TAIL_MAX = 512
 #: What a link label alone must say to mark the ledger.
 LEDGER_WORD = re.compile(r"\bledger\b", re.IGNORECASE)
@@ -265,7 +302,8 @@ def _trailing_ledger(text: str) -> tuple[int, re.Match] | None:
     offset = max(len(text.rstrip()) - LEDGER_TAIL_MAX, 0)
     tail = text[offset:]
     at = 0
-    while (match := TRAILING_LEDGER.search(tail, at)) is not None:
+    pattern = _trailing_ledger_re(_github_host())
+    while (match := pattern.search(tail, at)) is not None:
         label = match.group("label")
         if label is None or LEDGER_WORD.search(label):
             return offset + match.start(), match
@@ -277,16 +315,19 @@ def ledger_ref(report: str) -> LedgerRef | None:
     """The ledger issue a report ends with, or None when it does not end with one.
 
     The repository is whatever the report's URL names, so the caller must
-    fetch the issue only from a repository it manages.
+    fetch the issue only from a repository it manages. On github.com it is
+    the bare ``owner/name``; on a GitHub Enterprise Server host it is
+    ``<host>/owner/name``, the name the managed list gives it.
     """
     found = _trailing_ledger(report)
     if found is None:
         return None
     match = found[1]
-    repo, number = match.group("repo"), match.group("number")
+    host, repo, number = match.group("host").lower(), match.group("repo"), match.group("number")
     if any(segment in DOT_SEGMENTS for segment in repo.split("/")):
         return None
-    return LedgerRef(f"https://github.com/{repo}/issues/{number}", repo, int(number))
+    url = f"https://{host}/{repo}/issues/{number}"
+    return LedgerRef(url, repo if host == "github.com" else f"{host}/{repo}", int(number))
 
 
 def _new_count(line: str) -> int:
@@ -698,7 +739,7 @@ def _ledger_line(report: str) -> str:
     if not lines:
         return ""
     end = lines[-1].strip()
-    last = "" if BARE_URL_LINE.match(end) or TRAILING_LEDGER.match(end) else _fallback_line(lines[-1])
+    last = "" if BARE_URL_LINE.match(end) or _trailing_ledger_re(_github_host()).match(end) else _fallback_line(lines[-1])
     if last:
         return last
     counted = [
