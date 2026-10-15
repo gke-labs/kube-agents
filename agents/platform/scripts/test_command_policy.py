@@ -1994,12 +1994,11 @@ class LocalRenderTests(unittest.TestCase):
 
 
 class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
-    """submit-suggestion's "Deleting a resource" (#3077) turns a delete request
-    into a pull request that removes a manifest, and reads the reconcilers to
-    say what merging will do. Its reads must be ones the policy allows, and the
-    direct delete it never offers must be one the policy refuses, or the
-    section would coach the model into a refusal or rest on one that is not
-    there. Its fences sit inside a numbered list, so they are indented.
+    """submit-suggestion's "Deleting a resource" (#3077) answers a delete
+    request with a stated stop. It must run no cluster or cloud command, and
+    the direct delete it rules out must be one the policy refuses, or the
+    section would rest on a refusal that is not there. Its fences sit inside
+    a numbered list, so they are indented.
     """
 
     SKILL = Path(__file__).resolve().parents[1] / "skills" / "submit-suggestion" / "SKILL.md"
@@ -2010,19 +2009,18 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
         start = text.index("### Deleting a resource")
         return text[start:text.index("\n### ", start + 1)]
 
-    def test_every_fenced_kubectl_command_in_the_section_is_allowed(self):
-        commands = []
+    def test_the_section_runs_no_cluster_or_cloud_command(self):
+        # Every case in the section ends in a stated stop: its fences are the
+        # preflight and a search of the working copy, and none runs kubectl
+        # or gcloud, so nothing in it can coach a write the policy refuses.
+        lines = []
         for _, block in self.INDENTED_FENCE.findall(self._section()):
-            for line in block.splitlines():
-                argv = shlex.split(line.strip())
-                if argv and argv[0] in GOVERNED_TOOLS:
-                    commands.append(argv)
-        # Four reconciler reads and the CRD fallback.
-        self.assertGreaterEqual(len(commands), 5, "the section's fences moved or the parser is stale")
-        for argv in commands:
-            with self.subTest(command=" ".join(argv)):
-                decision = evaluate(argv)
-                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+            lines += [line.strip() for line in block.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), 3, "the section's fences moved or the parser is stale")
+        for line in lines:
+            with self.subTest(command=line):
+                argv = shlex.split(line)
+                self.assertNotIn(argv[0], GOVERNED_TOOLS)
 
     def test_the_direct_delete_is_refused(self):
         for argv in (
