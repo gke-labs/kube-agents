@@ -57,6 +57,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # invisible precondition that turns into a skipped test later.
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
+import mcp_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -124,6 +125,12 @@ SOURCES: dict[str, Source] = {
             "SLACK_METHOD_SHAPE",
         ),
     ),
+    # B1 imports this module: the per-tool allowlist the broker applies to
+    # every remote MCP call.
+    "mcp_policy": Source(
+        "agents/platform/scripts/mcp_policy.py",
+        ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
         ("/sessions/{session_id}/inject", "trigger_agent_troubleshooter", "_gateway_api_token"),
@@ -162,7 +169,7 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews"),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
@@ -596,17 +603,20 @@ SOURCES: dict[str, Source] = {
     # its overlay, and the Cluster Agent's template is copied as it is; the
     # Dockerfile anchors pin that model of the build, so the test cannot keep
     # asserting against a merge the image no longer does.
+    # The same three files are where B1 reads that every remote MCP server
+    # goes through the credential proxy's relay, so the anchor is the relay's
+    # variable rather than a Google URL.
     "shared_defaults_config": Source(
         "deploy/shared/defaults/config.yaml",
-        ("mcp_servers:", "container.googleapis.com/mcp"),
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
     "platform_config": Source(
         "agents/platform/config.yaml",
-        ("mcp_servers:", "container.googleapis.com/mcp"),
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
     "cluster_config": Source(
         "agents/cluster/config.yaml",
-        ("mcp_servers:", "container.googleapis.com/mcp"),
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
     "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
     "dockerfile_profile_configs": Source(

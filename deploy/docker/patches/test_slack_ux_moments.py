@@ -165,6 +165,57 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual(adapter.teams, ["T1"])
         self.assertIn("PR #412", post["text"])
 
+    def test_under_next_the_pr_card_is_a_chat_message_posted_once(self):
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((chat_id, content, chat, update, metadata))
+                return SimpleNamespace(success=True)
+
+        self.assertTrue(_run(runtime.pr_opened(StandIn(), SUB, f"Opened {PR}")))
+        self.assertFalse(_run(runtime.pr_opened(StandIn(), SUB, f"Report: opened {PR}")))
+        (chat_id, text, chat, update, metadata), = sent
+        self.assertEqual((chat_id, update, metadata), ("C0KAGE", "", {"thread_id": "1700000000.000100"}))
+        self.assertEqual(chat["tone"], "success")
+        self.assertEqual(chat["links"][0], {"text": "Open PR ↗", "url": PR, "primary": True})
+        self.assertIn(PR, text)
+
+    def test_under_next_a_card_that_asks_again_posts_a_new_question(self):
+        # Each question has its own key, so the second does not edit the first
+        # up the thread, and the first's settle cannot overwrite the second.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((update, "choices" in chat))
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        adapter = StandIn()
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 1)))
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 2))
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 3)))
+        self.assertEqual(sent, [("question-t_e0c1-1", True), ("question-t_e0c1-1", False), ("question-t_e0c1-3", True)])
+
+    def test_under_next_a_question_after_a_restart_takes_a_new_key(self):
+        # Named by its blocked event, the key does not repeat once the count is gone.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append(update)
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 7)))
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 9)))
+        self.assertEqual(sent, ["question-t_e0c1-7", "question-t_e0c1-9"])
+
     def test_the_pr_sits_beside_a_green_bar_under_its_headline(self):
         adapter = _Adapter()
         _run(runtime.pr_opened(adapter, SUB, f"Opened {PR}"))
@@ -215,6 +266,55 @@ class PrOpenedTest(unittest.TestCase):
         self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
         self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
         self.assertEqual([("PR #412" in p["text"], "PR #7" in p["text"]) for p in adapter.posts], [(True, False), (False, True)])
+
+    def test_a_gitlab_com_merge_request_posts_with_a_diffs_button(self):
+        adapter = _Adapter()
+        mr = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened MR !12: {mr}/diffs")))
+        post = adapter.posts[0]
+        self.assertIn("I opened merge request !12 in infra.", post["text"])
+        self.assertEqual([b["text"]["text"] for b in _buttons(_shown(post))], ["Open MR ↗", "Files changed ↗"])
+        self.assertEqual([b["url"] for b in _buttons(_shown(post))], [mr, mr + "/diffs"])
+
+    def test_a_self_managed_merge_request_posts_only_on_a_managed_gitlab_host(self):
+        managed = "https://gitlab.example.com/acme/infra/-/merge_requests/7"
+        unmanaged = "https://gitlab.other.example/acme/infra/-/merge_requests/8"
+        with_port = "https://gitlab.example.com:8443/acme/infra/-/merge_requests/3"
+        entries = (
+            '[{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra.git"},'
+            ' {"type": "github", "url": "https://gitlab.other.example/acme/infra"}]'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "managed_repos"
+            state.write_text(entries)
+            adapter = _Adapter()
+            with mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state)}):
+                self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"Opened {unmanaged}")))
+                self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {managed}")))
+                self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {with_port}")))
+        self.assertEqual(
+            [[b["url"] for b in _buttons(_shown(post))] for post in adapter.posts],
+            [[managed, managed + "/diffs"], [with_port, with_port + "/diffs"]],
+        )
+
+    def test_the_managed_list_is_read_only_for_a_text_with_a_merge_request(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime._gitops, "mounted_repo_entries", return_value=[]) as read:
+            self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {PR}")))
+            self.assertFalse(_run(runtime.pr_opened(adapter, SUB, "Checked the limits.")))
+            read.assert_not_called()
+            _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.com/acme/infra/-/merge_requests/7"))
+            read.assert_called_once()
+
+    def test_without_the_managed_list_only_gitlab_com_counts(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "_gitops", None):
+            self.assertFalse(
+                _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.example.com/acme/infra/-/merge_requests/7"))
+            )
+            self.assertTrue(
+                _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.com/acme/infra/-/merge_requests/7"))
+            )
 
     def test_the_announced_map_is_bounded(self):
         adapter = _Adapter()

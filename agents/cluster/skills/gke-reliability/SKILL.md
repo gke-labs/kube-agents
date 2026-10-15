@@ -7,6 +7,8 @@ description: Workflows for ensuring high availability and reliability of GKE wor
 
 This skill provides workflows for configuring your GKE cluster and workloads for high availability and reliability.
 
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
+
 ## Workflows
 
 ### 1. Verify Cluster High Availability
@@ -85,14 +87,9 @@ spec:
 
 Configure when GKE can perform automated upgrades to avoid peak hours.
 
-**Command to set maintenance window:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --region <region> \
-    --maintenance-window-start <start-time> \
-    --maintenance-window-recurrence "FREQ=DAILY"
-```
+**Maintenance window:** propose a recurring window with a start time, an end time and a
+`FREQ=DAILY` recurrence (Config Connector `ContainerCluster` field
+`spec.maintenancePolicy.recurringWindow`).
 
 ## Best Practices
 

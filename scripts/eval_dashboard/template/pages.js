@@ -119,6 +119,9 @@ const PAGE = {
   // A night split across two jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
   nightPartWords: { main: "main part", writers: "writers part" },
+  // The chat-turn target the opening turn's p95 is shown beside, as advice
+  // only (nightly.py's TURN1_P95_TARGET_S).
+  turn1P95TargetS: 10,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -258,6 +261,8 @@ function normalizeHealth(raw) {
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
+      lease_failures: count(pool.lease_failures),
+      lease_failures_hours: count(pool.lease_failures_hours),
     } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
@@ -288,8 +293,9 @@ function poolSentence(h) {
     return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
   }
   if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
-  // What tripped the verdict, which is a single day's row or the live queue --
-  // never the seven-day window, which one bad day leaves inside its own limit.
+  // What tripped the verdict: a single day's row, the live queue or a refused
+  // acquire -- never the seven-day window, which one bad day leaves inside
+  // its own limit.
   // The backlog's start while there is one, the episode's otherwise: the
   // verdict spans a week, so the episode can have opened days before the jam
   // the present tense below is describing.
@@ -311,6 +317,12 @@ function poolSentence(h) {
   if (p.over_threshold && p.threshold_p95_s != null) {
     found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
   }
+  // The third trigger, as post_health.pool_numbers lists it: a breach can
+  // rest on refusals alone, with nothing queued and no stretch to quote.
+  if (p.lease_failures) {
+    const window = p.lease_failures_hours ? ` in the last ${p.lease_failures_hours}h` : "";
+    found.push(`${p.lease_failures} run${p.lease_failures === 1 ? "" : "s"} refused a project${window}`);
+  }
   if (!found.length) return "";
   // health.pool_note's waiting_now. The verdict lasts a week, so most renders
   // of an episode find the queue already drained, and "are waiting" then sends
@@ -319,7 +331,12 @@ function poolSentence(h) {
   const live = p.waiting_now;
   // False is "nothing has waited past the limit", not "the queue is empty".
   const cleared = live === false ? " No backlog right now." : "";
-  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
+  // A queued run starts late and passes; a refused run died at the acquire,
+  // so the tail says which, as post_health.render_pool does.
+  const tail = p.lease_failures
+    ? "A refused run did not start; retest once the pool has room."
+    : "Runs still pass; /retest makes the queue longer.";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} ${tail}`;
 }
 
 /* ---- URL contract ---- */
@@ -966,7 +983,7 @@ function releasesHtml() {
 // The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
 // them out of every count above, so this section is the only place they
 // show. Each row links Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
 function laneRow(run) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
@@ -991,7 +1008,17 @@ function gitlabLaneHtml() {
     body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
       `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
   }
-  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}</div>`;
+  const nightlyJob = lane && lane.nightly_job || "ci-kube-agents-eval-nightly-gitlab";
+  const nights = lane && Array.isArray(lane.nights) ? lane.nights.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  let nightsHtml;
+  if (!nights.length) {
+    nightsHtml = `<p class="mut small">No GitLab night on record. <code>${esc(nightlyJob)}</code> runs the same list once a night on its own leased project.</p>`;
+  } else {
+    const nc = lane.night_counts || {};
+    nightsHtml = `<h3>Nights</h3><p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(nightlyJob)}</code>).</p>` +
+      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${nights.map(laneRow).join("")}</tbody></table>`;
+  }
+  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}${nightsHtml}</div>`;
 }
 
 function briefHtml(link) {
@@ -1275,12 +1302,24 @@ function lastFailureHtml(c) {
 // own -- a grader's reason is too long to share a row with eight columns.
 const CASE_COLUMNS = 8;
 
+// Seconds as the timing lines carry them: one decimal.
+const secText = (v) => `${v.toFixed(1)} s`;
+
+// The presubmit reps' timing (SCHEMA.md: cases[].latency), "" when none.
+function caseLatencyHtml(c) {
+  const l = c.latency && typeof c.latency === "object" ? c.latency : {};
+  const parts = [];
+  if (Number.isFinite(l.turn1_p50_s) && Number.isFinite(l.turn1_p95_s)) parts.push(`chat turn 1 p50 ${secText(l.turn1_p50_s)}, p95 ${secText(l.turn1_p95_s)}${Number.isFinite(l.n_turn1) ? ` (${plural(l.n_turn1, "rep")})` : ""}`);
+  if (Number.isFinite(l.agent_p50_s)) parts.push(`agent p50 ${secText(l.agent_p50_s)}${Number.isFinite(l.n_agent) ? ` (${plural(l.n_agent, "rep")})` : ""}`);
+  return parts.length ? `<small class="mut" title="presubmit repetitions not lost to infra">${esc(parts.join(" · "))}</small>` : "";
+}
+
 function caseRow(c, link) {
   const rates = c.rates || {};
   const pre = rates.presubmit || [], night = rates.nightly || [];
   const classes = [link.caseHash === c.name ? "hl" : "", c.status === "retired" ? "dim" : ""].filter(Boolean).join(" ");
   const issues = (c.issues || []).map(issueLink).join(" · ") || `<span class="mut">—</span>`;
-  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
+  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}${caseLatencyHtml(c)}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
     `<td>${stripHtml(c)}</td><td>${rateCell(pre[0])}</td><td>${rateCell(pre[1])}</td><td>${rateCell(night[0])}</td><td>${rateCell(night[1])}</td>` +
     `<td>${statusPill(c)}</td><td class="iss">${issues}</td></tr>` +
     `<tr class="why ${classes}"><td colspan="${CASE_COLUMNS}">${lastFailureHtml(c)}</td></tr>`;
@@ -1612,6 +1651,7 @@ function nightCaseRow(night, c, newly) {
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
     `<td><span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span></td>` +
     `<td class="num" title="repetitions passed / graded">${esc(repText)}</td>` +
+    `<td class="num tm" title="median opening chat turn / median agent wall clock, then the agent's p90, over the repetitions not lost to infra">${esc(Number.isFinite(c.turn1_p50_s) ? secText(c.turn1_p50_s) : "—")} / ${esc(Number.isFinite(c.agent_p50_s) ? secText(c.agent_p50_s) : "—")}${Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secText(c.agent_p90_s))}</small>` : ""}</td>` +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
 }
@@ -1623,10 +1663,10 @@ function nightCasesTable(night) {
   const rows = [];
   let domain = null;
   for (const c of cases) {
-    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="5">${esc(domainWords(domain))}</td></tr>`); }
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6">${esc(domainWords(domain))}</td></tr>`); }
     rows.push(nightCaseRow(night, c, newly));
   }
-  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
 function nightChangesHtml(night) {
@@ -1687,16 +1727,19 @@ function nightlyHtml(link) {
   const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
     `<div class="lede">${esc(when)} · ${jobs}${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${logs}</div>` +
     `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
-  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles">` +
+  // The night's opening chat turn, a sixth tile when its reps carried one.
+  const turn1 = Number.isFinite(night.turn1_p50_s) && Number.isFinite(night.turn1_p95_s);
+  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles${turn1 ? " six" : ""}">` +
     tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
     tile("Partial", `${c.partial}`, "failed some repetitions") +
     tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
     tile("Newly failing", `${night.previous_build == null || nightLacksMain(night) ? "—" : night.newly_failing.length}`, nightLacksMain(night) ? "no main part on record" : night.previous_build == null ? "first night on record" : "against the night before") +
+    (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     `</div></div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
-    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. The transcript is the first repetition's.</p></div>` +
+    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the agent's p90 under them. The transcript is the first repetition's.</p></div>` +
     nightsListHtml(night) + footHtml();
 }
 

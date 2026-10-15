@@ -31,7 +31,9 @@ var NotifySubjects = map[string]string{
 
 // NotifyRequest is the body of a chat.notify request.
 type NotifyRequest struct {
-	// Text is the message, chunked under the backend cap on the way out.
+	// Text is the message, chunked under the backend cap on the way out,
+	// except on a conversation request with an Update key, which is one
+	// message (an edit reaches one) and is cut to one chunk.
 	Text string `json:"text"`
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there. On Google Chat it
@@ -57,11 +59,12 @@ type NotifyRequest struct {
 	// conversation's own tasks brought to the agent. Thread must be empty.
 	Conversation string `json:"conversation,omitempty"`
 	ContextID    string `json:"context_id,omitempty"`
-	// Chat and Update are reserved for a card's work after its task ends:
-	// Chat a kube-agents.chat/v1 object, with Text its fallback, and Update
-	// a sender-chosen key whose later request edits the message the first
-	// posted in the same conversation. This gateway does not read them yet;
-	// a request carrying them is posted as its Text.
+	// Chat and Update carry a card's work after its task ends, on a request
+	// aimed at a conversation: Chat a kube-agents.chat/v1 object, with Text
+	// its fallback, laid out by a backend that renders it (Slack) and posted
+	// as Text by any other; Update a sender-chosen key whose later request
+	// edits the message the first posted in the same conversation. A home
+	// channel request carrying them is posted as its Text.
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
 }

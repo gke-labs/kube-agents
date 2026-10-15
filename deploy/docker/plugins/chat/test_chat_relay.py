@@ -696,10 +696,10 @@ class TestStandaloneSend(unittest.TestCase):
         self.assertIn("unrelayed", result["error"])
         self.assertIn("slack", result["error"])
 
-    def test_the_timeout_outlasts_a_chat_agent_turn(self):
+    def test_the_timeout_outlasts_the_routes_posts_budget(self):
         """Time out before the route answers and a delivered report is recorded
-        as a failure. `_run_relay_turn` allows the turn itself 300s."""
-        self.assertGreater(mod.RELAY_TIMEOUT_SECONDS, 300.0)
+        as a failure. The route's Slack work alone may take 180s."""
+        self.assertGreater(mod.RELAY_TIMEOUT_SECONDS, 180.0)
 
     def test_the_default_route_is_the_loopback_session_kv_server(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -961,7 +961,7 @@ class TestRegistration(unittest.TestCase):
         )
 
     def test_reports_are_never_chunked(self):
-        """A split report would start one Chat Agent turn per piece."""
+        """A split report would post as several messages, each its own piece."""
         captured = {}
 
         class Ctx:

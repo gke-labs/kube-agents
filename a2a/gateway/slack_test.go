@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -29,12 +31,15 @@ type fakeSlackAPI struct {
 	// gateway workers; single-goroutine tests read the slices directly.
 	mu sync.Mutex
 	// team is the team id auth.test answers with.
-	team     string
-	posted   []struct{ channel, thread, text string }
-	updated  []struct{ channel, ts, text string }
-	members  []string
-	cursor   string
-	openedIM string
+	team   string
+	posted []struct{ channel, thread, text string }
+	// postValues is every chat.postMessage's full form, for the fields
+	// posted does not name.
+	postValues []url.Values
+	updated    []struct{ channel, ts, text string }
+	members    []string
+	cursor     string
+	openedIM   string
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
@@ -51,6 +56,7 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 	f.posted = append(f.posted, struct{ channel, thread, text string }{
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
+	f.postValues = append(f.postValues, values)
 	return channelID, "999.001", nil
 }
 
@@ -859,6 +865,11 @@ func TestSlackPostThreadsAndTranslates(t *testing.T) {
 	if api.posted[2].channel != "D1" || api.posted[2].thread != "100.1" {
 		t.Errorf("a post to a DM thread's conversation must land in that thread: %+v", api.posted[2])
 	}
+	for i, v := range api.postValues {
+		if v.Get("unfurl_links") != "false" || v.Get("unfurl_media") != "false" {
+			t.Errorf("post %d: unfurl_links=%q unfurl_media=%q, want both false", i, v.Get("unfurl_links"), v.Get("unfurl_media"))
+		}
+	}
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")
 	}
@@ -1073,6 +1084,44 @@ func TestToMrkdwn(t *testing.T) {
 	}
 }
 
+// TestToMrkdwnKeepsAnExecutorsSlackLink mirrors
+// TestToGchatTextKeepsAnExecutorsChatLink: <url|text> is Slack's link form
+// too, and escaping turned every one the executor wrote into literal text
+// with a bare URL beside it (#3015 on Chat). A closed one in prose, with an
+// http(s) URL in the markdown destination class and text that names no
+// other host, is kept with its URL and text escaped as the rest of the text
+// is; everything else is escaped as before, Slack's other sequences
+// included.
+func TestToMrkdwnKeepsAnExecutorsSlackLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                              issue3015Reply,
+		"<https://x.example/a?b=1&c=2|R&D>":                         "<https://x.example/a?b=1&amp;c=2|R&amp;D>",
+		"<https://x.example/a|a> and [b](https://x.example/b)":      "<https://x.example/a|a> and <https://x.example/b|b>",
+		"<https://evil.example/login|https://github.com/x>":         "&lt;https://evil.example/login|https://github.com/x&gt;",
+		"<https://evil.example|x](https://good.example) [y>":        "&lt;https://evil.example|x](https://good.example) [y&gt;",
+		"<https://a.example|<https://b.example|c>>":                 "&lt;https://a.example|<https://b.example|c>&gt;",
+		"<https://x.example/a|b|c>":                                 "&lt;https://x.example/a|b|c&gt;",
+		"see <https://evil.example|docs: <https://x.example/p|doc>": "see &lt;https://evil.example|docs: <https://x.example/p|doc>",
+		"<!channel|everyone>":                                       "&lt;!channel|everyone&gt;",
+		"<@U999|bob> and <#C1|chan>":                                "&lt;@U999|bob&gt; and &lt;#C1|chan&gt;",
+		"<mailto:a@x.example|mail>":                                 "&lt;mailto:a@x.example|mail&gt;",
+		"`<https://x.example|doc>`":                                 "`&lt;https://x.example|doc&gt;`",
+		"see ``` <https://x.example|doc>":                           "see ``` &lt;https://x.example|doc&gt;",
+		// The markdown rules read a kept link as the link it is: the bold
+		// a heading becomes wraps it, and a markdown link around it or
+		// inside it is refused rather than nested.
+		"# Opened <https://x.example/p|PR 3>":                "*Opened <https://x.example/p|PR 3>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"[t](https://evil.example/<https://good.example|x>)": "[t](https://evil.example/<https://good.example|x>)",
+		"<https://x.example/a|[doc](https://x.example/b)>":   "<https://x.example/a|[doc](https://x.example/b)>",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestToMrkdwnConvertsProseAfterAChunkedFence: Gateway.post splits a result
 // with chatChunks(text, discordChunk) and the adapter translates each chunk
 // on its own, so the chunker closes a fenced block it cuts and reopens it in
@@ -1111,10 +1160,12 @@ func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
 func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
 	cases := map[string]string{
 		// The issue's rows: none of these is a bold pair.
-		"**kwargs":                "**kwargs",
-		"**/*.yaml":               "**/*.yaml",
-		"a ** b":                  "a ** b",
-		"***":                     "***",
+		"**kwargs":  "**kwargs",
+		"**/*.yaml": "**/*.yaml",
+		"a ** b":    "a ** b",
+		// Inline, since a line of only *** is a thematic break, which
+		// rewriteSlackBlocks drops (TestRewriteSlackBlocks).
+		"a *** b":                 "a *** b",
 		"def f(*args, **kwargs):": "def f(*args, **kwargs):",
 		// Bold-italic is the one triple that is a pair, and a single star
 		// inside a pair is emphasis inside it, not a second pair.
@@ -1992,7 +2043,7 @@ func TestSlackSessionLookupLogLevels(t *testing.T) {
 }
 
 // TestSlackDecodedTextDrivesTheAffordances pins a consequence of decoding the
-// inbound entities that nothing else in the suite notices. normalize() drops
+// inbound entities that nothing else in the suite notices. chattext.Normalize() drops
 // every non-alphanumeric, so the entity escaping used to survive it as
 // letters: "&lt;stop&gt;" normalized to "ltstopgt" and matched nothing.
 // Decoded first, the same wire text normalizes to "stop" — a hard task cancel.
@@ -2003,8 +2054,8 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 
 	// What Slack puts on the wire when a user types "<stop>".
 	const stopWire = "&lt;stop&gt;"
-	if got := normalize(stopWire); got != "ltstopgt" || isStop(stopWire) {
-		t.Fatalf("premise: normalize(%q) = %q, isStop = %v", stopWire, got, isStop(stopWire))
+	if got := chattext.Normalize(stopWire); got != "ltstopgt" || chattext.IsStop(stopWire) {
+		t.Fatalf("premise: chattext.Normalize(%q) = %q, chattext.IsStop = %v", stopWire, got, chattext.IsStop(stopWire))
 	}
 	msg, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", stopWire, "800.0", ""))
 	if !ok {
@@ -2013,7 +2064,7 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	if msg.Text != "<stop>" {
 		t.Fatalf("inbound text = %q, want the decoded form", msg.Text)
 	}
-	if !isStop(msg.Text) {
+	if !chattext.IsStop(msg.Text) {
 		t.Error("a typed <stop> must cancel: the decode is what lets normalize see \"stop\"")
 	}
 }

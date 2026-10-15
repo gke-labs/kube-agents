@@ -14,6 +14,13 @@ settled board, the continuation idiom, and a board without the attribution
 table all still complete, because a guard that can wedge a card shut is a
 worse bug than the one it fixes.
 
+It then replays the #2704 duplicate (card ``t_b999714f``, #250/#251): the
+worker, refused at completion, waits with ``kanban_block(kind="dependency")``.
+Upstream sends that card to ``todo`` with nothing to wait on, and a fresh
+worker claims it seconds later; after the patch the block is refused and the
+card stays with its worker. A ``needs_input`` block and a dependency block that
+has something to wait on still go through.
+
 Usage::
 
     cd /opt/hermes && python3 verify_kanban_children_settled.py
@@ -103,6 +110,11 @@ check(
     "the trailer import did not execute",
 )
 check(
+    "the block handler resolved the dependency gate import",
+    hasattr(kt, "_refuse_idle_dependency_block"),
+    "the trailer import did not execute",
+)
+check(
     "the complete handler resolved the gate import",
     hasattr(kt, "_require_children_settled")
     and hasattr(kt, "_kanban_children_connect"),
@@ -186,6 +198,91 @@ os.environ["HERMES_KANBAN_TASK"] = parent4
 bare = tool_complete(result="An answer.")
 check("a board without the attribution table completes", "refused" not in bare, bare)
 check("the fail-open card closed", status(parent4) == "done")
+
+# --- 8. The #2704 duplicate: a dependency block with nothing to wait on -------
+print("the #2704 dependency-block replay:")
+
+
+def tool_block(kind, reason="waiting on the seeded-b child"):
+    args = {"reason": reason}
+    if kind is not None:
+        args["kind"] = kind
+    return kt._handle_block(args)
+
+
+os.environ.pop("HERMES_KANBAN_TASK", None)
+fix = tool_create(title="Add a PDB for checkout-gateway")["task_id"]
+K.claim_task(conn, fix)
+os.environ["HERMES_KANBAN_TASK"] = fix
+seeded_b = tool_create(title="Apply on seeded-b")["task_id"]
+conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (seeded_b,))
+conn.commit()
+dep = tool_block("dependency")
+check("a dependency block with nothing to wait on is refused", "refused" in dep, dep)
+check("the refusal names the fan-out child", seeded_b in dep)
+check("the refusal points at needs_input", "needs_input" in dep)
+check(
+    "the card stays with its worker, not back in the queue",
+    status(fix) == "running",
+    f"status={status(fix)}",
+)
+again = tool_block("dependency")
+check("the refusal is not rationed: a retry is refused too", "refused" in again, again)
+escalate = tool_block("needs_input")
+check("a needs_input block goes through", "refused" not in escalate, escalate)
+check("the escalated card is blocked", status(fix) == "blocked", f"status={status(fix)}")
+
+# A child this card fans out with parents=[<this card>] is an edge the
+# scheduling repair turns into a real wait inside block_task, so that block
+# goes through and the card waits on the child rather than re-queueing.
+os.environ.pop("HERMES_KANBAN_TASK", None)
+waiter = tool_create(title="Coordinator with a linked child")["task_id"]
+K.claim_task(conn, waiter)
+os.environ["HERMES_KANBAN_TASK"] = waiter
+linked_child = tool_create(title="linked child", parents=[waiter])["task_id"]
+linked = tool_block("dependency")
+check(
+    "a dependency block over a child the repair flips goes through",
+    "kanban_block refused" not in linked,
+    linked,
+)
+K.recompute_ready(conn)
+inverted = conn.execute(
+    "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+    (linked_child, waiter),
+).fetchone()
+check(
+    "and it is a real wait: the edge is inverted and the card stays out of the queue",
+    inverted is not None and status(waiter) == "todo",
+    f"inverted={inverted is not None} status={status(waiter)}",
+)
+
+# A successor planned before this card started is never flipped, so a
+# dependency block over it would re-queue the card at once: refused.
+os.environ.pop("HERMES_KANBAN_TASK", None)
+stage_b = tool_create(title="Pipeline stage B")["task_id"]
+tool_create(title="Pipeline stage C", parents=[stage_b])
+K.claim_task(conn, stage_b)
+os.environ["HERMES_KANBAN_TASK"] = stage_b
+planned = tool_block("dependency")
+check(
+    "a dependency block over a planned successor is refused",
+    "refused" in planned,
+    planned,
+)
+check("the stage card stays with its worker", status(stage_b) == "running", f"status={status(stage_b)}")
+
+# A card that isn't running any more (its claim was released by a stale-claim
+# sweep or a restart) is left to upstream's block_task, whatever it answers,
+# rather than refused with "you still hold the card".
+conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL WHERE id = ?", (stage_b,))
+conn.commit()
+lost = tool_block("dependency")
+check(
+    "a card this worker no longer runs is left to upstream, not refused",
+    "kanban_block refused" not in lost,
+    lost,
+)
 
 print()
 if FAILURES:

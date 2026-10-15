@@ -13,7 +13,7 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013, #2016) -- and the nightly file holds the
+the documented exception: #2013; #2016's seat took its roster line 2026-10-14) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
 whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
@@ -86,7 +86,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); its held-out presubmit seat opened 2026-09-28 (HELD_OUT_IN_PRESUBMIT)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -169,10 +169,13 @@ ADDED_AFTER_THE_MOVE = [
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
+    "upgrades-fleet-readiness-failclosed-webhook",  # the readiness report's fail-closed webhook source
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
+    "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
+    "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -189,6 +192,8 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
     # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
+    # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -196,6 +201,7 @@ ADMITTED_AFTER_THE_SPLIT = [
 # it), since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -226,7 +232,6 @@ HELD_OUT_TO_NIGHTLY = [
 # less exactly this list.
 HELD_OUT_IN_PRESUBMIT = [
     ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
-    ("pdb-remediation-pr", "compliance-rbac-overgrant"),  # #2016 step 2, seat opened 2026-09-28; the roster line is step 4
 ]
 
 
@@ -404,6 +409,74 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
 }
+
+
+def positive_check_types(node, negations: int = 0) -> set:
+    """The check types a task REQUIRES to pass: every `type:` under an even
+    number of negating `type: none` compounds (parity, as the bench's
+    `_negates_every_leaf` reads them) and under no `any` compound, where a
+    leaf is one alternative and not required. The other compounds
+    (`sequence`, `parallel`, `all`) are conjunctive and transparent."""
+    if isinstance(node, dict):
+        if node.get("type") == "any":
+            return set()
+        if node.get("type") == "none":
+            found = set()
+            for value in node.values():
+                found |= positive_check_types(value, negations + 1)
+            return found
+        found = {node["type"]} if isinstance(node.get("type"), str) and negations % 2 == 0 else set()
+        for value in node.values():
+            found |= positive_check_types(value, negations)
+        return found
+    if isinstance(node, list):
+        found = set()
+        for item in node:
+            found |= positive_check_types(item, negations)
+        return found
+    return set()
+
+
+class GitLabLaneTest(unittest.TestCase):
+    """hack/eval/gitlab-cases.txt: what the GitLab lane's presubmit
+    runs (kube-agents#2394). Registered cases only, every entry a case that
+    grades the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.gitlab_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered(self):
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.gitlab_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+
+    def test_every_lane_case_grades_the_forge(self):
+        import yaml
+
+        for case in eval_rosters.gitlab_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+
+    def test_a_negated_forge_check_does_not_count(self):
+        # "The agent did not open a merge request" proves nothing on GitLab.
+        negated = {"verification_spec": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}
+        self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "pull_request_opened"}]}) & self.FORGE_CHECKS)
+        # A none under a none undoes it, as the bench reads it (bench/tests/test_cases.py, doubly-negated).
+        double = {"verification_spec": [{"type": "none", "checks": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}]}
+        self.assertTrue(positive_check_types(double) & self.FORGE_CHECKS)
+        # Under `any` the forge check is one alternative, not a requirement: a chat answer could pass the case instead.
+        either = {"verification_spec": [{"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}]}
+        self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_CASES_FILE.read_text(encoding="utf-8")), [])
 
 
 class InjectLaneExclusionsTest(unittest.TestCase):

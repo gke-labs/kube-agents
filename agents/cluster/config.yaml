@@ -23,6 +23,25 @@ model:
   base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
+# Model-call deadlines for the gateway above. Hermes reads them per provider
+# (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
+# detectors: a stream with no first chunk, or no chunk for that long, and a
+# non-streamed call with no answer; then Hermes drops the stream and retries.
+# It is 600s because Gemini thinks in silence on this path: with the request
+# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
+# 140-210s before its first chunk, so a shorter bound would cut off healthy
+# long thinks, and every retry would repeat the same think.
+# request_timeout_seconds is the per-read socket timeout (and the stream read
+# timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
+# its own. A call that stalls is retried inside each of Hermes' 3 attempts
+# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
+# a persistent stall costs five or six 600s windows before the turn fails; a
+# one-off stall recovers at the first 600s kill.
+providers:
+  custom:
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+
 # MCP Servers configuration. Read-only diagnostics surface only.
 mcp_servers:
   # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit
@@ -41,13 +60,22 @@ mcp_servers:
   # execution mode, so the API team serving the endpoint can attribute the traffic;
   # deploy/shared/defaults/config.yaml carries the full rationale. The string is
   # the same one the Platform Agent sends, character for character.
+  #
+  # Both servers are reached through the credential proxy's MCP relay, which
+  # enforces the tool allowlist; deploy/shared/defaults/config.yaml explains
+  # the URL, the flags and the `env` block.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://developerknowledge.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/developer_knowledge"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
@@ -57,13 +85,17 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
-    # Read tools only, as an allowlist: this server bypasses the credential
-    # broker, so the list is what keeps its write tools out of the model's
-    # reach. deploy/shared/defaults/config.yaml carries the full rationale; the
+    # Read tools only, as an allowlist: the credential proxy's relay refuses
+    # the write tools, and this list keeps them out of the model's offer. deploy/shared/defaults/config.yaml carries the full rationale; the
     # list is the same one, name for name.
     tools:
       include:
@@ -118,6 +150,16 @@ plugins:
 # to publish a Python-toolchain line that is factually wrong on this image.
 agent:
   environment_probe: false
+  # The same five toolsets agents/platform/config.yaml disables, for the same
+  # reason: declaring the full hermes-cli set puts Gemini on Vertex on an
+  # intermittent slow path before its first token, and a Cluster Agent's work
+  # (reading one cluster) uses none of them.
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt; rationale lives in agents/platform/config.yaml, which pins the same

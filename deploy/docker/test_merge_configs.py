@@ -157,6 +157,28 @@ class RealConfigTest(unittest.TestCase):
             self.assertNotIn("mcp-agent_common", surface)
         self.assertNotIn("agent_common", self.merged["mcp_servers"])
 
+    # Declaring the full hermes-cli set puts Gemini on Vertex on an intermittent
+    # slow path before its first token; agents/platform/config.yaml has the
+    # measurements. These toolsets go, and the ones the agents' work runs on stay.
+    _TRIMMED = {"browser", "computer_use", "image_gen", "tts", "vision"}
+    _NEEDED = {"terminal", "file", "skills", "code_execution", "delegation", "web",
+               "memory", "kanban", "gke", "platform_control", "mcp-gke",
+               "mcp-platform_control", "mcp-developer_knowledge"}
+
+    def test_the_platform_profile_disables_the_tools_its_turns_never_use(self):
+        disabled = set(self.merged["agent"]["disabled_toolsets"])
+        self.assertEqual(self._TRIMMED, disabled & self._TRIMMED)
+        self.assertEqual(set(), disabled & self._NEEDED)
+
+    def test_the_cluster_profile_disables_the_same_set(self):
+        root = Path(__file__).resolve().parents[2]
+        cluster = yaml.safe_load((root / "agents" / "cluster" / "config.yaml").read_text())
+        disabled = set(cluster["agent"]["disabled_toolsets"])
+        self.assertEqual(self._TRIMMED, disabled & self._TRIMMED)
+        self.assertEqual(set(), disabled & self._NEEDED)
+        # The cluster profile keeps its other agent key alongside the list.
+        self.assertIs(False, cluster["agent"]["environment_probe"])
+
 
 if __name__ == "__main__":
     unittest.main()

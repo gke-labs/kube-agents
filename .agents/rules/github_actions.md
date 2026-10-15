@@ -3,7 +3,7 @@
 paths:
   - ".github/workflows/**"
 trigger: model_decision
-description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, and collapsing superseded pull-request runs with a concurrency group."
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, collapsing superseded pull-request runs with a concurrency group, and detecting changed files with git rather than the API."
 ---
 
 # GitHub Actions rules
@@ -64,3 +64,24 @@ next push or edit. Keyed by head, a run can only supersede runs for its own head
 
 `smoke-test-sticky.yml` has no group on purpose and says why in its header: it starts on `status`
 and `push`, never on `pull_request`, and a dropped pending run there would drop a re-pin.
+
+## Detect changed files with git, not the API
+
+A `dorny/paths-filter` step on a workflow that starts on `pull_request` sets `token: ""`. With a
+token the action lists a pull request's files through the GitHub API, a page at a time, with no
+retry around any page, and one failed page reds the check: on 2026-10-14 between 01:33 and 01:42
+UTC that call failed in four runs across `a2a-test.yml` and `k8s-operator-test.yml`, two of them
+re-run by hand, and in the five thousand pull-request runs of those workflows around them it failed
+in none; the flaky-check tracker opened #2984 and #2983 for the two checks. With no token the action
+diffs the checked-out merge commit against the base SHA with git, the path it already takes on push
+and merge-queue runs, after one depth-one fetch of the base SHA from the server the checkout just
+used. `tests/test_paths_filter_uses_git_diff.py` holds the input on every such step.
+
+The checkout before the step stays at its default depth of one. A depth of two would make the base
+tip local and spare that fetch, but it changes what a `workflow_dispatch` run on `main` tests: at
+depth one the shallow root makes the action see every file as changed and the whole suite runs, at
+depth two it sees the tip commit's files alone and a dispatch after a commit outside the filter's
+paths tests nothing.
+
+A `pull_request_target` workflow is the exemption: there the action runs in the base branch's
+context and refuses an empty token, so it keeps the API path. None uses the action today.
