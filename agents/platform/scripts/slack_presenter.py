@@ -377,6 +377,8 @@ COLON = ":"
 COMMA = ","
 CLAUSE_ENDS = ".!?"
 CLAUSE_STOP = "."
+#: Emphasis markers a clause head's end is read through: "**Lead!**" already ends in a stop.
+CLAUSE_EMPHASIS = "*_"
 #: A first word :func:`as_line` capitalizes; "seeded-c" or "kube-system" is a name and keeps its case.
 LOWER_WORD = re.compile(r"[a-z]+(?![\w-])")
 #: Where :func:`clause_cut` may cut a first sentence too long for the headline: after a comma, a
@@ -791,7 +793,7 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
             continue
         if not connector and CLAUSE_SUBORDINATE.match(_plain(_restore_code(head, spans))):
             continue
-        if head[-1:] not in CLAUSE_ENDS:
+        if head.rstrip(CLAUSE_EMPHASIS)[-1:] not in CLAUSE_ENDS:
             head += CLAUSE_STOP
         title = len(_plain(_restore_code(head, spans)))
         if title > HEADLINE_MAX:

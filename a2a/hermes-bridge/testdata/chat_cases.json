@@ -7,6 +7,20 @@
       "body": ["It hit its 256Mi limit.", "Raise it to 512Mi."]
     },
     {
+      "in": "**The pod is OOMKilled!**, because its memory limit is 64Mi while the busybox command reads /dev/zero without bound, which exhausts it within seconds of each restart.",
+      "headline": "The pod is OOMKilled!",
+      "body": [
+        "Because its memory limit is 64Mi while the busybox command reads /dev/zero without bound, which exhausts it within seconds of each restart."
+      ]
+    },
+    {
+      "in": "**Is the HPA the cause of the payments-api restarts?** because it scales to zero overnight and the readiness probe then fails for every new pod for several minutes after the morning traffic arrives.",
+      "headline": "Is the HPA the cause of the payments-api restarts?",
+      "body": [
+        "Because it scales to zero overnight and the readiness probe then fails for every new pod for several minutes after the morning traffic arrives."
+      ]
+    },
+    {
       "in": "## **Yes**, [seeded-a](https://x) is `healthy`\n- one\n- two",
       "headline": "Yes, seeded-a is healthy",
       "body": ["- one\n- two"]

@@ -27,6 +27,9 @@ const (
 	// clauseStop and clauseEnds are CLAUSE_STOP and CLAUSE_ENDS.
 	clauseStop = "."
 	clauseEnds = ".!?"
+	// clauseEmphasis is CLAUSE_EMPHASIS: the markers a head's end is read
+	// through, so "**Lead!**" already ends in a stop.
+	clauseEmphasis = "*_"
 	// clauseOpeners and clauseClosers bound what a cut never falls inside.
 	clauseOpeners = "(["
 	clauseClosers = ")]"
@@ -161,7 +164,7 @@ func clauseCut(sentence string) (string, string, bool) {
 		if italic {
 			continue
 		}
-		if last, _ := utf8.DecodeLastRuneInString(h); h != "" && !strings.ContainsRune(clauseEnds, last) {
+		if last, _ := utf8.DecodeLastRuneInString(strings.TrimRight(h, clauseEmphasis)); h != "" && !strings.ContainsRune(clauseEnds, last) {
 			h += clauseStop
 		}
 		n := runeLen(plainLine(restoreCode(h, spans, false)))
