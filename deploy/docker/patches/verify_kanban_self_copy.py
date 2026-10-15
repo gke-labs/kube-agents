@@ -109,9 +109,9 @@ conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (cluster["task_id"
 conn.commit()
 done = json.loads(kt._handle_complete({"summary": "proposed", "result": "PR #276 adds the PDB."}))
 check("and the creator can still complete with its follow-up queued", done.get("ok"), str(done))
+K.recompute_ready(conn)
 status = conn.execute("SELECT status FROM tasks WHERE id = ?", (follow["task_id"],)).fetchone()[0]
-check("after which the follow-up is free to run", status in ("ready", "todo") and status != "running",
-      f"follow-up status={status}")
+check("after which the follow-up is released", status == "ready", f"follow-up status={status}")
 
 print()
 if FAILURES:

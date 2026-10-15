@@ -268,7 +268,7 @@ check(
 # dependency block over it would re-queue the card at once: refused.
 os.environ.pop("HERMES_KANBAN_TASK", None)
 stage_b = tool_create(title="Pipeline stage B")["task_id"]
-tool_create(title="Pipeline stage C", parents=[stage_b])
+tool_create(title="Pipeline stage C", parents=[stage_b], assignee=WORKER_CHILD_ASSIGNEE)
 K.claim_task(conn, stage_b)
 os.environ["HERMES_KANBAN_TASK"] = stage_b
 planned = tool_block("dependency")
