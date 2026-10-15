@@ -327,13 +327,50 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
                       '        rm -f "$tfvars_file"', install)
         self.assertEqual(install.count('"$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"'), 1)
         upgrade = _UPGRADE_SH.read_text()
-        self.assertIn('refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" || exit 1', upgrade)
+        self.assertIn('if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then', upgrade)
         self.assertIn('refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" "$SCOPE_CHECK_MODE_WARN"', upgrade)
         # In the full arm, before its apply starts.
         start = upgrade.index("\n    full)\n", upgrade.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
         arm = upgrade[start:upgrade.index("\n      ;;\n", start + 10)]
-        self.assertLess(arm.index('refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" || exit 1'),
+        self.assertLess(arm.index('if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then'),
                         arm.index('UPGRADE_APPLY_STARTED="true"'))
+
+
+class UpgradeRefusalRemovesTheTfvarsTest(unittest.TestCase):
+    """A full upgrade the guard refuses removes the tfvars the generator wrote
+    (they render the minter off), as install.sh and the Slack check do."""
+
+    def test_the_refused_full_arm_leaves_no_tfvars(self):
+        source = _UPGRADE_SH.read_text()
+        start = source.index("\n    full)\n", source.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
+        body_start = start + len("\n    full)\n")
+        arm = source[body_start:source.index("\n      ;;\n", body_start)]
+        stubs = (
+            "print_step() { :; }\nrefuse_apply_over_undeclared_scope() { :; }\n"
+            "announce_platform_agent_mode_for_apply() { :; }\ncheck_scope_container_access() { :; }\n"
+            "check_service_account_ownership() { :; }\nrefuse_full_apply_dropping_next() { :; }\n"
+            "refuse_next_slack_gateway_settings_from_env() { :; }\n"
+            'refuse_apply_dropping_live_gitops() { echo "REFUSED gitops"; return 1; }\n'
+            'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle() { echo "APPLIED terraform"; }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars = pathlib.Path(tmp) / "terraform.tfvars"
+            tfvars.write_text("enable_github_minter = false\n")
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                f"{stubs}"
+                f'repo_dir="{_REPO_ROOT}"; tfvars_file="{tfvars}"; target_namespace=kube-agents; install_env_file=/x/install.env\n'
+                f"_full() {{\n{arm}\n}}\n_full\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                  env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+            left = tfvars.exists()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("REFUSED gitops", out)
+        self.assertNotIn("APPLIED", out)
+        self.assertFalse(left, "the tfvars that render the minter off were left for a hand-run apply")
 
 
 class ValidateGithubAppIdTest(unittest.TestCase):

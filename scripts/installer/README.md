@@ -140,8 +140,8 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
-`install.sh` reads it and writes to it only in these cases, all when a run commits (the apply, or
-the `--generate-only` handoff; never a declined run or `--dry-run`):
+`install.sh` reads it and writes to it only in these cases. The last two happen only when a run
+commits (the apply, or the `--generate-only` handoff; never a declined run or `--dry-run`):
 
 - it creates one at the end of a first install, when there is nothing there;
 - it appends a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below;

@@ -2621,7 +2621,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it, except the GitOps forge keys when an applied run changes them."
+    printf '%s\n' "# This file is yours now: install.sh reads it and writes to it only as scripts/installer/README.md (\"install.env\") lists."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"

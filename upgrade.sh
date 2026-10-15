@@ -2019,7 +2019,12 @@ main() {
       # that lacks the GitOps keys (install.sh's flags were not recorded
       # before #3075) renders GitOps off. Guarded as above.
       if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
-        refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" || exit 1
+        # A refusal removes the tfvars the generator just wrote, which render
+        # the minter off, as install.sh does and the Slack check below does.
+        if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then
+          rm -f "$tfvars_file"
+          exit 1
+        fi
       fi
       # install.env's next onto a chart that predates platformAgent.mode is
       # refused, not dropped, as retag_values does on the other two arms. Ahead
